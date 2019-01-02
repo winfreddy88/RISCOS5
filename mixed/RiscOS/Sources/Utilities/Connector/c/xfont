@@ -1,0 +1,841 @@
+/*
+ * Copyright (c) 1992, 1993 Arno Augustin, Frank Hoering, University of
+ * Erlangen-Nuremberg, Germany.
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. All advertising materials mentioning features or use of this software
+ *    must display the following acknowledgement:
+ *	This product includes software developed by the University of
+ *	Erlangen-Nuremberg, Germany.
+ * 4. Neither the name of the University nor the names of its contributors
+ *    may be used to endorse or promote products derived from this software
+ *    without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE AUTHORS ``AS IS'' AND ANY EXPRESS OR
+ * IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO
+ * EVENT SHALL THE AUTHORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
+ * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
+ * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+ * WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
+ * OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
+ * ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+#include "Desk/WimpSWIs.h"
+#include "Desk/Wimp.h"
+#include "Desk/Screen.h"
+#include "Desk/ColourTran.h"
+#include "Desk/GFX.h"
+#include "Desk/Error.h"
+#include "Desk/Sprite.h"
+#include "Desk/DeskMem.h"
+#include "Desk/Font.h"
+
+#include "osspriteop.h"
+
+#include "global.h"
+
+#include <stdlib.h>
+#include <stdio.h>
+#include "font.h"
+#include "attrib.h"
+
+//extern Desk_font_handle outlfont;
+
+
+struct btxchar {
+   struct btxchar *link;    /* NULL: use this char,  else: use linked char */
+   char *raw;               /* pointer to raw font data */
+   char bits;               /* depth in case of DRC */
+   int map[4];              /* 0: normal   (index = yd*2+xd) */
+};                          /* 1: xdouble  */
+                            /* 2: ydouble  */
+                            /* 3: xydouble */
+
+typedef struct
+{
+  unsigned char r;
+  unsigned char g;
+  unsigned char b;
+}Colour;
+
+extern void Desk_Window_ForceWholeRedraw(int window);
+extern void redraw_screen_rect(int,int,int,int);
+extern int haupt_window;
+//extern void Error_Report(int,char *);
+extern int cept_xorigin,cept_yorigin;
+extern osspriteop_area *cept_spritearea;
+extern osspriteop_id   cept_sprite_id;
+extern osspriteop_trans_tab *trans_tab;
+extern unsigned int *screen_address;
+
+extern int      scr, btxwidth;
+extern int have_color, visible, fontheight;
+extern char raw_font[];
+extern int log2bpp;
+extern int xclip0,xclip1,yclip0,yclip1;
+
+/* local variables */
+static char tmpdata[2*FONT_HEIGHT*2*2*2*2], tmpraw[2*FONT_HEIGHT];
+static struct btxchar btx_font[6*96];
+static int fullrow_bg[24];        /* fullrow background color for eacch row */
+static int dclut[4];              /* map the 4-color DRC's */
+//static Color colormap[32+4+24];  /* store pixel value for each colorcell */
+static int colormap[32+4+24];
+static Colour orgcolormap[32+4+24];
+static int cur_fg = -1, cur_bg = -1;
+
+//static int screenx;
+//static int windowposx,windowposy;
+
+/* local functions */
+static void xdraw_normal_char(struct btxchar *ch,int x,int y,int xd,int yd,int ul,struct btxchar *dia,int fg,int bg);
+static void xdraw_multicolor_char(struct btxchar *ch,int x,int y,int xd,int yd);
+void init_colormap(void);
+void define_DCLUT(int entry,int index);
+void define_fullrow_bg(int row,int index);
+
+
+/*
+ * initialize character sets. No Pixmaps are created.
+ */
+
+void init_fonts(void)
+{
+   static char raw_del[] = { 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f,
+			     0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f,
+			     0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f, 0x3f };
+   int n, i;
+
+   /* primary graphic, 2nd suppl. mosaic, suppl. graphic, 3rd suppl. mosaic */
+   for(n=0; n<4*96; n++) {
+      btx_font[n].raw  = raw_font+n*2*FONT_HEIGHT;
+      btx_font[n].bits = 1;
+      btx_font[n].link = NULL;
+      for(i=0; i<4; i++)  btx_font[n].map[i] = NULL;
+   }
+
+   /* link chars into '1st supplementary mosaic' (L) set */
+   for(n=0; n<32; n++) {
+      btx_font[SUP1*96+n].link    = btx_font+SUP2*96+n;
+      btx_font[SUP1*96+n+32].link = btx_font+PRIM*96+n+32;
+      btx_font[SUP1*96+n+64].link = btx_font+SUP2*96+n+64;
+   }
+
+   /* initialize the DEL character of the L set */
+   btx_font[L*96+0x7f-0x20].link = NULL;
+   btx_font[L*96+0x7f-0x20].raw = raw_del;
+   btx_font[L*96+0x7f-0x20].bits = 1;
+   for(i=0; i<4; i++)  btx_font[L*96+0x7f-0x20].map[i] = NULL;
+
+   /* initialize DRCS font to all NULL's */
+   btx_font[DRCS*96+0].link = btx_font;    /* link 'SPACE' */
+   for(n=1; n<96; n++) {
+      btx_font[DRCS*96+n].bits = 0;
+      btx_font[DRCS*96+n].raw  = NULL;
+      btx_font[DRCS*96+n].link = NULL;
+      for(i=0; i<4; i++)  btx_font[DRCS*96+n].map[i] = NULL;
+   }
+}
+
+void set_mem(int x,int y,int c)
+{
+  unsigned char *spr8;
+  unsigned short *spr16;
+  unsigned int *spr32;
+  int x2;
+
+  switch(log2bpp)
+  {
+    case 0:
+      spr8=(unsigned char *)cept_spritearea+60;
+      x2=(x>>3);
+      switch(x&7)
+      {
+        case 0:
+          spr8[x2+60*y]=(spr8[x2+60*y]&0xfe)|colormap[c];
+        break;
+        case 1:
+          spr8[x2+60*y]=(spr8[x2+60*y]&0xfd)|(colormap[c]<<1);
+        break;
+        case 2:
+          spr8[x2+60*y]=(spr8[x2+60*y]&0xfb)|(colormap[c]<<2);
+        break;
+        case 3:
+          spr8[x2+60*y]=(spr8[x2+60*y]&0xf7)|(colormap[c]<<3);
+        break;
+        case 4:
+          spr8[x2+60*y]=(spr8[x2+60*y]&0xef)|(colormap[c]<<4);
+        break;
+        case 5:
+          spr8[x2+60*y]=(spr8[x2+60*y]&0xdf)|(colormap[c]<<5);
+        break;
+        case 6:
+          spr8[x2+60*y]=(spr8[x2+60*y]&0xbf)|(colormap[c]<<6);
+        break;
+        case 7:
+          spr8[x2+60*y]=(spr8[x2+60*y]&0x7f)|(colormap[c]<<7);
+        break;
+      }
+    break;
+    case 1:
+      spr8=(unsigned char *)cept_spritearea+60;
+      x2=(x>>2);
+      switch(x&3)
+      {
+        case 0:
+          spr8[x2+120*y]=(spr8[x2+120*y]&0xfc)|colormap[c];
+        break;
+        case 1:
+          spr8[x2+120*y]=(spr8[x2+120*y]&0xf3)|(colormap[c]<<2);
+        break;
+        case 2:
+          spr8[x2+120*y]=(spr8[x2+120*y]&0xcf)|(colormap[c]<<4);
+        break;
+        case 3:
+          spr8[x2+120*y]=(spr8[x2+120*y]&0x3f)|(colormap[c]<<6);
+        break;
+      }
+    break;
+    case 2:
+      spr8=(unsigned char *)cept_spritearea+60;
+      x2=(x>>1);
+      if((x2<<1)==x)
+        spr8[x2+240*y]=(spr8[x2+240*y]&0xf0)|colormap[c];
+      else
+        spr8[x2+240*y]=(spr8[x2+240*y]&0x0f)|(colormap[c]<<4);
+    break;
+    case 3:
+      spr8=(unsigned char *)cept_spritearea+60;
+      spr8[x+480*y]=c;
+    break;
+    case 4:
+      spr16=(unsigned short *)cept_spritearea+30;
+      spr16[x+480*y]=colormap[c];
+    break;
+    case 5:
+      spr32=(unsigned int *)cept_spritearea+15;
+      spr32[x+480*y]=colormap[c];
+    break;
+  }
+}
+
+
+
+
+/*
+ * draw the specified character at cursor position x, y (zero based).
+ * The character is stretched according to xdouble, ydouble (1=stretch,
+ * 0=don't). If the Pixmap for this state doesn't exist, it will be
+ * created and cached.
+ */
+
+void xputc(int c,int set,int x,int y,int xdouble,int ydouble,int underline,int diacrit,int fg,int bg)
+{
+   extern int rows;
+   struct btxchar *ch, *dia;
+
+   /*
+   screenx=Desk_screen_size.x>>Desk_screen_eig.x;
+   windowposy=Desk_screen_size.y-cept_yorigin;
+   windowposx=cept_xorigin;
+
+   switch(log2bpp)
+   {
+     case 0:
+       screenx>>=3;
+       windowposy>>=3;
+     break;
+     case 1:
+       screenx>>=2;
+       windowposy>>=2;
+     break;
+     case 2:
+       screenx>>=1;
+       windowposy>>=1;
+     break;
+   }
+   */
+
+
+   if(x<0 || y<0 || x>39 || y>rows-1) return;
+
+   ch = btx_font + set*96 + c - 0x20;
+
+   /* folow the link pointer */
+   if(ch->link)  ch = ch->link;
+
+   /* a yet undefined DRC should be drawn - draw a SPACE */
+   if(!ch->raw)  ch = btx_font;
+
+   if(ch->bits==1)
+   {
+      dia = diacrit ? btx_font + SUPP*96 + diacrit - 0x20 : NULL;
+      //Desk_Error_Report(0,"hier: %d,%d,%d",c,set,diacrit);
+      xdraw_normal_char(ch, x, y, xdouble, ydouble, underline, dia, fg, bg);
+
+      /*
+      Desk_GFX_GCOL(0,colormap[bg]);
+      Desk_GFX_RectangleFill(cept_xorigin+x*24,cept_yorigin-(y+1)*24,24,24);
+      Desk_Font_SetFontColours(outlfont,colormap[bg],colormap[fg],0);
+      Desk_Font_Paint((char *)&c,16,cept_xorigin+x*24,cept_yorigin+4-(y+1)*24);
+      */
+   }
+   else {  /* 2/4 bits */
+      xdraw_multicolor_char(ch, x, y, xdouble, ydouble);
+   }
+}
+
+/*
+static update_btx_char(int x,int y,int xd,int yd)
+{
+  window_redrawblock r;
+  BOOL more;
+
+  x=x*FONT_WIDTH+80;
+  y=y*fontheight+48;
+
+  cept_sprite_id=(osspriteop_id) (osspriteop_header *) ((char *)cept_spritearea+cept_spritearea->first);
+
+  r.window = haupt_window;
+  r.rect.min.x=x<<1;
+  r.rect.min.y=-((y+(fontheight<<yd))<<1);
+  r.rect.max.y=-(y<<1);
+  r.rect.max.x=(x+(FONT_WIDTH<<xd))<<1;
+  Wimp_EUpdateWindow(&r,&more);
+
+  while(more)
+  {
+    cept_xorigin=r.rect.min.x-r.scroll.x;
+    cept_yorigin=r.rect.max.y-r.scroll.y;
+    xosspriteop_put_sprite_user_coords(osspriteop_PTR,cept_spritearea,cept_sprite_id,cept_xorigin+160,cept_yorigin-288*2-96,0);
+    Wimp_EGetRectangle(&r,&more);
+  }
+}
+*/
+
+static void xdraw_normal_char(struct btxchar *ch,int x,int y,int xd,int yd,int ul,struct btxchar *dia,int fg,int bg)
+{
+   int i, j, z, s, yy, yyy, xxx;
+
+   if(fg==TRANSPARENT)  fg = 32+4+y;
+   if(bg==TRANSPARENT)  bg = 32+4+y;
+
+      z=y*fontheight;
+      for(yy=0; yy<fontheight; yy++) {
+	 for(yyy=0; yyy<(yd+1); yyy++) {
+	    s=x*FONT_WIDTH;
+	    for(j=0; j<2; j++)
+	       for(i=5; i>=0; i--)
+		  for(xxx=0; xxx<(xd+1); xxx++, s++)
+	             set_mem(s, z, ( (ch->raw[yy*2+j]&(1<<i)) ||
+				     (dia && (dia->raw[yy*2+j]&(1<<i))) )
+			           ? fg : bg);
+	    z++;
+	 }
+      }
+
+      if(ul)
+         for(yyy=0; yyy<(yd+1); yyy++)
+	    for(xxx=0; xxx<FONT_WIDTH*(xd+1); xxx++)
+	       set_mem(x*FONT_WIDTH+xxx,
+		       y*fontheight+(fontheight-1)*(yd+1)+yyy, fg);
+
+   //update_btx_char(x,y,xd,yd);
+   //Desk_Window_ForceWholeRedraw(haupt_window);
+
+/*
+   Desk_Window_ForceRedraw(haupt_window,(x*FONT_WIDTH)<<screen_eig.x,-((y*fontheight+(fontheight<<yd))<<screen_eig.y),
+                      (x*FONT_WIDTH+(FONT_WIDTH<<xd))<<screen_eig.x,-((y*fontheight)<<screen_eig.y));
+*/
+/*
+  xosspriteop_put_sprite_user_coords(osspriteop_PTR,cept_spritearea,cept_sprite_id,
+                                     cept_xorigin+(x*FONT_WIDTH+80)<<1,cept_yorigin-((y*fontheight+48)<<1)-24,0);
+*/
+}
+
+
+static void xdraw_multicolor_char(struct btxchar *ch,int x,int y,int xd,int yd)
+{
+   int c, i, j, z, s, p, yy, xxx, yyy;
+
+      z=y*fontheight;
+      for(yy=0; yy<fontheight; yy++) {
+	 for(yyy=0; yyy<(yd+1); yyy++) {
+	    s=x*FONT_WIDTH;
+	    for(j=0; j<2; j++)
+	       for(i=5; i>=0; i--) {
+		  for(p=0, c=0; p<ch->bits; p++)
+		     if(ch->raw[p*2*FONT_HEIGHT+yy*2+j]&(1<<i))  c |= 1<<p;
+		  if(ch->bits==2) {
+		     c = dclut[c];
+		     if(c==TRANSPARENT)  c = 32+4+y;
+		  }
+		  else c += 16;
+		  for(xxx=0; xxx<(xd+1); xxx++, s++)  set_mem(s, z, c);
+	       }
+	    z++;
+	 }
+      }
+   //update_btx_char(x,y,xd,yd);
+   //Desk_Window_ForceWholeRedraw(haupt_window);
+
+/*
+   Desk_Window_ForceRedraw(haupt_window,(x*FONT_WIDTH)<<screen_eig.x,-((y*fontheight+(fontheight<<yd))<<screen_eig.y),
+                      (x*FONT_WIDTH+(FONT_WIDTH<<xd))<<screen_eig.x,-((y*fontheight)<<screen_eig.y));
+*/
+}
+
+
+void fillrec(int x,int y,int w,int h,int c)
+{
+  unsigned char *spr8;
+  unsigned int *spr32;
+  int btxwidth;
+  int i,j;
+
+
+
+  switch(log2bpp)
+  {
+    case 0:
+      btxwidth = (40*FONT_WIDTH)>>3;
+      c=c+(c<<1)+(c<<2)+(c<<3)+(c<<4)+(c<<5)+(c<<6)+(c<<7);
+      spr8=(unsigned char *)cept_spritearea+60;
+      w=w>>3;
+      x=x>>3;
+      spr8+=x+60*y;
+      for(i=0;i<h;i++)
+      {
+        for(j=0;j<w;j++)
+          spr8[j]=c;
+        spr8+=btxwidth;
+      }
+    break;
+    case 1:
+      btxwidth = (40*FONT_WIDTH)>>2;
+      c=c+(c<<2)+(c<<4)+(c<<6);
+      spr8=(unsigned char *)cept_spritearea+60;
+      w=w>>2;
+      x=x>>2;
+      spr8+=x+120*y;
+      for(i=0;i<h;i++)
+      {
+        for(j=0;j<w;j++)
+          spr8[j]=c;
+        spr8+=btxwidth;
+      }
+    break;
+    case 2:
+      btxwidth = (40*FONT_WIDTH)>>1;
+      c=c+(c<<4);
+      spr8=(unsigned char *)cept_spritearea+60;
+      w=w>>1;
+      x=x>>1;
+      spr8+=x+240*y;
+      for(i=0;i<h;i++)
+      {
+        for(j=0;j<w;j++)
+          spr8[j]=c;
+        spr8+=btxwidth;
+      }
+    break;
+    case 3:
+      btxwidth = (40*FONT_WIDTH)>>2;
+      c=c+(c<<8)+(c<<16)+(c<<24);
+      spr32=(unsigned int *)cept_spritearea+15;
+      w=w>>2;
+      x=x>>2;
+      spr32+=x+120*y;
+      for(i=0;i<h;i++)
+      {
+        for(j=0;j<w;j++)
+          spr32[j]=c;
+        spr32+=btxwidth;
+      }
+    break;
+    case 4:
+      btxwidth = (40*FONT_WIDTH)>>1;
+      c=c+(c<<16);
+      spr32=(unsigned int *)cept_spritearea+15;
+      w=w>>1;
+      x=x>>1;
+      spr32+=x+240*y;
+      for(i=0;i<h;i++)
+      {
+        for(j=0;j<w;j++)
+          spr32[j]=c;
+        spr32+=btxwidth;
+      }
+    break;
+    case 5:
+      btxwidth = 40*FONT_WIDTH;
+      spr32=(unsigned int *)cept_spritearea+15;
+      spr32+=x+480*y;
+      for(i=0;i<h;i++)
+      {
+        for(j=0;j<w;j++)
+          spr32[j]=c;
+        spr32+=btxwidth;
+      }
+    break;
+  }
+}
+
+
+void xclearscreen(void)
+{
+   extern int tia, rows;
+   int y, bg;
+   int btxwidth;
+
+/*
+   bg = tia ? BLACK : 32+4+y;
+   if(cur_fg!=bg)
+     cur_fg=bg;
+   ColourTrans_SetGCOL3(orgcolormap[bg].r,orgcolormap[bg].g,orgcolormap[bg].b);
+   GFX_RectangleFill(cept_xorigin,cept_yorigin-(240<<screen_eig.y),(480<<screen_eig.x),(240<<screen_eig.y));
+*/
+   //redraw_screen_rect(0,0,39,rows-1);
+
+
+   btxwidth = 40*FONT_WIDTH;
+
+   for(y=0; y<rows; y++)
+   {
+     bg = tia ? BLACK : 32+4+y;
+     if(cur_fg!=bg)
+       cur_fg=bg;
+     fillrec(0,y*fontheight,btxwidth,fontheight,colormap[bg]);
+   }
+   Desk_Window_ForceWholeRedraw(haupt_window);
+
+   //Desk_GFX_GCOL(0,colormap[bg]);
+   //Desk_GFX_RectangleFill(cept_xorigin,cept_yorigin-(24+1)*24,960,480);
+
+/*
+   if(visible) {
+      if(have_color) {
+	 for(y=0; y<rows; y++) {
+	    bg = tia ? BLACK : 32+4+y;
+	    if(cur_fg!=bg)
+	       { XSetForeground(dpy, gc, colormap[bg].pixel); cur_fg=bg;}
+
+	    XFillRectangle(dpy, btxwin, gc, 0, y*fontheight*pixel_size,
+			   btxwidth, fontheight*pixel_size);
+	 }
+      }
+      else XClearWindow(dpy, btxwin);
+   }
+*/
+}
+
+
+void xscroll(int upper,int lower,int up)
+{
+  /*
+   int col, y;
+
+   if(visible) {
+
+      if(upper<lower)
+         XCopyArea(dpy, btxwin, btxwin, gc, 0,
+		   (upper+up)*fontheight*pixel_size,
+		   btxwidth, (lower-upper)*fontheight*pixel_size,
+		   0, (upper+!up)*fontheight*pixel_size);
+
+
+      y = up ? lower : upper;
+      if(have_color) {
+	 col = 32+4+y;
+	 if(cur_fg!=col)
+	    { XSetForeground(dpy, gc, colormap[col].pixel); cur_fg=col;}
+      }
+      else XSetForeground(dpy, gc, WhitePixel(dpy, scr));
+
+      XFillRectangle(dpy, btxwin, gc, 0, y*fontheight*pixel_size, btxwidth,
+		     fontheight*pixel_size);
+
+      if(!have_color) XSetForeground(dpy, gc, BlackPixel(dpy, scr));
+   }
+   */
+}
+
+
+void xcursor(int x,int y)
+{
+  Desk_sprite_outputstate oldstate;
+
+  Desk_Sprite_Redirect((Desk_sprite_area)cept_spritearea,"cept",NULL,&oldstate);
+  Desk_GFX_GCOL(Desk_gfx_action_INVERT,0);
+  Desk_GFX_RectangleFill((x*FONT_WIDTH)<<1,460-((y*fontheight)<<1),22,18);
+  Desk_Sprite_UnRedirect(&oldstate);
+  Desk_Window_ForceWholeRedraw(haupt_window);
+
+  /*
+  static int oldx=0,oldy=0;
+  int xd=0,yd=0;
+  Desk_window_redrawblock r;
+  Desk_bool more;
+
+  //Desk_Error_Report(0,"hier");
+
+  r.window = haupt_window;
+  r.rect.min.x=(x*FONT_WIDTH)<<Desk_screen_eig.x;
+  r.rect.min.y=-(((y*fontheight)+(fontheight<<yd))<<Desk_screen_eig.y);
+  r.rect.max.y=-((y*fontheight)<<Desk_screen_eig.y);
+  r.rect.max.x=((x*FONT_WIDTH)+(FONT_WIDTH<<xd))<<Desk_screen_eig.x;
+  Desk_Wimp_UpdateWindow(&r,&more);
+
+  while(more)
+  {
+    if(oldx!=x || oldy!=y)
+    {
+      Desk_Window_ForceRedraw(haupt_window,(oldx*FONT_WIDTH)<<Desk_screen_eig.x,
+                              -((oldy*fontheight+(fontheight<<yd))<<Desk_screen_eig.y),
+                              (oldx*FONT_WIDTH+(FONT_WIDTH<<xd))<<Desk_screen_eig.x,
+                              -((oldy*fontheight)<<Desk_screen_eig.y));
+      oldx=x;
+      oldy=y;
+    }
+    Desk_GFX_GCOL(4,0);
+    Desk_GFX_RectangleFill(cept_xorigin+((x*FONT_WIDTH)<<Desk_screen_eig.x),
+                      cept_yorigin-((y*fontheight)<<Desk_screen_eig.y)-(fontheight<<Desk_screen_eig.y),
+                      (FONT_WIDTH<<Desk_screen_eig.x)-2,(fontheight<<Desk_screen_eig.y)-2);
+    Desk_Wimp_GetRectangle(&r,&more);
+  }
+  */
+}
+
+
+/*
+ * initialize colormap and STORE colors !
+ */
+void default_colors(void)   /* page 153 */
+{
+   init_colormap();
+   //store_colors();
+}
+
+
+
+/*
+ * defines the raw bitmap data for a DRC 'c'. If 'c' was in use before,
+ * its old raw data and Pixmaps are freed. No Pixmap for any state is
+ * initialized, since xputc() does this on demand.
+ */
+
+void define_raw_DRC(int c,char *data,int bits)
+{
+   struct btxchar *ch = btx_font + DRCS*96 + c - 0x20;
+   int n;
+
+   if(ch->raw)  Desk_DeskMem_Free(ch->raw);
+   for(n=0; n<4; n++)
+      if(ch->map[n])
+      {
+	 //XFreePixmap(dpy, ch->map[n]);
+	 ch->map[n] = NULL;
+      }
+
+   if(! (ch->raw = Desk_DeskMem_Malloc(2*FONT_HEIGHT*bits)) )
+   {
+      //perror("XCEPT: no mem for raw DRCS");
+      exit(1);
+   }
+
+   ch->bits = bits;
+   for(n=0; n<2*FONT_HEIGHT*bits; n++)  ch->raw[n] = data[n];
+
+   ch->link = NULL;
+}
+
+
+/*
+ * free the current DRCS completely
+ */
+void free_DRCS(void)
+{
+   int i, n;
+
+   btx_font[DRCS*96+0].link = btx_font;    /* link 'SPACE' */
+   for(n=DRCS*96+1; n<(DRCS+1)*96; n++) {
+      if(btx_font[n].raw)  {
+	 Desk_DeskMem_Free(btx_font[n].raw);
+	 btx_font[n].raw = NULL;
+      }
+      for(i=0; i<4; i++)
+         if(btx_font[n].map[i])
+         {
+	    //XFreePixmap(dpy, btx_font[n].map[i]);
+	    btx_font[n].map[i] = NULL;
+	 }
+      btx_font[n].link = NULL;
+      btx_font[n].bits = 0;
+   }
+}
+
+void convert_colormap(void)
+{
+  int i;
+
+  for(i=0;i<32+4+24;i++)
+  {
+    colormap[i]=Desk_ColourTrans_ReturnColourNumber(Desk_ColourTrans_RGB(orgcolormap[i].r,orgcolormap[i].g,orgcolormap[i].b));
+
+    if(Desk_screen_bpp==8)
+      trans_tab->c[i]=colormap[i];
+    else
+      trans_tab->c[i]=i;
+  }
+}
+
+/*
+ * initialize colormap entries for clut 0-3, DCLUT + fullrow background
+ */
+void init_colormap(void)
+{
+   int n;
+   int r,g,b;
+
+   /* clut 0 + clut 1 */
+   for(n=0; n<16; n++)
+   {  /* page 112) */
+      if(n==8)
+      {
+        orgcolormap[n].r = orgcolormap[0].r;
+        orgcolormap[n].g = orgcolormap[0].g;
+        orgcolormap[n].b = orgcolormap[0].b;
+        colormap[n] = colormap[0];
+        trans_tab->c[n]=trans_tab->c[n];
+        continue;
+      }
+      r = orgcolormap[n].r = ((n&1)>0) ? ( ((n&8)==0) ? 0xff : 0x7f ) : 0;
+      g = orgcolormap[n].g = ((n&2)>0) ? ( ((n&8)==0) ? 0xff : 0x7f ) : 0;
+      b = orgcolormap[n].b = ((n&4)>0) ? ( ((n&8)==0) ? 0xff : 0x7f ) : 0;
+      colormap[n]=Desk_ColourTrans_ReturnColourNumber(Desk_ColourTrans_RGB(r,g,b));
+      if(Desk_screen_bpp==8)
+        trans_tab->c[n]=colormap[n];
+      else
+        trans_tab->c[n]=n;
+   }
+
+   /* clut 2 + clut 3 */
+   for(n=0; n<8; n++)
+   {
+      r = orgcolormap[n+16].r = orgcolormap[n+24].r = n&1 ? 0xff : 0;
+      g = orgcolormap[n+16].g = orgcolormap[n+24].r = n&2 ? 0xff : 0;
+      b = orgcolormap[n+16].b = orgcolormap[n+24].r = n&4 ? 0xff : 0;
+      colormap[n+16]=Desk_ColourTrans_ReturnColourNumber(Desk_ColourTrans_RGB(r,g,b));
+      colormap[n+24]=Desk_ColourTrans_ReturnColourNumber(Desk_ColourTrans_RGB(r,g,b));
+      if(Desk_screen_bpp==8)
+      {
+        trans_tab->c[n+16]=colormap[n+16];
+        trans_tab->c[n+24]=colormap[n+24];
+      }
+      else
+      {
+        trans_tab->c[n+16]=n+16;
+        trans_tab->c[n+24]=n+24;
+      }
+   }
+
+   /* DCLUT */
+   for(n=0; n<4; n++)
+   {
+      orgcolormap[32+n].r = orgcolormap[n].r;
+      orgcolormap[32+n].g = orgcolormap[n].g;
+      orgcolormap[32+n].b = orgcolormap[n].b;
+
+      colormap[32+n] = colormap[n];
+      if(Desk_screen_bpp==8)
+        trans_tab->c[32+n] = trans_tab->c[n];
+
+      dclut[n] = n;
+   }
+
+   /* fullrow background (BLACK) */
+   for(n=0; n<24; n++)
+   {
+      orgcolormap[32+4+n].r = orgcolormap[0].r;
+      orgcolormap[32+4+n].g = orgcolormap[0].g;
+      orgcolormap[32+4+n].b = orgcolormap[0].b;
+
+      colormap[32+4+n] = colormap[0];
+      if(Desk_screen_bpp==8)
+        trans_tab->c[32+4+n] = trans_tab->c[0];
+      fullrow_bg[n] = 0;
+   }
+}
+
+
+/*
+ * define new RGB values for color 'index' in colormap
+ */
+void define_color(unsigned int index,unsigned int r,unsigned int g,unsigned int b)
+{
+   int i;
+
+   orgcolormap[index].r = (r<<4);
+   orgcolormap[index].g = (g<<4);
+   orgcolormap[index].b = (b<<4);
+
+   colormap[index]=Desk_ColourTrans_ReturnColourNumber(Desk_ColourTrans_RGB(r<<4,g<<4,b<<4));
+   if(Desk_screen_bpp==8)
+     trans_tab->c[index]=colormap[index];
+
+   for(i=0; i<4; i++)
+      if(dclut[i]==index) define_DCLUT(i, index);
+
+   for(i=0; i<24; i++)
+      if(fullrow_bg[i]==index) define_fullrow_bg(i, index);
+
+   //Desk_Window_ForceWholeRedraw(haupt_window);
+}
+
+
+/*
+ * set RGB values for DCLUT color 'entry' to those of color 'index'.
+ */
+void define_DCLUT(int entry,int index)
+{
+   dclut[entry] = index;
+
+   orgcolormap[32+entry].r = orgcolormap[index].r;
+   orgcolormap[32+entry].g = orgcolormap[index].g;
+   orgcolormap[32+entry].b = orgcolormap[index].b;
+
+   colormap[32+entry] = colormap[index];
+   if(Desk_screen_bpp==8)
+     trans_tab->c[32+entry] = trans_tab->c[index];
+}
+
+
+/*
+ * set RGB values for fullrow_bg of 'row' to those of color 'index'.
+ */
+void define_fullrow_bg(int row,int index)
+{
+   fullrow_bg[row] = index;
+
+   orgcolormap[32+4+row].r = orgcolormap[index].r;
+   orgcolormap[32+4+row].g = orgcolormap[index].g;
+   orgcolormap[32+4+row].b = orgcolormap[index].b;
+
+   colormap[32+4+row] = colormap[index];
+   if(Desk_screen_bpp==8)
+     trans_tab->c[32+4+row] = trans_tab->c[index];
+
+   //redraw_screen_rect(0,row,39,row);
+
+}
+

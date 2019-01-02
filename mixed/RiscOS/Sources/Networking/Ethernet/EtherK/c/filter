@@ -1,0 +1,549 @@
+/* Copyright 2004 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/**************************************************************/
+/* File:    filter.c                                          */
+/*                                                            */
+/* Purpose: Functions that deal with claiming and releasing   */
+/*          address filters.                                  */
+/*                                                            */
+/* Author:  J.R.Byrne.                                        */
+/**************************************************************/
+
+#include <stdlib.h>
+
+#include <swis.h>
+
+#include "em_riscos.h"
+#include "if_em.h"
+#include "em_device.h"
+
+#include "filter.h"
+
+/* Local functions */
+
+static int single_claim(_kernel_swi_regs * r, device_t dev, FilterSingleRef * level);
+static int single_release(_kernel_swi_regs * r, device_t dev, FilterSingleRef * level);
+static void single_release_module(device_t dev, uint32_t pwp, uint32_t level, FilterSingleRef * fsrptr);
+static int chain_claim(_kernel_swi_regs * r, device_t dev, FilterChainRef * fcrptr);
+static int chain_release(_kernel_swi_regs * r, device_t dev, FilterChainRef * fcrptr);
+static void chain_release_module(device_t dev, uint32_t pwp, uint32_t level, FilterChainRef * fcrptr);
+static void send_frametypefree(device_t dev, uint32_t type, FilterSingleRef fs);
+
+
+/**************************************************************/
+/* filter_update()                                            */
+/*                                                            */
+/* Called by the Filter SWI handler to claim or release a     */
+/* filter for a device.                                       */
+/*                                                            */
+/* Parameters: Pointer to the Filter SWI register block;      */
+/*                                                            */
+/*             Pointer to the relevant device structure.      */
+/*                                                            */
+/* Returns:    BSD error number.                              */
+/**************************************************************/
+
+int filter_update(_kernel_swi_regs * r, device_t dev)
+{
+    bool claim = ((r->r[0] & FILTER_RELEASE) == 0);
+    int  error;
+
+    switch (GET_FRAMELEVEL(r->r[2]))
+    {
+        case FRMLVL_E2SPECIFIC:
+        {
+            if (claim)
+            {
+                if (dev->e2monitor == NULL)
+                {
+                    /* Try to add a filter to the specific level chain. */
+                    error = chain_claim(r, dev, &dev->e2specific);
+                }
+                else
+                {
+                    /* Can't claim a frame of level specific if a monitor */
+                    /* level filter exists.                               */
+                    error = INETERR_FILTERGONE;
+                }
+            }
+            else
+            {
+                /* Try to release this filter from the specific level chain. */
+                error = chain_release(r, dev, &dev->e2specific);
+            }
+            break;
+        }
+
+        case FRMLVL_E2SINK:
+        {
+            if (claim)
+            {
+                if (dev->e2monitor == NULL)
+                {
+                    /* Try to add a sink level filter. */
+                    error = single_claim(r, dev, &dev->e2sink);
+                }
+                else
+                {
+                    /* Can't claim sink level filter if a monitor level */
+                    /* filter exists.                                   */
+                    error = INETERR_FILTERGONE;
+                }
+            }
+            else
+            {
+                /* Try to release this filter. */
+                error = single_release(r, dev, &dev->e2sink);
+            }
+            break;
+        }
+
+        case FRMLVL_E2MONITOR:
+        {
+            if (claim)
+            {
+                if (dev->e2specific == NULL && dev->e2sink == NULL)
+                {
+                    /* Try to add a monitor level filter. */
+                    error = single_claim(r, dev, &dev->e2monitor);
+                }
+                else
+                {
+                    /* Can't claim monitor level filter if specific or sink */
+                    /* level filters exist.                                 */
+                    error = INETERR_FILTERGONE;
+                }
+            }
+            else
+            {
+                /* Try to release this filter. */
+                error = single_release(r, dev, &dev->e2monitor);
+            }
+            break;
+        }
+
+        case FRMLVL_IEEE:
+        {
+            if (claim)
+            {
+                /* Try to add an IEEE filter. */
+                error = single_claim(r, dev, &dev->ieeefilter);
+            }
+            else
+            {
+                /* Try to release this filter. */
+                error = single_release(r, dev, &dev->ieeefilter);
+            }
+            break;
+        }
+
+        default:
+        {
+            error = EINVAL;
+            break;
+        }
+    }
+
+    if (error == 0)
+    {
+        /* Set hardware filtering for this unit to the loosest necessary. */
+        em_ro_update_addrlevel(dev);
+    }
+
+    return error;
+}
+
+/**************************************************************/
+/* filter_release_module()                                    */
+/*                                                            */
+/* Release all filters for a device that belong to a protocol */
+/* module with a given private word pointer.                  */
+/*                                                            */
+/* Parameters: Pointer to the relevant device structure;      */
+/*                                                            */
+/*             Private word pointer for the relevant protocol */
+/*             module.                                        */
+/**************************************************************/
+
+void filter_release_module(device_t dev, uint32_t pwp)
+{
+    /* Start with the chained filter level. */
+    chain_release_module(dev, pwp, FRMLVL_E2SPECIFIC, &dev->e2specific);
+
+    /* Now the unique filter levels. */
+    single_release_module(dev, pwp, FRMLVL_E2SINK,    &dev->e2sink);
+    single_release_module(dev, pwp, FRMLVL_E2MONITOR, &dev->e2monitor);
+    single_release_module(dev, pwp, FRMLVL_IEEE,      &dev->ieeefilter);
+
+    /* Check whether receiver can be disabled. */
+    em_ro_update_addrlevel(dev);
+}
+
+/**************************************************************/
+/* single_claim()                                             */
+/*                                                            */
+/* Handle a claim on a filter level that does not chain       */
+/* multiple frame types.                                      */
+/*                                                            */
+/* Parameters: Pointer to the Filter SWI register block;      */
+/*                                                            */
+/*             Pointer to the relevant device structure;      */
+/*                                                            */
+/*             Pointer to where the pointer to the filter     */
+/*             structure is stored.                           */
+/*                                                            */
+/* Returns:    BSD error number.                              */
+/**************************************************************/
+
+static int single_claim(_kernel_swi_regs * r, device_t dev, FilterSingleRef * fsrptr)
+{
+    FilterSingleRef fs = *fsrptr;
+    int             error;
+
+    if (GET_FRAMETYPE(r->r[2]) != 0)
+    {
+        /* Frame type must be zero */
+        return EINVAL;
+    }
+
+    if (fs)
+    {
+        if (
+            dev->dupclaimexpected &&
+            fs->fs_addrlevel == r->r[3] &&
+            fs->fs_errlevel  == r->r[4] &&
+            fs->fs_pwptr     == r->r[5] &&
+            fs->fs_handler   == (void (*)())r->r[6]
+           )
+        {
+            /* This is a legitimate reclaim - start hardware if necessary */
+            return em_ro_start(dev);
+        }
+        else
+        {
+            /* This frame level is already claimed in some fashion */
+            return INETERR_FILTERGONE;
+        }
+    }
+
+    fs = (FilterSingleRef)malloc(sizeof(*fs));
+    if (fs == NULL)
+    {
+        /* Cannot claim memory for this structure */
+        return ENOMEM;
+    }
+
+    /* Start the hardware if necessary */
+    error = em_ro_start(dev);
+    if (error != 0)
+    {
+        free(fs);
+        return error;
+    }
+
+    /* Everything checks out OK, initialise the structure */
+    fs->fs_addrlevel = r->r[3];
+    fs->fs_errlevel  = r->r[4];
+    fs->fs_pwptr     = r->r[5];
+    fs->fs_handler   = (void (*)())r->r[6];
+
+    *fsrptr = fs;
+
+    return 0;
+}
+
+/**************************************************************/
+/* single_release()                                           */
+/*                                                            */
+/* Release a filter on a filter level that does not chain     */
+/* multiple frame types.                                      */
+/*                                                            */
+/* Parameters: Pointer to the Filter SWI register block;      */
+/*                                                            */
+/*             Pointer to the relevant device structure;      */
+/*                                                            */
+/*             Pointer to where the pointer to the filter     */
+/*             structure is stored.                           */
+/*                                                            */
+/* Returns:    BSD error number.                              */
+/**************************************************************/
+
+static int single_release(_kernel_swi_regs * r, device_t dev, FilterSingleRef * fsrptr)
+{
+    FilterSingleRef fs = *fsrptr;
+
+    if (!fs)
+    {
+        /* Trying to free a non-existent claim */
+        return EINVAL;
+    }
+
+    if (fs->fs_pwptr != r->r[5] || fs->fs_handler != (void (*)())r->r[6])
+    {
+        /* Trying to release somebody else's claim */
+        return EPERM;
+    }
+
+    /* Everything checks out, do the free */
+    send_frametypefree(dev, r->r[2], fs);
+    free(fs);
+    *fsrptr = NULL;
+
+    return 0;
+}
+
+/**************************************************************/
+/* single_release_module()                                    */
+/*                                                            */
+/* Release a filter on a filter level that does not chain     */
+/* multiple frame types if it belongs to a protocol module    */
+/* with a given private word pointer.                         */
+/*                                                            */
+/* Parameters: Pointer to the relevant device structure;      */
+/*                                                            */
+/*             Private word pointer for the relevant protocol */
+/*             module.                                        */
+/*                                                            */
+/*             Frame level being released;                    */
+/*                                                            */
+/*             Pointer to where the pointer to the filter     */
+/*             structure is stored.                           */
+/**************************************************************/
+
+static void single_release_module(device_t dev, uint32_t pwp, uint32_t level,
+                                  FilterSingleRef * fsrptr)
+{
+    FilterSingleRef fs = *fsrptr;
+
+    if (fs && fs->fs_pwptr == pwp)
+    {
+        uint32_t ftype = 0;
+
+        /* We have a match - send a service call round to let protocol */
+        /* modules know about new claims available.                    */
+        SET_FRAMELEVEL(ftype, level);
+        send_frametypefree(dev, ftype, fs);
+        free(fs);
+        *fsrptr = NULL;
+    }
+}
+
+/**************************************************************/
+/* chain_claim()                                              */
+/*                                                            */
+/* Handle a claim on a filter level that can chain multiple   */
+/* frame types.                                               */
+/*                                                            */
+/* Parameters: Pointer to the Filter SWI register block;      */
+/*                                                            */
+/*             Pointer to the relevant device structure;      */
+/*                                                            */
+/*             Pointer to where the pointer to the filter     */
+/*             chain is stored.                               */
+/*                                                            */
+/* Returns:    BSD error number.                              */
+/**************************************************************/
+
+static int chain_claim(_kernel_swi_regs * r, device_t dev, FilterChainRef * fcrptr)
+{
+    FilterChainRef fc;
+    int            error;
+
+    /* Search down the FilterChain, looking for this frametype */
+    fc = *fcrptr;
+    while (fc && fc->fc_type != GET_FRAMETYPE(r->r[2]))
+    {
+        fcrptr = &fc->fc_next;
+        fc = fc->fc_next;
+    }
+
+    if (fc)
+    {
+        /* This frame type is already claimed in some fashion, */
+        /* check that this is not an erroneous reclaim.        */
+        if (
+            dev->dupclaimexpected &&
+            fc->fc_type      == GET_FRAMETYPE(r->r[2]) &&
+            fc->fc_addrlevel == r->r[3] &&
+            fc->fc_errlevel  == r->r[4] &&
+            fc->fc_pwptr     == r->r[5] &&
+            fc->fc_handler   == (void (*)())r->r[6]
+           )
+        {
+            /* This is a legitimate reclaim - start hardware if necessary */
+            return em_ro_start(dev);
+        }
+        else
+        {
+            return INETERR_FILTERGONE;
+        }
+    }
+
+    dprintf(("Misc", "%s: Claiming frame type %x (*fcrptr = %p)\n", __func__,
+           GET_FRAMETYPE(r->r[2]), *fcrptr));
+
+    if ((fc = (FilterChainRef)malloc(sizeof(*fc))) == NULL)
+    {
+        /* Cannot claim memory for this structure */
+        return ENOMEM;
+    }
+
+    /* Start the hardware if necessary */
+    error = em_ro_start(dev);
+    if (error != 0)
+    {
+        free(fc);
+        return error;
+    }
+
+    /* Fill out the fields */
+    fc->fc_type      = GET_FRAMETYPE(r->r[2]);
+    fc->fc_addrlevel = r->r[3];
+    fc->fc_errlevel  = r->r[4];
+    fc->fc_pwptr     = r->r[5];
+    fc->fc_handler   = (void (*)())r->r[6];
+
+    /* Chain this structure onto the list */
+    fc->fc_next = *fcrptr;
+    *fcrptr = fc;
+
+    return 0;
+}
+
+/**************************************************************/
+/* chain_release()                                            */
+/*                                                            */
+/* Release a filter on a filter level that can chain multiple */
+/* frame types.                                               */
+/*                                                            */
+/* Parameters: Pointer to the Filter SWI register block;      */
+/*                                                            */
+/*             Pointer to the relevant device structure;      */
+/*                                                            */
+/*             Pointer to where the pointer to the filter     */
+/*             chain is stored.                               */
+/*                                                            */
+/* Returns:    BSD error number.                              */
+/**************************************************************/
+
+static int chain_release(_kernel_swi_regs * r, device_t dev, FilterChainRef * fcrptr)
+{
+    FilterChainRef fc;
+
+    /* Search down the FilterChain, looking for this frametype */
+    fc = *fcrptr;
+    while (fc && fc->fc_type != GET_FRAMETYPE(r->r[2]))
+    {
+        fcrptr = &fc->fc_next;
+        fc = fc->fc_next;
+    }
+
+    dprintf(("Misc", "%s: r2=%x, fcrptr = %p, fc = %p\n", __func__,
+           r->r[2], fcrptr, fc));
+
+    if (!fc)
+    {
+        /* Trying to free a non-existent claim */
+        return EINVAL;
+    }
+
+    if (fc->fc_pwptr != r->r[5] || fc->fc_handler != (void (*)())r->r[6])
+    {
+        /* Trying to release somebody else's claim */
+        return EPERM;
+    }
+
+    dprintf(("Misc", "%s: Releasing claim on frame type %x (*fcrptr = %p)\n", __func__,
+           GET_FRAMETYPE(r->r[2]), *fcrptr));
+
+    /* OK, this is a legitimate free, do it */
+    *fcrptr = fc->fc_next;
+    send_frametypefree(dev, r->r[2], &(fc->fc_filter));
+    free(fc);
+
+    return 0;
+}
+
+/**************************************************************/
+/* chain_release_module()                                     */
+/*                                                            */
+/* Release all filters on a filter level that can chain       */
+/* multiple frame types that belong to a protocol module with */
+/* a given private word pointer.                              */
+/*                                                            */
+/* Parameters: Pointer to the relevant device structure;      */
+/*                                                            */
+/*             Private word pointer for the relevant protocol */
+/*             module.                                        */
+/*                                                            */
+/*             Frame level being released;                    */
+/*                                                            */
+/*             Pointer to where the pointer to the filter     */
+/*             chain is stored.                               */
+/**************************************************************/
+
+static void chain_release_module(device_t dev, uint32_t pwp, uint32_t level,
+                                 FilterChainRef * fcrptr)
+{
+    FilterChainRef fc = *fcrptr;
+    uint32_t       ftype = 0;
+
+    SET_FRAMELEVEL(ftype, level);
+
+    while (fc)
+    {
+        if (fc->fc_pwptr == pwp)
+        {
+            /* Unchain this entry, send service call indicating it is free, */
+            /* then free it.                                                */
+            *fcrptr = fc->fc_next;
+            SET_FRAMETYPE(ftype, fc->fc_type);
+            send_frametypefree(dev, ftype, &(fc->fc_filter));
+            free(fc);
+        }
+        else
+        {
+            /* Move previous link pointer */
+            fcrptr = &fc->fc_next;
+        }
+        fc = *fcrptr;
+    }
+}
+
+/**************************************************************/
+/* send_frametypefree()                                       */
+/*                                                            */
+/* Raise a Service Call to let protocol modules know that a   */
+/* given frame type has been freed.                           */
+/*                                                            */
+/* Parameters: Pointer to the relevant device structure;      */
+/*                                                            */
+/*             Frame type being freed;                        */
+/*                                                            */
+/*             Pointer to the filter structure for the filter */
+/*             being freed.                                   */
+/**************************************************************/
+
+static void send_frametypefree(device_t dev, uint32_t type, FilterSingleRef fs)
+{
+    _swix(OS_ServiceCall,
+          _INR(0,4),
+
+          &dev->dib,
+          Service_DCIFrameTypeFree,
+          type,
+          fs->fs_addrlevel,
+          fs->fs_errlevel);
+}

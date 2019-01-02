@@ -1,0 +1,103 @@
+; Copyright 2003 Tematic Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:Machine.<Machine>
+
+        GET     Hdr:OSEntries
+
+        GET     hdr.80321
+        GET     hdr.StaticWS
+
+        AREA    |Asm$$Code|, CODE, READONLY, PIC
+
+        EXPORT  MSI_Init
+        EXPORT  HAL_PCIMSIFeatures
+        EXPORT  HAL_PCIMSIGetNextMessage
+        EXPORT  pci_msi_addr
+
+        IMPORT  vtophys
+
+MU_QueueSize    *       16*1024
+
+; Note that we don't program up the other 3 queues - any reads to the
+; Inbound Queue Port, or accesses to the Outbound Queue Port could be fatal.
+
+MSI_Init
+        Push    "lr"
+        LDR     a3, NCNBWorkspace
+        ADD     a1, a3, #NCNB_MUQueue
+        BL      vtophys                 ; get physical address of queue area
+        LDR     a4, PMMR_Address
+        MOV     a2, a1, LSR #20
+        MOV     a2, a2, LSL #20
+        STR     a2, [a4, #MU_QBAR]      ; top 12 bits into QBAR
+        STR     a1, [a4, #MU_IPHPR]     ; rest into 20-bit tail+head ptrs
+        STR     a1, [a4, #MU_IPTPR]
+        MOV     a1, #1:SHL:4            ; clear the interrupt (to indicate
+        STR     a1, [a4, #MU_IISR]      ; empty, not full)
+        LDR     a1, [a4, #MU_IIMR]      ; enable the interrupt
+        ORR     a1, a1, #1:SHL:4
+        STR     a1, [a4, #MU_IIMR]
+        MOV     a1, #2_00001:SHL:1 + 1
+        STR     a1, [a4, #MU_MUCR]      ; enable the circular queues
+
+        ; Now activate 80321's BAR 0 to allow devices to access queue ports
+        LDR     a3, NCNBWorkspace
+        ADD     a1, a3, #NCNB_MUArea
+        BL      vtophys                 ; get physical address of MU area
+        LDR     a4, PMMR_Address        ; map it in as 4K at PCI address
+        LDR     a2, =&FFFFF000          ; &80000000
+        STR     a2, [a4, #ATU_IALR0]
+        STR     a1, [a4, #ATU_IATVR0]
+        MOV     a1, #&80000000
+        STR     a1, [a4, #ATU_IABAR0]
+        Pull    "pc"
+
+HAL_PCIMSIFeatures
+        MOV     pc,lr
+
+HAL_PCIMSIGetNextMessage
+        LDR     a4, PMMR_Address
+        LDR     a3, [a4, #MU_IPHPR]     ; a3 = head ptr
+        LDR     a2, [a4, #MU_IPTPR]     ; a2 = tail ptr
+        LDR     ip, [a4, #MU_IISR]
+        TEQ     a2, a3                  ; if head ptr = tail ptr AND
+        TSTEQ   ip, #1:SHL:4            ; IPQ interrupt is clear, then
+        MOVEQ   a1, #-1                 ; the queue is empty
+        MOVEQ   pc, lr
+        LDR     ip, NCNBWorkspace       ; need to convert physical
+        ADD     ip, ip, #NCNB_MUQueue   ; tail address to logical
+        ASSERT  MU_QueueSize = 1:SHL:14
+        MOV     a1, a2, LSL #18         ; a1 = bottom 14 bits of ptr
+        LDR     a1, [ip, a1, LSR #18]   ; load from logical address
+        ADD     a2, a2, #4
+        EOR     ip, a2, a3              ; did we cross a queue size boundary?
+        TST     ip, #MU_QueueSize
+        SUBNE   a2, a2, #MU_QueueSize   ;   then wrap back down
+        TEQ     a2, a3                  ; will tail now = head?
+        MOVEQ   ip, #1:SHL:4            ;   then we've emptied it, so
+        STREQ   ip, [a4, #MU_IISR]      ;   clear the interrupt
+        ; no - only empty if new head = tail = old head????...
+        STR     a2, [a4, #MU_IPTPR]     ; write back the tail
+        MOV     pc, lr
+
+pci_msi_addr
+        MOV     a1, #&80000000
+        ADD     a1, a1, #MU_IQP - MU_Base
+        MOV     pc, lr
+
+        END

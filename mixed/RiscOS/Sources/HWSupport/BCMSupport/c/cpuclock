@@ -1,0 +1,292 @@
+/*
+ * Copyright (c) 2016, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include "swis.h"
+#include <stddef.h>
+
+#include "Global/HALEntries.h"
+#include "Interface/BCMSupport.h"
+
+#include "DebugLib/DebugLib.h"
+
+#include "cpuclock.h"
+#include "BCMSupportHdr.h"
+
+myclkdev_t myclkdev =
+{
+	.dev.dev.dev.dev.type = HALDeviceType_SysPeri + HALDeviceSysPeri_CPUClk,
+	.dev.dev.dev.dev.id = HALDeviceID_CPUClk_BCM283x,
+	.dev.dev.dev.dev.location = HALDeviceBus_Sys + HALDeviceSysBus_AHB,
+	.dev.dev.dev.dev.version = 2,
+	.dev.dev.dev.dev.description = "BCM283x CPU clock controller",
+	.dev.dev.dev.dev.Activate = cpuclock_asm_Activate,
+	.dev.dev.dev.dev.Deactivate = cpuclock_asm_Deactivate,
+	.dev.dev.dev.dev.Reset = cpuclock_asm_Reset,
+	.dev.dev.dev.dev.Sleep = cpuclock_asm_Sleep,
+	.dev.dev.dev.dev.devicenumber = -1,
+	.dev.dev.dev.NumSpeeds = cpuclock_asm_NumSpeeds,
+	.dev.dev.dev.Info = cpuclock_asm_Info,
+	.dev.dev.dev.Get = cpuclock_asm_Get,
+	.dev.dev.dev.Set = cpuclock_asm_Set,
+	.dev.GetDieTemperature = cpuclock_asm_GetDieTemperature,
+};
+
+static bool init;
+
+static uint32_t speeds[2];
+
+#define CLOCK_CPU 3
+#define CLOCK_SCALE 1000000
+
+#define TEMP_CPU 0 /* ??? */
+
+typedef struct
+{
+	uint32_t bufsize;
+	uint32_t code;
+} bufheader;
+
+typedef struct
+{
+	uint32_t tag;
+	uint32_t bufsize;
+	uint32_t valsize;
+} tagheader;
+
+void cpuclock_init(void)
+{
+	/* Read min, max CPU speeds */
+	struct {
+		bufheader hdr;
+		struct {
+			tagheader tag;
+			uint32_t data[2];
+		} min, max;
+		uint32_t end;
+	} block = {
+		.hdr.bufsize = sizeof(block),
+		.hdr.code = 0,
+		.min.tag.tag = ARM2VC_Tag_GetMinClockRate,
+		.min.tag.bufsize = 8,
+		.min.tag.valsize = 4,
+		.min.data[0] = CLOCK_CPU, 
+		.max.tag.tag = ARM2VC_Tag_GetMaxClockRate,
+		.max.tag.bufsize = 8,
+		.max.tag.valsize = 4,
+		.max.data[0] = CLOCK_CPU,
+		.end = ARM2VC_Tag_End,
+	};
+	if (_swix(BCMSupport_SendTempPropertyBuffer,_INR(0,2),&block,&block,0))
+	{
+		return;
+	}
+	if ((block.hdr.code != 0x80000000) || (block.min.tag.valsize < 0x80000008) || (block.max.tag.valsize < 0x80000008))
+	{
+		dprintf(("clk","Failed getting clock speeds\n"));
+		return;
+	}
+	speeds[0] = block.min.data[1];
+	speeds[1] = block.max.data[1];
+	dprintf(("clk","Min, max clock rates = %u %u\n",speeds[0],speeds[1]));
+
+	/* Fill in the relocation offsets */
+	uint32_t *reloc = (uint32_t *) (_kernel_current_stack_chunk() + 1);
+	myclkdev.reloc[0] = reloc[0];
+	myclkdev.reloc[1] = reloc[1];
+
+	/* Register device */
+	init = !_swix(OS_Hardware,_IN(0)|_IN(8),&myclkdev.dev,OSHW_DeviceAdd);
+}
+
+_kernel_oserror *cpuclock_shutdown(void)
+{
+	if (!init)
+	{
+		return NULL;
+	}
+	/* Try to deregister device */
+	_kernel_oserror *e = _swix(OS_Hardware,_IN(0)|_IN(8),&myclkdev.dev,OSHW_DeviceRemove);
+	init = (e != NULL);
+	return e;
+}
+
+bool cpuclock_Activate(struct device *dev)
+{
+	(void) dev;
+	dprintf(("clk","Activate\n"));
+	return true;
+}
+
+void cpuclock_Deactivate(struct device *dev)
+{
+	(void) dev;
+	dprintf(("clk","Deactivate\n"));
+}
+
+void cpuclock_Reset(struct device *dev)
+{
+	(void) dev;
+	dprintf(("clk","Reset\n"));
+}
+
+int32_t cpuclock_Sleep(struct device *dev, int32_t state)
+{
+	(void) dev;
+	(void) state;
+	dprintf(("clk","Sleep\n"));
+	return 0;
+}
+
+uint32_t cpuclock_NumSpeeds(struct cpuclkdevice *cpuclk)
+{
+	(void) cpuclk;
+	dprintf(("clk","NumSpeeds\n"));
+	/* The Raspberry Pi 1 only reports one speed by default.
+	   This makes our speed switching code redundant, but it's still useful to register the HAL device so that we can report the CPU speed and temperature.
+	   If we make sure to report that there's only one speed to the Portable module, it will be smart enough to avoid calling the Set entry when a request is made to switch from fast to slow speeds and vice-versa */
+	return (speeds[0] == speeds[1]) ? 1 : 2;
+}
+
+uint32_t cpuclock_Info(struct cpuclkdevice *cpuclk, uint32_t idx)
+{
+	(void) cpuclk;
+	dprintf(("clk","Info %u\n",idx));
+	return speeds[idx] / CLOCK_SCALE;
+}
+
+uint32_t cpuclock_Get(struct cpuclkdevice *cpuclk)
+{
+	(void) cpuclk;
+	dprintf(("clk","Get\n"));
+	/* Avoid getting confused if only one speed is supported but the current speed doesn't match it for some reason */
+	if (speeds[0] == speeds[1])
+	{
+		return 0;
+	}
+	struct {
+		bufheader hdr;
+		tagheader tag;
+		uint32_t data[2];
+		uint32_t end;
+	} block = {
+		.hdr.bufsize = sizeof(block),
+		.hdr.code = 0,
+		.tag.tag = ARM2VC_Tag_GetClockRate,
+		.tag.bufsize = 8,
+		.tag.valsize = 4,
+		.data[0] = CLOCK_CPU,
+		.end = ARM2VC_Tag_End,
+	};
+	/* Enable IRQs for slow mailbox op */
+	int irqs = _kernel_irqs_disabled();
+	_kernel_irqs_on();
+	uint32_t ret = 0;
+	if (!_swix(BCMSupport_SendTempPropertyBuffer,_INR(0,2),&block,&block,0))
+	{
+		ret = (block.data[1] > speeds[0]) ? 1 : 0;
+	}
+	if (irqs)
+	{
+		_kernel_irqs_off();
+	}
+	dprintf(("clk","-> %u\n",ret));
+	return ret;
+}
+
+int cpuclock_Set(struct cpuclkdevice *cpuclk, uint32_t idx)
+{
+	(void) cpuclk;
+	dprintf(("clk","Set %u\n",idx));
+	struct {
+		bufheader hdr;
+		tagheader tag;
+		uint32_t data[3];
+		uint32_t end;
+	} block = {
+		.hdr.bufsize = sizeof(block),
+		.hdr.code = 0,
+		.tag.tag = ARM2VC_Tag_SetClockRate,
+		.tag.bufsize = 12,
+		.tag.valsize = 12,
+		.data[0] = CLOCK_CPU,
+		.data[1] = speeds[idx],
+		.data[2] = 0,
+		.end = ARM2VC_Tag_End,
+	};
+	/* Ensure IRQs for slow mailbox op */
+	int irqs = _kernel_irqs_disabled();
+	_kernel_irqs_on();
+	int ret = -1;
+	if (!_swix(BCMSupport_SendTempPropertyBuffer,_INR(0,2),&block,&block,0))
+	{
+		ret = (block.hdr.code == 0x80000000) && (block.tag.valsize >= 0x80000008);
+	}
+	if (irqs)
+	{
+		_kernel_irqs_off();
+	}
+	dprintf(("clk","-> %d\n",ret));
+	return ret;
+}
+
+unsigned int cpuclock_GetDieTemperature(struct cpuclkdevice *cpuclk)
+{
+	(void) cpuclk;
+	dprintf(("clk","GetDieTemperature\n"));
+	struct {
+		bufheader hdr;
+		tagheader tag;
+		uint32_t data[2];
+		uint32_t end;
+	} block = {
+		.hdr.bufsize = sizeof(block),
+		.hdr.code = 0,
+		.tag.tag = ARM2VC_Tag_GetTemperature,
+		.tag.bufsize = 8,
+		.tag.valsize = 4,
+		.data[0] = TEMP_CPU,
+		.end = ARM2VC_Tag_End,
+	};
+	/* Ensure IRQs for slow mailbox op */
+	int irqs = _kernel_irqs_disabled();
+	_kernel_irqs_on();
+	unsigned int ret = 0;
+	if (!_swix(BCMSupport_SendTempPropertyBuffer,_INR(0,2),&block,&block,0))
+	{
+		if ((block.hdr.code == 0x80000000) && (block.tag.valsize >= 0x80000008))
+		{
+			/* Convert from thousands of a degree C to tenths of a degree K */
+			ret = (block.data[1] + 273150) / 100;
+		}
+	}
+	if (irqs)
+	{
+		_kernel_irqs_off();
+	}
+	dprintf(("clk","-> %u\n",ret));
+	return ret;
+}

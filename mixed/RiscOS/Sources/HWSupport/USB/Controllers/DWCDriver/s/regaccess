@@ -1,0 +1,187 @@
+; 
+; Copyright (c) 2012, RISC OS Open Ltd
+; All rights reserved.
+; 
+; Redistribution and use in source and binary forms, with or without
+; modification, are permitted provided that the following conditions are met: 
+;     * Redistributions of source code must retain the above copyright
+;       notice, this list of conditions and the following disclaimer.
+;     * Redistributions in binary form must reproduce the above copyright
+;       notice, this list of conditions and the following disclaimer in the
+;       documentation and/or other materials provided with the distribution.
+;     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+;       may be used to endorse or promote products derived from this software
+;       without specific prior written permission.
+; 
+; THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+; AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+; IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+; ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+; LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+; CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+; SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+; INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+; CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+; ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+; POSSIBILITY OF SUCH DAMAGE.
+; 
+
+        GET     Hdr:ListOpts
+        GET     Hdr:CPU.Arch
+        GET     Hdr:CPU.Generic32
+        GET     Hdr:Macros
+        GET     Hdr:System
+
+        AREA    |C$$code|, CODE, READONLY
+
+        EXPORT  DWC_READ_REG32
+        EXPORT  DWC_READ_REG64
+        EXPORT  DWC_WRITE_REG32
+        EXPORT  DWC_WRITE_REG64
+        EXPORT  DWC_MODIFY_REG32
+
+        EXPORT  mb
+        EXPORT  local_fiq_disable
+        EXPORT  local_fiq_enable
+        EXPORT  |_local_irq_save|
+        EXPORT  local_irq_restore
+
+        EXPORT  install_fiq
+        EXPORT  halcall
+
+        MACRO
+        myDSB
+     [ NoARMv6
+        ! 1, "Don't know what to do on pre-ARMv6!"
+     |
+      [ NoARMv7
+        ; pre-ARMv7, use legacy MCR op
+        MCR     p15,0,a1,c7,c10,4
+      |
+        ; ARMv7+, use DSB instruction
+        DSB
+      ]
+     ]
+        MEND
+        
+; uint32_t DWC_READ_REG32(uint32_t volatile *reg)
+DWC_READ_REG32
+        LDR     a1, [a1]
+        myDSB
+        MOV     pc, lr
+        
+; uint64_t DWC_READ_REG64(uint64_t volatile *reg)
+DWC_READ_REG64
+        LDMIA   a1, {a1-a2}
+        myDSB
+        MOV     pc, lr
+
+; void DWC_WRITE_REG32(uint32_t volatile *reg, uint32_t value)
+DWC_WRITE_REG32
+        myDSB
+        STR     a2, [a1]
+        MOV     pc, lr
+
+; void DWC_WRITE_REG64(uint64_t volatile *reg, uint64_t value)
+DWC_WRITE_REG64
+        myDSB
+        STMIA   a1, {a2-a3}
+        MOV     pc, lr
+
+; void DWC_MODIFY_REG32(uint32_t volatile *reg, uint32_t clear_mask, uint32_t set_mask)
+DWC_MODIFY_REG32
+        MRS     ip, CPSR
+        CPSID   if
+        LDR     a4, [a1]
+        myDSB
+        BIC     a4, a4, a2
+        ORR     a4, a4, a3
+        STR     a4, [a1]
+        MSR     CPSR_c, ip
+        MOV     pc, lr
+
+; void mb(void)
+mb
+        myDSB
+        MOV     pc, lr
+
+; void local_fiq_disable(void)
+local_fiq_disable
+        CPSID   f
+        MOV     pc, lr
+
+; void local_fiq_enable(void)
+local_fiq_enable
+        CPSIE   f
+        MOV     pc, lr
+
+; int _local_irq_save(void)
+|_local_irq_save|
+        MRS     a1, CPSR
+        CPSID   i
+        MOV     pc, lr
+
+; void local_irq_restore(int)
+; Restores both the IRQ and FIQ state
+local_irq_restore
+        MSR     CPSR_c, a1
+        MOV     pc, lr 
+
+; void install_fiq(uint32_t *stack,uint32_t stacksize,void *param1,int param2,void *func)
+; Install our FIQ handler on the FIQ vector
+install_fiq     ROUT
+        STMFD   sp!, {a1-a2,v1-v3,lr}
+        MOV     v1, a3
+        MOV     v2, a4
+        LDR     v3, [sp, #6*4]
+        MOV     a1, #0
+        SWI     XOS_PlatformFeatures
+        TST     a1, #1<<20
+        LDRNE   lr, =&FFFF001C
+        MOVEQ   lr, #&1C
+        ADR     a1, FIQcode
+        ADR     a2, FIQcode_end
+        MOV     a3, lr
+10
+        LDR     a4, [a1], #4
+        STR     a4, [a3], #4
+        CMP     a1, a2
+        BNE     %BT10
+        MOV     a1, #1
+        MOV     a2, lr
+        SWI     XOS_SynchroniseCodeAreas
+        ; Set up the C relocation offsets in the FIQ stack
+        LDMIA   sp, {a1-a2}
+        SUB     a3, sl, #540
+        LDMIA   a3, {a3-a4}
+        STMIA   a1, {a3-a4}
+        ; Set up the FIQ mode registers
+        CPS     #FIQ32_mode
+        ADD     sp, a1, a2
+        ADD     sl, a1, #540
+        MOV     fp, #0
+        MOV     v5, v3 ; i.e. r8
+        MOV     v6, v1
+        MOV     ip, v2
+        CPS     #SVC32_mode
+        LDMFD   sp!, {a1-a2,v1-v3,pc}
+
+FIQcode
+        SUB     lr, lr, #4
+        STMFD   sp!, {a1-a4,ip,lr}
+        MOV     a1, v6
+        MOV     a2, ip
+        myDSB
+        BLX     v5
+        CLREX
+        LDMFD   sp!, {a1-a4,ip,pc}^
+FIQcode_end
+
+; int halcall(int arg,void *func,void *sb)
+halcall
+        STMFD   sp!, {r9,lr}
+        MOV     r9, r2
+        BLX     r1
+        LDMFD   sp!, {r9,pc}
+        
+        END

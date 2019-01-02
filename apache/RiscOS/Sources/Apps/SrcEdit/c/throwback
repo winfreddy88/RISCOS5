@@ -1,0 +1,1290 @@
+/* Copyright 2007 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/* Title:   throwback.c
+ * Purpose: deal with error 'throwback' from tools
+ * Author:  IDJ
+ * History: 07-Mar-90: IDJ: created
+ *          08-Mar-90: IDJ: added msg-passing handler
+ *          09-Mar-90: IDJ: added throwback__pane_open
+ *          09-Mar-90: IDJ: started work on pane handler
+ *          09-Mar-90: IDJ: changed error list to array for redraw speed
+ *          11-Mar-90: IDJ: made throwback__textopen check that
+ *                          multiedit_open_handler won't warn about multiple
+ *                          edits
+ *          11-Mar-90: IDJ: added list of files which may have markers in
+ *                          them (wot a mess)
+ *          11-Mar-90: IDJ: finished throwback__textopen (I hope)
+ *          16-Mar-90: IDJ: **** radical new change to throwback display ******
+ *                          major changes to data structures
+ *          18-Mar-90: IDJ: added redraw code (tried to get it efficient!)
+ *          18-Mar-90: IDJ: added removal on right click, open on double left click
+ *          20-Mar-90: IDJ: added marker code for keeping place in text file despite
+ *                          user edits
+ *          21-Mar-90: IDJ: fixed use of txt_DISPLAY to stop marker placing being
+ *                          visible!
+ *          21-Mar-90: IDJ: tried to solve problem of which text we are talking
+ *                          about when mulitple copies opened/closed with multiple
+ *                          throwbacks.... etc.
+ *                          There are the following cases:
+ *                             file requested from throwback:
+ *                                  if already 'marked' copy exists bring to front
+ *                                  else if 'nonmarked' copy exists mark it
+ *                                  else load it and mark it
+ *                             file is closed:
+ *                                  delete our markers for it
+ *                             throwback session is closed:
+ *                                  remove markers from all texts for this session
+ *          21-Mar-90: IDJ: make requested file grab the caret
+ *          21-Mar-90: IDJ: made processingfile/errorin entries double size
+ *          22-Mar-90: IDJ: improvements to redraw when new msgs arrive
+ *          22-Mar-90: IDJ: free template space, when disposing session
+ *          23-Mar-90: IDJ: added scrolling code
+ *          02-Apr-90: IDJ: fixed bug in throwback__txt_open to do with txtedit_states
+ *                          and filenames (note it is v. fiddly, ensuring that we are
+ *                          referring to the correct edit state for a given throwback
+ *                          sesh)
+ *
+ *          02-Jul-90: IDJ: change to msg-passing protocol for throwback id's
+ *          23-Jul-90: IDJ: fixed 'orrible malloc/strcpy bug in throwback__add_to_errorfiles
+ *                          stooped throwback window popping back to top
+ *          29-Nov-90: IDJ: big bug fix to redraw & set extent problems
+ *                          This code needs reviewing - much was written just after
+ *                          having my wisdom teeth out, and it shows!
+ *          15-Jan-91: IDJ: yet another bug fix on redraw of selection
+ *          22-Jan-91: IDJ: fixed bug re: removing event handler for closed throwback
+ *                          windows (I hope)
+ *          08-Feb-91: IDJ: experiment with "informational" throwback as well as
+ *                          error throwback (for use by find).
+ *          14-Feb-91: IDJ: fixed bugs re: memory leakage in throwback
+ *          12-Mar-91: IDJ: attempt to fix throwback bug when file contains no
+ *                          terminating \n (allocate nlines+1 marker array)
+ *          13-Mar-91: IDJ: added multiple-line throwback support
+ *          14-Mar-91: IDJ: fixed two throwback bugs:
+ *                             - remove txt markers in close_handler
+ *                             - check line no. not above nmarkers because
+ *                               crap C compiler sometimes gets it wrong!
+ *          15-Mar-91: IDJ: use msgs.h
+ *          27-Mar-91: IDJ: fixed bug when removing last throwback msg.
+ *          04-Apr-91: IDJ: improved behaviour when out of memory and too many windows
+ *          16-Apr-91: IDJ: improved production of banners for new errors in file
+ *
+ *          Re-release
+ *          13-Nov-91: IDJ: attempt to improve out of memory handling (DDE-0732)
+ *          14-Nov-91: IDJ: make filename comparison case-insensitive (DDE-0855)
+ *          15-Nov-91: IDJ: hourglass on close of throwback (DDE-0821)
+ *
+ */
+
+#include <string.h>
+#include <stdlib.h>
+#include "swis.h"
+#include <stdio.h>
+
+#include "txt.h"
+#include "txtedit.h"
+#include "txtscrap.h"
+#include "bool.h"
+#include "wimp.h"
+#include "wimpt.h"
+#include "werr.h"
+#include "dbox.h"
+#include "win.h"
+#include "template.h"
+#include "visdelay.h"
+#include "bbc.h"
+#include "msgs.h"
+
+#include "slist.h"
+#include "multiedit.h"
+#include "DDEswis.h"
+#include "utils.h"
+#include "throwback.h"
+#include "canonise.h"
+#include "options.h"
+#include "languages.h"
+
+#define max(a,b)  ((a>b)?a:b)
+#define min(a,b)  ((a<b)?a:b)
+#define sysfont_height (wimpt_dy() * bbc_vduvar(bbc_GCharSpaceY))
+#define sysfont_width  (wimpt_dx() * bbc_vduvar(bbc_GCharSpaceX))
+
+#define throwback__width   256
+#define throwback__block  4096
+
+/* line types */
+#define throwback_line_blank              0
+#define throwback_line_processing1        1
+#define throwback_line_processing2        2
+#define throwback_line_errorin1           3
+#define throwback_line_errorin2           4
+#define throwback_line_errormsg           5
+#define throwback_line_error_heading      6
+#define throwback_line_infofor1           7
+#define throwback_line_infofor2           8
+#define throwback_line_infomsg            9
+#define throwback_line_info_heading      10
+#define throwback_line_err_continuation  11
+#define throwback_line_info_continuation 12
+
+/* text colours */
+#define throwback_procfile_forecol                      0x00
+#define throwback_procfile_backcol             (0x80 + 0x07)
+#define throwback_errorin_forecol                       0x00
+#define throwback_errorin_backcol              (0x80 + 0x02)
+#define throwback_errmsg_forecol                        0x07
+#define throwback_errmsg_backcol               (0x80 + 0x00)
+#define throwback_errmsg_hilight_forecol                0x07
+#define throwback_errmsg_hilight_backcol       (0x80 + 0x00)
+#define throwback_error_heading_forecol                 0x0b
+#define throwback_infofor_forecol                       0x00
+#define throwback_infofor_backcol              (0x80 + 0x02)
+#define throwback_infomsg_forecol                       0x07
+#define throwback_infomsg_backcol              (0x80 + 0x00)
+#define throwback_infomsg_hilight_forecol               0x07
+#define throwback_infomsg_hilight_backcol      (0x80 + 0x00)
+#define throwback_info_heading_forecol                  0x0b
+#define throwback_dft_forecol                           0x07
+#define throwback_dft_backcol                  (0x80 + 0x01)
+#define throwback_err_continuation_forecol              0x07
+#define throwback_info_continuation_forecol             0x07
+
+#define throwback_info       0
+#define throwback_error      1
+
+/******* error lists **********/
+
+typedef struct throwback_filename
+{
+   struct throwback_filename *next;
+   char filename[256];
+} throwback_filename;
+
+typedef struct throwback_marker_list
+{
+   char *filename;
+   txtedit_state *s;
+   int nmarkers;
+   txt_marker *chain;
+} throwback_marker_list;
+
+typedef struct throwback_line
+{
+   int type;                       /* error_line ::= blank | procfile | errorfile | msg | heading */
+   char *processing_file;          /* one shared version */
+   char *in_file;                  /* one per error/info msg */
+   int line_number;
+   int severity;
+   char *description;
+} throwback_line;
+
+typedef struct throwback__sessionstr
+{
+   struct throwback__sessionstr *next;
+   int id;
+   wimp_w main_w;
+   template *main_t;
+   throwback_filename *processing_files;
+   throwback_line **line_list;
+   char *current_infile;
+   throwback_marker_list *marker_list;
+   int selected_line;
+   int nlines;
+   int nfiles;
+   int initlines;
+} throwback__sessionstr;
+
+/* list of all current throwback sessions */
+static throwback__sessionstr *throwback__list = 0;
+static throwback__sessionstr *throwback__current = 0;
+
+/* forward decls */
+static BOOL throwback__bkg_events(wimp_eventstr *e, void *handle);
+static void throwback__dispose_session(throwback__sessionstr *session);
+
+static int fileexists(const char* filename,const char* path)
+{
+  int object;
+  return !_swix(OS_File,_INR(0,1)  | _IN(4) | _OUT(0),(path?13:5),filename,path,&object) && object==1;
+}
+
+static int throwback_canonisefilenamebuffer(char* filename, int max_size)
+{
+  if (fileexists(filename,0))
+      return canonise_filenamebuffer(filename,max_size,0);
+  if (fileexists(filename,options_own_search_path()))
+      return canonise_filenamebuffer(filename,max_size,options_own_search_path());
+  if (fileexists(filename,languages_get_current_search_path()))
+      return canonise_filenamebuffer(filename,max_size,languages_get_current_search_path());
+  return 0;
+}
+
+/*********************************** memory allocation ***********************************/
+
+static void *safe_realloc(void *p, unsigned int n)
+{
+   void *res;
+
+   if ((res = realloc(p, n)) == 0)
+   {
+      werr(FALSE, msgs_lookup("throw1:Out of space in throwback session"));
+      throwback__dispose_session(throwback__current);
+      throwback__current = 0;
+   }
+
+   return res;
+}
+
+static void *safe_malloc(unsigned int n)
+{
+   void *res;
+
+   if ((res = malloc(n)) == 0)
+   {
+      werr(FALSE, msgs_lookup("throw1:Out of space in throwback session"));
+      throwback__dispose_session(throwback__current);
+      throwback__current = 0;
+   }
+
+   return res;
+}
+
+static char *stralloc(char **dst, char *src)
+{
+   if ((*dst = safe_malloc(strlen(src)+1)) != 0)
+        strcpy(*dst, src);
+
+   return *dst;
+}
+
+/************************************ txt handling ***************************************/
+
+static void throwback__txt_poptotop(wimp_w w)
+{
+  wimp_wstate s;
+  wimp_get_wind_state(w, &s);
+  s.o.behind = -1;
+  wimp_sendwmessage(wimp_EOPEN, (wimp_msgstr*) &s.o, w, -1);
+}
+
+
+static BOOL throwback__txt_downaline(txt t)
+{
+   /* move dot down one line, and returns true if end-of-buffer reached */
+   txt_index at = txt_dot(t);
+
+   if (at == txt_size(t)) return TRUE;
+
+   while (at < txt_size(t) && (txt_charat(t, at) != '\n'))
+      at++;
+
+   at++;
+   if (at >= txt_size(t)) return TRUE;
+   else {txt_setdot(t, at); return FALSE;}
+}
+
+
+static void throwback__txt_open(throwback__sessionstr *session)
+{
+   txtedit_state *s = 0;
+   txt t;
+   txt_index size, at, eol;
+   char *filename;
+   int line_number;
+   throwback_marker_list *m;
+   int nlines = 0;
+
+   filename = session->line_list[session->selected_line]->in_file;
+   line_number = session->line_list[session->selected_line]->line_number;
+
+   /* search for this text */
+   /* look in our own list first! */
+   m = session->marker_list;
+   while (m < &session->marker_list[session->nfiles])
+   {
+      if (!cistrcmp(m->filename, filename))
+      {
+         if (m->s != 0)
+            s = m->s;
+         break;
+      }
+      m++;
+   }
+
+   if (m >= &session->marker_list[session->nfiles])
+   {
+      werr(FALSE, msgs_lookup("throw2:Internal error: file not found in marker chain"));
+      return;
+   }
+
+   /* now try in the library's list */
+   if (s == 0)
+   {   s = txtedit_getstates();
+      while (s != 0)
+      {
+         if (!cistrcmp(s->filename, filename)) break;
+         s = s->next;
+      }
+   }
+
+   /* if not found load it */
+   if (s == 0)
+      if ((s = txtedit_new(filename, 0xfff)) == 0)
+          return;
+
+   t = s->t;
+   size = txt_size(t);
+
+   /* place markers at every line of text if not already there */
+   /* this is tedious, but the only way of ensuring line numbers
+       are consistent in this volatile environment
+   */
+
+   if (m->chain == 0)
+   {
+      /* need to remember which txt the markers are in (for disposal) */
+      m->s = s;
+
+      /* this takes a looooong time ... */
+      visdelay_begin();
+
+      /* count number of lines (one marker per line) */
+      for (at = 0; at < size; at++)
+          if (txt_charat(t, at) == '\n') nlines++;
+      m->chain = safe_malloc((nlines+1) * sizeof(txt_marker));
+      if (m->chain == 0)
+      {
+         visdelay_end();
+         return;
+      }
+
+      /* put markers in text at bol's */
+      txt_setcharoptions(t, txt_DISPLAY, 0);
+      txt_setdot(t, 0);
+      do
+      {
+         txt_newmarker(t, &m->chain[m->nmarkers]);
+         m->nmarkers++;
+      } while (!throwback__txt_downaline(t));
+
+      /* ... done it */
+      visdelay_end();
+   }
+
+   /* go to given line (linenumber gives index of marker in chain) */
+   if (line_number > m->nmarkers) line_number = m->nmarkers;
+   txt_movedottomarker(t, &m->chain[line_number-1]);
+   txt_setcharoptions(t, txt_DISPLAY, txt_DISPLAY);  /* in case turned off above */
+   txt_setcharoptions(t, txt_CARET, txt_CARET);
+   throwback__txt_poptotop(txt_syshandle(t));
+
+   /* make line the selection */
+   eol = txt_dot(t);
+   while (eol < size && (txt_charat(t, eol) != '\n'))
+      eol++;
+   txtscrap_setselect(t, txt_dot(t), eol);
+}
+
+
+
+/********************************** throwback window handling *****************************/
+
+static void throwback__invalidate_line(int linenum, wimp_w w)
+{
+   wimp_redrawstr r;
+   wimp_wstate ws;
+
+   wimpt_noerr(wimp_get_wind_state(w, &ws));
+   r.w = w;
+   r.box.x0 = ws.o.x;
+   r.box.x1 = ws.o.x + ws.o.box.x1 - ws.o.box.x0;
+   r.box.y1 = - (linenum * sysfont_height) + wimpt_dy();
+   r.box.y0 = - (linenum * sysfont_height) - sysfont_height - wimpt_dy();
+   wimpt_noerr(wimp_force_redraw(&r));
+}
+
+
+static void throwback__set_extent(throwback__sessionstr *session)
+{
+   wimp_redrawstr r;
+
+   /* --- NB only reset extent if bigger than initial size --- */
+   if (session->nlines > session->initlines)
+   {
+      r.w = session->main_w;
+      r.box.x0 = 0;
+      r.box.y1 = 0;
+      r.box.x1 = throwback__width * sysfont_width - 1;
+      r.box.y0 = - (session->nlines * sysfont_height) + 1;
+      wimpt_noerr(wimp_set_extent(&r));
+   }
+}
+
+
+static void throwback__dispose_session(throwback__sessionstr *session)
+{
+   throwback_filename *df, *df_save;
+   int errcnt;
+   int mcnt;
+
+   if (session == 0) return;
+
+   /* IDJ: 15-Nov-91: hourgalss in case it takes a long time */
+   visdelay_begin();
+
+   /* free space used by processing file list */
+   df = session->processing_files;
+   while (df != 0)
+   {
+      df_save = df->next;
+      free(df);
+      df = df_save;
+   }
+
+   /* free space used for error list */
+   for (errcnt = 0; errcnt < session->nlines; errcnt++)
+   {
+      throwback_line *e = session->line_list[errcnt];
+      if (e->type == throwback_line_errormsg || e->type == throwback_line_infomsg
+          || e->type == throwback_line_err_continuation || e->type == throwback_line_info_continuation)
+      {
+         free(e->description);
+      }
+      else if (e->type == throwback_line_errorin1 || e->type == throwback_line_infofor1)
+           free(e->in_file);
+
+      free(e);
+   }
+   free(session->line_list);
+
+   /* free space used for marker chains */
+   for (mcnt = 0; mcnt < session->nfiles; mcnt++)
+   {  int m;
+      throwback_marker_list *marker = &session->marker_list[mcnt];
+
+      free(marker->filename);
+      for (m = 0; m < marker->nmarkers; m++)
+      {  txt t = marker->s->t;
+         txt_disposemarker(t, &marker->chain[m]);
+      }
+      if (marker->chain) free (marker->chain);
+      marker->s = 0;
+   }
+   if (session->marker_list) free(session->marker_list);
+
+   /* free space used for template copy */
+   free(session->main_t);
+   wimp_delete_wind(session->main_w);
+
+   /* unlink it from the list */
+   throwback__list = slist_remove(throwback__list, session);
+
+   /* free the session */
+   free(session);
+
+   /* ... and finally, remove the unknown event processor */
+   win_remove_unknown_event_processor(throwback__bkg_events, session);
+
+   /* bug fix DDE-0821 */
+   visdelay_end();
+}
+
+
+static void throwback__printtext(char *text, int leftmost, int rightmost)
+{
+   int len = strlen(text);
+   if (len > leftmost)
+   {
+      os_regset r;
+      if (len > rightmost)
+          len = rightmost + 1;
+      r.r[0] = (int)(text + leftmost);
+      r.r[1] = len - leftmost;
+      wimpt_noerr(os_swix(OS_WriteN, &r));
+   }
+}
+
+
+static void throwback__paint_line(char *text, int xtxtat, int ytxtat, int leftmost, int rightmost,
+                                  int forecol, int backcol,
+                                  int xfillfrom, int yfillfrom,
+                                  int xfillto, int yfillto)
+{
+   /* set backgnd */
+   bbc_move(xfillfrom, yfillfrom);
+   wimp_setcolour(backcol);
+   bbc_plot(bbc_RectangleFill+bbc_DrawAbsBack, xfillto, yfillto);
+
+   /* ... and overlay the text */
+   bbc_move(xtxtat, ytxtat);
+   wimp_setcolour(forecol);
+   throwback__printtext(text, leftmost, rightmost);
+
+   /* back to defaults */
+   wimp_setcolour(throwback_dft_forecol);
+   wimp_setcolour(throwback_dft_backcol);
+}
+
+
+static void throwback__refresh(wimp_redrawstr *r, BOOL more, throwback__sessionstr *session)
+{
+   int topspot, leftspot, topline, bottomline, leftmost, rightmost, plotx, ploty, j;
+   int cheight = sysfont_height, cwidth = sysfont_width;
+   char text[throwback__width];
+
+   /* variables are:
+      topspot ---- > topmost point in work area to be redrawn
+      leftspot --- >    "      "    "   "   "    "  "    "
+      topline  --- > index of first line of work area to redraw
+      bottomline - >   "   "  last   "    "   "    "  "    "
+      leftmost --- > index of leftmost character to redraw
+      rightmost -- >   "   "  rightmost   "      "    "
+      plotx ------ > x screen-coord to plot at
+      ploty ------ > y   "      "   "    "   "
+   */
+
+   while (more)
+   {
+      topspot = r->box.y1 - r->g.y1 - r->scy;
+      leftspot = r->scx + r->g.x0 - r->box.x0;
+      topline = topspot/cheight;
+      leftmost = leftspot/cwidth;
+      bottomline = (r->box.y1 - r->g.y0 - r->scy)/cheight;
+      rightmost = (r->scx + r->g.x1 - r->box.x0)/cwidth;
+      plotx = r->g.x0 - (leftspot & (cwidth-1));
+      ploty = r->g.y1 + (topspot & (cheight-1));
+
+      /* now do the redrawing line by line */
+      for (j = topline; j <= bottomline && j < session->nlines; j++)
+      {
+          throwback_line *line = session->line_list[j];
+          throwback_line *lineup = session->line_list[j-1];
+
+          switch(line->type)
+          {
+             case throwback_line_blank:
+               /* do nothing cos it gets cleared to backgnd colour by wimp (I hope) */
+               break;
+
+             case throwback_line_processing1:
+                  strcpy(text, msgs_lookup("throw3: Processing File:  "));
+                  strncat(text, line->processing_file, throwback__width);
+                  throwback__paint_line(text, plotx, ploty-cheight/4, leftmost, rightmost,
+                                        throwback_procfile_forecol, throwback_procfile_backcol,
+                                        plotx, ploty,
+                                        r->g.x1, ploty-cheight);
+                  break;
+
+
+             case throwback_line_processing2:
+                  strcpy(text, msgs_lookup("throw3: Processing File:  "));
+                  strncat(text, lineup->processing_file, throwback__width);
+                  throwback__paint_line(text, plotx, ploty+(3*cheight/4), leftmost, rightmost,
+                                        throwback_procfile_forecol, throwback_procfile_backcol,
+                                        plotx, ploty,
+                                        r->g.x1, ploty-cheight/4);
+                  break;
+
+             case throwback_line_errorin1:
+                  strcpy(text, msgs_lookup("throw4: Errors in:  "));
+                  strncat(text, line->in_file, throwback__width);
+                  throwback__paint_line(text, plotx, ploty-cheight/2, leftmost, rightmost,
+                                        throwback_errorin_forecol, throwback_errorin_backcol,
+                                        plotx, ploty-cheight/4,
+                                        r->g.x1, ploty-cheight);
+                  break;
+
+             case throwback_line_errorin2:
+                  strcpy(text, msgs_lookup("throw4: Errors in:  "));
+                  strncat(text, lineup->in_file, throwback__width);
+                  throwback__paint_line(text, plotx, ploty+cheight/2, leftmost, rightmost,
+                                        throwback_errorin_forecol, throwback_errorin_backcol,
+                                        plotx, ploty,
+                                        r->g.x1, ploty-(3*cheight/4));
+                  break;
+
+             case throwback_line_error_heading:
+                  throwback__paint_line(msgs_lookup("throw5:  Line        Type           Description"), plotx, ploty,
+                                        leftmost, rightmost,
+                                        throwback_error_heading_forecol,
+                                        throwback_dft_backcol,
+                                        plotx, ploty,
+                                        r->g.x1, ploty-cheight);
+                 break;
+
+             case throwback_line_errormsg:
+               /* plot line of text */
+               /* hilight if selected */
+                  sprintf(text, msgs_lookup("throw6:%6d     "), line->line_number);
+                  strcat(text, (line->severity == throwback_err_warning)?msgs_lookup("throw7:   Warning        "):
+                               (line->severity == throwback_err_error)?msgs_lookup("throw8:   Error          "):
+                               msgs_lookup("throw9:   Serious Error  "));
+                  strcat(text, line->description);
+
+                  if (j == session->selected_line)
+                      throwback__paint_line(text, plotx, ploty, leftmost, rightmost,
+                                            throwback_errmsg_hilight_forecol,
+                                            throwback_errmsg_hilight_backcol,
+                                            plotx, ploty,
+                                            r->g.x1, ploty-cheight);
+                  else
+                      throwback__paint_line(text, plotx, ploty, leftmost, rightmost,
+                                            throwback_dft_forecol,
+                                            throwback_dft_backcol,
+                                            plotx, ploty,
+                                            r->g.x1, ploty-cheight);
+                  break;
+
+             case throwback_line_infofor1:
+                  strcpy(text, msgs_lookup("throw10: Information for file:  "));
+                  strncat(text, line->in_file, throwback__width);
+                  throwback__paint_line(text, plotx, ploty-cheight/2, leftmost, rightmost,
+                                        throwback_infofor_forecol, throwback_infofor_backcol,
+                                        plotx, ploty-cheight/4,
+                                        r->g.x1, ploty-cheight);
+                  break;
+
+             case throwback_line_infofor2:
+                  strcpy(text, msgs_lookup("throw10: Information for file:  "));
+                  strncat(text, lineup->in_file, throwback__width);
+                  throwback__paint_line(text, plotx, ploty+cheight/2, leftmost, rightmost,
+                                        throwback_infofor_forecol, throwback_infofor_backcol,
+                                        plotx, ploty,
+                                        r->g.x1, ploty-(3*cheight/4));
+                  break;
+
+             case throwback_line_info_heading:
+                  throwback__paint_line(msgs_lookup("throw11:  Line     Message"), plotx, ploty,
+                                        leftmost, rightmost,
+                                        throwback_info_heading_forecol,
+                                        throwback_dft_backcol,
+                                        plotx, ploty,
+                                        r->g.x1, ploty-cheight);
+                 break;
+
+             case throwback_line_infomsg:
+               /* plot line of text */
+               /* hilight if selected */
+                  sprintf(text, msgs_lookup("throw6:%6d     "), line->line_number);
+                  strcat(text, line->description);
+
+                  if (j == session->selected_line)
+                      throwback__paint_line(text, plotx, ploty, leftmost, rightmost,
+                                            throwback_infomsg_hilight_forecol,
+                                            throwback_infomsg_hilight_backcol,
+                                            plotx, ploty,
+                                            r->g.x1, ploty-cheight);
+                  else
+                      throwback__paint_line(text, plotx, ploty, leftmost, rightmost,
+                                            throwback_dft_forecol,
+                                            throwback_dft_backcol,
+                                            plotx, ploty,
+                                            r->g.x1, ploty-cheight);
+                  break;
+
+             case throwback_line_err_continuation:
+                  sprintf(text, msgs_lookup("throw12:                              %s"), line->description);
+                  throwback__paint_line(text, plotx, ploty,
+                                        leftmost, rightmost,
+                                        throwback_err_continuation_forecol,
+                                        throwback_dft_backcol,
+                                        plotx, ploty,
+                                        r->g.x1, ploty-cheight);
+                  break;
+
+             case throwback_line_info_continuation:
+                  sprintf(text, msgs_lookup("throw13:                   %s"), line->description);
+                  throwback__paint_line(text, plotx, ploty,
+                                        leftmost, rightmost,
+                                        throwback_info_continuation_forecol,
+                                        throwback_dft_backcol,
+                                        plotx, ploty,
+                                        r->g.x1, ploty-cheight);
+                 break;
+
+             default:
+               werr(FALSE, msgs_lookup("throw14:Line of unknown type in redraw"));
+               break;
+          }
+
+          ploty -= cheight;
+      }
+      wimp_get_rectangle(r, &more);
+   }
+}
+
+
+static void throwback__button_click(wimp_eventstr *e, throwback__sessionstr *session)
+{
+   wimp_wstate ws;
+   wimp_redrawstr r;
+   int line;
+
+   /* find error line which click was on */
+   wimpt_noerr(wimp_get_wind_state(e->data.but.m.w, &ws));
+   line = - (e->data.but.m.y + ws.o.y - ws.o.box.y1)/sysfont_height;
+
+   /* danger - it may be off end of array due to blanks at end! */
+   if (line >= session->nlines) return;
+
+   if (session->line_list[line]->type != throwback_line_errormsg &&
+       session->line_list[line]->type != throwback_line_infomsg)
+      return;
+
+   if (e->data.but.m.bbits & wimp_BLEFT)
+   {
+      int old_selection = (session->selected_line==-1)?0:session->selected_line;
+
+      session->selected_line = line;
+
+      /* redraw old selection back to normal */
+      throwback__invalidate_line(old_selection, session->main_w);
+
+      /* redraw new highlighted line */
+      throwback__invalidate_line(session->selected_line, session->main_w);
+
+      /* open the error file */
+      throwback__txt_open(session);
+   }
+   else  /* wimp_BRIGHT | wimp_BCLICKRIGHT */
+   {
+      int i;
+      int lines_removed = 0;
+
+      /* delete the entry */
+      free(session->line_list[line]->description);
+      free(session->line_list[line]);
+      for (i = line; i < session->nlines; i++)
+         session->line_list[i] = session->line_list[i+1];
+      session->nlines--;
+      lines_removed++;
+
+      /* --- now delete any continuation lines --- */
+      while (line < session->nlines &&
+             (session->line_list[line]->type == throwback_line_err_continuation ||
+             session->line_list[line]->type == throwback_line_info_continuation))
+      {
+         free(session->line_list[line]->description);
+         free(session->line_list[line]);
+         for (i = line; i < session->nlines; i++)
+            session->line_list[i] = session->line_list[i+1];
+         session->nlines--;
+         lines_removed++;
+      }
+
+      if (line < session->selected_line) session->selected_line -= lines_removed;
+      else if (line == session->selected_line) session->selected_line = -1;
+
+      /* reset the extent */
+      throwback__set_extent(session);
+      wimpt_noerr(wimp_open_wind(&ws.o));
+
+      /* force a redraw */
+      r.w = e->data.but.m.w;
+      r.box.x0 = ws.o.x;
+      r.box.x1 = ws.o.x + ws.o.box.x1 - ws.o.box.x0;
+      r.box.y1 = ws.o.y;
+      r.box.y0 = r.box.y1 - (ws.o.box.y1 - ws.o.box.y0);
+      wimpt_noerr(wimp_force_redraw(&r));
+   }
+}
+
+
+static void throwback__open(wimp_openstr *o)
+{
+   wimpt_noerr(wimp_open_wind(o));
+}
+
+
+static void throwback__scroll(wimp_openstr *o, int x, int y)
+{
+   int offset;
+
+   if (x & 1)   /* char left or char right */
+   {
+       offset = sysfont_width;
+       if (x < 0) offset = -offset;
+       o->x += offset;
+   }
+   else if (x)   /* page left or page right */
+   {
+       offset = o->box.x1 - o->box.x0;
+       if (x < 0) offset = -offset;
+       o->x += offset;
+   }
+
+   if (y & 1)   /* line up or line down */
+   {
+      if (y < 0)
+          offset = ((o->box.y1 - o->box.y0 - o->y) & (sysfont_height-1)) - sysfont_height;
+      else
+          offset = sysfont_height - (o->y & (sysfont_height-1));
+      o->y += offset;
+   }
+   else if (y)   /* page up or page down */
+   {
+      offset = o->box.y1 - o->box.y0;
+      if (y < 0) offset = -offset;
+      o->y += offset;
+   }
+
+   throwback__open(o);
+}
+
+
+static void throwback__event_handler(wimp_eventstr *e, void *handle)
+{
+   throwback__sessionstr *session = (throwback__sessionstr *) handle;
+
+   switch (e->e)
+   {
+      case wimp_EBUT:
+         if (e->data.but.m.bbits & (wimp_BLEFT|wimp_BRIGHT|wimp_BCLICKRIGHT))
+            throwback__button_click(e, session);
+         break;
+
+      case wimp_ESCROLL:
+         throwback__scroll(&e->data.scroll.o, e->data.scroll.x, e->data.scroll.y);
+         break;
+
+      case wimp_ECLOSE:
+         /* close this window, and remove event handler!!!! */
+         wimpt_noerr(wimp_close_wind(e->data.o.w));
+         win_register_event_handler(e->data.o.w, (win_event_handler)0, 0);
+
+         /* free up space used by this session */
+         throwback__dispose_session(session);
+         break;
+
+      case wimp_EOPEN:
+         throwback__open(&e->data.o);
+         break;
+
+      case wimp_EREDRAW:
+         {
+           wimp_redrawstr r;
+           BOOL more;
+           r.w = e->data.o.w;
+           wimpt_noerr(wimp_redraw_wind(&r, &more));
+           throwback__refresh(&r, more, session);
+         }
+         break;
+
+      default:
+         break;
+   }
+}
+
+
+
+/******************************* message-passing handling ********************************/
+
+
+static throwback_line *throwback__newline(int type, throwback__sessionstr *session)
+{
+   throwback_line *new;
+
+   /* add an error to the error line list */
+   new = safe_malloc(sizeof(throwback_line));
+   if (new) new->type = type;
+   else return 0;
+
+
+   if ((session->nlines+1) % throwback__block == 0)
+      if ((session->line_list = safe_realloc(session->line_list, (session->nlines+1 + throwback__block)*sizeof(throwback_line *))) == 0) return 0;
+   session->nlines++;
+   session->line_list[session->nlines-1] = new;
+   throwback__set_extent(session);
+
+   return new;
+}
+
+
+static void throwback__add_to_errorfiles(throwback__sessionstr *session, char *entry)
+{
+   int i = 0;
+
+   /* add an entry into the list of files which may require markers,
+      if opened from throwback window
+      at the moment we can afford to use realloc here, 'cos it
+      doesn't happen that often
+   */
+   while (i < session->nfiles)
+   {
+      if (!cistrcmp(entry, session->marker_list[i].filename)) return;
+      i++;
+   }
+   session->nfiles++;
+   if ((session->marker_list = safe_realloc(session->marker_list, session->nfiles * sizeof(throwback_marker_list))) == 0) return;
+   if (!stralloc(&session->marker_list[session->nfiles-1].filename, entry)) return;
+   session->marker_list[session->nfiles-1].s = 0;
+   session->marker_list[session->nfiles-1].chain = 0;
+   session->marker_list[session->nfiles-1].nmarkers = 0;
+}
+
+
+static BOOL throwback__msg_processingfile(throwback__sessionstr *session,
+                                          throwback_msgstr *msg)
+{
+   throwback_filename *newfile;
+   throwback_line *newline;
+
+   /* create new processing file entry */
+   newfile = safe_malloc(sizeof(throwback_filename));
+   if (newfile == 0) return TRUE;
+
+   strcpy(newfile->filename, msg->data.processing_file.filename);
+
+   session->processing_files = slist_add(session->processing_files, (void *)newfile);
+
+   /* create new error line for processing file */
+   if ((newline = throwback__newline(throwback_line_processing1, session)) == 0) return TRUE;
+   newline->processing_file = newfile->filename;
+   throwback__invalidate_line(session->nlines-1, session->main_w);
+
+   /* create second half of entry */
+   if (throwback__newline(throwback_line_processing2, session) == 0) return TRUE;
+   throwback__invalidate_line(session->nlines-1, session->main_w);
+
+   /* so that "errors in" or "info for" banner gets drawn */
+   session->current_infile = 0;
+
+   return TRUE;
+}
+
+
+static BOOL throwback__msg_infile(throwback__sessionstr *session,
+                                   throwback_msgstr *msg, int type)
+{
+   throwback_line *newline = 0;
+
+   /* is this a new set of errors ? */
+   if (session->current_infile == 0 || (session->current_infile != 0 && cistrcmp(session->current_infile, msg->data.error_in.filename)))
+   {
+
+      /* --- blank line separator for info throwback --- */
+      if (type == throwback_info)
+         if (throwback__newline(throwback_line_blank, session) == 0) return TRUE;
+
+      /* --- create error_in upper half entry --- */
+      if (type == throwback_error)
+      {
+          if ((newline = throwback__newline(throwback_line_errorin1, session)) == 0) return TRUE;
+      }
+      else if (type == throwback_info)
+          if ((newline = throwback__newline(throwback_line_infofor1, session)) == 0) return TRUE;
+
+      /* --- store filename where error/info occured --- */
+
+      if (newline != 0)
+          if (!stralloc(&newline->in_file, msg->data.error_in.filename)) return TRUE;
+
+      /* --- remember filename for use by subsequent lines --- */
+      session->current_infile = newline->in_file;
+
+      throwback__invalidate_line(session->nlines-1, session->main_w);
+
+      /* --- create the lower half --- */
+      if (type == throwback_error)
+      {
+          if (throwback__newline(throwback_line_errorin2, session) == 0) return TRUE;
+      }
+      else if (type == throwback_info)
+          if (throwback__newline(throwback_line_infofor2, session) == 0) return TRUE;
+      throwback__invalidate_line(session->nlines-1, session->main_w);
+
+      /* --- create heading --- */
+      if (type == throwback_error)
+      {
+          if (throwback__newline(throwback_line_error_heading, session) == 0) return TRUE;
+      }
+      else if (type == throwback_info)
+          if (throwback__newline(throwback_line_info_heading, session) == 0) return TRUE;
+      throwback__invalidate_line(session->nlines-1, session->main_w);
+
+      throwback__add_to_errorfiles(session, newline->in_file);
+   }
+
+   /* create new error entry */
+   newline = 0;
+   if (type == throwback_error)
+   {
+       if ((newline = throwback__newline(throwback_line_errormsg, session)) == 0) return TRUE;
+   }
+   else if (type == throwback_info)
+       if ((newline = throwback__newline(throwback_line_infomsg, session)) == 0) return TRUE;
+
+   if (newline != 0)
+   {
+      /* point to current processing filename */
+      newline->description = 0;
+      newline->processing_file = session->processing_files->filename;
+      /* point to filename where error occurred */
+      newline->in_file = session->current_infile;
+   }
+
+   return TRUE;
+}
+
+
+static BOOL throwback__msg_details(throwback__sessionstr *session,
+                                        throwback_msgstr *msg, int type)
+{
+   char one_description_line[220];
+   char *src, *dst;
+   throwback_line *newline;
+
+   /* --- fill in line number, severity (for errors), description (first line) --- */
+   session->line_list[session->nlines-1]->line_number = msg->data.details.line_number;
+   if (type == throwback_error)
+       session->line_list[session->nlines-1]->severity = msg->data.details.severity;
+   src = msg->data.details.description;
+   dst = one_description_line;
+   while (*src != '\n' && *src != 0) *dst++ = *src++;
+   *dst = 0;
+   if (!stralloc(&session->line_list[session->nlines-1]->description, one_description_line)) return TRUE;
+   throwback__invalidate_line(session->nlines-1, session->main_w);
+
+   /* --- now see if line needs a continuation --- */
+   if (*src == '\n')
+   {
+      while (*src != 0)
+      {
+         src++;
+         dst = one_description_line;
+         while (*src != '\n' && *src != 0)
+         {
+            *dst++ = *src++;
+         }
+         *dst = 0;
+         if (dst == one_description_line) break;
+
+         /* --- allocate a new continuation line --- */
+         if ((newline = throwback__newline((type == throwback_error)?throwback_line_err_continuation:throwback_line_info_continuation, session)) == 0) return TRUE;
+         if (!stralloc(&session->line_list[session->nlines-1]->description, one_description_line)) return TRUE;
+         newline->in_file = session->current_infile;
+         throwback__invalidate_line(session->nlines-1, session->main_w);
+      }
+   }
+
+   return TRUE;
+}
+
+
+static BOOL throwback__bkg_events(wimp_eventstr *e, void *handle)
+{
+   throwback__sessionstr *session = (throwback__sessionstr *)handle;
+   throwback_msgstr *msg = (throwback_msgstr *)&e->data.msg;
+   wimp_t sender = e->data.msg.hdr.task;
+
+   /* handler for all unknown events - only interested in throwback msgs */
+   if (!(e->e == wimp_ESEND || e->e == wimp_ESENDWANTACK))
+      return FALSE;
+   else
+   {
+      switch(msg->hdr.action)
+      {
+         case MSG_Throwback_ProcessingFile:
+           if (session->id != sender)
+               return FALSE;
+           else
+           {
+               throwback__current = session;
+               throwback_canonisefilenamebuffer(msg->data.processing_file.filename,
+                                      sizeof(msg->data.processing_file.filename));
+               return throwback__msg_processingfile(session, msg);
+           }
+           break;
+
+         case MSG_Throwback_ErrorsIn:
+           if (session->id != sender)
+               return FALSE;
+           else
+           {
+               throwback__current = session;
+               throwback_canonisefilenamebuffer(msg->data.error_in.filename,
+                                      sizeof(msg->data.error_in.filename));
+               return throwback__msg_infile(session, msg, throwback_error);
+           }
+           break;
+
+         case MSG_Throwback_ErrorDetails:
+           if (session->id != sender)
+               return FALSE;
+           else
+           {
+               throwback__current = session;
+               return throwback__msg_details(session, msg, throwback_error);
+           }
+           break;
+
+         case MSG_Throwback_InfoForFile:
+           if (session->id != sender)
+               return FALSE;
+           else
+           {
+               throwback__current = session;
+               throwback_canonisefilenamebuffer(msg->data.processing_file.filename,
+                                      sizeof(msg->data.processing_file.filename));
+               return throwback__msg_infile(session, msg, throwback_info);
+           }
+           break;
+
+         case MSG_Throwback_InfoDetails:
+           if (session->id != sender)
+               return FALSE;
+           else
+           {
+               throwback__current = session;
+               return throwback__msg_details(session, msg, throwback_info);
+           }
+           break;
+
+         case MSG_Throwback_End:
+           if (session->id != sender)
+               return FALSE;
+           /* blank line separator */
+           throwback__current = session;
+           if (throwback__newline(throwback_line_blank, session) == 0) return TRUE;
+           return TRUE;
+           break;
+
+         default:
+           return FALSE;
+      }
+   }
+   return FALSE;
+}
+
+
+
+/*************************** exported functions ***************************/
+
+extern void throwback_close_handler(char *filename, txtedit_state *s, void *handle)
+{
+   throwback__sessionstr *session = throwback__list;
+   handle = handle;
+   filename = filename;
+
+   /* for all occurrences of this txt in the marker lists: */
+   /*    dispose of markers, set chain = 0, nmarkers = 0 */
+   /*    set s = 0; */
+
+   /* --- IDJ: 15-Nov-91: hourglass on in case close is very slow --- */
+   /* bug fix DDE-0821 */
+   visdelay_begin();
+
+   while (session != 0)
+   {
+      int mentry;
+      for (mentry = 0; mentry < session->nfiles; mentry++)
+      {
+         throwback_marker_list *m = &session->marker_list[mentry];
+         if (m->s == s)
+         {
+             int n;
+             for (n = 0; n < m->nmarkers; n++)
+                txt_disposemarker(m->s->t, &m->chain[n]);
+             if (m->chain) free(m->chain);
+             m->chain = 0;
+             m->s = 0;
+             m->nmarkers = 0;
+         }
+     }
+     session = session -> next;
+   }
+
+   /* bug fix DDE-0821 */
+   visdelay_end();
+}
+
+extern throwback_session throwback_new_session(int id)
+{
+   throwback__sessionstr *new;
+   throwback__sessionstr *s;
+   wimp_openstr o;
+   wimp_redrawstr r;
+   os_error *err = 0;
+
+   /* first check if we already know about the sending task */
+   s = throwback__list;
+   while (s != 0)
+   {
+      if (s->id == id) return s;
+      s = s->next;
+   }
+
+   if ((new = malloc(sizeof(throwback__sessionstr))) == 0)
+   {
+      werr(FALSE, "throw15:Not enough space to start throwback session");
+      return 0; /* note careful when using this !!!*/
+   }
+   else
+   {
+      /* stick it in the list of them all */
+      throwback__list = slist_add(throwback__list, (void *)new);
+
+      /* initialise */
+      throwback__current = new;
+      new->id = id;
+      new->processing_files = 0;
+      new->current_infile = 0;
+      new->marker_list = 0;
+      new->selected_line = -1;
+      new->nlines = 0;
+      new->nfiles = 0;
+      new->line_list = safe_malloc(throwback__block * sizeof(throwback_line *));
+
+      /* create main window for error display */
+      if ((new->main_t = template_copy(template_find("Errors"))) == 0)
+      {
+          werr(FALSE, "throw16:Not enough space to create errors window");
+          throwback__dispose_session(new);
+          return 0;
+      }
+
+      new->initlines = (new->main_t->window.box.y1 - new->main_t->window.box.y0)/sysfont_height;
+
+      err = wimp_create_wind(&new->main_t->window, &new->main_w);
+      wimpt_complain(err);
+      if (err)
+      {
+         throwback__dispose_session(new);
+         return 0;
+      }
+
+      /*   add event handlers:
+       *
+       *   an unknown event processor to continue msg-passing dialogue
+       *   an event handler for the main tool window
+      */
+      win_add_unknown_event_processor(throwback__bkg_events, (void *)new);
+      win_register_event_handler(new->main_w, throwback__event_handler, (void *)new);
+
+      /* show the throwback window (setting initial extent) */
+      r.w = new->main_w;
+      r.box.x0 = 0;
+      r.box.x1 = new->main_t->window.ex.x1;
+      r.box.y0 = -(new->main_t->window.box.y1 - new->main_t->window.box.y0);
+      r.box.y1 = 0;
+      wimpt_noerr(wimp_set_extent(&r));
+      o.w = new->main_w;
+      o.box = new->main_t->window.box;
+      o.x = new->main_t->window.scx;
+      o.y = new->main_t->window.scy;
+      o.behind = -1;
+      wimpt_noerr(wimp_open_wind(&o));
+   }
+   return (throwback_session)new;
+}

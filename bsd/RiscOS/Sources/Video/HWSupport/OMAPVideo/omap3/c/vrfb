@@ -1,0 +1,492 @@
+/*
+ * Copyright (c) 2017, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include <stdlib.h>
+#include <stdio.h>
+#include "kernel.h"
+#include "swis.h"
+
+#include "vrfb.h"
+#include "regs.h"
+#include "gvoverlay.h"
+#include "buffer.h"
+#include "pmp.h"
+#include "utils.h"
+#include "consts.h"
+#include "utils.h"
+
+#include "Global/OSMem.h"
+#include "Global/OSMisc.h"
+
+#define ERROR_BAD_BANK ((_kernel_oserror*)"\0\0\0\0Bad bank")
+#define ERROR_BAD_DESC ((_kernel_oserror*)"\0\0\0\0Buffer descriptor unacceptable")
+
+typedef struct {
+	uint32_t rotation_window; /* Offset from start of VRFB bank to correct rotation window */
+	uint32_t phys_offset; /* Offset from start of VRFB rotation window to start of image */
+	uint32_t bank_offsets[2]; /* Bank offsets in A & B directions */
+} vrfb_view_t;
+
+typedef struct {
+	vrfb_view_t gpu,os; /* Different buffer views to be used by GPU & OS */
+	uint32_t stride; /* Stride between rows (fixed for all rotations due to VRFB design) */
+	uint32_t buffer_size; /* Buffer size required */
+	uint32_t rot_control; /* SMS_ROT_CONTROLn register setting */
+	uint32_t rot_size; /* SMS_ROT_SIZEn register setting */
+	uint8_t banks[2]; /* Number of banks in A & B directions */
+} vrfb_config_t;
+
+typedef struct {
+	buffer_t base;
+	vrfb_config_t config;
+	pmp_block_t *pmp; /* PMP allocation containing all the buffers */
+	int context; /* VRFB context we've been assigned */
+	uint32_t gpu_pa; /* Physical address of GPU view of first bank, ~0 if none */
+	uint8_t *os_la; /* Virtual address of OS view of first bank */
+} vrfb_buffer_t;
+
+#define VRFB_CACHEABLE
+
+#ifdef VRFB_CACHEABLE
+#define VRFB_MEMORY_FLAGS (OSMemReason_MapIOPermanent+(1<<17)+(memory_access_privilege<<24)+(CP_CB_Writethrough<<10)+(3<<8)) /* Write-through cacheable */
+static void (*clean_invalidate)(int base,int limit);
+#else
+#define VRFB_MEMORY_FLAGS (OSMemReason_MapIOPermanent+(1<<17)+(memory_access_privilege<<24)+(1<<8)) /* Bufferable */
+#endif
+
+static volatile struct sms_regs *sms;
+/* Base physical addresses of each VRFB context "virtual address space" */
+static uint32_t vrfb_context_spaces[12];
+static uint32_t sdram_page_size_log2;
+
+/* We only use one VRFB context per overlay, so we shouldn't need to support more than this number total */
+#define VRFB_NUM_CONTEXTS (GVOVERLAY_MAX)
+
+#define VRFB_ROTATION_SPACING 0x1000000 /* 16MB gap between each rotated view */
+
+static uint32_t free_contexts = (1<<VRFB_NUM_CONTEXTS)-1;
+
+typedef struct {
+	uint32_t buffer_width;
+	uint32_t buffer_height;
+	uint32_t buffer_size;
+} vrfb_buffer_params_t;
+
+static vrfb_buffer_params_t vrfb_get_buffer_params(uint32_t width,uint32_t height,uint32_t PS,uint32_t PW,uint32_t PH)
+{
+	vrfb_buffer_params_t p;
+	/* Round the width up to a whole number of tiles */
+	uint32_t linear_stride = ((width<<PS) + (1<<PW)-1) & ~((1<<PW)-1);
+	p.buffer_width = linear_stride>>PS;
+	/* Round the height up to a whole number of tiles */
+	p.buffer_height = (height + (1<<PH)-1) & ~((1<<PH)-1);
+	/* Calculate RAM requirements */
+	p.buffer_size = linear_stride*p.buffer_height;
+	return p;
+}
+
+static bool vrfb_get_config(const buffer_desc_t *desc,vrfb_config_t *ret)
+{
+	/* To reduce the number of VRFB contexts we need, pack all the screen banks into one context by tiling them side-by-side
+	   This also has the benefit of reducing logical address space wastage (make better use of the 16MB window we map in) */
+	uint32_t maxbanks[2];
+	maxbanks[0] = 2048/desc->width;
+	maxbanks[1] = 2048/desc->height;
+	if (maxbanks[0] >= 256)
+	{
+		maxbanks[0] = 255;
+	}
+	if (maxbanks[1] >= 256)
+	{
+		maxbanks[1] = 255;
+	}
+	if (maxbanks[0]*maxbanks[1] <= desc->maxbank)
+	{
+		return false;
+	}
+	uint32_t width = desc->width;
+	uint32_t height = desc->height;
+
+	/* Rotation angle follows GraphicsV numbering, so:
+	   0 -> no rotation (shouldn't happen)
+	   1 -> 90 right
+	   2 -> 180
+	   3 -> 90 left
+	   Set things up so that the OS accesses the buffer with no rotation, while the GPU uses the rotated version
+	   This is necessary for YUV to operate correctly. It also helps to save on logical address space usage (since we'll only ever need to map in one rotation)
+	 */
+	ret->gpu.rotation_window = desc->rotation*VRFB_ROTATION_SPACING;
+	ret->os.rotation_window = 0;
+	uint32_t sdram_page_size = sdram_page_size_log2;
+	/* Get suitable page size parameters */
+	uint32_t PS,PH,PW;
+	PS = log2(pixel_format_bpp[desc->format])-3;
+	/* YUV needs treating as 32bpp */
+	if (buffer_alignment_pixels[desc->format])
+	{
+		PS++;
+		width>>=1; /* This should be guaranteed to be a multiple of two */
+	}
+	if (desc->rotation & 1)
+	{
+		/* 90 degree rotation, aim for something square-ish (more tall than wide, so GPU get better bandwidth) */
+		uint32_t page_pixels = sdram_page_size-PS;
+		PW = ((page_pixels-1)>>1)+PS; /* Page width is in bytes */
+		PH = sdram_page_size-PW; /* Page height is in rows */
+	}
+	else
+	{
+		/* 180 degree rotation, go rectangular */
+		PW = sdram_page_size;
+		PH = 0;
+	}
+	/* Make sure values are within range */
+	while (PW > (SMS_ROT_CONTROL_PW_MASK>>SMS_ROT_CONTROL_PW_SHIFT))
+	{
+		PW--;
+		PH++;
+	}
+	while (PH > (SMS_ROT_CONTROL_PH_MASK>>SMS_ROT_CONTROL_PH_SHIFT))
+	{
+		PH--;
+		PW++;
+	}
+	/* Find the optimal setup for tiling the screen banks */
+	vrfb_buffer_params_t best = {0}; /* Keep norcroft happy */
+	best.buffer_size = ~0;
+	for(int i=1;i<=maxbanks[0];i++)
+	{
+		for(int j=1;j<=maxbanks[1];j++)
+		{
+			if (i*j <= desc->maxbank)
+			{
+				continue;
+			}
+			vrfb_buffer_params_t candidate = vrfb_get_buffer_params(width*i,height*j,PS,PW,PH);
+			if ((candidate.buffer_size < best.buffer_size) /* If it uses less memory */
+			|| ((candidate.buffer_size == best.buffer_size) && (i*j > ret->banks[0]*ret->banks[1]))) /* Or fits more banks in the same space */
+			{
+				/* Then accept it as the new best */
+				best = candidate;
+				ret->banks[0] = i;
+				ret->banks[1] = j;
+			}
+		}
+	}
+	ret->buffer_size = best.buffer_size;
+
+	/* Calculate SMS registers */
+	ret->rot_control = (PS<<SMS_ROT_CONTROL_PS_SHIFT) | (PW<<SMS_ROT_CONTROL_PW_SHIFT) | (PH<<SMS_ROT_CONTROL_PH_SHIFT);
+	ret->rot_size = (best.buffer_width<<SMS_ROT_SIZE_IMAGEWIDTH_SHIFT) | (best.buffer_height<<SMS_ROT_SIZE_IMAGEHEIGHT_SHIFT);
+
+	/* Calculate stride
+	   For each rotation, the VRFB address decoding treats the buffer row stride as being 2048 pixels
+	   This ensures the X & Y coordinates use separate address lines
+	   However when accessing the buffer the coordinates still need to be kept within (0,0)-(buffer_width,buffer_height) */
+	uint32_t vrfb_stride = 2048<<PS;
+	ret->stride = vrfb_stride;
+	/* Calculate inter-bank offsets, and offset to first bank within window */
+	ret->os.phys_offset = 0;
+	ret->os.bank_offsets[0] = width<<PS;
+	ret->os.bank_offsets[1] = height*vrfb_stride;
+	switch(desc->rotation)
+	{
+	case 0:
+		ret->gpu.phys_offset = 0;
+		ret->gpu.bank_offsets[0] = width<<PS;
+		ret->gpu.bank_offsets[1] = height*vrfb_stride;
+		break;
+	case 1:
+		/* Skip padding rows that were inserted on the bottom of the unrotated image
+		   (which will appear on the left edge of this rotated view) */
+		ret->gpu.phys_offset = (best.buffer_height - height)<<PS;
+		ret->gpu.bank_offsets[0] = width*vrfb_stride;
+		ret->gpu.bank_offsets[1] = -height<<PS;
+		break;
+	case 2:
+		/* Skip padding row and columns */
+		ret->gpu.phys_offset = (best.buffer_height - height)*vrfb_stride + ((best.buffer_width - width)<<PS);
+		ret->gpu.bank_offsets[0] = -width<<PS;
+		ret->gpu.bank_offsets[1] = -height*vrfb_stride;
+		break;
+	case 3:
+		/* Skip padding columns that were inserted to the right of the unrotated image
+		   (which will appear on the top edge of this rotated view) */
+		ret->gpu.phys_offset = (best.buffer_width - width)*vrfb_stride;
+		ret->gpu.bank_offsets[0] = -width*vrfb_stride;
+		ret->gpu.bank_offsets[1] = height<<PS;
+		break;
+	}
+	return ret;
+}
+
+static _kernel_oserror *vrfb_program_context(const vrfb_config_t *config,uint32_t pa,int *context)
+{
+	int i = log2(free_contexts);
+	if (i < 0)
+	{
+		return (_kernel_oserror *)"\0\0\0\0No free VRFB contexts";
+	}
+	free_contexts &= ~(1<<i);
+	sms->rot[i].control = config->rot_control;
+	sms->rot[i].size = config->rot_size;
+	sms->rot[i].physical_ba = pa;
+	*context = i;
+	/* Ensure mapping is valid before anything starts using it */
+	dmb();
+	return NULL;
+}
+
+static void vrfb_release_context(const vrfb_config_t *config,int context)
+{
+	(void)config;
+#ifdef VRFB_CACHEABLE
+	/* Areas are write-through cacheable, so no cache clean should be necessary on map out (dmb will make sure any buffered writes are complete) */
+#endif
+	dmb();
+	/* Resetting these to zero probably isn't important? */
+	sms->rot[context].control = 0;
+	sms->rot[context].size = 0;
+	sms->rot[context].physical_ba = 0;
+	free_contexts |= 1<<context;
+}
+
+static bool vrfb_vet(const buffer_desc_t *desc);
+static _kernel_oserror *vrfb_create(const buffer_desc_t *desc,buffer_t **out_buffer);
+static _kernel_oserror *vrfb_destroy(buffer_t *buffer);
+static _kernel_oserror *vrfb_config_gpu(buffer_t *buffer,uint32_t bank,uint32_t *out_pa,uint32_t *out_pa2,uint32_t *out_stride);
+static _kernel_oserror *vrfb_release_gpu(buffer_t *buffer,uint32_t bank);
+static _kernel_oserror *vrfb_config_cpu(buffer_t *buffer,uint32_t bank,void **out_la,void **out_la2,uint32_t *out_stride);
+static _kernel_oserror *vrfb_release_cpu(buffer_t *buffer,uint32_t bank);
+static _kernel_oserror *vrfb_discard(buffer_t *buffer,uint32_t bank);
+#ifdef DEBUGLIB
+static void vrfb_describe(buffer_t *buffer);
+#endif
+
+
+static buffer_if_t vrfb_if = 
+{
+	.vet = vrfb_vet,
+	.create = vrfb_create,
+	.destroy = vrfb_destroy,
+	.config_gpu = vrfb_config_gpu,
+	.release_gpu = vrfb_release_gpu,
+	.config_cpu = vrfb_config_cpu,
+	.release_cpu = vrfb_release_cpu,
+	.discard = vrfb_discard,
+#ifdef DEBUGLIB
+	.describe = vrfb_describe,
+#endif
+};
+
+void vrfb_init(void)
+{
+	/* TODO: Get this from a HAL device or something */
+	_swix(OS_Memory,_INR(0,2)|_OUT(3),13,0x6c000000,4096,&sms);
+	vrfb_context_spaces[0] = 0x70000000;
+	vrfb_context_spaces[1] = 0x74000000;
+	vrfb_context_spaces[2] = 0x78000000;
+	vrfb_context_spaces[3] = 0x7C000000;
+	vrfb_context_spaces[4] = 0xE0000000;
+	vrfb_context_spaces[5] = 0xE4000000;
+	vrfb_context_spaces[6] = 0xE8000000;
+	vrfb_context_spaces[7] = 0xEC000000;
+	vrfb_context_spaces[8] = 0xF0000000;
+	vrfb_context_spaces[9] = 0xF4000000;
+	vrfb_context_spaces[10] = 0xF8000000;
+	vrfb_context_spaces[11] = 0xFC000000;
+	sdram_page_size_log2 = 10; /* TODO: Must be correct for us to get full performance */
+#ifdef VRFB_CACHEABLE
+	/* Get cache clean ARMop */
+	_swix(OS_MMUControl,_IN(0)|_OUT(0),MMUCReason_GetARMop | (ARMop_Cache_CleanInvalidateRange<<8),&clean_invalidate);
+#endif
+	/* Register with the buffer manager */
+	buffer_rotation_if = &vrfb_if;
+}
+
+static bool vrfb_vet(const buffer_desc_t *desc)
+{
+	vrfb_config_t config;
+	return vrfb_get_config(desc,&config);
+}
+
+static _kernel_oserror *vrfb_create(const buffer_desc_t *desc,buffer_t **out_buffer)
+{
+	vrfb_config_t config;
+	if (!vrfb_get_config(desc,&config))
+	{
+		return ERROR_BAD_DESC;
+	}
+	vrfb_buffer_t *b = calloc(1,sizeof(vrfb_buffer_t));
+	if (!b)
+	{
+		return (_kernel_oserror *)"\0\0\0\0No memory";
+	}
+	b->base.iface = &vrfb_if;
+	b->config = config;
+	b->context = -1;
+	b->gpu_pa = ~0;
+	b->os_la = NULL;
+	/* Might as well allocate all the memory now */
+	_kernel_oserror *e = pmp_alloc(b->config.buffer_size,&b->pmp);
+	if (e)
+	{
+		free(b);
+		return e;
+	}
+	*out_buffer =  &b->base;
+	return NULL;
+}
+
+static _kernel_oserror *vrfb_destroy(buffer_t *buffer)
+{
+	vrfb_buffer_t *b = (vrfb_buffer_t *) buffer;
+	if (b->context != -1)
+	{
+		vrfb_release_context(&b->config,b->context);
+		b->context = -1;
+		b->gpu_pa = ~0;
+		b->os_la = NULL;
+	}
+	if (b->pmp)
+	{
+		_kernel_oserror *e = pmp_free(b->pmp);
+		if (e)
+		{
+			return e;
+		}
+		b->pmp = NULL;
+	}
+	free(b);
+	return NULL;
+}
+
+static _kernel_oserror *vrfb_config_gpu(buffer_t *buffer,uint32_t bank,uint32_t *out_pa,uint32_t *out_pa2,uint32_t *out_stride)
+{
+	vrfb_buffer_t *b = (vrfb_buffer_t *) buffer;
+	uint32_t bankvals[2];
+	bankvals[0] = bank % b->config.banks[0];
+	bankvals[1] = bank / b->config.banks[0];
+	if (bankvals[1] >= b->config.banks[1])
+	{
+		return ERROR_BAD_BANK;
+	}
+	if (b->context == -1)
+	{
+		_kernel_oserror *e = vrfb_program_context(&b->config,b->pmp->pa,&b->context);
+		if (e)
+		{
+			return e;
+		}
+		b->gpu_pa = vrfb_context_spaces[b->context] + b->config.gpu.rotation_window + b->config.gpu.phys_offset;
+	}
+	*out_pa = b->gpu_pa + bankvals[0]*b->config.gpu.bank_offsets[0] + bankvals[1]*b->config.gpu.bank_offsets[1];
+	*out_stride = b->config.stride;
+	return NULL;
+}
+
+static _kernel_oserror *vrfb_release_gpu(buffer_t *buffer,uint32_t bank)
+{
+	(void) buffer;
+	(void) bank;
+	/* NOP */
+	return NULL;
+}
+
+static _kernel_oserror *vrfb_config_cpu(buffer_t *buffer,uint32_t bank,void **out_la,void **out_la2,uint32_t *out_stride)
+{
+	vrfb_buffer_t *b = (vrfb_buffer_t *) buffer;
+	uint32_t bankvals[2];
+	bankvals[0] = bank % b->config.banks[0];
+	bankvals[1] = bank / b->config.banks[0];
+	if (bankvals[1] >= b->config.banks[1])
+	{
+		return ERROR_BAD_BANK;
+	}
+	if (b->context == -1)
+	{
+		_kernel_oserror *e = vrfb_program_context(&b->config,b->pmp->pa,&b->context);
+		if (e)
+		{
+			return e;
+		}
+		b->gpu_pa = vrfb_context_spaces[b->context] + b->config.gpu.rotation_window + b->config.gpu.phys_offset;
+	}
+	if (b->os_la == NULL)
+	{
+		/* Map the rotation we care about */
+		uint32_t base;
+		_kernel_oserror *e = _swix(OS_Memory,
+			_INR(0,2)|_OUT(3),
+			VRFB_MEMORY_FLAGS,
+			vrfb_context_spaces[b->context]+b->config.os.rotation_window, /* Start of rotation window */
+			VRFB_ROTATION_SPACING, /* Size of rotation window */
+			&base);
+		if (e)
+		{
+			return e;
+		}
+#ifdef VRFB_CACHEABLE
+		/* In case something else was previously mapped here, clean + invalidate the cache for the region */
+		clean_invalidate(base,base+VRFB_ROTATION_SPACING); /* Just do the whole thing for simplicity */
+#endif
+		b->os_la = ((uint8_t *)base) + b->config.os.phys_offset;
+	}
+	*out_la = b->os_la + bankvals[0]*b->config.os.bank_offsets[0] + bankvals[1]*b->config.os.bank_offsets[1];
+	*out_stride = b->config.stride;
+	return NULL;
+}
+
+static _kernel_oserror *vrfb_release_cpu(buffer_t *buffer,uint32_t bank)
+{
+	(void) buffer;
+	(void) bank;
+	/* NOP */
+	return NULL;
+}
+
+static _kernel_oserror *vrfb_discard(buffer_t *buffer,uint32_t bank)
+{
+	(void) buffer;
+	(void) bank;
+	/* NOP */
+	return NULL;
+}
+
+#ifdef DEBUGLIB
+static void vrfb_describe(buffer_t *buffer)
+{
+	vrfb_buffer_t *b = (vrfb_buffer_t *) buffer;
+	printf(" VRFB buffer:\n");
+	printf("  GPU rotation_window %08x phys_offset %08x bank_offsets %08x %08x\n",b->config.gpu.rotation_window,b->config.gpu.phys_offset,b->config.gpu.bank_offsets[0],b->config.gpu.bank_offsets[1]);
+	printf("   OS rotation_window %08x phys_offset %08x bank_offsets %08x %08x\n",b->config.os.rotation_window,b->config.os.phys_offset,b->config.os.bank_offsets[0],b->config.os.bank_offsets[1]);
+	printf("  stride %08x buffer_size %08x banks %d x %d\n",b->config.stride,b->config.buffer_size,b->config.banks[0],b->config.banks[1]);
+	printf("  rot_control %08x rot_size %08x\n",b->config.rot_control,b->config.rot_size);
+	printf("  buffer PA %08x\n",b->pmp->pa);
+	printf("  context %d gpu_pa %08x os_la %08x\n",b->context,b->gpu_pa,b->os_la);
+}
+#endif

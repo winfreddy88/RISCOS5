@@ -1,0 +1,701 @@
+;
+; Copyright (c) 2012, RISC OS Open Ltd
+; Copyright (c) 2012, Adrian Lees
+; All rights reserved.
+;
+; Redistribution and use in source and binary forms, with or without
+; modification, are permitted provided that the following conditions are met: 
+;     * Redistributions of source code must retain the above copyright
+;       notice, this list of conditions and the following disclaimer.
+;     * Redistributions in binary form must reproduce the above copyright
+;       notice, this list of conditions and the following disclaimer in the
+;       documentation and/or other materials provided with the distribution.
+;     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+;       may be used to endorse or promote products derived from this software
+;       without specific prior written permission.
+; 
+; THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+; AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+; IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+; ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+; LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+; CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+; SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+; INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+; CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+; ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+; POSSIBILITY OF SUCH DAMAGE.
+;
+; With many thanks to Broadcom Europe Ltd for releasing the source code to
+; its Linux drivers, thus making this port possible.
+;
+
+        AREA    |Asm$$Code|, CODE, READONLY, PIC
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:Machine.<Machine>
+        GET     Hdr:ImageSize.<ImageSize>
+
+        GET     Hdr:Proc
+
+        GET     hdr.BCM2835
+        GET     hdr.StaticWS
+        GET     hdr.UART
+
+        EXPORT  HAL_UARTPorts
+        EXPORT  HAL_UARTStartUp
+        EXPORT  HAL_UARTShutdown
+        EXPORT  HAL_UARTFeatures
+        EXPORT  HAL_UARTReceiveByte
+        EXPORT  HAL_UARTTransmitByte
+        EXPORT  HAL_UARTLineStatus
+        EXPORT  HAL_UARTInterruptEnable
+        EXPORT  HAL_UARTRate
+        EXPORT  HAL_UARTFormat
+        EXPORT  HAL_UARTFIFOSize
+        EXPORT  HAL_UARTFIFOClear
+        EXPORT  HAL_UARTFIFOEnable
+        EXPORT  HAL_UARTFIFOThreshold
+        EXPORT  HAL_UARTInterruptID
+        EXPORT  HAL_UARTBreak
+        EXPORT  HAL_UARTModemControl
+        EXPORT  HAL_UARTModemStatus
+        EXPORT  HAL_UARTDevice
+        EXPORT  HAL_UARTDefault
+
+        ; Control support for RTS/CTS. These aren't exported on the model B
+        ; rev 1 PCB, and on future PCBs they're in awkward positions, so I
+        ; doubt anyone makes any serious use of them. Also, this code is
+        ; untested!
+        GBLL    ModemControl
+ModemControl SETL {FALSE}
+
+; Put base address into the indicated register, given port number in a1
+        MACRO
+        BaseAddr $reg
+        LCLS    r
+ [ "$reg" <> ""
+r       SETS    "$reg"
+ |
+r       SETS    "a1"
+ ]
+        LDR     $r, PeriBase
+        ADD     $r, $r, #UART_Base :AND: :NOT: &FFFF
+        ADD     $r, $r, #UART_Base :AND: &FFFF
+        MEND
+
+; Stop the UART and wait for it to become idle
+; Required before modifying UARTIBRD, UARTFBRD, UARTLCRH
+        MACRO
+        StopUART $temp
+        LDR     $temp, [a1,#UARTCR]
+        BIC     $temp, $temp, #CR_UARTEN
+        STR     $temp, [a1,#UARTCR]
+        ; Wait for transmission of current character to finish
+10
+        LDR     $temp, [a1,#UARTFLAG]
+        TST     $temp, #1:SHL:FLAG_BUSY
+        BNE     %BT10
+        MEND
+
+        MACRO
+        StartUART $temp
+        LDR     $temp, [a1,#UARTCR]
+        ORR     $temp, $temp, #CR_UARTEN
+        STR     $temp, [a1,#UARTCR]
+        MEND
+
+; int HAL_UARTPorts(void)
+;
+;   Return number of UART ports
+;
+HAL_UARTPorts
+        MOV     a1, #1                  ; Currently we only support the main UART (PL011-compatible)
+        MOV     pc, lr
+
+; void StartUp(int port)
+;
+HAL_UARTStartUp
+        DataSyncBarrier a2              ; resync before writing peripheral
+        LDR     a2, PeriBase            ; first turn on the serial pins
+        ADD     a3, a2, #GPIO_Base      ; (for setting pins up)
+        LDR     a2, [a3, #GPFSel1]      ;
+        BIC     a2, a2, #8_00770000     ;         
+        ORR     a2, a2, #8_00440000     ; set GPIO 14 + 15 to alt0 (100)
+        STR     a2, [a3, #GPFSel1]      ;        
+        DataSyncBarrier a2              ; resync before writing peripheral
+        BaseAddr
+        StopUART a2
+        LDR     a2, =((UARTCLK*64)/115200)/16
+        AND     a3, a2,#&3F
+        STR     a3, [a1,#UARTFBRD]
+        MOV     a2, a2,LSR #6
+        STR     a2, [a1,#UARTIBRD]
+        MOV     a2, #3<<5
+        ORR     a2, a2,#&10
+        STR     a2, [a1,#UARTLCRH]
+        MOV     a2, #(2:SHL:3)+2        ; Set default FIFO threshold of 1/2
+        STR     a2, [a1,#UARTIFLS]
+        LDR     a2, =CR_RXE+CR_TXE+CR_UARTEN
+        STR     a2, [a1,#UARTCR]
+        DataSyncBarrier a2
+        MOV     pc, lr
+
+; void HAL_UARTShutdown(int port)
+;
+HAL_UARTShutdown ROUT
+        BaseAddr
+        DataSyncBarrier a3
+        StopUART a2
+        ; Flush FIFO
+        MOV     a3, #0
+        STR     a3, [a1,#UARTLCRH]        
+        DataSyncBarrier a3
+        MOV     pc, lr
+
+; int HAL_UARTFeatures(int port)
+;
+;      Bit 0:  FIFOs available
+;      Bit 1:  DMA available
+;      Bit 2:  Modem lines available
+;      Bit 3:  Hardware RTS/CTS available
+;      Bit 4:  Transmitter empty IRQ is actually "TX FIFO under threshold" IRQ
+;
+HAL_UARTFeatures
+ [ ModemControl
+        MOV     a1, #2_11101
+ |
+        MOV     a1, #2_10001
+ ]
+        MOV     pc, lr
+
+; int HAL_UARTReceiveByte(int port, int *status)
+;
+;   Returns the next byte from the FIFO (if enabled) or the holding register.
+;   If status is non-NULL, the line status associated with the byte is
+;   read (see LineStatus). The return value is only meaningful if a
+;   received byte is available (bit 0 of *status will be set).
+;
+HAL_UARTReceiveByte ROUT
+        Entry
+        BaseAddr
+        LDR     a3, [a1, #UARTFLAG]
+        ANDS    a4, a3, #1:SHL:FLAG_RXFE
+        MOVNE   ip, #0
+        LDREQ   ip, [a1, #UARTDR]
+        DataSyncBarrier lr             ; resync after reading peripheral
+
+        ; If the FIFO is empty, clear all the line status error IRQs. This is
+        ; the only time we can be reasonably certain that there aren't any
+        ; further bad bytes in the FIFO.
+        ;
+        ; There is a race condition here where a new bad byte could arrive just
+        ; before we clear the errors, but as long as the OS has the RX threshold
+        ; & RX timeout IRQs active there shouldn't be any danger of the bad data
+        ; being missed, just delayed a bit.
+        MOVNE   lr, #(1:SHL:UI_OE)+(1:SHL:UI_BE)+(1:SHL:UI_PE)+(1:SHL:UI_FE)
+        STRNE   lr, [a1, #UARTICR]
+
+        TEQ     a2, #0
+        BEQ     %FT90
+        ; Status wanted, so clear error bits from UARTLineStatus
+        TST     ip, #(1:SHL:DR_OE)+(1:SHL:DR_BE)+(1:SHL:DR_PE)+(1:SHL:DR_FE)
+        STRNE   ip, [a1, #UARTRSRECR]  ; n.b. written value doesn't matter
+        BL      calcstatus
+        STR     a1, [a2]
+90
+        AND     a1, ip, #255
+        EXIT
+
+; In:
+; a3 = UARTFLAG
+; a4 = a3 AND 1:SHL:FLAG_RXFE
+; ip = UARTDR
+; Out:
+; a1 = status flags
+; a3, a4 corrupt
+calcstatus
+        MOV     a1, #1                 ; Bit 0 needs inverting
+        TST     a3, #1:SHL:FLAG_BUSY
+        EOR     a1, a1, a4, LSR #FLAG_RXFE ; -> RDR
+        AND     a4, a3, #1:SHL:FLAG_TXFE
+        ORREQ   a1, a1, a4, LSR #FLAG_TXFE-6 ; -> Transmitter+FIFO empty
+        ORR     a1, a1, a4, LSR #FLAG_TXFE-5 ; -> TX FIFO empty
+        AND     a4, a3, #1:SHL:FLAG_TXFF
+        ORR     a1, a1, a4, LSL #8-FLAG_TXFF ; TX FIFO full
+
+        AND     a4, ip, #1:SHL:DR_OE
+        AND     a3, ip, #1:SHL:DR_BE
+        ORR     a1, a1, a4, LSR #DR_OE-1
+        AND     a4, ip, #1:SHL:DR_PE
+        ORR     a1, a1, a3, LSR #DR_BE-4
+        AND     a3, ip, #1:SHL:DR_FE
+        ORR     a1, a1, a4, LSR #DR_PE-2
+
+        TST     ip, #(1:SHL:DR_PE)+(1:SHL:DR_FE)+(1:SHL:DR_BE)
+        ORR     a1, a1, a3, LSR #DR_FE-3
+        ORRNE   a1, a1, #128           ; "FIFO contains PE, FE, BE" - we can only report this for the current byte
+        MOV     pc, lr
+
+; void HAL_UARTTransmitByte(int port, int byte)
+;
+HAL_UARTTransmitByte
+        BaseAddr
+        DataSyncBarrier a3              ; resync before writing peripheral
+        STRB    a2, [a1, #UARTDR]
+        MOV     pc, lr
+
+; int HAL_UARTLineStatus(int port)
+;
+;      Bit 0: Receiver Data Ready
+;      Bit 1: Overrun Error
+;      Bit 2: Parity Error
+;      Bit 3: Framing Error
+;      Bit 4: Break Error
+;      Bit 5: Transmitter FIFO Empty
+;      Bit 6: Transmitter FIFO + hold register empty
+;      Bit 7: FIFO contains a Parity, Framing or Break error
+;      Bit 8: TX FIFO full
+;
+;   Parity, Framing and Break errors are associated with each byte received.
+;   Whether the values reported here are associated with the last byte
+;   read using ReceiveByte or with the next byte to be read is undefined.
+;   You should request the status using ReceiveByte to ensure accurate
+;   identification of bytes with errors.
+;
+;   Error bits are cleared whenever status is read, using either LineStatus
+;   or ReceiveByte with status non-NULL.
+;
+HAL_UARTLineStatus
+        BaseAddr
+        LDR     a3, [a1, #UARTFLAG]
+        LDR     ip, [a1, #UARTRSRECR]
+        DataSyncBarrier a2             ; resync after reading/before write
+        MOVS    ip, ip, LSL #DR_FE-RSR_FE ; Convert RSRECR to fake DR
+        AND     a4, a3, #1:SHL:FLAG_RXFE
+        STRNE   ip, [a1, #UARTRSRECR]  ; Clear any errors, written value doesn't matter
+        B       calcstatus             ; Exit via calcstatus
+
+; int HAL_UARTInterruptEnable(int port, int eor, int mask)
+;
+;   Enables interrupts. Bits are:
+;
+;      Bit 0: Received Data Available (and Character Timeout)
+;      Bit 1: Transmitter Holding Register Empty
+;      Bit 2: Received Line Status
+;      Bit 3: Modem Status
+;
+;   Returns previous state.
+;
+HAL_UARTInterruptEnable
+        Entry
+        BaseAddr
+        PHPSEI
+        LDR     a4, [a1, #UARTIMSC]
+        DataSyncBarrier ip             ; resync after reading/before write
+        ; Remap IMSC to match the API
+ [ ModemControl
+        AND     ip, a4, #1:SHL:UI_CTS
+        MOV     ip, ip, LSL #3-UI_CTS
+ |
+        MOV     ip, #0
+ ]
+        TST     a4, #(1:SHL:UI_OE)+(1:SHL:UI_BE)+(1:SHL:UI_PE)+(1:SHL:UI_FE)
+        ORRNE   ip, ip, #1:SHL:2
+        TST     a4, #1:SHL:UI_TX
+        ORRNE   ip, ip, #1:SHL:1
+        TST     a4, #(1:SHL:UI_RT)+(1:SHL:UI_RX)
+        ORRNE   ip, ip, #1:SHL:0
+        ; Modify
+        AND     a3, ip, a3
+        EOR     a3, a3, a2
+        ; Map back
+        MOV     a2, #0
+        TST     a3, #1:SHL:0
+        ORRNE   a2, a2, #(1:SHL:UI_RT)+(1:SHL:UI_RX)
+        TST     a3, #1:SHL:1
+        ORRNE   a2, a2, #1:SHL:UI_TX
+        TST     a3, #1:SHL:2
+        ORRNE   a2, a2, #(1:SHL:UI_OE)+(1:SHL:UI_BE)+(1:SHL:UI_PE)+(1:SHL:UI_FE)
+ [ ModemControl
+        TST     a3, #1:SHL:3
+        ORRNE   a2, a2, #1:SHL:UI_CTS
+ ]
+        TEQ     a2, a4
+        STRNE   a2, [a1, #UARTIMSC]
+        PLP
+        DataSyncBarrier a2
+        MOV     a1, ip        
+        EXIT
+
+
+; int HAL_UARTRate(int port, int baud16)
+;
+;   Sets the rate, in units of 1/16 of a baud. Returns the previous rate.
+;   Use -1 to read.
+;
+HAL_UARTRate ROUT
+        Entry   "v1"
+        BaseAddr
+        DataSyncBarrier a3
+        PHPSEI  v1
+        ; Get current baud
+        LDR     a3, [a1, #UARTIBRD]
+        LDR     a4, [a1, #UARTFBRD]
+        ORR     a3, a4, a3, LSL #6
+        LDR     a4, =UARTCLK*64
+        DivRem  ip, a4, a3, lr
+        ; Set new baud
+        CMP     a2, #-1
+        BEQ     %FT90
+        StopUART a3
+        LDR     a3, =UARTCLK*64
+        ADD     a3, a3, a2, LSR #1 ; Add 0.5 to round to nearest
+        DivRem  a4, a3, a2, lr     ; a4 = new divisor
+        AND     a3, a4, #63
+        MOV     a4, a4, LSR #6
+        STR     a3, [a1, #UARTFBRD]
+        STR     a4, [a1, #UARTIBRD]
+        ; Perform a dummy write to LCRH to latch the new divisor values
+        LDR     a3, [a1, #UARTLCRH]
+        STR     a3, [a1, #UARTLCRH]
+        StartUART a3
+90
+        PLP     v1
+        DataSyncBarrier a3
+        MOV     a1, ip
+        EXIT
+
+; int HAL_UARTFormat(int port, int format)
+;
+;   Bits 0-1: Bits per word  0=>5, 1=>6, 2=>7, 3=>8
+;   Bit 2:    Stop length 0=>1, 1=>2 (1.5 if 5 bits)
+;   Bit 3:    Parity enabled
+;   Bits 4-5: Parity:  0 => Odd (or disabled)
+;                      1 => Even
+;                      2 => Mark (parity bit = 1)
+;                      3 => Space (parity bit = 0)
+;
+;   Returns previous format. -1 to read.
+;
+
+HAL_UARTFormat ROUT
+        Entry
+        BaseAddr
+        DataSyncBarrier a3
+        PHPSEI
+        ; Get current settings
+        LDR     a3, [a1, #UARTLCRH]
+        AND     a4, a3, #LCRH_WLEN
+        MOV     a4, a4, LSR #LCRH_WLEN_shift
+        TST     a3, #LCRH_STP2
+        ORRNE   a4, a4, #1:SHL:2
+        TST     a3, #LCRH_PEN
+        ORRNE   a4, a4, #1:SHL:3
+        TST     a3, #LCRH_EPS
+        ORRNE   a4, a4, #1:SHL:4
+        TST     a3, #LCRH_SPS
+        ORRNE   a4, a4, #1:SHL:5
+        ; Apply new settings
+        CMP     a2, #-1
+        BEQ     %FT90
+        StopUART ip
+        BIC     a3, a3, #LCRH_SPS+LCRH_WLEN+LCRH_STP2+LCRH_EPS+LCRH_PEN
+        TST     a2, #1:SHL:5
+        ORRNE   a3, a3, #LCRH_SPS
+        TST     a2, #1:SHL:4
+        ORRNE   a3, a3, #LCRH_EPS
+        TST     a2, #1:SHL:3
+        ORRNE   a3, a3, #LCRH_PEN
+        TST     a2, #1:SHL:2
+        ORRNE   a3, a3, #LCRH_STP2
+        AND     a2, a2, #3
+        ORR     a3, a3, a2, LSL #LCRH_WLEN_shift
+        STR     a3, [a1, #UARTLCRH]
+        StartUART a3
+90
+        PLP
+        DataSyncBarrier a3
+        MOV     a1, a4
+        EXIT
+
+; void HAL_UARTFIFOSize(int port, int *rx, int *tx)
+;
+;   Returns the size of the RX and TX FIFOs. Either parameter may be NULL.
+;   Note that the size of the TX FIFO is the total amount of data that can
+;   be sent immediately when the TX Holding Register Empty/FIFO under threshold
+;   IRQ holds. (So an unusual UART that had a transmit threshold
+;   should return total FIFO size minus threshold).
+;
+HAL_UARTFIFOSize
+        MOV     a1, #16
+        TEQ     a2, #0
+        STRNE   a1, [a2]
+        MOV     a1, #8
+        TEQ     a3, #0
+        STRNE   a1, [a3]
+        MOV     pc, lr
+
+; void HAL_UARTFIFOClear(int port, int flags)
+;
+;   Clears the input FIFO (if bit 0 set) and the output FIFO (if bit 1 set).
+;
+HAL_UARTFIFOClear
+        BaseAddr
+        ; We can't individually flush FIFOs, so just flush both of them
+        DataSyncBarrier a2
+        PHPSEI  ip
+        StopUART a2
+        LDR     a2, [a1, #UARTLCRH]
+        BIC     a3, a2, #LCRH_FEN
+        STR     a3, [a1, #UARTLCRH] ; Disabling the FIFOs should flush them
+        MOV     a3, #1:SHL:UI_RX
+        STR     a3, [a1, #UARTICR] ; Clear RX threshold IRQ as well, otherwise it may get stuck on
+        STR     a2, [a1, #UARTLCRH] ; Restore original state
+        StartUART a3
+        PLP     ip
+        DataSyncBarrier a2        
+        MOV     pc, lr
+
+; int HAL_UARTFIFOEnable(int port, int enable)
+;
+;   Enables or disables the RX and TX FIFOs: 0 => disable, 1 => enable
+;   -1 => read status. Returns previous status.
+;
+HAL_UARTFIFOEnable ROUT
+        BaseAddr
+        DataSyncBarrier a3
+        PHPSEI  ip
+        LDR     a3, [a1, #UARTLCRH]
+        CMP     a2, #0
+        BLT     %FT90
+        BICEQ   a4, a3, #LCRH_FEN
+        ORRGT   a4, a3, #LCRH_FEN
+        StopUART a2
+        STR     a4, [a1, #UARTLCRH]
+        StartUART a2
+90
+        PLP     ip
+        DataSyncBarrier a2
+        AND     a1, a3, #LCRH_FEN
+        ASSERT  LCRH_FEN = 1:SHL:4
+        MOV     a1, a1, LSR #4
+        MOV     pc, lr
+
+; int HAL_UARTFIFOThreshold(int port, int threshold)
+;
+;   Sets the receive threshold level for the FIFO RX interrupt. -1 to read.
+;
+HAL_UARTFIFOThreshold ROUT
+        Entry   "v1"
+        BaseAddr
+        DataSyncBarrier a3
+        PHPSEI  v1
+        ; Calc current level
+        LDR     a3, [a1, #UARTIFLS]
+        AND     a4, a3, #7:SHL:3
+        ADR     ip, fifolevels
+        LDRB    a4, [ip, a4, LSR #3]
+        ; Calc new level
+        CMP     a2, #-1
+        BEQ     %FT90
+        BIC     a3, a3, #7:SHL:3
+10
+        LDRB    lr, [ip], #1
+        CMP     lr, a2
+        BGE     %FT20
+        ADD     a3, a3, #1:SHL:3
+        TST     a3, #4:SHL:3 ; 4 is highest level
+        BNE     %BT10
+20
+        STR     a3, [a1, #UARTIFLS]
+        MOV     a3, #1:SHL:UI_RX
+        STR     a3, [a1, #UARTICR] ; Clear RX threshold IRQ as well, otherwise it may get stuck on (n.b. if FIFO is currently non-empty we'll assume the RX timeout IRQ will take care of it)
+90
+        PLP     v1
+        DataSyncBarrier a2
+        MOV     a1, a4
+        EXIT
+
+fifolevels
+        DCB     (16*1)/8
+        DCB     (16*1)/4
+        DCB     (16*1)/2
+        DCB     (16*3)/4
+        DCB     (16*7)/8
+        ALIGN
+
+; int HAL_UARTInterruptID(int port)
+;
+;   Returns the highest priority interrupt currently asserted. In order
+;   of priority:
+;
+;   3 => Receiver Line Status (Cleared by ReceiveByte)
+;   2 => Received Data Available (Cleared by reading enough data)
+;   6 => Character Timeout (received data waiting)
+;   1 => TX Holding Register Empty (cleared by this call)/FIFO under threshold
+;        (cleared by sending enough chars)
+;   0 => Modem Status (Cleared by ModemStatus)
+;   -1 => No Interrupt
+;
+;   The Modem Status interrupt occurs when the CTS, DSR or DCD inputs
+;   change, or when RI goes from high to low (ie bits 0 to 3 of ModemStatus
+;   are set).
+;
+HAL_UARTInterruptID ROUT
+        BaseAddr a4
+        DataSyncBarrier a3
+        LDR     a2, [a4, #UARTMIS]
+        DataSyncBarrier a3
+        TST     a2, #(1:SHL:UI_OE)+(1:SHL:UI_BE)+(1:SHL:UI_PE)+(1:SHL:UI_FE)
+        MOV     a1, #3
+        MOVNE   pc, lr
+        TST     a2, #1:SHL:UI_RX
+        MOV     a1, #2
+        MOVNE   pc, lr
+        TST     a2, #1:SHL:UI_RT
+        MOV     a1, #6
+        MOVNE   pc, lr
+        TST     a2, #1:SHL:UI_TX
+ [ ModemControl
+        BNE     %FT90
+        TST     a2, #1:SHL:UI_CTS
+        MOVNE   a1, #0
+        MOVEQ   a1, #-1
+        MOV     pc, lr
+90
+ |
+        MOVEQ   a1, #-1
+        MOVEQ   pc, lr
+ ]
+        MOV     a1, #1
+        MOV     pc, lr
+
+
+; int HAL_UARTBreak(int port, int enable)
+;
+;   Activates (1) or deactivates (0) a break condition. -1 to read,
+;   returns previous state.
+;
+HAL_UARTBreak ROUT
+        BaseAddr
+        DataSyncBarrier a3
+        PHPSEI  ip
+        LDR     a3, [a1, #UARTLCRH]
+        AND     a4, a3, #LCRH_BRK
+        CMP     a2, #0
+        BLT     %FT90
+        BICEQ   a3, a3, #LCRH_BRK
+        ORRGT   a3, a3, #LCRH_BRK
+        StopUART a2
+        STR     a3, [a1, #UARTLCRH]
+        StartUART a2
+90
+        PLP     ip
+        DataSyncBarrier a2
+        ASSERT  LCRH_BRK = 1
+        MOV     a1, a4
+        MOV     pc, lr
+
+; int HAL_UARTModemControl(int port, int eor, int mask)
+;
+;   Modifies the modem control outputs.
+;
+;   Bit 0: DTR
+;   Bit 1: RTS
+;   Bit 5: Hardware RTS/CTS
+;
+;   Note that these are logical outputs, although the physical pins may be
+;   inverted.  So 1 indicates a request to send.  Returns previous state.
+;
+
+HAL_UARTModemControl
+ [ ModemControl
+        Entry
+        BaseAddr
+        DataSyncBarrier a4
+        PHPSEI
+        LDR     a4, [a1, #UARTCR]
+        ; Map to API format
+        AND     ip, a4, #CR_RTS
+        TST     a4, #CR_CTSEN+CR_RTSEN
+        ASSERT  CR_RTS = 1:SHL:11
+        MOV     ip, ip, LSR #10
+        ORRNE   ip, ip, #1:SHL:5
+        ; Calc new value
+        AND     a3, ip, a3
+        EOR     a3, a3, a2
+        ; Map back
+        BIC     a2, a4, #CR_RTS+CR_CTSEN+CR_RTSEN
+        TST     a3, #1:SHL:1
+        ORRNE   a2, a2, #CR_RTS
+        TST     a3, #1:SHL:5
+        ORRNE   a2, a2, #CR_CTSEN+CR_RTSEN
+        TEQ     a2, a4
+        STRNE   a2, [a1, #UARTCR]
+        PLP
+        DataSyncBarrier a2
+        MOV     a1, ip
+        EXIT
+ |
+        MOV     pc, lr
+ ]
+
+
+; int HAL_UARTModemStatus(int port)
+;
+;   Reads the modem status inputs.
+;
+;   Bit 0: CTS changed since last call
+;   Bit 1: DSR changed since last call
+;   Bit 2: RI changed from high to low since last call
+;   Bit 3: DCD changed since last call
+;   Bit 4: CTS
+;   Bit 5: DSR
+;   Bit 6: RI
+;   Bit 7: DCD
+;
+;   Note that these are logical inputs, although the physical pins may be
+;   inverted.  So 1 indicates a Clear To Send condition.  This must also clear
+;   the modem interrupt status.
+;
+HAL_UARTModemStatus
+ [ ModemControl
+        BaseAddr
+        DataSyncBarrier a2
+        PHPSEI  a3
+        ; Clear modem interrupt status
+        MOV     a4, #1:SHL:UI_CTS
+        STR     a4, [a1, #UARTICR]
+        ; Get current status
+        LDR     a2, [a1, #UARTFLAG]
+        DataSyncBarrier a4
+        AND     a2, a2, #FLAG_CTS
+        ; Get old status
+        LDR     a4, UARTOldModemStatus
+        ; Store new status
+        STR     a2, UARTOldModemStatus
+        PLP     a3
+        ; Calc return value
+        EOR     a1, a4, a2
+        MOV     a1, a1, LSR #UI_CTS
+        ORR     a1, a1, a2, LSL #4-UI_CTS
+ ]
+        MOV     pc, lr
+
+; int HAL_UARTDevice(int port)
+;
+;   Return the device number allocated to the UART port
+;
+HAL_UARTDevice
+        MOV     a1, #iDev_GPU_Uart
+        MOV     pc, lr
+
+; Return the UART number that should be used for OS_SerialOp
+HAL_UARTDefault
+        MOV     a1, #0
+        MOV     pc, lr
+
+        END

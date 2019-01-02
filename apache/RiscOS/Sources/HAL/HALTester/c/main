@@ -1,0 +1,270 @@
+/* Copyright 2009 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#include <stdio.h>
+#include <stdarg.h>
+#include <string.h>
+#include <limits.h>
+
+__global_reg(6) void *sb;
+
+#undef putchar
+#undef putc
+
+#define NO_FLOATING_POINT
+
+typedef struct {
+	unsigned int flags;
+	int baseoffset;
+	int halsize;
+	int entrytableoffset;
+	int numentries;
+	int workspacesize;
+} hal;
+
+typedef struct {
+	unsigned int startflags;
+	hal *hal;
+	void *halworkspace;
+	int halworkspacesize;
+	void *jumptable;
+	void *halncnbworkspace;
+	void *ramlist;
+} zeropage;
+
+typedef struct {
+	unsigned int addr;
+	unsigned int lenflags;
+} ramentry;
+
+typedef struct {
+	unsigned int cpuid;
+	unsigned int cachetype;
+	unsigned int control;
+} cpuinfo;
+
+/* Assembler/HAL routines */
+extern unsigned long long HAL_MachineID(void);
+extern void CPU_examine(cpuinfo *i);
+extern int HAL_DebugRX(void);
+extern int HAL_Timers(void);
+extern int HAL_TimerDevice(int timer);
+extern unsigned int HAL_CounterRate(void);
+extern unsigned int HAL_TimerGranularity(int timer);
+extern unsigned int HAL_TimerMaxPeriod(int timer);
+extern void HAL_TimerSetPeriod(int timer,unsigned int period);
+extern unsigned int HAL_CounterPeriod(void);
+extern unsigned int HAL_TimerPeriod(int timer);
+extern unsigned int HAL_CounterRead(void);
+extern unsigned int HAL_TimerReadCountdown(int timer);
+extern void HAL_CounterDelay(unsigned int microseconds);
+extern int HAL_IRQEnable(int i);
+extern int HAL_IRQDisable(int i);
+extern void HAL_IRQClear(int i);
+extern int HAL_IRQSource(void);
+extern int HAL_IRQStatus(int i);
+extern int HAL_FIQEnable(int i);
+extern int HAL_FIQDisable(int i);
+extern void HAL_FIQDisableAll(void);
+extern void HAL_FIQClear(int i);
+extern int HAL_FIQStatus(int i);
+extern int HAL_FIQSource(void);
+
+void enter_ok(void)
+{
+	printf("enter 'OK' to continue\n");
+	int old1=-1,old2=-1;
+	do {
+		int c = HAL_DebugRX();
+		if(c != -1)
+		{
+			putchar(c);
+			old1 = old2;
+			old2 = c;
+		}
+	} while (!(((old1 == 'o') || (old1 == 'O')) && ((old2 == 'k') || (old2 == 'K'))));
+	printf("\n");
+}
+
+void dump_pointers(zeropage *ZeroPage)
+{
+	printf("ZeroPage = %08p\n",(void *) ZeroPage);
+	printf("Kernel startflags = %08x\n",ZeroPage->startflags);
+	printf("HAL descriptor = %08p\n",(void *) ZeroPage->hal);
+	printf("HAL base = %08x\n",((int) ZeroPage->hal)+ZeroPage->hal->baseoffset);
+	printf("HAL workspace = %08p\n",ZeroPage->halworkspace);
+	printf("HAL workspace size = %08x\n",ZeroPage->halworkspacesize);
+	printf("HAL jump table = %08p\n",ZeroPage->jumptable);
+	printf("HAL NCNB workspace = %08p\n",ZeroPage->halncnbworkspace);
+	/* dump RAM list */
+	int i = *((int *)ZeroPage->ramlist);
+	printf("RAM list @ %08p contains %d entries\n",(void *) ZeroPage->ramlist,i);
+	while(i > 0)
+	{
+		ramentry *e = (ramentry *) (((int) ZeroPage->ramlist)-sizeof(ramentry)*i);
+		printf("Address %08x Length %08x Flags %03x\n",e->addr,e->lenflags & 0xFFFFF000,e->lenflags & 0xFFF);
+		i--;
+	}
+}
+
+void dump_machine(void)
+{
+	/* Ask for machine ID */
+	printf("Machine ID = %016llx\n",HAL_MachineID());
+	/* Dump CPU info */
+	cpuinfo info;
+	CPU_examine(&info);
+	printf("CPU ID = %08x\n",info.cpuid);
+	printf("Cache type = %08x\n",info.cachetype);
+	printf("Control reg = %08x\n",info.control);
+}
+
+void dump_timers(void)
+{
+	int num = HAL_Timers();
+	printf("HAL reports %d timers\n",num);
+	printf("Timer\tDevice\tGranularity\tPeriod\t\tValue\n");
+	for(int i=0;i<num;i++)
+	{
+		printf("%d\t%d\t%16u%16u%16u\n",i,HAL_TimerDevice(i),HAL_TimerGranularity(i),HAL_TimerPeriod(i),HAL_TimerReadCountdown(i));
+	}
+}
+
+void delay_test(void)
+{
+	printf("Waiting for 1 second...\n");
+	HAL_CounterDelay(1000000);
+	printf("...done\n");
+}
+
+#define INTERRUPT_MAX 96
+
+void dump_irqs(void)
+{
+	int i;
+	printf("Interrupt enable state: (I=IRQ, F=FIQ, X=both)\n");
+	for(i=0;i<INTERRUPT_MAX;i++)
+	{
+		int irq = HAL_IRQDisable(i);
+		int fiq = HAL_FIQDisable(i);
+		if(fiq && irq)
+		{
+			HAL_IRQEnable(i);
+			HAL_FIQEnable(i);
+			putchar('X');
+		}
+		else if(irq)
+		{
+			HAL_IRQEnable(i);
+			putchar('I');
+		}
+		else if(fiq)
+		{
+			HAL_FIQEnable(i);
+			putchar('F');
+		}
+		else
+			putchar(' ');
+	}
+	printf("\n");
+	printf("IRQ fire status: (I=IRQ, F=FIQ, X=both)\n");
+	for(i=0;i<INTERRUPT_MAX;i++)
+	{
+		int irq = HAL_IRQStatus(i);
+		int fiq = HAL_FIQStatus(i);
+		if(fiq && irq)
+			putchar('X');
+		else if(irq)
+			putchar('I');
+		else if(fiq)
+			putchar('F');
+		else
+			putchar(' ');
+	}
+	printf("\n");
+	printf("Current IRQ source: %d\n",HAL_IRQSource());
+	printf("Current FIQ source: %d\n",HAL_FIQSource());
+}
+
+void disable_test(void)
+{
+	int i,j;
+	for(i=0;i<INTERRUPT_MAX;i++)
+		HAL_IRQEnable(i);
+	j=0;
+	while(((i = HAL_IRQSource()) != -1) && (j<=INTERRUPT_MAX))
+	{
+		printf("IRQ %d firing\n",i);
+		HAL_IRQDisable(i);
+		j++;
+	}
+	printf("%d loops completed\n",j);
+	if(i == -1)
+		printf("All IRQs reported as silenced\n");
+}
+
+void silence_test(void)
+{
+	int i = HAL_TimerDevice(0);
+	if(i == -1)
+	{
+		printf("No timer device, can't test IRQClear\n");
+		return;
+	}
+	HAL_IRQEnable(i);
+	if(HAL_IRQStatus(i) == 0)
+	{
+		printf("Timer not interrupting, can't test IRQClear\n");
+		return;
+	}
+	HAL_IRQClear(i);
+	if(HAL_IRQStatus(i) == 0)
+		printf("Timer IRQ cleared OK\n");
+	else
+		printf("Timer still interrupting!\n");
+}
+
+void test_complete(void)
+{
+	printf("---- Tests complete ----\n");
+	while(1) {};
+}
+
+void notmain(zeropage *ZeroPage)
+{
+	/* Basic tests */
+	enter_ok();
+	dump_pointers(ZeroPage); enter_ok();
+	dump_machine(); enter_ok();
+	/* Timer tests */
+	dump_timers(); enter_ok();
+	HAL_TimerSetPeriod(0,HAL_TimerMaxPeriod(0));
+	dump_timers(); enter_ok();
+	dump_timers(); enter_ok();
+	delay_test(); enter_ok();
+	/* IRQ tests */
+	dump_irqs(); enter_ok();
+	dump_irqs(); enter_ok();
+	disable_test(); enter_ok();
+	dump_irqs(); enter_ok();
+	HAL_TimerSetPeriod(0,HAL_TimerMaxPeriod(0));
+	silence_test(); enter_ok();
+	dump_irqs(); enter_ok();
+	HAL_TimerSetPeriod(0,500); /* Min period */
+	HAL_CounterDelay(1000); /* Wait a bit to make sure the interrupt is set */
+	silence_test(); enter_ok();
+	dump_irqs(); enter_ok();
+	/* Done! */
+	test_complete();
+}

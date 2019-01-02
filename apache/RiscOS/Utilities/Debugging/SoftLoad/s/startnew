@@ -1,0 +1,402 @@
+; Copyright 2000 Pace Micro Technology plc
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+
+; startnew.s
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:Services
+        GET     Hdr:APCS.<APCS>
+        GET     Hdr:OSEntries
+        GET     Hdr:PublicWS
+        GET     Hdr:Sound
+
+        GET     Copro15ops.s
+
+        AREA    |main|, CODE, READONLY
+
+        EXPORT  |startnew|
+        EXPORT  |DAhandler|
+        EXPORT  |svcpeek|
+;        EXPORT  |svcpoke|
+        EXPORT  |svcarmid|
+        EXPORT  |svcmemcpy|
+        EXPORT  |asm_decompress|
+        IMPORT  |log2phys|
+
+startnew
+
+; in -  r0 -> where ROM image will be in phys space (-1 if soft unloading)
+;       r1 -> L1PT
+;       r2 -> current ROM in phys space (-1 if soft loading)
+;       r3 -> ARMA_Cleaner_flipflop word (kernel workspace, for StrongARM cache clean)
+;       arg4 = logical base address of current ROM
+;       arg5 = target ROM size, or current ROM size if soft unloading
+
+        Push    "r0-r3" ;In some IOMD ROMs, Sound_Enable corrupts r2-r3. Store more
+                        ; regs than necessary to protect against this.
+        MOV     r0,#1
+        SWI     XSound_Enable ;Make sure sound is off; avoids blast of noise when
+                              ; booting compressed ROMs on Tungsten (not entirely sure why this
+                              ; only happens with compressed ones, but we should make sure sound
+                              ; is off regardless)
+
+        SUB     sp,sp,#4
+        MOV     r0,#AppSpaceStart
+        MOV     r1,sp         ;Lookup physical address of first page of app space, but make sure that's
+        BL      log2phys      ; done *after* the dynamic area containing the ROM has been set up
+        ADD     sp,sp,#4
+        MOV     r6,r0         ;Keep PA for later
+
+        Pull    "r0-r5"
+
+        SWI     XOS_EnterOS
+
+        MSR     CPSR_c,#SVC32_mode+I32_bit+F32_bit ; Disable IRQs & FIQs when calling PreReset, same as the OS
+
+        Push    "r0-r2"
+
+        LDR     r0, =2 :OR: (10:SHL:8)  ; Get ARMop address of MMU_Changing
+        SWI     XOS_MMUControl
+        MOVVS   r0, #0
+        MOV     r8, r0
+
+        MOV     r1, #Service_PreReset   ; issue Service_PreReset to turn off h/w
+        SWI     XOS_ServiceCall
+
+        MSR     CPSR_c,#SVC32_mode+I32_bit+F32_bit ; Make sure they're still off
+
+        ; There are at least two different DCache clean methods in use for
+        ; StrongARM. 3.x and 4.x use ARMA_Cleaner_flipflop, while 5.x uses
+        ; DCacheCleanAddr. So rather than keep adding more and more cleaner
+        ; methods to the softload tool, we'll just flush and disable the data
+        ; cache here using a simple SWI (assuming the SWI is supported!)
+
+        CMP     r3,#0                   ; Only if no ARMA_Cleaner_flipflop
+        BNE     %FT10
+        ARM_read_ID r0
+        AND     r1,r0,#&FF000000
+        TEQ     r1,#&69000000
+        BEQ     %FT10                   ; Ignore XScale
+        AND     r1,r0,#&000F0000
+        TEQ     r1,#&000F0000
+        BEQ     %FT10                   ; Ignore 'Fancy' ARMs
+        AND     r0,r0,#&F000
+        CMP     r0,#&A000
+        BNE     %FT10                   ; Ignore ARM6/7
+        MOV     r0,#0
+        MOV     r1,#0
+        MVN     r2,#4
+        SWI     XOS_MMUControl          ; StrongARM
+
+        MSR     CPSR_c,#SVC32_mode+I32_bit+F32_bit ; Make sure they're still off
+10
+        Pull    "r0-r2"
+
+        CMP     r0,#-1                  ; -1 means we want to 'soft unload' to real ROM
+        BNE     startnew_flatten
+
+        MOV     r0,r2                   ; we'll restart current ROM, but altered to jump to old
+        ADD     r2,r1,r4,LSR #18        ; L1PT entry for ROM
+        MOV     r7,r0
+        ORR     r7,r7,#&400             ; make sure we have temporary write access to ROM
+        ORR     r7,r7,#&01E             ; 1st 1MB section of ROM
+        STR     r7,[r2]
+        ARM_flush_TLB r2
+
+        LDR     r7,NOPInst
+        STR     r7,[r4]                 ; bung in a few NOPs to allow for some MMU-off delay
+        STR     r7,[r4,#4]
+        STR     r7,[r4,#8]
+        STR     r7,[r4,#12]
+        LDR     r7,MOVPC0Inst
+        STR     r7,[r4,#16]             ; make it leap to real ROM
+
+startnew_flatten
+
+;
+;set up L1 mapping so that logical mapping of ROM image at r0 is flat with
+;physical mapping - this means that things will go smoothly when we turn off the
+;MMU - we get away with this because the physical address of RAM on Medusa style
+;machine is sufficiently high to avoid trashing any critical mapping around us
+;at this point
+;
+        ARM_read_ID r7
+        TST     r7, #&F000
+        ADD     r7, r1, r0, LSR #18     ; r7 -> first L1PT entry
+        ORR     r2, r0, #(1:SHL:10)     ; svc-only access
+        ORR     r2, r2, #2              ; section mapped
+        ORREQ   r2, r2, #1:SHL:4        ; U~C~B (L1_U only valid pre-ARM7)
+10
+        SUBS    r5, r5, #1024*1024
+        STR     r2, [r7], #4
+        ADD     r2, r2, #1024*1024
+        BGT     %BT10
+
+        Push    "r0-r4"
+
+;
+;set up L1 mapping so that logical mapping of app space bottom is flat with
+;physical mapping - this gives somewhere to put a couple of MMU switch off instructions
+;which will still be there when app space vanishes
+;
+        MOV     r0, r6, LSR #20
+        MOV     r0, r0, LSL #20         ; MB align the page containing AppSpaceStart
+        ADD     r7, r1, r0, LSR #18     ; r7 -> L1PT entry
+        MOV     r2, r2, LSL #12
+        ORR     r2, r0, r2, LSR #12     ; recycle L1PT flags from above
+        STR     r2, [r7]                ; map it with a big spade
+
+        ADR     r0, MMUOffInst
+        ADR     r1, MMUOffInstEnd
+        MOV     r2, #AppSpaceStart
+10
+        LDR     r5, [r0], #4            ; Copy the MMU off & jump to start of app
+        STR     r5, [r2], #4
+        TEQ     r0, r1
+        BNE     %BT10
+
+        ARM_read_ID r4
+        AND     r2,r4,#&FF000000
+        TEQ     r2,#&69000000
+        BNE     notXScale
+
+;flush cache(s) and TLB(s) - XScale version
+        MOV     r1,#&FC000000
+        ADD     r1,r1,#&800000
+        ;we should really read the cache properties from the CP
+        MOV     r0,#1024
+xsynclp SUB     r1,r1,#32
+        MCR     ARM_config_cp,0,r1,C7,C2,5   ;line-allocate
+        SUBS    r0,r0,#1
+        BNE     xsynclp
+
+        ;Note that at this point the Dcache is full of invalid data for
+        ;  the address range used and hopefully nothing else,
+        ;  all other data having been written back to RAM
+
+        MCR     ARM_config_cp,0,r0,C7,C6,0       ;invalidate Dcache and mini-Dcache
+        MCR     ARM_config_cp,0,r1,C7,C5,0       ;invalidate Icache and BTB
+        MRC     ARM_config_cp,0,r0,C2,C0,0       ;stall until CP15 changes effected
+        MOV     r0,r0
+        SUB     pc,pc,#4
+        MCR     ARM_config_cp,0,r0,C8,C7,0       ;purge I+DTLBs
+
+        ;ensure debug functionality is disabled so that the HAL/kernel code
+        ;  doesn't stop at breakpoints, and position processor vectors at 0
+
+        MRC     ARM_debug_cp,0,r0,ARM_DCS_reg,C0,0
+        BIC     r0,r0,#1<<31
+        MCR     ARM_debug_cp,0,r0,ARM_DCS_reg,C0,0
+        ARM_read_control r1
+        BIC     r1,r1,#&2000       ; Vectors at 0
+        ARM_write_control r1
+
+        B       doneflush
+
+notXScale
+;flush cache(s) and TLB(s) - Fancy ARM version
+        AND     r2,r4,#&000F0000
+        TEQ     r2,#&000F0000
+        BNE     notFancy
+
+        ARM_read_control r1
+        BIC     r1,r1,#&2000       ; Vectors at 0
+        ARM_write_control r1
+        MOV     r1,#0
+        MCR     ARM_config_cp,0,r1,C12,C0,0 ; VBAR=0
+
+        TEQ     r8,#0
+        BEQ     .                  ;pre Kernel 5.23 not supported
+        BLX     r8                 ;MMU_Changing
+        B       doneflush
+
+notFancy
+;flush cache(s) and TLB(s) - StrongARM/ARM6/ARM7 version
+        AND     r4,r4,#&F000
+        ;flush cache
+        CMP     r4,#&A000
+        ARM67_flush_cache NE       ;if not StrongARM, assume 6,7
+        BNE     flushTLB
+        ;StrongARM then (and OS must be 3.7 or later)
+        MOVS    r2,r3              ;ARMA_Cleaner_flipflop, passed in
+        BEQ     noflipflop
+        LDR     r1,[r2]
+        EOR     r1,r1,#16*1024
+        STR     r1,[r2]
+        ARMA_clean_DC r1,r2,r3     ;effectively, fully clean/flush wrt non-interrupt stuff
+noflipflop
+        ARMA_drain_WB
+        ARMA_flush_IC              ;do *not* flush DC - may be interrupt stuff in it
+flushTLB
+        CMP     r4,#&A000
+        ARMA_flush_TLBs EQ
+        ARM67_flush_TLB NE         ;if not StrongARM, assume 6,7
+
+doneflush
+        Pull    "r0-r4"
+
+        LDR     r3,[r0]
+        LDR     r4,NOPInst               ;if inserted NOP, we want to jump here
+        TEQ     r3,r4
+        MOVEQ   r3,#0
+        BEQ     startnew_jump
+
+        LDR     r4,LDRPCInst             ;check if 1st instruction of the form LDR PC, [PC, +/-#x]
+        EORS    r2, r4, r3, LSR #12      ; LDR PC,[PC,+#]
+        CMPNE   r2, #1 :SHL: (23-12)     ; LDR PC,[PC,-#]
+        MOVNE   r3, #0
+        BNE     startnew_jump            ;assume it's a B instr then
+        EOR     r3, r3, r4, LSL #12      ; extract offset, and up/down bit
+        TST     r3, #1 :SHL: 23          ; NE => bit was 0, so -ve
+        RSBNE   r3, r3, #1 :SHL: 23      ; get rid of bit 23 and negate
+        ADD     r3, r3, #8               ; offset in ROM we're reading
+        LDR     r3, [r0, r3]             ; address to jump to (may be in hi- or lo- ROM)
+
+startnew_jump
+; switch into 32-bit mode (we're already in 32-bit config)
+        MRS     r2, CPSR
+        BIC     r2, r2, #&1F
+        ORR     r2, r2, #SVC32_mode
+        MSR     CPSR_c, r2
+        MOV     pc, r6                   ;jump to flat mapped MMU off code
+
+MMUOffInst
+        MOV     r2,#&30                  ; MMU off, in 32-bit config
+        ARM_write_control r2
+        ADD     pc, r0, r3               ; jump to it
+MMUOffInstEnd
+
+LDRPCInst
+        DCI     &E59FF
+NOPInst
+        MOV     R0,R0
+MOVPC0Inst
+        MOV     PC,#0
+
+;DAhandler for softROM DA (needs specific pages)
+;r12 on entry to pregrow points to next page number needed
+;
+;we get away with handler code in app space, because softload runs predesktop
+;(no swapping) and never returns
+;
+DAhandler
+        CMP     r0,#0           ;pregrow? (clears V)
+        MOVNE   pc,r14
+        Push    "r0-r2"
+        LDR     r0,[r12]        ;next page needed
+DAh_pregrowloop
+        STR     r0,[r1],#12
+        ADD     r0,r0,#1
+        SUBS    r2,r2,#1
+        BNE     DAh_pregrowloop
+        STR     r0,[r12]        ;for next call
+        Pull    "r0-r2"
+        MOV     pc,r14
+
+
+; uint32 svcpeek(uint32 *addr)
+svcpeek
+        SWI     XOS_EnterOS
+        LDR     r0, [r0]
+        WritePSRc USR_mode,r3
+        Return  ,LinkNotStacked
+
+; void svcpoke(uint32 *addr, uint32 val)
+;svcpoke
+;        SWI     XOS_EnterOS
+;        STR     r1, [r0]
+;        WritePSRc USR_mode,r3
+;        Return  ,LinkNotStacked
+
+; uint32 svcarmid(void)
+svcarmid
+        SWI     XOS_EnterOS
+        MRC     p15,0,r0,c0,c0,0
+        WritePSRc USR_mode,r3
+        Return  ,LinkNotStacked
+
+; void svcmemcpy(void *dest,void *src,uint32 len)
+svcmemcpy ROUT
+        SWI     XOS_EnterOS
+        ORR     r3,r0,r1
+        ORR     r3,r3,r2
+        TST     r3,#3
+        BEQ     svcmemcpy_words
+10
+        SUBS    r2,r2,#1
+        LDRGEB  r3,[r1],#1
+        STRGEB  r3,[r0],#1
+        BNE     %BT10
+        WritePSRc USR_mode,r3
+        Return  ,LinkNotStacked
+svcmemcpy_words
+        TST     r2,#7
+        BEQ     svcmemcpy_doublewords      
+20
+        SUBS    r2,r2,#4
+        LDRGE   r3,[r1],#4
+        STRGE   r3,[r0],#4
+        BNE     %BT20
+        WritePSRc USR_mode,r3
+        Return  ,LinkNotStacked
+svcmemcpy_doublewords
+30
+        SUBS    r2,r2,#8
+        LDMGEIA r1!,{r3,ip}
+        STMGEIA r0!,{r3,ip}
+        BNE     %BT30
+        WritePSRc USR_mode,r3
+        Return  ,LinkNotStacked
+
+IMB32   Push    "lr"
+        SWI     XOS_SynchroniseCodeAreas
+        Pull    "pc"
+
+IMB26   Push    "lr"
+        ; Temporarily drop into 26bit mode so we can safely call the (26bit) SWI
+        MSR     CPSR_c,#SVC26_mode
+        SWI     XOS_SynchroniseCodeAreas
+        MSR     CPSR_c,#SVC32_mode+I32_bit+F32_bit
+        Pull    "pc"
+
+asm_decompress
+        ; R0 = OS hdr
+        ; R1 = workspace ptr
+        ; Switch to SVC mode to stop clib throwing a hissy fit if an event
+        ; occurs and it tries to unwind the stack
+        MRS     R3,CPSR
+        SWI     OS_EnterOS
+        Push    "r3"
+        ; Get workspace pointer in right reg
+        MOV     R2,R1
+        ; If we're in a 26bit mode we must switch to SVC32 (with IRQ+FIQ disabled) to allow us to safely run the code located in the ROM (which will be in a DA)
+        TST     R3,#&10
+        ADREQ   R1,IMB26
+        MSREQ   CPSR_c,#SVC32_mode+I32_bit+F32_bit
+        ADRNE   R1,IMB32
+        ; Call the decompression code
+        LDR     R3,[R0,#OSHdr_DecompressHdr]
+        ADD     R3,R3,R0
+        LDR     R12,[R3,#OSDecompHdr_Code]
+        MOV     LR,PC
+        ADD     PC,R12,R3
+        ; Back to USR26/USR32
+        Pull    "r3"
+        MSR     CPSR_c,r3
+        MOV     pc,lr
+
+        END

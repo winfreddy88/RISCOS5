@@ -1,0 +1,291 @@
+/*
+ * Copyright (c) 2012, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include "swis.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stddef.h>
+
+#include "Global/RISCOS.h"
+#include "Global/Services.h"
+#include "Global/HALDevice.h"
+#include "Global/HALEntries.h"
+#include "Global/NewErrors.h"
+#include "Interface/Portable.h"
+
+#include "DebugLib/DebugLib.h"
+
+#include "globals.h"
+#include "bmu.h"
+
+typedef struct {
+	uint32_t varno;
+	uint32_t result;
+	uint32_t value;
+} readbmuvariables_t;
+
+typedef struct {
+	uint32_t errnum;
+	char     errmess[8];
+} internaterr_t;
+
+/* Enable this to build a test version of BatMgr that cuts out all Portable module calls and uses simulated battery state instead */
+//#define TESTBED
+
+#pragma no_check_stack
+
+uint32_t bmu_count = 0;
+
+bmu_state_t bmu_state[BMU_MAX];
+
+#define UNSUPPORTED(X) (vars[X].result == PortableBMUR_Unsupported)
+
+_kernel_oserror *bmu_init(void)
+{
+#ifdef TESTBED
+	bmu_count = 2;
+#else
+	/* Enumerate batteries */
+	int i=0; /* Skip BMU 0, it'll be a duplicate of one of the other BMUs, and is only really there for backwards compatability */
+	do {
+		_kernel_oserror *e = _swix(Portable_EnumerateBMU,_INR(0,1)|_OUTR(0,2),i,0,&i,&bmu_state[bmu_count].bmuflags,&bmu_state[bmu_count].validflags);
+		if(e)
+			return e;
+		if(i == -1)
+			break;
+		/* We only care about batteries that power the main system */
+		if(!(bmu_state[bmu_count].bmuflags & PortableBMUDF_System))
+			continue;
+		bmu_state[bmu_count].index = i;
+		/* Query the battery to find what method we should use to obtain % & time remaining */
+		readbmuvariables_t vars[9];
+		vars[0].varno = PortableBMUV_Flags;
+		vars[1].varno = PortableBMUV_BatteryPercentRemaining;
+		vars[2].varno = PortableBMUV_BatteryTimeRemaining;
+		vars[3].varno = PortableBMUV_Current;
+		vars[4].varno = PortableBMUV_SmoothedCurrent;
+		vars[5].varno = PortableBMUV_NominalAvailableCapacity;
+		vars[6].varno = PortableBMUV_UsableCapacity;
+		vars[7].varno = PortableBMUV_CompensatedAvailableCapacity;
+		vars[8].varno = PortableBMUV_NominalCapacity;
+		e = _swix(Portable_ReadBMUVariables,_INR(0,2),i,9,&vars);
+		dprintf(("","bmu_init: %d %d ReadBMUVariables %d %s\n",bmu_count,i,(e?e->errnum:0),(e?e->errmess:"")));
+		if(e)
+			continue; /* Skip this battery? */
+		/* Work out which vars are supported */
+		for(int j=0;j<9;j++)
+		{
+			dprintf(("","[%d] = result %d value %d\n",vars[j].varno,vars[j].result,vars[j].value));
+			if(vars[j].result != PortableBMUR_Unsupported)
+				bmu_state[bmu_count].availablevars |= 1<<vars[j].varno;
+		}
+		/* Verify we can read the status flags */
+		if(!(bmu_state[bmu_count].availablevars & (1<<PortableBMUV_Flags)))
+			continue;
+		/* Verify we have at least some way of estimating charge */
+		if(!(bmu_state[bmu_count].availablevars & (1<<PortableBMUV_BatteryPercentRemaining)))
+		{
+			/* Does the battery track current & full capacity? */
+			if(!(bmu_state[bmu_count].availablevars & ((1<<PortableBMUV_NominalAvailableCapacity)+(1<<PortableBMUV_CompensatedAvailableCapacity))) || !(bmu_state[bmu_count].availablevars & ((1<<PortableBMUV_UsableCapacity)+(1<<PortableBMUV_NominalCapacity))))
+			{
+				/* Do we at least have all the level thresholds? */
+				if(!(bmu_state[bmu_count].validflags & (PortableBMUF_BatteryFlat | PortableBMUF_BatteryLow | PortableBMUF_BatteryFull)))
+					continue;
+			}
+		}
+		/* Time remaining is optional, don't care too much if we don't know how to calculate that */
+		/* Initialise state vars */
+		if(vars[0].result == PortableBMUR_Success)
+			bmu_state[bmu_count].statusflags = vars[0].value;
+		else
+			bmu_state[bmu_count].statusflags = -1;
+		bmu_state[bmu_count].percentremaining = -1;
+		bmu_state[bmu_count].timeremaining = -1;
+		bmu_count++;
+	} while(bmu_count < BMU_MAX);
+#endif
+	if(!bmu_count)
+	{
+		static const internaterr_t hwdep = { ErrorNumber_HardwareDepends, "HWDep" };
+		/* No suitable BMU found */
+		return _swix(MessageTrans_ErrorLookup,_INR(0,2),&hwdep,0,0);
+	}
+	return NULL;
+}
+
+void bmu_shutdown(void)
+{
+	/* ??? */
+}
+
+#pragma check_stack
+
+void bmu_update(void)
+{
+#ifdef TESTBED
+	bmu_state[0].validflags = bmu_state[0].statusflags = PortableBMUF_BatteryPresent + PortableBMUF_BatteryLow;
+	bmu_state[0].percentremaining = 25;
+	bmu_state[0].timeremaining = rand()%512;;
+	bmu_state[1].validflags = bmu_state[1].statusflags = PortableBMUF_BatteryPresent + PortableBMUF_Charging;
+	bmu_state[1].percentremaining = rand()%100;
+	bmu_state[1].timeremaining = -1;
+#else
+	for(int i=0;i<bmu_count;i++)
+	{
+		readbmuvariables_t vars[4]; /* Status flags, 1-2 for charge estimate, 1-2 for time remaining (with exception that if both use two, one is shared) */
+		vars[0].varno = PortableBMUV_Flags;
+		/* Work out how to read charge estimate */
+		int j = 1;
+		int have_capacity = 0;
+		bool can_read_capacity = (bmu_state[i].availablevars & ((1<<PortableBMUV_NominalAvailableCapacity)+(1<<PortableBMUV_CompensatedAvailableCapacity)));
+		bool can_read_full_capacity = (bmu_state[i].availablevars & ((1<<PortableBMUV_UsableCapacity)+(1<<PortableBMUV_NominalCapacity)));
+		bool can_read_current = (bmu_state[i].availablevars & ((1<<PortableBMUV_Current)+(1<<PortableBMUV_SmoothedCurrent)));
+		if(bmu_state[i].availablevars & (1<<PortableBMUV_BatteryPercentRemaining))
+		{
+			vars[j].varno = PortableBMUV_BatteryPercentRemaining;
+			j++;
+		}
+		else if(can_read_capacity && can_read_full_capacity)
+		{
+			have_capacity = j;
+			vars[j].varno = (bmu_state[i].availablevars & (1<<PortableBMUV_CompensatedAvailableCapacity))?PortableBMUV_CompensatedAvailableCapacity:PortableBMUV_NominalAvailableCapacity;
+			j++;
+			vars[j].varno = (bmu_state[i].availablevars & (1<<PortableBMUV_UsableCapacity))?PortableBMUV_UsableCapacity:PortableBMUV_NominalCapacity;
+			j++;
+		}
+		else
+		{
+			/* Rely on status flags */
+		}
+		/* Work out how to read time remaining */
+		if(bmu_state[i].availablevars & (1<<PortableBMUV_BatteryTimeRemaining))
+		{
+			vars[j].varno = PortableBMUV_BatteryTimeRemaining;
+			j++;
+		}
+		else if(can_read_capacity && can_read_current)
+		{
+			if(!have_capacity)
+			{
+				have_capacity = j;
+				vars[j].varno = (bmu_state[i].availablevars & (1<<PortableBMUV_CompensatedAvailableCapacity))?PortableBMUV_CompensatedAvailableCapacity:PortableBMUV_NominalAvailableCapacity;
+				j++;
+			}
+			vars[j].varno = (bmu_state[i].availablevars & (1<<PortableBMUV_SmoothedCurrent))?PortableBMUV_SmoothedCurrent:PortableBMUV_Current;
+			j++;
+		}
+		/* Query battery */
+		_kernel_oserror *e = _swix(Portable_ReadBMUVariables,_INR(0,2),bmu_state[i].index,j,&vars);
+		dprintf(("","bmu_update: %d %d ReadBMUVariables %d %s\n",i,bmu_state[i].index,(e?e->errnum:0),(e?e->errmess:"")));
+		if(e)
+			continue; /* Try again next time */
+#ifdef DEBUG
+		for(int k=0;k<j;k++)
+		{
+			dprintf(("","[%d] = result %d value %d\n",vars[k].varno,vars[k].result,vars[k].value));
+		}
+#endif
+		/* Process results */
+		if(vars[0].result == PortableBMUR_Success)
+			bmu_state[i].statusflags = vars[0].value;
+		if(!(bmu_state[i].statusflags & PortableBMUF_BatteryPresent))
+		{
+			/* No battery, ignore rest */
+			bmu_state[i].percentremaining = bmu_state[i].timeremaining = -1;
+			dprintf(("","-> no battery\n"));
+			continue;
+		}
+		/* Calculate charge percent */
+		j=1;
+		if(bmu_state[i].availablevars & (1<<PortableBMUV_BatteryPercentRemaining))
+		{
+			if(vars[j].result == PortableBMUR_Success)
+			{
+				bmu_state[i].percentremaining = vars[j].value;
+				dprintf(("","-> %d%% remaining (direct)\n",bmu_state[i].percentremaining));
+			}
+			j++;
+		}
+		else if(can_read_capacity && can_read_full_capacity)
+		{
+			if((vars[j].result == PortableBMUR_Success) && (vars[j+1].result == PortableBMUR_Success))
+			{
+				bmu_state[i].percentremaining = (vars[j].value*100)/vars[j+1].value;
+				dprintf(("","-> %d%% remaining (capacity)\n",bmu_state[i].percentremaining));
+			}
+			j+=2;
+		}
+		else
+		{
+			/* Status flags only, don't set percent value */
+			bmu_state[i].percentremaining = -1;
+			dprintf(("","-> unknown %% remaining\n"));
+		}
+		/* Calculate time remaining */
+		if(bmu_state[i].statusflags & PortableBMUF_Charging)
+		{
+			/* Should be infinite */
+			bmu_state[i].timeremaining = -1;
+			dprintf(("","-> charging, unknown time remaining\n"));
+		}
+		else if(bmu_state[i].availablevars & (1<<PortableBMUV_BatteryTimeRemaining))
+		{
+			if(vars[j].result == PortableBMUR_Success)
+			{
+				bmu_state[i].timeremaining = vars[j].value/60;
+				dprintf(("","-> %d time remaining (direct)\n",bmu_state[i].timeremaining));
+			}
+			j++;
+		}
+		else if(can_read_capacity && can_read_current)
+		{
+			if(j == have_capacity)
+				j++;
+			if((vars[have_capacity].result == PortableBMUR_Success) && (vars[j].result == PortableBMUR_Success))
+			{
+				bmu_state[i].timeremaining = (vars[have_capacity].value*60)/vars[j].value;
+				dprintf(("","-> %d time remaining (capacity)\n",bmu_state[i].timeremaining));
+			}
+			j++;
+		}
+		else
+		{
+			/* No estimation method available */
+			bmu_state[i].timeremaining = -1;
+			dprintf(("","-> unknown time remaining"));
+		}
+		/* Clamp values */
+		if(bmu_state[i].percentremaining < 0)
+			bmu_state[i].percentremaining = -1;
+		else if(bmu_state[i].percentremaining > 100)
+			bmu_state[i].percentremaining = 100;
+		if(bmu_state[i].timeremaining < 0)
+			bmu_state[i].timeremaining = -1;
+	}
+#endif
+}

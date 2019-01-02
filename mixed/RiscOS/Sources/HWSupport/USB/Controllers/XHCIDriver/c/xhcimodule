@@ -1,0 +1,406 @@
+/* Copyright 2015 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include "swis.h"
+
+#include "Global/Services.h"
+#include "Global/OSEntries.h"
+#include "Global/OSMisc.h"
+#include "Global/HALEntries.h"
+#include "Global/ModHand.h"
+#undef   Module_Title /* Avoid CMHG clash */
+#include "Interface/USBDriver.h"
+
+#include "callx/callx.h"
+
+#include "sys/types.h"
+#include "sys/systm.h"
+
+#include "machine/bus.h"
+
+#include "dev/usb/usb.h"
+#include "dev/usb/usbdi.h"
+#include "dev/usb/usbdivar.h"
+
+#include "glue.h"
+
+#include "XHCIDriverHdr.h"
+#include "xhcimodule.h"
+#include "xhcireg.h"
+#include "xhcivar.h"
+#include "USB/USBDevFS.h"
+#include "DebugLib/DebugLib.h"
+
+/* Globals */
+void     *g_pw;
+uint32_t  g_msgblock[4];
+uint32_t  g_instance;
+uint32_t  g_controller = 0;
+usbinfo_t g_device;
+barrier_func barriers[3]; /* Write + Read + ReadWrite */
+
+/* Locals */
+static int   *magic;
+static struct xhci_softc xhcisoftc;
+static struct device *usbstate = NULL;
+static bool_t driver_up = FALSE;
+static bool_t driver_registering = FALSE;
+
+/*
+ * International support functions
+ */
+const char *intl_lookup(const char *token)
+{
+	_kernel_oserror *err;
+	static char string[48];
+
+	err = _swix(MessageTrans_Lookup, _INR(0,7),
+	            g_msgblock, token, string, sizeof(string), 0, 0, 0, 0);
+	if (err != NULL)
+	{
+		return "???";
+	}
+	return (const char *)string;
+}
+
+static _kernel_oserror *intl_error(uint32_t which)
+{
+	_kernel_oserror *err;
+	internaterr_t    errblk;
+
+	/* Translate via MessageTrans' internal buffer */
+	sprintf(errblk.errmess, "E%02x", which);
+	errblk.errnum = which + ErrorBase_XHCIDriver;
+	err = _swix(MessageTrans_ErrorLookup, _INR(0,7),
+	            &errblk, g_msgblock, 0, 0, 0, 0, 0, 0);
+
+	return err;
+}
+
+/*
+ * Driver specifics
+ */
+static _kernel_oserror *xhcidriver_registerbus(void *mystate, struct device **yourstate)
+{
+	_kernel_oserror *err;
+	uint32_t version;
+
+	err = _swix(USBDriver_Version, _OUT(0), &version);
+	if (err != NULL) return err;
+	if (version < MIN_USBDRIVER_API_VERSION)
+	{
+		return intl_error(ERR03_OLD_USBD);
+	}
+	dprintf(("" , "USBDriver is API %u\n", version));
+
+	/* Guard this bit to prevent reentering via the service call */
+	driver_registering = TRUE;
+	err = _swix(USBDriver_RegisterBus, _INR(0,1) | _OUT(0),
+	            mystate, MIN_USBDRIVER_API_VERSION,
+	            yourstate);
+	if (err != NULL) *yourstate = NULL;
+	driver_registering = FALSE;
+	dprintf(("", "Bus registered -> %s\n", (err == NULL) ? "OK" : err->errmess));
+
+	return err;
+}
+
+static _kernel_oserror *xhcidriver_spawn(_kernel_swi_regs *r, void *pw, void *arg)
+{
+	_kernel_oserror *err;
+	char name[sizeof(Module_Title) + 1 + 10 + 1 + 10];
+
+	/* Try to register this controller */
+	xhcidriver_registerbus(&xhcisoftc, &usbstate);
+
+	/* Try for another instance for another controller */
+	sprintf(name, Module_Title "%%%u %u", g_instance + 1, g_controller + 1);
+	err = _swix(OS_Module, _INR(0,1), ModHandReason_NewIncarnation, name);
+	dprintf(("" , "Try instance %u for controller %u -> %s\n",
+	              g_instance + 1, g_controller + 1, (err == NULL) ? "OK" : err->errmess));
+
+	UNUSED(r);
+	UNUSED(pw);
+	UNUSED(arg);
+
+	return NULL;
+}
+
+static _kernel_oserror *xhcidriver_startup(void)
+{
+	_kernel_oserror *err;
+
+	if (driver_up) return NULL;
+
+	memset(&xhcisoftc, '\0', sizeof(xhcisoftc));
+	xhcisoftc.sc_ioh = (bus_space_handle_t)(BUS_SPACE_XHCI_OFFSET + (uintptr_t)g_device.hw);
+//TODO! Root hub port power turn on?
+	xhci_init(&xhcisoftc);
+
+	/* Start processing interrupts */
+	err = _swix(OS_ClaimDeviceVector, _INR(0,2), g_device.devno, xhcidriver_irq_entry, g_pw);
+	if (err != NULL) return err;
+	err = _swix(OS_Hardware, _IN(0) | _INR(8,9),
+	                         g_device.devno, OSHW_CallHAL, EntryNo_HAL_IRQEnable);
+	if (err != NULL) return err;
+	dprintf(("", "Claimed device %u\n", g_device.devno));
+
+	driver_up = TRUE;
+
+	return NULL;
+}
+
+static _kernel_oserror *xhcidriver_shutdown(void)
+{
+	if (!driver_up) return NULL;
+
+	dprintf(("", "Shut down " Module_Title " instance %u\n", g_instance));
+
+	/* Emulate NetBSD shutdown */
+	xhci_activate((device_t)&xhcisoftc, DVACT_DEACTIVATE);
+	xhci_detach(&xhcisoftc, DETACH_QUIET);
+//TODO! Root hub port power turn off?
+
+	/* Cancel pending callbacks */
+	callx_remove_all_callafters();
+	callx_remove_all_callbacks();
+
+	/* Get off device */
+	_swix(OS_ReleaseDeviceVector, _INR(0,2), g_device.devno, xhcidriver_irq_entry, g_pw);
+
+	driver_up = FALSE;
+
+	return NULL;
+}
+
+void veneer_install(int *vn, int *st, size_t sz)
+{
+	size_t i;
+	int   *entry_table = vn + (sz / sizeof(void *));
+
+	for (i = 0; i < sz / sizeof(void *); i++)
+	{
+		int *entry = entry_table + (2 * i);
+
+		/* if the method isn't implemented, don't veneer it */
+		if (st[i] == NULL) continue;
+
+		/* copy function pointer into veneer */
+		vn[i] = st[i];
+	
+		/* copy new pointer into structure */
+		st[i] = (int)entry;
+	
+		/* LDR ip, function[i] */
+		entry[0] = 0xE51FC000   /* LDR ip, [pc, #-0] */
+		         + 8            /* go back to current instruction */
+		         + i * 8        /* go back to beginning of veneers */
+		         + sz           /* go back to beginning of struct */
+		         - i * 4;       /* go to func pointer */
+
+		/* B common */
+		entry[1] = 0xEA000000   /* B here + 8 */
+		         | ((magic - entry - 1) & 0x00ffffff);
+	                                /* branch to diff */
+	}
+	_swix(OS_SynchroniseCodeAreas, _INR(0,2), 1,
+	                               entry_table,
+	                               entry_table + 2 * (sz / sizeof(void *)) - 1);
+}
+
+/*
+ * Module functions
+ */
+_kernel_oserror *xhcidriver_init(const char *cmd_tail, int podule_base, void *pw)
+{
+	_kernel_oserror *err;
+
+	g_pw = pw;
+	g_instance = (uint32_t)podule_base;
+
+#ifndef ROM
+	/* Register the messages in the base instance for RAM modules */
+	if (g_instance == 0)
+	{
+		err = _swix(ResourceFS_RegisterFiles, _IN(0), Resources());
+		if (err != NULL) return err;
+	}
+#endif
+	/* Try open, report fail */
+	err = _swix(MessageTrans_OpenFile, _INR(0,2), g_msgblock, Module_MessagesFile, 0);
+	if (err != NULL) goto initdereg;
+
+	/* Open the debug if compiled in */
+	debug_initialise(Module_Title, "", "");
+	debug_set_device(PRINTF_OUTPUT);
+
+	/* Get the memory barriers for DMA related sync */
+	err = _swix(OS_MMUControl, _IN(0) | _OUT(0),
+	            MMUCReason_GetARMop + (ARMop_DMB_Write << 8), &barriers[BARRIER_WRITE - 1]);
+	if (err != NULL) goto initclose;
+	err = _swix(OS_MMUControl, _IN(0) | _OUT(0),
+	            MMUCReason_GetARMop + (ARMop_DMB_Read << 8), &barriers[BARRIER_READ - 1]);
+	if (err != NULL) goto initclose;
+	err = _swix(OS_MMUControl, _IN(0) | _OUT(0),
+	            MMUCReason_GetARMop + (ARMop_DMB_ReadWrite << 8), &barriers[BARRIER_READ + BARRIER_WRITE - 1]);
+	if (err != NULL) goto initclose;
+
+	/* For the first instance, start at 0, otherwise continue from the
+	 * controller number passed in the command_tail string.
+	 */
+	if (g_instance != 0)
+	{
+		if (sscanf(cmd_tail, "%u", &g_controller) == 0)
+		{
+			/* Tail missing or not a number */
+			err = intl_error(ERR00_SINGLE_INSTANCE);
+			goto initclose;
+		}
+	}
+	while (1)
+	{
+		size_t size;
+
+		err = _swix(OS_Hardware, _INR(0,2) | _INR(8,9) | _OUT(0),
+		            g_controller, &g_device, sizeof(g_device),
+		            OSHW_CallHAL, EntryNo_HAL_USBControllerInfo,
+		            &size);
+		if (err != NULL) goto initclose;
+		if (size == 0)
+		{
+			err = intl_error(ERR01_NO_MORE_XHCI);
+			goto initclose;
+		}
+		if ((size == sizeof(g_device)) && (g_device.type == HALUSBControllerType_XHCI))
+		{
+			/* Found another */
+			break;
+		}
+		g_controller++;
+	}
+
+	/* Initialise this one */
+	callx_init(pw);
+	dprintf(("", "Controller %u is at %p\n", g_controller, g_device.hw));
+	magic = veneer_init();
+	if (magic == NULL)
+	{
+		err = intl_error(ERR02_VENEER_CONSTRUCTION);
+		goto initclose;
+	}
+	dprintf(("", "Common veneer magic at %p\n", magic));
+	err = xhcidriver_startup();
+	if (err != NULL) goto initfree;
+	dprintf(("", "Driver start -> %s\n", (err == NULL) ? "OK" : err->errmess));
+
+	/* Do the rest in a callback */
+	callx_add_callback(xhcidriver_spawn, 0);
+
+	return NULL;
+
+initfree:
+	_swix(OS_Module, _IN(0) | _IN(2), ModHandReason_Free, magic);
+initclose:
+	_swix(MessageTrans_CloseFile, _IN(0), g_msgblock);
+initdereg:
+#ifndef ROM
+	if (g_instance == 0) _swix(ResourceFS_DeregisterFiles, _IN(0), Resources());
+#endif
+	return err;
+}
+
+_kernel_oserror *xhcidriver_final(int fatal, int podule, void *pw)
+{
+	/* Tell USBDriver we're going away */
+	if (usbstate != NULL)
+	{
+		_swix(USBDriver_DeregisterBus, _IN(0), usbstate);
+		usbstate = NULL;
+	}
+
+	/* Common shutdown operations as when USB driver goes away */
+	xhcidriver_shutdown();
+
+	/* Tidy up and deregister */
+	if (magic != NULL) _swix(OS_Module, _IN(0) | _IN(2), ModHandReason_Free, magic);
+	_swix(MessageTrans_CloseFile, _IN(0), g_msgblock);
+#ifndef ROM
+	if (g_instance == 0) _swix(ResourceFS_DeregisterFiles, _IN(0), Resources());
+#endif
+
+	UNUSED(fatal);
+	UNUSED(podule);
+	UNUSED(pw);
+
+	return NULL;
+}
+
+void xhcidriver_services(int service_number, _kernel_swi_regs *r, void *pw)
+{
+	switch (service_number)
+	{
+		case Service_USB:
+			switch (r->r[0])
+			{
+				case Service_USB_USBDriverStarting:
+					/* Started after us */
+					if ((usbstate == NULL) && !driver_registering)
+					{
+						xhcidriver_startup();
+						xhcidriver_registerbus(&xhcisoftc, &usbstate);
+					}
+					break;
+
+				case Service_USB_USBDriverDying:
+					/* Died before us */
+					usbstate = NULL;
+					xhcidriver_shutdown();
+					break;
+			}
+			break;
+
+		case Service_PreReset:
+			usbstate = NULL;
+			xhcidriver_shutdown();
+			break;
+#ifndef ROM
+		case Service_ResourceFSStarting:
+			(*(void (*)(void *, void *, void *, void *))r->r[2])(Resources(), 0, 0, (void *)r->r[3]);
+			break;
+#endif
+	}
+
+	UNUSED(pw);
+}
+
+int xhcidriver_irq_handler(_kernel_swi_regs *r, void *pw)
+{
+	int handled;
+
+	/* Prevent recursion by masking the device while we handle the interrupt */
+	_swix(OS_Hardware, _IN(0) | _INR(8,9), g_device.devno,
+	                                       OSHW_CallHAL, EntryNo_HAL_IRQDisable);
+	handled = xhci_intr(&xhcisoftc);
+	_swix(OS_Hardware, _IN(0) | _INR(8,9), g_device.devno,
+	                                       OSHW_CallHAL, EntryNo_HAL_IRQEnable);
+
+	UNUSED(r);
+	UNUSED(pw);
+
+	return handled ? 0 : 1;
+}

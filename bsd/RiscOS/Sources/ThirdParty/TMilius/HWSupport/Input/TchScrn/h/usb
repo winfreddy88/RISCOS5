@@ -1,0 +1,212 @@
+/** @file
+
+  Contains access to the touch screen over USB and is used by the driver
+  itself and the calibration program.
+
+  */
+/* Created 31.12.2007 T. Milius
+   Changed 12.04.2016 T. Milius D-WAV egalax HID added
+   Changed 15.04.2016 T. Milius Entirely rewrite of USB handling */
+/* Copyright (c) 2007-2016 by Thomas Milius Stade, Germany
+* All rights reserved.
+*
+* Redistribution and use in source and binary forms, with or without
+* modification, are permitted provided that the following conditions are met:
+*     * Redistributions of source code must retain the above copyright
+*       notice, this list of conditions and the following disclaimer.
+*     * Redistributions in binary form must reproduce the above copyright
+*       notice, this list of conditions and the following disclaimer in the
+*       documentation and/or other materials provided with the distribution.
+*     * Neither the name of the &lt;organization&gt; nor the
+*       names of its contributors may be used to endorse or promote products
+*       derived from this software without specific prior written permission.
+*
+* THIS SOFTWARE IS PROVIDED BY Thomas Milius Stade, Germany ``AS IS'' AND ANY
+* EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+* WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+* DISCLAIMED. IN NO EVENT SHALL Thomas Milius Stade, Germany BE LIABLE FOR ANY
+* DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+* (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+* LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+* ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+* (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+* SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE. */
+/* RISC OS */
+/* Note: Used for application and module.
+   So take care that module stack limit is not exceeded. */
+
+#ifndef usb_h
+#define usb_h
+
+/* !!!!!!!!!! libraries !!!!!!!!!! */
+/* ---------- ANSI-C ---------- */
+#include <stdbool.h>
+#include <stdio.h>
+#include <string.h>
+
+/* ------------ RISC OS ------------ */
+#include <kernel.h>
+#include <swis.h>
+
+/* ------------ own ------------ */
+#include "common_mod.h"
+
+/* !!!!!!!!!!! definitions !!!!!!!!!! */
+
+/* !!!!!!!!!! data structures !!!!!!!!!! */
+
+/* !!!!!!!!!! support functions !!!!!!!!!! */
+
+/* !!!!!!!!!! functions !!!!!!!!!! */
+/** The function will update the x and y position of the pen on the screen and the button state
+    inside a given touch_screen_control_struct structure.
+
+    It will return the information whether an error occurred or the
+    position of the pen has been changed.
+
+    USB variant. */
+int touch_screen_get_position_usb(touch_screen_control_struct *touch_screen_control,
+                                  int panel_type,
+                                  bool clean_buffer)
+{
+int result;
+unsigned int position;
+int data_size;
+int buffer_offset;
+bool data_available;
+_kernel_swi_regs regs;
+_kernel_oserror *error_os;
+
+if (touch_screen_control->input_file_handle == 0) return TOUCHSCREEN_CONNECTION_RESULT_ERROR;
+result=TOUCHSCREEN_CONNECTION_RESULT_NO_DATA;
+switch(panel_type) {
+  case TOUCHSCREEN_TYPE_DWAV_EGALAX: {
+    buffer_offset=0;
+    data_size=16;
+    }
+  break;
+  case TOUCHSCREEN_TYPE_DWAV_EGALAX_HID:
+  case TOUCHSCREEN_TYPE_DWAV_EGALAX_HID2: {
+    buffer_offset=1;
+    data_size=6;
+    }
+  break;
+  }
+/* Do we require more data? */
+if (touch_screen_control->buffer_size < data_size) {
+  /* Fetch bytes from touch screen */
+  regs.r[0]=4;
+  regs.r[1]=touch_screen_control->input_file_handle;
+  regs.r[2]=(int) touch_screen_control->buffer + touch_screen_control->buffer_size;
+  if (clean_buffer) {
+    /* Get all, ignore data after the first one. */
+    regs.r[3]=256 - touch_screen_control->buffer_size;
+    }
+  else {
+    regs.r[3]=data_size - touch_screen_control->buffer_size;
+    }
+  if ((error_os=_kernel_swi(OS_GBPB, &regs, &regs)) != NULL) {
+    return TOUCHSCREEN_CONNECTION_RESULT_ERROR;
+    }
+  if (clean_buffer) {
+    touch_screen_control->buffer_size+=256 - touch_screen_control->buffer_size - regs.r[3];
+    }
+  else {
+    touch_screen_control->buffer_size+=data_size - touch_screen_control->buffer_size - regs.r[3];
+    }
+  }
+data_available=false;
+if (touch_screen_control->buffer_size >= data_size) {
+  /* Data is available */
+  data_available=true;
+  touch_screen_control->buffer_size=0;
+  if ((panel_type == TOUCHSCREEN_TYPE_DWAV_EGALAX_HID) ||
+      (panel_type == TOUCHSCREEN_TYPE_DWAV_EGALAX_HID2)){
+    if (touch_screen_control->buffer[0] != 1) {
+      data_available=false;
+      }
+    }
+  /* Note time of last activity */
+  _kernel_swi(OS_ReadMonotonicTime, &regs, &regs);
+  touch_screen_control->last_pressure_time=regs.r[0];
+  if (data_available) {
+    /* First byte
+      129 indicates Pressure 16 Byte Block
+      128 indicates Release  16 Byte Block
+      else ignore buffer content in case of transmission errors. */
+    if ((touch_screen_control->buffer[0 + buffer_offset] == 128) ||
+        (touch_screen_control->buffer[0 + buffer_offset] == 129)) {
+      /* Block received. Evaluate */
+      /* Assume no change. */
+      result=TOUCHSCREEN_CONNECTION_RESULT_NO_CHANGE;
+      if (touch_screen_control->buffer[0 + buffer_offset] == 129) {
+        if (touch_screen_control->state == TOUCHSCREEN_STATE_RELEASED) {
+          result=TOUCHSCREEN_CONNECTION_RESULT_CHANGE;
+          }
+        touch_screen_control->state=TOUCHSCREEN_STATE_PRESSED;
+        }
+      else {
+        if (touch_screen_control->state == TOUCHSCREEN_STATE_PRESSED) {
+          result=TOUCHSCREEN_CONNECTION_RESULT_CHANGE;
+          }
+        touch_screen_control->state=TOUCHSCREEN_STATE_RELEASED;
+        }
+      /* Evaluate the positions. */
+      /* horizontal X */
+      switch(panel_type) {
+        case TOUCHSCREEN_TYPE_DWAV_EGALAX: {
+          position=touch_screen_control->buffer[1 + buffer_offset]<<8 | ((touch_screen_control->buffer[2 + buffer_offset] << 1) & 0xFE);
+          }
+        break;
+        case TOUCHSCREEN_TYPE_DWAV_EGALAX_HID: {
+          position=touch_screen_control->buffer[3 + buffer_offset]<<0 | (touch_screen_control->buffer[4 + buffer_offset] << 8);
+          }
+        break;
+        case TOUCHSCREEN_TYPE_DWAV_EGALAX_HID2: {
+          position=touch_screen_control->buffer[1 + buffer_offset]<<0 | (touch_screen_control->buffer[2 + buffer_offset] << 8);
+          }
+        break;
+        }
+      if (touch_screen_control->last_x_position != position) {
+        result=TOUCHSCREEN_CONNECTION_RESULT_CHANGE;
+        }
+      touch_screen_control->last_x_position=position;
+      /* vertical Y */
+      switch(panel_type) {
+        case TOUCHSCREEN_TYPE_DWAV_EGALAX: {
+          position=touch_screen_control->buffer[3 + buffer_offset]<<8 | ((touch_screen_control->buffer[4 + buffer_offset] << 1) & 0xFE);
+          }
+        break;
+        case TOUCHSCREEN_TYPE_DWAV_EGALAX_HID: {
+          position=touch_screen_control->buffer[1 + buffer_offset]<<0 | (touch_screen_control->buffer[2 + buffer_offset] << 8);
+          }
+        break;
+        case TOUCHSCREEN_TYPE_DWAV_EGALAX_HID2: {
+          position=touch_screen_control->buffer[3 + buffer_offset]<<0 | (touch_screen_control->buffer[4 + buffer_offset] << 8);
+          }
+        break;
+        }
+      if (touch_screen_control->last_y_position != position) {
+        result=TOUCHSCREEN_CONNECTION_RESULT_CHANGE;
+        }
+      touch_screen_control->last_y_position=position;
+      }
+    }
+  }
+if (!data_available) {
+  /* No data available */
+  /* Data is delivered continously in case of pressure.
+     If there is no data devilered this indicates that
+     the pen has been released. */
+  if (touch_screen_control->state == TOUCHSCREEN_STATE_PRESSED) {
+    _kernel_swi(OS_ReadMonotonicTime, &regs, &regs);
+    if ((regs.r[0] - touch_screen_control->last_pressure_time) > 4) {
+      result=TOUCHSCREEN_CONNECTION_RESULT_CHANGE;
+      touch_screen_control->state=TOUCHSCREEN_STATE_RELEASED;
+      }
+    }
+  }
+return result;
+}
+
+#endif

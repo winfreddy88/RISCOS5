@@ -1,0 +1,962 @@
+/*
+ * Copyright (c) 2012, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include <stdarg.h>
+#include <stdlib.h>
+#include "kernel.h"
+#include "swis.h"
+#include "Global/HALEntries.h"
+#include "AsmUtils/irqs.h"
+#include "Interface/RTSupport.h"
+#include "callx/callx.h"
+
+#include <sys/callout.h>
+#include <sys/queue.h>
+
+#include <machine/bus.h>
+#include <dev/usb/usb.h>
+#include <dev/usb/usbdi.h>
+#include <dev/usb/usbdivar.h>
+
+#include "cmodule.h"
+#include "dwc_os.h"
+#include "dwc_common_riscos.h"
+#include "dwc_otg_riscos.h"
+
+extern uint32_t g_dbg_lvl;
+uint32_t g_dbg_lvl = 0;
+
+static const int dummy_pollword_1 = 1;
+static const int dummy_pollword_0 = 0;
+
+typedef struct {
+	uint32_t flags;
+	uint32_t *pollword;
+	uint32_t timeout;
+} RT_routine_result_t;
+
+dwc_bool_t DWC_IN_IRQ(void)
+{
+	return ((_swi(RT_ReadInfo,_IN(0)|_RETURN(0),RTReadInfo_Handle) == -1)?YES:NO);
+}
+
+dwc_bool_t DWC_IN_BH(void)
+{
+	return NO;
+}
+
+/* Diagnostic messages */
+
+#ifdef DEBUG
+void __DWC_WARN(char *format,...)
+{
+	va_list a;
+	va_start(a,format);
+	dvprintf(("",format,a));
+	va_end(a);
+}
+
+void __DWC_ERROR(char *format,...)
+{
+	va_list a;
+	va_start(a,format);
+	dvprintf(("",format,a));
+	va_end(a);
+}
+
+void DWC_EXCEPTION(char *format,...)
+{
+	ensure_irqs_off();
+	va_list a;
+	va_start(a,format);
+	dvprintf(("",format,a));
+	va_end(a);
+	_swix(0x531C1,0); /* DADebug_Print */
+	/* Halt */
+	while(1) {};
+}
+
+void __DWC_DEBUG(char *format,...)
+{
+	va_list a;
+	va_start(a,format);
+	dvprintf(("",format,a));
+	va_end(a);
+}
+#endif
+
+/* Memory management */
+
+void *__DWC_DMA_ALLOC(void *dma_ctx, uint32_t size, dwc_dma_t *dma_addr)
+{
+	(void) dma_ctx;
+	void *mem;
+	_kernel_oserror *e = _swix(PCI_RAMAlloc,_INR(0,2)|_OUTR(0,1),size,0,0,&mem,dma_addr);
+	if(e)
+		return NULL;
+	if(mem)
+	{
+		memset(mem,0,size);
+		/* Convert ARM phys addr to DMA addr */
+		*dma_addr += dma_offset;
+	}
+	return mem;
+}
+
+void *__DWC_DMA_ALLOC_ATOMIC(void *dma_ctx, uint32_t size, dwc_dma_t *dma_addr)
+{
+	/* TODO - probably want to be clever about this */
+	return __DWC_DMA_ALLOC(dma_ctx,size,dma_addr);
+}
+
+void __DWC_DMA_FREE(void *dma_ctx, uint32_t size, void *virt_addr, dwc_dma_t dma_addr)
+{
+	(void) dma_ctx;
+	(void) size;
+	(void) dma_addr;
+	_swix(PCI_RAMFree,_IN(0),virt_addr);
+}
+
+/* The DWC driver can make memory allocations on quite a regular basis, and
+   doesn't always seem to cope very well if the allocations fail.
+   To reduce the load on the heap manager we'll use a simple bucket and chain
+   system to collect together all the 'free' memory blocks, so that they can
+   be quickly and easily reused for future transfers. This somewhat mimics
+   the way the BSD code recycles their xfer structs */
+
+#define MAX_BUCKET_SIZE 1024 /* Maximum block size that will be placed into a bucket */
+#define BUCKET_GRANULARITY 32 /* Size that OS_Module rounds RMA allocations to */
+struct mem_chain {
+	union {
+		struct mem_chain *next; /* Free blocks point at the next block in the chain */
+		struct mem_chain **bucket; /* Allocated blocks point at the bucket they belong in */
+		uint32_t flags; /* Allocated blocks also have two flag bits in their bottom word */
+	} u;
+};
+
+#define BUCKET_FLAG_PENDING_CB 1 /* an endpoint_disable_cb is pending for this alloc. This flags avoids us having multiple pending disable callbacks for the same endpoint, and allows us to cancel our callback if DWC decides to free the endpoint before we do */
+
+static struct mem_chain *mem_buckets[MAX_BUCKET_SIZE/BUCKET_GRANULARITY];
+
+void *__DWC_ALLOC(void *mem_ctx, uint32_t size)
+{
+	(void) mem_ctx;
+	/* Round allocation size to bucket size
+	   We need 8 bytes of overhead: 4 for the 'bucket' ptr in allocated blocks, and 4 bytes for the size field the heap manager's size field
+	   If we were feeling naughty we could peek at the heap manager's size field to work out which bucket an allocated block belongs in, but for now let's do it by the book */
+	size += (BUCKET_GRANULARITY-1)+8;
+	size &= ~(BUCKET_GRANULARITY-1);
+
+	struct mem_chain **bucket = NULL;
+	struct mem_chain *block;
+
+	if(size < MAX_BUCKET_SIZE)
+		bucket = &mem_buckets[size/BUCKET_GRANULARITY];
+
+	int irqs = ensure_irqs_off();
+	if(!bucket || !*bucket)
+	{
+		restore_irqs(irqs);
+		block = malloc(size-4); /* Subtract 4 bytes for heap block header */
+		if(!block)
+		{
+			dwc_debug("Failed to allocate %d bytes",size-4);
+			return NULL;
+		}
+	}
+	else
+	{
+		block = *bucket;
+		*bucket = block->u.next;
+		restore_irqs(irqs);
+	}
+	block->u.bucket = bucket;
+	memset(block+1,0,size-8); /* Subtract 8 bytes for heap block header and our header */
+	DPRINTFN(20,("dwc_alloc -> %08x\n",block+1));
+	return block+1;
+}
+
+void *__DWC_ALLOC_ATOMIC(void *mem_ctx, uint32_t size)
+{
+	/* Heap manager is atomic */
+	return __DWC_ALLOC(mem_ctx,size);
+}
+
+void __DWC_FREE(void *mem_ctx, void *addr)
+{
+	(void) mem_ctx;
+	if(!addr)
+		return;
+	DPRINTFN(20,("dwc_free -> %08x\n",addr));
+	struct mem_chain *block = ((struct mem_chain *) addr)-1;
+	uint32_t flags = block->u.flags & 0x3;
+	block->u.flags &= ~flags;
+	if(flags & BUCKET_FLAG_PENDING_CB)
+	{
+		DPRINTFN(15,("cancelling endpoint_disable_cb\n"));
+		callx_remove_callback(endpoint_disable_cb,addr);
+	}
+	struct mem_chain **bucket = block->u.bucket;
+	if(!bucket)
+	{
+		free(block);
+		return;
+	}
+	/* Add this block back onto the chain */
+	int irqs = ensure_irqs_off();
+	block->u.next = *bucket;
+	*bucket = block;
+	restore_irqs(irqs);
+}
+
+char *DWC_STRDUP(char const *str)
+{
+	char *c = DWC_ALLOC(strlen(str)+1);
+	if(c)
+		strcpy(c,str);
+	return c;
+}
+
+void register_endpoint_disable_cb(void *addr)
+{
+	if(!addr)
+		return;
+	struct mem_chain *block = ((struct mem_chain *) addr)-1;
+	DPRINTFN(15,("register_endpoint_disable_cb: %08x %d\n",addr,block->u.flags & BUCKET_FLAG_PENDING_CB));
+	if(block->u.flags & BUCKET_FLAG_PENDING_CB)
+		return;
+	block->u.flags |= BUCKET_FLAG_PENDING_CB;
+	callx_add_callback(endpoint_disable_cb,addr);
+}
+
+/* Wait queues */
+
+struct dwc_waitq_entry
+{
+	uint32_t pollword;
+	LIST_ENTRY(dwc_waitq_entry) list;
+};
+
+struct dwc_waitq
+{
+	LIST_HEAD(,dwc_waitq_entry) list;
+};
+
+dwc_waitq_t *DWC_WAITQ_ALLOC(void)
+{
+	dwc_waitq_t *q = DWC_ALLOC(sizeof(dwc_waitq_t));
+	LIST_INIT(&q->list);
+	return q;
+}
+
+void DWC_WAITQ_FREE(dwc_waitq_t *wq)
+{
+	DWC_FREE(wq);
+}
+
+static int32_t check_wait_result(_kernel_oserror *e,struct dwc_waitq_entry *entry,int irq)
+{
+	uint32_t result = entry->pollword;
+	if(e)
+	{
+		LIST_REMOVE(entry,list);
+		result = 3;
+	}
+	restore_irqs(irq);
+	DWC_FREE(entry);
+	switch(result)
+	{
+	case 0:
+		return -DWC_E_TIMEOUT;
+	case 1:
+		return 0;
+	case 2:
+		return -DWC_E_ABORT;
+	case 3:
+	default:
+		return -DWC_E_UNKNOWN;
+	}
+}
+
+int32_t DWC_WAITQ_WAIT(dwc_waitq_t *wq, dwc_waitq_condition_t condition, void *data)
+{
+	if(condition(data))
+		return 1;
+	/* Add ourselves to the queue */
+	/* Must alloc entry from heap, since we might be using the shared SVC stack */
+	struct dwc_waitq_entry *entry = DWC_ALLOC(sizeof(struct dwc_waitq_entry));
+	if(!entry)
+		return -DWC_E_UNKNOWN;
+	entry->pollword = 0;
+	/* Atomic insert and yield */
+	int irq = ensure_irqs_off();
+	LIST_INSERT_HEAD(&wq->list,entry,list);
+	_kernel_oserror *e = _swix(RT_Yield,_IN(1),&entry->pollword);
+	return check_wait_result(e,entry,irq);
+}
+
+int32_t DWC_WAITQ_WAIT_TIMEOUT(dwc_waitq_t *wq, dwc_waitq_condition_t condition, void *data, int32_t msecs)
+{
+	if(condition(data))
+		return 1;
+	/* Add ourselves to the queue */
+	/* Must alloc entry from heap, since we might be using the shared SVC stack */
+	struct dwc_waitq_entry *entry = DWC_ALLOC(sizeof(struct dwc_waitq_entry));
+	if(!entry)
+		return -DWC_E_UNKNOWN;
+	entry->pollword = 0;
+	int32_t csecs = (msecs+9)/10;
+	/* Atomic insert and yield */
+	int irq = ensure_irqs_off();
+	LIST_INSERT_HEAD(&wq->list,entry,list);
+	_kernel_oserror *e = _swix(RT_TimedYield,_INR(1,2),&entry->pollword,csecs+_swi(OS_ReadMonotonicTime,_RETURN(0)));
+	return check_wait_result(e,entry,irq);
+}
+
+static void wait_trigger(dwc_waitq_t *wq,int status)
+{
+	int irq = ensure_irqs_off();
+	struct dwc_waitq_entry *entry = LIST_FIRST(&wq->list);
+	int yield = (int) entry;
+	while(entry)
+	{
+		entry->pollword = status;
+		LIST_REMOVE(entry,list);
+		entry = LIST_FIRST(&wq->list);
+	}
+	restore_irqs(irq);
+	/* Only yield if there was something to wake up */
+	if(yield)
+		_swix(RT_Yield,_IN(1),&dummy_pollword_1);
+}
+
+void DWC_WAITQ_TRIGGER(dwc_waitq_t *wq)
+{
+	wait_trigger(wq,1);
+}
+
+void DWC_WAITQ_ABORT(dwc_waitq_t *wq)
+{
+	wait_trigger(wq,2);
+}
+
+/* Threads */
+
+#define THREAD_STACK_SIZE 16384
+
+struct dwc_thread
+{
+	LIST_ENTRY(dwc_thread) list;
+
+	uint32_t rt_handle;
+	dwc_bool_t stop;
+	int retval;
+	uint32_t stopped;
+	_kernel_stack_chunk *stack;
+
+	dwc_thread_function_t thread_function;
+	char *name;
+	void *data;
+};
+
+static LIST_HEAD(thread_list, dwc_thread) thread_list = LIST_HEAD_INITIALIZER(thread_list);
+
+static void thread_wrapper(dwc_thread_t *t)
+{
+	/* Initialise t->rt_handle */
+	_swix(RT_ReadInfo,_IN(0)|_OUT(0),RTReadInfo_Handle,&t->rt_handle);
+	if(!t->stop)
+		t->retval = t->thread_function(t->data);
+	ensure_irqs_off();
+	t->stopped = 1;
+	_swix(RT_Deregister,_INR(0,1),0,t->rt_handle);
+}
+
+dwc_thread_t *DWC_THREAD_RUN(dwc_thread_function_t thread_function, char *name, void *data)
+{
+	dwc_thread_t *t = DWC_ALLOC(sizeof(dwc_thread_t));
+	if(!t)
+		return NULL;
+	_kernel_stack_chunk *stack = DWC_ALLOC(THREAD_STACK_SIZE);
+	if(!stack)
+	{
+		DWC_FREE(t);
+		return NULL;
+	}
+	t->stop = NO;
+	t->retval = -DWC_E_ABORT;
+	t->stack = stack;
+	stack->sc_mark = 0xF60690FF;
+	stack->sc_size = THREAD_STACK_SIZE;
+	memcpy(stack+1, _kernel_current_stack_chunk()+1, 28);
+
+	t->thread_function = thread_function;
+	t->name = DWC_STRDUP(name);
+	t->data = data;
+
+	int irq = ensure_irqs_off();
+	LIST_INSERT_HEAD(&thread_list,t,list);
+	_kernel_oserror *e = _swix(RT_Register,_INR(0,7)|_OUT(0),0,thread_wrapper,t,private_word,&dummy_pollword_1, ((int) stack) + 560, ((int) stack) + THREAD_STACK_SIZE, "DWCDriver:144",&t->rt_handle);
+	if(e)
+	{
+		LIST_REMOVE(t,list);
+		restore_irqs(irq);
+		DWC_FREE(t->name);
+		DWC_FREE(t);
+		DWC_FREE(stack);
+		return NULL;
+	}
+	restore_irqs(irq);
+	return t;
+}
+
+int DWC_THREAD_STOP(dwc_thread_t *thread)
+{
+	if(!thread)
+		return -DWC_E_ABORT;
+	/* DWCTODO - Assuming that DWC_THREAD_STOP will only be called once for each thread
+	   Could handle multiple stop calls by using a counter within the thread? Then whoever is last is the one to free the memory */
+	thread->stop = YES;
+	_swix(RT_Yield,_IN(1),&thread->stopped);
+	int ret = thread->retval;
+	int irq = ensure_irqs_off();
+	LIST_REMOVE(thread,list);
+	restore_irqs(irq);
+	DWC_FREE(thread->name);
+	DWC_FREE(thread->stack);
+	DWC_FREE(thread);
+	return ret;
+}
+
+dwc_bool_t DWC_THREAD_SHOULD_STOP(dwc_thread_t *thread)
+{
+	return thread->stop;
+}
+
+/* Work queues */
+
+struct dwc_workq_entry
+{
+	union {
+		STAILQ_ENTRY(dwc_workq_entry) list;
+		dwc_workq_t *queue;
+	} u;
+
+	dwc_work_callback_t work_cb;
+	void *data;
+	char *name;
+};
+
+struct dwc_workq
+{
+	uint32_t stop; /* 1 if we want the queue to stop */
+	uint32_t stopped; /* 1 if queue has stopped */
+	uint32_t pollword; /* 1 if we want the queue to wake */
+	uint32_t pending; /* total count of pending work (including delayed ones) */
+	uint32_t idle; /* 1 if (pending == 0) */
+	_kernel_stack_chunk *stack;
+
+	STAILQ_HEAD(, dwc_workq_entry) list;
+	char *name;
+};
+
+static __value_in_regs RT_routine_result_t workq_wrapper(dwc_workq_t *q)
+{
+	ensure_irqs_off();
+	struct dwc_workq_entry *e = STAILQ_FIRST(&q->list);
+	while(e)
+	{
+		STAILQ_REMOVE_HEAD(&q->list,u.list);
+		ensure_irqs_on();
+		e->work_cb(e->data);
+		DWC_FREE(e->name);
+		DWC_FREE(e);
+		ensure_irqs_off();
+		e = STAILQ_FIRST(&q->list);
+		q->pending--;
+	}
+	if(q->stop && !q->pending)
+	{
+		uint32_t rt_handle;
+		_swix(RT_ReadInfo,_IN(0)|_OUT(0),RTReadInfo_Handle,&rt_handle);
+		q->stopped = 1;
+		_swix(RT_Deregister,_INR(0,1),0,rt_handle);
+	}
+	q->pollword = 0;
+	q->idle = !q->pending;
+	return (RT_routine_result_t) { 0, 0, 0 };
+}
+
+dwc_workq_t *DWC_WORKQ_ALLOC(char *name)
+{
+	dwc_workq_t *q = DWC_ALLOC(sizeof(dwc_workq_t));
+	if(!q)
+		return NULL;
+	_kernel_stack_chunk *stack = DWC_ALLOC(THREAD_STACK_SIZE);
+	if(!stack)
+	{
+		DWC_FREE(q);
+		return NULL;
+	}
+	q->idle = 0;
+	q->pollword = 1; /* Give it a kick on startup so that it can disable interrupts. If interrupts are left enabled it can cause problems when we try and shut down during Service_PreReset */
+	q->name = (name?DWC_STRDUP(name):0);
+	q->stack = stack;
+	stack->sc_mark = 0xF60690FF;
+	stack->sc_size = THREAD_STACK_SIZE;
+	memcpy(stack+1, _kernel_current_stack_chunk()+1, 28);
+	STAILQ_INIT(&q->list);
+
+	_kernel_oserror *e = _swix(RT_Register,_INR(0,7),0,workq_wrapper,q,private_word,&q->pollword, ((int) stack) + 560, ((int) stack) + THREAD_STACK_SIZE, "DWCDriver:144");
+	if(e)
+	{
+		DWC_FREE(q->name);
+		DWC_FREE(q);
+		DWC_FREE(stack);
+		return NULL;
+	}
+	_swix(RT_Yield,_IN(1),&q->idle);
+	return q;
+}
+
+void DWC_WORKQ_FREE(dwc_workq_t *workq)
+{
+	/* DWCTODO - Assuming that DWC_WORKQ_FREE will only be called once for each queue */
+	workq->stop = 1;
+	workq->pollword = 1;
+	_swix(RT_Yield,_IN(1),&workq->stopped);
+	DWC_FREE(workq->name);
+	DWC_FREE(workq->stack);
+	DWC_FREE(workq);
+}
+
+void DWC_WORKQ_SCHEDULE(dwc_workq_t *workq, dwc_work_callback_t work_cb, void *data, char *format, ...)
+{
+	va_list a;
+	va_start(a,format);
+	char buf[128];
+	if(format)
+		vsnprintf(buf,sizeof(buf),format,a);
+	else
+		buf[0] = 0;
+	va_end(a);
+	struct dwc_workq_entry *e = DWC_ALLOC(sizeof(struct dwc_workq_entry)+strlen(buf)+1);
+	if(!e)
+		return;
+	e->name = (char *) (e+1);
+	strcpy(e->name,buf);
+	e->data = data;
+	e->work_cb = work_cb;
+	int irq = ensure_irqs_off();
+	STAILQ_INSERT_TAIL(&workq->list,e,u.list);
+	workq->pollword = 1;
+	workq->pending++;
+	workq->idle = 0;
+	restore_irqs(irq);
+	/* Assume the fact that it's being inserted into a work queue means that we don't want to perform the work immediately */
+	/* i.e. don't yield */
+}
+
+static _kernel_oserror *delayed_workq_wrapper(_kernel_swi_regs *r,void *pw,void *handle)
+{
+	(void) r;
+	(void) pw;
+	struct dwc_workq_entry *e = (struct dwc_workq_entry *) handle;
+	dwc_workq_t *q = e->u.queue;
+	STAILQ_INSERT_TAIL(&q->list,e,u.list);
+	q->pollword = 1;
+	return NULL;
+}
+
+void DWC_WORKQ_SCHEDULE_DELAYED(dwc_workq_t *workq, dwc_work_callback_t work_cb, void *data, uint32_t time, char *format, ...)
+{
+	va_list a;
+	va_start(a,format);
+	char buf[128];
+	if(format)
+		vsnprintf(buf,sizeof(buf),format,a);
+	else
+		buf[0] = 0;
+	va_end(a);
+	struct dwc_workq_entry *e = DWC_ALLOC(sizeof(struct dwc_workq_entry)+strlen(buf)+1);
+	if(!e)
+		return;
+	e->name = (char *) (e+1);
+	strcpy(e->name,buf);
+	e->data = data;
+	e->work_cb = work_cb;
+	e->u.queue = workq;
+	int irq = ensure_irqs_off();
+	workq->pending++;
+	workq->idle = 0;
+	restore_irqs(irq);
+	/* Register a ticker event that will schedule this task for us */
+	callx_add_callafter((time+9)/10,delayed_workq_wrapper,e);
+}
+
+int DWC_WORKQ_PENDING(dwc_workq_t *workq)
+{
+	return workq->pending;
+}
+
+int DWC_WORKQ_WAIT_WORK_DONE(dwc_workq_t *workq,int timeout)
+{
+	if(workq->idle)
+		return 0;
+	timeout = ((timeout+9)/10)+1+_swi(OS_ReadMonotonicTime,_RETURN(0));
+	_swix(RT_TimedYield,_INR(1,2),&workq->idle,timeout);
+	return (workq->idle?0:-1);
+}
+
+/* Tasklets */
+
+/* Tasklets are implemented using a simplified workq that runs at a higher priority level */
+
+struct dwc_tasklet
+{
+	LIST_ENTRY(dwc_tasklet) list;
+
+	dwc_tasklet_callback_t cb;
+	void *data;
+	uint32_t count;
+};
+
+struct tasklet_state
+{
+	uint32_t stop;
+	uint32_t stopped;
+	uint32_t pollword;
+	uint32_t idle;
+
+	LIST_HEAD(, dwc_tasklet) list;
+};
+
+static struct tasklet_state tasklets;
+static char tasklet_stack[THREAD_STACK_SIZE];
+
+static __value_in_regs RT_routine_result_t tasklet_wrapper(struct tasklet_state *s)
+{
+	struct dwc_tasklet *t = LIST_FIRST(&s->list);
+	while(t)
+	{
+		while(t->count)
+		{
+			ensure_irqs_on();
+			t->cb(t->data);
+			ensure_irqs_off();
+			t->count--;
+		}
+		LIST_REMOVE(t,list);
+		t = LIST_FIRST(&s->list);
+	}
+	if(s->stop)
+	{
+		uint32_t rt_handle;
+		_swix(RT_ReadInfo,_IN(0)|_OUT(0),RTReadInfo_Handle,&rt_handle);
+		s->stopped = 1;
+		_swix(RT_Deregister,_INR(0,1),0,rt_handle);
+	}
+	s->idle = 1;
+	s->pollword = 0;
+	return (RT_routine_result_t) { 0, 0, 0 };
+}
+
+dwc_tasklet_t *DWC_TASK_ALLOC(char *name, dwc_tasklet_callback_t cb, void *data)
+{
+	(void) name;
+	dwc_tasklet_t *t = DWC_ALLOC(sizeof(dwc_tasklet_t));
+	if(!t)
+		return NULL;
+	t->cb = cb;
+	t->data = data;
+	t->count = 0;
+	return t;
+}
+
+void DWC_TASK_FREE(dwc_tasklet_t *t)
+{
+	/* Ensure task isn't running */
+	int irq = ensure_irqs_off();
+	if(t->count)
+	{
+		_swix(RT_Yield,_IN(1),&tasklets.idle);
+	}
+	restore_irqs(irq);
+	DWC_FREE(t);
+}
+
+void DWC_TASK_SCHEDULE(dwc_tasklet_t *t)
+{
+	int irq = ensure_irqs_off();
+	if(!(t->count++))
+	{
+		LIST_INSERT_HEAD(&tasklets.list,t,list);
+		tasklets.pollword = 1;
+		tasklets.idle = 0;
+	}
+	restore_irqs(irq);
+	/* don't bother yielding (we'll likely be in IRQ context) */
+}
+
+/* Timers */
+
+/* Judging by the Linux implementation timers don't appear to require a thread context, so we'll implement them as OS_CallAfter's */
+
+struct dwc_timer
+{
+	dwc_timer_callback_t cb;
+	void *data;
+	char *name;
+	uint32_t scheduled;
+};
+
+dwc_timer_t *DWC_TIMER_ALLOC(char *name, dwc_timer_callback_t cb, void *data)
+{
+	dwc_timer_t *t = DWC_ALLOC(sizeof(dwc_timer_t)+strlen(name)+1);
+	if(!t)
+		return NULL;
+	t->cb = cb;
+	t->data = data;
+	t->name = (char *) (t+1);
+	strcpy(t->name,name);
+	return t;
+}
+
+static _kernel_oserror *timer_wrapper(_kernel_swi_regs *r,void *pw,void *handle)
+{
+	(void) r;
+	(void) pw;
+	dwc_timer_t *t = (dwc_timer_t *) handle;
+	t->scheduled = 0;
+	t->cb(t->data);
+	return NULL;
+}
+
+void DWC_TIMER_FREE(dwc_timer_t *timer)
+{
+	if(timer->scheduled)
+		callx_remove_callafter(timer_wrapper,timer);
+	DWC_FREE(timer);
+}
+
+void DWC_TIMER_SCHEDULE(dwc_timer_t *timer, uint32_t time)
+{
+	int irqs = ensure_irqs_off();
+	if(timer->scheduled)
+	{
+		callx_remove_callafter(timer_wrapper,timer);
+	}
+	timer->scheduled = 1;
+	callx_add_callafter((time+9)/10,timer_wrapper,timer);
+	restore_irqs(irqs);
+}
+
+void DWC_TIMER_CANCEL(dwc_timer_t *timer)
+{
+	int irqs = ensure_irqs_off();
+	if(timer->scheduled)
+		callx_remove_callafter(timer_wrapper,timer);
+	timer->scheduled = 0;
+	restore_irqs(irqs);
+}
+
+/* Spinlocks */
+
+struct dwc_spinlock
+{
+	int irq;
+};
+
+dwc_spinlock_t *DWC_SPINLOCK_ALLOC(void)
+{
+	return (dwc_spinlock_t *) DWC_ALLOC(sizeof(struct dwc_spinlock));
+}
+
+void DWC_SPINLOCK_FREE(dwc_spinlock_t *lock)
+{
+	DWC_FREE(lock);
+}
+
+void DWC_SPINLOCK_IRQSAVE(dwc_spinlock_t *lock, dwc_irqflags_t *flags)
+{
+	(void) lock;
+	*flags = ensure_irqs_off();
+}
+
+void DWC_SPINUNLOCK_IRQRESTORE(dwc_spinlock_t *lock, dwc_irqflags_t flags)
+{
+	(void) lock;
+	restore_irqs((int)flags);
+}
+
+void DWC_SPINLOCK(dwc_spinlock_t *lock)
+{
+	((struct dwc_spinlock *) lock)->irq = ensure_irqs_off();
+}
+
+void DWC_SPINUNLOCK(dwc_spinlock_t *lock)
+{
+	restore_irqs(((struct dwc_spinlock *) lock)->irq);
+}
+
+/* non-IRQSAVE/IRQRESTORE versions aren't used */
+
+/* Mutexes */
+
+/* Linux implementation uses mutexes that don't support recursive locks
+   We'll use a simple implementation that doesn't attempt to guarantee fariness if multiple threads are waiting on the mutex */
+
+struct dwc_mutex
+{
+	uint32_t pollword; /* 1 if free, 0 if claimed */
+	uint32_t rt_handle; /* Current owner. Not really needed, but might be useful for debugging? */
+};
+
+dwc_mutex_t *DWC_MUTEX_ALLOC(void)
+{
+	dwc_mutex_t *m = DWC_ALLOC(sizeof(dwc_mutex_t));
+	if(m)
+		m->pollword = 1;
+	return m;
+}
+
+void DWC_MUTEX_FREE(dwc_mutex_t *mutex)
+{
+	/* Ensure current holder is done with it
+	   Although this won't guarantee that the mutex is free if multiple threads are waiting */
+	uint32_t rt_handle = _swi(RT_ReadInfo,_IN(0)|_RETURN(0),RTReadInfo_Handle);
+	int irqs = ensure_irqs_off();
+	while(!mutex->pollword && (mutex->rt_handle != rt_handle))
+	{
+		_swix(RT_Yield,_IN(1),&mutex->pollword);
+	}
+	restore_irqs(irqs);
+	DWC_FREE(mutex);
+}
+
+void DWC_MUTEX_LOCK(dwc_mutex_t *mutex)
+{
+	uint32_t rt_handle = _swi(RT_ReadInfo,_IN(0)|_RETURN(0),RTReadInfo_Handle);
+	int irqs = ensure_irqs_off();
+	while(!mutex->pollword && (mutex->rt_handle != rt_handle))
+	{
+		_swix(RT_Yield,_IN(1),&mutex->pollword);
+	}
+	mutex->pollword = 0;
+	mutex->rt_handle = rt_handle;
+	restore_irqs(irqs);
+}
+
+int DWC_MUTEX_TRYLOCK(dwc_mutex_t *mutex)
+{
+	uint32_t rt_handle = _swi(RT_ReadInfo,_IN(0)|_RETURN(0),RTReadInfo_Handle);
+	int irqs = ensure_irqs_off();
+	if(!mutex->pollword && (mutex->rt_handle != rt_handle))
+	{
+		restore_irqs(irqs);
+		return 0;
+	}
+	mutex->pollword = 0;
+	mutex->rt_handle = rt_handle;
+	restore_irqs(irqs);
+	return 1;
+}
+
+void DWC_MUTEX_UNLOCK(dwc_mutex_t *mutex)
+{
+	mutex->pollword = 1;
+	/* Wake up any waiting threads */
+	_swix(RT_Yield,_IN(1),&dummy_pollword_1);
+}
+
+/* Time */
+
+void DWC_UDELAY(uint32_t usecs)
+{
+	/* DWCTODO - Direct HAL call */
+	_swix(OS_Hardware, _IN(0)|_INR(8,9), usecs, 0, EntryNo_HAL_CounterDelay);
+}
+
+void DWC_MDELAY(uint32_t msecs)
+{
+	/* DWCTODO - Direct HAL call */
+	_swix(OS_Hardware, _IN(0)|_INR(8,9), msecs*1000, 0, EntryNo_HAL_CounterDelay);
+}
+
+void DWC_MSLEEP(uint32_t msecs)
+{
+	uint32_t csecs = (msecs+9)/10;
+	_swix(RT_TimedYield,_INR(1,2),&dummy_pollword_0,csecs+_swi(OS_ReadMonotonicTime,_RETURN(0)));
+}
+
+/* Init/shutdown of OS layer */
+
+static dwc_bool_t dwc_common_init = NO;
+
+_kernel_oserror *dwc_common_riscos_init(void)
+{
+	/* Init tasklet thread */
+	LIST_INIT(&tasklets.list);
+	tasklets.stop = 0;
+	tasklets.stopped = 0;
+	tasklets.idle = 0;
+	tasklets.pollword = 1; /* Give it a kick on startup so that it can disable interrupts. If interrupts are left enabled it can cause problems when we try and shut down during Service_PreReset */
+	_kernel_stack_chunk *stack = (_kernel_stack_chunk *) tasklet_stack;
+	stack->sc_mark = 0xF60690FF;
+	stack->sc_size = THREAD_STACK_SIZE;
+	memcpy(stack+1, _kernel_current_stack_chunk()+1, 28);
+	_kernel_oserror *e = _swix(RT_Register,_INR(0,7),0,tasklet_wrapper,&tasklets,private_word,&tasklets.pollword, ((int) stack) + 560, ((int) stack) + THREAD_STACK_SIZE, "DWCDriver_Tasklet:145");
+	if(!e)
+		_swix(RT_Yield,_IN(1),&tasklets.idle);
+	dwc_common_init = (e?NO:YES);
+	return e;
+}
+
+void dwc_common_riscos_shutdown(void)
+{
+	if(dwc_common_init == YES)
+	{
+		/* Shutdown tasklet thread */
+		tasklets.stop = 1;
+		tasklets.pollword = 1;
+		_swix(RT_Yield,_IN(1),&tasklets.stopped);
+
+		/* Free all memory blocks */
+		for(int i=0;i<MAX_BUCKET_SIZE/BUCKET_GRANULARITY;i++)
+		{
+			struct mem_chain *block = mem_buckets[i];
+			while(block)
+			{
+				struct mem_chain *next = block->u.next;
+				free(block);
+				block = next;
+			}
+		}
+		memset(mem_buckets,0,sizeof(mem_buckets)); /* Just in case */
+	}
+	dwc_common_init = NO;
+}

@@ -1,0 +1,327 @@
+; Copyright 2015 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:Machine.<Machine>
+        GET     Hdr:ImageSize.<ImageSize>
+        $GetIO
+        GET     Hdr:Proc
+
+        GET     Hdr:OSEntries
+        GET     Hdr:HALEntries
+
+        GET     hdr.omap543x
+        GET     hdr.StaticWS
+        GET     hdr.PRCM
+        GET     hdr.GPIO
+        GET     hdr.GPIOExtend
+        GET     hdr.Timers
+
+        AREA    |Asm$$Code|, CODE, READONLY, PIC
+
+        EXPORT  Video_Init
+        EXPORT  VideoDevice_Init
+        EXPORT  Video_Power_VBC_HDMI
+
+        IMPORT  memcpy
+        IMPORT  I2CBusRead
+        IMPORT  I2CBusWrite
+        IMPORT  IIC_DoOp_Poll
+        IMPORT  TPSWrite
+
+; A brief rundown of OMAP543x video output modes:
+; The display subsystem (DSS) provides the logic to display a video frame from the
+; memory frame buffer on a LCD panel or a TV set.
+; DSS can display different pictures simultaneously by using three LCD outputs (LCD1, LCD2
+; and LCD3), in addition to the TV output.
+; All three LCD outputs can use one of the following interfaces:
+;   DSI  - Display serial interface (MIPI DSI)
+;   RFBI - Remote frame buffer interface (MIPI DBI 2.0)
+;   DPI  - Parallel CMOS output interface (MIPI DPI 2.0, BT-656, or BT-1120)
+; The TV output can be one of the following:
+;   DPI composite signal
+;   HDMI - High definition multimedia interface
+
+; The modules integrated in the DSS are:
+;   Display controller (DISPC)
+;     1 direct memory access (DMA) engine
+;     3 LCD outputs + 1 TV output
+;     1 graphics pipeline (GFX), 3 video pipelines + 1 write-back pipeline
+;   RFBI (Remote Frame Buffer Interface)
+;     8-, 9-, 12- and 16-bit parallel interface
+;     programmable pixel memory formats
+;     programmable output formats on one or multiple cycles per pixel
+;  2 DSI protocol engines (DSI1_A and DSI1_C)
+;     4-data lane complex I/O in addition to the clock lane
+;     bidirectional data link support
+;     supports video mode + command mode
+;     supports data interleaving
+;   HDMI protocol engine
+;     HDMI 1.4 support at 1080p, 60 Hz (including 3D frame-packing support)
+;     36-bit RGB color
+;     DES_HDCP 1.4 key protection
+;     deep color mode support (10- or 12-bit for 148.5 MHzpixel clock)
+
+; Video is handled by OMAPVideo module ==> no HAL implementation
+
+; -------------------------------------------------------------------------
+
+
+; some definitions for TWL6037 register
+
+        MACRO
+$name   DeclareTPSReg $group, $offset
+TPSRegGroup_$name * $group
+TPSRegOffset_$name * $offset
+        MEND
+
+; LDO4 generates 1.5 - 1.8V (VDDAPHY_DISP: vdda_dsiport/hdmi)
+; LDO7 generates 2.0V (VDD_VPP: VPP1)
+LDO4_CTRL               DeclareTPSReg &48, &56
+LDO4_VOLTAGE            DeclareTPSReg &48, &57
+LDO7_CTRL               DeclareTPSReg &48, &5C
+LDO7_VOLTAGE            DeclareTPSReg &48, &5D
+
+; bits in CTRL register
+CTRL_MODE_ACTIVE_MSK    *       (3 << 0)
+CTRL_MODE_ACTIVE_ON     *       (1 << 0)
+CTRL_MODE_SLEEP_MSK     *       (3 << 2)
+CTRL_MODE_SLEEP_ON      *       (1 << 2)
+CTRL_STATUS_MSK         *       (3 << 4)
+CTRL_STATUS_ON          *       (1 << 4)
+
+CTRL_MODE_ON            *       (CTRL_MODE_ACTIVE_ON + CTRL_MODE_SLEEP_ON)
+
+; voltage values
+VOLTAGE_VAL_1V5         *       &0D
+VOLTAGE_VAL_1V8         *       &13
+VOLTAGE_VAL_2V0         *       &17
+
+
+        MACRO
+        MyTPSWrite $reg, $value
+        LDR     lr, =$value
+        STR     lr, [a2]
+        MOV     a1, #TPSRegGroup_$reg * 2
+        MOV     a4, #TPSRegOffset_$reg
+        BL      TPSWrite
+        MEND
+
+
+Video_Init
+        Push    "lr"
+
+        ; Configure GPIO pins for HDMI usage
+        LDR     a1, L4_Core_Log
+        LDR     a2, =(L4_CTRL_MODULE_CORE_PAD - L4_Core)
+        ADD     a1, a2, a1
+        ADD     a3, a1, #0x100          ; add common offset (STRH restriction)
+        LDR     a2, =0x0118             ; input: IEN + PTD + Mode 0
+        STRH    a2, [a3, #0x03C]        ; gpio7_192/hdmi_cec
+        LDR     a2, =0x0116             ; input: IEN + PTU + Mode 6 (GPIO)
+        STRH    a2, [a3, #0x03E]        ; gpio7_193/hdmi_hpd
+        LDR     a2, =0x0100             ; input: IEN + Mode 0 (HDMI_DDC_SCL/SDA)
+        STRH    a2, [a3, #0x040]        ; gpio7_194/hdmi_ddc_scl
+        STRH    a2, [a3, #0x042]        ; gpio7_195/hdmi_ddc_sda
+
+        ; Enable DSS power domain
+        LDR     a1, L4_PRM_Log
+        ADD     a1, a1, #DSS_PRM
+        LDR     a2, [a1, #PM_DSS_PWRSTCTRL]
+        ORR     a2, a2, #3              ; ON state
+        STR     a2, [a1, #PM_DSS_PWRSTCTRL]
+
+        ; Activate DSS specific clocks
+        LDR     a1, L4_CM_CORE_Log
+        ADD     a1, a1, #DSS_CM_CORE
+        LDR     a2, =((0xF << 8) + 2)   ; OPTFCLKEN_* + enable module
+        STR     a2, [a1, #CM_DSS_DSS_CLKCTRL]
+        MOV     a2, #2                  ; SW_WKUP
+        STR     a2, [a1, #CM_DSS_CLKSTCTRL]
+
+  [ {TRUE}
+        ; Prepare TWL6037 voltages used by video system
+        Push    "v1-v2"                 ; v1,v2 is used by I2C calls
+        SUB     sp, sp, #4              ; buffer for TWL6037 register contents
+        ADRL    v1, IIC_DoOp_Poll       ; OSentries+4*OS_IICOpV (not yet initialised)
+        LDR     a1, [sb, #BoardConfig_MachID]
+        LDR     a4, =MachID_OMAP5430EVM
+        CMP     a4, a1
+        BNE     %FT10
+        ; OMAP5 EVM needs LDO4 at 1.8V
+        MOV     a2, sp
+        MOV     a3, #1
+        MyTPSWrite LDO4_VOLTAGE, VOLTAGE_VAL_1V8
+        MOV     a2, sp
+        MOV     a3, #1
+        MyTPSWrite LDO4_CTRL, CTRL_MODE_ON
+        B       %FT20
+10
+        ; IGEPv5 needs LDO7 at 2V
+        MOV     a2, sp
+        MOV     a3, #1
+        MyTPSWrite LDO7_VOLTAGE, VOLTAGE_VAL_2V0
+        MOV     a2, sp
+        MOV     a3, #1
+        MyTPSWrite LDO7_CTRL, CTRL_MODE_ON
+20
+        ADD     sp, sp, #4
+        Pull    "v1-v2"                 ; restore orignal values
+  ]
+
+        Pull    "pc"
+
+VideoDevice_Init
+        ; Not much to do here - just register our HAL device
+        Push    "v1,lr"
+        ADRL    v1, VideoDevice
+        MOV     a1, v1
+        ADR     a2, VideoDeviceTemplate
+        MOV     a3, #Video_DeviceSize
+        BL      memcpy
+        LDR     a1, L4_Display_Log
+        STR     a1, [v1, #HALDevice_Address]
+        ADRL    a3, VideoBoardConfig
+        STR     a3, [v1, #HALDevice_VDUDeviceSpecificField]
+        STR     sb, [v1, #:INDEX:VideoWorkspace]
+        ; Fill in the board config
+        LDR     a2, sys_clk
+        STR     a2, [a3, #VideoBoardConfig_sys_clk]
+        BL      Determine_PorchSync_Limits
+        STRH    a1, [a3, #VideoBoardConfig_Max_Porch]
+        STRH    a2, [a3, #VideoBoardConfig_Max_Sync]
+        LDR     a2, L4_sDMA_Log
+        STR     a2, [a3, #VideoBoardConfig_DMA_Ptr]
+        MOV     a2, #SDMA_IRQ_1
+        STR     a2, [a3, #VideoBoardConfig_DMA_Device]
+        ASSERT  SDMA_NumDevices = 31
+        MOV     a2, #&80000000
+        STR     a2, [a3, #VideoBoardConfig_DMA_Chans]
+        LDRB    a2, [sb, #BoardConfig_VBC_Flags]
+        STRB    a2, [a3, #VideoBoardConfig_Flags]
+        LDRB    a2, [sb, #BoardConfig_VBC_LCDNum]
+        STRB    a2, [a3, #VideoBoardConfig_Num_LCDs]
+        LDR     a2, [sb, #BoardConfig_VBC_LCDPtr]
+        STR     a2, [a3, #VideoBoardConfig_LCD_Configs]
+        MOV     a1, #0
+        MOV     a2, v1
+        CallOS  OS_AddDevice
+        Pull    "v1,pc"
+
+VideoDeviceTemplate
+        DCW     HALDeviceType_Video + HALDeviceVideo_VDU
+        DCW     HALDeviceID_VDU_OMAP5
+        DCD     HALDeviceBus_Sys + HALDeviceSysBus_NoC
+        DCD     0               ; API version 0
+        DCD     VideoDevice_Desc
+        DCD     0               ; Address - filled in later
+        %       12              ; Reserved
+        DCD     VideoDevice_Activate
+        DCD     VideoDevice_Deactivate
+        DCD     VideoDevice_Reset
+        DCD     VideoDevice_Sleep
+        DCD     VIDEO_IRQ       ; Device interrupt
+        DCD     0               ; TestIRQ cannot be called
+        %       8
+        DCD     0               ; Pointer to board config stuff - filled in later
+        ASSERT (. - VideoDeviceTemplate) = HALDevice_VDU_Size
+        DCD     0               ; HAL workspace pointer - filled in later
+        ASSERT (. - VideoDeviceTemplate) = Video_DeviceSize
+
+VideoDevice_Desc
+        =       "OMAP5 video controller", 0
+        ALIGN
+
+VideoDevice_Activate
+        Entry   "sb"
+        LDR     sb, VideoWorkspace
+        ; Enable DSS power (if not already activated)
+        LDR     a1, L4_CM_CORE_Log
+        ADD     a1, a1, #DSS_CM_CORE
+        LDR     a2, [a1, #CM_DSS_DSS_CLKCTRL]
+        ANDS    a2, a2, #(3 << 16)      ; IDLEST
+        BEQ     %FT10
+        MOV     a2, #2                  ; SW_WKUP
+        STR     a2, [a1, #CM_DSS_CLKSTCTRL]
+        ; Wait until module is active
+05
+        LDR     a2, [a1, #CM_DSS_DSS_CLKCTRL]
+        ANDS    a2, a2, #(3 << 16)      ; IDLEST
+        BNE     %BT05
+
+10
+        MOV     a1, #1
+        EXIT
+
+VideoDevice_Deactivate
+VideoDevice_Reset
+        MOV     pc, lr
+
+VideoDevice_Sleep
+        MOV     a1, #0
+        MOV     pc, lr
+
+Video_Power_VBC_HDMI
+        ; a1 = HAL device
+        ; a2 = level shifter state (0,1,2,3)
+        Push    "v1-v4,sb,lr"
+        LDR     sb, VideoWorkspace
+  [ DebugTiming
+        CMP     a2, #0
+        BEQ     %FT10
+        DebugTime a1, "Video on @ "
+10
+  ]
+        ; Set the Level Shifter (TPD12S01x) according to MachID
+        SUB     sp, sp, #4      ; buffer for TCA64xx register contents
+        LDR     a1, [sb, #BoardConfig_MachID]
+        LDR     a4, =MachID_OMAP5430EVM
+        CMP     a1, a4
+        MOVEQ   v2, #TCA6424A_IIC_BUS
+        MOVNE   v2, #TCA6416_IIC_BUS
+        MOVEQ   a4, #TCA6424A_HDMI_PORT
+        MOVNE   a4, #TCA6416_HDMI_PORT
+        MOVEQ   v3, #TCA6424A_HDMI_MASK
+        MOVNE   v3, #TCA6416_HDMI_MASK
+        MOVEQ   v4, a2, LSL #TCA6424A_HDMI_SHIFT        ; remember state at correct bit pos
+        MOVNE   v4, a2, LSL #TCA6416_HDMI_SHIFT         ; remember state at correct bit pos
+        MOVEQ   a1, #TCA6424A_IIC_ADDR
+        MOVNE   a1, #TCA6416_IIC_ADDR
+        MOV     a2, sp
+        Push    "a1"            ; remember for later
+        LDR     v1, OSentries+4*OS_IICOpV
+        MOV     a3, #1
+        BL      I2CBusRead
+        LDRB    a1, [a2]
+        BIC     a1, a1, v3
+        ORR     a1, a1, v4
+        STRB    a1, [a2]
+        Pull    "a1"
+        BL      I2CBusWrite
+        ADD     sp, sp, #4
+        Pull    "v1-v4,sb,pc"
+
+Determine_PorchSync_Limits
+        ; Returns:
+        ; a1 = max porch value
+        ; a2 = max sync value
+        ; OMAP543x has fixed values
+        MOV     a1, #(1 << 12)
+        MOV     a2, #(1 << 8)
+        MOV     pc, lr
+
+        END

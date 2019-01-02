@@ -1,0 +1,863 @@
+/*
+ * Copyright (c) 2014, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include "kernel.h"
+#include "swis.h"
+
+#include "udl_riscos.h"
+#include "udl.h"
+#include "screen.h"
+#include "netbsd.h"
+#include "graphicsv.h"
+#include "instance.h"
+#include "modhead.h"
+
+#include "Global/RISCOS.h"
+#include "Global/VduExt.h"
+#include "Global/Services.h"
+#include "Global/GraphicsV.h"
+#include "Global/HALEntries.h"
+#include "Global/VIDCList.h"
+
+static const pixelformat_t pixelformats[] =
+{
+	{ 65535, ModeFlag_64k+ModeFlag_DataFormatSub_RGB, 4 },
+	{ -1, 0, 5 },
+};
+
+static int getpixelformat(const VIDCList3 *params)
+{
+	pixelformat_t format;
+	format.log2bpp = params->PixelDepth;
+	format.ncolour = (1<<(1<<params->PixelDepth))-1;
+	format.modeflags = (params->PixelDepth==3?ModeFlag_FullPalette:0);
+	const ControlList *c = params->ControlList;
+	while(c->index != -1)
+	{
+		if(c->index == ControlList_NColour)
+			format.ncolour = c->value;
+		else if(c->index == ControlList_ModeFlags)
+			format.modeflags = c->value;
+		c++;
+	}
+	for(int i=0;i<sizeof(pixelformats)/sizeof(pixelformats[0]);i++)
+	{
+		if((format.ncolour == pixelformats[i].ncolour)
+		 && (format.modeflags == pixelformats[i].modeflags)
+		 && (format.log2bpp == pixelformats[i].log2bpp))
+		{
+			return i;
+		}
+	}
+	return -1;
+}
+
+static bool get_mode_timings(const VIDCList3 *in,udl_mode *out)
+{
+	uint32_t val;
+
+	/* Calculate the values needed for writing to the timing registers */
+
+	/* these represent the absolute times of each of the different events in a frame, with 0,0 being the start of the sync periods */
+
+	val = in->HorizSyncWidth;
+	if(in->SyncPol & SyncPol_InvertHSync)
+	{
+		out->hsyncstart = udl_lfsr(val+1);
+		out->hsyncend = udl_lfsr(1);
+	}
+	else
+	{
+		out->hsyncstart = udl_lfsr(1);
+		out->hsyncend = udl_lfsr(val+1);
+	}
+	val += in->HorizBackPorch+in->HorizLeftBorder;
+	out->xdisplaystart = udl_lfsr(val);
+	val += in->HorizDisplaySize;
+	out->xdisplayend = udl_lfsr(val);
+	val += in->HorizRightBorder+in->HorizFrontPorch;
+	out->xendcount = udl_lfsr(val-1);
+
+	if(val > 65535)
+		return false;
+
+	val = in->VertiSyncWidth;
+	if(in->SyncPol & SyncPol_InvertVSync)
+	{
+		out->vsyncstart = udl_lfsr(val);
+		out->vsyncend = udl_lfsr(0);
+	}
+	else
+	{
+		out->vsyncstart = udl_lfsr(0);
+		out->vsyncend = udl_lfsr(val);
+	}
+	val += in->VertiBackPorch+in->VertiTopBorder;
+	out->ydisplaystart = udl_lfsr(val);
+	val += in->VertiDisplaySize;
+	out->ydisplayend = udl_lfsr(val);
+	val += in->VertiBottomBorder+in->VertiFrontPorch;
+	out->yendcount = udl_lfsr(val);
+
+	if(val > 65535)
+		return false;
+
+	val = in->PixelRate/5;
+
+	if(val > 65535)
+		return false;
+
+	out->pixelclock5khz = bswap16(val);
+
+	return true;
+}
+
+#if 0
+static void wait(instance_t *i)
+{
+	dprintf(("","waiting for TX buffer to empty...\n"));
+	my_pipe *mpipe = (my_pipe *) i->softc.sc_tx_pipeh;
+	my_usbdev *mdev = (my_usbdev *) i->softc.sc_iface;
+	uint32_t used,status;
+	do
+	{
+		if(_swix(Buffer_GetInfo,_IN(0)|_OUT(6),mpipe->bufh,&used))
+		{
+			dprintf(("","!!\n"));
+			return;
+		}
+		if(_swix(DeviceFS_CallDevice,_INR(0,2)|_OUT(3),DeviceCall_USB_TransferInfo,mdev->devname,mpipe->strh,&status))
+		{
+			dprintf(("","!!\n"));
+			return;
+		}
+		dprintf(("","%d %d\n",used,status));
+	} while(used || !status);
+}
+#endif
+
+/* Recalculate scrstate settings for a new mode/vinit */
+static void calc_scrstate(instance_t *i)
+{
+	uint32_t vinit = i->state.vinit;
+	if((vinit == ~0) || !i->softc.sc_height)
+		return;
+	i->scrstate.vinit = vinit;
+	i->scrstate.stride = i->softc.sc_width<<(i->log2bpp-3);
+	i->scrstate.vend = vinit+i->scrstate.stride*i->softc.sc_height;
+	i->scrstate.curoffset = vinit;
+	/* Also update vinit value used by pointer */
+	if(i->state.pointer.vinit != ~0)
+		i->state.pointer.vinit = vinit;
+}
+
+/* Apply given vinit value to device */
+static void set_offsets(instance_t *i,uint32_t vinit)
+{
+	i->live.vinit = vinit;
+
+	int start16 = vinit>>(i->log2bpp-4);
+	int stride16 = i->scrstate.stride>>(i->log2bpp-4);
+	int start8 = i->scrstate.byte_base+(start16>>1);
+	int stride8 = stride16>>1;
+	udl_init_fb_offsets(&i->softc,start16,stride16,start8,stride8);
+	udl_cmd_send(&i->softc);
+}
+
+static void set_mode(instance_t *i)
+{
+	const udl_mode *mode = &i->mode;
+	struct udl_softc *sc = &i->softc;
+
+	udl_cmd_write_reg_1(sc,UDL_REG_SYNC,0x00);
+
+	/* Program all the mode timing registers */
+	udl_cmd_write_reg_2(sc,UDL_REG_HSYNCSTART,mode->hsyncstart);
+	udl_cmd_write_reg_2(sc,UDL_REG_HSYNCEND,mode->hsyncend);
+	udl_cmd_write_reg_2(sc,UDL_REG_XDISPLAYSTART,mode->xdisplaystart);
+	udl_cmd_write_reg_2(sc,UDL_REG_XDISPLAYEND,mode->xdisplayend);
+	udl_cmd_write_reg_2(sc,UDL_REG_XENDCOUNT,mode->xendcount);
+
+	udl_cmd_write_reg_2(sc,UDL_REG_VSYNCSTART,mode->vsyncstart);
+	udl_cmd_write_reg_2(sc,UDL_REG_VSYNCEND,mode->vsyncend);
+	udl_cmd_write_reg_2(sc,UDL_REG_YDISPLAYSTART,mode->ydisplaystart);
+	udl_cmd_write_reg_2(sc,UDL_REG_YDISPLAYEND,mode->ydisplayend);
+	udl_cmd_write_reg_2(sc,UDL_REG_YENDCOUNT,mode->yendcount);
+
+	udl_cmd_write_reg_2(sc,UDL_REG_PIXELCLOCK5KHZ,mode->pixelclock5khz);
+
+	/* Resolution and colour depth */
+	udl_cmd_write_reg_2(sc,UDL_REG_HPIXELS,sc->sc_width);
+	udl_cmd_write_reg_2(sc,UDL_REG_VPIXELS,sc->sc_height);
+	udl_cmd_write_reg_1(sc,UDL_REG_COLORDEPTH,(i->log2bpp==5?UDL_REG_COLORDEPTH_24:UDL_REG_COLORDEPTH_16));
+
+	udl_cmd_write_reg_1(sc,UDL_REG_SYNC,0xff);
+
+	udl_cmd_send(sc);
+}
+
+/* Apply given blanking state to device */
+static void set_blank(instance_t *i,int state)
+{
+	struct udl_softc *sc = &i->softc;
+
+	i->live.blank_state = state;
+
+	/* Disabling all clocks requires us to reprogram the mode timings on resume */
+	if(state == 0x7)
+		i->need_reset = true;
+
+	udl_cmd_write_reg_1(sc,UDL_REG_BLANK,state);
+	udl_cmd_write_reg_1(sc,UDL_REG_SYNC,0xff);
+
+	udl_cmd_send(sc);
+}
+
+void update_state(instance_t *i)
+{
+	/* Update any out-of-date mode/blanking parameters for the device */
+	int blank_state = i->state.blank_state;
+	uint32_t vinit = i->state.vinit;
+
+	/* Do nothing if mode or DAG are invalid */
+	if((vinit == ~0) || !i->softc.sc_height)
+		return;
+
+#if 0 /* Experimental code for resetting broken devices - doesn't seem to work */
+	static bool tried_reset;
+	/* Reset any broken devices */
+	if(i->usbdev.broken && !tried_reset)
+	{
+		/* Wait until xfer times out */
+		my_pipe *mpipe = (my_pipe *) i->softc.sc_tx_pipeh;
+		my_usbdev *mdev = (my_usbdev *) i->softc.sc_iface;
+		uint32_t status;
+		if(_swix(DeviceFS_CallDevice,_INR(0,2)|_OUT(3),DeviceCall_USB_TransferInfo,mdev->devname,mpipe->strh,&status))
+		{
+			dprintf(("","!!\n"));
+			return;
+		}
+		if(!status)
+			return;
+		
+//		my_pipe *mpipe = (my_pipe *) i->softc.sc_tx_pipeh;
+		tried_reset = true;
+		dprintf(("","update_state: resetting broken device\n"));
+//		_swix(OS_BPut,_INR(0,1),0,mpipe->fh);
+//		wait(i);
+		/* Try clearing any stall */
+#if 0
+		_kernel_oserror *e = _swix(DeviceFS_CallDevice,_INR(0,2),DeviceCall_USB_ClearStall,i->usbdev.devname,mpipe->fh);
+		if(e)
+		{
+			dprintf(("","clear stall %08x %s\n",e->errnum,e->errmess));
+			return;
+		}
+#endif
+		/* Try closing and reopening the pipe */
+		dprintf(("","update_state: closing pipe\n"));
+		usbd_close_pipe(i->softc.sc_tx_pipeh);
+		i->softc.sc_tx_pipeh = NULL;
+		i->usbdev.broken = false;
+		dprintf(("","update_state: opening pipe\n"));
+		usbd_status error = usbd_open_pipe(i->softc.sc_iface, 0x01, USBD_EXCLUSIVE_USE, &i->softc.sc_tx_pipeh);
+		dprintf(("","update_state: result = %d\n",error));
+		/* Now re-initialise the chip */
+		if(!error)
+			error = udl_init_chip(&i->softc);
+		/* Resend the huffman table */
+		if(huffman_decomp && !error)
+			error = udl_set_decomp_table(&i->softc,huffman_decomp,HUFFMAN_DECOMP_SIZE);
+		/* And wipe its memory */
+		if(!error)
+			screen_clear(&i->softc,i->screensize/2);
+		/* And set things up so that we'll reprogram the mode */
+		i->live.pointer.vinit = ~0;
+		i->state.blank_state = 0;
+		i->live.vinit = ~0;
+		i->need_reset = true;
+		dprintf(("","update_state: reset done\n"));
+	}
+#endif
+
+	if(blank_state != i->live.blank_state)
+	{
+		dprintf(("","update_state: Setting blank state to %d\n",blank_state));
+		set_blank(i,blank_state);
+	}
+	if(!blank_state && i->need_reset)
+	{
+		dprintf(("","update_state: resetting mode parameters\n"));
+#if 0
+		/* At one point I needed this here to fix some corruption that would appear when recovering from the 0x7 blank state. udlfb also has similar code to make sure that mode changes occur correctly
+		   However this code is now causing 0x7 recovery to fail on my DL120, and doesn't seem to be needed at all on my DL165. */
+		static const uint8_t dummy_cmd[] =
+		{
+			UDL_BULK_SOC,
+			UDL_BULK_CMD_FB_COPY16,
+			0,0,0,
+			1,
+			0,0,0,
+		};
+		udl_cmd_insert_buf(&i->softc,dummy_cmd,sizeof(dummy_cmd));
+		udl_cmd_send(&i->softc);
+#endif
+		/* Reprogram mode timings to recover from blanked state */
+		set_mode(i);
+		i->need_reset = false;
+		/* We also need to reset the offsets */
+		i->live.vinit = ~0;
+	}
+	if(vinit != i->live.vinit)
+	{
+		dprintf(("","update_state: Setting VInit to %08x\n",vinit));
+		set_offsets(i,vinit);
+		dprintf(("","stride %08x vend %08x\n",i->scrstate.stride,i->scrstate.vend));
+	}
+}
+
+static int do_null(_kernel_swi_regs *r,instance_t *i)
+{
+	/* Nothing */
+	(void) r;
+	(void) i;
+	return 0;
+}
+
+static int do_setmode(_kernel_swi_regs *r,instance_t *i)
+{
+	r->r[4] = 0;
+	const VIDCList3 *params = (const VIDCList3 *) r->r[0];
+	/* Clear all screen memory to make it easy to deal with switching between 16 & 24bpp modes. Also avoids lots of garbage being visible while we slowly refresh! */
+	dprintf(("","do_setmode: %dx%d, %dbpp\n",params->HorizDisplaySize,params->VertiDisplaySize,1<<params->PixelDepth));
+	memset(i->pci_logaddr,0,i->screensize);
+	memset(i->shadow,0,i->screensize);
+	screen_clear(&i->softc,i->screensize/2);
+	/* The mouse pointer will have been nuked by the above clear */
+	i->state.pointer.vinit = i->live.pointer.vinit = ~0;
+	/* Do the mode change */
+	i->softc.sc_width = params->HorizDisplaySize;
+	i->softc.sc_height = params->VertiDisplaySize;
+	i->log2bpp = params->PixelDepth;
+	calc_scrstate(i);
+	get_mode_timings(params,&i->mode);
+	/* Poke some values to make sure that update_state() will reprogram everything */
+	i->state.blank_state = 0;
+	i->live.vinit = ~0;
+	i->need_reset = true;
+	update_state(i);
+
+	return 0;
+}
+
+static int do_setblank(_kernel_swi_regs *r,instance_t *i)
+{
+	r->r[4] = 0;
+	int state = 0;
+	if(r->r[0])
+	{
+		state |= 1; /* Halt pixel clock/show blank image */
+		if(r->r[1] & 1)
+			state |= 4; /* Halt HSync */
+		if(r->r[1] & 2)
+			state |= 2; /* Halt VSync */
+	}
+	i->state.blank_state = state;
+
+	return 0;
+}
+
+static int do_updatepointer(_kernel_swi_regs *r,instance_t *i)
+{
+	shape_t *shape = ((shape_t *) r->r[3]);
+	r->r[4] = 0;
+	if(r->r[0] & 1)
+	{
+		/* Show */
+		i->state.pointer.x = r->r[1];
+		i->state.pointer.y = r->r[2];
+		i->state.pointer.vinit = i->scrstate.vinit;
+		if(r->r[0] & 2)
+		{
+			/* New image */
+			memcpy(i->state.pointer.image,shape->buffLA,shape->height*8);
+			for(int y=shape->height;y<32;y++)
+				i->state.pointer.image[y] = 0;
+		}
+	}
+	else
+	{
+		/* Remove */
+		i->state.pointer.vinit = ~0;
+	}
+	return 0;
+}
+
+static int do_setdmaaddress(_kernel_swi_regs *r,instance_t *i)
+{
+	int val = r->r[1] - i->pci_physaddr;
+	if(r->r[0] == GVDAG_VInit)
+	{
+		/* Update device offsets */
+		if(i->state.vinit != val)
+		{
+			dprintf(("","do_setdmaaddress: vinit = %08x\n",val));
+			i->state.vinit = val;
+			calc_scrstate(i);
+		}
+	}
+	else if(r->r[0] == GVDAG_VRender)
+	{
+		dprintf(("","do_setdmaaddress: vrender = %08x\n",val));
+		i->scrstate.vrender = val;
+	}
+	r->r[4] = 0;
+	return 0;
+}
+
+static int do_vetmode(_kernel_swi_regs *r,instance_t *i)
+{
+	r->r[4] = 0;
+	const VIDCList3 *params = (const VIDCList3 *) r->r[0];
+	int pixels = params->HorizDisplaySize*params->VertiDisplaySize;
+
+	/* Check pixel format */
+	if(getpixelformat(params) == -1)
+	{
+		return 0;
+	}
+
+	/* Check interlace */
+	const ControlList *c = params->ControlList;
+	while(c->index != -1)
+	{
+		if((c->index == ControlList_Interlaced) && (c->value != 0))
+			return 0;
+		c++;
+	}
+
+	/* Check against device capabilities */
+	if(params->HorizDisplaySize > i->devcaps.max_width)
+	{
+		/* Too wide */
+		return 0;
+	}
+	if(pixels > i->devcaps.max_total_pixels)
+	{
+		/* Frame size too large */
+		return 0;
+	}
+	int bpp = (params->PixelDepth==5?3:2); /* 2 or 3 bytes per pixel (in device memory) */
+	if(pixels*bpp > i->devcaps.mem_end+1-i->devcaps.mem_start)
+	{
+		/* Not enough memory on device */
+		return 0;
+	}
+
+	/* Check if we can generate the timing registers for this mode */
+	udl_mode mode;
+	if(!get_mode_timings(params,&mode))
+	{
+		return 0;
+	}
+	r->r[0] = 0;
+	return 0;
+}
+
+static int do_displayfeatures(_kernel_swi_regs *r,instance_t *i)
+{
+	(void) i;
+
+	r->r[0] = GVDisplayFeature_HardwarePointer
+	        | GVDisplayFeature_InterlaceWithProgressiveFramestore
+	        | GVDisplayFeature_SeparateFramestore
+	        | GVDisplayFeature_NoVsyncIRQ;
+	r->r[1] = 0x20; /* 32bpp is the only standard pixel format supported */
+	r->r[2] = 4; /* 4 byte buffer alignment */
+	r->r[4] = 0;
+	return 0;
+}
+
+static int do_framestoreaddress(_kernel_swi_regs *r,instance_t *i)
+{
+	r->r[0] = i->pci_physaddr;
+	r->r[1] = i->screensize;
+	r->r[4] = 0;
+	return 0;
+}
+
+static int do_writepaletteentry(_kernel_swi_regs *r,instance_t *i)
+{
+	r->r[4] = 0;
+	uint32_t idx = r->r[2];
+	if((r->r[0] == 2) && (idx < 4))
+	{
+		MUNGE24_8((r->r[1]>>8),i->state.pointer.pal[idx][0],i->state.pointer.pal[idx][1],i->state.pointer.pal[idx][2])
+	}
+	return 0;
+}
+
+static int do_writepaletteentries(_kernel_swi_regs *r,instance_t *i)
+{
+	r->r[4] = 0;
+	uint32_t idx = r->r[2];
+	uint32_t c = r->r[3];
+	uint32_t *pal = (uint32_t *) r->r[1];
+	if(r->r[2] == 2)
+	{
+		while(c--)
+		{
+			if(idx < 4)
+			{
+				MUNGE24_8(((*pal)>>8),i->state.pointer.pal[idx][0],i->state.pointer.pal[idx][1],i->state.pointer.pal[idx][2])
+			}
+			pal++;
+			idx++;
+		}
+	}
+	return 0;
+}
+
+static int do_readpaletteentry(_kernel_swi_regs *r,instance_t *i)
+{
+	(void) i;
+
+	r->r[4] = 0;
+	return 0;
+}
+
+static bool copyrect(instance_t *i,const copyrect_params_t *params)
+{
+	/* Convert coordinates */
+	int width = params->width+1;
+	int height = params->height+1;
+	int srcx = params->src_left;
+	int srcy = i->softc.sc_height-(params->src_bottom+height);
+	int destx = params->dest_left;
+	int desty = i->softc.sc_height-(params->dest_bottom+height);
+	if((srcy == desty) && (srcx < destx) && (srcx+width > destx))
+	{
+		/* Overlapping region requiring a right-to-left copy - not supported */
+		return false;
+	}
+	/* Skip acceleration if we're copying a large area
+	   This is to combat the slow speed of the shadow update, especially
+	   when doing things like scrolling the screen at the CLI */
+	if(width*height*2 >= i->softc.sc_width*i->softc.sc_height)
+	{
+		return false;
+	} 
+	bool remove_pointer = false;
+	if(i->live.pointer.vinit != ~0)
+	{
+		/* Do a simple range check on the source & dest memory region
+		   This will generate false-positives in many situations, but it's quick and simple */
+		int pointer_min = i->live.pointer.vinit+(i->live.pointer.x<<(i->log2bpp-3))+i->live.pointer.y*i->scrstate.stride;
+		int pointer_max = pointer_min+32*i->scrstate.stride;
+		int rect_min = i->scrstate.vrender+(srcx<<(i->log2bpp-3))+srcy*i->scrstate.stride;
+		int rect_max = rect_min+height*i->scrstate.stride;
+		if((pointer_min < rect_max) && (rect_min < pointer_max))
+			remove_pointer = true;
+		else
+		{
+			rect_min = i->scrstate.vrender+(destx<<(i->log2bpp-3))+desty*i->scrstate.stride;
+			rect_max = rect_min+height*i->scrstate.stride;
+			if((pointer_min < rect_max) && (rect_min < pointer_max))
+				remove_pointer = true;
+		}
+	}
+	if(i->log2bpp == 4)
+	{
+		if(remove_pointer)
+		{
+			pointer_remove_16(i,&i->live.pointer);
+			i->live.pointer.vinit = ~0; /* Let the ticker redraw it */
+		}
+		screen_copy_16(i,srcx,srcy,destx,desty,width,height);
+	}
+	else
+	{
+		if(remove_pointer)
+		{
+			pointer_remove_24(i,&i->live.pointer);
+			i->live.pointer.vinit = ~0; /* Let the ticker redraw it */
+		}
+		screen_copy_24(i,srcx,srcy,destx,desty,width,height);
+	}
+	return true;
+}
+
+static bool fillrect(instance_t *i,const fillrect_params_t *params)
+{
+	const uint32_t *oraeor = params->oraeor;
+	uint32_t col = oraeor[1];
+	int row;
+	/* Verify that it's a solid fill */
+	for(row=0;row<8;row++)
+	{
+		if((oraeor[0] != 0xFFFFFFFF) || (oraeor[1] != col))
+			return false;
+		oraeor += 2;
+	}
+	col = ~col;
+	/* Convert coordinates */
+	int x = params->left;
+	int y = i->softc.sc_height-(params->top+1);
+	int w = (params->right-params->left)+1;
+	int h = (params->top-params->bottom)+1;
+	bool remove_pointer = false;
+	if(i->live.pointer.vinit != ~0)
+	{
+		/* Do a simple range check on the dest memory region
+		   This will generate false-positives in many situations, but it's quick and simple */
+		int pointer_min = i->live.pointer.vinit+(i->live.pointer.x<<(i->log2bpp-3))+i->live.pointer.y*i->scrstate.stride;
+		int pointer_max = pointer_min+32*i->scrstate.stride;
+		int rect_min = i->scrstate.vrender+(x<<(i->log2bpp-3))+y*i->scrstate.stride;
+		int rect_max = rect_min+h*i->scrstate.stride;
+		if((pointer_min < rect_max) && (rect_min < pointer_max))
+			remove_pointer = true;
+	}
+	if(i->log2bpp == 4)
+	{
+		bool pattern_16bit = ((col ^ (col<<16)) < 65536); /* True if left halfword == right halfword */
+		if(!pattern_16bit)
+			return false;
+		if(remove_pointer)
+		{
+			pointer_remove_16(i,&i->live.pointer);
+			i->live.pointer.vinit = ~0; /* Let the ticker redraw it */
+		}
+		screen_fill_16(i,col>>16,x,y,w,h);
+	}
+	else
+	{
+		if(remove_pointer)
+		{
+			pointer_remove_24(i,&i->live.pointer);
+			i->live.pointer.vinit = ~0; /* Let the ticker redraw it */
+		}
+		screen_fill_24(i,col,x,y,w,h);
+	}
+	return true;
+}
+
+static int do_render(_kernel_swi_regs *r,instance_t *i)
+{
+	/* Don't claim if this screen bank isn't active? */
+	if((i->scrstate.vinit == ~0) || (i->scrstate.vinit != i->scrstate.vrender) || (i->live.blank_state))
+		return 1;
+	switch(r->r[1])
+	{
+	case GVRender_NOP:
+		goto complete;
+	case GVRender_CopyRectangle:
+		if(!copyrect(i,(const copyrect_params_t *)r->r[2]))
+			break;
+		goto complete;
+	case GVRender_FillRectangle:
+		if(!fillrect(i,(const fillrect_params_t *)r->r[2]))
+			break;
+		goto complete;
+	}
+	return 1;
+complete:
+	r->r[4] = 0;
+	return 0;
+}
+
+static int do_iicop(_kernel_swi_regs *r,instance_t *i)
+{
+	/* Read/write one byte at a time. This will be a bit slow, but it's the only way we have of determining how many bytes were transferred (buf[0] looks like it's only ever 0 or 1, and with the DeviceFS interface there's no way of finding out how long the control message response was) */
+	uint8_t buf[2];
+	int count = r->r[2];
+	int offset = r->r[0] & 0xffff;
+	int addr = (r->r[0]>>16) & 0xff;
+	if(!(addr & 1))
+	{
+		/* Not sure if we can write, or how to do it (just out ctrl message with the raw data to write?). Ignore. */
+		return 1;
+	}
+	r->r[0] = IICStatus_Completed;
+	r->r[4] = 0;
+	while(count--)
+	{
+		if(offset >= 256)
+		{
+			r->r[0] = IICStatus_Error;
+			break;
+		}
+		usbd_status err = udl_ctrl_msg(&i->softc, UT_READ_VENDOR_DEVICE, UDL_CTRL_CMD_READ_EDID, addr, offset<<8, buf, 2);
+		if(err || buf[0])
+		{
+			dprintf(("","do_iicop: addr %02x offset %04x -> err %d buf[0] %02x\n",addr,offset,err,buf[0]));
+			r->r[0] = IICStatus_NoACK; /* Most likely cause */
+			break;
+		}
+		*((uint8_t *) (r->r[1]++)) = buf[1]; /* Advance buffer ptr */
+		r->r[2]--; /* Decrease count */
+		offset++; /* Advance offset */
+	}
+	return 0;
+}
+
+static int do_pixelformats(_kernel_swi_regs *r,instance_t *i)
+{
+	(void) i;
+
+	r->r[0] = (int) pixelformats;
+	r->r[1] = sizeof(pixelformats)/sizeof(pixelformats[0]);
+	r->r[4] = 0;
+	return 0;
+}
+
+static int do_startupmode(_kernel_swi_regs *r,instance_t *i)
+{
+	(void) i;
+
+#ifdef DEBUGLIB
+	r->r[0] = (int) i->startupmode;
+	r->r[4] = 0;
+	return 0;
+#else
+	(void) r;
+	return 1;
+#endif
+}
+
+static int do_readinfo(_kernel_swi_regs *r,instance_t *i)
+{
+	const void *src = NULL;
+	int len = 0;
+	int version = 0;
+	int controllist[] = {
+		ControlList_Interlaced,
+		ControlList_NColour,
+		ControlList_ModeFlags,
+		ControlList_Terminator
+	};
+	switch(r->r[0])
+	{
+	case GVReadInfo_Version:
+		src = &version;
+		len = sizeof(version);
+		for(int i=0,j=Module_VersionNumber;i<6;i++,j/=10)
+			version |= (j % 10)<<(i*4+8);
+		break;
+	case GVReadInfo_ModuleName: /* Only one module instance assumed */
+	case GVReadInfo_DriverName:
+		src = Module_Title;
+		len = sizeof(Module_Title); /* Includes terminator */
+		break;
+	case GVReadInfo_HardwareName:
+		{
+			/* This one's a bit trickier. Get the manufacturer and product strings, as per *usbdevices */
+			usb_string_descriptor_t sdesc;
+			int desclen;
+			if(usbd_get_string_desc((usbd_device_handle) &i->usbdev,i->usbdev.ddesc.iManufacturer,0,&sdesc,&desclen))
+				return 1;
+			desclen >>= 1;
+			for(int i=0;i<desclen;i++)
+			{
+				int c;
+				if(i==desclen-1)
+					c=' ';
+				else
+				{
+					c = UGETW(sdesc.bString[i]);
+					if(c >= 256)
+						c = '?';
+				}
+				if(len < r->r[2])
+					((char *) r->r[1])[len++] = c;
+			}
+			if(usbd_get_string_desc((usbd_device_handle) &i->usbdev,i->usbdev.ddesc.iProduct,0,&sdesc,&desclen))
+				return 1;
+			desclen >>= 1;
+			for(int i=0;i<desclen;i++)
+			{
+				int c;
+				if(i==desclen-1)
+					c=0;
+				else
+				{
+					c = UGETW(sdesc.bString[i]);
+					if(c >= 256)
+						c = '?';
+				}
+				if(len < r->r[2])
+					((char *) r->r[1])[len++] = c;
+			}
+			r->r[2] -= len;
+			r->r[4] = 0;
+			return 0;
+		}
+	case GVReadInfo_ControlListItems:
+		src = controllist;
+		len = sizeof(controllist);
+		break;
+	}
+	if(!len)
+		return 1;
+	int copy = ((len < r->r[2])?len:r->r[2]);
+	memcpy((void *) r->r[1],src,copy);
+	r->r[2] -= len;
+	r->r[4] = 0;
+	return 0;
+}
+
+int graphicsv_handler(_kernel_swi_regs *r,void *pw)
+{
+	(void) pw;
+	instance_t *i = instances[((uint32_t)r->r[4])>>24];
+	if(!i)
+		return 1;
+	uint16_t func = (uint16_t) r->r[4];
+	switch(func)
+	{
+	case GraphicsV_Complete:		return do_null(r,i);
+	case GraphicsV_SetMode:			return do_setmode(r,i);
+	case GraphicsV_SetBlank:		return do_setblank(r,i);
+	case GraphicsV_UpdatePointer:		return do_updatepointer(r,i);
+	case GraphicsV_SetDMAAddress:		return do_setdmaaddress(r,i);
+	case GraphicsV_VetMode:			return do_vetmode(r,i);
+	case GraphicsV_DisplayFeatures:		return do_displayfeatures(r,i);
+	case GraphicsV_FramestoreAddress:	return do_framestoreaddress(r,i);
+	case GraphicsV_WritePaletteEntry:	return do_writepaletteentry(r,i);
+	case GraphicsV_WritePaletteEntries:	return do_writepaletteentries(r,i);
+	case GraphicsV_ReadPaletteEntry:	return do_readpaletteentry(r,i);
+	case GraphicsV_Render:			return do_render(r,i);
+	case GraphicsV_IICOp:			return do_iicop(r,i);
+	case GraphicsV_PixelFormats:		return do_pixelformats(r,i);
+	case GraphicsV_StartupMode:		return do_startupmode(r,i);
+	case GraphicsV_ReadInfo:		return do_readinfo(r,i);
+
+	case GraphicsV_SelectHead:
+	case GraphicsV_VSync:
+	case GraphicsV_SetInterlace:
+	default:				return 1;
+	}
+}

@@ -1,0 +1,1043 @@
+; Copyright 2018 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+
+        GBLL    OverlayDebug
+OverlayDebug SETL   Debug :LAND: {FALSE}
+
+GVOverlay_Init
+        B       Dispmanx_Init
+
+GVOverlay_Finalise
+        Entry   "r10-r11"
+        ADRL    r11, GVOverlays
+        MOV     r10, #MaxOverlays
+10
+        LDR     lr, [r11, #GVOverlay_Format]
+        CMP     lr, #0
+        BLNE    DestroyOverlay
+        ADD     r11, r11, #GVOverlay_Size
+        SUBS    r10, r10, #1
+        BNE     %BT10
+        EXIT
+
+; In: R0 = Pointer to mode selector describing the required properties of the
+;          overlay.
+;     R1 = Aspect ratio to use when calculating returned min/max scale values
+;          Top 16 bits = width
+;          Low 16 bits = height
+;     R2 = Flags:
+;          bit 0: Overlay must support scaling
+;          bits 1-31: Reserved, should be zero
+;     R3 = Mask of which heads the overlay is to be used with
+;     R4 = reason code + driver number
+;     
+; Out: R0 = Overlay number
+;      R1 = Flags:
+;           bits 0-7: Overlay type
+;                     0 = Z-Order
+;                     1 = Basic
+;                     2+ = Reserved
+;           bits 8-31: Reserved
+;      R2 = Minimum width overlay can be scaled to
+;      R3 = Minimum height overlay can be scaled to
+;      R5 = Maximum width overlay can be scaled to
+;      R6 = Maximum height overlay can be scaled to
+GV_CreateOverlay ROUT
+        Push    "r7-r11"
+        BL      OverlayCreateVetCommon
+        CMP     r8, #-1
+        Pull    "r7-r11,pc",EQ
+      [ OverlayDebug
+        Push    "r0"
+        MOV     r0, r7
+        bl DebugHexTX4
+        bl DebugTXStrInline
+        DCB "overlay addr",10,13,0
+        ALIGN
+        Pull    "r0"
+      ]
+        ; Fill in the overlay details
+        STR     r9, [r7, #GVOverlay_Format]
+        STRB    r10, [r7, #GVOverlay_NumBuffers]
+        ADD     r11, r7, #GVOverlay_Buffers
+        MOV     lr, #-1
+10
+        ASSERT  GVOverlayBuffer_Resource = 0
+        STR     lr, [r11], #GVOverlayBuffer_Size
+        SUBS    r10, r10, #1
+        BNE     %BT10
+        LDR     r10, [r0, #ModeSelector_XRes]
+        LDR     r11, [r0, #ModeSelector_YRes]
+        STRH    r10, [r7, #GVOverlay_Width]
+        STRH    r11, [r7, #GVOverlay_Height]
+        STRH    r10, [r7, #GVOverlay_ScaledWidth]
+        STRH    r11, [r7, #GVOverlay_ScaledHeight]
+        MOV     lr, #255
+        STRB    lr, [r7, #GVOverlay_DisplayBank]
+        MOV     lr, #65536
+        STR     lr, [r7, #GVOverlay_InvXScale]
+        STR     lr, [r7, #GVOverlay_InvYScale]
+        MOV     lr, #0
+        STR     lr, [r7, #GVOverlay_Element]
+        STRH    lr, [r7, #GVOverlay_ClipRectX0]
+        STRH    lr, [r7, #GVOverlay_ClipRectY0]
+        LDR     lr, mbxres
+        STRH    lr, [r7, #GVOverlay_ClipRectX1]
+        LDR     lr, mbyres
+        STRH    lr, [r7, #GVOverlay_ClipRectY1]
+        ADD     r0, r8, #NumHeads
+        MOV     r4, #0
+        Pull    "r7-r11,pc"
+
+taggethan  DCD     taggethanlen
+           DCD     0
+           DCD     ARM2VC_Tag_GetDispmanxMemHandle
+           DCD     8
+           DCD     4
+gethandata DCD     0
+           DCD     0
+           DCD     ARM2VC_Tag_End
+taggethanlen *     . - taggethan
+
+taglockmem  DCD     taglockmemlen
+            DCD     0
+            DCD     ARM2VC_Tag_LockMemory
+            DCD     4
+            DCD     4
+lockmemdata DCD     0
+            DCD     ARM2VC_Tag_End
+taglockmemlen *     . - taglockmem
+
+tagunlockmem  DCD     tagunlockmemlen
+              DCD     0
+              DCD     ARM2VC_Tag_UnlockMemory
+              DCD     4
+              DCD     4
+unlockmemdata DCD     0
+              DCD     ARM2VC_Tag_End
+tagunlockmemlen *     . - tagunlockmem
+
+; In: R0 = Bank number
+;     R11 -> overlay
+; Out: R8 -> GVOverlayBuffer
+;      V set, R8 corrupt if error
+CreateOverlayBuffer ROUT
+        Entry   "r0-r3", taggethanlen
+        LDRB    r1, [r11, #GVOverlay_NumBuffers]
+        CMP     r0, r1
+        BHS     %FT99
+        ASSERT  taggethanlen >= 16
+        ADD     r8, r11, #GVOverlay_Buffers
+        ASSERT  GVOverlayBuffer_Size = 32
+        ASSERT  GVOverlayBuffer_Resource = 0
+        LDR     lr, [r8, r0, LSL #5]!
+        CMP     lr, #-1
+        BNE     %FT80
+        LDR     r1, [r11, #GVOverlay_Format]
+        LDRH    r2, [r11, #GVOverlay_Width]
+        LDRH    r3, [r11, #GVOverlay_Height]
+        MOV     r0, #EDispmanResourceCreate
+        LDR     r1, [r1, #OverlayFormat_Dispmanx]
+        STMIA   sp, {r0-r3}
+        MOV     r0, #16
+        BL      Dispmanx_Send
+      [ OverlayDebug
+        BVC     %FT05
+        LDR     r0, [r0]
+        bl DebugHexTX4
+        bl DebugTXStrInline
+        DCB "overlay err",10,13,0
+        ALIGN
+        SETV
+05
+      ]
+        EXIT    VS
+      [ OverlayDebug
+        bl DebugHexTX4
+        bl DebugTXStrInline
+        DCB "overlay resource",10,13,0
+        ALIGN
+      ]
+        ; Zero is returned if creation fails
+        CMP     r0, #0
+        BEQ     %FT99
+        STR     r0, [r8, #GVOverlayBuffer_Resource]
+        ; Attempt to get memory handle
+        MOV     r2, #taggethanlen
+        ADR     r1, taggethan
+10
+        SUBS    r2, r2, #4
+        LDR     lr, [r1, r2]
+        STR     lr, [sp, r2]
+        BNE     %BT10
+        STR     r0, [sp, #gethandata-taggethan]
+        MOV     r0, sp
+        MOV     r1, sp
+        SWI     XBCMSupport_SendTempPropertyBuffer
+      [ OverlayDebug
+        BVC     %FT15
+        LDR     r0, [r0]
+        bl DebugHexTX4
+        bl DebugTXStrInline
+        DCB "gethan err",10,13,0
+        ALIGN
+        SETV
+15
+      ]
+        BVS     %FT90
+        LDR     r0, [sp, #gethandata-taggethan]
+        CMP     r0, #0
+        BNE     %FT90
+        LDR     r0, [sp, #gethandata+4-taggethan]
+      [ OverlayDebug
+        bl DebugHexTX4
+        bl DebugTXStrInline
+        DCB "mem handle",10,13,0
+        ALIGN
+      ]
+        STR     r0, [r8, #GVOverlayBuffer_MemHandle]
+80
+        CLRV
+        EXIT
+90
+        ; Release resource
+        MOV     r0, #EDispmanResourceDelete
+        LDR     r1, [r8, #GVOverlayBuffer_Resource]
+        STMIA   sp, {r0-r1}
+        MOV     r0, #8
+        BL      Dispmanx_Send
+        MOV     r0, #-1
+        STR     r0, [r8, #GVOverlayBuffer_Resource]
+99
+        SETV
+        EXIT
+
+; In: R4 = reason code + driver number + overlay number
+GV_DestroyOverlay
+        BL      GetOverlay
+        BL      DestroyOverlay
+        MOV     r4, #0
+        Pull    "r11,pc"
+
+; In: R11 -> overlay
+DestroyOverlay ROUT
+        Entry   "r0"
+        ; Destroy all the buffers
+        LDRB    r0, [r11, #GVOverlay_NumBuffers]
+10
+        SUB     r0, r0, #1
+        BL      DiscardOverlayBuffer
+        CMP     r0, #0
+        BNE     %BT10
+        ; Free the slot
+        MOV     r0, #0
+        STR     r0, [r11, #GVOverlay_Format]
+        EXIT        
+
+; In: R0 = bank number
+;     R11 -> overlay
+DiscardOverlayBuffer
+        Entry   "r0-r2,r4",8
+        ADD     r1, r11, #GVOverlay_Buffers
+        ASSERT  GVOverlayBuffer_Size = 32
+        ASSERT  GVOverlayBuffer_Resource = 0
+        LDR     r2, [r1, r0, LSL #5]!
+        CMP     r2, #-1
+        EXIT    EQ
+      [ OverlayDebug
+        bl DebugHexTX4
+        bl DebugTXStrInline
+        DCB "discarding buffer",10,13,0
+        ALIGN
+      ]
+        ; Unmap if necessary (ensures memory handle unlocked)
+        BL      UnmapOverlayBuffer
+        ; Hide if necessary (destroying the resource doesn't hide it!)
+        LDRB    r4, [r11, #GVOverlay_DisplayBank]
+        CMP     r4, r0
+        MOVEQ   r4, #255
+        STREQB  r4, [r11, #GVOverlay_DisplayBank]
+        BLEQ    SetOverlayPosition
+        ; Destroy the buffer
+        MOV     r0, #EDispmanResourceDelete
+        STMIA   sp, {r0,r2}
+        MOV     r0, #8
+        BL      Dispmanx_Send
+        MOV     r0, #-1
+        STR     r0, [r1, #GVOverlayBuffer_Resource]
+        EXIT
+        
+
+; In: R0 = Pointer to coordinate array:
+;          Word 0: Head number
+;          Word 1: X position
+;          Word 2: Y position
+;     R1 = Number of entries in array
+;     R2 = Bank to display (ignored if R1=0)
+;     R4 = reason code + driver number + overlay number
+GV_SetOverlayPosition ROUT
+        BL      GetOverlay
+        Push    "r0,r2,r3,r8"
+        LDRB    lr, [r11, #GVOverlay_DisplayBank]
+        EORS    r3, r2, lr ; Prep R3 for SetOverlayPosition
+        CMPNE   r1, #0
+        BEQ     %FT50
+        ; Allocate buffer if necessary
+        MOV     r0, r2, LSR #1
+        BL      CreateOverlayBuffer
+        BVS     %FT90
+        LDR     r0, [sp]
+50        
+        CMP     r1, #0
+        MOVEQ   r2, #255
+        STRB    r2, [r11, #GVOverlay_DisplayBank]
+        BEQ     %FT60
+        LDMIB   r0, {r2, lr}
+        SSAT    r2, #16, r2
+        SSAT    lr, #16, lr
+        STRH    r2, [r11, #GVOverlay_XCoord]
+        STRH    lr, [r11, #GVOverlay_YCoord]
+60
+        BL      SetOverlayPosition ; Clears R4 for us
+90
+        CLRV
+        Pull    "r0,r2,r3,r8,r11,pc"
+
+; In: R3 non-zero if element might need switching to different resource (i.e. bank)
+;     R11 -> overlay
+; Out: R4=0 if successful
+SetOverlayPosition ROUT
+        Entry   "r0-r8", 128
+        LDRB    r7, [r11, #GVOverlay_DisplayBank]
+        ; Set position by adding/updating element
+        CMP     r7, #255
+        BEQ     %FT50
+        MOV     r0, #EDispmanUpdateStart
+        MOV     r1, #10
+        STMIA   sp, {r0-r1}
+        MOV     r0, #8
+        BL      Dispmanx_Send
+        BVS     %FT90
+        MOV     r8, r0
+        LDR     r0, [r11, #GVOverlay_Element]
+        CMP     r0, #0
+        BNE     %FT10
+        ; Add element
+        MOV     r0, #EDispmanElementAdd
+        MOV     r1, r8
+        LDR     r2, DispHandle
+        LDR     r3, ModeFlags
+        TST     r3, #ModeFlag_DataFormatSub_Alpha
+        LDRB    r3, [r11, #GVOverlay_Depth]
+        MOVNE   lr, #BaseDepth_ZOrder
+        SUBNE   r3, lr, r3
+        RSBEQ   r3, r3, #BaseDepth_Basic  
+        STMIA   sp, {r0-r3}
+        ADD     r0, r11, #GVOverlay_Buffers
+        ASSERT  GVOverlayBuffer_Size = 32
+        ASSERT  GVOverlayBuffer_Resource = 0
+        LDR     r0, [r0, r7, LSL #5]
+        STR     r0, [sp, #32] ; resource
+        MOV     r1, #0
+        STR     r1, [sp, #52] ; protection
+        LDR     r2, [r11, #GVOverlay_Format]
+        LDR     r2, [r2, #OverlayFormat_Log2BPP]
+        CMP     r2, #7 ; YUV needs fixed alpha
+        MOVEQ   r2, #1 ; Fixed alpha
+        MOVEQ   r3, #255 ; opaque
+        MOVNE   r2, #0 ; Src alpha
+        MOVNE   r3, #0
+        STR     r2, [sp, #56] ; alpha flags
+        STR     r3, [sp, #60] ; opacity
+        STR     r1, [sp, #64] ; mask image
+        STR     r1, [sp, #68] ; clamp mode
+        STR     r1, [sp, #72] ; clamp key mask
+        STR     r1, [sp, #76] ; yy_upper
+        STR     r1, [sp, #80] ; yy_lower
+        STR     r1, [sp, #84] ; cr_upper
+        STR     r1, [sp, #88] ; cr_lower
+        STR     r1, [sp, #92] ; cb_upper
+        STR     r1, [sp, #96] ; cb_lower
+        STR     r1, [sp, #100] ; replace_value
+        STR     r1, [sp, #104] ; transform
+        ADD     r0, sp, #16 ; dest rect
+        ADD     r1, sp, #36 ; src rect
+        BL      Overlay_TransformPos
+        MOV     r0, #108
+        BLVC    Dispmanx_Send
+        STRVC   r0, [r11, #GVOverlay_Element]
+        B       %FT60
+10
+        ; Move existing element
+        MOV     r0, #EDispmanElementChangeAttributes + NoReply
+        MOV     r1, r8
+        LDR     r2, [r11, #GVOverlay_Element]
+        MOV     r3, #1<<2+(1<<3) ; Only update src & dest rects
+        MOV     r4, #0 ; layer
+        MOV     r5, #0 ; opacity
+        MOV     r6, #0 ; mask
+        MOV     lr, #0 ; transform
+        STMIA   sp, {r0-r6,lr}
+        ADD     r0, sp, #32 ; dest rect
+        ADD     r1, sp, #48 ; src rect
+        BL      Overlay_TransformPos
+        BVS     %FT55 ; Invalid position - remove image
+        MOV     r0, #64
+        BL      Dispmanx_Send
+        FRAMLDR r3
+        CMP     r3, #0
+        BEQ     %FT60
+        ; Change source
+        MOV     r0, #EDispmanElementChangeSource + NoReply
+        MOV     r1, r8
+        LDR     r2, [r11, #GVOverlay_Element]
+        ADD     r3, r11, #GVOverlay_Buffers
+        ASSERT  GVOverlayBuffer_Size = 32
+        ASSERT  GVOverlayBuffer_Resource = 0
+        LDR     r3, [r3, r7, LSL #5]
+        STMIA   sp, {r0-r3}
+        MOV     r0, #16
+        BL      Dispmanx_Send
+        B       %FT60
+50
+        LDR     r0, [r11, #GVOverlay_Element]
+        CMP     r0, #0
+        BEQ     %FT80
+        ; Remove image
+        MOV     r0, #EDispmanUpdateStart
+        MOV     r1, #10
+        STMIA   sp, {r0-r1}
+        MOV     r0, #8
+        BL      Dispmanx_Send
+        BVS     %FT90
+        MOV     r8, r0
+55
+        MOV     r0, #EDispmanElementRemove + NoReply
+        MOV     r1, r8
+        LDR     r2, [r11, #GVOverlay_Element]
+        STMIA   sp, {r0-r2}
+        MOV     r0, #12
+        BL      Dispmanx_Send
+        MOV     r0, #0
+        STR     r0, [r11, #GVOverlay_Element]
+60
+        MOV     r0, #EDispmanUpdateSubmit
+        MOV     r1, r8
+        STMIA   sp, {r0-r1}
+        MOV     r0, #8
+        BL      Dispmanx_Send
+80
+        ; Done
+        PullEnv
+        MOV     r4, #0
+        MOV     pc, lr
+90
+        ; Error!        
+        EXIT
+
+; In: R0 -> dest rect (x, y, w, h in pixels)
+;     R1 -> src rect (x, y, w, h in 1/65536th pixels)
+;     R11 -> overlay
+; Out: R0, R1 filled in
+;      V set if invalid position
+;      R0-R6 corrupt
+Overlay_TransformPos ROUT
+        Entry   "r7-r10"
+        ; Build r2-r5 as the src rect, r7-r10 as the dest rect
+        MOV     r2, #0
+        MOV     r3, #0
+        LDRH    r4, [r11, #GVOverlay_Width]
+        LDRH    r5, [r11, #GVOverlay_Height]
+        MOV     r4, r4, LSL #16
+        MOV     r5, r5, LSL #16
+        LDRSH   r7, [r11, #GVOverlay_XCoord]
+        LDRSH   r8, [r11, #GVOverlay_YCoord]
+        LDRH    r9, [r11, #GVOverlay_ScaledWidth]
+        LDRH    r10, [r11, #GVOverlay_ScaledHeight]
+        ; Calculate and clip against screen-space clipping rectangle
+        ADD     r9, r9, r7
+        ADD     r10, r10, r8
+        ; Right edge
+        LDRSH   lr, [r11, #GVOverlay_ClipRectX1]
+        ADD     lr, lr, r7
+        LDR     r6, mbxres
+        CMP     lr, r6
+        MOVGT   lr, r6
+        LDR     r6, [r11, #GVOverlay_InvXScale]
+        SUBS    lr, lr, r9 ; Negative clip amount
+        ADDLT   r9, r9, lr
+        MLALT   r4, r6, lr, r4
+
+        ; Left edge
+        LDRSH   lr, [r11, #GVOverlay_ClipRectX0]
+        ADDS    lr, lr, r7
+        MOVLT   lr, #0
+        SUBS    lr, lr, r7 ; Positive clip amount
+        ADDGT   r7, r7, lr
+        MULGT   r2, r6, lr
+
+        ; Bottom edge
+        LDRSH   lr, [r11, #GVOverlay_ClipRectY1]
+        ADD     lr, lr, r8
+        LDR     r6, mbyres
+        CMP     lr, r6
+        MOVGT   lr, r6        
+        LDR     r6, [r11, #GVOverlay_InvYScale]
+        SUBS    lr, lr, r10 ; Negative clip amount
+        ADDLT   r10, r10, lr
+        MLALT   r5, r6, lr, r5
+
+        ; Top edge
+        LDRSH   lr, [r11, #GVOverlay_ClipRectY0]
+        ADDS    lr, lr, r8
+        MOVLT   lr, #0
+        SUBS    lr, lr, r8 ; Positive clip amount
+        ADDGT   r8, r8, lr
+        MULGT   r3, r6, lr
+
+        SUB     r4, r4, r2
+        SUB     r5, r5, r3
+        SUBS    r9, r9, r7 ; Back to width & height
+        SUBGTS  r10, r10, r8
+        BLE     %FT90
+        ; Transform dest from framebuffer pixels to screen pixels
+        LDR     r6, XScale
+        LDR     lr, XOffset
+        MUL     r7, r6, r7
+        ADD     r7, lr, r7, ASR #16
+        MUL     r9, r6, r9
+        MOV     r9, r9, ASR #16
+        LDR     r6, YScale
+        LDR     lr, YOffset
+        MUL     r8, r6, r8
+        ADD     r8, lr, r8, ASR #16
+        MUL     r10, r6, r10
+        MOV     r10, r10, ASR #16
+        ; Since the clipping rectangle is limited to the bounds of the framebuffer, we shouldn't need to check for invalid coordinates at this stage
+        ; TODO - Unless overscan settings can push the framebuffer offscreen?
+        STMIA   r0, {r7-r10}
+        STMIA   r1, {r2-r5}
+        CLRV
+        EXIT
+90
+        ; Invalid position
+      [ OverlayDebug
+        bl DebugTXStrInline
+        DCB "bad pos",10,13,0
+        ALIGN
+      ]
+        SETV
+        EXIT
+
+; In: R0 = Bank number
+;     R4 = reason code + driver number + overlay number
+;     
+; Out: R0 = Pointer to array giving buffer addresses:
+;           Word 0: Plane 0 base logical address
+;           Word 1: Plane 0 stride between image rows
+;           Word 2+: logical addresses & strides for any additional planes
+GV_MapOverlayBuffer ROUT
+        BL      GetOverlay
+        Push    "r0-r8"
+        ; Already mapped?
+        LDRB    r4, [r11, #GVOverlay_Mapped]
+        MOV     r5, #1
+        MOV     r5, r5, LSL r0
+        TST     r4, r5
+        BNE     %FT90
+        ; Ensure it exists
+        BL      CreateOverlayBuffer ; Out: R8 -> GVOverlayBuffer
+        BVS     %FT70
+        ; Lock the buffer
+        SUB     sp, sp, #taglockmemlen
+        MOV     r2, #taglockmemlen
+        ADRL    r1, taglockmem
+10
+        SUBS    r2, r2, #4
+        LDR     lr, [r1, r2]
+        STR     lr, [sp, r2]
+        BNE     %BT10
+        LDR     r0, [r8, #GVOverlayBuffer_MemHandle]
+        STR     r0, [sp, #lockmemdata-taglockmem]
+        MOV     r0, sp
+        MOV     r1, sp
+        SWI     XBCMSupport_SendTempPropertyBuffer
+      [ OverlayDebug
+        BVS     %FT25
+        MOV     r2, #taggethanlen
+20
+        LDR     r0, [r1], #4
+        bl DebugHexTX4
+        SUBS    r2, r2, #4
+        BNE     %BT20
+        bl DebugTXStrInline
+        DCB "mapbuffer result",10,13,0
+        ALIGN
+25
+      ]
+        LDRVC   r1, [sp, #lockmemdata-taglockmem]
+        ADD     sp, sp, #taglockmemlen
+        BVS     %FT70
+        ; Map the buffer
+        BIC     r1, r1, #&C0000000
+        LDRH    r2, [r11, #GVOverlay_Width]
+        ; Row stride is multiple of 16 pixels (or 32 for YUV)
+        ; For planar images, plane height is padded to 16 rows
+        ; https://www.raspberrypi.org/forums/viewtopic.php?t=140855#p933049
+        LDR     r0, [r11, #GVOverlay_Format]
+        LDRH    r3, [r11, #GVOverlay_Height]
+        LDR     r7, [r0, #OverlayFormat_Log2BPP]
+        CMP     r7, #5
+        MOVGT   lr, #31
+        MOVLE   lr, #15
+        ADD     r2, r2, lr
+        BIC     r2, r2, lr
+        BGT     %FT30
+        ; 16 or 32bit RGB
+        SUB     r7, r7, #3
+        MOV     r2, r2, LSL r7
+        STR     r2, [r8, #GVOverlayBuffer_Mapping+4]
+        MUL     r2, r3, r2
+        B       %FT50
+30
+        ; YUV format
+        ADD     r3, r3, #15
+        BIC     r3, r3, #15
+        LDR     r0, [r0, #OverlayFormat_Dispmanx]
+        ASSERT  Format_YV12 < Format_YV16
+        ASSERT  Format_YV16 < Format_NV12
+        CMP     r0, #Format_YV16
+        ; Plane 0 always luma
+        STR     r2, [r8, #GVOverlayBuffer_Mapping+4]
+        MUL     r6, r3, r2 ; Plane 1 offset
+        ; YV12, YV16 has half stride for planes 1 & 2
+        MOVLE   r2, r2, LSR #1
+        STR     r2, [r8, #GVOverlayBuffer_Mapping+8+4]
+        STRLE   r2, [r8, #GVOverlayBuffer_Mapping+16+4]
+        ; YV12 planes 1 & 2 are half-height
+        MOVLT   r3, r3, LSR #1
+        MLA     r7, r3, r2, r6 ; Plane 2 offset
+        MOVGT   r2, r7 ; NV12 has no plane 2
+        MLALE   r2, r3, r2, r7 ; ... else, plane 2 is same size as plane 1
+50
+        LDR     r0, =OSMemReason_MapIOPermanent+(1:SHL:8)+(1:SHL:17)
+        SWI     XOS_Memory
+        STRVC   r3, [r8, #GVOverlayBuffer_Mapping]
+        ADDVC   r6, r3, r6
+        STRVC   r6, [r8, #GVOverlayBuffer_Mapping+8]
+        ADDVC   r7, r3, r7
+        STRVC   r7, [r8, #GVOverlayBuffer_Mapping+16]
+        BVC     %FT80
+      [ OverlayDebug
+        LDR     r0, [r0]
+        bl DebugHexTX4
+        bl DebugTXStrInline
+        DCB "mapbuffer io err",10,13,0
+        ALIGN
+      ]
+        ; No IO space?
+        ; Unlock the buffer and give up
+        LDR     r0, [sp]
+        BL      UnlockOverlayBuffer
+70
+        CLRV
+        Pull    "r0-r8,r11,pc"
+80
+        ORR     r4, r4, r5
+        STRB    r4, [r11, #GVOverlay_Mapped]
+90
+        Pull    "r0-r8"
+        ASSERT  GVOverlayBuffer_Size = 32
+        ADD     r0, r11, r0, LSL #5
+        MOV     r4, #0
+        ADD     r0, r0, #GVOverlay_Buffers+GVOverlayBuffer_Mapping
+        Pull    "r11,pc"
+
+; In: R0 = Bank number
+;     R4 = reason code + driver number + overlay number
+GV_UnmapOverlayBuffer ROUT
+        BL      GetOverlay
+        BL      UnmapOverlayBuffer ; Clears R4 on success
+        Pull    "r11,pc"
+
+; In: R0 = bank number
+;     R11 -> overlay
+; Out: R4 = 0 on success
+UnmapOverlayBuffer ROUT
+        Entry   "r0-r3"
+        LDRB    r3, [r11, #GVOverlay_Mapped]
+        MOV     r2, #1
+        TST     r3, r2, LSL r0
+        MOVEQ   r4, #0
+        EXIT    EQ
+        BIC     r3, r3, r2, LSL r0
+        BL      UnlockOverlayBuffer
+        STRVCB  r3, [r11, #GVOverlay_Mapped]
+        MOVVC   r4, #0
+        EXIT
+
+; In: R0 = bank number (assumed valid)
+;     R11 -> overlay
+; Out: R0-R2 corrupt
+;      V set on error
+UnlockOverlayBuffer ROUT
+        Entry   , tagunlockmemlen     
+        MOV     r2, #tagunlockmemlen
+        ADRL    r1, tagunlockmem
+10
+        SUBS    r2, r2, #4
+        LDR     lr, [r1, r2]
+        STR     lr, [sp, r2]
+        BNE     %BT10
+        ASSERT  GVOverlayBuffer_Size = 32
+        ADD     r0, r11, r0, LSL #5
+        LDR     r0, [r0, #GVOverlay_Buffers+GVOverlayBuffer_MemHandle]
+        STR     r0, [sp, #unlockmemdata-tagunlockmem]
+        MOV     r0, sp
+        MOV     r1, sp
+        SWI     XBCMSupport_SendTempPropertyBuffer
+        EXIT
+
+; In: R0 = Bank number
+;     R4 = reason code + driver number + overlay number
+GV_DiscardOverlayBuffer
+        BL      GetOverlay
+        BL      DiscardOverlayBuffer
+        MOV     r4,#0
+        Pull    "r11,pc"
+
+; In: R0 = Pointer to mode selector, as per GraphicsV_CreateOverlay
+;     R1 = Aspect ratio to use when calculating returned min/max scale values
+;          Top 16 bits = width
+;          Low 16 bits = height
+;     R2 = Flags:
+;          bit 0: Overlay must support scaling
+;          bits 1-31: Reserved, should be zero
+;     R3 = Mask of which heads the overlay is to be used with
+;     R4 = reason code + driver number
+;     
+; Out: R1 = Flags:
+;           bits 0-7: Overlay type
+;                     0 = Z-Order
+;                     1 = Basic
+;                     2+ = Reserved
+;           bits 8-31: Reserved
+;      R2 = Minimum width overlay can be scaled to
+;      R3 = Minimum height overlay can be scaled to
+;      R5 = Maximum width overlay can be scaled to
+;      R6 = Maximum height overlay can be scaled to
+GV_VetOverlay
+        Push    "r7-r11"
+        BL      OverlayCreateVetCommon
+        CMP     r8, #-1
+        MOVNE   r4, #0
+        Pull    "r7-r11,pc"
+
+; In: R0 = Pointer to mode selector describing the required properties of the
+;          overlay.
+;     R1 = Aspect ratio to use when calculating returned min/max scale values
+;          Top 16 bits = width
+;          Low 16 bits = height
+;     R2 = Flags:
+;          bit 0: Overlay must support scaling
+;          bits 1-31: Reserved, should be zero
+;     R3 = Mask of which heads the overlay is to be used with
+;     
+; Out: R8 = -1 if vet failed
+;           R7, R9-R10 corrupt
+;           Other regs preserved
+;      Or if vet succeeded:
+;      R1 = Flags:
+;           bits 0-7: Overlay type
+;                     0 = Z-Order
+;                     1 = Basic
+;                     2+ = Reserved
+;           bits 8-31: Reserved
+;      R2 = Minimum width overlay can be scaled to
+;      R3 = Minimum height overlay can be scaled to
+;      R5 = Maximum width overlay can be scaled to
+;      R6 = Maximum height overlay can be scaled to
+;      R7 = Overlay pointer
+;      R8 = Overlay number
+;      R9 = Dispmanx pixel format
+;      R10 = Num buffers
+OverlayCreateVetCommon ROUT
+        Entry   "r0,r4,r11"
+        ; Default state is failure
+        MOV     r8, #-1
+        ; No dispmanx means no overlays
+        LDR     lr, DispManServiceC
+        CMP     lr, #0
+        EXIT    EQ
+        ; No overlays if screen is larger than GPU coord limit (too much hassle to deal with)
+        LDR     lr, DisplayWidth
+        CMP     lr, #2048
+        LDRLE   lr, DisplayHeight
+        CMPLE   lr, #2048
+        EXIT    GT
+        ; Only one head
+        CMP     r3, #1
+        EXIT    NE
+        ; Only supported flags
+        CMP     r2, #GVOverlayFlag_Scalable
+        EXIT    HI
+        LDR     r4, [r0, #ModeSelector_PixelDepth]
+        ; Convert pixel depth to default NColour value
+        MOV     lr, #1
+        MOV     r8, lr, LSL r4 ; log2bpp -> bpp
+        RSB     r8, lr, lr, LSL r8 ; bpp -> ncolour
+        ; ModeFlags
+        MOV     r11, #0
+        ; Validate mode variables
+        ADD     r9, r0, #ModeSelector_ModeVars
+        MOV     r0, #1
+10
+        LDR     r7, [r9], #4
+        CMP     r7, #-1
+        BEQ     %FT20
+        LDR     lr, [r9], #4
+        CMP     r7, #VduExt_ModeFlags
+        MOVEQ   r11, lr
+        CMP     r7, #VduExt_NColour
+        MOVEQ   r8, lr
+        CMP     r7, #VduExt_MinScreenBanks
+        MOVEQ   r0, lr
+        B       %BT10
+20
+        SUB     lr, r0, #1
+        CMP     lr, #MaxOverlayBuffers
+        BHS     %FT85 ; Bad num banks
+        ; Try and find matching format
+        ; TODO: Deal with YUV sub-formats properly
+        CMP     r4, #7
+        BICEQ   r11, r11, #ModeFlag_ChromaSubsampleMode+ModeFlag_DataFormatSub_Video+ModeFlag_DataFormatSub_709
+        ADR     r9, OverlayFormats-OverlayFormat_Size
+30
+        LDR     lr, [r9, #OverlayFormat_Size]!
+        CMP     lr, #-1
+        BEQ     %FT85 ; Bad format
+        LDR     lr, [r9, #OverlayFormat_Log2BPP]
+        CMP     lr, r4
+        LDREQ   lr, [r9, #OverlayFormat_NColour]
+        CMPEQ   lr, r8
+        LDREQ   lr, [r9, #OverlayFormat_ModeFlags]
+        CMPEQ   lr, r11
+        BNE     %BT30
+        ; Look for a free overlay slot
+        ADRL    r7, GVOverlays
+        MOV     r8, #0
+80
+        LDR     lr, [r7, #GVOverlay_Format]
+        CMP     lr, #0
+        BEQ     %FT90
+        ADD     r7, r7, #GVOverlay_Size
+        ADD     r8, r8, #1
+        CMP     r8, #MaxOverlays
+        BNE     %BT80
+85
+        MOV     r8, #-1
+        EXIT
+90
+        ; TODO: Scaling limits
+        MOV     r2, #1
+        MOV     r3, #1
+        MOV     r5, #2048
+        MOV     r6, #2048
+        ; We can only (usefully) place overlays behind the desktop if we're in an alpha-blended mode
+        LDR     r1, ModeFlags
+        TST     r1, #ModeFlag_DataFormatSub_Alpha
+        MOVNE   r1, #GVOverlayType_ZOrder
+        MOVEQ   r1, #GVOverlayType_Basic
+        MOV     r10, r0
+        EXIT
+
+                        ^ 0
+OverlayFormat_Dispmanx  # 4
+OverlayFormat_Log2BPP   # 4
+OverlayFormat_NColour   # 4
+OverlayFormat_ModeFlags # 4
+OverlayFormat_Size      # 0
+
+OverlayFormats
+        DCD Format_RGB565, 4, 65535, ModeFlag_DataFormatSub_RGB+ModeFlag_64k
+        DCD Format_TBGR8888, 5, -1, 0
+        DCD Format_ABGR8888, 5, -1, ModeFlag_DataFormatSub_Alpha
+        DCD Format_TRGB8888, 5, -1, ModeFlag_DataFormatSub_RGB
+        DCD Format_ARGB8888, 5, -1, ModeFlag_DataFormatSub_RGB+ModeFlag_DataFormatSub_Alpha
+        DCD Format_YV12, 7, &32315659, ModeFlag_DataFormatFamily_YCbCr
+        DCD Format_YV16, 7, &36315659, ModeFlag_DataFormatFamily_YCbCr
+        DCD Format_NV12, 7, &3231564e, ModeFlag_DataFormatFamily_YCbCr
+        DCD -1
+
+; In: R0 = Left edge of clipping rectangle (inclusive)
+;     R1 = Top edge of clipping rectangle (inclusive)
+;     R2 = Right edge of clipping rectangle (exclusive)
+;     R3 = Bottom edge of clipping rectangle (exclusive)
+;     R4 = reason code + driver number + overlay number
+;     R5 = Scaled width
+;     R6 = Scaled height
+;     R7 = Aspect ratio to use if image size needs adjusting
+;          Top 16 bits = width
+;          Low 16 bits = height
+;     
+; Out: R0 = Actual left edge of clipping rectangle
+;      R1 = Actual top edge of clipping rectangle
+;      R2 = Actual right edge of clipping rectangle
+;      R3 = Actual bottom edge of clipping rectangle
+;      R5 = Actual scaled width
+;      R6 = Actual scaled height
+GV_SetOverlayTransform
+        BL      GetOverlay
+        Push    "r4-r6"
+        ; Clamp values
+        SSAT    r0, #16, r0
+        SSAT    r1, #16, r1
+        SSAT    r2, #16, r2
+        SSAT    r3, #16, r3
+        USAT    r5, #16, r5
+        USAT    r6, #16, r6
+        ; Store values
+        STRH    r0, [r11, #GVOverlay_ClipRectX0]
+        STRH    r1, [r11, #GVOverlay_ClipRectY0]
+        STRH    r2, [r11, #GVOverlay_ClipRectX1]
+        STRH    r3, [r11, #GVOverlay_ClipRectY1]
+        STRH    r5, [r11, #GVOverlay_ScaledWidth]
+        STRH    r6, [r11, #GVOverlay_ScaledHeight]
+        ; Calculate scale factors
+        LDRH    r4, [r11, #GVOverlay_Width]
+        MOV     r4, r4, LSL #16
+        DivRem  r6, r4, r5, lr, norem
+        STR     r6, [r11, #GVOverlay_InvXScale]
+        LDRH    r4, [r11, #GVOverlay_Height]
+        MOV     r4, r4, LSL #16
+        LDR     r5, [sp, #8]
+        DivRem  r6, r4, r5, lr, norem
+        STR     r6, [r11, #GVOverlay_InvYScale]
+        LDRB    r4, [r11, #GVOverlay_DisplayBank]
+        CMP     r4, #255
+        Pull    "r4-r6"
+        MOVEQ   r4, #0
+        Pull    "r11,pc",EQ
+        Push    "r3"
+        MOV     r3, #0 ; No change in bank
+        BL      SetOverlayPosition
+        Pull    "r3,r11,pc"
+
+; In: R0 = Pointer to byte array containing overlay IDs
+;     R1 = Length of array
+;     R4 = reason code + driver number
+GV_SetOverlayZOrder ROUT
+        Push    "r0-r3,r5-r8"
+        SUB     sp, sp, #16
+        ; Begin an update
+        MOV     r0, #EDispmanUpdateStart
+        MOV     r1, #10
+        STMIA   sp, {r0-r1}
+        MOV     r0, #8
+        BL      Dispmanx_Send
+        MOVVS   r8, #-99
+        MOVVC   r8, r0
+        ; Prepare the layer update command
+        MOV     r0, #EDispmanElementChangeLayer + NoReply
+        MOV     r1, r8
+        STMIA   sp, {r0-r1}
+        LDR     r6, [sp, #16] ; r0
+        LDR     r7, [sp, #20] ; r1
+        MOV     r3, #0
+        ADRL    r5, GVOverlays
+        MOV     r4, #GVOverlay_Size
+        LDR     r2, ModeFlags
+        TST     r2, #ModeFlag_DataFormatSub_Alpha
+        MOVNE   r2, #BaseDepth_ZOrder
+        MOVEQ   r2, #BaseDepth_Basic
+10
+        SUBS    r7, r7, #1
+        BLT     %FT50
+        LDRB    r0, [r6], #1
+        ; Find overlay
+        SUB     r0, r0, #NumHeads
+        CMP     r0, #MaxOverlays
+        BHS     %BT10
+        MLA     r0, r4, r0, r5
+        ADD     r3, r3, #1
+        STRB    r3, [r0, #GVOverlay_Depth]
+        LDR     r0, [r0, #GVOverlay_Element]
+        CMP     r8, #-99 ; If we started an update
+        CMPNE   r0, #0 ; And the overlay is visible
+        BEQ     %BT10
+        ; Then update its layer now
+        STR     r0, [sp, #8]
+        SUB     lr, r2, r3
+        STR     lr, [sp, #12]
+        MOV     r0, #16
+        BL      Dispmanx_Send
+        B       %BT10
+50
+        CMP     r8, #-99
+        MOVNE   r0, #EDispmanUpdateSubmit
+        STMNEIA sp, {r0, r8}
+        MOVNE   r0, #8
+        BLNE    Dispmanx_Send
+90
+        MOV     r4, #0
+        ADD     sp, sp, #16
+        Pull    "r0-r3,r5-r8,pc"
+
+; In: R4 = reason code + driver number + overlay number
+;     LR stacked for returning if overlay number is bad
+;
+; Out: Input R11 stacked
+;      R11 = Overlay pointer (or corrupt)
+;      
+GetOverlay ROUT
+        Push    "r4,r11"
+      [ OverlayDebug
+        Push    "r0,lr"
+        MOV     r0, r4
+        bl DebugHexTX4
+        bl DebugTXStrInline
+        DCB "check overlay",10,13,0
+        ALIGN
+        Pull    "r0,lr"
+      ]
+        MOV     r4, r4, LSR #16
+        AND     r4, r4, #255
+        SUB     r4, r4, #NumHeads
+        CMP     r4, #MaxOverlays
+        Pull    "r4",HS
+        BHS     %FT90
+        MOV     r11, #GVOverlay_Size
+        MLA     r11, r4, r11, r12
+        ASSERT  GVOverlay_Format = 0
+        LDR     r4, [r11, #:INDEX:GVOverlays]!
+        CMP     r4, #0
+        Pull    "r4"
+        MOVNE   pc, lr
+        ; Bad overlay, return from GraphicsV handler
+90
+      [ OverlayDebug
+        Push    "r0"
+        MOV     r0, r4
+        bl DebugHexTX4
+        bl DebugTXStrInline
+        DCB "bad overlay",10,13,0
+        ALIGN
+        Pull    "r0"
+      ]
+        Pull    "r11,pc"
+
+        LTORG
+
+        END

@@ -1,0 +1,249 @@
+#! @PERL@ -w
+
+# cvsd-passwd - generate password entries for repositories
+# Copyright (C) 2000 Philippe Kehl
+# Copyright (C) 2002 Arthur de Jong
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA
+
+# the configfile to get the uid settings from
+$configfile='@CONFIGFILE@';
+
+# the user cvsd is run under
+# this value is used to set up new repository account mappings
+$default_usermap='';
+open(PWDFILE,"<$configfile") or warn("$0: can't open configfile '$configfile': $!\n");
+while(<PWDFILE>)
+{
+  $default_usermap=$1 if (/^Uid\s*([^\s]*)/);
+}
+close(PWDFILE);
+$default_usermap='' if $default_usermap eq 'root' or $default_usermap eq '0';
+
+
+# print command usage
+sub usage
+{
+  print <<EOM;
+Usage: $0 REPOS [+|-]NAME...
+Manipulate users in repository password file.
+    REPOS          the location of the repository
+  [+]NAME[:SUSER]  add user or change user password
+    -NAME          remove user
+The SUSER argument may be used to set the mapping to a system user.
+EOM
+  if ($default_usermap eq '')
+  {
+    print "Per default users are not mapped.\n";
+  }
+  else
+  {
+    print "Per default users are mapped to the '".$default_usermap."' system user.\n".
+          "use NAME: to disable mapping (NAME is a system user).\n";
+  }
+}
+
+
+# return an crpyt() version of the password supplied as an argument
+sub cryptpasswd
+{
+  my ($passwd) = @_;
+  return crypt($passwd,join('',('.','/',0..9,'A'..'Z','a'..'z')[rand 64,rand 64]));
+}
+
+
+# present a prompt to enter the passwd, retry and return passwd if they match
+sub askpasswd
+{
+  my ($passwd1,$passwd2);
+  system "stty -echo";
+  print "Enter new password: ";
+  chomp($passwd1=<STDIN>);
+  print "\nRetype new password: ";
+  chomp($passwd2=<STDIN>);
+  print "\n";
+  system "stty echo";
+  $passwd1 eq $passwd2 or die "$0: Error: passwords do not match\n";
+  return $passwd1;
+}
+
+
+# find out which passwd file to use from the supplied argument
+sub passwdfile
+{
+  my ($repos) = shift;
+  $repos=substr($repos,0,-1) if ( $repos =~ /\/$/ );
+  my ($passwdfile,$basename);
+  ($basename=$repos)=~s{.*/([^/]*)$}{$1};
+  if ($basename eq "passwd")
+  {
+    $passwdfile=$repos;
+  }
+  elsif ($basename eq "CVSROOT" && -d $repos)
+  {
+    $passwdfile=$repos."/passwd";
+  }
+  elsif (-d $repos."/CVSROOT")
+  {
+    $passwdfile=$repos."/CVSROOT/passwd";
+  }
+  else
+  {
+    die "$0: Error: argument should be an existing repository\n";
+  }
+  return $passwdfile;
+}
+
+
+# remove the specified user from the specified repository passwd file
+sub removeuser
+{
+  my ($passwdfile, $user) = @_;
+  my ($tmpfile) = "/tmp/.cvsd-passwd-$$".join('',('=','-',0..9,'A'..'Z','a'..'z')[rand 64,rand 64]);
+  print "$0: removing user '$user' from '$passwdfile'\n";
+  eval
+  {
+    open(PWDFILE,"<$passwdfile") or die("$0: Error: can't open passwd file '$passwdfile': $!\n");
+    open(TMPFILE,">$tmpfile") or die("$0: Error: can't open temporary file '$tmpfile': $!\n");
+    my $found=0;
+    while(<PWDFILE>)
+    {
+      if (/^$user:/)
+      {
+        $found++;
+        next;
+      }
+      print TMPFILE;
+    }
+    $found>0 or die("$0: Error: user '$user' not found in '$passwdfile'\n");
+    $found<2 or warn("$0: Warning: user was found multiple times, removing all occurrences\n");
+    close(TMPFILE);
+    close(PWDFILE);
+    open(TMPFILE,"<$tmpfile") or die("$0: Error: can't open temporary file '$tmpfile': $!\n");
+    open(PWDFILE,">$passwdfile") or die("$0: Error: can't open passwd file '$passwdfile': $!\n");
+    while(<TMPFILE>)
+    {
+      print PWDFILE;
+    }
+    close(TMPFILE);
+    close(PWDFILE);
+  };
+  unlink($tmpfile);
+  die $@ if $@;
+}
+
+
+# add a user to the specified passwd file
+# a mapping may be supplied to specify either a mapping to a system user
+# (":sysuser"), to not use mappings (":") or to use the default ("")
+# TODO: this function should be split in a couple of parts
+sub adduser
+{
+  my ($passwdfile, $user, $map) = @_;
+  my ($found) = 0;
+  if ( -e "$passwdfile" )
+  {
+    open(PWDFILE,"<$passwdfile") or die("$0: Error: can't open passwd file '$passwdfile': $!\n");
+    while(<PWDFILE>)
+    {
+      $found++ if (/^$user:/);
+    }
+    close(PWDFILE);
+  }
+  if ($found == 0)
+  {
+    $map = ':'.$default_usermap if ( $map eq '' );
+    $map = '' if ( $map eq ':' );
+    print "$0: adding user '$user' to '$passwdfile'\n";
+    open(PWDFILE,">>$passwdfile") or die("$0: Error: can't open passwd file '$passwdfile': $!\n");
+    print PWDFILE "$user:".cryptpasswd(askpasswd()).$map."\n";
+    close(PWDFILE);
+  }
+  else
+  {
+    $found<2 or warn("$0: Warning: user was found multiple times, changing all occurrences\n");
+    my ($tmpfile) = "/tmp/.cvsd-passwd-$$".join('',('=','-',0..9,'A'..'Z','a'..'z')[rand 64,rand 64]);
+    eval
+    {
+      open(PWDFILE,"<$passwdfile") or die("$0: Error: can't open passwd file '$passwdfile': $!\n");
+      open(TMPFILE,">$tmpfile") or die("$0: Error: can't open temporary file '$tmpfile': $!\n");
+      while(<PWDFILE>)
+      {
+        if (/^$user:/)
+        {
+          print "$0: changing password for user '$user' in '$passwdfile'\n";
+          my $cp=cryptpasswd(askpasswd());
+          if ( $map eq '' )
+          {
+            s/^$user:[^:]*(:?.*)\n$/$user:$cp$1\n/;
+          }
+          elsif ( $map eq ':' )
+          {
+            s/^$user:[^:]*(:?.*)\n$/$user:$cp\n/;
+          }
+          else
+          {
+            s/^$user:[^:]*(:?.*)\n$/$user:$cp$map\n/;
+          }
+        }
+        print TMPFILE;
+      }
+      close(PWDFILE);
+      close(TMPFILE);
+      open(TMPFILE,"<$tmpfile") or die("$0: Error: can't open temporary file '$tmpfile': $!\n");
+      open(PWDFILE,">$passwdfile") or die("$0: Error: can't open passwd file '$passwdfile': $!\n");
+      while(<TMPFILE>)
+      {
+        print PWDFILE;
+      }
+      close(TMPFILE);
+      close(PWDFILE);
+    };
+    unlink($tmpfile);
+    die $@ if $@;
+  }
+}
+
+
+# main program
+if ($#ARGV<1)
+{
+  usage();
+  exit 1;
+}
+# find the passwdfile
+$passwdfile=passwdfile(shift);
+# process the arguments
+my ($moduser);
+while ($moduser = shift)
+{
+  my ($modmap)='';
+  if ( $moduser =~ /:/ )
+  {
+    ($moduser,$modmap) = split(/:/,$moduser);
+    $modmap = ":".$modmap;
+  }
+  if ( $moduser =~ /^-.*$/ )
+  {
+    removeuser($passwdfile,substr($moduser,1));
+  }
+  else
+  {
+    $moduser=substr($moduser,1) if ( $moduser =~ /^\+.*$/ );
+    adduser($passwdfile,$moduser,$modmap);
+  }
+}
+# we're done
+exit 0;

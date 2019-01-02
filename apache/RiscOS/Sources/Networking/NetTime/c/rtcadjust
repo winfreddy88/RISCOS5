@@ -1,0 +1,406 @@
+/* Copyright 2000 Pace Micro Technology plc
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#include <inttypes.h>
+#include <stdbool.h>
+#include <stdlib.h>
+#include <limits.h>
+#include <stdio.h>
+
+#include <swis.h>
+
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netdb.h>
+
+#include <Global/HALEntries.h>
+#include <Global/IO/GenericIO.h>
+#include <Global/ModHand.h>
+#include <Interface/RTC.h>
+
+#include "nettime.h"
+#include "ntp.h"
+#include "rtcadjust.h"
+#include "nt_nvram.h"
+
+
+/* Maximum 1% (10000ppm) slew */
+static int DefaultLatchValue;
+static int MinimumLatchValue;
+static int MaximumLatchValue;
+
+static uint32_t LastMonoTime;
+static int64_t  LastDelta;
+static uint32_t LastLatchValue;
+
+static bool hal, delagate, running;
+
+#define T0LO (*(volatile unsigned char *)(IOC + Timer0CL))
+#define T0HI (*(volatile unsigned char *)(IOC + Timer0CH))
+
+unsigned int rtcadjust_latch(void)
+{
+    if (delagate)
+    {
+        /* Delagation implies HAL, so ask it for the period */
+        _swix(OS_Hardware, _IN(0)|_INR(8,9)|_OUT(0),
+                           0, OSHW_CallHAL, EntryNo_HAL_TimerPeriod,
+                           &LastLatchValue);
+    }
+    return LastLatchValue;
+}
+
+static void ProgramLatch(int n)
+{
+    LastLatchValue = n;
+    if (hal)
+    {
+        _swix(OS_Hardware, _INR(0,1)|_INR(8,9),
+                           0, n,
+                           OSHW_CallHAL, EntryNo_HAL_TimerSetPeriod);
+    }
+    else
+    {
+        n -= 1;
+        T0LO = n;
+        T0HI = n >> 8;
+    }
+}
+
+void rtcadjust_init(void)
+{
+    unsigned int rate, max;
+
+    if (_swix(OS_Hardware, _IN(0)|_INR(8,9)|_OUT(0),
+                           0, OSHW_CallHAL, EntryNo_HAL_TimerGranularity,
+                           &rate) != NULL)
+    {
+        /* No HAL apparently, assume IOMD then */
+        rate = 2000000;
+        max = 65536;
+        hal = false;
+    }
+    else
+    {
+        max = UINT_MAX;
+        hal = true;
+        _swix(OS_Hardware, _IN(0)|_INR(8,9)|_OUT(0),
+                           0, OSHW_CallHAL, EntryNo_HAL_TimerMaxPeriod,
+                           &max);
+    }
+    LastLatchValue = DefaultLatchValue = (rate+50) / 100;
+    MinimumLatchValue = DefaultLatchValue - DefaultLatchValue/100;
+    if (MinimumLatchValue < 1) MinimumLatchValue = 1;
+    MaximumLatchValue = DefaultLatchValue + DefaultLatchValue/100;
+    if (MaximumLatchValue > max) MaximumLatchValue = max;
+
+    /* Check if we can delagate adjustments to the RTC module */
+    delagate = _swix(RTC_Features, 0) == NULL;
+}
+
+static void rtcadjust_start(void)
+{
+    if (!running)
+    {
+        /* Kill the RTCAdjust module, if it's active */
+        _swix(OS_Module, _INR(0,1), ModHandReason_Delete, "RTCAdjust");
+
+        rtcadjust_initvars();
+        LastLatchValue = DefaultLatchValue;
+        running = true;
+    }
+}
+
+void rtcadjust_suspend(void)
+{
+    rtcadjust_final(1);
+}
+
+void rtcadjust_final(int fixup)
+{
+    if (running)
+    {
+        if (fixup) rtcadjust_fixup_hardware_rtc();
+        if (!delagate)
+        {
+            /* Restart RTCAdjust, if in ROM */
+            ProgramLatch(DefaultLatchValue);
+            _swix(OS_Module, _INR(0,1), ModHandReason_ReInit, "RTCAdjust");
+        }
+        running = false;
+    }
+}
+
+void rtcadjust_initvars(void)
+{
+    LastDelta = 0;
+    _swix(OS_ReadMonotonicTime, _OUT(0), &LastMonoTime);
+}
+
+static int64_t fixedpoint_multiply(int64_t a, int64_t b)
+{
+    uint64_t l, h;
+    uint32_t al, ah, bl, bh;
+    int64_t r;
+
+    al = (uint32_t) a; ah = (uint32_t) (a >> 32);
+    bl = (uint32_t) b; bh = (uint32_t) (b >> 32);
+
+    l = (uint64_t) al * bl;
+    h = (uint64_t) al * bh;
+    r = h + (l >> 32);
+
+    l = (uint64_t) ah * bl;
+    h = (uint64_t) ah * bh;
+    r += (h << 32) + l;
+
+    dprintf(("rtcadjust_7", "%08"PRIX32".%08"PRIX32" x "
+                            "%08"PRIX32".%08"PRIX32" = "
+                            "%08"PRIX32".%08"PRIX32"\n",
+                            ah, al, bh, bl,
+                            (uint32_t) (r >>32), (uint32_t) r));
+
+    return r;
+}
+
+/*                          (P+C)       P'
+ * new latch := old latch * ------ * --------
+ *                            P      (P'-C+W)
+ *
+ *                                             C-W
+ *            = old latch * (1 + C/P) * (1 + -------- )
+ *                                           P'-(C-W)
+ *
+ * where P = Period, the requested number of cs ticks between calls
+ *
+ *       P' = the actual number of cs ticks since last called (different from
+ *            P because of the time taken to grant the callback)
+ *
+ *       C  = the number of cs we are ahead of the RTC this call
+ *
+ *       W  = the number of cs we were ahead of the RTC last call
+ */
+
+int rtcadjust_adjtime(int64_t offset, int P)
+{
+    uint32_t OldMonoTime;
+    int P2;
+    bool was_running = running;
+    int64_t temp2;
+    int64_t C, C_W, W;
+    int64_t latch64;
+    int32_t latch32;
+
+    dprintf(("rtcadjust_2", "offset = %010"PRIX64".%06"PRIX64"cs\n",
+                            offset >> 24, offset & 0xFFFFFF));
+
+    if (delagate)
+    {
+        /* Submit the offset to the central adjustments bureau */
+        LastDelta = offset;
+        running = true;
+        we_are_setting = 1;
+        offset = offset >> 24;
+        _swix(RTC_Adjust, _INR(0,3),
+                          (uint32_t)offset, (uint32_t)(offset >> 32),
+                          P, RTCPriority_NetTime);
+        _swix(OS_ReadMonotonicTime, _OUT(0), &LastMonoTime);
+        we_are_setting = 0;
+                
+        return -1;
+    }
+
+    rtcadjust_start();
+
+    /* If P is too small, we go all wobbly. Clamp it (effect is to
+     * smooth adjustments over at least a few minutes when using small
+     * poll intervals.) */
+    if (P < 180 * 100)
+        P = 180 * 100;
+
+    /* To aid the arithmetic, we require offset.high to be a sign
+     * extension of offset.low - ie maximum error is 1.28 seconds.
+     */
+    if (offset < INT32_MIN || offset >= INT32_MAX)
+    {
+        /* Immediate set - not synchronised, or miles out of range */
+        struct riscos_time cur, t;
+        dprintf(("rtcadjust_2", "Setting time immediately\n"));
+        C = offset >> 24;
+        cur = current_time();
+        *(int64_t *) &t = *(int64_t *) &cur - C;
+        LastDelta = 0;
+        module_set_time(&t);
+        ProgramLatch(DefaultLatchValue);
+        rtcadjust_initvars();
+        return -1;
+    }
+
+    /* Express C and W as a 32.32 fixed point number of centiseconds */
+    C = offset << 8;
+    W = LastDelta << 8;
+
+    OldMonoTime = LastMonoTime;
+    if (_swix(OS_ReadMonotonicTime, _OUT(0), &LastMonoTime))
+        return 0;
+
+    P2 = LastMonoTime - OldMonoTime;
+
+    dprintf(("rtcadjust_2", "C=%"PRId64".%08"PRIX64", "
+                            "W=%"PRId64".%08"PRIX64", "
+                            "P=%d, P'=%d, L=%d\n",
+                            C >> 32, C & 0xFFFFFFFF,
+                            W >> 32, W & 0xFFFFFFFF,
+                            P, P2, LastLatchValue));
+
+    if (P)
+    {
+        temp2 = C / P;
+        dprintf(("rtcadjust_4", "C/P=%08"PRIX32".%08"PRIX32"\n",
+                                (uint32_t)(temp2 >> 32), (uint32_t)temp2));
+        temp2 += 0x100000000;
+        dprintf(("rtcadjust_4", "1+C/P=%08"PRIX32".%08"PRIX32"\n",
+                                (uint32_t)(temp2 >> 32), (uint32_t)temp2));
+        latch64 = LastLatchValue * temp2;
+        dprintf(("rtcadjust_4", "latch64(1)=%08"PRIX32".%08"PRIX32"\n",
+                                (uint32_t)(latch64 >> 32), (uint32_t)latch64));
+    }
+    else
+        latch64 = (int64_t) LastLatchValue << 32;
+
+    if (was_running) /* Otherwise, P' = infinity: P' term eliminated */
+    {
+        C_W = C - W;
+        dprintf(("rtcadjust_4", "C-W=%08"PRIX32".%08"PRIX32"\n",
+                                (uint32_t)(C_W >> 32), (uint32_t)C_W));
+        temp2 = ((int64_t) P2 << 32) - C_W;
+        dprintf(("rtcadjust_4", "P'-(C-W)=%08"PRIX32".%08"PRIX32"\n",
+                                (uint32_t)(temp2 >> 32), (uint32_t)temp2));
+        /* Now C_W and temp2 contain top and bottom of fraction, each as 32.32 fp.
+         * To achieve a 32.32 fp result, shift top left 23 bits, bottom right 9 bits
+         */
+        C_W <<= 23;
+        temp2 >>= 9;
+        temp2 = C_W / temp2;
+        dprintf(("rtcadjust_4", "(C-W)/[P'-(C-W)]=%08"PRIX32".%08"PRIX32"\n",
+                                (uint32_t)(temp2 >> 32), (uint32_t)temp2));
+        temp2 += 0x100000000;
+        latch64 = fixedpoint_multiply(latch64, temp2);
+        dprintf(("rtcadjust_4", "latch64(2)=%08"PRIX32".%08"PRIX32"\n",
+                                (uint32_t)(latch64 >> 32), (uint32_t)latch64));
+    }
+
+    if (latch64 & 0x80000000) /* Round up prior to shift */
+        latch64 += 0x100000000;
+
+    latch32 = (int32_t) (latch64 >> 32);
+
+    LastDelta = offset;
+
+    if (latch32 < MinimumLatchValue)
+        latch32 = MinimumLatchValue;
+    else if (latch32 > MaximumLatchValue)
+        latch32 = MaximumLatchValue;
+
+    ProgramLatch(latch32);
+
+    dprintf(("rtcadjust_2", "New latch value = %d\n", LastLatchValue));
+
+    return -1;
+}
+
+void rtcadjust_fixup_hardware_rtc(void)
+{
+    struct riscos_time cur;
+
+    /* Nasty little fudge - we're messing with the latch, which affects
+     * the software copy of the RTC, but if we have a hardware RTC it
+     * could be doing anything. This will resync the hardware RTC to
+     * the soft copy.
+     *
+     * We don't want to do this too often, as it's liable to muck up
+     * our carefully synced time. Especially on old Kernels where the
+     * centiseconds are brutally set to zero.
+     */
+    cur = current_time();
+    module_set_time(&cur);
+    nvram_settime(riscos_to_ntp(cur).secs);
+}
+
+static char *pretty_interval(unsigned int t)
+{
+    static char buffer[128];
+    int n = 0;
+    unsigned int days, hours, minutes, seconds;
+
+    seconds = t % 60; t /= 60;
+    minutes = t % 60; t /= 60;
+    hours   = t % 24; t /= 24;
+    days    = t;
+
+    if (days)
+        n += sprintf(buffer + n, "%d day%s ", days, days == 1 ? "" : "s");
+    if (hours)
+        n += sprintf(buffer + n, "%d hour%s ", hours, hours == 1 ? "" : "s");
+    if (minutes)
+        n += sprintf(buffer + n, "%d minute%s ", minutes, minutes == 1 ? "" : "s");
+    if (seconds || n == 0)
+        n += sprintf(buffer + n, "%d second%s ", seconds, seconds == 1 ? "" : "s");
+
+    buffer[n - 1] = '\0'; /* Remove trailing space */
+
+    return buffer;
+}
+
+void rtcadjust_print_status(void)
+{
+    if (running)
+    {
+        uint32_t time;
+        uint64_t tmp, error;
+
+        _swix(OS_ReadMonotonicTime, _OUT(0), &time);
+        time -= LastMonoTime;
+        error = llabs(LastDelta);
+        tmp = (uint32_t)(error << 8) * UINT64_C(10000);
+        printf("Last adjustment: %s ago\n", pretty_interval(time/100));
+        printf("Last delta:      %llu.%02u%04u seconds%s\n",
+                  (error >> 24) / 100, (uint32_t)((error >> 24) % 100),
+                  (uint32_t)(tmp >> 32),
+                  LastDelta < 0 ? " slow" : LastDelta > 0 ? " fast" : "");
+    }
+    if (last_server.s_addr != 0)
+    {
+        struct hostent *hp = gethostbyaddr((char *) &last_server, sizeof last_server, AF_INET);
+        printf("Last server:     %s\n", hp ? hp->h_name : inet_ntoa(last_server));
+        if (last_protocol)
+            printf("Last protocol:   %s\n", last_protocol == PORT_NTP ? "SNTP" : "Time/UDP");
+    }
+    if (poll_period)
+        printf("Poll interval:   %s\n", pretty_interval(poll_period / 100));
+    if (!delagate)
+    {
+        printf("Timer latch:     %d", LastLatchValue);
+        if (LastLatchValue != DefaultLatchValue)
+        {
+            /* Currently expressed as an adjustment to crystal time - this is not the same
+             * as our deviation from "real" time.
+             */
+            printf(" (%+lldppm)", (DefaultLatchValue - (long long)LastLatchValue) * 1000000LL / DefaultLatchValue);
+        }
+        putchar('\n');
+    }
+}

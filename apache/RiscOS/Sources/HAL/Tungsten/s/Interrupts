@@ -1,0 +1,471 @@
+; Copyright 2002 Tematic Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:Machine.<Machine>
+
+        GET     Hdr:OSEntries
+
+        GET     hdr.StaticWS
+        GET     hdr.80321
+
+        AREA    |Asm$$Code|, CODE, READONLY, PIC
+
+        EXPORT  Interrupt_Init
+        EXPORT  HAL_IRQEnable
+        EXPORT  HAL_IRQDisable
+        EXPORT  HAL_IRQSource
+        EXPORT  HAL_IRQStatus
+        EXPORT  HAL_FIQEnable
+        EXPORT  HAL_FIQDisable
+        EXPORT  HAL_FIQDisableAll
+        EXPORT  HAL_FIQSource
+        EXPORT  HAL_FIQStatus
+        EXPORT  HAL_IRQMax
+
+
+Interrupt_Init
+        LDR     ip, PMMR_Address
+        MOV     a1, #0
+        WriteINTCTL a1                  ; mask all interrupts
+        MOV     a1, #2_1111
+        STR     a1, [ip, #ATU_PIRSR]    ; route XINT[0:3] to XScale core
+        MOV     a1, #1:SHL:(Device_HPI-Device_80321_0)
+        WriteINTSTR a1                  ; HPI to FIQ, rest to IRQ
+
+        LDR     a2, PCI_IO_Address
+        ADR     a3, PICInitTable
+10      LDRB    a4, [a3], #1
+        TEQ     a4, #0
+        LDRNEB  a1, [a3], #1
+        STRNEB  a1, [a2, a4]
+        BNE     %BT10
+        MOV     a1, #&FF
+        STRB    a1, MasterPICMask
+        STRB    a1, SlavePICMask
+        ASSERT  Device_AC97 :AND: 15 = 1
+        ASSERT  Device_ATA1 :AND: 15 = 3
+        ASSERT  Device_ATA2 :AND: 15 = 4
+        ASSERT  Device_USB1 :AND: 15 = 5
+        ASSERT  Device_USB2 :AND: 15 = 6
+        MOV     a1, #2_01111010         ; level sensitive for USB & ATA
+        STRB    a1, [a2, #IO_MasterPICLevel]
+        MOV     pc, lr
+
+PICInitTable
+        =       IO_MasterPIC+0, &11     ; Edge, cascade, ICW4
+        =       IO_MasterPIC+1, &00     ; (interrupt vector address)
+        =       IO_MasterPIC+1, &04     ; IR2 has a slave
+        =       IO_MasterPIC+1, &01     ; 8086 mode, normal EOI
+        =       IO_MasterPIC+1, &FF     ; mask everything
+        =       IO_SlavePIC+0,  &11     ; Edge, cascade, ICW4
+        =       IO_SlavePIC+1,  &00     ; (interrupt vector address)
+        =       IO_SlavePIC+1,  &02     ; slave number 2
+        =       IO_SlavePIC+1,  &01     ; 8086 mode, normal EOI
+        =       IO_SlavePIC+1,  &FF     ; mask everything
+        =       0
+        ALIGN
+
+HAL_IRQEnable
+        MOV     ip, #1
+        CMP     a1, #Device_80321_0
+        BLO     HAL_IRQEnable_Extra
+        MRS     a4, CPSR
+        AND     a1, a1, #31
+        MOV     ip, ip, LSL a1
+        ORR     a3, a4, #F32_bit+I32_bit
+        MSR     CPSR_c, a3
+        ReadINTCTL a1
+        ORR     a2, a1, ip
+        WriteINTCTL a2
+        MSR     CPSR_c, a4
+        AND     a1, a1, ip
+        MOV     pc, lr
+
+HAL_IRQEnable_Extra
+        CMP     a1, #Device_MPIC_0
+        BHS     HAL_IRQEnable_PIC
+        LDR     a2, IOMD_Address
+        CMP     a1, #Device_IRQB_0
+        AND     a1, a1, #7
+        ADDHS   a2, a2, #IRQMSKB-IRQMSKA
+        MOV     ip, ip, LSL a1
+        MRS     a4, CPSR
+        ORR     a3, a4, #F32_bit+I32_bit
+        MSR     CPSR_c, a3
+        LDRB    a1, [a2, #IRQMSKA]
+        ORR     a3, a1, ip
+        STRB    a3, [a2, #IRQMSKA]
+        MSR     CPSR_c, a4
+        AND     a1, a1, ip
+        Push    "a1,lr"
+        MOV     a1, #Device_IOMD
+        BL      HAL_IRQEnable
+        Pull    "a1,pc"
+
+HAL_IRQEnable_PIC
+        CMP     a1, #Device_SPIC_0
+        AND     a1, a1, #7
+        LDR     a2, PCI_IO_Address
+        MOV     ip, ip, LSL a1
+        BHS     HAL_IRQEnable_SlavePIC
+        MRS     a4, CPSR
+        ORR     a3, a4, #I32_bit
+        MSR     CPSR_c, a3
+        LDRB    a1, MasterPICMask
+        BIC     a3, a1, ip
+        TEQ     a3, a1
+        STRNEB  a3, [a2, #IO_MasterPIC+1]
+        STRNEB  a3, MasterPICMask
+        MSR     CPSR_c, a4
+        AND     a1, a1, ip
+        EOR     a1, a1, ip
+        Push    "a1,lr"
+        MOV     a1, #Device_PIC
+        BL      HAL_IRQEnable
+        Pull    "a1,pc"
+
+HAL_IRQEnable_SlavePIC
+        MRS     a4, CPSR
+        ORR     a3, a4, #I32_bit
+        MSR     CPSR_c, a3
+        LDRB    a1, SlavePICMask
+        BIC     a3, a1, ip
+        TEQ     a3, a1
+        STRNEB  a3, [a2, #IO_SlavePIC+1]
+        STRNEB  a3, SlavePICMask
+        MSR     CPSR_c, a4
+        AND     a1, a1, ip
+        EOR     a1, a1, ip
+        Push    "a1,lr"
+        MOV     a1, #Device_SlavePIC
+        BL      HAL_IRQEnable
+        Pull    "a1,pc"
+
+HAL_IRQDisable
+        MOV     ip, #1
+        CMP     a1, #Device_80321_0
+        BLO     HAL_IRQDisable_Extra
+ [ :LNOT:RevB
+        TEQ     a1, #Device_XINT0
+        BEQ     BadXINT0Mask
+ ]
+        AND     a1, a1, #31
+        MRS     a4, CPSR
+        MOV     ip, ip, LSL a1
+        ORR     a3, a4, #F32_bit+I32_bit
+        MSR     CPSR_c, a3
+        ReadINTCTL a1
+        BIC     a2, a1, ip
+        WriteINTCTL a2
+        MSR     CPSR_c, a4
+        AND     a1, a1, ip
+        MOV     pc, lr
+
+ [ :LNOT:RevB
+BadXINT0Mask
+        LDR     a4, XINT0Masks
+        ADD     a4, a4, #1
+        STR     a4, XINT0Masks
+        MOV     pc, lr
+ ]
+
+HAL_IRQDisable_Extra
+        CMP     a1, #Device_MPIC_0
+        BHS     HAL_IRQDisable_PIC
+        LDR     a2, IOMD_Address
+        CMP     a1, #Device_IRQB_0
+        AND     a1, a1, #7
+        ADDHS   a2, a2, #IRQMSKB-IRQMSKA
+        MOV     ip, ip, LSL a1
+        MRS     a4, CPSR
+        ORR     a3, a4, #F32_bit+I32_bit
+        MSR     CPSR_c, a3
+        LDRB    a1, [a2, #IRQMSKA]
+        BIC     a3, a1, ip
+        STRB    a3, [a2, #IRQMSKA]
+        MSR     CPSR_c, a4
+        AND     a1, a1, ip
+        MOV     pc, lr
+
+
+HAL_IRQDisable_PIC
+        CMP     a1, #Device_SPIC_0
+        AND     a1, a1, #7
+        LDR     a2, PCI_IO_Address
+        MOV     ip, ip, LSL a1
+        MRS     a4, CPSR
+        ORR     a3, a4, #I32_bit
+        MSR     CPSR_c, a3
+        BHS     HAL_IRQDisable_SlavePIC
+        LDRB    a1, MasterPICMask
+        ORR     a3, a1, ip
+        TEQ     a3, a1
+        STRNEB  a3, [a2, #IO_MasterPIC+1]
+        STRNEB  a3, MasterPICMask
+        MSR     CPSR_c, a4
+        AND     a1, a1, ip
+        EOR     a1, a1, ip
+        MOV     pc, lr
+
+HAL_IRQDisable_SlavePIC
+        LDRB    a1, SlavePICMask
+        ORR     a3, a1, ip
+        TEQ     a3, a1
+        STRNEB  a3, [a2, #IO_SlavePIC+1]
+        STRNEB  a3, SlavePICMask
+        MSR     CPSR_c, a4
+        AND     a1, a1, ip
+        EOR     a1, a1, ip
+        MOV     pc, lr
+
+        ASSERT  Device_IRQB_0 > Device_IRQA_0
+        ASSERT  Device_MPIC_0 > Device_IRQB_0
+        ASSERT  Device_SPIC_0 > Device_MPIC_0
+        ASSERT  Device_80321_0 > Device_SPIC_0
+
+; Mickey-mouse prioritisation, but I get to use CLZ. Whoot.
+HAL_IRQSource
+        ReadIINTSRC a1
+        CLZ     a1, a1
+        RSB     a1, a1, #31 + Device_80321_0
+ [ {TRUE}
+        CMP     a1, #Device_80321_0 - 1
+        BEQ     BadInt1
+ ]
+        TEQ     a1, #Device_IOMD
+        MOVNE   pc, lr
+
+        LDR     a4, IOMD_Address
+        LDRB    a3, [a4, #IRQRQA]
+        MOV     a2, #31 + Device_IRQA_0
+        TEQ     a3, #0
+        LDREQB  a3, [a4, #IRQRQB]
+        MOVEQ   a2, #31 + Device_IRQB_0
+        TEQ     a3, #0
+        MOVEQ   pc, lr
+        CLZ     a3, a3
+        RSB     a1, a3, a2
+        ; return IOMD address in R3 for compatibility
+        TEQ     a1, #Device_PIC
+        MOVNE   pc, lr
+
+HAL_IRQSource_SuperIO
+; Now read the Interrupt Request register of the PIC, and mask
+; manually. This allows us to treat interrupts as level-sensitive,
+; avoiding all the latching and servicing nonsense.
+        LDR     a2, PCI_IO_Address
+        LDRB    a3, MasterPICMask
+        LDRB    a4, [a2, #IO_MasterPIC+0]
+        BICS    a4, a4, a3
+; If it claims it isn't interrupting, it's lying. We say "no interrupt"
+; to prevent the OS masking anything. We may get re-entered until it
+; shuts up.
+        BEQ     BadInt3
+        CLZ     a1, a4
+        RSB     a1, a1, #31+Device_MPIC_0
+        TEQ     a1, #Device_SlavePIC
+        MOVNE   pc, lr
+; Now check the slave PIC. Similarly, if it denies it, say "no
+; interrupt".
+        LDRB    a3, SlavePICMask
+        LDRB    a4, [a2, #IO_SlavePIC+0]
+        BICS    a4, a4, a3
+        BEQ     BadInt4
+        CLZ     a1, a4
+        RSB     a1, a1, #31+Device_SPIC_0
+        MOV     pc, lr
+
+HAL_IRQStatus
+        MOV     ip, #1
+        CMP     a1, #Device_80321_0
+        BLO     HAL_IRQStatus_Extra
+        AND     a1, a1, #31
+        MOV     a1, ip, LSL a1
+        MRS     a4, CPSR
+        ORR     a3, a4, #F32_bit+I32_bit
+        MSR     CPSR_c, a3
+        ReadINTCTL ip
+        MOV     a2, #-1
+        WriteINTCTL a2          ; Unmask all
+        ReadIINTSRC a2          ; Read source
+        WriteINTCTL ip          ; Put mask back
+        MSR     CPSR_c, a4
+        AND     a1, a1, a2
+        MOV     pc, lr
+
+HAL_IRQStatus_Extra
+        CMP     a1, #Device_MPIC_0
+        BHS     HAL_IRQStatus_PIC
+        LDR     a2, IOMD_Address
+        CMP     a1, #Device_IRQB_0
+        ADDHS   a2, a2, #IRQSTB-IRQSTA
+        AND     a1, a1, #7
+        LDRB    a3, [a2, #IRQSTA]
+        AND     a1, a3, ip, LSL a1
+        MOV     pc, lr
+
+HAL_IRQStatus_PIC
+        LDR     a2, PCI_IO_Address
+        CMP     a1, #Device_SPIC_0
+        AND     a1, a1, #7
+        ADDHS   a2, a2, #IO_SlavePIC-IO_MasterPIC
+        LDRB    a2, [a2, #IO_MasterPIC]
+        AND     a1, a2, ip, LSL a1
+        MOV     pc, lr
+
+
+BadInt1 ADR     a3, SpuriousIRQs1
+        B       BadInt
+BadInt2 ADR     a3, SpuriousIRQs2
+        B       BadInt
+BadInt3 ADR     a3, SpuriousIRQs3
+        B       BadInt
+BadInt4 ADR     a3, SpuriousIRQs4
+BadInt  LDR     a4, [a3]
+        MOV     a1, #-1
+        ADD     a4, a4, #1
+        STR     a4, [a3]
+        MOV     pc, lr
+
+HAL_FIQEnable
+        CMP     a1, #Device_80321_0
+        MOV     ip, #1
+        BHS     HAL_FIQEnable_Core
+        LDR     a4, IOMD_Address
+        MRS     a3, CPSR
+        MOV     ip, ip, LSL a1
+        ORR     a2, a3, #F32_bit+I32_bit
+        MSR     CPSR_c, a2
+        LDRB    a1, [a4, #FIQMSK]
+        ORR     a2, a1, ip
+        STRB    a2, [a4, #FIQMSK]
+        MSR     CPSR_c, a3
+        AND     a1, a1, ip
+        MOV     pc, lr
+
+HAL_FIQEnable_Core
+        MRS     a4, CPSR
+        AND     a1, a1, #31
+        MOV     ip, ip, LSL a1
+        ORR     a3, a4, #F32_bit+I32_bit
+        MSR     CPSR_c, a3
+        ReadINTSTR a2
+        ORR     a2, a2, ip
+        WriteINTSTR a2
+        ReadINTCTL a1
+        ORR     a2, a1, ip
+        WriteINTCTL a2
+        MSR     CPSR_c, a4
+        AND     a1, a1, ip
+        MOV     pc, lr
+
+HAL_FIQDisable
+        CMP     a1, #Device_80321_0
+        MOV     ip, #1
+        BHS     HAL_FIQDisable_Core
+        LDR     a4, IOMD_Address
+        MRS     a3, CPSR
+        MOV     ip, ip, LSL a1
+        ORR     a2, a3, #F32_bit+I32_bit
+        MSR     CPSR_c, a2
+        LDRB    a1, [a4, #FIQMSK]
+        BIC     a2, a1, ip
+        STRB    a2, [a4, #FIQMSK]
+        MSR     CPSR_c, a3
+        AND     a1, a1, ip
+        MOV     pc, lr
+
+HAL_FIQDisable_Core
+        MRS     a4, CPSR
+        AND     a1, a1, #31
+        MOV     ip, ip, LSL a1
+        ORR     a3, a4, #F32_bit+I32_bit
+        MSR     CPSR_c, a3
+        ReadINTSTR a2
+        BIC     a2, a2, ip
+        WriteINTSTR a2
+        ReadINTCTL a1
+        BIC     a2, a1, ip
+        WriteINTCTL a2
+        MSR     CPSR_c, a4
+        AND     a1, a1, ip
+        MOV     pc, lr
+
+HAL_FIQDisableAll
+        ; Disable IOMD FIQs
+        LDR     a4, IOMD_Address
+        MOV     a1, #0
+        STRB    a1, [a4, #FIQMSK]
+        MRS     a4, CPSR
+        ORR     a3, a4, #F32_bit+I32_bit
+        MSR     CPSR_c, a3
+        ; Disable any other FIQs
+        ReadINTSTR a2
+        BICS    a2, a2, #1:SHL:(Device_HPI-Device_80321_0)
+        BEQ     %FT90
+        ReadINTCTL a3
+        BIC     a3, a3, a2
+        WriteINTCTL a3
+        MOV     a2, #1:SHL:(Device_HPI-Device_80321_0)
+        WriteINTSTR a2
+90
+        MSR     CPSR_c, a4
+        MOV     pc, lr
+
+HAL_FIQStatus
+        MOV     ip, #1
+        CMP     a1, #Device_80321_0
+        BHS     HAL_FIQStatus_Core
+        LDR     a4, IOMD_Address
+        LDRB    a2, [a4, #FIQST]
+        AND     a1, a2, ip, LSL a1
+        MOV     pc, lr
+
+HAL_FIQStatus_Core
+        AND     a1, a1, #31
+        MOV     a1, ip, LSL a1
+        MRS     a4, CPSR
+        ORR     a3, a4, #F32_bit+I32_bit
+        MSR     CPSR_c, a3
+        ReadINTCTL ip
+        MOV     a2, #-1
+        WriteINTCTL a2          ; Unmask all
+        ReadIINTSRC a2          ; Read source
+        ReadFINTSRC a3          ; Check FIQ as well, in case it's routed to that
+        WriteINTCTL ip          ; Put mask back
+        MSR     CPSR_c, a4
+        ORR     a2, a2, a3
+        AND     a1, a1, a2
+        MOV     pc, lr
+
+HAL_FIQSource
+        ReadFINTSRC a1
+        TST     a1, #1:SHL:(Device_HPI-Device_80321_0)
+        CLZEQ   a1, a1
+        RSBEQ   a1, a1, #31 + Device_80321_0
+        MOVEQ   pc, lr
+        LDR     a4, IOMD_Address
+        LDRB    a1, [a4, #FIQRQ]
+        CLZ     a1, a1
+        RSB     a1, a1, #31
+        MOV     pc, lr
+
+HAL_IRQMax
+        MOV     a1, #64
+        MOV     pc, lr
+
+        END

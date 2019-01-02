@@ -1,0 +1,278 @@
+; Copyright 2005 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+; IIC buses
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:Machine.<Machine>
+        GET     Hdr:ImageSize.<ImageSize>
+
+        GET     Hdr:MEMM.ARM600
+
+        GET     Hdr:HALEntries
+        GET     Hdr:OSEntries
+
+        GET     hdr.pxa255
+        GET     hdr.StaticWS
+        GET     hdr.RAM
+
+        AREA    |Asm$$Code|, CODE, READONLY, PIC
+
+        EXPORT  I2C_Init
+        EXPORT  HAL_IICBuses
+        EXPORT  HAL_IICType
+        EXPORT  HAL_IICDevice
+        EXPORT  HAL_IICTransfer
+        EXPORT  HAL_IICMonitorTransfer
+
+ECOMPLETED *    0
+EINPROGRESS *   1
+ENOACK  *       2
+EBUSY   *       3
+EERROR  *       5
+
+I2C_Init
+        STMFD   sp!, {v5,lr}
+        ADR     v5, I2C_Base
+        LDR     a1, =REG_Base
+        ADD     a1, a1, #I2CB1
+        ADD     a1, a1, #I2CB2
+        ADD     a1, a1, #I2CB3
+        STR     a1, [v5]
+        LDMFD   sp!, {v5,pc}
+        
+HAL_IICBuses
+        MOV     a1, #1
+        MOV     pc, lr
+
+HAL_IICType
+        MOV     a1, #IICFlag_HighLevel+IICFlag_Background
+        MOV     pc, lr
+
+HAL_IICDevice
+        ADD     a2, a2, #Device_I2C
+        MOV     a3, #0
+        MOV     a4, #0
+        STMIA   a1, {a2-a4}
+        MOV     pc, lr
+
+; We don't support slaving yet.
+
+HAL_IICTransfer
+        STMFD   sp!, {v1-v5,lr}
+;        TEQ     a1, #0
+        ADR   v5, IICTransferBlk0     ; address appropriate block
+;        ADREQ   v5, IICTransferBlk0     ; address appropriate block
+;        ADRNE   v5, IICTransferBlk1
+        MRS     ip, CPSR
+        ORR     a4, ip, #I32_bit
+        MSR     CPSR_c, a4              ; disable interrupts for atomic claim
+        LDR     a4, [v5, #IIC_XStart]
+        TEQ     a4, #0                  ; in use already?
+        STREQ   a3, [v5, #IIC_XStart]   ; if not, claim it
+        MSR     CPSR_c, ip
+        MOVNE   a1, #EBUSY              ; if it is, return "BUSY"
+        LDMNEFD sp!, {v1-v5,pc}
+
+        STR     a3, [v5, #IIC_XCurrent]
+        SUB     a2, a2, #1              ; a2 = transfers - 1 (needed below)
+        ADD     ip, a3, a2, LSL #3
+        ADD     ip, ip, a2, LSL #2
+        STR     ip, [v5, #IIC_XEnd]
+        MOV     lr, #0
+        STR     lr, [v5, #IIC_XBytes]
+
+        ADR     v4, I2C_Base
+        LDR     v4, [v4]
+;        TEQ     a1, #0
+;        ADDNE   v4, v4, #IIC_ICR1 - IIC_ICR0
+
+        LDRB    a1, [a3, #0]
+        STRB    a1, [v4, #IDBR]
+
+        LDR     a1, [v4, #ISR]     ; clear any interrupts
+        STR     a1, [v4, #ISR]
+
+        LDR     a1, [v4, #ICR]
+        ORR     a1, a1, #ICR_TransmitIE+ICR_ReceiveIE+ICR_BusErrorIE
+        BIC     a1, a1, #ICR_ArbLossIE
+        ORR     a1, a1, #ICR_SCLEnable+ICR_Transfer+ICR_Start
+        BIC     a1, a1, #ICR_Abort+ICR_Nack+ICR_Stop
+        ; Figure out whether we need to signal STOP
+        LDR     a4, [a3, #8]            ; a4 = length of first transfer
+        TEQ     a4, #0                  ; if at end of this transfer
+        TEQEQ   a2, #0                  ; and no more transfers
+ [ {TRUE}
+        BEQ     unexpected_error
+ |
+        ORREQ   a1, a1, #ICR_Stop
+ ]
+        STR     a1, [v4, #ICR]
+
+        MOV     a1, #EINPROGRESS
+        LDMFD   sp!, {v1-v5,pc}
+
+HAL_IICMonitorTransfer
+        STMFD   sp!, {v1-v5,lr}
+        ADR   v5, IICTransferBlk0     ; address appropriate block
+        LDR     v4, I2C_Base
+        LDR     a1, [v5, #IIC_XStart]   ; a1 = start pointer
+        LDR     a2, [v4, #ISR]     ; a2 = ISR
+        TEQ     a1, #0                  ; if no transfer in progress - odd
+        ASSERT  ECOMPLETED=0            ; just shut off all interrupts
+        STREQ   a2, [v4, #ISR]
+        LDMEQFD sp!, {v1-v5,pc}
+        LDR     v1, [v5, #IIC_XCurrent] ; v1 -> current transfer block
+        LDR     a3, [v5, #IIC_XBytes]   ; a3 = bytes transmitted
+        TST     a2, #ISR_SlaveAddr+ISR_SlaveStop
+        BNE     unexpected_error
+        TST     a2, #ISR_BusError
+        BNE     bus_error
+        TST     a2, #ISR_ArbLoss
+        CMPNE   a3, #0                  ; only process if past address
+        BNE     arb_loss
+        TST     a2, #ISR_TransmitEmpty
+        BNE     tx_empty
+        TST     a2, #ISR_ReceiveFull
+        BNE     rx_full
+        ; No interrupts pending - hmm
+        MOV     a1, #EINPROGRESS
+        LDMFD   sp!, {v1-v5,pc}
+
+tx_empty
+        BIC     a2, a2, #ISR_AllInts:AND::NOT:ISR_TransmitEmpty
+        STR     a2, [v4, #ISR]
+        LDR     a4, [v1, #8]
+        TEQ     a3, a4
+        BEQ     next_transaction
+        TST     a2, #ISR_RnW            ; go into read mode (just written address)
+        BNE     next_read
+next_write
+        LDR     ip, [v1, #4]
+        LDRB    a1, [ip, a3]
+        ADD     a3, a3, #1
+        STRB    a1, [v4, #IDBR]
+        ; Figure out whether we need to signal STOP
+        TEQ     a3, a4                  ; if at end of this transfer
+        LDREQ   ip, [v5, #IIC_XEnd]     ; and it's the last one
+        TEQEQ   ip, v1
+10      LDR     a1, [v4, #ICR]
+        ORR     a1, a1, #ICR_ArbLossIE
+        ORR     a1, a1, #ICR_Transfer
+        BIC     a1, a1, #ICR_Start+ICR_Stop
+        ORREQ   a1, a1, #ICR_Stop
+        STR     a1, [v4, #ICR]
+        STR     a3, [v5, #IIC_XBytes]
+        MOV     a1, #EINPROGRESS
+        LDMFD   sp!, {v1-v5,pc}
+
+rx_full
+        BIC     a2, a2, #ISR_AllInts:AND::NOT:ISR_ReceiveFull
+        STR     a2, [v4, #ISR]
+        LDR     a4, [v1, #8]
+        LDR     ip, [v1, #4]
+        LDR     v3, [v1, #0]
+        LDRB    a1, [v4, #IDBR]
+        TST     v3, #1:SHL:30
+        ADDNE   ip, ip, a1
+        STREQB  a1, [ip, a3]
+        STRNE   ip, [v1, #4]
+        ADD     a3, a3, #1
+        TEQ     a3, a4
+        BEQ     next_transaction
+next_read
+        LDR     a1, [v4, #ICR]
+        ; Figure out whether to NAK
+        SUB     a4, a4, #1
+        TEQ     a3, a4                  ; if at end of this transfer
+        BNE     %FT20
+        LDR     ip, [v5, #IIC_XEnd]     ; NAK+STOP if last transfer
+        TEQ     ip, v1
+        ORREQ   a1, a1, #ICR_Stop+ICR_Nack
+        BEQ     %FT20
+        LDR     ip, [v1, #12]           ; NAK if next transfer has START
+        TST     ip, #1:SHL:31
+        ORRNE   a1, a1, #ICR_Nack
+20      ORR     a1, a1, #ICR_Transfer
+        BIC     a1, a1, #ICR_Start
+        STR     a1, [v4, #ICR]
+        STR     a3, [v5, #IIC_XBytes]
+        MOV     a1, #EINPROGRESS
+        LDMFD   sp!, {v1-v5,pc}
+
+next_transaction
+        LDR     ip, [v5, #IIC_XEnd]
+        TEQ     v1, ip
+        BEQ     done
+        LDR     a1, [v1, #12]!
+        STR     v1, [v5, #IIC_XCurrent]
+        MOV     a3, #0
+        TST     a1, #1:SHL:30           ; checksum?.. zero needed
+        TSTNE   a1, #1                  ; only for reads..
+        STRNE   a3, [v1, #4]            ; yes .. do so
+        TST     a1, #1:SHL:31           ; EQ if doing START
+        BEQ     next_start
+        TST     a2, #ISR_RnW
+        BNE     next_read
+        BEQ     next_write
+
+next_start
+        STRB    a1, [v4, #IDBR]
+        LDR     a1, [v4, #ICR]
+        ORR     a1, a1, #ICR_Transfer+ICR_Start
+        BIC     a1, a1, #ICR_Nack+ICR_Stop
+        BIC     a1, a1, #ICR_ArbLossIE
+        ; Figure out whether we need to signal STOP
+        LDR     lr, [v1, #8]            ; lr = length of transfer
+        TEQ     lr, #0                  ; if zero length
+        LDREQ   ip, [v5, #IIC_XEnd]     ; and it's the last one
+        TEQEQ   ip, v1
+ [ {TRUE}
+        BEQ     unexpected_error
+ |
+        ORREQ   a1, a1, #ICR_Stop
+ ]
+        STR     a1, [v4, #ICR]
+        MOV     a3, #0
+        STR     a3, [v5, #IIC_XBytes]
+        MOV     a1, #EINPROGRESS
+        LDMFD   sp!, {v1-v5,pc}
+
+done
+        MOV     a1, #ECOMPLETED
+        B       clear_and_return
+
+bus_error
+        MOV     a1, #ENOACK
+clear_and_return
+        STR     a2, [v4, #ISR]
+        MOV     ip, #0
+        STR     ip, [v5, #IIC_XStart]
+        LDMFD   sp!, {v1-v5,pc}
+
+unexpected_error
+        MOV     a1, #EERROR
+        B       clear_and_return
+
+arb_loss
+        STR     a2, [v4, #ISR]
+        LDR     a1, [v5, #IIC_XStart]
+        STR     a1, [v5, #IIC_XCurrent]
+        B       next_start
+
+
+        END
+

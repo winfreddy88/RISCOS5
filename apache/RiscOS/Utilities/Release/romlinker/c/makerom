@@ -1,0 +1,611 @@
+/* Copyright 2001 Pace Micro Technology plc
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*
+ * ROM Linker
+ *
+ * Copyright (C) Pace Micro Technology plc. 2001
+ *
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <errno.h>
+#include <time.h>
+
+#ifdef __riscos
+#include "kernel.h"
+#endif
+
+/* CLX headers */
+#include "bytesex.h"
+#include "err.h"
+
+/* Local headers */
+#include "memory.h"
+#include "filereader.h"
+#include "filewriter.h"
+#include "romlinker.h"
+#include "makerom.h"
+#include "symbols.h"
+
+/* Keep this structure in step with the arg_descriptors and the linker_characteristics! */
+typedef struct {
+  /* All members of this structure must be of type const char * */
+  /* The mandatory arguments must be stored first */
+  const char *format;
+  const char *image_filename;
+  const char *image_size;
+  /* The optional arguments must be stored second and the index of
+   * the first optional argument inserted in the table of characteristics.
+   */
+  const char *sigstr;
+  const char *signumstr;
+  const char *noimagesize;
+  const char *nodebugsyms;
+  const char *subformat;
+  const char *load_addr;
+  const char *exec_addr;
+} args_structure;
+
+/* Some useful constants */
+enum {
+  imagesize_offset = 0x60,                  /* Where to patch the image size in */
+  default_signature = 0x534F434E,           /* "NCOS" (in host byte order!) */
+  crc_magic = 0xA001,                       /* CRC algorithm magic number */
+  crc_table_size = 1<<8,                    /* Do not change this one */
+  uimage_magic = 0x56190527                 /* uImage header magic value */
+};
+
+static const uint32_t crc32_magic = 0xedb88320u; /* CRC-32 magic number */
+
+/* This structure holds all the local state for a join job */
+typedef struct {
+  args_structure args;                      /* The CLI arguments */
+  module_list *modules;                     /* The module to go in the ROM */
+  const char *image_filename;               /* Output image filename */
+  unsigned long image_size;                 /* Size of the image */
+  const char *extra_information;            /* extra information */
+  const char *sigstr;                       /* ROM signature */
+  uint32_t load_addr;                       /* uImage load address */
+  uint32_t exec_addr;                       /* uImage exec address */
+
+  bool have_hal;                            /* This image has a HAL */
+  bool is_uimage;                           /* True if we're generating a uImage */
+  int module_count;                         /* Number of modules so far */
+  int module_chain_terminated;              /* Non-zero if the chain is terminated */
+
+  char *module_cache_memory;                /* A dynamic block of memory holding a module */
+  module_list *current;                     /* The last module to have been output */
+  FILE *image;                              /* Output filehandle */
+  unsigned long rom_position;               /* Where we are in the output ROM */
+  unsigned long neg_checksum;               /* The negative checksum */
+  unsigned long total_image_size;           /* Cumulative total */
+  unsigned long signature;                  /* For end block */
+  unsigned long crc_16;                     /* 16-bit CRC */
+  unsigned long crc_32;                     /* 32-bit CRC */
+  unsigned long crc_64[4];                  /* 64-bit CRC */
+  unsigned long crc_table[crc_table_size];  /* Speeds up CRC calculation */
+  unsigned long crc32_table[crc_table_size];
+} makerom_state;
+
+typedef struct {
+  /* Note - all values are big-endian! */
+  uint32_t magic;
+  uint32_t header_crc;
+  uint32_t timestamp;
+  uint32_t length;
+  uint32_t load_addr;
+  uint32_t exec_addr;
+  uint32_t data_crc;
+  uint8_t os;
+  uint8_t arch;
+  uint8_t type;
+  uint8_t compression;
+  char name[32];
+} uimage_header;
+
+/* Return the makerom state structure */
+static makerom_state *makerom_get_state(void)
+{
+  static makerom_state state;
+  return &state;
+}
+
+static void makerom_init(void)
+{
+  makerom_linker_characteristics.vals = &(makerom_get_state()->args.format);
+}
+
+static void makerom_init_crc_table(makerom_state *state)
+{
+  int i, j;
+  unsigned int crc;
+
+  for (i=0; i<crc_table_size; ++i) {
+    crc = i;
+    for (j=0; j < 8; ++j) {
+      const unsigned int eor = (crc & 1) ? crc32_magic : 0;
+      crc = (crc >> 1) ^ eor;
+    }
+    state->crc32_table[i] = crc;
+  }
+  
+  for (i=0; i<crc_table_size; ++i) {
+    crc = i;
+    for (j=0; j < 8; ++j) {
+      const unsigned int eor = (crc & 1) ? crc_magic : 0;
+      crc = (crc >> 1) ^ eor;
+    }
+    state->crc_table[i] = crc;
+  }
+}
+
+/* Load in the module list file, taking into account our special headers */
+static void makerom_read_module_list(makerom_state *state)
+{
+  const char *hal;
+  module_list **list;
+
+  /* This will be the kernel in images that have no HAL */
+  hal = fault_null_const(find_next_arg(), "No modules in ROM!");
+
+  state->have_hal = (memcmp(hal, "HAL:", 4) == 0);
+  if (state->have_hal) {
+    hal += 4;
+  }
+
+  list = module_add_to_list(&state->modules, hal, unassigned_position);
+  romlinker_load_module_list(list);
+}
+
+static void makerom_write_byte(makerom_state *state, unsigned long c)
+{
+  unsigned long index, crc;
+  int int_c = (int) (c & 0xFF);
+
+  c &= 0xFF;
+
+  if (fputc(int_c, state->image) == EOF) {
+    err_fail("fputc failed: %s", strerror(errno));
+  }
+
+  index = (state->rom_position++ & 3);
+  /* Update total checksum */
+  state->neg_checksum -= c << (index * 8UL);
+  /* Update 16-bit checksum */
+  crc = state->crc_16 ^ c;
+  state->crc_16 = (crc >> 8UL) ^ state->crc_table[crc & 0xFF];
+  /* Update 32-bit checksum */
+  crc = state->crc_32 ^ c;
+  state->crc_32 = (crc >> 8UL) ^ state->crc32_table[crc & 0xFF];
+  /* Update 64-bit checksum */
+  crc = state->crc_64[index] ^ c;
+  state->crc_64[index] = (crc >> 8UL) ^ state->crc_table[crc & 0xFF];
+}
+
+static void makerom_write_word(makerom_state *state, unsigned long word32)
+{
+  int i;
+
+  while (state->rom_position & 3) {
+    makerom_write_byte(state, 0xFF);
+  }
+  for (i = 0; i < 32; i += 8) {
+    makerom_write_byte(state, (int) (word32 >> i));
+  }
+}
+
+static const unsigned char *makerom_create_ext_footer(int *length, uint32_t symbols_pos)
+{
+  /* Extended footers can contain one or more entries. Each entry starts with
+     a 1-byte type field and a 1-byte length field, followed by the data itself.
+     The length byte doesn't include the 2-byte header. Entries are aligned on
+     byte boundaries.
+
+     The list is terminated by a word containing the length of the entry list
+     in the low two bytes and a 16-bit CRC of the entry list in the high bytes.
+     This footer word is inserted by the caller, we just need to provide the
+     entry list & length. */
+
+  /* Add entry ID 0, for a standard RISC OS 5-byte time value giving the ROM
+     build date */
+  static unsigned char footer[7 + 6];
+  footer[0] = 0;
+  footer[1] = 5;
+#ifdef __riscos
+  footer[2] = 3;
+  if (_kernel_osword(14,(int *) &footer[2]) < 0) {
+    err_fail("Couldn't get time");
+  }
+#else
+  /* Assume standard Unix time, and don't worry about time zones for now */
+  unsigned long long t = (unsigned long long) time(NULL);
+#define secs0070 (((unsigned)86400)*(365*70+17))
+  t = (t+secs0070)*100;
+  footer[2] = t;
+  footer[3] = (t>>8);
+  footer[4] = (t>>16);
+  footer[5] = (t>>24);
+  footer[6] = (t>>32);
+#endif
+  *length = 7;
+
+  /* Add entry ID 2, for the offset to the debug symbols */
+  if (symbols_pos) {
+    footer[7] = 2;
+    footer[8] = 4;
+    footer[9] = symbols_pos;
+    footer[10] = symbols_pos>>8;
+    footer[11] = symbols_pos>>16;
+    footer[12] = symbols_pos>>24;
+    *length += 6;
+  }
+
+  return footer;
+}
+
+
+static module_list *makerom_start(void)
+{
+  makerom_state *const state = makerom_get_state();
+  module_list *module;
+  unsigned long largest_module = 0UL;
+  unsigned long total_size = 0UL;
+
+  makerom_init_crc_table(state);
+  makerom_read_module_list(state);
+  state->current = state->modules;
+  state->module_count = 0;
+  state->module_chain_terminated = 0;
+  state->rom_position = 0;
+  state->neg_checksum = 0;
+  state->extra_information = NULL;
+  state->crc_32 = 0xffffffff;
+
+  if (state->args.sigstr) {
+    int i;
+    if (strlen(state->args.sigstr) != 4) {
+      err_fail("Illegal signature '%s' - must be four characters long", state->args.sigstr);
+    }
+    state->signature = 0;
+    for (i = 0; i < 4; ++i) {
+      state->signature |= (unsigned long) ((state->args.sigstr[i] & 0xFF) << (i*8));
+    }
+  }
+  else if (state->args.signumstr) {
+    char *nextc;
+    state->signature = romlinker_strtoul(state->args.signumstr, &nextc, 0);
+    if (!state->args.signumstr[0] || *nextc != '\0') {
+      err_fail("Illegal signature number '%s'", state->args.signumstr);
+    }
+  }
+  else {
+    state->signature = 0xFFFFFFFFul;
+  }
+
+  for (module = state->modules; module; module = module->next) {
+    const unsigned long rounded_size = (module->size + 3) & ~3;
+    total_size += rounded_size;
+    if (rounded_size > largest_module) {
+      largest_module = rounded_size;
+    }
+  }
+
+  /* Ensure that the cache is large enough to hold the largest module */
+  state->module_cache_memory = safe_alloc(largest_module);
+
+  /* Size of the image (in bytes) */
+  state->image_size = romlinker_strtoul(state->args.image_size, NULL, 0);
+
+  /* Deal with uImage options */
+  if (state->args.subformat && !strcmp(state->args.subformat,"uimage")) {
+    state->is_uimage = true;
+    if (!state->args.load_addr || !state->args.exec_addr) {
+      err_fail("Both load_addr and exec_addr must be provided for uImage files");
+    }
+    state->load_addr = romlinker_strtoul(state->args.load_addr, NULL, 0);
+    state->exec_addr = romlinker_strtoul(state->args.exec_addr, NULL, 0);
+    if ((state->exec_addr - state->load_addr) >= state->image_size) {
+      err_fail("Exec addr outside image");
+    }
+  }
+
+  /* Open the image file ready for writing ... (creating RAM cache if possible) */
+  state->image = filewriter_image_open(state->args.image_filename, state->image_size);
+
+  if (state->is_uimage) {
+    /* Reserve space for the uImage header */
+    uimage_header temp = {0};
+    fwrite(&temp, sizeof(uimage_header), 1, state->image);
+  }
+
+  return state->current;
+}
+
+static module_list *makerom_add_next_module(void)
+{
+  makerom_state *const state = makerom_get_state();
+  module_list *current = state->current;
+  unsigned long rounded_size;
+  char *cp, *ep, *patchstart;
+  int hal = 0, kernel = (state->module_count == 0);
+  unsigned long module_size;
+
+  current->memory_cache = state->module_cache_memory;
+  fault_null(filereader_load_file(current->filename, current->size, current->memory_cache),
+    "Unable to load module '%s'", current->filename);
+
+  if (current->fixed_position != unassigned_position) {
+    if (state->module_count > 1 && !state->module_chain_terminated) {
+      makerom_write_word(state, 0); /* terminate ROM chain */
+      state->module_chain_terminated = 1;
+    }
+    else if (state->module_count == 1) {
+      /* Fixed position second component?  Must be the kernel after a HAL */
+      kernel = 1;
+    }
+
+    if (state->rom_position > current->fixed_position) {
+      err_fail("Component %s overlaps previous data", current->filename);
+    }
+
+    while (state->rom_position < current->fixed_position) {
+      /* Pad to module position */
+      makerom_write_byte(state, 0xFF);
+    }
+  }
+
+  if (state->have_hal) {
+    switch (state->module_count) {
+      case 0: kernel = 0; hal = 1; break;
+      case 1: kernel = 1; break;
+      default: break;
+    }
+  }
+
+  module_size = current->size + 4;
+  rounded_size = (module_size + 3) & ~3;
+
+  if (!kernel && !hal && (current->fixed_position == unassigned_position)) {
+    /* Write the link word */
+    makerom_write_word(state, rounded_size);
+  }
+
+  if (verbose) {
+    err_report("Adding at 0x%#08lx: %s", state->rom_position, current->filename);
+  }
+
+  if (!state->args.nodebugsyms) {
+    load_symbols(current->filename, state->rom_position, current->memory_cache, current->size);
+  }
+
+  cp = current->memory_cache;
+  ep = cp + current->size;
+  if (state->args.noimagesize) {
+    patchstart = NULL;
+  }
+  else {
+    /* patchstart may fall outside the range cp,ep but this does not matter, since
+     * the pointer will never compare equal with any value in the range cp,ep.
+     */
+    patchstart = cp + imagesize_offset - state->rom_position;
+  }
+
+  if (kernel) {
+    ep -= 4;
+  }
+
+  while (cp < ep) {
+    if (cp == patchstart) {
+      makerom_write_byte(state, state->image_size >>  0);
+      makerom_write_byte(state, state->image_size >>  8);
+      makerom_write_byte(state, state->image_size >> 16);
+      makerom_write_byte(state, state->image_size >> 24);
+      cp += 4;
+    }
+    else {
+      makerom_write_byte(state, *cp++);
+    }
+  }
+
+  ++state->module_count;
+
+  if (state->rom_position > state->image_size) {
+    err_fail("ROM image overflowed by %ld bytes in %s",
+      state->image_size - state->rom_position, current->filename);
+  }
+
+  current->memory_cache = NULL;
+  state->current = state->current->next;
+  return state->current;
+}
+
+static uint32_t be32(uint32_t val)
+{
+  return (val>>24) | ((val>>8) & 0xff00) | ((val<<8) & 0xff0000) | (val<<24);
+}
+
+static void uimage_write_header(makerom_state *const state)
+{
+  uimage_header header = {0};
+  if (fseek(state->image, 0, SEEK_SET)) {
+    err_fail("Unable to seek to start of image file: %s", strerror(errno));
+  }
+  /* Fill in the header */
+  header.magic = uimage_magic;
+  header.timestamp = be32(time(NULL)); /* TODO - Use same timestamp from ROM footer */
+  header.length = be32(state->image_size);
+  header.load_addr = be32(state->load_addr);
+  header.exec_addr = be32(state->exec_addr);
+  header.data_crc = be32(state->crc_32 ^ 0xffffffff);
+  /* To ensure compatibility with all U-Boot versions, we claim we're a Linux kernel */
+  header.os = 5; /* Linux */
+  header.arch = 2; /* ARM */
+  header.type = 2; /* Kernel */
+  header.compression = 0; /* No compression */
+  strcpy(header.name,"RISC OS");
+  /* Calculate the header CRC */
+  uint32_t header_crc = 0xffffffff;
+  for(int i=0;i<sizeof(header);i++)
+  {
+    uint32_t crc = header_crc ^ ((uint8_t *) &header)[i];
+    header_crc = (crc>>8) ^ state->crc32_table[crc & 0xFF];
+  }
+  header.header_crc = be32(header_crc ^ 0xffffffff);
+  /* Write out the header */
+  if (fwrite(&header, sizeof(header), 1, state->image) != 1) {
+    err_fail("Unable to write uImage header: %s", strerror(errno));
+  } 
+}
+
+static size_t makerom_symbols_size(void)
+{
+  if (!symbols_index_count)
+  {
+    return 0;
+  }
+  /* index_count + symbols_index + symbols_buffer */
+  return 4 + sizeof(symbols_index)*symbols_index_count + symbols_index[symbols_index_count-1].syms_end;
+}
+
+static void makerom_symbols_write(makerom_state *const state)
+{
+  makerom_write_word(state, symbols_index_count);
+  for(int i=0;i<symbols_index_count;i++)
+  {
+    makerom_write_word(state, symbols_index[i].rom_start);
+    makerom_write_word(state, symbols_index[i].rom_end);
+    makerom_write_word(state, symbols_index[i].syms_start);
+    makerom_write_word(state, symbols_index[i].syms_end);
+  }
+  int len = symbols_index[symbols_index_count-1].syms_end;
+  for(int i=0;i<len;i++)
+  {
+    makerom_write_byte(state, symbols_buffer[i]);
+  }
+}
+
+static void makerom_finish(void)
+{
+  makerom_state *const state = makerom_get_state();
+  signed long space;
+  unsigned long footer_length = 20UL;
+  int i;
+
+  if (!state->module_chain_terminated) {
+    makerom_write_word(state, 0);
+  }
+
+  /* Only include symbols if there's enough room for all of them. TODO - improve */
+  uint32_t symbols_pos = 0;
+  if (!state->args.nodebugsyms) {
+    size_t required = makerom_symbols_size();
+    if ((required > 0) && (required + 1024 < state->image_size - state->rom_position)) { /* Estimate 1K max footer size */
+      symbols_pos = (state->rom_position + 3) & ~3;
+      makerom_symbols_write(state);
+      if (verbose) {
+        err_report("Debug symbols at %08x",symbols_pos);
+      }
+    }
+    else if (required) {
+      err_report("Warning: Insufficient space for ROM symbols");
+    }
+  }
+
+  int ext_footer_len;
+  const unsigned char *ext_footer = makerom_create_ext_footer(&ext_footer_len, symbols_pos);
+
+  if (ext_footer_len) {
+    if (ext_footer_len > 65534) { /* 65535 could be confused with padding */
+      err_fail("Extended footer too long (%d bytes)",ext_footer_len);
+    }
+    footer_length += ext_footer_len + 4;
+  }
+
+
+  romlinker_report_rom_summary(state->image_size, state->rom_position + footer_length);
+
+  space = state->image_size - state->rom_position - footer_length;
+
+  while (space--) {
+    makerom_write_byte(state, 0xFF);
+  }
+
+  if (ext_footer_len) {
+    unsigned long crc=0;
+    /* Write extended footer, and calculate CRC */
+    for(i = 0; i < ext_footer_len; ++i) {
+      makerom_write_byte(state, ext_footer[i]);
+      crc ^= ext_footer[i];
+      crc = (crc >> 8) ^ state->crc_table[crc & 0xFF];
+    }
+    /* Write CRC & length */
+    makerom_write_word(state, (crc << 16UL) | ext_footer_len);
+  }
+  
+  makerom_write_word(state, 0x0);                   /* Write POST zero word */
+  makerom_write_word(state, state->signature);      /* ROM signature */
+  makerom_write_word(state, state->neg_checksum);   /* 16-bit checksum */
+  for (i = 0; i < 8; ++i) {                         /* 64-bit checksum */
+    makerom_write_byte(state, state->crc_64[i & 3]);/* XXX - this looks wrong? */
+  }
+
+  if (state->is_uimage) {
+    /* Go back and fill in the uImage header */
+    uimage_write_header(state);
+  }
+
+  if (fclose(state->image) == EOF) {
+    err_fail("Unable to write/close image file: %s", strerror(errno));
+  }
+
+  filewriter_mark_as_rom_image(state->args.image_filename);
+
+  err_report("crc16=%.4lx\n", state->crc_16);
+}
+
+/* Keep this structure in step with struct args and the linker_characteristics! */
+static const char *arg_descriptors[] = {
+  "format",
+  "imagename",
+  "imagesize",
+  /* Now the optional parameters */
+  "sigstr",
+  "signum",
+  "noimagesize",
+  "nodebugsyms",
+  "subformat",
+  "load_addr",
+  "exec_addr",
+  /* And the terminator */
+  NULL
+};
+
+linker_characteristics makerom_linker_characteristics = {
+  "rom",
+  "Standard ROM image construction",
+  arg_descriptors,
+  NULL,                                 /* Filled in by makerom_init() */
+  3,                                    /* number of mandatory parameters */
+
+  /* Finally, the linker method table */
+  makerom_init,
+  makerom_start,
+  makerom_add_next_module,
+  makerom_finish
+};

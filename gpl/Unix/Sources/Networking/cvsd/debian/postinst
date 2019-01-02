@@ -1,0 +1,316 @@
+#!/bin/sh
+
+set -e
+
+# source debconf library.
+. /usr/share/debconf/confmodule
+
+# location of the configfile
+configfile="/etc/cvsd/cvsd.conf"
+
+# location of the file that will be edited
+# only when editing is complete will $configfile be overwritten
+tmpconfigfile=`mktemp`
+
+# location of the file that will be used temporarily
+tmpfile=`mktemp`
+
+# create cvsd group if it's not there yet
+getent group cvsd >/dev/null || \
+  addgroup --system cvsd
+
+# create cvsd user if it's not there yet
+getent passwd cvsd >/dev/null || \
+  adduser --system --ingroup cvsd --home /var/lib/cvsd cvsd
+
+# correct settings for cvsd user
+(getent passwd cvsd | grep -q "^cvsd:.*:cvs pserver daemon:") || usermod -c "cvs pserver daemon" cvsd
+gid=`getent group cvsd | sed 's/^cvsd:[^:]*:\([0-9]*\):.*$/\1/'`
+(getent passwd cvsd | grep -q "^cvsd:.*:$gid:") || usermod -g "cvsd" cvsd
+(getent passwd cvsd | grep -q ":/bin/false$") || usermod -s "/bin/false" cvsd
+
+# sed expressions to escape character so vars may be used in regexps
+RE_ESCAPE="s/[\\\\\/.+*()\[^$]/\\\\&/g"
+RP_ESCAPE="s/[\\\\\/&]/\\\\&/g"
+
+# function to do modification of an option
+# modifications are to $tmpconfigfile
+thingamagiggy () {
+  setting="$1"
+  value="$2"
+  value_re=`echo "$value" | sed "$RE_ESCAPE"`
+  value_rp=`echo "$value" | sed "$RP_ESCAPE"`
+  # if config already contains this setting we're done
+  grep \
+    '^[[:space:]]*'"$setting"'[[:space:]][[:space:]]*'"$value_re"'[[:space:]]*$' \
+    < "$tmpconfigfile" > /dev/null 2>&1 \
+    && return 0
+  # check if a setting should be modified or added
+  if grep \
+       '^[[:space:]]*'"$setting"'[[:space:]][[:space:]]*[^[:space:]]*[[:space:]]*$' \
+       < "$tmpconfigfile" > /dev/null 2>&1
+  then
+    # setting is present with another value, modify
+    sed \
+      's/^\([[:space:]]*'"$setting"'[[:space:]][[:space:]]*\)[^[:space:]]*\([[:space:]]*\)$/\1'"$value_rp"'\2/' \
+      < "$tmpconfigfile" > "$tmpfile"
+    cat "$tmpfile" > "$tmpconfigfile"
+  else
+    # setting is not yet present, add
+    echo "$setting $value" >> "$tmpconfigfile"
+  fi
+}
+
+# install a new configfile if there is no existing one or if it
+# is an old generated one, otherwise modify current configfile
+if ! [ -e "$configfile" ]
+then
+  # create a new configuration file
+  cat > "$tmpconfigfile" << EOM
+# This is the configuration file for cvsd.
+# See the manual page cvsd.conf(5) for more information.
+#
+# You can also use 'dpkg-reconfigure cvsd' to modify these
+# settings.
+#
+# See the "Password authentication server"
+# section in the cvs texinfo for more information
+# about running a pserver.
+
+# RootJail <path>
+#  This is the location of the chroot jail
+#  cvs should be run in.
+#  Specify 'none' (without quotes) to not use
+#  a chroot jail.
+#  This directory should be initialized with
+#  the cvsd-buildroot script.
+RootJail /var/lib/cvsd
+
+# Uid <uid>
+#  This specifies which user id cvs should be
+#  run as. This can be a numerical id or
+#  a symbolic value.
+Uid cvsd
+
+# Gid <gid>
+#  This specifies which group id cvs should be
+#  run as. This can be a numerical id or
+#  a symbolic value.
+Gid cvsd
+
+# CvsCommand <path>
+#  If you define this it should point to the cvs
+#  command to execute. Otherwise "/bin/cvs" will
+#  be used if a RootJail is configured and the
+#  cvs command found at compiletime otherwise.
+#  The path should be relative to the specified
+#  RootJail and should start with a '/'.
+
+# CvsArgs <arg>...
+#  Additional arguments to pass to the cvs command.
+#  For example, to enable read-only access to the
+#  repository, pass the -R option.
+
+# Nice <num>
+#  This specifies the nice value (on most systems
+#  ranging from -20 to 20) where the smaller the number
+#  (more negative) the higher the priority.
+Nice 1
+
+# Umask <mask>
+#  This specifies a umask used by the cvs pserver when
+#  creating files. Specify as an octal value.
+Umask 027
+
+# Limit <resource> <value>
+#  <resource> can be one of: coredumpsize, cputime, datasize, filesize,
+#  memorylocked, openfiles, maxproc, memoryuse, stacksize or virtmem.
+#  <value> is the maximum value for the given resource. For size values
+#  a suffix of 'b', 'k' or 'm' can be specified ('k' is default). Time
+#  values can be formatted as 'mm:ss' or have 'm' or 's' suffixes
+#  ('s' is default).
+Limit coredumpsize 0
+
+# PidFile <file>
+#  This specifies the location the process id of the
+#  daemon is written.
+PidFile /var/run/cvsd.pid
+
+# Listen <address> <port>
+#  The addresses and ports to listen on for connections.
+#Listen * 2401
+
+# MaxConnections <num>
+#  The maximum number of connections that will
+#  be handled simultaneously. 0 is unlimited.
+MaxConnections 10
+
+# Log <scheme/file> [<loglevel>]
+#  The way logging is done. Either none, syslog or a
+#  filename may be specified, followed by an optional
+#  loglevel. Loglevel may be one of:
+#  crit, error, warning, notice, info (default) or debug.
+#  This option can be supplied multiple times.
+#  If this option is not specified syslog info is assumed.
+Log syslog info
+#Log /var/log/cvsd.log debug
+
+# Repos <path>
+#  This option specifies which repositories
+#  can be used. The value is passed as a
+#  --allow-root=<path> parameter to cvs.
+#  The path should be relative to the specified
+#  RootJail and should start with a '/'.
+#  This option can be supplied multiple times.
+Repos /test
+Repos /coolsoftware
+
+EOM
+else
+  # use the existing configfile
+  cat "$configfile" > "$tmpconfigfile"
+fi
+
+# Location of Chroot jail
+db_get cvsd/rootjail
+[ "$RET" = "" ] || [ "$RET" = "/" ] && RET="none"
+thingamagiggy "RootJail" "$RET"
+if [ "$RET" = "none" ]; then
+  (getent passwd cvsd | grep -q "^cvsd:.*:/:") || usermod -d "/" cvsd
+else
+  (getent passwd cvsd | grep -q "^cvsd:.*:$RET:") || usermod -d "$RET" cvsd
+fi
+rootjail="$RET"
+
+# Maximum number of connections
+db_get cvsd/maxconnections
+[ -n "$RET" ] || RET=0
+thingamagiggy "MaxConnections" "$RET"
+
+# Nice value to run at
+db_get cvsd/nice
+[ -n "$RET" ] || RET=1
+thingamagiggy "Nice" "$RET"
+
+# Umask to use
+db_get cvsd/umask
+[ -n "$RET" ] || RET="027"
+thingamagiggy "Umask" "$RET"
+
+# Address-Port combinations to listen on
+sed 's/^\([[:space:]]*\)Listen/\1x-Listen/' < "$tmpconfigfile" > "$tmpfile"
+cat "$tmpfile" > "$tmpconfigfile"
+# check current listen settings
+db_get cvsd/listen
+if [ -n "$RET" ]
+then
+  echo "$RET" | tr ' ' '\n' | while read addr
+  do
+    read port
+    # if current config already contains this addr/port combination
+    # remove the x-, otherwise add a new option
+    addr_re=`echo "$addr" | sed "$RE_ESCAPE"`
+    port_re=`echo "$port" | sed "$RE_ESCAPE"`
+    if grep \
+         '^[[:space:]]*x-Listen[[:space:]][[:space:]]*'"$addr_re"'[[:space:]][[:space:]]*'"$port_re"'[[:space:]]*$' \
+         < "$tmpconfigfile" > /dev/null 2>&1
+    then
+      sed \
+        's/^\([[:space:]]*\)x-\(Listen[[:space:]][[:space:]]*'"$addr_re"'[[:space:]][[:space:]]*'"$port_re"'[[:space:]]*\)$/\1\2/' \
+        "$tmpconfigfile" > "$tmpfile"
+      cat "$tmpfile" > "$tmpconfigfile"
+    else
+      echo "Listen $addr $port" >> "$tmpconfigfile"
+    fi
+  done
+fi
+# remove remaining x-Listen options
+grep -v '^[[:space:]]*x-Listen' < "$tmpconfigfile" > "$tmpfile" || true
+cat "$tmpfile" > "$tmpconfigfile"
+
+# Repositories to have
+sed 's/^\([[:space:]]*\)Repos/\1x-Repos/' < "$tmpconfigfile" > "$tmpfile"
+cat "$tmpfile" > "$tmpconfigfile"
+# check current repository settings
+db_get cvsd/repositories
+# remove extra repositories
+OLDIFS="$IFS"
+IFS=':'
+for repos in $RET
+do
+  IFS="$OLDIFS"
+  repos_re=`echo "$repos" | sed "$RE_ESCAPE"`
+  if grep \
+       '^[[:space:]]*x-Repos[[:space:]][[:space:]]*'"$repos_re"'[[:space:]]*$' \
+       < "$tmpconfigfile" > /dev/null 2>&1
+  then
+    sed \
+      's/^\([[:space:]]*\)x-\(Repos[[:space:]][[:space:]]*'"$repos_re"'[[:space:]]*\)$/\1\2/' \
+      "$tmpconfigfile" > "$tmpfile"
+    cat "$tmpfile" > "$tmpconfigfile"
+  else
+    echo "Repos $repos" >> "$tmpconfigfile"
+  fi
+done
+# remove remaining x-Repos options
+grep -v '^[[:space:]]*x-Repos' < "$tmpconfigfile" > "$tmpfile" || true
+cat "$tmpfile" > "$tmpconfigfile"
+
+# Limits
+sed 's/^\([[:space:]]*\)Limit/\1x-Limit/' < "$tmpconfigfile" > "$tmpfile"
+cat "$tmpfile" > "$tmpconfigfile"
+# check current limits
+db_get cvsd/limits
+for limit in `echo "$RET" | sed 's/,//g'`
+do
+  db_get "cvsd/limit_$limit"
+  if [ "x$RET" != "x" ]
+  then
+    value="$RET"
+    value_rp=`echo "$value" | sed "$RP_ESCAPE"`
+    if grep \
+         '^[[:space:]]*x-Limit[[:space:]][[:space:]]*'"$limit"'[[:space:]]' \
+         < "$tmpconfigfile" > /dev/null 2>&1
+    then
+      sed \
+        's/^\([[:space:]]*\)x-\(Limit[[:space:]][[:space:]]*'"$limit"'[[:space:]]*\)[^[:space:]]*\([[:space:]]*\)$/\1\2'"$value_rp"'\3/' \
+        "$tmpconfigfile" > "$tmpfile"
+      cat "$tmpfile" > "$tmpconfigfile"
+    else
+      echo "Limit $limit $value" >> "$tmpconfigfile"
+    fi
+  fi
+done
+# remove remaining x-Limit options
+grep -v '^[[:space:]]*x-Limit' < "$tmpconfigfile" > "$tmpfile" || true
+cat "$tmpfile" > "$tmpconfigfile"
+
+# acutually save (and make a backup) of the configfile
+# only save if there are any differences
+if ! diff "$tmpconfigfile" "$configfile" > /dev/null 2>&1
+then
+  if [ -e "$configfile" ]
+  then
+    # make backup
+    [ -e "$configfile.old" ] || ( touch "$configfile.old"; chmod 644 "$configfile.old")
+    cat "$configfile" > "$configfile.old"
+  else
+    # create configfile
+    touch "$configfile"
+    chmod 644 "$configfile"
+  fi
+  cat "$tmpconfigfile" > "$configfile"
+fi
+rm "$tmpconfigfile"
+rm "$tmpfile"
+
+# rebuild the rootjail
+if [ "$rootjail" != "none" ]
+then
+  /usr/sbin/cvsd-buildroot "$rootjail"
+fi
+
+#DEBHELPER#
+
+db_stop
+exit 0

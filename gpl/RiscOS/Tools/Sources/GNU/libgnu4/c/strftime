@@ -1,0 +1,336 @@
+/* Lifted from the UnixLib source. Tweaked to use _swi; comments stripped.
+ * Added 'z', and '-' and '_' modifiers. */
+
+#include <stdio.h>
+#include <swis.h>
+#include "strftime.h"
+
+static void
+__cvt_broken_time (const struct tm *brokentime, int ns, char *riscos_time)
+{
+  unsigned int ordinals_buffer[7];
+
+  ordinals_buffer[0] = (ns / 1000000000) * 100;
+  ordinals_buffer[1] = brokentime->tm_sec;
+  ordinals_buffer[2] = brokentime->tm_min;
+  ordinals_buffer[3] = brokentime->tm_hour;
+  ordinals_buffer[4] = brokentime->tm_mday;
+  ordinals_buffer[5] = (brokentime->tm_mon % 12) + 1;
+  ordinals_buffer[6] = brokentime->tm_year + (brokentime->tm_mon / 12) + 1900;
+  _swi (0x43051 /* Territory_ConvertOrdinalsToTime */ , 7,
+	-1, riscos_time, ordinals_buffer);
+}
+
+#define isleap(y) (((y) % 4) == 0 && (((y) % 100) != 0 || ((y) % 400) == 0))
+
+static char *
+add (const char *str, char *pt, const char *ptlim)
+{
+  while (pt < ptlim && (*pt = *str++) != '\0')
+    ++pt;
+  return pt;
+}
+
+static char *
+conv (const int n, const char *format, char *pt, const char *ptlim)
+{
+  char buf[32];
+
+  sprintf (buf, format, n);
+  return add (buf, pt, ptlim);
+}
+
+static char *
+secs (const struct tm *t, char *pt, const char *ptlim)
+{
+  char buf[32];
+  time_t s;
+  struct tm tmp;
+
+  /* Make a copy, mktime(3) modifies the tm struct. */
+  tmp = *t;
+  s = mktime (&tmp);
+  sprintf (buf, "%d", s);
+  return add (buf, pt, ptlim);
+}
+
+static char *
+territory_convert (char *format, const char *time, char *pt,
+		   const char *ptlim)
+{
+  char buffer[64];
+
+  _swi (0x4304B /* Territory_ConvertDateAndTime */ , 0x1F,
+	-1, time, buffer, sizeof (buffer) - 1, format);
+  return add (buffer, pt, ptlim);
+}
+
+static char *
+territory_standard (int swinum, const char *time, char *pt, const char *ptlim)
+{
+  char buffer[64];
+
+  _swi (swinum, 0xF, -1, time, buffer, sizeof (buffer) - 1);
+  return add (buffer, pt, ptlim);
+}
+
+static char *
+fmt (const char *format, const struct tm *t, char *pt,
+     const char *ptlim, const char *riscos_time, int ns, int ut)
+{
+  for (; *format; ++format)
+  {
+    int pad = 0;
+    static const char conv2[][5] = { "%02d", "%d", "%2d" };
+    static const char conv3[][5] = { "%03d", "%d", "%3d" };
+    static const char conv4[][5] = { "%04d", "%d", "%4d" };
+
+    if (*format == '%')
+    {
+    label:
+      switch (*++format)
+      {
+      case '-':
+	pad = 1;		/* don't pad */
+	goto label;
+      case '_':
+	pad = 2;		/* pad with spaces */
+	goto label;
+      case '\0':
+	--format;
+	break;
+      case 'A':
+	pt = territory_convert ("%WE", riscos_time, pt, ptlim);
+	continue;
+      case 'a':
+	pt = territory_convert ("%W3", riscos_time, pt, ptlim);
+	continue;
+      case 'B':
+	pt = territory_convert ("%MO", riscos_time, pt, ptlim);
+	continue;
+      case 'b':
+      case 'h':
+	pt = territory_convert ("%M3", riscos_time, pt, ptlim);
+	continue;
+      case 'C':
+	pt = territory_convert ("%YR", riscos_time, pt, ptlim);
+	continue;
+      case 'c':
+	pt = territory_standard (0x4304C
+				 /* Territory_ConvertStandardDateAndTime */ ,
+				 riscos_time, pt, ptlim);
+	continue;
+      case 'D':
+	pt = fmt ("%m/%d/%y", t, pt, ptlim, riscos_time, 0, 0);
+	continue;
+      case 'd':
+	pt = conv (t->tm_mday, conv2[pad], pt, ptlim);
+	continue;
+      case 'E':
+      case 'O':
+	goto label;
+      case 'e':
+	pt = conv (t->tm_mday, "%2d", pt, ptlim);
+	continue;
+      case 'H':
+	pt = conv (t->tm_hour, conv2[pad], pt, ptlim);
+	continue;
+      case 'I':
+	pt = conv ((t->tm_hour % 12) ? (t->tm_hour % 12) : 12,
+		   conv2[pad], pt, ptlim);
+	continue;
+      case 'j':
+	pt = conv (t->tm_yday + 1, conv3[pad], pt, ptlim);
+	continue;
+      case 'k':
+	pt = conv (t->tm_hour, "%2d", pt, ptlim);
+	continue;
+      case 'l':
+	pt = conv ((t->tm_hour % 12) ? (t->tm_hour % 12) : 12,
+		   "%2d", pt, ptlim);
+	continue;
+      case 'M':
+	pt = conv (t->tm_min, conv2[pad], pt, ptlim);
+	continue;
+      case 'm':
+	pt = conv (t->tm_mon + 1, conv2[pad], pt, ptlim);
+	continue;
+      case 'N':
+	{
+	  char buf[10];
+	  int n = 100000000;
+	  if (ns)
+	    while (n && (ns % n))
+	    {
+	      int d = (ns / n) % 10;
+	      if (pt < ptlim)
+		*pt++ = '0' + d;
+	      n /= 10;
+	    }
+	  else
+	    pt = add ("0", pt, ptlim);
+	}
+	continue;
+      case 'n':
+	pt = add ("\n", pt, ptlim);
+	continue;
+      case 'p':
+	pt = territory_convert ("%AM", riscos_time, pt, ptlim);
+	continue;
+      case 'R':
+	pt = fmt ("%H:%M", t, pt, ptlim, riscos_time, 0, 0);
+	continue;
+      case 'r':
+	pt = fmt ("%I:%M:%S %p", t, pt, ptlim, riscos_time, 0, 0);
+	continue;
+      case 'S':
+	pt = conv (t->tm_sec, conv2[pad], pt, ptlim);
+	continue;
+      case 's':
+	pt = secs (t, pt, ptlim);
+	continue;
+      case 'T':
+	pt = fmt ("%H:%M:%S", t, pt, ptlim, riscos_time, 0, 0);
+	continue;
+      case 't':
+	pt = add ("\t", pt, ptlim);
+	continue;
+      case 'U':
+	pt = conv ((t->tm_yday + 7 - t->tm_wday) / 7, conv2[pad], pt, ptlim);
+	continue;
+      case 'u':
+	pt = conv ((t->tm_wday == 0) ? 7 : t->tm_wday, "%d", pt, ptlim);
+	continue;
+      case 'V':
+	{
+	  int i = (t->tm_yday + 10 - (t->tm_wday ? (t->tm_wday - 1) : 6)) / 7;
+	  if (i == 0)
+	  {
+#ifdef XPG4_1994_04_09
+	    i = 53;
+#else
+	    i = t->tm_wday - (t->tm_yday - 1);
+	    i = (i == 5) ? 53 :
+	      (i == 0) ? 52 : isleap (t->tm_year + 1900) ? 53 : 52;
+#endif
+	  }
+	  pt = conv (i, conv2[pad], pt, ptlim);
+	}
+	continue;
+      case 'v':
+	pt = fmt ("%e-%b-%Y", t, pt, ptlim, riscos_time, 0, 0);
+	continue;
+      case 'W':
+	pt = conv ((t->tm_yday + 7 -
+		    (t->tm_wday ?
+		     (t->tm_wday - 1) : 6)) / 7, conv2[pad], pt, ptlim);
+	continue;
+      case 'w':
+	pt = conv (t->tm_wday, "%d", pt, ptlim);
+	continue;
+      case 'X':
+	pt = territory_standard (0x4304E /* Territory_ConvertStandardTime */ ,
+				 riscos_time, pt, ptlim);
+	continue;
+      case 'x':
+	pt = territory_standard (0x4304D /* Territory_ConvertStandardDate */ ,
+				 riscos_time, pt, ptlim);
+	continue;
+      case 'y':
+	pt = conv ((t->tm_year + 1900) % 100, conv2[pad], pt, ptlim);
+	continue;
+      case 'Y':
+	pt = conv (t->tm_year + 1900, conv4[pad], pt, ptlim);
+	continue;
+      case 'z':
+	{
+	  int tz, tz_dst;
+	  char buf[64];
+
+	  if (ut)
+	    tz = 0;
+	  else
+	  {
+	    _swi (0x4304A /* Territory_ReadTimeZones */ , 1 | 3 << 28,
+		  -1, &tz, &tz_dst);
+	    if (t->tm_isdst)
+	      tz = tz_dst;
+	    buf[0] = tz < 0 ? '-' : '+';
+	    if (tz < 0)
+	      tz = -tz;
+	    tz = (tz / (60 * 60 * 100)) * 100 + (tz % (60 * 60 * 100));
+	  }
+	  sprintf (buf + 1, conv4[pad], tz);
+	  pt = add (buf, pt, ptlim);
+	}
+	continue;
+      case 'Z':
+	{
+	  int tz, tz_dst;
+	  const char *tzn, *tzn_dst;
+	  char buf[64];
+	  if (ut)
+	    tzn = "GMT";
+	  else
+	  {
+	    _swi (0x4304A /* Territory_ReadTimeZones */ , 1U | 15U << 28,
+		  -1, &tzn, &tzn_dst, &tz, &tz_dst);
+	    if (t->tm_isdst)
+	    {
+	      tz = tz_dst;
+	      tzn = tzn_dst;
+	    }
+	  }
+	  if (tzn)
+	    pt = add (tzn, pt, ptlim);
+	  else
+	  {
+	    buf[0] = tz < 0 ? '-' : '+';
+	    if (tz < 0)
+	      tz = -tz;
+	    tz = (tz / (60 * 60 * 100)) * 100 + (tz % (60 * 60 * 100));
+	    sprintf (buf + 1, conv4[pad], tz);
+	    pt = add (buf, pt, ptlim);
+	  }
+	}
+	continue;
+#if 0
+      case '+':
+	pt = fmt (Locale->date_fmt, t, pt, ptlim, riscos_time, 0, 0);
+	continue;
+#endif
+      case '%':
+      default:
+	break;
+      }
+    }
+    if (pt == ptlim)
+      break;
+    *pt++ = *format;
+  }
+  return pt;
+}
+
+size_t
+nstrftime (char *s, const size_t maxsize, const char *format,
+	   const struct tm * t, int ut, int ns)
+{
+  char *p;
+  char riscos_time[6];
+
+  __cvt_broken_time (t, ns, riscos_time);
+  p =
+    fmt (((format == NULL) ? "%c" : format), t, s, s + maxsize, riscos_time,
+	 ns % 1000000000, ut);
+  if (p == s + maxsize)
+    return 0;
+  *p = '\0';
+  return p - s;
+}
+
+size_t
+ds_strftime (char *s, const size_t maxsize, const char *format,
+	     const struct tm * t)
+{
+  return nstrftime (s, maxsize, format, t, 0, 0);
+}

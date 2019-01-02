@@ -1,0 +1,657 @@
+/* Copyright 2003 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*-*-C-*-
+ * Grid support
+ */
+
+
+#include "resed.h"
+
+static int gpw, gph;
+
+
+/*
+ * Move whole item by the specified offset
+ */
+
+void grid_move_item (ResourcePtr res, ItemInfoPtr item, int deltax, int deltay)
+{
+    int i, j;
+    for (i = 0; i < numicons[item->type]; i++)
+    {
+        j = item->u.rawicons[i];
+        if (j != -1)
+        {
+            IconInfoPtr icon = res->icons + j;
+            icon->icon.bbox.minx += deltax;
+            icon->icon.bbox.miny += deltay;
+            icon->icon.bbox.maxx += deltax;
+            icon->icon.bbox.maxy += deltay;
+        }
+    }
+}
+
+
+/*
+ * Calculate baseline y-coord for a given icon.  The number returned is
+ * relative to the bottom of the icon.
+ *
+ * XXX This relies on duplicating internal WIMP knowledge of how the
+ * icon is laid out.  Should the WIMP change, this will need revision.
+ */
+
+static int baseline (IconPtr icon)
+{
+    int y0 = icon->bbox.miny, y1 = icon->bbox.maxy;
+    int cy1 = 28, cy0 = cy1 - 32; /* sys font baseline */
+    enum {Top, Bot, Cent} pos;
+    int bordertype = 0;
+    char *border = template_validation_command_start (template_get_validation (icon), 'R');
+    static int sizetable[] = {0, 4, 4, 8, 8, 4, 12, 8};
+
+    if (border)
+    {
+        sscanf (border + 1, "%d", &bordertype);
+        if (bordertype < 0 || bordertype >= NUMBER(sizetable))
+            bordertype = 0;
+    }
+
+    if (icon->flags & IF_BORDER)
+    {
+        if (bordertype == 0 || bordertype == 7)
+        {
+            /* Needs an extra pixel removing */
+            y0 += scaley;
+            y1 -= scaley;
+        }
+        y0 += sizetable[bordertype];
+        y1 -= sizetable[bordertype];
+    }
+        
+    if (icon->flags & IF_FONT)
+        _swix(Font_ReadInfo, _IN(0) | _OUT(2) | _OUT(4),
+              IF_GET_FIELD(FONT, icon->flags),
+              &cy0, &cy1);
+
+    switch (icon->flags & (IF_TEXT | IF_SPRITE))
+    {
+    case 0:
+    case IF_TEXT:
+        pos = Cent;
+        break;
+    default:
+        switch (icon->flags & (IF_VCENT | IF_RJUST))
+        {
+        case 0:
+            pos = Bot;
+            break;
+        case IF_RJUST:
+            pos = icon->flags & IF_HCENT ? Top : Bot;
+            break;
+        default:
+            pos = Cent;
+            break;
+        }
+        break;
+    }
+    
+    if (pos == Top)
+        cy1 = y1 - cy1;
+    else if (pos == Cent)
+        cy1 = ((y0 + y1) - (cy0 + cy1)) >> 1;
+    else
+        cy1 = y0 - cy0;
+
+    return cy1 - icon->bbox.miny;
+}
+        
+        
+/*
+ * Grid offset functions for the different types.  These return the
+ * distance from the bottom left corner of the snap point.
+ */
+
+typedef void (*OffsetProc)(ResourcePtr, ItemInfoPtr, RectPtr, int *, int *);
+
+
+static void offset_simple (ResourcePtr res, ItemInfoPtr item, RectPtr bbox, int *x, int *y)
+{
+    IconPtr icon = &res->icons[item->u.master].icon;
+    *x = 0;
+    *y = icon->bbox.miny - bbox->miny + baseline (icon);
+}
+
+
+static void offset_label (ResourcePtr res, ItemInfoPtr item, RectPtr bbox, int *x, int *y)
+{
+    IconPtr icon = &res->icons[item->u.master].icon;
+    switch (justify_type (res->icons + item->u.master))
+    {
+    case Left:
+    case Centre:
+        *x = 0;
+        break;
+    case Right:
+        *x = bbox->maxx - bbox->minx;
+        break;
+    }
+    *y = icon->bbox.miny - bbox->miny + baseline (icon);
+}
+
+
+static void offset_groupbox (ResourcePtr res, ItemInfoPtr item, RectPtr bbox, int *x, int *y)
+{
+    IconPtr icon = &res->icons[item->u.groupbox.label].icon;
+    *x = 0;
+    *y = icon->bbox.miny - bbox->miny + baseline (icon);
+}
+
+
+/*
+ * Table of snap offset procedures for each type of item
+ */
+
+static OffsetProc offsetproc[] =
+{
+    offset_simple,              /* Simple icon */
+    offset_simple,              /* Command */
+    offset_label,               /* Label */
+    offset_simple,              /* Display field */
+    offset_simple,              /* Writeable field */
+    offset_simple,              /* HSlider */
+    offset_simple,              /* VSlider */
+    offset_simple,              /* Option button */
+    offset_simple,              /* Radio button */
+    offset_groupbox,            /* Group box */
+    offset_simple,              /* Menu button */
+    offset_simple,              /* Adjuster button */
+};
+
+
+void grid_snap_offset (ResourcePtr res, ItemInfoPtr item, RectPtr bbox, int *x, int *y)
+{
+    (offsetproc[item->type]) (res, item, bbox, x, y);
+}
+
+
+/*
+ * Plot a grid point at the given screen coordinates.  cx and
+ * cy are both zero if this should be a cross.
+ */
+
+static void plot_point (GridPtr grid, int x, int y, int cx, int cy)
+{
+    if (cx == 0 && cy == 0)
+    {
+        _swix(OS_Plot, _INR(0,2),
+              4, x - (gpw - scalex) / 2, y);
+        _swix(OS_Plot, _INR(0,2),
+              8 | 1, gpw, 0);
+        _swix(OS_Plot, _INR(0,2),
+              4, x, y - (gph - scaley) / 2);
+        _swix(OS_Plot, _INR(0,2),
+              8 | 1, 0, gph);
+    }
+    else
+        _swix(OS_Plot, _INR(0,2),
+              5 | 64, x, y);
+}
+
+
+/*
+ * Initialise the grid field of a new resource. 
+ */
+
+void grid_init (ResourcePtr res)
+{
+    GridPtr grid = &res->grid;
+    grid->intx = GRID_INT_X;
+    grid->inty = GRID_INT_Y;
+    grid->subx = GRID_SUB_X;
+    grid->suby = GRID_SUB_Y;
+    grid->colour = GRID_COLOUR;
+    grid->show = GRID_SHOW;
+    grid->lock = GRID_LOCK;
+}
+
+
+/*
+ * Draw the grid for the work-area coordinates specified.
+ */
+
+void grid_draw (ResourcePtr res, RectPtr work)
+{
+    GridPtr grid = &res->grid;
+    PointRec start, stop;
+    int circx, circy;
+
+    if (!res->grid.show)
+        return;
+
+    gpw = (GRID_POINT_WIDTH + (scalex - 1)) & ~(scalex - 1);
+    if ((gpw / scalex & 1) == 0)
+        gpw += scalex;
+    gph = (GRID_POINT_HEIGHT + (scaley - 1)) & ~(scaley - 1);
+    if ((gph / scaley & 1) == 0)
+        gph += scaley;
+dprintf("gpw %d gph %d\n" _ gpw _ gph);
+
+    start.x = (work->minx - gpw) / grid->intx * grid->intx;
+    start.y = (work->miny - gph) / grid->inty * grid->inty;
+    stop.x = work->maxx + gpw;
+    stop.y = work->maxy + gph;
+
+    if (start.x < 0)
+        circx = (grid->subx - (-(start.x / grid->intx) % grid->subx)) % grid->subx;
+    else
+        circx = (start.x / grid->intx) % grid->subx;
+
+    if (start.y < 0)
+        circy = (grid->suby - (-(start.y / grid->inty) % grid->suby)) % grid->suby;
+    else
+        circy = (start.y / grid->inty) % grid->suby;
+
+    wimp_convert_point(WorkToScreen, (WindowPtr) &res->window, &start, &start);
+    wimp_convert_point(WorkToScreen, (WindowPtr) &res->window, &stop, &stop);
+            
+    _swix(Wimp_SetColour, _IN(0),
+          grid->colour);
+
+    while (start.y < stop.y)
+    {
+        int x = start.x;
+        int circx2 = circx;
+        while (x < stop.x)
+        {
+            plot_point (&res->grid, x, start.y, circx2, circy);
+            x += grid->intx;
+            if (++circx2 == grid->subx) circx2 = 0;
+        }
+        start.y += grid->inty;
+        if (++circy == grid->suby) circy = 0;
+    }
+}
+
+
+/*
+ * Snap a single number to the nearest grid point.
+ */
+
+static int snap_int (int x, int interval)
+{
+    int a = abs(x) % interval, b = interval - a;
+    int s = x < 0 ? -1 : 1;
+    if (a < b)
+        return x - a * s;
+    else
+        return x + b * s;
+}
+
+
+/*
+ * Snap a point to the nearest grid point.  Caller is expected
+ * to first check that grid lock is on.
+ */
+
+void grid_snap_point (ResourcePtr res, PointPtr in, PointPtr out)
+{
+    out->x = snap_int (in->x, res->grid.intx);
+    out->y = snap_int (in->y, res->grid.inty);
+}
+
+
+
+/*
+ * Grid dialogue box
+ */
+
+static int grey[] =
+{
+    I_GRID_SHOW, I_GRID_LOCK,
+    I_GRID_SPACING_ADJ_DOWN, I_GRID_SPACING_ADJ_UP, I_GRID_SPACING,
+    I_GRID_CROSSES_ADJ_DOWN, I_GRID_CROSSES_ADJ_UP, I_GRID_CROSSES,
+    I_GRID_COLOUR, I_GRID_COLOUR_MENU,
+    I_GRID_OK, I_GRID_CANCEL,
+};
+
+
+/*
+ * This is a singly-instantiated dialogue.
+ * Remember whether we are open or not.
+ */
+
+static Bool open = FALSE;
+
+/*
+ * Which resource is the dbox currently displaying?  When NULL, the
+ * box is inactive and should be greyed.
+ */
+
+static ResourcePtr disp = NULL;
+static WindowPtr window;
+static int nameindex;
+
+
+
+/*
+ * Create the window, but don't open it yet.  This step is done once at the
+ * beginning of execution.
+ */
+
+error * grid_load_prototypes ()
+{
+    ER ( wimp_load_template("Grid", &window) );
+    ER ( _swix(Wimp_CreateWindow, _IN(1) | _OUT(0),
+               &window->visarea,
+               &window->handle) );
+    ER ( registry_register_window (window->handle, Grid, (void *) window) );
+
+    /* Determine index of the window name in the title string.
+     * If the message is not found, then atoi on the tag string
+     * will return zero, so the name will start at the beginning
+     * of the titlebar... harmless.
+     */
+
+    nameindex = atoi(message_lookup (&msgs, "GridInd"));
+    return NULL;
+}
+
+
+
+/*
+ * Open window (and/or bring it to the top)
+ */
+
+error * grid_show_window ()
+{
+    grid_retitle (disp);
+    window->behind = -1;
+    ER ( _swix(Wimp_OpenWindow, _IN(1),
+               window) );
+    open = TRUE;
+    return NULL;
+}
+
+
+
+static error * shade_all (Bool shaded)
+{
+    unsigned int eor = shaded ? IF_SHADED : 0;
+    int i;
+    for (i = 0; i < NUMBER(grey); i++)
+    {
+        ER ( dbox_iconflag (window, grey[i], IF_SHADED, eor) );
+    }
+    return NULL;
+}
+
+
+
+/*
+ * Get all icon settings from the resource
+ */
+
+static error * get_values (ResourcePtr res)
+{
+   /* Do the option buttons */
+
+    ER (dbox_iconflag (window, I_GRID_SHOW, IF_SELECTED,
+                       res->grid.show ? IF_SELECTED : 0) );
+    ER (dbox_iconflag (window, I_GRID_LOCK, IF_SELECTED,
+                       res->grid.lock ? IF_SELECTED : 0) );
+
+    colours_set_colour_display (window, I_GRID_COLOUR, res->grid.colour);
+
+    ER ( dbox_setint (window, I_GRID_SPACING, res->grid.intx) );
+    ER ( dbox_setint (window, I_GRID_CROSSES, res->grid.subx) );
+    return NULL;
+}
+
+
+
+/*
+ * Set all grid flags from the icon settings.  Activated by the OK
+ * button.
+ */
+
+static error * set_values (ResourcePtr res)
+{
+    res->grid.show = dbox_getbutton (window, I_GRID_SHOW);
+    res->grid.lock = dbox_getbutton (window, I_GRID_LOCK);
+
+    res->grid.intx = res->grid.inty = atoi (dbox_getstring (window, I_GRID_SPACING));
+    res->grid.subx = res->grid.suby = atoi (dbox_getstring (window, I_GRID_CROSSES));
+
+dprintf("Before: %d and %x\n" _ res->grid.colour _ (int) res->next);
+    res->grid.colour = colours_get_colour_display (window, I_GRID_COLOUR);
+dprintf("After: %d and %x\n" _ res->grid.colour _ (int) res->next);
+
+    if (res->window.handle != -1)
+    {
+        RectRec work;
+        wimp_convert_rect (ScreenToWork, &res->window, &res->window.visarea, &work);
+        wimp_invalidate (&res->window, &work);
+    }
+
+    return NULL;
+}
+
+
+    
+/*
+ * If win is NULL, then shade the whole window.
+ * If win is non-NULL, unshade and setup the window.
+ * Don't auto-open it though.
+ */
+
+error * grid_select (ResourcePtr res)
+{
+    if (res == disp)
+    {
+        return NULL;
+    }
+    else if (res && !disp)
+    {
+        dprintf("Unshading window\n");
+        ER ( shade_all (FALSE) );
+    }
+    else if (!res && disp)
+    {
+        dprintf("Shading window\n");
+        ER ( shade_all (TRUE) );
+    }
+
+    disp = res;
+    grid_retitle (res);    
+
+    if (disp)
+    {
+        ER ( get_values (disp) );
+    }
+    return NULL;
+}
+
+
+
+/*
+ * Change the titlebar of the grid window.  This is called
+ * when grid_select, and also when the user renames a resource.
+ * NB: the name field of res is expected to fit!  (and should).
+ */
+
+error * grid_retitle (ResourcePtr res)
+{
+    char *title = (char *) window->titledata[0];
+    if (res)
+        sprintf (title + nameindex, " - %s", res->name);
+    else
+        title[nameindex] = 0;
+
+    if (open)
+    {
+        WindowRedrawRec win, vis;
+        win.handle = vis.handle = window->handle;
+        ER ( _swix(Wimp_GetWindowOutline, _IN(1),
+                   &win) );
+        ER ( _swix(Wimp_GetWindowState, _IN(1),
+                   &vis) );
+dprintf("FORCE of %d %d %d %d\n" _ win.visarea.minx _ vis.visarea.maxy _ win.visarea.maxx _ win.visarea.maxy);
+        ER ( _swix(Wimp_ForceRedraw, _INR(0,4),
+                   -1, win.visarea.minx, vis.visarea.maxy, win.visarea.maxx, win.visarea.maxy) );
+    }
+    return NULL;
+}
+
+
+/*
+ * Receive mouse clicks.
+ */
+
+error * grid_mouse_click (MouseClickPtr mouse, unsigned int modifiers)
+{
+    int dir = 1, val;
+
+    dprintf("GRID MOUSE %x mod %x\n" _ mouse->buttons _ modifiers);
+    switch (mouse->buttons)
+    {
+    case MB_CLICK(MB_ADJUST):
+        dir = -1;
+        /* FALLTHRU */
+
+    case MB_CLICK(MB_SELECT):
+        switch (mouse->iconhandle)
+        {
+        case I_GRID_OK:
+            ER ( set_values (disp) );
+            if (dir == 1)
+            {
+                ER ( grid_close_window () );
+            }
+            break;
+
+        case I_GRID_CANCEL:
+            ER ( grid_close_window () );
+            break;
+
+        case I_GRID_SPACING_ADJ_DOWN:
+            dir = -dir;
+            /* FALLTHRU */
+        case I_GRID_SPACING_ADJ_UP:
+            val = atoi(dbox_getstring (window, I_GRID_SPACING)) + dir;
+            if (val < 1) val = 1;
+            if (val > 999) val = 999;
+            ER ( dbox_setint (window, I_GRID_SPACING, val) );
+            break;
+
+        case I_GRID_CROSSES_ADJ_DOWN:
+            dir = -dir;
+            /* FALLTHRU */
+        case I_GRID_CROSSES_ADJ_UP:
+            val = atoi(dbox_getstring (window, I_GRID_CROSSES)) + dir;
+            if (val < 1) val = 1;
+            if (val > 999) val = 999;
+            ER ( dbox_setint (window, I_GRID_CROSSES, val) );
+            break;
+        case I_GRID_COLOUR_MENU:
+            ER ( colours_do_colour_menu (window, I_GRID_COLOUR, &mouse->position, FALSE) );
+            break;
+        }
+        break;
+    case MB_CLICK(MB_MENU):
+        switch (mouse->iconhandle)
+        {
+        case I_GRID_COLOUR:
+        case I_GRID_COLOUR_MENU:
+            ER ( colours_do_colour_menu (window, I_GRID_COLOUR, &mouse->position, FALSE) );
+            break;
+        }
+        break;
+    }
+    return NULL;
+}
+
+
+
+/*
+ * Close window if open.  Leave the window created though.
+ */
+
+error * grid_close_window ()
+{
+    if (open)
+    {
+        ER ( _swix(Wimp_CloseWindow, _IN(1),
+                   window) );
+        ER ( grid_select (NULL) );
+        open = FALSE;
+    }
+    return NULL;
+}
+
+
+
+/* 
+ * Respond to open_window_request on the grid window.
+ * Note: the 'win' parameter is only a partial window structure
+ * (just the fields returned with Open_Window_Request).
+ */
+
+error * grid_open_window (WindowPtr win)
+{
+    window->visarea = win->visarea;
+    window->scrolloffset = win->scrolloffset;
+    window->behind = win->behind;
+    return _swix(Wimp_OpenWindow, _IN(1),
+                 window);
+}
+
+
+
+/*
+ * Check for RETURN in the window.   Return in the first
+ * field moves to the second one.  Return in that closes
+ * the window and does the OK action.  Up/down arrows
+ * move between the writeable icons.
+ */
+
+error * grid_key_pressed (KeyPressPtr key, Bool *consumed)
+{
+    *consumed = TRUE;
+    if (key->caret.windowhandle == window->handle)
+    {
+        switch (key->code)
+        {
+        case 0x0d:
+            if (disp)
+            {
+                ER ( set_values (disp) );
+            }
+            return grid_close_window ();
+        }
+    }
+    *consumed = FALSE;
+    return NULL;
+}
+
+ResourcePtr grid_current ()
+{
+    return disp;
+}
+
+
+void grid_palette ()
+{
+    colours_set_colour_display (window, I_GRID_COLOUR, -1);
+}

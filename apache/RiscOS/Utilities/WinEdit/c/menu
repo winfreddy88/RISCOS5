@@ -1,0 +1,342 @@
+/* Copyright 2003 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*-*-C-*-
+ * Menu support
+ */
+
+#include "resed.h"
+
+static MenuPtr currentmenu = NULL;
+static MenuCallback currentcallback = NULL;
+
+char * strsave (char *src)
+{
+    char *dst = malloc(strlen(src) + 1);
+    if (dst)
+        strcpy(dst, src);
+    return dst;
+}
+
+
+/*
+ * Create menu in malloced space, deallocate with free().
+ */
+
+error * menu_create (int numitems, char *title, MenuPtr *ret)
+{
+    MenuPtr menu = (MenuPtr) calloc(1, sizeof(MenuRec) + (numitems -1) * sizeof(MenuItemRec));
+    if (menu == NULL)
+        return error_lookup("NoMem");
+    strncpy(menu->title, title, sizeof(menu->title));
+    menu->titleFG = MENU_TITLEFG;
+    menu->titleBG = MENU_TITLEBG;
+    menu->workFG = MENU_WORKFG;
+    menu->workBG = MENU_WORKBG;
+    menu->itemwidth = MENU_WIDTH(strlen(title));
+    menu->itemheight = 44;
+    menu->itemspacing = 0;
+    menu->items[numitems - 1].flags = MF_LAST;
+    *ret = menu;
+    return NULL;
+}
+
+
+/*
+ * Set a menu entry to the given details.  Expands the menu's width
+ * if necessary, but never contracts it.  NB: it is the initial string's
+ * width, not the maxwidth, that is used for this.  Frees the data
+ * associated with the old entry.
+ *
+ * Note: If the caller does not specify MF_WRITEABLE, the maxlength is
+ * zero, and the text will fit in 12 chars, then the menu entry is
+ * made non-indirected.
+ */
+
+error * menu_entry (MenuPtr menu,
+                    int item,
+                    char *text,          /* NULL -> empty */
+                    int maxlength,       /* 0 -> use strlen */
+                    unsigned int flags,
+                    int fg, int bg,      /* -1 for defaults */
+                    void *sub)           /* NULL -> leaf item*/
+{
+    MenuItemPtr this = &menu->items[item];
+    char *buf = NULL;
+    int length, origlength;
+
+    if (!text)
+        text = "";
+
+    origlength = length = strlen(text);
+    if (length < maxlength) length = maxlength;
+
+    if (fg == -1) fg = MENU_WORKFG;
+    if (bg == -1) bg = MENU_WORKBG;
+
+    /* Free old text if any (but only if it was indirected) */
+    if (this->iconflags & IF_INDIR && this->data[0])
+        free((char *) this->data[0]);
+
+    if (!(flags & MF_WRITEABLE) && maxlength == 0 && length <= 12)
+    {
+        /* Make it non-indirected, possibly unterminated */
+        strncpy ((char *) this->data, text, 12);
+    }
+    else
+    {
+        buf = malloc(length + 1);
+        if (!buf)
+            return error_lookup("NoMem");
+        strcpy(buf, text);
+        this->data[0] = (unsigned int) buf;
+        this->data[1] = 0;                       /* no validation */
+        this->data[2] = length;
+    }
+    
+    {
+        int width = MENU_WIDTH(origlength);
+        if (width > menu->itemwidth) menu->itemwidth = width;
+    }
+
+    this->flags = flags | (this->flags & MF_LAST);
+    this->sub = sub ? sub : (void *) -1;
+    this->iconflags = (IF_TEXT | IF_FILLED |
+                       (buf ? IF_INDIR : 0) |
+                       IF_FIELD(FG, fg) |
+                       IF_FIELD(BG, bg) );
+    return NULL;
+}
+
+
+
+/*
+ * Set the validation string for a menu entry.  Caller is expected
+ * to store-manage this string.
+ */
+
+void menu_set_validation (MenuPtr menu, int item, char *valid)
+{
+    MenuItemPtr this = &menu->items[item];
+    this->data[1] = (int) valid;
+}
+
+
+/*
+ * Get the string associated with a menu entry
+ */
+
+char * menu_get_entry (MenuPtr menu, int item)
+{
+    MenuItemPtr this = &menu->items[item];
+    return (char *) this->data[0];
+}
+
+
+
+/*
+ * Alter menu entry's details.
+ */
+
+error * menu_alter_entry (MenuPtr menu,
+                          int item,
+                          unsigned int flagsclear,
+                          unsigned int flagseor,
+                          int fg, int bg)      /* -1 for current */
+
+{
+    MenuItemPtr this = &menu->items[item];
+
+    if (fg == -1) fg = IF_GET_FIELD(FG, this->iconflags);
+    if (bg == -1) bg = IF_GET_FIELD(BG, this->iconflags);
+
+    this->flags = (this->flags & ~flagsclear) ^ flagseor;
+    this->iconflags = (IF_TEXT | IF_FILLED |
+                       (this->iconflags & IF_INDIR) |
+                       IF_FIELD(FG, fg) |
+                       IF_FIELD(BG, bg) );
+    return NULL;
+}
+
+
+/*
+ * Interactor for the menu system.  The menu callback is called
+ * with a NULL buf parameter if the menu was deleted.
+ */
+
+static error * menu_interactor (unsigned int event, int *buf, void *closure, Bool *consumed)
+{
+    MenuPtr lastmenu = currentmenu;
+    PointerInfoRec pointer;
+    if (buf == NULL)                     /* we are being asked to cancel */
+        if (currentmenu)
+        {
+            (*currentcallback) (currentmenu, NULL, closure, FALSE);
+            currentmenu = NULL;
+            return _swix(Wimp_CreateMenu, _IN(1),
+                         -1);
+        }
+
+    switch (event)
+    {
+    case EV_MENU_SELECTION:
+        ER ( _swix(Wimp_GetPointerInfo, _IN(1),
+                   &pointer) );
+
+        /*
+         * If the menu callback returns an error, return it immediately.
+         * We will then be called again with buf == NULL to cancel.
+         */
+
+        ER ( (*currentcallback) (currentmenu, buf, closure, pointer.buttons & MB_ADJUST) );
+
+        /* The following check is needed to cater for the case when the
+         * interactor has already been cancelled by the callback (e.g. it
+         * created a menu-type dialogue box).
+         */
+
+        if (currentmenu == lastmenu)
+        {
+            if (pointer.buttons & MB_ADJUST)
+            {
+                ER ( _swix(Wimp_CreateMenu, _INR(1,3),
+                           currentmenu, 100, 100) );
+            }
+            else
+            {
+                (*currentcallback) (currentmenu, NULL, closure, FALSE);
+                currentmenu = NULL;
+                interactor_cancel();
+            }
+        }
+        *consumed = TRUE;
+        break;
+
+    case EV_USER_MESSAGE:
+    case EV_USER_MESSAGE_RECORDED:
+        block
+        {
+            MessagePtr mess = (MessagePtr) buf;
+            if (mess->code == 0x400c9 && mess->data[0] == (int)currentmenu)
+            {
+                (*currentcallback) (currentmenu, NULL, closure, FALSE);
+                currentmenu = NULL;             
+                interactor_cancel();
+                *consumed = TRUE;
+            }
+            else if (mess->code == 0x400C0)
+            {
+                MessageMenuWarningPtr warn = (MessageMenuWarningPtr) buf;
+                MenuWarningCallback warncb = (MenuWarningCallback) warn->submenu;
+dprintf("About to call %x\n" _ (int) warncb);
+                *consumed = TRUE;
+                return (*warncb) (currentmenu, warn, closure);
+            }
+            break;
+        }
+    }
+    return NULL;
+}
+
+
+/*
+ * Post a menu at a given place.  Register a callback proc to
+ * handle menu clicks.
+ */
+
+error * menu_post (MenuPtr menu,
+                   PointPtr position,
+                   Bool iconbar,         /* alter y coord for iconbar menus */
+                   MenuCallback callback,
+                   void *cls)
+{
+    /*
+     * Cancel all current interactors (which also removes any open menu)
+     */
+
+    interactor_cancel();
+
+    /*
+     * Fix menu vertical position for iconbar menus
+     */
+
+    if (iconbar)
+    {
+        MenuItemPtr item = menu->items;
+        position->y = 96;
+        for (;;)
+        {
+            position->y += 44;
+            if (item->flags & MF_DOTTED)
+                position->y += 24;
+            if (item->flags & MF_LAST)
+                break;
+            item++;
+        }
+    }
+
+    /*
+     * Record state and open the menu
+     */
+
+    currentmenu = menu;
+    currentcallback = callback;
+
+    ER ( _swix(Wimp_CreateMenu, _INR(1,3),
+               menu, position->x - 64, position->y) );
+    
+    /*
+     * Install our interactor
+     */
+
+    interactor_install (menu_interactor, cls);
+
+    return NULL;
+}
+
+
+void menu_shade (MenuPtr menu, int item, Bool shaded)
+{
+    if (shaded)
+        menu->items[item].iconflags |= IF_SHADED;
+    else
+        menu->items[item].iconflags &= ~IF_SHADED;
+}
+
+
+void menu_shade_menu (MenuPtr menu, Bool shaded)
+{
+    int c = 0;
+    do
+    {
+        menu_shade (menu, c, shaded);
+    } while (!(menu->items[c++].flags & MF_LAST));
+}
+
+
+/*
+ * Tick the given item, unticking all others.
+ */
+
+error * menu_tick_menu (MenuPtr menu, int ticked)
+{
+    int c = 0;
+    do
+    {
+        ER ( menu_alter_entry (menu, c,
+                               MF_TICKED, (c == ticked) ? MF_TICKED : 0,
+                               -1, -1) );
+    } while (!(menu->items[c++].flags & MF_LAST));
+    return NULL;
+}

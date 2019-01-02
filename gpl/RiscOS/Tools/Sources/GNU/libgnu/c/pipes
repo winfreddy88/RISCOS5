@@ -1,0 +1,212 @@
+/* pipes.c
+   popen() and pclose() - an implementation of pipes.
+   Copyright (C) 1999 Darren Salt.
+   All rights reserved.
+
+   Redistribution and use in source and binary forms, with or without
+   modification, are permitted provided that the following conditions are
+   met:
+   1. Redistributions of source code must retain the above copyright notice,
+      this list of conditions and the following disclaimer.
+   2. Redistributions in binary form must reproduce the above copyright
+      notice, this list of conditions and the following disclaimer in the
+      documentation and/or other materials provided with the distribution.
+   3. All advertising materials mentioning features or use of this software
+      must display the following acknowledgement:
+        This product includes software developed by Darren Salt.
+   4. The name of the author may not be used to endorse or promote products
+      derived from this software without specific prior written permission.
+
+   This software is provided by the author "as is" and any express or implied
+   warranties including, but not limited to, the implied warranties of
+   merchantability and fitness for a particular purpose are disclaimed. in no
+   event shall the author be liable for any direct, indirect, incidental,
+   special, exemplary, or consequential damages (including, but not limited
+   to, procurement of substitute goods or services; loss of use, data, or
+   profits; or business interruption) however caused and on any theory of
+   liability, whether in contract, strict liability, or tort (including
+   negligence or otherwise) arising in any way out of the use of this
+   software, even if advised of the possibility of such damage.
+ */
+
+/* Written by Darren Salt <ds@youmustbejoking.demon.co.uk>.  */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <kernel.h>
+#include "system.h"
+#include "ro_file.h"
+#include "error.h"
+
+extern _kernel_oserror *_swix (int, unsigned int,...);
+
+
+/* Structure used to contain info on all pipes opened for output.
+   Pipes have to be emulated on RISC OS.  */
+struct pipe_t
+  {
+    struct pipe_t *next;	/* Next in the chain.  */
+    const char *cmd;		/* To be executed when the pipe is closed.  */
+    FILE *file;			/* The pipe's FILE block.  */
+  };
+
+/* Pointer to the first open pipe in the output pipes chain.  */
+static struct pipe_t *pipelist = 0;
+
+/* Non-zero if pipe_cleanup() has been registered with atexit().  */
+static int pipe_cleanup_initialised = 0;
+
+
+/* At exit, clean up any unclosed output pipes.  Don't execute the commands.
+   We don't need to bother with input pipes, since they've been set up such
+   that fclose() will automatically delete them.  */
+static void
+pipe_cleanup (void)
+{
+  /* While there is still at least one remaining pipe...  */
+  while (pipelist)
+    {
+      struct pipe_t *pipe = pipelist;
+      if (pipe->file->__file && pipe->file->__signature)
+	{ /* if this *is* a pipe... */
+	  int rm;
+	  const char *tmp = zp_tmpread (pipe->file);
+	  rm = fclose (pipe->file);
+	  pipelist = pipe->next; /* unlink this pipe.  */
+	  free ((void *) pipe->cmd);
+	  free (pipe); /* free workspace and delete the file.  */
+	  if (rm)
+	    error (0, errno, "atexit pipe cleanup");
+	}
+    }
+}
+
+
+/* Open an emulated pipe.
+   Execute the command immediately if the pipe is to be opened for input.  */
+FILE *
+popen (const char *command, const char *modes)
+{
+  char tmp[32] = "";
+  FILE *f;
+
+  if (!strcmp (modes, "r"))
+    {
+      /* Want to open a pipe for input.  */
+      int ret;
+      char *cmd;
+      if ((cmd = malloc (strlen (command) + 40)) == 0)
+	return 0;
+      zp_tmpnam (tmp);
+      sprintf (cmd, "call:%s > %s", command, tmp);
+      ret = system (cmd);
+      free (cmd);
+      if (ret < 0 || ret > 1)
+	{
+	  remove (tmp);
+	  errno = EOSERR;
+	  return 0;
+	}
+      f = fopen (tmp, "rb");
+      if (f)
+	{
+	  /* Do some magic to cause the file to be deleted on closing.  */
+	  f->__flag |= 0xAD800001;
+	  f->__signature = (int) strtol (tmp + 17, 0, 16);
+	}
+      else
+	errno = ENOENT;
+      return f;
+    }
+
+  if (!strcmp (modes, "w"))
+    {
+      /* Want to open a pipe for output.  */
+      char *cmd;
+      struct pipe_t *pipe;
+      /* The command is executed when the pipe is closed;
+	 we need to store it. */
+      if ((cmd = malloc (strlen (command) + 40)) == 0)
+	return 0;
+      /* We also need a pipe_t in which to store the command
+	 and the FILE block.  */
+      if ((pipe = malloc (sizeof (struct pipe_t))) == 0)
+	{
+	  free (cmd);
+	  return 0;
+	}
+      /* Temporary filename needed... */
+      zp_tmpnam (tmp);
+      /* Build the command line (assume that it's a C program). */
+      sprintf (cmd, "call:%s < %s", command, tmp);
+      /* Open the "pipe". */
+      f = fopen (tmp, "wb");
+      if (!f)
+	{
+	  /* Open failed - return, freeing allocated blocks.  */
+	  free (cmd);
+	  free (pipe);
+	  return 0;
+	}
+      /* Store the pointers and link this pipe into the list.  */
+      pipe->next = pipelist;
+      pipe->cmd = cmd;
+      pipe->file = f;
+      pipelist = pipe;
+      /* Ensure that cleanup will occur on exit(). */
+      if (!pipe_cleanup_initialised)
+	{
+	  pipe_cleanup_initialised = 1;
+	  atexit (pipe_cleanup);
+	}
+      return f;
+    }
+
+/* Mode wasn't "r" or "w". */
+  fprintf (stderr, "popen(): bad mode\n");
+  exit (1);
+  return 0;
+}
+
+
+/* Close an emulated pipe.
+   Execute the command immediately if the pipe was opened for output. */
+int
+pclose (FILE * f)
+{
+  struct pipe_t *pipe = pipelist, *prev = 0;
+
+  /* Find the pipe's entry in the pipes list. */
+  while (pipe && pipe->file != f)
+    {
+      prev = pipe;
+      pipe = pipe->next;
+    }
+  if (pipe)
+    {
+      /* Pipe was opened for output... */
+      int r, rm;
+      const char *cmd = pipe->cmd;
+      const char *tmp = zp_tmpread (f);	/* Pipe filename. */
+      rm = fclose (f);
+      /* Unlink this pipe.  */
+      if (prev)
+	prev->next = pipe->next;
+      else
+	pipelist = pipe->next;
+      free (pipe);
+      /* Return early, attempting to delete the file,
+	 if the fclose() failed.  */
+      if (rm)
+	return rm | remove (tmp);
+      /* Execute the command. */
+      r = system (cmd);
+      free ((void *) cmd);
+      /* Delete the file.  */
+      rm = remove (tmp);
+      return r ? r : rm;
+    }
+  /* Pipe was opened for input; just close it.
+     It'll be deleted automatically. */
+  return fclose (f);
+}

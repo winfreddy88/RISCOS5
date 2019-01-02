@@ -1,0 +1,1009 @@
+/** @file
+
+  Implements ... under RISC OS.
+
+  */
+/* Created 25.04.2011 T. Milius
+   Changed 24.07.2011 T. Milius Wait for closing of file before deactivation
+   Changed 08.08.2011 T. Milius Wait for closing of file before deactivation
+   Changed 11.12.2012 T. Milius Reentrance protection of initiate_usb_fetch
+   Changed 12.12.2012 T. Milius Reinsert of accidentally received Bytes into Buffer */
+/* Copyright (c) 2011-2012 by Thomas Milius Stade, Germany
+* All rights reserved.
+*
+* Redistribution and use in source and binary forms, with or without
+* modification, are permitted provided that the following conditions are met:
+*     * Redistributions of source code must retain the above copyright
+*       notice, this list of conditions and the following disclaimer.
+*     * Redistributions in binary form must reproduce the above copyright
+*       notice, this list of conditions and the following disclaimer in the
+*       documentation and/or other materials provided with the distribution.
+*     * Neither the name of Thomas Milius Stade, Germany nor the
+*       names of its contributors may be used to endorse or promote products
+*       derived from this software without specific prior written permission.
+*
+* THIS SOFTWARE IS PROVIDED BY Thomas Milius Stade, Germany ``AS IS'' AND ANY
+* EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+* WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+* DISCLAIMED. IN NO EVENT SHALL Thomas Milius Stade, Germany BE LIABLE FOR ANY
+* DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+* (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+* LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+* ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+* (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+* SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE. */
+/** @mainpage
+    @author Thomas Milius Stade, Germany
+    @version 0.11
+    @date 12.12.2012
+
+ Implements ... under RISC OS.
+
+    */
+/* RISC OS */
+
+/* !!!!!!!!!! libraries !!!!!!!!!! */
+/* ---------- ANSI-C ---------- */
+#include <stdbool.h>
+#include <ctype.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+
+/* ------------ RISC OS ------------ */
+#include "kernel.h"
+#include "swis.h"
+
+/* ------------ Own ------------ */
+#include "usbsdvemuhead.h"
+#ifdef DEBUG
+#include "debug.h"
+#endif
+
+/* !!!!!!!!!!! definitions !!!!!!!!!! */
+#define NO_HANDLE 0
+
+#define NO_BUFFER_HANDLE -1
+
+#define NO_USB_STREAM_HANDLE 0
+
+#define NO_EMULATION -1
+
+#define USB_BUFFER_SIZE 16384
+
+/* !!!!!!!!!! data structures !!!!!!!!!! */
+struct risc_os_buffer_info_structure {
+int id;
+void *routine;
+void *ws;
+};
+
+struct common_structure {
+void *ws;
+/* Only temporary. Located here to save RMA Stack and
+   to avoid often allocation/deallcation. */
+char temp[129];
+char temp_b[129];
+char temp_c[129];
+char usb_device_name[20];
+char device_emu_start[129];
+int device_emu_start_length;
+char device_emu_start_s[129];
+int device_emu_start_s_length;
+int serial_if;
+int scsifs_if;
+int usb_number_to_emulate;
+struct risc_os_buffer_info_structure risc_os_buffer_info;
+int input_file_handle;
+int input_buffer_handle;
+int input_usb_stream_handle;
+int output_file_handle;
+int output_usb_stream_handle;
+int self_access;
+int usb_initiation_lock;
+bool deactivation_requested;
+/* required for pseudo OS_GBPB operations but not really. */
+char dummy_buffer[USB_BUFFER_SIZE];
+} common;
+
+/* !!!!!!!!!! support functions !!!!!!!!!! */
+_kernel_oserror *perform_risc_os_buffer_operation(_kernel_swi_regs *regs,
+                                                  struct risc_os_buffer_info_structure *risc_os_buffer_info)
+{
+
+/* ARM ADS */
+__asm
+  {
+  MOV R0,regs->r[0]
+  MOV R1,risc_os_buffer_info->id
+  MOV R2,regs->r[2]
+  MOV R3,regs->r[3]
+  MOV R12, risc_os_buffer_info->ws
+  /* Format: registers input output corrupted
+     BLX is only useable from ARMv5 onwards */
+  BLX risc_os_buffer_info->routine, {R0-R3,R12}, {R2,R3}, {LR,PSR}
+  MOV regs->r[2],R2
+  MOV regs->r[3],R3
+  }
+return NULL;
+}
+
+_kernel_oserror *initiate_usb_fetch (void)
+{
+_kernel_swi_regs regs;
+_kernel_oserror *error_os;
+int dummy_buffer_size;
+
+#ifdef DEBUG
+debug_writef(DEBUG_LEVEL_INITIALIZATION,
+             "Trying an USB fetch\n");
+#endif
+if (common.usb_initiation_lock > 0) return NULL;
+common.usb_initiation_lock++;
+if (common.input_file_handle == NO_HANDLE) {
+  common.usb_initiation_lock--;
+  return NULL;
+  }
+regs.r[0]=(int) 0x80000006;
+regs.r[1]=(int) common.usb_device_name;
+regs.r[2]=common.input_usb_stream_handle;
+/* We have to check that an input request is running at USB side. */
+if ((error_os=_kernel_swi(DeviceFS_CallDevice, &regs, &regs)) != NULL) {
+  common.usb_initiation_lock--;
+  return error_os;
+  }
+#ifdef DEBUG
+debug_writef(DEBUG_LEVEL_INITIALIZATION,
+             "Status fetch %d %d\n",
+             regs.r[1],
+             regs.r[3]);
+#endif
+if (regs.r[3] != 0) {
+  regs.r[0]=4;
+  regs.r[1]=common.input_file_handle;
+  regs.r[2]=(int) &common.dummy_buffer;
+  dummy_buffer_size=USB_BUFFER_SIZE;
+  regs.r[3]=dummy_buffer_size;
+  common.self_access++;
+  /* Restart dummy transfer */
+  if ((error_os=_kernel_swi(OS_GBPB, &regs, &regs)) != NULL) {
+    common.self_access--;
+    common.usb_initiation_lock--;
+    return error_os;
+    }
+  common.self_access--;
+  dummy_buffer_size-=regs.r[3];
+  if (dummy_buffer_size != 0) {
+    /* Shit. We received something.
+       We have to reinsert this into the buffer. */
+    regs.r[0]=1;
+    regs.r[2]=(int) &common.dummy_buffer;
+    regs.r[3]=dummy_buffer_size;
+    if ((error_os=perform_risc_os_buffer_operation(&regs,
+                                                   &common.risc_os_buffer_info)) != NULL) {
+#ifdef DEBUG
+      debug_writef(DEBUG_LEVEL_INITIALIZATION,
+                   "Bytes not reinserted %d!!!!!!\n",
+                   dummy_buffer_size);
+#endif
+      common.usb_initiation_lock--;
+      return error_os;
+      }
+    else {
+#ifdef DEBUG
+      debug_writef(DEBUG_LEVEL_INITIALIZATION,
+                   "Bytes reinserted %d\n",
+                   dummy_buffer_size);
+#endif
+      }
+    }
+#ifdef DEBUG
+  debug_writef(DEBUG_LEVEL_INITIALIZATION,
+               "Kicked\n");
+#endif
+  }
+common.usb_initiation_lock--;
+return NULL;
+}
+
+void disable_emulation(void)
+{
+
+common.usb_number_to_emulate=NO_EMULATION;
+common.input_file_handle=NO_HANDLE;
+common.input_buffer_handle=NO_BUFFER_HANDLE;
+common.input_usb_stream_handle=NO_USB_STREAM_HANDLE;
+common.output_file_handle=NO_HANDLE;
+common.output_usb_stream_handle=NO_USB_STREAM_HANDLE;
+common.self_access=0;
+common.usb_initiation_lock=0;
+common.deactivation_requested=false;
+}
+
+/* !!!!!!!!!! functions !!!!!!!!!! */
+int find_handler(_kernel_swi_regs *regs,
+                 void *pw)
+{
+char *dev_name_offset;
+char *name_source;
+int usb_number;
+int i;
+int ioctl_block[5];
+_kernel_swi_regs regs_b;
+_kernel_oserror *error_os;
+
+if (common.usb_number_to_emulate == NO_EMULATION) return 1;
+if (regs->r[0] == 0) {
+  if ((regs->r[1] == 0) ||
+      (regs->r[1] == common.input_file_handle)) {
+    common.input_file_handle=NO_HANDLE;
+    common.input_buffer_handle=NO_BUFFER_HANDLE;
+    common.input_usb_stream_handle=NO_USB_STREAM_HANDLE;
+    }
+  if ((regs->r[1] == 0) ||
+      (regs->r[1] == common.output_file_handle)) {
+    common.output_file_handle=NO_HANDLE;
+    common.output_usb_stream_handle=NO_USB_STREAM_HANDLE;
+    }
+  if ((common.input_file_handle == NO_HANDLE) &&
+      (common.output_file_handle == NO_HANDLE) &&
+      (common.deactivation_requested)) {
+    disable_emulation();
+    }
+  return 1;
+  }
+else if (regs->r[0] >= 64) {
+  /* in case of self access pass request to the OS. */
+  if (common.self_access > 0) return 1;
+  if (((regs->r[0] & 0x00000003) == 0) ||
+      ((regs->r[0] & 0x00000003) == 3)) {
+    if (common.self_access > 0) {
+      /* Perform real operation */
+      return 1;
+      }
+    i=128;
+    dev_name_offset=common.temp;
+    name_source=(char *) regs->r[1];
+    /* Spaces are terminators */
+    while((*name_source > 32) &&
+          (i>0)) {
+      *dev_name_offset=tolower(*name_source);
+      dev_name_offset++;
+      name_source++;
+      i--;
+      }
+    *dev_name_offset='\0';
+    }
+  else {
+    /* Not one of our emulation cases.
+       Continue with regular OS. */
+    return 1;
+    }
+  /* Patch IF */
+  if ((common.scsifs_if != -1) &&
+      (strncmp(common.temp,
+               common.device_emu_start_s,
+               common.device_emu_start_s_length) == 0)) {
+    common.self_access++;
+    sprintf(common.temp,
+            "Devices#alternate0;interface%d;bulk;size32768:$.USB%d",
+            common.scsifs_if,
+            common.usb_number_to_emulate);
+    regs_b.r[0]=regs->r[0];
+    regs_b.r[1]=(int) common.temp;
+    regs_b.r[2]=NULL;
+    if ((error_os=_kernel_swi(OS_Find, &regs_b, &regs_b)) != NULL) {
+      regs->r[0]=0;
+      common.self_access--;
+      return 0;
+      }
+    common.self_access--;
+    regs->r[0]=regs_b.r[0];
+#ifdef DEBUG
+    debug_writef(DEBUG_LEVEL_INITIALIZATION,
+                 "changed.\n");
+#endif
+    return 0;
+    }
+  /* If handles to emulate have been already set, then there is no need
+     to check whether another request will claim one of them. We can leave
+     to error generation to the OS in case that it is our device. */
+  if ((((regs->r[0] & 0x000000F0) == 0x00000040) &&
+        (common.input_file_handle != NO_HANDLE)) ||
+      (((regs->r[0] & 0x000000F0) == 0x000000C0) &&
+        (common.output_file_handle != NO_HANDLE))) return 1;
+  /* Must be DeviceFS and certain interface. */
+  if (strncmp(common.temp,
+              common.device_emu_start,
+              common.device_emu_start_length) != 0) return 1;
+  /* determine USB number. */
+  if ((dev_name_offset=strrchr(common.temp, '.')) == NULL) return 1;
+  dev_name_offset-=2;
+  if (strncmp(dev_name_offset, ":$.usb", 6) != 0) return 1;
+  if (!isdigit(dev_name_offset[6])) return 1;
+  usb_number=atoi(dev_name_offset + 6);
+  /* Not our device. */
+  if (usb_number != common.usb_number_to_emulate) return 1;
+  /* Determine new stream name. */
+  sprintf(common.usb_device_name,
+          "USB%d",
+          usb_number);
+  if ((regs->r[0] & 0x000000F0) == 0x00000040) {
+    regs_b.r[0]=0x0000004F;
+    sprintf(common.temp,
+            /* nopad not working here */
+            "Devices#interface%d;alternate0;bulk;size%d:$.USB%d",
+            common.serial_if,
+            USB_BUFFER_SIZE + 1,
+            usb_number);
+    }
+  else if ((regs->r[0] & 0x000000F0) == 0x000000C0) {
+    regs_b.r[0]=0x000000CF;
+    sprintf(common.temp,
+            /* short not working here */
+            "Devices#interface%d;alternate0;bulk;size%d:$.USB%d",
+            common.serial_if,
+            USB_BUFFER_SIZE + 1,
+            usb_number);
+    }
+  /* Open the device stream. */
+  common.self_access++;
+  regs_b.r[1]=(int) common.temp;
+  regs_b.r[2]=NULL;
+  if ((error_os=_kernel_swi(OS_Find, &regs_b, &regs_b)) != NULL) {
+    regs->r[0]=0;
+    common.self_access--;
+    return 0;
+    }
+  common.self_access--;
+  /* Note stream handle, pass it to caller and prepare. */
+  if ((regs->r[0] & 0x000000F0) == 0x00000040) {
+    regs->r[0]=regs_b.r[0];
+    common.input_file_handle=regs_b.r[0];
+    /* Ensure NoBlock at reading. */
+    ioctl_block[0]=(int) 0x80FF0001;
+    ioctl_block[1]=(int) 0x00000001;
+    regs_b.r[0]=9;
+    regs_b.r[1]=common.input_file_handle;
+    regs_b.r[2]=(int) ioctl_block;
+    if ((error_os=_kernel_swi(OS_Args, &regs_b, &regs_b)) != NULL) {
+      /* Ensure no special activities in case of error */
+      common.input_file_handle=NO_HANDLE;
+      common.input_buffer_handle=NO_BUFFER_HANDLE;
+      common.input_usb_stream_handle=NO_USB_STREAM_HANDLE;
+      return 0;
+      }
+    regs_b.r[0]=(int) 0x80000007;
+    regs_b.r[1]=(int) common.usb_device_name;
+    regs_b.r[2]=common.input_file_handle;
+    if ((error_os=_kernel_swi(DeviceFS_CallDevice, &regs_b, &regs_b)) != NULL) {
+      /* Ensure no special activities in case of error */
+#ifdef DEBUG
+      debug_writef(DEBUG_LEVEL_INITIALIZATION,
+                   "Shit4\n");
+#endif
+      common.input_file_handle=NO_HANDLE;
+      common.input_buffer_handle=NO_BUFFER_HANDLE;
+      common.input_usb_stream_handle=NO_USB_STREAM_HANDLE;
+      return 0;
+      }
+    common.input_buffer_handle=regs_b.r[3];
+    common.input_usb_stream_handle=regs_b.r[5];
+    /* Ensure stream flags. */
+    regs_b.r[0]=(int) 0x80000008;
+    regs_b.r[1]=(int) common.usb_device_name;
+    regs_b.r[2]=common.input_usb_stream_handle;
+    /* Nopad */
+    regs_b.r[3]=(int) 0x00000001;
+    regs_b.r[4]=(int) 0xFFFFFFFE;
+    if ((error_os=_kernel_swi(DeviceFS_CallDevice, &regs_b, &regs_b)) != NULL) {
+      /* Ensure no special activities in case of error */
+#ifdef DEBUG
+      debug_writef(DEBUG_LEVEL_INITIALIZATION,
+                   "Shit6\n");
+#endif
+      common.input_file_handle=NO_HANDLE;
+      common.input_buffer_handle=NO_BUFFER_HANDLE;
+      common.input_usb_stream_handle=NO_USB_STREAM_HANDLE;
+      return 0;
+      }
+    /* Setup the buffer flags */
+    regs_b.r[0]=common.input_buffer_handle;
+    /* Events and Upcalls. */
+    regs_b.r[1]=(int) 0x0000000E;
+    regs_b.r[2]=(int) 0xFFFFFFF1;
+    if ((error_os=_kernel_swi(Buffer_ModifyFlags, &regs_b, &regs_b)) != NULL) {
+      /* Ensure no special activities in case of error */
+#ifdef DEBUG
+      debug_writef(DEBUG_LEVEL_INITIALIZATION,
+                   "Shit3\n");
+#endif
+      common.input_file_handle=NO_HANDLE;
+      common.input_buffer_handle=NO_BUFFER_HANDLE;
+      common.input_usb_stream_handle=NO_USB_STREAM_HANDLE;
+      return 0;
+      }
+    regs_b.r[0]=common.input_buffer_handle;
+    if ((error_os=_kernel_swi(Buffer_InternalInfo, &regs_b, &regs_b)) != NULL) {
+#ifdef DEBUG
+      debug_writef(DEBUG_LEVEL_INITIALIZATION,
+                   "Shit2\n");
+#endif
+      return 0;
+      }
+    common.risc_os_buffer_info.id=regs_b.r[0];
+    common.risc_os_buffer_info.routine=(void *) regs_b.r[1];
+    common.risc_os_buffer_info.ws=(void *) regs_b.r[2];
+    /* Ensure threshold.
+       Upcall shall be raised if buffer became entirely empty
+       which implies that the whole buffer size is available. */
+    regs_b.r[0]=common.input_buffer_handle;
+    regs_b.r[1]=USB_BUFFER_SIZE;
+    if ((error_os=_kernel_swi(Buffer_Threshold, &regs_b, &regs_b)) != NULL) {
+#ifdef DEBUG
+      debug_writef(DEBUG_LEVEL_INITIALIZATION,
+                   "Shit\n");
+#endif
+      }
+    }
+  else if ((regs->r[0] & 0x000000F0) == 0x000000C0) {
+    regs->r[0]=regs_b.r[0];
+    common.output_file_handle=regs_b.r[0];
+    regs_b.r[0]=(int) 0x80000007;
+    regs_b.r[1]=(int) common.usb_device_name;
+    regs_b.r[2]=common.output_file_handle;
+    if ((error_os=_kernel_swi(DeviceFS_CallDevice, &regs_b, &regs_b)) != NULL) {
+      /* Ensure no special activities in case of error */
+#ifdef DEBUG
+      debug_writef(DEBUG_LEVEL_INITIALIZATION,
+                   "Shit4\n");
+#endif
+      common.output_file_handle=NO_HANDLE;
+      common.output_usb_stream_handle=NO_USB_STREAM_HANDLE;
+      return 0;
+      }
+    common.output_usb_stream_handle=regs_b.r[5];
+    /* Ensure stream flags. */
+    regs_b.r[0]=(int) 0x80000008;
+    regs_b.r[1]=(int) common.usb_device_name;
+    regs_b.r[2]=common.output_usb_stream_handle;
+    /* short */
+    regs_b.r[3]=(int) 0x00000002;
+    regs_b.r[4]=(int) 0xFFFFFFFD;
+    if((error_os=_kernel_swi(DeviceFS_CallDevice, &regs_b, &regs_b)) != NULL) {
+      /* Ensure no special activities in case of error */
+#ifdef DEBUG
+      debug_writef(DEBUG_LEVEL_INITIALIZATION,
+                   "Shit5\n");
+#endif
+      common.output_file_handle=NO_HANDLE;
+      common.output_usb_stream_handle=NO_USB_STREAM_HANDLE;
+      return 0;
+      }
+    }
+#ifdef DEBUG
+    debug_writef(DEBUG_LEVEL_INITIALIZATION,
+                 "claimed.\n");
+#endif
+  return 0;
+  }
+return 1;
+}
+
+int args_handler(_kernel_swi_regs *regs,
+                 void *pw)
+{
+int *ioctl_block;
+_kernel_oserror *error_os;
+
+if (common.usb_number_to_emulate == NO_EMULATION) return 1;
+switch(regs->r[0]) {
+  case 2: {
+    if ((regs->r[1] != NO_HANDLE) &&
+        (regs->r[1] == common.input_file_handle)) {
+      if (common.self_access > 0) {
+        /* Perform real operation */
+        return 1;
+        }
+      common.self_access++;
+      /* Fetch required information. */
+      /* Use the original registers. */
+      if ((error_os=_kernel_swi(OS_Args, regs, regs)) != NULL) {
+        common.self_access--;
+        return 0;
+        }
+      common.self_access--;
+#ifdef DEBUG
+      debug_writef(DEBUG_LEVEL_INITIALIZATION,
+                   "Extend %d\n",
+                   regs->r[2]);
+#endif
+      if (regs->r[2] == 0) {
+        initiate_usb_fetch();
+        }
+      /* No further activities required. */
+      return 0;
+      }
+    }
+  break;
+  case 9: {
+    if ((regs->r[1] != NO_HANDLE) &&
+        ((regs->r[1] == common.input_file_handle) ||
+         (regs->r[1] == common.output_file_handle))) {
+      ioctl_block=(int *) regs->r[2];
+      if ((ioctl_block[0] & 0x00FF0000) == 0x00000000) {
+        /* Serielles Interface emulieren */
+        /* Schreiben ignorieren wir vollkommen */
+        if ((ioctl_block[0] & 0x40000000) == 0x40000000) {
+          /* Lesen */
+          switch(ioctl_block[0] & 0x000FFFF) {
+            case 1: {
+              /* Die unbekannte Rate */
+              ioctl_block[1]=192000;
+              }
+            break;
+            case 2: {
+              /* 8 Bit */
+              ioctl_block[1]=8;
+              }
+            break;
+            case 3: {
+              /* Kein Stoppbit */
+              ioctl_block[1]=0;
+              }
+            break;
+            case 4: {
+              /* Bezieht sich auf Devicepuffer. Den gibt es bei USB nicht. */
+              ioctl_block[1]=0;
+              }
+            break;
+            case 5: {
+              /* Bezieht sich auf Devicepuffer. Den gibt es bei USB nicht. */
+              ioctl_block[1]=0;
+              }
+            break;
+            case 6: {
+              /* Wenn schon Signalauswertung, dann ewige Sende/Empfangsbereitschaft.
+                 0  - ctr
+                 1  - rts
+                 16 - cts
+                 17 - dsr
+                 18 - ri
+                 19 - dcd
+                 20 - Fifos present */
+              ioctl_block[1]=0x00010003;
+              }
+            break;
+            case 7: {
+              ioctl_block[1]=1;
+              }
+            break;
+            case 8: {
+              /* Das ist bei direktem USB nicht relevant */
+              ioctl_block[1]=0;
+              }
+            break;
+            case 9: {
+              /* Die unbekannte Rate */
+              ioctl_block[1]=192000;
+              }
+            break;
+            }
+          }
+        /* Keine weiteren Aktivitäten erforderlich */
+        return 0;
+        }
+      }
+    }
+  break;
+  }
+return 1;
+}
+
+int upcall_handler(_kernel_swi_regs *regs,
+                   void *pw)
+{
+#ifdef DEBUG
+_kernel_swi_regs regs_b;
+_kernel_oserror *error_os;
+#endif
+
+switch(regs->r[0]) {
+#ifdef DEBUG
+  case 8: {
+    if ((regs->r[2] == 0) &&
+        (regs->r[1] != NO_HANDLE) &&
+        (regs->r[1] == common.input_buffer_handle)) {
+      debug_writef(DEBUG_LEVEL_INITIALIZATION,
+                   "Buffer filled\n");
+      regs_b.r[0]=(int) 0x80000006;
+      regs_b.r[1]=(int) common.usb_device_name;
+      regs_b.r[2]=common.input_usb_stream_handle;
+      /* We have to check whether an input request is running at USB side. */
+      if ((error_os=_kernel_swi(DeviceFS_CallDevice, &regs_b, &regs_b)) != NULL) {
+        return 1;
+        }
+      debug_writef(DEBUG_LEVEL_INITIALIZATION,
+                   "Status filled %d %d\n",
+                   regs_b.r[1],
+                   regs_b.r[3]);
+      if (regs_b.r[3] == -1) {
+        debug_writef(DEBUG_LEVEL_INITIALIZATION,
+                     "ohoh\n");
+//        initiate_usb_fetch();
+        }
+      else {
+        regs_b.r[0]=6;
+        if ((error_os=perform_risc_os_buffer_operation(&regs_b,
+                                                       &common.risc_os_buffer_info)) != NULL) {
+          return 1;
+          }
+        debug_writef(DEBUG_LEVEL_INITIALIZATION,
+                     "Data received %d\n",
+                     regs_b.r[2]);
+        }
+      }
+    }
+  break;
+#endif
+  case 9: {
+    if ((regs->r[2] == -1) &&
+        (regs->r[1] != NO_HANDLE) &&
+        (regs->r[1] == common.input_buffer_handle)) {
+#ifdef DEBUG
+      debug_writef(DEBUG_LEVEL_INITIALIZATION,
+                   "Buffer empty\n");
+#endif
+      initiate_usb_fetch();
+      }
+    }
+  break;
+  }
+return 1;
+}
+
+int gbpb_handler(_kernel_swi_regs *regs,
+                 void *pw)
+{
+_kernel_swi_regs regs_b;
+_kernel_oserror *error_os;
+int buffer_size;
+
+switch(regs->r[0]) {
+  case 3:
+  case 4: {
+    if (regs->r[1] == common.input_file_handle) {
+      if (common.self_access > 0) {
+        /* Perform real operation */
+        return 1;
+        }
+#ifdef DEBUG
+      debug_writef(DEBUG_LEVEL_INITIALIZATION,
+                   "GBPB read. mem %x len %d\n",
+                   regs->r[2],
+                   regs->r[3]);
+#endif
+      /* Adapt access to USB */
+      regs_b.r[0]=6;
+      if ((error_os=perform_risc_os_buffer_operation(&regs_b,
+                                                     &common.risc_os_buffer_info)) != NULL) {
+        return 1;
+        }
+      buffer_size=regs_b.r[2];
+#ifdef DEBUG
+      debug_writef(DEBUG_LEVEL_INITIALIZATION,
+                   "Buffer GBPB size %d\n",
+                   buffer_size);
+#endif
+      if (buffer_size == 0) {
+        /* ignore */
+        /* Possible RISC OS 5.19 Bug. Empty Upcall sometines not handled correctly. Initiate New Transfer. */
+        initiate_usb_fetch();
+        return 0;
+        }
+      regs_b.r[0]=3;
+      regs_b.r[2]=regs->r[2];
+      if (buffer_size > regs->r[3]) {
+        regs_b.r[3]=regs->r[3];
+        }
+      else {
+        regs_b.r[3]=buffer_size;
+        }
+      if ((error_os=perform_risc_os_buffer_operation(&regs_b,
+                                                     &common.risc_os_buffer_info)) != NULL) {
+#ifdef DEBUG
+        debug_writef(DEBUG_LEVEL_INITIALIZATION,
+                     "oh shit\n");
+#endif
+        return 0;
+        }
+      regs->r[2]=regs_b.r[2];
+      if (buffer_size > regs->r[3]) {
+         regs->r[3]=regs_b.r[3];
+        }
+      else {
+        regs->r[3]=regs_b.r[3] + (regs->r[3] - buffer_size);
+        }
+      return 0;
+      }
+    }
+  break;
+  }
+return 1;
+}
+
+int bget_handler(_kernel_swi_regs *regs,
+                 void *pw)
+{
+_kernel_swi_regs regs_b;
+_kernel_oserror *error_os;
+
+if (regs->r[1] == common.input_file_handle) {
+  /* Adapt access to USB */
+  regs_b.r[0]=2;
+  if ((error_os=perform_risc_os_buffer_operation(&regs_b,
+                                                 &common.risc_os_buffer_info)) != NULL) {
+    }
+  regs->r[0]=regs_b.r[2];
+  /* Perhaps transfer initiation missing */
+  }
+return 1;
+}
+
+_kernel_oserror *module_init(const char *cmd_tail,
+                             int podule_base,
+                             void *pw)
+{
+_kernel_swi_regs regs;
+_kernel_oserror *error_os;
+
+#ifdef DEBUG
+debug_initialize();
+#endif
+common.ws=pw;
+disable_emulation();
+/* Examine Finds */
+regs.r[0]=0x0000000D;
+regs.r[1]=(int) find_handler_entry;
+regs.r[2]=(int) common.ws;
+if ((error_os=_kernel_swi(OS_Claim, &regs, &regs)) != NULL) {
+#ifdef DEBUG
+  debug_finalize();
+#endif
+  return error_os;
+  }
+/* Examine Args */
+regs.r[0]=0x00000009;
+regs.r[1]=(int) args_handler_entry;
+regs.r[2]=(int) common.ws;
+if ((error_os=_kernel_swi(OS_Claim, &regs, &regs)) != NULL) {
+  /* No longer examine Finds */
+  regs.r[0]=0x0000000D;
+  regs.r[1]=(int) find_handler_entry;
+  regs.r[2]=(int) common.ws;
+  /* Don't worry about errors */
+  _kernel_swi(OS_Release, &regs, &regs);
+#ifdef DEBUG
+  debug_finalize();
+#endif
+  return error_os;
+  }
+/* Examine Upcalls */
+regs.r[0]=0x0000001D;
+regs.r[1]=(int) upcall_handler_entry;
+regs.r[2]=(int) common.ws;
+if ((error_os=_kernel_swi(OS_Claim, &regs, &regs)) != NULL) {
+  /* No longer examine Args */
+  regs.r[0]=0x00000009;
+  regs.r[1]=(int) args_handler_entry;
+  regs.r[2]=(int) common.ws;
+  /* Don't worry about errors */
+  _kernel_swi(OS_Release, &regs, &regs);
+  /* No longer examine Finds */
+  regs.r[0]=0x0000000D;
+  regs.r[1]=(int) find_handler_entry;
+  regs.r[2]=(int) common.ws;
+  /* Don't worry about errors */
+  _kernel_swi(OS_Release, &regs, &regs);
+#ifdef DEBUG
+  debug_finalize();
+#endif
+  return error_os;
+  }
+/* Examine GBPB */
+regs.r[0]=0x0000000C;
+regs.r[1]=(int) gbpb_handler_entry;
+regs.r[2]=(int) common.ws;
+if ((error_os=_kernel_swi(OS_Claim, &regs, &regs)) != NULL) {
+  /* No longer examine Upcalls */
+  regs.r[0]=0x0000001D;
+  regs.r[1]=(int) upcall_handler_entry;
+  regs.r[2]=(int) common.ws;
+  /* Don't worry about errors */
+  _kernel_swi(OS_Release, &regs, &regs);
+  /* No longer examine Args */
+  regs.r[0]=0x00000009;
+  regs.r[1]=(int) args_handler_entry;
+  regs.r[2]=(int) common.ws;
+  /* Don't worry about errors */
+  _kernel_swi(OS_Release, &regs, &regs);
+  /* No longer examine Finds */
+  regs.r[0]=0x0000000D;
+  regs.r[1]=(int) find_handler_entry;
+  regs.r[2]=(int) common.ws;
+  /* Don't worry about errors */
+  _kernel_swi(OS_Release, &regs, &regs);
+#ifdef DEBUG
+  debug_finalize();
+#endif
+  return error_os;
+  }
+/* Examine BGET */
+regs.r[0]=0x0000000A;
+regs.r[1]=(int) gbpb_handler_entry;
+regs.r[2]=(int) common.ws;
+if ((error_os=_kernel_swi(OS_Claim, &regs, &regs)) != NULL) {
+  /* No longer examine GBPB */
+  regs.r[0]=0x0000000C;
+  regs.r[1]=(int) gbpb_handler_entry;
+  regs.r[2]=(int) common.ws;
+  /* No longer examine Upcalls */
+  regs.r[0]=0x0000001D;
+  regs.r[1]=(int) upcall_handler_entry;
+  regs.r[2]=(int) common.ws;
+  /* Don't worry about errors */
+  _kernel_swi(OS_Release, &regs, &regs);
+  /* No longer examine Args */
+  regs.r[0]=0x00000009;
+  regs.r[1]=(int) args_handler_entry;
+  regs.r[2]=(int) common.ws;
+  /* Don't worry about errors */
+  _kernel_swi(OS_Release, &regs, &regs);
+  /* No longer examine Finds */
+  regs.r[0]=0x0000000D;
+  regs.r[1]=(int) find_handler_entry;
+  regs.r[2]=(int) common.ws;
+  /* Don't worry about errors */
+  _kernel_swi(OS_Release, &regs, &regs);
+#ifdef DEBUG
+  debug_finalize();
+#endif
+  return error_os;
+  }
+return NULL;
+}
+
+_kernel_oserror *module_final(int fatal,
+                              int podule,
+                              void *pw)
+{
+_kernel_swi_regs regs;
+
+/* No longer examine BGET */
+regs.r[0]=0x0000000A;
+regs.r[1]=(int) bget_handler_entry;
+regs.r[2]=(int) common.ws;
+/* No longer examine GBPB */
+regs.r[0]=0x0000000C;
+regs.r[1]=(int) gbpb_handler_entry;
+regs.r[2]=(int) common.ws;
+/* Don't worry about errors */
+_kernel_swi(OS_Release, &regs, &regs);
+/* No longer examine Upcalls */
+regs.r[0]=0x0000001D;
+regs.r[1]=(int) upcall_handler_entry;
+regs.r[2]=(int) common.ws;
+/* Don't worry about errors */
+_kernel_swi(OS_Release, &regs, &regs);
+/* No longer examine Args */
+regs.r[0]=0x00000009;
+regs.r[1]=(int) args_handler_entry;
+regs.r[2]=(int) common.ws;
+/* Don't worry about errors */
+_kernel_swi(OS_Release, &regs, &regs);
+/* No longer examine Finds */
+regs.r[0]=0x0000000D;
+regs.r[1]=(int) find_handler_entry;
+regs.r[2]=(int) common.ws;
+/* Don't worry about errors */
+_kernel_swi(OS_Release, &regs, &regs);
+#ifdef DEBUG
+debug_finalize();
+#endif
+return NULL;
+}
+
+_kernel_oserror *usbsdvemu_cmd(const char *arg_string,
+                               int argc,
+                               int cmd_no,
+                               void *pw)
+{
+
+switch(cmd_no) {
+#ifdef DEBUG
+  case CMD_USBSDvEmu_DebugPrint: {
+    debug_print();
+    }
+  break;
+#endif
+  case CMD_USBSDvEmu_Activate: {
+    char *c, *temp_pointer;
+    char **params;
+    int i;
+    _kernel_swi_regs regs;
+    _kernel_oserror *error_os;
+
+    temp_pointer=(char *) arg_string;
+    i=128;
+    c=common.temp_b;
+    while((*temp_pointer >= 32) &&
+          (i > 0)) {
+      *c=*temp_pointer;
+      c++;
+      temp_pointer++;
+      i--;
+      }
+    *c='\0';
+    regs.r[0]=(int) "usb_dev/A/G,interface/A/G,scsi/G";
+    regs.r[1]=(int) common.temp_b;
+    regs.r[2]=(int) common.temp_c;
+    regs.r[3]=128;
+    if ((error_os=_kernel_swi(OS_ReadArgs, &regs, &regs)) != NULL) {
+      return error_os;
+      }
+    params=(char **) common.temp_c;
+    if ((params[0] == NULL) ||
+        (params[1] == NULL)) {
+      return NULL;
+      }
+    if ((common.input_file_handle != NO_HANDLE) &&
+        (common.output_file_handle != NO_HANDLE)) {
+      /* ??? Error message */
+      return NULL;
+      }
+    /* USB device number */
+    temp_pointer=params[0];
+    strncpy(common.temp_b, temp_pointer + 2, temp_pointer[1]*256 + temp_pointer[0]);
+    common.temp_b[temp_pointer[1]*256 + temp_pointer[0]]='\0';
+    common.usb_number_to_emulate=atoi(common.temp_b);
+    temp_pointer=params[1];
+    strncpy(common.temp_b, temp_pointer + 2, temp_pointer[1]*256 + temp_pointer[0]);
+    common.temp_b[temp_pointer[1]*256 + temp_pointer[0]]='\0';
+    sprintf(common.device_emu_start,
+            "devices#interface%s;",
+            common.temp_b);
+    common.device_emu_start_length=strlen(common.device_emu_start);
+    common.serial_if=atoi(common.temp_b);
+    temp_pointer=params[2];
+    if (temp_pointer != NULL) {
+      strncpy(common.temp_b, temp_pointer + 2, temp_pointer[1]*256 + temp_pointer[0]);
+      common.temp_b[temp_pointer[1]*256 + temp_pointer[0]]='\0';
+      common.scsifs_if=atoi(common.temp_b);
+      sprintf(common.device_emu_start_s,
+              "usb%d#alternate%s;",
+              common.usb_number_to_emulate,
+              common.temp_b);
+      common.device_emu_start_s_length=strlen(common.device_emu_start_s);
+      }
+    else {
+      common.scsifs_if=-1;
+      common.device_emu_start_s[0]='\0';
+      common.device_emu_start_s_length=0;
+      }
+    }
+  break;
+  case CMD_USBSDvEmu_Deactivate: {
+    if (common.usb_number_to_emulate != NO_EMULATION) {
+      if ((common.input_file_handle == NO_HANDLE) &&
+          (common.output_file_handle == NO_HANDLE)) {
+        disable_emulation();
+        }
+      else {
+        common.deactivation_requested=true;
+        }
+      }
+    }
+  break;
+  }
+return NULL;
+}

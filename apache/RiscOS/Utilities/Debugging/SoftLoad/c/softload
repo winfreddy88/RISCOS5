@@ -1,0 +1,1563 @@
+/* Copyright 2000 Pace Micro Technology plc
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/* softload.c - soft load a RISC OS ROM */
+
+/*
+   MJS 08-Sep-96 Derived from SoftLoad9 BASIC code, but:
+                 - updated for RISC OS 3.7 and StrongARM
+   MJS 23-Sep-97 Rewritten to be more flexible, and to be simpler by assuming
+                 most of memory in Free Pool rather than AppSpace (via a
+                 proper AppSize command in boot sequence)
+   AML 18-Dec-08 Modified for loading RISC OS Open ROM images on Tungsten
+*/
+
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <assert.h>
+
+#include "kernel.h"
+#include "swis.h"
+
+#include "Global/OSEntries.h"
+#include "Global/OSRSI6.h"
+
+#include "VersionNum"
+
+/* deactivate the ADFS module as a safety measure */
+//#define PLAY_SAFE
+
+#define DefaultROMPath  "<Boot$Dir>.SoftLoad."
+
+/* ------------------------------------------------------------------------ */
+
+#define ROMcheckoffset   (-12)       /* offset in ROM for checksum word */
+
+#define DA_RMA          1            /* dynamic area number */
+#define DA_FreePool     6            /* dynamic area number */
+
+#define Log2PageSize    12
+#define PageSize        (1<<Log2PageSize)
+
+/* min machine memory to attempt softload (not including ROM size) */
+#define AbsMinMemSize   (0x200000)
+
+#define ErrorReturnCode 257
+
+#define ROMaddr_unknown 0xffffffff
+
+/* ------------------------------------------------------------------------ */
+
+typedef enum
+{
+  Plat_Unknown,
+  Plat_RiscPC,
+  Plat_A7000,
+  Plat_ARM7500FE,
+  Plat_Phoebe,
+  Plat_HAL,
+  Plat_VirtualRPC,
+  Plat_A9Home,
+
+  Plat_MAX,
+} PlatformClass;
+
+static const char *plattypes[] = {"Unknown","RiscPC","A7000","ARM7500FE","Phoebe","HAL","VirtualRPC","A9Home"};
+
+typedef enum
+{
+  ROMType_Unknown,
+  ROMType_Hard,
+  ROMType_Soft,
+} ROMType;
+
+static const char *romtypes[] = {"Unknown","Hard","Soft"};
+
+typedef struct
+{
+  uint32_t logaddr;
+  uint32_t flags;
+} CAMentry_t;
+
+typedef struct
+{
+  uint32_t addr;
+  uint32_t size;
+} physmemtable_t;
+
+typedef struct
+{
+  int      page;      /* first page number */
+  uint32_t physaddr;  /* start physical address */
+  int      DAN;       /* dynamic area number */
+  uint32_t DAbase;    /* start logical address */
+} softROM_t;
+
+typedef struct
+{
+  uint32_t PhysRamTable;
+  uint32_t CAMbase;
+  uint32_t PageFlags_Unavailable;
+  uint32_t ARMA_Cleaner_flipflop;
+  uint32_t L1PT;
+} kernelvals_t;
+
+typedef struct
+{
+  int      pagenum;
+  uint32_t logaddr;
+  uint32_t physaddr;
+} osmemory0_t;
+
+typedef struct
+{
+  uint32_t logaddr; /* ROMaddr_unknown if unknown */
+  uint32_t physaddr; /* ROMaddr_unknown if unknown */
+  bool size_valid; /* False if size is just an estimate. Means checksums & header offsets may also be invalid. */
+  uint32_t c_size; /* == 0 if unknown */
+  uint32_t u_size; /* == c_size if not compressed */
+  uint32_t c_neg_checksum; /* negative checksum (compressed) */
+  uint32_t u_neg_checksum; /* negative checksum (uncompressed) */
+  uint32_t oshdr_offset; /* ~0 if invalid */
+} ROMinfo_t;
+
+typedef struct
+{
+  PlatformClass platform;
+  ROMType rom_type;
+  ROMinfo_t rom; /* Information about current ROM */
+  ROMinfo_t hardrom; /* Information about hard ROM */
+  bool traditional_memmap; /* True if physical RAM is flat mapped to 0x80000000 */
+} sysinfo_t;
+
+/* ------------------------------------------------------------------------ */
+
+extern void   startnew(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
+extern uint32_t svcpeek(uint32_t);
+extern uint32_t svcarmid(void);
+extern void   svcmemcpy(void *,void *,uint32_t);
+extern void   DAhandler(void);
+extern void asm_decompress(OSHdr *hdr,void *ws);
+
+/* ------------------------------------------------------------------------ */
+
+extern uint32_t log2phys(uint32_t,size_t *);
+
+/* ------------------------------------------------------------------------ */
+
+static uint32_t     ROMlogaddr;
+static uint32_t     mod_chain_ofst;
+static bool         verbose;
+static size_t       min_memsize, Npages;
+static int          ROMversion;
+static softROM_t    softROM; /* Dynamic area we create for holding a soft ROM */
+static kernelvals_t kernelvals;
+static sysinfo_t    sysinfo;
+static bool         decompress = true;
+static bool         dummyrun = false;
+static ROMinfo_t    fileROM; /* Info about last examined ROM file */
+static void        *rma_block = NULL;
+static uint32_t     rma_size;
+
+/* ------------------------------------------------------------------------ */
+
+static void error_noslot(const char *code)
+{
+  fprintf(stderr,"-- softload failed; %s\n",code);
+  exit(ErrorReturnCode);
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void *rma_alloc(size_t size,const char *err)
+{
+  /* Allocate a chunk of memory from the RMA. This is a workaround for the fact
+     that SharedCLibrary can't extend the heap if the wimp isn't active
+     (or more accurately, if there aren't any tasks active) */
+  /* Note that for garbage collection purposes we require that we only have one
+     block of memory active at once! */
+  assert(!rma_block);
+  if(_swix(OS_Module,_IN(0)|_IN(3)|_OUT(2),6,size,&rma_block))
+  {
+    rma_block = NULL;
+    error_noslot(err);
+  }
+  return rma_block;
+}
+
+static void rma_free(void *ptr)
+{
+  /* Free the block, assume pointer is correct */
+  _swix(OS_Module,_IN(0)|_IN(2),7,ptr);
+  rma_block = NULL;
+}
+
+static void rma_shrink(void)
+{
+  /* Attempt to shrink the RMA back to the size it originally was
+     We could attempt to shrink it as far as possible, but this approach
+     should be safer */
+  uint32_t cursize;
+  if(!_swix(OS_DynamicArea,_INR(0,1)|_OUT(2),2,DA_RMA,&cursize))
+  {
+    if(cursize > rma_size)
+    {
+      _swix(OS_ChangeDynamicArea,_INR(0,1),DA_RMA,rma_size-cursize);
+    }
+  }
+}
+
+static void rma_atexit(void)
+{
+  if(rma_block)
+    rma_free(rma_block);
+  rma_shrink();
+}
+
+/* ------------------------------------------------------------------------ */
+
+static bool physmemcpy(void *dest,uint32_t src,uint32_t len)
+{
+  /* dest is logaddr, src is physaddr */
+  if(sysinfo.traditional_memmap)
+  {
+    svcmemcpy(dest,(void *) (0x80000000+src),len);
+    return true;
+  }
+  /* Try OS_Memory 14 */
+  uint32_t meg;
+  uint32_t refkey;
+  if(!_swix(OS_Memory,_INR(0,1)|_OUTR(2,3),14,src&~0xfffff,&meg,&refkey))
+  {
+    while(len)
+    {
+      uint32_t offset = src&0xfffff;
+      uint32_t copy = ((len+offset>0x100000)?0x100000-offset:len);
+      svcmemcpy(dest,(void *) (meg+offset),copy);
+      dest = (void *) (((uint32_t) dest)+copy);
+      src += copy;
+      len -= copy;
+      if(len)
+      {
+        if(_swix(OS_Memory,_INR(0,1)|_OUT(2),14,src&~0xfffff,&meg))
+          break;
+      }
+    }
+    _swix(OS_Memory,_INR(0,1),15,refkey);
+    return (len==0);
+  }
+  /* TODO - Try some other memory access method */
+  return false;
+}
+
+/* ------------------------------------------------------------------------ */
+
+static bool rom_log_memcpy(void *buf,uint32_t offset,uint32_t len,uint32_t param)
+{
+  svcmemcpy(buf,((char *)param)+offset,len);
+  return true;
+}
+
+/* ------------------------------------------------------------------------ */
+
+static bool rom_phy_memcpy(void *buf,uint32_t offset,uint32_t len,uint32_t param)
+{
+  return physmemcpy(buf,param+offset,len);
+}
+
+/* ------------------------------------------------------------------------ */
+
+static bool rom_file_memcpy(void *buf,uint32_t offset,uint32_t len,uint32_t param)
+{
+  FILE *f = (FILE *) param;
+  return !fseek(f,offset,SEEK_SET) && (fread(buf,len,1,f) == 1);
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void guess_rom_size(ROMinfo_t *rom,bool (*readfunc)(void *,uint32_t,uint32_t,uint32_t),uint32_t param)
+{
+  /* Guess ROM size by calculating negative checksum */
+  /* rom->c_size must be set */
+  int bufsize = 65536;
+  uint32_t *buf = rma_alloc(bufsize,"Out of memory");
+  uint32_t sum = 0;
+  uint32_t offset=0;
+  uint32_t rom_size = rom->c_size & ~3;
+  uint32_t last_valid_length = 0;
+  while(offset < rom_size)
+  {
+    uint32_t bufamt = bufsize;
+    if(bufamt > rom_size-offset)
+      bufamt = rom_size-offset;
+    if(!readfunc(buf,offset,bufamt,param))
+    {
+      break;
+    }
+    for(uint32_t i=0;i<bufamt;i+=4)
+    {
+      sum += buf[i>>2];
+      if(!sum && (offset+i+12 <= rom_size))
+      {
+        last_valid_length = offset+i+12;
+      }
+    }
+    offset += bufamt;
+  }
+  rma_free(buf);
+  if(last_valid_length)
+  {
+    /* Go with the largest valid length found */
+    rom->c_size = last_valid_length;
+    rom->size_valid = true;
+  }
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void examine_rom(ROMinfo_t *rom,bool (*readfunc)(void *,uint32_t,uint32_t,uint32_t),uint32_t param)
+{
+  /* rom->c_size must be set */
+  bool ext_footer_valid = false;
+  uint32_t ext_footer_len,crc;
+
+  int bufsize = 65536+4+20; /* Large enough for ROM footer + extended footer */
+  if(bufsize > rom->c_size)
+    bufsize = rom->c_size;
+  char *buf = rma_alloc(bufsize,"Out of memory");
+  if(!readfunc(buf,rom->c_size-bufsize,bufsize,param))
+  {
+    rma_free(buf);
+    goto fail;
+  }
+  memcpy(&rom->c_neg_checksum,buf+bufsize+ROMcheckoffset,4);
+  /* Parse the extended footer, looking for tag ID 1 (ROOL compressed ROM softload info) */
+  ext_footer_len = buf[bufsize-24] | (buf[bufsize-23]<<8);
+  crc = buf[bufsize-22] | (buf[bufsize-21]<<8);
+  if(ext_footer_len && (ext_footer_len <= 65534) && (ext_footer_len+24 <= bufsize))
+  {
+    char *ext_footer = buf+bufsize-24-ext_footer_len;
+    uint32_t crc2;
+    _swi(OS_CRC,_INR(0,3)|_OUT(0),0,ext_footer,ext_footer+ext_footer_len,1,&crc2);
+    if(crc == crc2)
+    {
+      char *tag1 = NULL;
+      uint32_t next_len = 1;
+      for(int i=0;i<ext_footer_len;i++)
+      {
+        if(i == next_len)
+        {
+          /* Is this tag 1? */
+          if((ext_footer[i-1] == 1) && (ext_footer[i] >= 8))
+          {
+            tag1 = ext_footer+i+1;
+          }
+          /* Make sure the data in the footer doesn't overrun the footer itself */
+          next_len = i+ext_footer[i]+2;
+        }
+      }
+      if(tag1 && (next_len == ext_footer_len+1))
+      {
+        memcpy(&rom->u_neg_checksum,tag1,4);
+        memcpy(&rom->oshdr_offset,tag1+4,4);
+        /* Examine OS header to determine uncompressed image size
+           We could do more checks to make sure the header is valid, but for now
+           we'll just assume it is */
+        if(readfunc(buf,rom->oshdr_offset,sizeof(OSHdr),param))
+        {
+          OSHdr *h = (OSHdr *) buf;
+          rom->u_size = rom->oshdr_offset+h->ImageSize;
+          ext_footer_valid = true;
+        }
+      }
+    }
+  }
+  rma_free(buf);
+
+  if(!ext_footer_valid)
+  {
+fail:
+    /* Assume uncompressed image */
+    /* TODO - Could probe for OS headers at likely locations and deduce size from that (useful for when rom->c_size is just a guess) */
+    rom->u_size = rom->c_size;
+    rom->u_neg_checksum = rom->c_neg_checksum;
+    rom->oshdr_offset = ~0;
+  }
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void find_kernelvals(int ROMversion, kernelvals_t *k)
+{
+  /* Note: These aren't in the same order as kernelvals_t */
+  static int inblock[6] = {
+    OSRSI6_CamEntriesPointer,
+    OSRSI6_PageFlags_Unavailable,
+    OSRSI6_PhysRamTable,
+    OSRSI6_ARMA_Cleaner_flipflop,
+    OSRSI6_L1PT,
+    -1
+  };
+
+  static kernelvals_t k_360 = { 0x170, 0x1e02000, 0x2000, 0,     0x2c0c000 };
+  static kernelvals_t k_370 = { 0x180, 0x1e02000, 0x2000, 0x178, 0x2c0c000 };
+
+  uint32_t         outblock[5];
+  _kernel_oserror *e;
+
+  *k = k_360;
+  if (ROMversion >= 370) *k = k_370;
+  if (ROMversion >= 380)
+  {
+    e = _swix(OS_ReadSysInfo,_INR(0,2),6,inblock,outblock);
+    if (e) error_noslot("failed to read kernel variables");
+    k->CAMbase = *((uint32_t *)outblock[0]);
+    k->PageFlags_Unavailable = outblock[1];
+    k->PhysRamTable = outblock[2];
+    k->ARMA_Cleaner_flipflop = outblock[3];
+    k->L1PT = outblock[4];
+  }
+
+}
+
+/* ------------------------------------------------------------------------ */
+
+uint32_t log2phys(uint32_t logaddr,size_t *size)
+{
+  /* Requires find_kernelvals to have been called
+     Returns -1 if unmapped/unknown */
+  uint32_t      mmu1, mmu2;
+  osmemory0_t mblock;
+
+  *size = 0;
+
+  mmu1 = svcpeek(kernelvals.L1PT + ((logaddr >> 20) << 2));
+  switch(mmu1 & 3)
+  {
+    case 0:
+      /* Unmapped */
+      return ~0;
+    case 1:
+      /* page/large page, check L2PT */
+      mblock.physaddr = mmu1 & 0xfffff000;
+      if(_swix(OS_Memory,_INR(0,2),0x1400,&mblock,1)) /* phys -> log transform */
+      {
+        return ~0;
+      }
+      mmu2 = svcpeek(mblock.logaddr+(((logaddr >> 12) << 2) & 0xfff));
+      switch(mmu2 & 3)
+      {
+        case 0:
+          /* Unmapped */
+          return ~0;
+        case 1:
+          /* Large page */
+          *size = 1<<16;
+          return (mmu2 & 0xffff0000) | (logaddr & 0xffff);
+        default:
+          /* Page */
+          *size = 1<<12;
+          return (mmu2 & 0xfffff000) | (logaddr & 0xfff);
+      }
+    case 2:
+      /* section/supersection mapped (assume just section mapping) */
+      *size = 1<<20;
+      return (mmu1 & 0xfff00000) | (logaddr & 0xfffff);
+    default:
+      /* fine page, or reserved - not supported */
+      return ~0;
+  }
+}  
+
+/* ------------------------------------------------------------------------ */
+
+static void read_sys_info(uint32_t ROMpa,uint32_t ROMlogaddr,sysinfo_t *s)
+{
+  int plat,flags,mask;
+  int physinfo_size,physinfo_pagesize;
+  bool is_iomd = false;
+  memset(s,0,sizeof(sysinfo_t));
+  s->platform = Plat_Unknown;
+  s->rom_type = ROMType_Unknown;
+  s->hardrom.logaddr = ROMaddr_unknown;
+  s->hardrom.physaddr = ROMaddr_unknown;
+  s->hardrom.oshdr_offset = ~0;
+  s->rom.logaddr = ROMlogaddr;
+  s->rom.physaddr = ROMpa;
+  s->rom.oshdr_offset = ~0;
+  s->traditional_memmap = false;
+
+  if(_swix(OS_ReadSysInfo,_IN(0)|_OUTR(0,2),8,&plat,&flags,&mask))
+  {
+    /* Assume it's something with a traditional memory map */
+    s->traditional_memmap = true;
+  }
+  else
+  {
+    if((plat < 0) || (plat >= Plat_MAX))
+      error_noslot("Unrecognised platform class");
+    s->platform = (PlatformClass) plat;
+    if((s->platform == Plat_RiscPC) || (s->platform == Plat_A7000) || (s->platform == Plat_ARM7500FE) || (s->platform == Plat_VirtualRPC))
+    {
+      /* Should have a traditional memory map */
+      s->traditional_memmap = true;
+    }
+    if(mask & (1<<4))
+      s->rom_type = ((flags & (1<<4))?ROMType_Soft:ROMType_Hard);
+  }
+
+  /* Get a copy of the physical memory table and use that to determine hard ROM
+     location and (approximate) size */
+  if(!_swix(OS_Memory,_IN(0)|_OUTR(1,2),6,&physinfo_size,&physinfo_pagesize))
+  {
+    if(physinfo_size && physinfo_pagesize)
+    {
+      char *physinfo = rma_alloc(physinfo_size,"Out of memory");
+      if(!_swix(OS_Memory,_INR(0,1),7,physinfo))
+      {
+#define MEMTYPE_ROM 3
+        uint32_t pa = ROMaddr_unknown;
+        bool valid_map = true; /* False if we find two sets of ROM */
+        uint32_t length = 0;
+        for(int i=0;i<physinfo_size;i++)
+        {
+          if((physinfo[i] & 0x7) == MEMTYPE_ROM)
+          {
+            if(pa == ROMaddr_unknown)
+              pa = i*physinfo_pagesize*2;
+            else if((physinfo[i-1] & 0x70) != MEMTYPE_ROM<<4)
+            {
+              valid_map = false;
+              break;
+            }
+            length+=physinfo_pagesize;
+          }
+          if((physinfo[i] & 0x70) == MEMTYPE_ROM<<4)
+          {
+            if(pa == ROMaddr_unknown)
+              pa = i*physinfo_pagesize*2+1;
+            else if((physinfo[i] & 0x7) != MEMTYPE_ROM)
+            {
+              valid_map = false;
+              break;
+            }
+            length+=physinfo_pagesize;
+          }
+        }
+        if(valid_map && (pa != ROMaddr_unknown))
+        {
+          /* Note that this is just a guess of the size, since we don't know
+             if the OS returns the physical ROM size or not
+             e.g. on Tungsten it'll always be 4MB, but on IOMD it'll (always?)
+             be OSROM_ImageSize */
+          s->hardrom.physaddr = pa;
+          s->hardrom.c_size = length;
+        }
+      }
+      rma_free(physinfo);
+    }
+  }
+
+  /* If this looks like a typical IOMD system, the hard ROM should be at 0x0 */
+  if((s->hardrom.physaddr == ROMaddr_unknown) && !_swix(OS_ReadSysInfo,_IN(0)|_OUT(0),2,&flags))
+  {
+    if(flags == 0x01010100)
+    {
+      is_iomd = true;
+      s->hardrom.physaddr = 0;
+    }
+  }
+
+
+  /* Try and determine soft ROM size */
+
+
+  uint32_t i,j;
+
+  /* Try the RISC OS 5 way
+     This will only work if we've been softloaded */
+  if(!_swix(OS_Memory,_IN(0)|_OUTR(1,2),0x508,&i,&j))
+  {
+    if(i && j)
+    {
+      s->rom.size_valid = true;
+      s->rom.c_size = s->rom.u_size = i*j;
+    }
+  }
+
+  /* Try the ROL way */
+  if(!s->rom.size_valid && !_swix(OS_ReadSysInfo,_IN(0)|_OUT(1),10,&i))
+  {
+    /* ROL kernel 9.06+ has the OS ROM as DA 11 */
+    if((i >= 906) && !_swix(OS_DynamicArea,_INR(0,1)|_OUTR(2,3),2,11,&i,&j))
+    {
+      if(i == ROMlogaddr)
+      {
+        s->rom.size_valid = true;
+        s->rom.c_size = s->rom.u_size = j;
+      }
+    }
+  }
+  
+  /* Try the old fashioned way
+     This seems to return OSROM_ImageSize, so it's probably safe to assume that
+     it will always return the size of the current ROM, not the size of the
+     hard ROM (Or at least that's how RISC OS 3 will behave)
+     If on newer OS versions this call starts returning the size of the hard
+     ROM, then hopefully we'll have already determined the soft ROM size via
+     some other means, so this code shouldn't be reached.
+     Note that this currently returns 0 on RISC OS 5! */
+  if(!s->rom.size_valid && !_swix(OS_Memory,_IN(0)|_OUTR(1,2),0x308,&i,&j))
+  {
+    if(i && j)
+    {
+      s->rom.size_valid = true;
+      s->rom.c_size = s->rom.u_size = i*j;
+    }
+  }
+
+
+  /* Now examine all the data we've collected to try and fill in any gaps
+     in our knowledge */
+
+
+  /* If ROM type is unknown but hard ROM physaddr is known, we can work out the ROM type */
+  if((s->rom_type == ROMType_Unknown) && (s->hardrom.physaddr != ROMaddr_unknown))
+  {
+    s->rom_type = ((ROMpa == s->hardrom.physaddr)?ROMType_Hard:ROMType_Soft);
+  }
+
+  /* With a traditional memory map, we can deduce the hard ROM log addr */
+  if(s->traditional_memmap && (s->hardrom.physaddr != ROMaddr_unknown))
+    s->hardrom.logaddr = s->hardrom.physaddr + 0x80000000;
+
+  /* If this is a hard ROM we can cross-reference the data with s->rom */
+  if(s->rom_type == ROMType_Hard)
+  {
+    if(s->hardrom.physaddr == ROMaddr_unknown)
+    {
+      s->hardrom.physaddr = s->rom.physaddr;
+
+      /* Prefer this calculation of logaddr over copying from s->rom.logaddr
+         (allows us to avoid ROM patches when examining via logaddr) */
+      if(s->traditional_memmap)
+        s->hardrom.logaddr = s->hardrom.physaddr + 0x80000000;
+    }
+
+    if(s->hardrom.logaddr == ROMaddr_unknown)
+      s->hardrom.logaddr = s->rom.logaddr;
+
+    if(s->rom.size_valid)
+    {
+      /* Determine hard ROM size from current ROM size */
+      s->hardrom.size_valid = true;
+      s->hardrom.c_size = s->hardrom.u_size = s->rom.c_size;
+    }
+    else if(s->hardrom.c_size)
+    {
+      /* Determine current ROM size from hard ROM size */
+      /* Also means that hard ROM size estimate is valid */
+      s->hardrom.size_valid = s->rom.size_valid = true;
+      s->hardrom.u_size = s->rom.c_size = s->rom.u_size = s->hardrom.c_size;
+    }
+  }
+
+  /* Enforce the requirement that we must know the size of the current ROM
+     otherwise, we can't easily check if the ROM we're activating matches the
+     current one */
+  if(!s->rom.size_valid)
+  {
+    error_noslot("Unable to determine current ROM size");
+  }
+
+  /* Examine soft ROM to get remaining details */
+  examine_rom(&s->rom,rom_log_memcpy,ROMlogaddr);
+
+  /* Now get hard ROM details */
+  if(s->rom_type == ROMType_Hard)
+  {
+    /* Should be same details as soft ROM */
+    s->hardrom.c_neg_checksum = s->rom.c_neg_checksum;
+    s->hardrom.u_neg_checksum = s->rom.u_neg_checksum;
+    s->hardrom.oshdr_offset = s->rom.oshdr_offset;
+  }
+  else
+  {
+    if(!s->hardrom.size_valid && s->hardrom.c_size)
+    {
+      if(s->hardrom.logaddr != ROMaddr_unknown)
+        guess_rom_size(&s->hardrom,rom_log_memcpy,s->hardrom.logaddr);
+      else if(s->hardrom.physaddr != ROMaddr_unknown)
+        guess_rom_size(&s->hardrom,rom_phy_memcpy,s->hardrom.physaddr);
+    }      
+    if(s->hardrom.size_valid)
+    {
+      if(s->hardrom.logaddr != ROMaddr_unknown)
+        examine_rom(&s->hardrom,rom_log_memcpy,s->hardrom.logaddr);
+      else if(s->hardrom.physaddr != ROMaddr_unknown)
+        examine_rom(&s->hardrom,rom_phy_memcpy,s->hardrom.physaddr);
+      else
+      {
+        /* This shouldn't be possible */
+        error_noslot("Know hard ROM size but don't know address");
+      }
+    }
+  }
+}
+
+/* ------------------------------------------------------------------------ */
+
+static int read_arg_options(int argc, char *argv[],
+                            bool *verbose, size_t *min_memsize)
+{
+  /* set any options, return index of first filename arg, don't bother
+     much with syntax checking */
+
+  int  a;
+
+
+  /* defaults */
+  *verbose     = false;
+  *min_memsize = 0;
+
+  for (a=1; (a<argc) && (argv[a][0]=='-'); a++)
+  {
+    /* -v[erbose] means verbose */
+    if (strncmp(argv[a],"-verbose",strlen(argv[a])) == 0) *verbose = true;
+
+    /* -m[inmemory] <size>[K|M] sets min mem size to attempt softload,
+       and disable error if minimum not reached */
+    if (strncmp(argv[a],"-minmemory",strlen(argv[a])) == 0)
+    {
+      if (a < argc-1)
+      {
+        a++;
+        *min_memsize = atoi(argv[a]);
+        if ((strchr(argv[a],'k') != NULL) || (strchr(argv[a],'K') != NULL))
+          *min_memsize = *min_memsize << 10;
+        if ((strchr(argv[a],'m') != NULL) || (strchr(argv[a],'M') != NULL))
+          *min_memsize = *min_memsize << 20;
+      }
+    }
+
+    /* -n[odecompress] disables decompression */
+    if (strncmp(argv[a],"-nodecompress",strlen(argv[a])) == 0) decompress = false;
+
+    /* -d[ummyrun] will exit just before the softload happens */
+    if (strncmp(argv[a],"-dummyrun",strlen(argv[a])) == 0) dummyrun = true;
+  }
+
+  return a;
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void read_ROMfname(int arg, char *argv[], char ROMfname[])
+{
+  /* prefix default pathname if arg string appears to be a simple leaf name */
+
+  ROMfname[0] = '\0';
+  if ((strchr(argv[arg],'.') == NULL) &&
+      (strchr(argv[arg],':') == NULL) &&
+      (strchr(argv[arg],'<') == NULL)    ) strcpy(ROMfname,DefaultROMPath);
+  strcat(ROMfname,argv[arg]);
+}
+
+/* ------------------------------------------------------------------------ */
+
+static int arewefine(char loadtype, uint32_t currentROMPhysAddr,
+                     char newROMfname[])
+{
+  (void)currentROMPhysAddr;
+  /* see if current ROM state is what we want, checking ROM checksum words
+     and current ROM physical address as necessary
+      - loadtype must be one of 'u','f','r'
+      - return value: 0=not fine, 1=fine, -1=ROM file not found or bad */
+
+  int     fine = -1;
+  FILE    *fp;
+
+  switch(loadtype)
+  {
+    case 'u': /* fine if current ROM is hard ROM */
+      fine = (sysinfo.rom_type == ROMType_Hard);
+      break;
+    case 'f': /* fine if soft loaded and checksum matches file */
+      fp = fopen(newROMfname,"rb");
+      if (fp == NULL)
+        fine = -1;
+      else
+      {
+        fseek(fp,0,SEEK_END);
+        memset(&fileROM,0,sizeof(fileROM));
+        fileROM.size_valid = true;
+        fileROM.c_size = (uint32_t) ftell(fp);
+        if(fileROM.c_size < 65536) /* Basic sanity check on file size */
+          fine = -1;
+        else
+        {
+          examine_rom(&fileROM,rom_file_memcpy,(uint32_t)fp);
+          fine = ((sysinfo.rom_type == ROMType_Soft) && (sysinfo.rom.u_neg_checksum == fileROM.u_neg_checksum));
+        }
+        fclose(fp);
+      }
+      break;
+    case 'r': /* fine if soft loaded, and checksum matches hard ROM */
+      if(sysinfo.rom_type == ROMType_Soft)
+      {
+        if(!sysinfo.hardrom.size_valid)
+          error_noslot("Don't know enough about hard ROM for '.rom.' option");
+        fine = (sysinfo.rom.u_neg_checksum == sysinfo.hardrom.u_neg_checksum);
+      }
+      else
+        fine = 0;
+      break;
+  }
+
+  return fine;
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void find_ROMversion(void)
+{
+  _kernel_oserror *e;
+  float           v;
+
+  e = _swix(OS_Byte,_INR(0,1),0,0);
+  sscanf(e->errmess,"RISC OS %f",&v);
+  ROMversion = (int)(v*100.0F + 0.5F);
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void find_contiguous_chunk(int Npages, int pages_needed,
+                                  int *chunk_page, uint32_t *chunk_physaddr)
+{
+  int            chunk, max_chunk, min_chunk, pagenum, pages, p, foundpage;
+  uint32_t       foundphysaddr;
+  int            vram_pages;
+  const physmemtable_t *physmem;
+  const CAMentry_t *CAM;
+
+  /* kernel's table of physical RAM chunks */
+  physmem = (const physmemtable_t *)kernelvals.PhysRamTable;
+
+  /* kernel's soft CAM */
+  CAM = (const CAMentry_t *)kernelvals.CAMbase;
+
+  /* find end of physical memory chunk list */
+  if (verbose)
+    printf("physmem @ %8.8x\nchunk addr chunk size\n",(unsigned int)physmem);
+  chunk = 0;
+  while(physmem[chunk].size)
+  {
+    if (verbose)
+      printf("  %8.8x   %8.8x\n",physmem[chunk].addr,physmem[chunk].size);
+    chunk++;
+  }
+  max_chunk = chunk - 1;
+
+  int cam_format;
+  if (!_swix(OS_ReadSysInfo, _INR(0,2)|_OUT(2), 6, 0, OSRSI6_CAMFormat, &cam_format) && cam_format)
+  {
+    /* New format CAM (RISC OS 5.23-ish). Rather than walk the CAM manually
+       looking for free pages, use OS_Memory 12, which mostly does what we want,
+       and has been around since RISC OS 4.00-ish.
+
+       Caveats:
+       * Current OS_Memory 12 implementation always skips the first chunk,
+         regardless of whether it's real or fake VRAM. So we may need to revisit
+         this code if it causes us to fail on machines with no VRAM and little
+         RAM.
+       * In versions of the OS prior to the new CAM format being introduced,
+         OS_Memory 0 page number -> physical address translation was flawed and
+         would fail for pages which aren't mapped in
+    */
+    if (_swix(OS_Memory, _INR(0,2)|_OUT(3), 12, pages_needed<<12, 20, &foundpage))
+    {
+      foundpage = foundphysaddr = 0;
+    }
+    else
+    {
+      int block[3];
+      block[0] = foundpage;
+      if (_swix(OS_Memory, _INR(0,2), 0 + (1<<8) + (1<<13), block, 1))
+      {
+        foundpage = foundphysaddr = 0;
+      }
+      else
+      {
+        foundphysaddr = block[2];
+      }
+    }
+  }
+  else
+  {
+    /* walk back over physical memory chunks, looking for a big enough chunk,
+       whose pages are not unavailable (VRAM is the first chunk in the list,
+       so avoid chunk 0 if VRAM is present) */
+    if (!_swix(OS_Memory, _IN(0)|_OUT(1), 0x208, &vram_pages) && vram_pages)
+      min_chunk = 1;
+    else
+      min_chunk = 0;
+  
+    pagenum       = Npages;
+    foundpage     = 0;
+    foundphysaddr = 0;
+    for (chunk=max_chunk; (chunk >= min_chunk) && (foundpage == 0); chunk--)
+    {
+      pages = physmem[chunk].size >> Log2PageSize;
+      if ((pages >= pages_needed) &&
+          ((physmem[chunk].addr & 0xfff00000) == physmem[chunk].addr) &&
+          ((physmem[chunk].size & 0xfff00000) == (physmem[chunk].size & ~0xfff)))
+      {
+        /* chunk big enough, and 1MB aligned */
+        /* try for end of chunk */
+        foundpage     = pagenum-pages_needed;
+        foundphysaddr = physmem[chunk].addr + (physmem[chunk].size & ~0xfff) - (pages_needed<<Log2PageSize);
+        for (p=foundpage; p<foundpage+pages_needed; p++)
+        {
+          if (svcpeek((uint32_t)(&CAM[p].flags)) & kernelvals.PageFlags_Unavailable)
+          {
+            foundpage = foundphysaddr = 0;
+            break;
+          }
+        }
+        if ((foundpage == 0) && (pages > pages_needed))
+        {
+          /* try for beginning of chunk */
+          foundpage = pagenum-pages;
+          foundphysaddr = physmem[chunk].addr;
+          for (p=foundpage; p<foundpage+pages_needed; p++)
+          {
+            if (svcpeek((uint32_t)(&CAM[p].flags)) & kernelvals.PageFlags_Unavailable)
+            {
+              foundpage = foundphysaddr = 0;
+              break;
+            }
+          }
+        }
+      }
+      pagenum -= pages;
+    }
+  }
+
+  if (verbose)
+    printf("foundpage=%1d foundphysaddr=%8.8x\n",foundpage,foundphysaddr);
+
+  *chunk_page     = foundpage;
+  *chunk_physaddr = foundphysaddr;
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void removeDA(void)
+{
+  _swix(OS_DynamicArea,_INR(0,1),1,softROM.DAN);
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void get_softROM_DA(uint32_t ROMsize)
+{
+  int             RO370_bug;
+  uint32_t        freesize;
+  _kernel_oserror *e;
+
+  static int DAh_word;
+
+  /* Reshrink RMA just in case we claimed an unacceptably large amount earlier */
+  rma_shrink();
+
+  /* Round size up to nearest page */
+  ROMsize = (ROMsize+(PageSize-1)) & ~(PageSize-1);
+
+  /* RISC OS 3.70 or 3.71 have interrupt hole in page reclaiming kernel
+     code when running on StrongARM, which may make DA grow go pop. The
+     workaround is to turn off the data cache during the grow, which is
+     supported by the secret '*cache id' syntax.
+  */
+  if ((ROMversion == 370) || (ROMversion == 371))
+    RO370_bug = ((svcarmid() & 0xf000) == 0xa000); /* if StrongARM */
+  else
+    RO370_bug = 0;
+
+  _swix(OS_DynamicArea,_INR(0,1)|_OUT(2),2,DA_FreePool,&freesize);
+
+  if (verbose) printf("Npages=%1d FreeSize=%1dk\n",Npages,freesize>>10);
+
+  if ((Npages<<Log2PageSize) < AbsMinMemSize+ROMsize)
+    error_noslot("not enough RAM fitted");
+
+  /* ensure a little left in Free Pool after DA created */
+  if (freesize < ROMsize + 64*1024)
+    error_noslot("not enough free memory");
+
+  find_contiguous_chunk(Npages,ROMsize >> Log2PageSize,
+                        &softROM.page, &softROM.physaddr);
+  if (softROM.page == 0)
+    error_noslot("no suitable physical RAM chunk found");
+
+  /* create DA to get pages we want - OS does all the hard work of arranging
+     pages in order, and reclaiming them from other use if necessary */
+  if (RO370_bug) _swix(OS_CLI,_IN(0),"cache iw");
+  DAh_word = softROM.page;
+  e = _swix(OS_DynamicArea,_INR(0,8)|_OUT(1)|_OUT(3),
+            0,-1,ROMsize,-1,0x180,ROMsize,DAhandler,&DAh_word,"softROM",
+            &softROM.DAN,&softROM.DAbase);
+  if (RO370_bug) _swix(OS_CLI,_IN(0),"cache idw");
+  if (e) error_noslot("failed to create temporary DA");
+  atexit(removeDA);
+}
+
+/* ------------------------------------------------------------------------ */
+
+static uint32_t locate_mod_chain(uint32_t base, uint32_t ROMsize)
+{
+  (void)ROMsize;
+  /* locate the start of the UtilityModule */
+  char *tp = (char*)base;
+  while (tp < (char*)base + 0x40000)
+  {
+    if (!memcmp(tp + 0x400, "UtilityModule", 14))
+    {
+      uint32_t *p = (uint32_t*)(((uint32_t)tp+4)&~3);
+      uint32_t *ep = p + 0x100;
+      while (p < ep)
+      {
+        /* resort to pattern-matching to find the actual start */
+        if (p[5] == ((uint32_t)tp+0x400 - (uint32_t)(&p[1])) &&
+            p[1] < 0x10000 && !p[2] && p[3] < 0x10000 && p[4] < 0x10000 &&
+            (!p[8] || p[8] == 0xF00000))
+          return (uint32_t)p - base;
+        p++;
+      }
+    }
+    tp++;
+  }
+  return ~0U;
+}
+
+/* ------------------------------------------------------------------------ */
+
+static uint32_t *find_ROM_module(uint32_t base, uint32_t ROMsize, const char *name)
+{
+  uint32_t *rom_end = (uint32_t*)(base + ROMsize);
+  uint32_t *mod = (uint32_t*)(base + mod_chain_ofst);
+  while (*mod && (*mod < (char*)rom_end - (char*)mod) && !(mod[0] & 3) && (mod[5]+4 < mod[0]))
+  {
+    const char *mod_title = (char*)(&mod[1]) + mod[5];
+    if (!strcmp(mod_title, name))
+      return mod+1;  /* first word of module itself */
+    mod += *mod/4;
+  }
+  return NULL;  /* not found */
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void patch_ROM_image(uint32_t base, uint32_t ROMsize, uint32_t offset, uint32_t data)
+{
+  uint32_t *chk = (uint32_t *)(base + ROMsize + ROMcheckoffset);
+  uint32_t *p = (uint32_t *)(base + offset);
+  *chk += *p - data;
+  *p = data;
+}
+
+/* ------------------------------------------------------------------------ */
+#ifdef PLAY_SAFE
+static void disable_adfs(uint32_t base, uint32_t ROMsize)
+{
+  uint32_t *mod = find_ROM_module(base, ROMsize, "ADFS");
+  if (mod)
+  {
+    /* locate and deactivate the ADFS module as a safety measure */
+    unsigned ofst;
+    printf("ADFS module located at %u\n", (uint32_t)mod - base);
+    ofst = (uint32_t)mod - base;
+    patch_ROM_image(base, ROMsize, ofst,    0);
+    patch_ROM_image(base, ROMsize, ofst+4,  0);
+    patch_ROM_image(base, ROMsize, ofst+8,  0);
+    patch_ROM_image(base, ROMsize, ofst+12, 0);
+    patch_ROM_image(base, ROMsize, ofst+24, 0);
+    patch_ROM_image(base, ROMsize, ofst+28, 0);
+    patch_ROM_image(base, ROMsize, ofst+32, 0);
+    patch_ROM_image(base, ROMsize, ofst+36, 0);
+    patch_ROM_image(base, ROMsize, ofst+40, 0);
+  }
+  else
+  {
+    int ch, psr;
+    printf("WARNING: Unable to locate ADFS module to deactivate it. Continue? (Y/N) ");
+    _swix(OS_ReadC, _OUT(0)|_OUT(_FLAGS), &ch, &psr);
+    if (ch=='n' || ch=='N' || (psr&_C)) exit(1);
+  }
+}
+#endif
+
+/* ------------------------------------------------------------------------ */
+
+static void patch_STRAP_info(uint32_t base, uint32_t ROMsize, char *table)
+{
+  unsigned bh;
+  /* identify the type(s) of graphics card(s) currently */
+  for(bh = 0x30; bh < 0x50; bh += 8)
+  {
+    _kernel_oserror *err;
+    int fh;
+    err = _swix(PCI_FindByLocation, _INR(0,1)|_OUT(3), bh>>6, bh, &fh);
+    if (fh && !err)
+    {
+      int id0;
+      err = _swix(PCI_ReadID, _IN(3)|_OUT(0), fh, &id0);
+      if (!err && (id0 & 0xffff) == 0x10de)
+      {
+        int mbase;
+        err = _swix(PCI_HardwareAddress, _INR(0,3)|_OUT(4), 0, 0, 0, fh, &mbase);
+        if (!err)
+        {
+          uint32_t *p = (uint32_t*)(table + bh - 0x30);
+          uint32_t strap = svcpeek(mbase + 0x101000);
+          /* check what we're replacing with the current STRAP info */
+          if (!(~p[0] | p[1]))
+          {
+            uint32_t ofst = (uint32_t)p - base;
+            patch_ROM_image(base, ROMsize, ofst,   id0);
+            patch_ROM_image(base, ROMsize, ofst+4, strap | 0x80000000U);
+          }
+        }
+      }
+      if (err) error_noslot(err->errmess);
+    }
+  }
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void patch_NVidia_module(uint32_t base, uint32_t ROMsize)
+{
+  uint32_t off, *mod;
+
+  mod = find_ROM_module(base, ROMsize, "NVidia");
+  if (!mod) return;  /* Don't protest, there could be a different graphics card? */
+
+  /* locate the patch area within the module;
+     (known to follow the module flags word) */
+  off = mod[12] + 4;
+  patch_STRAP_info(base, ROMsize, (char *)mod + off);
+
+  /* Detect and patch any old Tungsten HALs that aren't softload aware */
+  if((((uint32_t*)base)[0xF4/4]>>24 == 0xEB) // initialise_ram call
+  && (((uint32_t*)base)[0xF8/4] == 0xEB000128) // clear_ram call
+  && (((uint32_t*)base)[0x5A4/4]>>24 == 0xEB) // get_end_of_ram call
+  && (((uint32_t*)base)[0x5A8/4] == 0xE1A09000) // get_end_of_ram result
+  && (((uint32_t*)base)[0x174/4] == 0xE3370000) // checksum check
+  && (((uint32_t*)base)[0x178/4]>>24 == 0x1A)) // checksum fail 
+  {
+    if(verbose) printf("Softload unaware HAL detected; applying patch\n");
+  
+    ((uint32_t*)base)[0xF4/4] = 0xE1A00000;  // remove the initialise_ram call
+    ((uint32_t*)base)[0xF8/4] = 0xE1A00000;  // remove the clear_ram call
+  
+    // fudge the returned value of get_end_of_ram so that clear_ram
+    //    doesn't trample over our in-memory image
+    patch_ROM_image(base, ROMsize, 0x5A4, 0xE1A0962FU);
+    patch_ROM_image(base, ROMsize, 0x5A8, 0xE1A09609U);
+  
+    // disable the HAL's checksum code, mostly because we need a place
+    //    to call 'clear_ram'
+    ((uint32_t*)base)[0x174/4] = 0xEB000000 + ((0x5A0-0x17C)/4);  // clear_ram
+    ((uint32_t*)base)[0x178/4] = 0xE1A00000;
+  }
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void patch_HAL_STRAP_info(uint32_t base, uint32_t ROMsize)
+{
+  /* Scan for a specific HAL device in the HAL which contains the STRAP info */
+  char *search = ((char *)base)+8192; /* Skip boot region */
+  char *limit = ((char *)base)+65536; /* Stop at end of HAL */
+  while(search != limit)
+  {
+    if(!strcmp(search,"NVidia STRAP data"))
+    {
+      char *strap = search+((strlen("NVidia STRAP data")+1+3)&~3);
+      /* Word preceeding the string should be a pointer to the table (which
+         occurs right after the string) */
+      if(((uint32_t*)strap)[-1] != (((uint32_t)strap)-base)+0xFC000000)
+      {
+        patch_STRAP_info(base, ROMsize, strap);
+        return;
+      }
+    }
+    search += 4;
+  }
+}      
+
+/* ------------------------------------------------------------------------ */
+
+static void patch_ROM(ROMinfo_t *rom)
+{
+  decompress &= (rom->c_size != rom->u_size) && (rom->oshdr_offset != ~0);
+  
+  if(decompress)
+  {
+    if(verbose) printf("Decompressing ROM...\n");
+    OSHdr *h = (OSHdr *) (softROM.DAbase+rom->oshdr_offset);
+    OSDecompHdr *dh = (OSDecompHdr *) (softROM.DAbase+rom->oshdr_offset+h->DecompressHdr);
+    void *ws = NULL;
+    if(dh->WSSize)
+    {
+      /* On 26bit OS's this should probably be made to come from a dynamic area,
+         since the RMA limit is going to be quite small */
+      ws = rma_alloc(dh->WSSize,"Failed to get decompression workspace\n");
+    }
+    asm_decompress(h,ws);
+    if(verbose) printf("ROM decompressed\n");
+    _swix(OS_SynchroniseCodeAreas,_INR(0,2),1,softROM.DAbase,rom->u_size);
+    if(ws)
+      rma_free(ws);
+    /* Patch up... */
+    rom->c_size = rom->u_size;
+    rom->c_neg_checksum = *((uint32_t *) (softROM.DAbase+rom->u_size+ROMcheckoffset));
+  }
+
+  patch_HAL_STRAP_info(softROM.DAbase, rom->c_size);
+
+  if ((rom->c_size == rom->u_size) && (~0 != (mod_chain_ofst = locate_mod_chain(softROM.DAbase, rom->c_size))))
+  {
+#ifdef PLAY_SAFE
+    disable_adfs(softROM.DAbase, rom->c_size);
+#endif
+    patch_NVidia_module(softROM.DAbase, rom->c_size);
+  }
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void copy_ROM_and_go(void)
+{
+  if(!sysinfo.hardrom.size_valid)
+    error_noslot("Don't know size of hard ROM");
+  get_softROM_DA(sysinfo.hardrom.u_size);
+
+  if(sysinfo.hardrom.logaddr != ROMaddr_unknown)
+  {
+    svcmemcpy((void *)softROM.DAbase,(void *)sysinfo.hardrom.logaddr,sysinfo.hardrom.c_size);
+  }
+  else if(sysinfo.hardrom.physaddr != ROMaddr_unknown)
+  {
+    if(!physmemcpy((void *)softROM.DAbase,sysinfo.hardrom.physaddr,sysinfo.hardrom.c_size))
+    {
+      error_noslot("Failed to copy hard ROM");
+    }
+  }
+  else
+  {
+    error_noslot("Don't know where hard ROM is");
+  }
+
+  ROMinfo_t rom = sysinfo.hardrom;
+  rom.physaddr = softROM.physaddr;
+  rom.logaddr = softROM.DAbase;
+  patch_ROM(&rom);
+
+  /* Now that the ROM is patched, check again for whether we're fine */
+  uint32_t ow,nw;
+  ow = sysinfo.rom.u_neg_checksum;
+  nw = *((uint32_t *)(softROM.DAbase+rom.c_size+ROMcheckoffset));
+  bool fine = ((sysinfo.rom_type == ROMType_Soft) && (ow == nw));
+  if(fine)
+  {
+    printf("soft-loaded OS\n");
+    exit(0);
+  }
+
+  /* should never return */
+  if(dummyrun)
+  {
+    printf("dummy run complete (.rom.)\n");
+    exit(0);
+  }
+  startnew(softROM.physaddr,kernelvals.L1PT,-1,kernelvals.ARMA_Cleaner_flipflop,ROMlogaddr,sysinfo.hardrom.u_size);
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void load_ROM_and_go(char ROMfname[])
+{
+  if(!fileROM.size_valid)
+    error_noslot("Loading a file we haven't examined");
+
+  get_softROM_DA(fileROM.u_size);
+
+  if(_swix(OS_File,_INR(0,3),16,ROMfname,softROM.DAbase,0x80000000))
+  {
+    error_noslot("Failed to load ROM file");
+  }
+
+  patch_ROM(&fileROM);
+
+  /* Now that the ROM is patched, check again for whether we're fine */
+  uint32_t ow,nw;
+  ow = sysinfo.rom.u_neg_checksum;
+  nw = *((uint32_t *)(softROM.DAbase+fileROM.c_size+ROMcheckoffset));
+  bool fine = ((sysinfo.rom_type == ROMType_Soft) && (ow == nw));
+  if(fine)
+  {
+    printf("soft-loaded OS\n");
+    exit(0);
+  }
+
+  /* should never return */
+  if(dummyrun)
+  {
+    printf("dummy run complete (%s)\n",ROMfname);
+    exit(0);
+  }
+  startnew(softROM.physaddr,kernelvals.L1PT,-1,kernelvals.ARMA_Cleaner_flipflop,ROMlogaddr,fileROM.u_size);
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void unload_ROM_and_go(uint32_t ROMpa /* ROM physical address*/)
+{
+  /* should never return */
+  if(dummyrun)
+  {
+    printf("dummy run complete (.none.)\n");
+    exit(0);
+  }
+  startnew(-1,kernelvals.L1PT,ROMpa,kernelvals.ARMA_Cleaner_flipflop,ROMlogaddr,sysinfo.rom.u_size);
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void wait_cs(uint32_t cs)
+{
+  uint32_t t0,t1;
+  _swix(OS_ReadMonotonicTime,_OUT(0),&t0);
+  do
+  {
+    _swix(OS_ReadMonotonicTime,_OUT(0),&t1);
+  } while ((t1 - t0) < cs);
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void describe_rom(const char *name,ROMinfo_t *rom)
+{
+  if(name)
+  {
+    /* Display name and location */
+    printf("%s:\n",name);
+    if(rom->logaddr != ROMaddr_unknown)
+      printf("  logaddr:  %08x\n",rom->logaddr);
+    else
+      printf("  logaddr:  Unknown\n");
+    if(rom->physaddr != ROMaddr_unknown)
+      printf("  physaddr: %08x\n",rom->physaddr);
+    else
+      printf("  physaddr: Unknown\n");
+  }
+  if(!rom->c_size)
+    printf("  size:     Unknown\n");
+  else if(!rom->size_valid)
+    printf("  size:     %08x (guess)\n",rom->c_size);
+  else if(rom->c_size == rom->u_size)
+    printf("\
+  size:     %08x\n\
+  checksum: %08x\n",rom->c_size,rom->c_neg_checksum);
+  else
+  {
+    printf("\
+  size:     %08x (compressed)\n\
+            %08x (uncompressed)\n\
+  checksum: %08x (compressed)\n\
+            %08x (uncompressed)\n",rom->c_size,rom->u_size,rom->c_neg_checksum,rom->u_neg_checksum);
+  }
+}
+
+/* ------------------------------------------------------------------------ */
+
+int main(int argc, char *argv[])
+{
+  int    argf0,argf,wearefine;
+  size_t memsize, unused;
+  uint32_t ROMpa;
+  char   ROMfname[256];
+
+  char   loadtype='n'; /* 'n'=do nothing,'f'=load file,'r'=copy ROM,'u'=unload */
+
+  if(!_swix(TaskWindow_TaskInfo,_IN(0)|_OUT(0),0,&argf0))
+  {
+    if(argf0)
+    {
+      fprintf(stderr,"softload can't be used from within a taskwindow\n");
+      exit(ErrorReturnCode);
+    }
+  }
+
+  find_ROMversion();
+  if (ROMversion < 360)
+  {
+    fprintf(stderr,"softload only runs on RISC OS 3.6 or later\n");
+    exit(ErrorReturnCode);
+  }
+
+  /* Read current RMA size, so we can attempt to restore it on exit */
+  _swi(OS_DynamicArea,_INR(0,1)|_OUT(2),2,DA_RMA,&rma_size);
+  atexit(rma_atexit);
+
+  /* determine logical base address of ROM */
+  if (_swix(OS_Module, _INR(0,1)|_OUT(3), 18, "UtilityModule", &ROMlogaddr))
+  {
+    fprintf(stderr, "Can't read ROM base address\n");
+    exit(ErrorReturnCode);
+  }
+  ROMlogaddr = ROMlogaddr & ~0xfffff;  /* align to MB boundary */
+
+  find_kernelvals(ROMversion,&kernelvals);
+
+  /* no. of RAM pages in machine */
+  _swix(OS_ReadMemMapInfo,_OUT(1),&Npages);
+
+  argf0 = read_arg_options(argc,argv,&verbose,&min_memsize);
+  if (argf0 >= argc)
+  {
+    fprintf(stderr,"SoftLoad " Module_FullVersion " [" Module_Date "]\n\n"
+                   "Usage: softload [-v] [-m <minmem>[K|M]] [-n] [-d] <ROMname> [<ROMname> ...]\n"
+                   " -v[erbose]      enables verbose operation\n"
+                   " -m[inmem]       specifies minimum memory required for softload to proceed\n"
+                   " -n[odecompress] disables ROM decompression\n"
+                   " -d[ummyrun]     perform a dummy run for testing; new ROM will be loaded but not started\n");
+    exit(ErrorReturnCode);
+  }
+
+  ROMpa = log2phys(ROMlogaddr,&unused);
+
+  read_sys_info(ROMpa,ROMlogaddr,&sysinfo);
+
+  if (verbose)
+  {
+    printf("Softload version " Module_FullVersion "\n\
+Platform class: %s\n\
+Traditional memory map: %s\n\
+ROM type: %s\n",
+plattypes[sysinfo.platform],
+(sysinfo.traditional_memmap?"Yes":"No"),
+romtypes[sysinfo.rom_type]);
+    describe_rom("Hard ROM",&sysinfo.hardrom);
+    describe_rom("Soft ROM",&sysinfo.rom);
+  }
+
+  memsize = Npages << Log2PageSize;
+  if (sysinfo.rom_type == ROMType_Soft) memsize += sysinfo.rom.u_size;
+  if ((min_memsize != 0) && (memsize < min_memsize))
+  {
+    /* do nothing if memory size below -m specified option */
+    if (verbose) printf("  fitted memory below -m %8.8x\n",min_memsize);
+    exit(0);
+  }
+
+  wearefine = -1;
+  for (argf=argf0; (argf < argc) && (wearefine == -1); argf++)
+  {
+    read_ROMfname(argf,argv,ROMfname);
+
+    if ((strcmp(ROMfname,".NONE.") == 0) ||
+        (strcmp(ROMfname,".none.") == 0)    )
+    {
+      loadtype = 'u';
+    }
+    else if ((strcmp(ROMfname,".ROM.") == 0) ||
+             (strcmp(ROMfname,".rom.") == 0)    )
+    {
+      loadtype = 'r';
+    }
+    else /* assume load from file */
+    {
+      loadtype = 'f';
+    }
+
+    wearefine = arewefine(loadtype,ROMpa,ROMfname);
+  }
+
+  if (wearefine == -1) error_noslot("file(s) not found or bad");
+
+  if (wearefine) loadtype = 'n';
+
+  if ((loadtype == 'r') || (loadtype == 'f'))
+  {
+    if ((sysinfo.rom_type == ROMType_Soft) && (memsize-sysinfo.rom.u_size < min_memsize))
+    {
+      /* We don't have enough memory to load a second soft ROM. Tackle this by
+         unloading the current ROM and allowing the next boot to load the
+         desired ROM (assuming the softloading is automatic!) */
+      printf("Warning: Not enough memory to load desired ROM. Will unload current soft ROM first.\n");
+      strcpy(ROMfname,".none.");
+      loadtype = 'u';
+    }
+  }
+
+  switch(loadtype)
+  {
+    case 'u':
+      if(sysinfo.hardrom.physaddr == 0)
+      {
+        printf("soft-unloading ROM...\n");
+        wait_cs(75);
+        unload_ROM_and_go(ROMpa);
+      }
+      else
+      {
+        error_noslot("Don't know how to unload a softrom on this system");
+      }
+      break;
+    case 'r':
+      /* This will only work if we know where the hard ROM is */
+      if(sysinfo.hardrom.physaddr != ROMaddr_unknown)
+      {
+        printf("soft-copying ROM...\n");
+        copy_ROM_and_go();
+      }
+      else
+      {
+        error_noslot("Don't know where hard ROM is located");
+      }
+      break;
+    case 'f':
+      printf("soft-loading ROM '%s'...\n",ROMfname);
+      if(verbose)
+        describe_rom(NULL,&fileROM);
+      load_ROM_and_go(ROMfname);
+      break;
+    case 'n':
+      /* do nothing */
+      if (sysinfo.rom_type == ROMType_Soft)
+        printf("soft-loaded OS\n");
+      else if(dummyrun)
+        printf("dummy run complete (no action required)\n");
+      break;
+  }
+
+  return 0;
+}

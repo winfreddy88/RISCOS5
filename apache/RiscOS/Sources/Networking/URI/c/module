@@ -1,0 +1,439 @@
+/* Copyright 1998 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/* File		: module.c
+ * Purpose	: URI handler module code
+ * Author	: C.Elkins
+ * History	: Started 8/2/97
+ */
+
+#include <stdio.h>
+#include <string.h>
+
+#include "kernel.h"
+#include "swis.h"
+#include "Global/Services.h"
+
+#include "ralloc.h"
+#include "globals.h"
+#include "URIHdr.h"
+#include "task.h"
+#include "module.h"
+#include "URIswis.h"
+
+#if CMHG_VERSION < 516
+#define CMHG_CONST
+#else
+#define CMHG_CONST const
+#endif
+
+
+static int module_send_service(int, URI_handle_t);
+static void clearcallback(void);
+
+static int msg_struct[4];
+static _kernel_oserror msg_buff;
+
+_kernel_oserror *module_initialise(CMHG_CONST char *cmd_tail, int podule_base, void *pw)
+{
+  _kernel_oserror *e;
+
+  UNUSED(podule_base);
+  UNUSED(cmd_tail);
+
+#if defined DEBUG && defined PDebug_DEBUG
+  PDebug_XInit ();
+#endif
+
+#ifndef ROM
+  e = _swix(ResourceFS_RegisterFiles, _IN(0), Resources());
+  if (e != NULL)
+  {
+    return(e);
+  }
+#endif
+  e = _swix(MessageTrans_OpenFile, _INR(0,2),
+            msg_struct, Module_MessagesFile, 0);
+  if (e != NULL)
+  {
+#ifndef ROM
+     _swix(ResourceFS_DeregisterFiles, _IN(0), Resources());
+#endif
+    return(e);
+  }
+
+  ModuleR12      = pw;
+  URI_taskhandle = 0;
+  URI_taskstack  = 0;
+  if ((URI_handle_chain = rcalloc(sizeof(URI_t),1)) == 0)
+  {
+    return ERR(err_nomemory);
+  }
+  else
+  {
+    URI_handle_chain->guardword	= MagicWord;
+    URI_handle_chain->action	= 0;
+    URI_handle_chain->previous	= NULL;
+    URI_handle_chain->next	= NULL;
+    URI_handle_chain->string	= NULL;
+  }
+  /* XXX: Wrong - need to send this on a callback??? */
+  module_send_service(ServiceA7_Started, NULL);
+  return(0);
+}
+
+
+_kernel_oserror *module_finalise(int fatal, int podule, void *pw)
+{
+  _kernel_oserror*	e;
+  URI_handle_t		handle;
+
+  UNUSED(podule);
+  UNUSED(pw);
+  UNUSED(fatal);
+
+  clearcallback();
+  module_send_service(ServiceA7_Dying, NULL);
+
+
+  /* must free up URI chain */
+  while (URI_handle_chain)
+  {
+    handle = URI_handle_chain->next;
+    URI_handle_chain->guardword = NULL;
+    rfree(URI_handle_chain);
+    URI_handle_chain = handle;
+  }
+
+#if defined DEBUG && defined PDebug_DEBUG
+  PDebug_XFinal ();
+#endif
+
+  e = task_closedown(0);
+
+  if (e == NULL)
+  {
+    _swix(MessageTrans_CloseFile, _IN(0), msg_struct);
+#ifndef ROM
+    _swix(ResourceFS_DeregisterFiles, _IN(0), Resources());
+#endif
+  }
+
+  return(e);
+}
+
+
+void module_service(int service_number, _kernel_swi_regs *r, void *pw)
+{
+  UNUSED(pw);
+
+  M_debug(("URI service handler entered : service &%x\n",service_number));
+
+  switch(service_number)
+  {
+    case Service_StartedWimp:
+      if (URI_taskhandle != -1) break;
+    case Service_Reset:
+      URI_taskhandle = 0;
+      break;
+
+    case Service_StartWimp:
+      if (URI_taskhandle == 0)
+      {
+        URI_taskhandle = -1;
+        r->r[0] = (int) (ModuleStartCommand);
+        r->r[1] = 0;
+      }
+      break;
+
+    case Service_WimpCloseDown:
+      if (r->r[0] > 0 && r->r[2] > 0 && r->r[2] == URI_taskhandle) {
+        r->r[0] = (int)ERR(err_feactive);
+        /* Must not claim */
+      }
+      break;
+  }
+}
+
+
+
+_kernel_oserror *module_swi(int swi_no, _kernel_swi_regs *r, void *pw)
+{
+	(void) pw;
+
+  	switch(swi_no) {
+    		case URI_Version - URI_00:
+      			r->r[0] = Module_VersionNumber;
+      			return(0);
+
+    		case URI_Dispatch - URI_00:
+      			return(swi_dispatchURI(r));
+
+    		case URI_RequestURI - URI_00:
+      			return(swi_requestURI(r));
+
+    		case URI_InvalidateURI - URI_00:
+      			return(swi_invalidateURI(r));
+
+    		default:
+      			return(error_BAD_SWI);
+        }
+}
+
+
+
+_kernel_oserror *module_command(CMHG_CONST char *arg_string, int argc, int cmd_no, void *pw)
+{
+  	URI_handle_t		entry_ptr;
+  	UNUSED(pw);
+
+  	switch(cmd_no) {
+    		case CMD_Desktop_AcornURI:
+      			if (URI_taskhandle != -1) {
+              			return ERR(err_usedesktop);
+                        }
+      			else {
+              			/* Call will not return if SWI call was successful */
+              			(void) _swix(OS_Module,_INR(0,2),2,ModuleName,arg_string);
+              			return 0;
+                        }
+
+    case CMD_URIinfo:
+      entry_ptr = URI_handle_chain;
+      printf("%s: &%08X\n", msg_lookup("TskHand"), (unsigned int) URI_taskhandle);
+      printf("%s: &%08X\n", msg_lookup("ChStart"), (unsigned int) URI_handle_chain);
+      while (entry_ptr->next != NULL)
+      {
+        entry_ptr = entry_ptr->next;
+        if (entry_ptr->guardword != MagicWord)
+        {
+          printf(msg_lookup("ChBad"), (void *)entry_ptr);
+          printf("\n");
+        }
+        else
+        {
+          printf("%s: %p ", msg_lookup("ChHand"), (void *)entry_ptr);
+          printf("(%s:%08x) '%s'\n", msg_lookup("ChAct"), entry_ptr->action, (char*)&entry_ptr->string);
+        }
+      }
+      return(0);
+
+    case CMD_URIdispatch:
+    {
+      char *uri;
+      const char *c = arg_string;
+      int len = 0;
+      _kernel_oserror *e;
+      _kernel_swi_regs r;
+
+      /* strip trailing control characters from URI */
+      c = arg_string;
+      while (*c++ >= ' ') ++len;
+
+      if ((uri = rmalloc (len + 1)) == NULL)    /* +1 for 0 terminator */
+        return ERR(err_nomemory);
+      strncpy (uri, arg_string, len);
+      uri[len] = '\0';
+
+      r.r[0] = 0;
+      r.r[1] = (int) uri;
+
+      e = swi_dispatchURI(&r);
+      rfree (uri);
+      return e;
+    }
+
+    default:
+      return(0);
+      break;
+  }
+  UNUSED(argc);
+}
+
+
+
+static int module_send_service(int service_call, URI_handle_t handle)
+{
+  _kernel_swi_regs	r;
+  _kernel_oserror*	e;
+
+  r.r[1] = 0xa7;
+
+  switch(service_call)
+  {
+    case ServiceA7_Started:
+      r.r[0] = 0;
+      break;
+
+    case ServiceA7_Dying:
+      r.r[0] = 1;
+      break;
+
+    case ServiceA7_Check:
+      r.r[0] = 2;
+      r.r[2] = (int) &handle->string;
+      r.r[3] = (int) handle;
+      break;
+
+    case ServiceA7_Process:
+      r.r[0] = 3;
+      r.r[2] = (int) &handle->string;
+      r.r[3] = (int) handle;
+      break;
+
+    default:
+      return(0);
+  }
+  e = _kernel_swi(OS_ServiceCall,&r,&r);
+  if (e) return(0);
+  return(r.r[1]);
+}
+
+
+/*
+ * Callback handler - used for asynchronous dispatches
+ */
+
+_kernel_oserror *callback_handler(_kernel_swi_regs *r, void *pw)
+{
+  URI_handle_t		uri_handle;
+  int			action,result;
+
+
+  M_debug (("callback handler entered\n"));
+  if (callback_flag == 0) return(NULL);
+  callback_flag = 0;
+
+  uri_handle = URI_handle_chain;
+  while (uri_handle->next != NULL)
+  {
+    uri_handle = uri_handle->next;
+    M_debug(("URI handle %08x action %08x\n",(int) uri_handle,(int) uri_handle->action));
+    if ((action = uri_handle->action) == 0) continue;	/* nothing to do, so be quick */
+    if (action & Action_ServiceA7)				/* implies service call broadcast needed */
+    {
+      action &= ~Action_ServiceA7;				/* clear 'need service flag' */
+      if (action & Action_Check)
+      {
+        result = module_send_service(ServiceA7_Check,uri_handle);
+        if (result == 0) action = (action | Action_Claimed) & ~Action_WimpBroad;
+      }
+      else
+      {
+        result = module_send_service(ServiceA7_Process,uri_handle);
+        if (result == 0) action = (action | Action_Claimed) & ~Action_WimpBroad;
+      }
+      M_debug(("URI handle %08x action %08x\n",(int) uri_handle,(int) action));
+    }
+    if (action & (Action_WimpBroad|Action_WimpUnicast|Action_URLProto))
+    {
+      poll_word = (int) URI_handle_chain;
+      M_debug (("set pollword to %p\n", poll_word));
+    }
+    if (action & Action_Delete)
+    {
+      uri_remove_from_chain(uri_handle);
+      uri_handle->guardword = NULL;
+      rfree(uri_handle);
+    }
+
+    uri_handle->action = action;
+    M_debug(("URI handle %08x action %08x\n",(int) uri_handle,(int) uri_handle->action));
+  }
+  UNUSED(pw);
+  UNUSED(r);
+  
+  return NULL;
+}
+
+/**********************************************************************/
+
+const char *msg_lookup(const char *token)
+{
+  if (_swix(MessageTrans_Lookup, _INR(0,7),
+            msg_struct, token, &msg_buff, sizeof(msg_buff), 0, 0, 0, 0) != NULL)
+  {
+    return "";
+  }
+  return (const char *)&msg_buff;
+}
+
+/**********************************************************************/
+
+_kernel_oserror *msg_error(int which)
+{
+  struct {
+    int errnum;
+    char errmess[8];
+  } token;
+
+  token.errnum = URI_ErrorChunk + which;
+  sprintf(token.errmess, "E%02u", which);
+  return _swix(MessageTrans_ErrorLookup, _INR(0,3),
+            &token, msg_struct, &msg_buff, sizeof(msg_buff));
+}
+
+/**********************************************************************/
+
+static int set_callback(void (*func)())
+{
+    _kernel_swi_regs r;
+
+    r.r[0] = (int) func;
+    r.r[1] = (int) ModuleR12;
+    return(_kernel_swi(XOS_Bit | OS_AddCallBack,&r,&r) != 0 ? -1 : 0);
+}
+
+/**********************************************************************/
+
+static void clear_callback(void (*func)())
+{
+    _kernel_swi_regs r;
+
+    r.r[0] = (int) func;
+    r.r[1] = (int) ModuleR12;
+    (void)_kernel_swi(XOS_Bit | OS_RemoveCallBack,&r,&r);
+}
+
+/**********************************************************************/
+
+
+void setcallback(void)
+{
+  M_debug(("SCB> setcallback (flag = %d) ",callback_flag));
+  if (callback_flag == 0)
+  {
+    callback_flag = 1;
+    if (set_callback(callback_entry) != 0)
+      {
+        M_debug(("Failed\n"));
+        callback_flag = 0;
+      }
+  }
+  M_debug(("Ok!\n"));
+}
+
+
+
+static void clearcallback(void)
+{
+  M_debug(("CCB> clearcallback (flag = %d) ",callback_flag));
+  if (callback_flag == 1)
+  {
+    callback_flag = 0;
+    clear_callback(callback_entry);
+  }
+  M_debug(("Ok!\n"));
+}
+

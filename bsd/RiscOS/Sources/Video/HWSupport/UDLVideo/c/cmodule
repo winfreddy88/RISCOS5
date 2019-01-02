@@ -1,0 +1,913 @@
+/*
+ * Copyright (c) 2014, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include "udl_riscos.h"
+
+#include <dev/usb/usb.h>
+#include <dev/usb/usbdi.h>
+#include <dev/usb/usbdevs.h>
+
+#include <stdio.h>
+#include <stdlib.h>
+#include "kernel.h"
+#include "swis.h"
+
+#include "instance.h"
+#include "netbsd.h"
+#include "graphicsv.h"
+
+#include "Global/RISCOS.h"
+#include "Global/Services.h"
+#include "Global/NewErrors.h"
+#include "Global/GraphicsV.h"
+#include "Global/VduExt.h"
+#include "Global/ModHand.h"
+#include "Global/VIDCList.h"
+
+#undef Module_Title
+#include "modhead.h"
+
+void *private_word;
+static int instance;
+
+instance_t *instances[256];
+int extant_instance_count;
+uint32_t process_rate;
+
+static bool callback_registered;
+
+#ifdef STANDALONE
+extern void* Resources(void);
+#endif
+
+#ifdef SPOOL
+FILE *spool = NULL;
+#endif
+
+static bool match_device(const USBServiceCall *svc, instance_t *i)
+{
+	usbd_status err;
+	const char *devname = svc->devname;
+
+	/* Get the data needed to determine the devcaps */
+	uint32_t status = 0;
+	uint32_t version = 0;
+	uint8_t dl120_160 = 0;
+
+	err = udl_poll(&i->softc,&status);
+	if(err)
+	{
+		dprintf(("","match_device: Failed to poll status of %s\n",devname));
+		return false;
+	}
+
+	/* Give up if the device looks broken */
+	if((status & 0xf000) == 0x2000)
+	{
+		dprintf(("","match_device: Device %s is broken! status %08x\n",devname,status));
+		return false;
+	}
+
+	for(int j=0;j<4;j++)
+	{
+		err = udl_read_1(&i->softc,0xc400+j,((uint8_t *) &version)+j);
+		if(err)
+		{
+			dprintf(("","match_device: Failed to read version of %s\n",devname));
+			return false;
+		}
+	}
+
+	err = udl_read_1(&i->softc,0xc484,&dl120_160);
+	if(err)
+	{
+		dprintf(("","match_device: Failed to read 0xc484 of %s\n",devname));
+		return false;
+	}
+
+	/* Now get the capabilties */
+	dprintf(("","match_device: Checking %s status %08x version %08x dl120_160 %02x\n",devname,status,version,dl120_160));
+	const uint8_t *ddesc = (const uint8_t *) &svc->ddesc;
+	int desclen = (((const uint8_t *) svc)+svc->sclen)-ddesc;
+	i->devcaps = devcaps_get(ddesc,desclen,status,version,dl120_160);
+
+	dprintf(("","match_device: Capabilities:\n"));
+	dprintf(("","  chip = %s\n",chip_names[i->devcaps.chip]));
+	dprintf(("","  fussy_huffman = %d\n",i->devcaps.fussy_huffman));
+	dprintf(("","  diff_mode = %02x\n",i->devcaps.diff_mode));
+	dprintf(("","  max_total_pixels = %d\n",i->devcaps.max_total_pixels));
+	dprintf(("","  max_width = %d\n",i->devcaps.max_width));
+	dprintf(("","  mem_start = %06x\n",i->devcaps.mem_start));
+	dprintf(("","  mem_end = %06x\n",i->devcaps.mem_end));
+	dprintf(("","  chip_id = %08x\n",i->devcaps.chip_id));
+
+	return ((i->devcaps.chip != DLUNK) && (i->devcaps.chip != DLUNSUPPORTED));  
+}
+
+static void enumerate_cb(const USBServiceCall *svc)
+{
+	_kernel_oserror *e;
+
+	const char *devname = svc->devname;
+	const usb_device_descriptor_t *ddesc = &svc->ddesc;
+
+	/* Check the vendor ID */
+	if(UGETW(ddesc->idVendor) != USB_VENDOR_DISPLAYLINK)
+		return;
+
+	/* Device looks promising, take a closer look */
+	instance_t *i = (instance_t *) malloc(sizeof(instance_t));
+	if(!i)
+		return;
+	memset(i,0,sizeof(instance_t));
+	i->state.blank_state = 0x7;
+	i->live.blank_state = 0x7;
+
+	/* Initialise our USB dev struct */
+	strcpy(i->usbdev.devname,devname);
+	i->usbdev.ddesc = *ddesc;
+	strcpy(i->usbdev.sc_dev.dv_xname,devname);
+
+	/* Initialise the UDL dev struct */
+	strcpy(i->softc.sc_dev.dv_xname,devname);
+	i->softc.sc_udev = (usbd_device_handle) &i->usbdev;
+
+	/* Try matching the device */
+	if(!match_device(svc,i))
+	{
+		dprintf(("","enumerate_cb: Failed to match device %s\n",devname));
+		goto fail0;
+	}
+
+	dprintf(("","enumerate_cb: Matched device %s\n",devname));
+
+	/* Initialise huffman tables if not done yet */
+	huffman_init();
+
+	/* Initialise the device */
+	if(udl_attach(NULL,(struct device *) &i->softc,NULL))
+	{
+		dprintf(("","UDL initialisation failed\n"));
+		goto fail1;
+	}
+
+	/* Set decompression table if possible */
+	if(huffman_decomp)
+	{
+		usbd_status err = udl_set_decomp_table(&i->softc,huffman_decomp,HUFFMAN_DECOMP_SIZE);
+		if(err == USBD_NORMAL_COMPLETION)
+		{
+			i->decomp_table_set = true;
+
+			/* Enable huffman if possible */
+			i->huffman_enabled = !i->devcaps.fussy_huffman;
+		}
+		else
+		{
+			dprintf(("","Failed to set decompression table - %d\n",err));
+		}
+	}
+
+	/* Next hurdle is screen memory allocation
+	   For now we just allocate enough to cope with the largest screen size supported by the device */
+	i->screensize = i->devcaps.max_total_pixels*4;
+	/* To make things work reasonably cleanly we need to round up to a multiple of 1MB */
+	i->screensize = (i->screensize+0xfffff)&~0xfffff;
+	/* Try and get the required PCI memory. Must be 1MB aligned to cope with the kernel mapping it in as IO memory. */
+	e = _swix(PCI_RAMAlloc,_INR(0,2)|_OUTR(0,1),i->screensize,1<<20,0,&i->pci_logaddr,&i->pci_physaddr);
+	if(e)
+	{
+		dprintf(("","PCI_RAMAlloc failed, error %08x %s\n",e->errnum,e->errmess));
+		goto fail2;
+	}
+	dprintf(("","PCI RAM at %08x log %08x phys, size %08x\n",i->pci_logaddr,i->pci_physaddr,i->screensize));
+
+	/* Now create the shadow DA */
+	char name[32];
+	sprintf(name,"UDLVideo %s",devname);
+	e = _swix(OS_DynamicArea,_INR(0,8)|_OUT(1)|_OUT(3),0,-1,i->screensize,-1,2+(1<<7),i->screensize,NULL,NULL,name,&i->shadow_da_number,&i->shadow);
+	if(e)
+	{
+		dprintf(("","DA creation failed, error %08x %s\n",e->errnum,e->errmess));
+		goto fail3;
+	}
+	dprintf(("","Created DA %d @ %08x\n",i->shadow_da_number,i->shadow));
+
+	/* Zero all memory */
+	memset(i->pci_logaddr,0,i->screensize);
+	memset(i->shadow,0,i->screensize);
+	screen_clear(&i->softc,i->screensize/2);
+	i->state.pointer.vinit = i->live.pointer.vinit = ~0;
+	i->state.vinit = i->live.vinit = ~0;
+
+	/* Initialise scrstate */
+	i->scrstate.screen = i->pci_logaddr;
+	i->scrstate.shadow = i->shadow;
+	i->scrstate.byte_base = i->screensize/2; /* TODO might need tweaking for devices with restricted memory */
+	i->scrstate.vinit = ~0;
+	i->scrstate.vend = ~0;
+	i->scrstate.vrender = ~0;
+
+	/* Measure system performance if not done yet */
+	if(!process_rate)
+	{
+		int start = clock();
+		while(clock() == start) {};
+		start = clock();
+		memcmp_len(i->pci_logaddr,i->shadow,0,i->screensize);
+		int end = clock();
+		if(end == start)
+			end++;
+		/* We don't want idle processing to use any more than 20% CPU load (i.e. 1/5) */
+		process_rate = i->screensize/((end-start)*5);
+		/* Round up to quadword */
+		process_rate = (process_rate+15) & ~15;
+		dprintf(("","process_rate set to %d bytes per tick\n",process_rate));
+	}
+
+#ifdef DEBUGLIB
+	/* Default startup mode is 640x480 16bpp */
+	i->startupmode[0] = 1;
+	i->startupmode[1] = 640;
+	i->startupmode[2] = 480;
+	i->startupmode[3] = 4;
+	i->startupmode[4] = -1;
+	i->startupmode[5] = 0;
+	i->startupmode[6] = ModeFlag_64k+ModeFlag_DataFormatSub_RGB;
+	i->startupmode[7] = -1;
+#endif
+
+	/* Now register with GraphicsV */
+	/* TODO include something more device-specific in the driver name (serial number? product name?) */
+	sprintf(i->devname,"UDLVideo#%04x_%04x",UGETW(ddesc->idProduct),UGETW(ddesc->bcdDevice));
+	int number;
+	e = _swix(OS_ScreenMode,_INR(0,2)|_OUT(0),ScreenModeReason_RegisterDriver,0,i->devname,&number);
+	if(e)
+	{
+		dprintf(("","RegisterDriver failed, error %08x %s\n",e->errnum,e->errmess));
+		goto fail4;
+	}
+	dprintf(("","Device %s assigned GraphicsV driver number %d\n",devname,number));
+	i->graphicsv_driver_number = number;
+
+	/* Hook into the instance array and get on GraphicsV */
+	instances[i->graphicsv_driver_number] = i;
+	if(!extant_instance_count)
+	{
+		e = _swix(OS_Claim,_INR(0,2),GraphicsV,graphicsv_entry,private_word);
+		if(e)
+		{
+			dprintf(("","OS_Claim GraphicsV failed, error %08x %s\n",e->errnum,e->errmess));
+			goto fail5;
+		}
+		e = _swix(OS_Claim,_INR(0,2),TickerV,tickerv_entry,private_word);
+		if(e)
+		{
+			dprintf(("","OS_Claim TickerV failed, error %08x %s\n",e->errnum,e->errmess));
+			goto fail6;
+		}
+	}
+	extant_instance_count++;
+
+	/* Start the driver */
+	e = _swix(OS_ScreenMode,_INR(0,1),ScreenModeReason_StartDriver,i->graphicsv_driver_number);
+	if(e)
+	{
+		dprintf(("","StartDriver failed, error %08x %s\n",e->errnum,e->errmess));
+		goto fail7;
+	}
+
+	/* Success! */
+	dprintf(("","Device %s successfully started!\n",devname));
+	return;
+
+fail7:
+	if(!--extant_instance_count)
+	{
+		/* Stop ticker */
+		_swix(OS_Release,_INR(0,2),TickerV,tickerv_entry,private_word);
+	}
+fail6:
+	if(!extant_instance_count)
+	{
+		/* Release GraphicsV */
+		_swix(OS_Release,_INR(0,2),GraphicsV,graphicsv_entry,private_word);
+	}
+fail5:
+	/* Unlink instance, relinquish driver number */
+	instances[i->graphicsv_driver_number] = NULL;
+	_swix(OS_ScreenMode,_INR(0,1),ScreenModeReason_DeregisterDriver,i->graphicsv_driver_number);
+fail4:
+	/* Destroy shadow DA */
+	_swix(OS_DynamicArea,_INR(0,1),1,i->shadow_da_number);
+fail3:
+	/* Release PCI RAM */
+	_swix(PCI_RAMFree,_IN(0),i->pci_logaddr);
+fail2:
+fail1:
+	/* Shutdown UDL */
+	udl_detach((struct device *) &i->softc,0);
+fail0:
+	/* Release instance memory */
+	free(i);
+}
+
+static void release_instance(instance_t *i)
+{
+	dprintf(("","Releasing instance %s\n",i->usbdev.devname));
+	/* Indicate to the OS that we're stopping */
+	_swix(OS_ScreenMode,_INR(0,1),ScreenModeReason_StopDriver,i->graphicsv_driver_number);
+
+	if(!--extant_instance_count)
+	{
+		/* Stop ticker */
+		_swix(OS_Release,_INR(0,2),TickerV,tickerv_entry,private_word);
+		/* Release GraphicsV */
+		_swix(OS_Release,_INR(0,2),GraphicsV,graphicsv_entry,private_word);
+	}
+
+	/* Unlink instance, relinquish driver number */
+	instances[i->graphicsv_driver_number] = NULL;
+	_swix(OS_ScreenMode,_INR(0,1),ScreenModeReason_DeregisterDriver,i->graphicsv_driver_number);
+
+	/* Destroy shadow DA */
+	_swix(OS_DynamicArea,_INR(0,1),1,i->shadow_da_number);
+
+	/* Release PCI RAM */
+	_swix(PCI_RAMFree,_IN(0),i->pci_logaddr);
+
+	/* Shutdown UDL */
+	udl_detach((struct device *) &i->softc,0);
+
+	/* Release instance memory */
+	free(i);
+}
+
+static void release_device(const char *devname)
+{
+	for(int idx=0;idx<256;idx++)
+	{
+		instance_t *i = instances[idx];
+		if(i && !strcmp(devname,i->usbdev.devname))
+		{
+			release_instance(i);
+			return;
+		}
+	}
+}
+
+static void enumerate_usb_devices(void)
+{
+	USBServiceAnswer *dev = NULL;
+	_kernel_oserror *e = _swix(OS_ServiceCall,_INR(0,2)|_OUT(2),Service_USB_Connected,Service_USB,0,&dev);
+
+	while(dev)
+	{
+		USBServiceAnswer *next = dev->link;
+
+		if(!e)
+		{
+			enumerate_cb(&dev->svc);
+		}
+
+		_swix(OS_Module, _IN(0)|_IN(2), ModHandReason_Free, dev);
+
+		dev = next;
+	}
+}
+
+_kernel_oserror* module_init (const char *cmd_tail, int podule_base, void *pw)
+{
+	(void) cmd_tail;
+
+	_kernel_oserror *e = NULL;
+    
+	/* set up debugging */
+	debug_initialise(Module_Title, "", "");
+	debug_set_device(DADEBUG_OUTPUT);
+	debug_set_unbuffered_files(TRUE);
+
+	instance = podule_base;
+    
+	private_word = pw;
+
+#ifdef STANDALONE
+	/* Register resources */
+	e = _swix(ResourceFS_RegisterFiles,_IN(0),Resources());
+	if(e)
+		return e;
+#endif
+
+#ifdef SPOOL
+	spool = fopen("spool","wb");
+#endif
+
+	/* Look for any USB devices that are already connected */
+	/* TODO should be done on a callback? */
+	enumerate_usb_devices();
+
+	return e;
+}
+
+_kernel_oserror *module_final(int fatal, int podule, void *pw)
+{
+	(void) podule;
+	(void) fatal;
+	(void) pw;
+
+	/* Shutdown all instances */
+	for(int i=0;i<256;i++)
+		if(instances[i])
+			release_instance(instances[i]);
+
+	/* Free the huffman tables */
+	huffman_shutdown();
+
+	/* Cancel any callback */
+	if(callback_registered)
+		_swix(OS_RemoveCallBack,_INR(0,1),callback_entry,private_word);
+
+#ifdef SPOOL
+	if(spool) fclose(spool);
+#endif
+
+#ifdef STANDALONE
+	_swix(ResourceFS_DeregisterFiles,_IN(0),Resources());
+#endif
+    
+	return NULL;
+}
+
+_kernel_oserror *module_commands(const char *arg_string, int argc, int cmd_no, void *pw)
+{
+	(void) argc;
+	(void) pw;
+	(void) arg_string;
+
+	switch (cmd_no) {
+	case CMD_UDLDevices:
+		for(int idx=0;idx<256;idx++)
+		{
+			instance_t *i = instances[idx];
+			if(i)
+			{
+				printf("Device %d:\n",idx);
+				printf("  USB device: %s\n",i->usbdev.devname);
+				printf("  GraphicsV driver: %d\n",idx);
+				printf("  Chip: %s (%08x)\n",chip_names[i->devcaps.chip],i->devcaps.chip_id);
+				printf("  Fussy huffman: %s\n",(i->devcaps.fussy_huffman?"Yes":"No"));
+				printf("  diff_mode: %02x\n",i->devcaps.diff_mode);
+				printf("  Max FB size: %d pixels\n",i->devcaps.max_total_pixels);
+				printf("  Max FB width: %d pixels\n",i->devcaps.max_width);
+				printf("  Device memory: %06x-%06x\n",i->devcaps.mem_start,i->devcaps.mem_end);
+				printf("  Driver memory: %dMB @ %08x\n",i->screensize>>20,i->pci_logaddr);
+				if(i->softc.sc_width)
+					printf("  Mode: %dx%d %dbpp\n",i->softc.sc_width,i->softc.sc_height,1<<i->log2bpp);
+				printf("  Display: %s\n",(i->live.blank_state?"blanked":"on"));
+#ifdef DEBUGLIB
+				printf("  Startup mode: %dx%d 16bpp\n",i->startupmode[1],i->startupmode[2]);
+#endif
+				printf("  Huffman compression: %s\n",(i->decomp_table_set?(i->huffman_enabled?"enabled":"disabled"):"tables not loaded"));
+				uint32_t status;
+				usbd_status err = udl_poll(&i->softc,&status);
+				printf((err?"  Status: ERR\n":"  Status: %08x\n"),status);
+			}
+		}
+		break;
+#if 0 /* Obsolete */
+	case CMD_UDLProducts:
+		{
+			printf("Vendor Product Chip\n");
+			printf("------ ------- ----\n");
+			/* List system variables first */
+			char varname[32];
+			char val[32];
+			const char *wildcard = "UDLVideo$Product_*_*";
+			_kernel_swi_regs regs;
+			regs.r[1] = (int) val;
+			regs.r[3] = 0;
+			do {
+				regs.r[0] = (int) wildcard;
+				regs.r[2] = sizeof(val)-1;
+				regs.r[4] = 3;
+				if(!_kernel_swi(OS_ReadVarVal,&regs,&regs))
+				{
+					int vendor,product;
+					const char *name = (const char *) regs.r[3];
+					if(name && regs.r[2] && (strlen(name) == 26) && (sscanf(name+17,"%04x_%04x",&vendor,&product) == 2))
+					{
+						val[regs.r[2]] = 0;
+						int chip = chip_matchname(val);
+						printf("  %04x    %04x %s (%s)\n",vendor,product,CHIP_NAME(chip),name);
+					}
+				}
+			} while(regs.r[2]);
+			/* List builtin devices */
+			for(int i=0;i<udl_num_devs;i++)
+			{
+				sprintf(varname,"UDLVideo$Product_%04x_%04x",udl_devs[i].udl_dev.ud_vendor,udl_devs[i].udl_dev.ud_product);
+				printf("  %04x    %04x %s%s\n",udl_devs[i].udl_dev.ud_vendor,udl_devs[i].udl_dev.ud_product,CHIP_NAME(udl_devs[i].udl_chip),(getenv(varname)?" (overridden)":""));
+			}
+		}
+		break;
+#endif
+#ifdef DEBUGLIB
+	case CMD_UDLWriteReg:
+		{
+			uint32_t idx,reg,value;
+			if(sscanf(arg_string,"%u %x %x",&idx,&reg,&value) == 3)
+			{
+				if((idx >= 256) || !instances[idx])
+				{
+					printf("Bad device number\n");
+					return NULL;
+				}
+				if(reg >= 256)
+				{
+					printf("Bad register number\n");
+					return NULL;
+				}
+				if(value >= 256)
+				{
+					printf("Bad register value\n");
+					return NULL;
+				}
+				udl_cmd_write_reg_1(&instances[idx]->softc,reg,value);
+//				udl_cmd_write_reg_1(&instances[idx]->softc, UDL_REG_SYNC, 0xff);
+				udl_cmd_send(&instances[idx]->softc);
+				printf("Wrote %02x to reg %02x of %s\n",value,reg,instances[idx]->usbdev.devname);
+			}
+			else
+			{
+				printf("Bad arguments\n");
+			}
+		}
+		break;
+	case CMD_UDLStartupMode:
+		{
+			uint32_t idx,width,height;
+			if(sscanf(arg_string,"%u %u %u",&idx,&width,&height) == 3)
+			{
+				if((idx >= 256) || !instances[idx])
+				{
+					printf("Bad device number\n");
+					return NULL;
+				}
+				instances[idx]->startupmode[1] = width;
+				instances[idx]->startupmode[2] = height;
+				printf("%dx%d startup mode selected\n",width,height);
+			}
+			else
+			{
+				printf("Bad arguments\n");
+			}
+		}
+		break;
+	case CMD_UDLHuffman:
+		{
+			uint32_t idx,enable;
+			if(sscanf(arg_string,"%u %u",&idx,&enable) == 2)
+			{
+				if((idx >= 256) || !instances[idx])
+				{
+					printf("Bad device number\n");
+					return NULL;
+				}
+				instances[idx]->huffman_enabled = (enable?instances[idx]->decomp_table_set:false);
+				printf("Huffman compression %s\n",(instances[idx]->huffman_enabled?"enabled":"disabled"));
+			}
+			else
+			{
+				printf("Bad arguments\n");
+			}
+		}
+		break;
+	case CMD_UDLTest:
+		{
+			uint32_t idx,width,height,bpp;
+			char file[256];
+			if(sscanf(arg_string,"%u %u %u %u %s",&idx,&width,&height,&bpp,file) == 5)
+			{
+				if((idx >= 256) || !instances[idx])
+				{
+					printf("Bad device number\n");
+					return NULL;
+				}
+				instance_t *i = instances[idx];
+				/* Get some mode timings */
+				int mode[6];
+				mode[0] = 1;
+				mode[1] = width;
+				mode[2] = height;
+				mode[3] = 3;
+				mode[4] = -1;
+				mode[5] = -1;
+				int ret = 0;
+				VIDCList3 *vidclist = NULL;
+				_swix(OS_ServiceCall,_INR(1,3)|_OUT(1)|_OUT(3),Service_ModeExtension,mode,7,&ret,&vidclist);
+				if(ret || !vidclist)
+				{
+					printf("Failed to get mode\n");
+					return NULL;
+				}
+				/* Copy VIDC list and poke it */
+				VIDCList3 mylist = *vidclist;
+				mylist.PixelDepth = (bpp==16?4:5);
+				mylist.ControlList[0].index = -1;
+				/* Set mode */
+				_swix(OS_CallAVector,_IN(0)|_IN(4)|_IN(9),&mylist,(idx<<24)|GraphicsV_SetMode,GraphicsV);
+				_swix(OS_CallAVector,_INR(0,1)|_IN(4)|_IN(9),GVDAG_VInit,i->pci_physaddr,(idx<<24)|GraphicsV_SetDMAAddress,GraphicsV);
+				_swix(OS_CallAVector,_INR(0,1)|_IN(4)|_IN(9),GVDAG_VRender,i->pci_physaddr,(idx<<24)|GraphicsV_SetDMAAddress,GraphicsV);
+				/* Open the sprite file */
+				FILE *f = fopen(file,"rb");
+				if(!f)
+				{
+					printf("Failed to open sprite file\n");
+					return NULL;
+				}
+				fseek(f,0,SEEK_END);
+				int srcsize = ftell(f);
+				fseek(f,0,SEEK_SET);
+				/* Create a temp sprite large enough for the screen. Not writing directly to screen memory as it may overflow due to the header! */
+				int size = srcsize+1024+((width*height)<<(mylist.PixelDepth-3));
+				int *area = (int *) malloc(size);
+				if(!area)
+				{
+					printf("Failed to get temp sprite area\n");
+					fclose(f);
+					return NULL;
+				}
+				memset(area,0,size);
+				area[0] = size;
+				/* Load source sprite */
+				fread(area+1,srcsize,1,f);
+				fclose(f);
+				/* Create our temp sprite */
+				if(_swix(OS_SpriteOp,_INR(0,6),15+256,area,"udl",0,width,height,(mylist.PixelDepth==4?0x78a04051:0x301680b5)))
+				{
+					printf("Failed to create sprite\n");
+					free(area);
+					return NULL;
+				}
+				_kernel_swi_regs regs;
+				regs.r[0] = 60+256;
+				regs.r[1] = (int) area;
+				regs.r[2] = (int) "udl";
+				regs.r[3] = 0;
+				if(_kernel_swi(OS_SpriteOp,&regs,&regs))
+				{
+					printf("Failed to switch output\n");
+					free(area);
+					return NULL;
+				}
+				/* Plot */
+				_swix(OS_SpriteOp,_INR(0,7),52+512,area,area+4,0,0,8+16,0,0);
+				_kernel_swi(OS_SpriteOp,&regs,&regs);
+				/* Copy over to screen memory */
+				memcpy(i->pci_logaddr,area+1+(srcsize/4)+11,(width*height)<<(mylist.PixelDepth-3));
+				free(area);
+			}
+			else
+			{
+				printf("Bad arguments\n");
+			}
+		}
+		break;
+	case CMD_UDLDumpRegs:
+		{
+			uint32_t idx;
+			if(sscanf(arg_string,"%u",&idx) == 1)
+			{
+				if((idx >= 256) || !instances[idx])
+				{
+					printf("Bad device number\n");
+					return NULL;
+				}
+				for(int i=0;i<256;i++)
+				{
+					uint8_t reg;
+					usbd_status err = udl_read_1(&instances[idx]->softc,0xc300+i,&reg);
+					if(err)
+						printf("%02x: ERR\n",i);
+					else
+						printf("%02x: %02x\n",i,reg);
+				}
+			}
+			else
+			{
+				printf("Bad arguments\n");
+			}
+		}
+		break;
+	case CMD_UDLPeek:
+		{
+			uint32_t idx,addr,len;
+			if(sscanf(arg_string,"%u %u %u",&idx,&addr,&len) == 3)
+			{
+				while(len--)
+				{
+					uint8_t reg;
+					usbd_status err = udl_read_1(&instances[idx]->softc,addr,&reg);
+					if(err)
+						printf("%04x: ERR\n",addr);
+					else
+						printf("%04x: %02x\n",addr,reg);
+					addr++;
+				}
+			}
+			else
+			{
+				printf("Bad arguments\n");
+			}
+		}
+		break;
+#endif /* DEBUGLIB */
+	}
+	return NULL;
+}
+
+void module_service(int service_number, _kernel_swi_regs *r, void *pw)
+{
+	(void) pw;
+
+	switch(service_number)
+	{
+	case Service_USB:
+		if(r->r[0] == Service_USB_Attach)
+		{
+			const USBServiceCall *svc = (const USBServiceCall *) r->r[2];
+			enumerate_cb(svc);
+		}
+		break;
+	case Service_DeviceDead:
+		{
+			const char *devname = (const char *) r->r[3];
+			if(devname && (devname[0] == 'U') && (devname[1] == 'S') && (devname[2] == 'B'))
+			{
+				release_device(devname);
+			}
+		}
+		break;
+	}
+}
+
+int tickerv_handler(_kernel_swi_regs *r,void *pw)
+{
+	(void) r;
+	(void) pw;
+
+	if(!callback_registered && extant_instance_count)
+	{
+		/* Just register a callback and exit */
+		callback_registered = (_swix(OS_AddCallBack,_INR(0,1),callback_entry,private_word) == NULL);
+	}
+	return 1;
+}
+
+_kernel_oserror *callback_handler(_kernel_swi_regs *r,void *pw)
+{
+	(void) r;
+	(void) pw;
+
+	if(!extant_instance_count)
+	{
+		callback_registered = false;
+		return NULL;
+	}
+
+	/* Update blanking state and display offsets for all devices
+	   We also count up the number of unblanked displays, so we can work out how much processing to do per device */
+	int active_instance_count = 0;
+	for(int idx=0;idx<256;idx++)
+	{
+		instance_t *i = instances[idx];
+		if(!i)
+			continue;
+
+		if(i->usbdev.broken)
+		{
+			/* If the device is broken, wait for the timeout error, otherwise we're likely to hang if we try releasing it */
+			my_pipe *mpipe = (my_pipe *) i->softc.sc_tx_pipeh;
+			my_usbdev *mdev = (my_usbdev *) i->softc.sc_iface;
+			uint32_t status;
+			_kernel_oserror *e = _swix(DeviceFS_CallDevice,_INR(0,2)|_OUT(3),DeviceCall_USB_TransferInfo,mdev->devname,mpipe->strh,&status);
+			if(e)
+			{
+				dprintf(("","error when waiting for broken device to timeout: %08x %s\n",e->errnum,e->errmess));
+				continue;
+			}
+			if(!status)
+			{
+				continue;
+			}
+			dprintf(("","Resetting broken device %s\n",i->usbdev.devname));
+			char cmd[32];
+			sprintf(cmd,"USBReset %s",i->usbdev.devname+3);
+			/* Release the device before resetting it */
+			release_device(i->usbdev.devname);
+			/* Reset it */
+			_swix(OS_CLI,_IN(0),cmd);
+			/* Give up on this ticker event */
+			callback_registered = false;
+			return NULL;
+			/* Note that even though we've *USBReset the device, there's no guarantee that it'll have reset it properly! Sometimes manually pulling the power seems to be the only way. */
+		}
+
+		/* Update blanking state and display offsets */
+		update_state(i);
+
+		if(!i->live.blank_state)
+			active_instance_count++;
+	}
+
+	/* Exit if no screen memory updates are required */
+	if(!active_instance_count)
+	{
+		callback_registered = false;
+		return NULL;
+	}
+
+	/* Work out how many bytes to process per device */
+	int amount_per_device = process_rate/active_instance_count;
+	amount_per_device = amount_per_device & ~3;
+
+	for(int idx=0;idx<256;idx++)
+	{
+		instance_t *i = instances[idx];
+		if(!i)
+			continue;
+
+		/* Skip this device if it's blanked or we're in an inconsistent state
+		   TODO - Could background SetDAG calls screw us over here? */
+		if(i->live.blank_state || i->usbdev.broken || (i->scrstate.vinit == ~0) || (i->scrstate.vend == ~0) || (i->scrstate.vend <= i->scrstate.vinit))
+			continue;
+
+		int process_amount = i->scrstate.stride*i->softc.sc_height;
+		if(process_amount > amount_per_device)
+			process_amount = amount_per_device;
+
+		bool update_pointer = memcmp(&i->state.pointer,&i->live.pointer,sizeof(pointer_t));
+		bool updated;
+
+		if(i->log2bpp == 4)
+		{
+			if(update_pointer && (i->live.pointer.vinit != ~0))
+				pointer_remove_16(i,&i->live.pointer);
+			updated = screen_process_16(i,process_amount);
+			if(update_pointer || (updated && (i->state.pointer.vinit != ~0)))
+			{
+				if(update_pointer)
+				{
+					/* Copy and then render from the copy to avoid problems caused by i->pointer being updated under IRQ while we're in the middle of rendering */
+					i->live.pointer = i->state.pointer;
+				}
+				pointer_show_16(i,&i->live.pointer);
+			}
+		}
+		else
+		{
+			if(update_pointer && (i->live.pointer.vinit != ~0))
+				pointer_remove_24(i,&i->live.pointer);
+			updated = screen_process_24(i,process_amount);
+			if(update_pointer || (updated && (i->state.pointer.vinit != ~0)))
+			{
+				if(update_pointer)
+				{
+					i->live.pointer = i->state.pointer;
+				}
+				pointer_show_24(i,&i->live.pointer);
+			}
+		}
+		if(updated || update_pointer)
+		{
+			/* A dummy command appears to be necessary here in order to force the last command to be processed. Otherwise it looks like the last render command will only get flushed to screen when the next command is received, which may not be for some time if the screen is static. */
+			udl_cmd_send(&i->softc);
+		}
+	}
+	callback_registered = false;
+	return NULL;
+}

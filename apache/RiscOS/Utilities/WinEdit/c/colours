@@ -1,0 +1,564 @@
+/* Copyright 2003 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*-*-C-*-
+ *
+ * Manipulate window colours.
+ */
+
+#include "resed.h"
+
+
+/*
+ * This is a singly-instantiated dialogue.
+ * Remember whether we are open or not.
+ */
+
+static Bool open = FALSE;
+
+static MenuPtr menu16 = NULL;
+static MenuPtr menu17 = NULL;           /* with Transparent */
+
+/* Which text colour to use on which coloured background */
+
+static int uncolour[16];
+
+/*
+ * Which resource is the dbox currently displaying?  When NULL, the
+ * box is inactive and should be greyed.
+ */
+
+static ResourcePtr disp = NULL;
+static WindowPtr window;
+static int nameindex;
+
+
+/*
+ * How the icons and menus relate.  Also used for shading
+ */
+
+static struct
+{
+    int dispicon,        menuicon;                 Bool transp;
+} info[] =
+{
+    I_COLOURS_TITLE_FG,  I_COLOURS_TITLE_FG_MENU,  TRUE,
+    I_COLOURS_TITLE_BG,  I_COLOURS_TITLE_BG_MENU,  FALSE,
+    I_COLOURS_FOCUS_BG,  I_COLOURS_FOCUS_BG_MENU,  FALSE,
+    I_COLOURS_WORK_FG,   I_COLOURS_WORK_FG_MENU,   FALSE,
+    I_COLOURS_WORK_BG,   I_COLOURS_WORK_BG_MENU,   TRUE,
+    I_COLOURS_SCROLL_FG, I_COLOURS_SCROLL_FG_MENU, FALSE,
+    I_COLOURS_SCROLL_BG, I_COLOURS_SCROLL_BG_MENU, FALSE,
+};
+    
+
+/*
+ * Create the window, but don't open it yet.  This step is done once at the
+ * beginning of execution.
+ */
+
+error * colours_load_prototypes ()
+{
+    int i;
+
+    ER ( wimp_load_template("Colours", &window) );
+    ER ( _swix(Wimp_CreateWindow, _IN(1) | _OUT(0),
+               &window->visarea,
+               &window->handle) );
+    ER ( registry_register_window (window->handle, Colours, (void *) window) );
+
+
+    /* Use this opportunity to create menus.  Don't bother about
+     * their proper item colours yet, we'll do that when
+     * we post them.
+     */
+
+    ER ( menu_create (16, message_lookup(&msgs, "Colour"), &menu16) );
+    ER ( menu_create (17, message_lookup(&msgs, "Colour"), &menu17) );
+    for (i = 0; i < 16; i++)
+    {
+        char colour[10];
+        sprintf(colour, "%d", i);
+        ER ( menu_entry (menu16, i, colour, 0, 0, -1, -1, NULL) );
+        ER ( menu_entry (menu17, i, colour, 0, 0, -1, -1, NULL) );
+    } 
+    ER ( menu_entry (menu17, 16, message_lookup(&msgs, "Transp"), 0, 0, -1, -1, NULL) );
+
+
+    /* Determine index of the window name in the title string.
+     * If the message is not found, then atoi on the tag string
+     * will return zero, so the name will start at the beginning
+     * of the titlebar... harmless.
+     */
+
+    nameindex = atoi(message_lookup (&msgs, "ColInd"));
+
+    /* Check the palette for opposite colours
+     */
+
+    colours_palette();
+
+    return NULL;
+}
+
+
+/*
+ * Get all icon settings from the window flags
+ */
+
+static error * get_values (ResourcePtr res)
+{
+    /* Do the colour selectors */
+    colours_set_colour_display (window, I_COLOURS_TITLE_FG,
+                                 (res->window.colours.titleFG == 0xff) ? 16 : res->window.colours.titleFG);
+    colours_set_colour_display (window, I_COLOURS_TITLE_BG, res->window.colours.titleBG);
+    colours_set_colour_display (window, I_COLOURS_FOCUS_BG, res->window.colours.focusBG);
+
+    colours_set_colour_display (window, I_COLOURS_WORK_FG, res->window.colours.workFG);
+    colours_set_colour_display (window, I_COLOURS_WORK_BG,
+                                 (res->window.colours.workBG == 0xff) ? 16 : res->window.colours.workBG);
+
+    colours_set_colour_display (window, I_COLOURS_SCROLL_FG, res->window.colours.scrollFG);
+    colours_set_colour_display (window, I_COLOURS_SCROLL_BG, res->window.colours.scrollBG);
+
+    return NULL;
+}
+
+
+
+/*
+ * Set all window flags from the icon settings.  Activated by the OK
+ * button.  This has to delete and re-create the window (but only
+ * if it is open).
+ */
+
+static error * set_values (ResourcePtr res)
+{
+    int col;
+
+    col = colours_get_colour_display(window, I_COLOURS_TITLE_FG);
+    res->window.colours.titleFG = col == 16 ? 0xff : col;
+    res->window.colours.titleBG = colours_get_colour_display(window, I_COLOURS_TITLE_BG);
+    res->window.colours.focusBG = colours_get_colour_display(window, I_COLOURS_FOCUS_BG);
+    res->window.colours.workFG = colours_get_colour_display(window, I_COLOURS_WORK_FG);
+    res->window.colours.scrollFG = colours_get_colour_display(window, I_COLOURS_SCROLL_FG);
+    res->window.colours.scrollBG = colours_get_colour_display(window, I_COLOURS_SCROLL_BG);
+
+    col = colours_get_colour_display(window, I_COLOURS_WORK_BG);
+    if (col == 16)
+        col = 0xff;
+    if (col != res->window.colours.workBG)
+    {
+        int i;
+        for (i = 0; i < res->numicons; i++)
+        {
+            IconInfoPtr icon = res->icons + i;
+            if (icon->owner == NULL || icon->owner->type < 0 || icon->owner->type >= NUM_TYPES)
+                continue;
+            if (icon->owner->u.master == i)
+            {
+                int j;
+                for (j = 0; j < numicons[icon->owner->type]; j++)
+                    if (icon->owner->u.rawicons[j] != -1 && (trackbgcolour[icon->owner->type] & BIT(j)))
+                        props_set_icon_bg (res->icons + icon->owner->u.rawicons[j], col);
+            }
+        }
+
+        res->window.colours.workBG = col;
+    }
+            
+    /*
+     * Now if the window is open, we need to delete/recreate it
+     * to effect the change as far as the window manager is concerned.
+     */
+
+    if (res->window.handle != -1)
+    {
+        WindowRec temp;
+        unsigned int flags = res->window.flags;
+
+        /* Get 'behind' handle afresh */
+        _swix(Wimp_GetWindowState, _IN(1),
+              &res->window);
+        res->window.flags = flags;
+        temp = res->window;
+
+        if (res->window.colours.workBG == 0xff)
+            temp.colours.workBG = 0;
+
+        ER ( registry_deregister_window (res->window.handle) );
+        ER ( _swix(Wimp_DeleteWindow, _IN(1),
+                   &res->window) );
+
+        /* Create window, doctoring some of the flag values */
+        temp.flags &= ~(WF_AUTO_REDRAW | WF_BACKDROP);
+        temp.workareaflags = 10 << 12;
+        ER ( _swix(Wimp_CreateWindow, _IN(1) | _OUT(0),
+                   &temp.visarea,
+                   &res->window.handle) );
+        ER ( registry_register_window(res->window.handle, Template, (void *) res) );
+
+        /* Raise */
+        ER ( _swix(Wimp_OpenWindow, _IN(1),
+                   &res->window) );
+    }
+
+    return document_modified (res->owner, TRUE);
+}
+
+
+    
+/*
+ * Open window (and/or bring it to the top)
+ */
+
+error * colours_show_window ()
+{
+    colours_retitle (disp);
+    window->behind = -1;
+    ER ( _swix(Wimp_OpenWindow, _IN(1),
+               window) );
+    open = TRUE;
+    return NULL;
+}
+
+
+
+static error * shade_all (Bool shaded)
+{
+    unsigned int eor = shaded ? IF_SHADED : 0;
+    int i;
+    for (i = 0; i < NUMBER(info); i++)
+    {
+        ER ( dbox_iconflag (window, info[i].dispicon, IF_SHADED, eor) );
+        ER ( dbox_iconflag (window, info[i].menuicon, IF_SHADED, eor) );
+    }
+    return NULL;
+}
+
+
+
+/*
+ * If win is NULL, then shade the whole window.
+ * If win is non-NULL, unshade and setup the window.
+ * Don't auto-open it though.
+ */
+
+error * colours_select (ResourcePtr res)
+{
+    dprintf("colours_select %x\n" _ (int) res);
+
+    if (res == disp)
+    {
+        return NULL;
+    }
+
+    else if (res && !disp)
+    {
+        dprintf("Unshading window\n");
+        ER ( shade_all (FALSE) );
+    }
+    else if (!res && disp)
+    {
+        dprintf("Shading window\n");
+        ER ( shade_all (TRUE) );
+    }
+
+    disp = res;
+    colours_retitle (res);    
+
+    if (disp)
+    {
+        ER ( get_values (disp) );
+    }
+    return NULL;
+}
+
+
+
+/*
+ * Change the titlebar of the colours window.  This is called
+ * when colours_select, and also when the user renames a resource.
+ * NB: the name field of res is expected to fit!  (and should).
+ */
+
+error * colours_retitle (ResourcePtr res)
+{
+    char *title = (char *) window->titledata[0];
+    if (res)
+        sprintf (title + nameindex, " - %s", res->name);
+    else
+        title[nameindex] = 0;
+
+    if (open)
+    {
+        WindowRedrawRec win, vis;
+        win.handle = vis.handle = window->handle;
+        ER ( _swix(Wimp_GetWindowOutline, _IN(1),
+                   &win) );
+        ER ( _swix(Wimp_GetWindowState, _IN(1),
+                   &vis) );
+dprintf("FORCE of %d %d %d %d\n" _ win.visarea.minx _ vis.visarea.maxy _ win.visarea.maxx _ win.visarea.maxy);
+        ER ( _swix(Wimp_ForceRedraw, _INR(0,4),
+                   -1, win.visarea.minx, vis.visarea.maxy, win.visarea.maxx, win.visarea.maxy) );
+    }
+    return NULL;
+}
+
+
+
+/*
+ * Receive mouse clicks.
+ */
+
+error * colours_mouse_click (MouseClickPtr mouse, unsigned int modifiers)
+{
+    int i;
+    switch (mouse->buttons)
+    {
+    case MB_CLICK(MB_SELECT):
+    case MB_CLICK(MB_ADJUST):
+        dprintf("click on button %d\n" _ mouse->iconhandle);
+
+        switch (mouse->iconhandle)
+        {
+        case I_COLOURS_OK:
+            if (disp)
+            {
+                ER ( set_values (disp) );
+                if (mouse->buttons == MB_CLICK(MB_SELECT))
+                {
+                    ER ( colours_close_window () );
+                }
+            }
+            break;
+        case I_COLOURS_CANCEL:
+            ER ( colours_close_window () );
+            break;
+        default:
+            for (i = 0; i < NUMBER(info); i++)
+                if (info[i].menuicon == mouse->iconhandle)
+                {
+                    colours_do_colour_menu (window, info[i].dispicon, &mouse->position, info[i].transp);
+                    break;
+                }
+            break;
+        }
+        break;
+
+    case MB_MENU:
+        for (i = 0; i < NUMBER(info); i++)
+            if (info[i].menuicon == mouse->iconhandle || info[i].dispicon == mouse->iconhandle)
+            {
+                colours_do_colour_menu (window, info[i].dispicon, &mouse->position, info[i].transp);
+                break;
+            }
+        break;
+    }
+    return NULL;
+}
+
+
+
+/*
+ * Close window if open.  Leave the window created though.
+ */
+
+error * colours_close_window ()
+{
+    if (open)
+    {
+        ER ( _swix(Wimp_CloseWindow, _IN(1),
+                   window) );
+        ER ( colours_select (NULL) );
+        open = FALSE;
+    }
+    return NULL;
+}
+
+
+/* 
+ * Respond to open_window_request on the colours window.
+ * Note: the 'win' parameter is only a partial window structure
+ * (just the fields returned with Open_Window_Request).
+ */
+
+error * colours_open_window (WindowPtr win)
+{
+    window->visarea = win->visarea;
+    window->scrolloffset = win->scrolloffset;
+    window->behind = win->behind;
+    return _swix(Wimp_OpenWindow, _IN(1),
+                 window);
+}
+
+
+ResourcePtr colours_current ()
+{
+    return disp;
+}
+
+
+/*
+ * Look at the palette, and decide which contrasting colours
+ * to use for menu entries.  Store in uncolour[].
+ */
+
+void colours_palette ()
+{
+    unsigned int pal[20];
+    int bright[16], c, d;
+
+    if ( _swix(Wimp_ReadPalette, _IN(1),
+               &pal) != NULL)
+        return;
+    
+    for (c = 0; c < 16; c++)
+    {
+        int b = (pal[c] & 0xff000000) >> 24;
+        int g = (pal[c] & 0x00ff0000) >> 16;
+        int r = (pal[c] & 0x0000ff00) >>  8;
+        bright[c] = r + g + g + b;
+    }
+
+    for (c = 0; c < 16; c++)
+    {
+        int maxe = -1, maxd;
+        for (d = 0; d < 16; d++)
+        {
+            int e = abs (bright[d] - bright[c]);
+            if (e > maxe)
+            {
+                maxe = e;
+                maxd = d;
+            }
+        }
+        uncolour[c] = maxd;
+    }
+
+    /*
+     * Now poke the icons showing fg/bg colours, so that
+     * they have the correct text colour
+     */
+
+    for (c = 0; c < NUMBER(info); c++)
+        colours_set_colour_display (window, info[c].dispicon, -1);
+}
+
+
+/*
+ * Fix up the colours of a colour menu just before
+ * posting it.
+ */
+
+static error * colours_colour_menu (MenuPtr menu)
+{
+    int c;
+    int len = menu == menu16 ? 16 : 17;
+    for (c = 0; c < len; c++)
+    {
+        int c2 = (c < 16) ? c : 0;
+        ER ( menu_alter_entry (menu, c,
+                               0, 0,
+                               uncolour[c2], c2) );
+    }
+    return NULL;
+}
+
+
+
+/*
+ * Return value of colour setting.
+ */
+
+int colours_get_colour_display (WindowPtr win, int icon)
+{
+    char *col = dbox_getstring (win, icon);
+    if (strcmp(col, message_lookup (&msgs, "Transp")) == 0)
+        return 16;
+    else
+        return atoi (col);
+}
+
+
+
+/*
+ * Set the text and colour of the colour value.
+ * Pass 16 to mean "transparent", which is done in the
+ * same colours as entry 0.
+ */
+
+void colours_set_colour_display (WindowPtr win, int icon, int value)
+{
+    dprintf("COLOURS_SET_COLOUR_DISPLAY to %d\n" _ value);
+    if (value == 16)
+        dbox_setstring (win, icon, message_lookup(&msgs, "Transp"));
+    else if (value != -1)
+        dbox_setint (win, icon, value);
+    else
+        value = colours_get_colour_display(win, icon);
+
+    block
+    {
+        int dispval = (value == 16) ? 0 : value;
+        dbox_iconflag (win, icon,
+                       IF_FIELD(FG, IF_FG_MASK) | IF_FIELD(BG, IF_BG_MASK),
+                       IF_FIELD(FG, uncolour[dispval]) | IF_FIELD(BG, dispval));
+    }
+}
+
+
+
+/*
+ * Colour menu stuff
+ */
+
+static struct
+{
+    WindowPtr window;
+    int icon;
+} menuinfo;
+
+
+/*
+ * Colour menu callback.  Called with choice == NULL if the menu is
+ * being cancelled.
+ */
+
+static error * callback (MenuPtr menu, int *choice, void *closure, Bool reopen)
+{
+    if (choice != NULL)
+    {
+        dprintf("COLOUR MENU HIT %d\n" _ *choice);
+        if (*choice >= 0)
+        {
+            colours_set_colour_display (menuinfo.window, menuinfo.icon, *choice);
+            if (reopen)
+                    menu_tick_menu (menu, *choice);
+        }
+    }
+    return NULL;
+}
+
+
+error * colours_do_colour_menu (WindowPtr window, int icon, PointPtr position, Bool transp)
+{
+    MenuPtr menu = transp ? menu17 : menu16;
+    colours_colour_menu (menu);
+    menu_tick_menu (menu, colours_get_colour_display (window, icon));
+    menuinfo.window = window;
+    menuinfo.icon = icon;
+    return menu_post (menu, position, FALSE, callback, NULL);
+}
+

@@ -1,0 +1,643 @@
+/* ro_wild.c
+   Wildcarded (file,directory) name expansion library
+   Copyright (C) 1999 Darren Salt
+   All rights reserved.
+
+   Redistribution and use in source and binary forms, with or without
+   modification, are permitted provided that the following conditions are
+   met:
+   1. Redistributions of source code must retain the above copyright notice,
+   this list of conditions and the following disclaimer.
+   2. Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in the
+   documentation and/or other materials provided with the distribution.
+   3. All advertising materials mentioning features or use of this software
+   must display the following acknowledgement:
+   This product includes software developed by Darren Salt.
+   4. The name of the author may not be used to endorse or promote products
+   derived from this software without specific prior written permission.
+
+   This software is provided by the author "as is" and any express or implied
+   warranties including, but not limited to, the implied warranties of
+   merchantability and fitness for a particular purpose are disclaimed. in no
+   event shall the author be liable for any direct, indirect, incidental,
+   special, exemplary, or consequential damages (including, but not limited
+   to, procurement of substitute goods or services; loss of use, data, or
+   profits; or business interruption) however caused and on any theory of
+   liability, whether in contract, strict liability, or tort (including
+   negligence or otherwise) arising in any way out of the use of this
+   software, even if advised of the possibility of such damage.
+ */
+
+/* Written by Darren Salt <ds@youmustbejoking.demon.co.uk>.  */
+
+#include "system.h"
+#include "ro_wild.h"
+#include <stdarg.h>
+#include <swis.h>
+
+
+#define zfree(x) { free((x)); (x) = 0; }
+
+
+/* Returns "s1.s2".  */
+static char *
+strdup1 (const char *s1, const char *s2)
+{
+  char *x = xmalloc (strlen (s1) + strlen (s2) + 2);
+  sprintf (x, "%s.%s", s1, s2);
+  return x;
+}
+
+
+/* For a path of the form "path:foo", return the value of <path$Path>.  */
+static char *
+pathvar (const char *path)
+{
+  const char *colon = strchr (path, ':');
+  if (colon && colon != path && colon[1] != ':' /* not "::" */ )
+    {
+      int l = colon++ - path;
+      char *name = xmalloc (l + 6);
+      char *value;
+      memcpy (name, path, l);
+      strcpy (name + l, "$Path");
+      value = ds_getenv (name);
+#ifdef DEBUG
+      fprintf (stderr, "path: %s\n", name);
+#endif
+      free (name);
+      return value ? xstrdup (value) : 0;
+    }
+  else
+    return 0;
+}
+
+
+/* Return 1 if the given name is of the form "path:foo" and <path$Path>
+ * contains at least one comma.  */
+static int
+is_pathvar (const char *path)
+{
+  char *p = pathvar (path);
+  char *comma = p ? strchr (p, ',') : 0;
+  if (p)
+    free (p);
+  return p != 0 && comma != 0;
+}
+
+
+/*** Dir cacheing ***/
+/* Possible future improvements:
+ * - Sort cache entries & binary search when looking up a dir/wild pair
+ */
+
+typedef struct {
+  char *name;
+  char *wild;
+  char *entries; /* not really char, but need sizeof (*entries) == 1 */
+  int *offsets;
+  int count;
+} dir_cache_entry;
+
+static int dir_cache_entries;
+static dir_cache_entry *dir_cache;
+
+
+/* Is this dir/wildcard combination cached? */
+static int
+check_cached_dir (const char *name, const char *wild)
+{
+  int i;
+#ifdef DEBUG
+  fprintf (stderr, "checking cache for dir %s (wild %s)\n", name, wild);
+#endif
+  for (i = 0; i < dir_cache_entries; i++)
+    if (dir_cache[i].name
+	&& !strcasecmp (name, dir_cache[i].name)
+	&& !strcasecmp (wild, dir_cache[i].wild))
+      return i + 1;
+  return 0;
+}
+
+
+/* Cache this dir/wildcard combination if not already done so.
+ * Return the cache buffer number. */
+static int
+cache_dir (const char *name, const char *wild)
+{
+  int i, offset;
+  dir_cache_entry dir;
+  size_t size = 4096;
+  int index, objects;
+  int entry;
+
+  i = check_cached_dir (name, wild);
+  if (i)
+    {
+#ifdef DEBUG
+      fprintf (stderr, "already cached (%i)\n", i);
+#endif
+      return i;
+    }
+
+  entry = 0;
+  if (dir_cache_entries)
+    {
+      for (; entry < dir_cache_entries; ++entry)
+	if (!dir_cache[entry].name)
+	  break;
+    }
+#ifdef DEBUG
+      fprintf (stderr, "cacheing (%i)\n", i+1);
+#endif
+  if (entry == dir_cache_entries)
+    {
+      dir_cache_entry *p;
+      i = dir_cache_entries + 8;
+      p = malloc (i * sizeof (dir_cache_entry));
+      if (!p)
+	return 0;
+      memset (p + dir_cache_entries, 0, 8 * sizeof (dir_cache_entry));
+      if (dir_cache)
+        memcpy (p, dir_cache, dir_cache_entries * sizeof (dir_cache_entry));
+      free (dir_cache);
+      dir_cache = p;
+      dir_cache_entries = i;
+    }
+
+  dir.name = dir.wild = 0;
+  dir.entries = 0;
+  dir.offsets = 0;
+  dir.count = 0;
+
+  dir.name = strdup (name);
+  dir.wild = strdup (wild);
+  dir.entries = malloc (size);
+  if (!dir.name || !dir.wild || !dir.entries)
+    goto uncached;
+
+  index = objects = offset = 0;
+
+  do
+    {
+      if (size - index < 1024)
+	{
+	  dir.entries = realloc (dir.entries, size += 4096);
+	  if (!dir.entries)
+	    goto uncached;
+	}
+      if (_swix (12 /*OS_GBPB */ , 0x7F | 1 << 28 | 1 << 27,
+		 10, name, dir.entries + index, 1, offset, size - index,
+		 wild,  &i, &offset))
+	goto uncached;		/* fail quietly */
+      dir.count += i;
+      dir.offsets = realloc (dir.offsets, (dir.count + 1) * sizeof (int));
+      if (!dir.offsets)
+	goto uncached;
+      while (i)
+	{
+	  dir.offsets[dir.count - i] = index;
+	  index += 24;
+	  index += strlen (dir.entries + index);
+	  index = (index + 4) & ~3;
+	  i--;
+	}
+      dir.offsets[dir.count] = index;
+    }
+  while (offset != -1);
+
+  dir.entries = xrealloc (dir.entries, index);
+  dir_cache[entry] = dir;
+  return entry + 1;
+
+uncached:
+#ifdef DEBUG
+  fprintf (stderr, "cache failed\n");
+#endif
+  free (dir.name);
+  free (dir.wild);
+  free (dir.entries);
+  free (dir.offsets);
+  return 0;
+}
+
+
+/* Uncache a dir/wildcard combination */
+static void
+uncache_dir (int entry)
+{
+  if (entry > 0 && entry <= dir_cache_entries && dir_cache[entry - 1].name)
+    {
+      dir_cache_entry *d = &dir_cache[entry - 1];
+#ifdef DEBUG
+  fprintf (stderr, "uncacheing entry %i\n", entry);
+#endif
+      free (d->name);
+      free (d->wild);
+      free (d->entries);
+      free (d->offsets);
+      d->name = 0;
+    }
+}
+
+
+/* Get an entry from a dir/wildcard cache */
+static int
+get_entry (int cache, void *buffer, size_t bufsize, int *read, int *offset)
+{
+  dir_cache_entry *d = &dir_cache[cache - 1];
+  int i;
+  if (cache < 1 || cache > dir_cache_entries || !d->name)
+    {
+#ifdef DEBUG
+      fprintf (stderr, "cache %i not found\n", cache);
+#endif
+      return 1;
+    }
+  if (*offset < 0 || *offset >= d->count)
+    {
+#ifdef DEBUG
+      fprintf (stderr, "cache %i entry %i not found\n", cache, *offset);
+#endif
+      *read = 0;
+      *offset = -1;
+      return 0;
+    }
+  i = d->offsets[*offset + 1] - d->offsets[*offset];
+  *read = i <= bufsize;
+  if (*read)
+    memcpy (buffer, d->entries + d->offsets[*offset], i);
+#ifdef DEBUG
+  if (*read)
+    fprintf (stderr, "cache %i entry %i found (%x)\n", cache, *offset-1, d->offsets[*offset-1]);
+  else
+    fprintf (stderr, "cache %i entry %i too big (%i > %i)\n", cache, *offset-1, i, bufsize);
+#endif
+  if (++*offset >= d->count)
+    *offset = -1;
+  return 0;
+}
+
+
+/* Return 1 if the given name contains a path variable or wildcards.  */
+int
+ro_wild_test (const char *name)
+{
+  const char *p = strchr (name, '$');
+  if (!p)
+    p = strchr (name, ':');
+  if (!p)
+    p = name;
+  return strpbrk (p, "#*") != 0 || is_pathvar (name);
+}
+
+
+/* Initialise for wildcard expansion.  */
+ro_wild *
+ro_wild_init (const char *name)
+{
+  ro_wild *wild = xmalloc (sizeof (ro_wild));
+  char *pvar = pathvar (name);
+
+#ifdef DEBUG
+  fprintf (stderr, "root wildcard block = %p\n", wild);
+#endif
+  memset (wild, 0, sizeof (ro_wild));
+  wild->remaining = strdup (pvar ? (strchr (name, ':') + 1) : name);
+  if (pvar)
+    {
+      char *comma = strchr (pvar, ',');
+      ro_wild_path *wp = xmalloc (sizeof (ro_wild_path));
+      wild->pathvar = wp;
+      wp->pathvar = wp->pathstart = pvar;
+      wp->pathend = pvar + strlen (pvar);
+      wp->pathtail = "";
+      wp->up = 0;
+      if (comma)
+	*comma = '\0';
+    }
+
+  return wild;
+}
+
+
+/* Return the next match (internal).  */
+static char *
+ro_wild_next_internal (ro_wild * wild)
+{
+  int i;
+  char *ret;
+  ro_wild *up;
+  int cached_dir;
+  static char buffer[256];
+
+  while (wild->down)
+    wild = wild->down;
+
+resume:
+  cached_dir = 0;
+  switch (wild->state)
+    {
+    case 0:			/* get next section of pathname */
+      wild->state = 1;
+      if (!wild->processed)
+	{
+	  char *p = strchr (wild->remaining, '$');
+	  if (!p)
+	    p = strchr (wild->remaining, ':');
+	  if (p)
+	    wild->e = p - wild->remaining;	/* skip over first part */
+	}
+      i = wild->b;
+      do
+	{
+	  wild->b = wild->e;
+	  do
+	    {
+	      if (wild->remaining[wild->e] == '*'
+		  || wild->remaining[wild->e] == '#')
+		wild->wildcard = 1;
+	      wild->e++;
+	    }
+	  while (wild->remaining[wild->e] != '.'
+		 && wild->remaining[wild->e]);
+	}
+      while (!wild->wildcard & wild->remaining[wild->e] == '.');
+
+      if (!wild->wildcard)
+	{			/* no wildcards... */
+	  int lenpath = wild->pathvar ? strlen (wild->pathvar->pathvar) : 0;
+	  int lentail = wild->pathvar ? strlen (wild->pathvar->pathtail) : 0;
+	  int lenproc = wild->processed ? strlen (wild->processed) : 0;
+	  int retlen;
+	  ret = xmalloc (lenpath + lentail + lenproc + wild->e - i + 1);
+	  sprintf (ret, "%s%s%s%s",
+		   wild->pathvar ? wild->pathvar->pathvar : "",
+		   wild->pathvar ? wild->pathvar->pathtail : "",
+		   wild->processed ? wild->processed : "",
+		   wild->remaining + i);
+	  retlen = strlen (ret);
+	  if (retlen && ret[retlen - 1] == '.')
+	    ret[retlen - 1] = '\0';	/* lose any trailing dot */
+	  if (_swix (8 /*OS_File */ , 3 | 1 << 31, 17, ret, &i) || i == 0)
+	    {
+	      zfree (ret);	/* on error, or object not found */
+	      goto up_a_dir;
+	    }
+	  wild->found = 1;
+	  wild->offset = -1;
+	  wild->state = 2;
+	  return ret;		/* return object name */
+	}
+      /* wildcarded */
+      if (wild->b == 0)
+	{
+#ifdef DEBUG
+	  fprintf (stderr, "(wildcarded; b == 0, pathvar == '%s')\n", wild->pathvar ? wild->pathvar->pathvar : "");
+#endif
+	  if (wild->pathvar)
+	    {
+	      int l = wild->processed ? strlen (wild->processed) : 0;
+	      wild->path = xmalloc (strlen (wild->pathvar->pathvar)
+				    + strlen (wild->pathvar->pathtail)
+				    + l + 1);
+	      sprintf (wild->path, "%s%s%s", wild->pathvar->pathvar,
+		       wild->pathvar->pathtail,
+		       wild->processed ? wild->processed : "");
+	      l = strlen (wild->path) - 1;
+	      if (wild->path[l] == '.')
+		wild->path[l] = '\0';
+	    }
+	  else
+	    wild->path = 0;
+	  wild->node = xmalloc (wild->e + 1);
+	  strncpy (wild->node, wild->remaining, wild->e);
+	  wild->node[wild->e] = 0;
+	}
+      else
+	{			/* copy to path */
+#ifdef DEBUG
+	  fprintf (stderr, "(wildcarded; b != 0, pathvar == '%s', processed == '%s')\n", wild->pathvar ? wild->pathvar->pathvar : "", wild->processed ? wild->processed : "");
+#endif
+	  if (!wild->processed)
+	    {
+	      wild->path = xmalloc (wild->b + 1);
+	      strncpy (wild->path, wild->remaining, wild->b);
+	      wild->path[wild->b] = 0;
+	    }
+	  else
+	    {
+	      wild->path = xmalloc (strlen (wild->processed)
+				    + wild->b - i + 1);
+	      strcpy (wild->path, wild->processed);
+	      strncat (wild->path, wild->remaining + i, wild->b - i);
+	    }
+	  if (wild->pathvar)
+	    {
+	      char *p = xmalloc (strlen (wild->pathvar->pathvar)
+				 + strlen (wild->pathvar->pathtail)
+				 + strlen (wild->path) + 1);
+	      sprintf (p, "%s%s%s", wild->pathvar->pathvar,
+		       wild->pathvar->pathtail, wild->path);
+	      free (wild->path);
+	      wild->path = p;
+	    }
+	  wild->node = xmalloc (wild->e - wild->b);	/* copy node */
+	  strncpy (wild->node, wild->remaining + wild->b + 1,
+		   wild->e - wild->b - 1);
+	  wild->node[wild->e - wild->b - 1] = 0;
+	}			/* fall through */
+#ifdef DEBUG
+      fprintf (stderr, "dir : %s\nproc: %s\n", wild->path, wild->processed);
+#endif
+    case 1:
+      if (!wild->remaining[wild->e])
+	{			/* nothing lower to search */
+	  /* just scan through directory with leaf wildcard */
+	  if (wild->offset != -1)
+	    cached_dir = cache_dir (wild->path ? wild->path : "@",
+				    wild->node);
+	  while (wild->offset != -1)
+	    {
+	      if (cached_dir
+		  ? get_entry (cached_dir, buffer, 256, &i, &wild->offset)
+		  : (int)_swix (12 /*OS_GBPB */ , _INR(0,6) | _OUTR(3,4),
+				10, wild->path ? wild->path : "@", buffer,
+				1, wild->offset, 256, wild->node,
+				&i, &wild->offset))
+		goto up_a_dir;	/* fail quietly */
+	      if (i && buffer[16] == 1)
+		{
+		  wild->found = 1;
+		  return wild->path
+		    ? strdup1 (wild->path, buffer + 20)
+		    : xstrdup (buffer + 20);	/* return file name */
+		}
+	    }
+	  wild->offset = 0;
+	}
+      wild->state = 2;
+    case 2:
+      /* scan through directory looking for (wildcarded) objects which are
+       * directories, and process each one */
+      if (wild->offset != -1)
+        cached_dir = cache_dir (wild->path ? wild->path : "@", wild->node);
+      while (wild->offset != -1)
+	{
+	  if (cached_dir
+	      ? get_entry (cached_dir, buffer, 256, &i, &wild->offset)
+	      : (int)_swix (12 /*OS_GBPB */ , _INR(0,6) | _OUTR(3,4),
+			    10, wild->path ? wild->path : "@",
+			    buffer, 1, wild->offset, 256, wild->node,
+			    &i, &wild->offset))
+	    goto up_a_dir;	/* fail quietly */
+	  if (i && buffer[16] > 1)
+	    {			/* directory, or image file */
+	      if (wild->remaining[wild->e])
+		{		/* need to search further */
+		  ro_wild *wnew = xmalloc (sizeof (ro_wild));
+		  wnew->offset = wnew->state = wnew->wildcard = 0;
+		  wnew->path = wnew->node = 0;
+		  wnew->down = 0;
+		  wnew->b = wild->e;
+		  wnew->e = wild->e;
+		  wnew->processed = (!wild->pathvar && wild->path)
+		    ? strdup1 (wild->path, buffer + 20)
+		    : xstrdup (buffer + 20);
+		  wnew->remaining = wild->remaining /*+ wild->e + 1 */ ;
+		  wnew->pathvar = wild->pathvar;	/* just in case */
+		  wnew->up = wild;
+		  wild->down = wnew;
+		  wild = wnew;
+#ifdef DEBUG
+		  fprintf (stderr, "down a dir\nnew wildcard block = %p\n", wnew);
+#endif
+		  goto resume;
+		}
+	      else
+		{		/* return directory name */
+		  wild->found = 1;
+		  return wild->path
+		    ? strdup1 (wild->path, buffer + 20)
+		    : xstrdup (buffer + 20);
+		}
+	    }
+	}
+    }
+
+up_a_dir:
+#ifdef DEBUG
+  fprintf (stderr, "up a dir\n");
+#endif
+  uncache_dir (cached_dir);
+  up = wild->up;
+  if (wild->path != wild->processed)
+    zfree (wild->path);
+  zfree (wild->processed);
+  zfree (wild->node);
+  if (!up)
+    return 0;			/* no more */
+  up->found |= wild->found;
+#ifdef DEBUG
+  fprintf (stderr, "freeing wildcard block %p", wild);
+#endif
+  zfree (wild);
+#ifdef DEBUG
+  fprintf (stderr, " - OK\n");
+#endif
+  wild = up;
+  wild->down = 0;
+  goto resume;
+}
+
+
+/* Return the next match.  */
+char *
+ro_wild_next (ro_wild * wild)
+{
+  for (;;)
+    {
+      char *p = ro_wild_next_internal (wild);
+      if (p)
+	{
+	  if (p[0] == '.')
+	    strcpy (p, p + 1);	/* Trim leading '.' if present.  */
+	  return p;		/* Got a match.  */
+	}
+      wild->offset = wild->state = wild->wildcard = wild->b = wild->e = 0;
+      if (wild->pathvar)
+	{
+	  int again;
+	  do
+	    {
+	      again = 0;
+	      wild->pathvar->pathvar += strlen (wild->pathvar->pathvar) + 1;
+	      if (wild->pathvar->pathvar >= wild->pathvar->pathend)
+		{
+		  if (wild->pathvar->up)
+		    {
+		      ro_wild_path *up = wild->pathvar->up;
+		      free (wild->pathvar->pathstart);
+		      free (wild->pathvar);
+		      wild->pathvar = up;
+		      again = 1;
+#ifdef DEBUG
+		      fprintf (stderr, "up a path\n");
+#endif
+		    }
+		  else
+		    return 0;	/* No more. */
+		}
+	      p = strchr (wild->pathvar->pathvar, ',');
+	      if (p)
+		*p = '\0';
+	    }
+	  while (again || wild->pathvar->pathvar[0] == '\0');
+#ifdef DEBUG
+	  fprintf (stderr, "next path segment: %s\n", wild->pathvar->pathvar);
+#endif
+	  p = pathvar (wild->pathvar->pathvar);
+	  if (p)
+	    {
+	      ro_wild_path *wp = xmalloc (sizeof (ro_wild_path));
+	      wp->up = wild->pathvar;
+	      wild->pathvar = wp;
+	      wp->pathvar = wp->pathstart = p;
+	      wp->pathend = p + strlen (p);
+	      wp->pathtail = strchr (wp->up->pathvar, ':');
+	      wp->pathtail = wp->pathtail ? wp->pathtail + 1 : "";
+#ifdef DEBUG
+	      fprintf (stderr, "path = %s\n", p);
+#endif
+	      p = strchr (p, ',');
+	      if (p)
+		*p = '\0';
+	    }
+	}
+      else
+	return 0;
+    }
+}
+
+
+/* Free up and finish.  */
+int
+ro_wild_finish (ro_wild * wild)
+{
+  int r = wild->found;
+  free (wild->remaining);
+  if (wild->path != wild->processed)
+    free (wild->path);
+  free (wild->processed);
+/*free(wild->node); */
+  while (wild->pathvar)
+    {
+      ro_wild_path *wp = wild->pathvar->up;
+      free (wild->pathvar->pathstart);
+      free (wild->pathvar);
+      wild->pathvar = wp;
+    }
+  free (wild);
+  return r;
+}

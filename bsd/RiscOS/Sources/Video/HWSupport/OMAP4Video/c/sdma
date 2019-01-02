@@ -1,0 +1,227 @@
+/*
+ * Copyright (c) 2010, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include "sdma.h"
+
+#include "DebugLib/DebugLib.h"
+
+#ifdef DEBUGLIB
+int sdma_stats[4];
+#endif
+
+void sdma_sync(void)
+{
+	while (sdmachan->ccr & (DMA4_CCR_ENABLE | DMA4_CCR_RD_ACTIVE | DMA4_CCR_WR_ACTIVE))
+	{
+		; /* TODO - Timeout/error checking */
+	}
+}
+
+bool sdma_copyrect(overlay *o, copyrect_params *r)
+{
+#ifdef DEBUGLIB
+	if (	(r->src_left >= o->width)
+		 || (r->src_bottom >= o->height)
+		 || (r->src_left + r->width + 1 > o->width)
+		 || (r->src_bottom + r->height + 1 > o->height)
+		 || (r->dest_left >= o->width)
+		 || (r->dest_bottom >= o->height)
+		 || (r->dest_left + r->width + 1 > o->width)
+		 || (r->dest_bottom + r->height + 1 > o->height))
+	{
+		dprintf(("", "Bad copy rect? src %d,%d dest %d,%d size %d,%d overlay %d,%d\n", r->src_left,r->src_bottom,r->dest_left,r->dest_bottom,r->width+1,r->height+1,o->width,o->height));
+	}
+#endif
+	/* Calculate line length & start pos, in bits */
+	uint8_t bpp = overlay_format_bpp[o->format >> OVERLAY_ATTRIBUTES_FORMAT_SHIFT];
+	uint32_t src_x = r->src_left * bpp;
+	uint32_t dest_x = r->dest_left * bpp;
+	uint32_t width = (r->width + 1) * bpp;
+	/* Calculate element size from alignment */
+	uint32_t csdp;
+	uint32_t temp = src_x | dest_x | width;
+	if (temp & 7)
+		return false; /* Not byte aligned; abort */
+	if (temp & 8)
+		csdp = DMA4_CSDP_DATA_TYPE_8;
+	else if (temp & 16)
+		csdp = DMA4_CSDP_DATA_TYPE_16;
+	else
+		csdp = DMA4_CSDP_DATA_TYPE_32;
+	/* Convert to bytes */
+	src_x  = src_x >> 3;
+	dest_x = dest_x >> 3;
+	width  = width >> 3;
+	/* Calculate start/end addresses */
+	uint32_t src_y  = vdu_init + o->stride * ((o->height - r->src_bottom)  - (r->height + 1));
+	uint32_t dest_y = vdu_init + o->stride * ((o->height - r->dest_bottom) - (r->height + 1));
+	src_y  += src_x;
+	dest_y += dest_x;
+	/* Make sure previous is complete */
+	sdma_sync();
+	/* Start programming registers */
+	sdmachan->cen = width >> csdp; /* Relies on assumption about CSDP location & values! */
+	sdmachan->cfn = r->height + 1;
+	if (dest_y <= src_y)
+	{
+		/* Copy in forwards direction, top to bottom */
+		sdmachan->cssa = src_y;
+		sdmachan->cdsa = dest_y;
+		sdmachan->csei = sdmachan->cdei = 1;
+		sdmachan->csfi = sdmachan->cdfi = (o->stride - width) + 1;
+#ifdef DEBUGLIB
+		sdma_stats[1]++;
+#endif
+	}
+	else if ((src_y + width) <= dest_y)
+	{
+		/* Copy in forwards direction, bottom to top */
+		sdmachan->cssa = src_y  + o->stride * r->height;
+		sdmachan->cdsa = dest_y + o->stride * r->height;
+		sdmachan->csei = sdmachan->cdei = 1;
+		sdmachan->csfi = sdmachan->cdfi = -width - o->stride + 1;
+#ifdef DEBUGLIB
+		sdma_stats[2]++;
+#endif
+	}
+	else
+	{
+#if 1
+		/* Leave this code disabled for now since it's so slow! */
+		return false;
+#else
+		/* Copy in backwards direction - this will be slow due to lack of burst transfers */
+		/* Splitting into multiple vertical strips might help, but for that we'd really need
+		   a nicer way of chaining channels other than stalling for completion of each strip */
+		sdmachan->cssa = src_y  + width - (1 << csdp);
+		sdmachan->cdsa = dest_y + width - (1 << csdp);
+		sdmachan->csei = sdmachan->cdei = 1 - (2 << csdp);
+		sdmachan->csfi = sdmachan->cdfi = o->stride + width + 1 - (2 << csdp);
+#ifdef DEBUGLIB
+		sdma_stats[3]++;
+#endif
+#endif
+	}
+	sdmachan->csdp	= csdp
+					| DMA4_CSDP_SRC_PACKED
+					| DMA4_CSDP_SRC_BURST_EN_64BYTES
+					| DMA4_CSDP_DST_PACKED
+					| DMA4_CSDP_DST_BURST_EN_64BYTES
+					| DMA4_CSDP_WRITE_MODE_LAST_NONPOSTED;
+	sdmachan->ccr	= DMA4_CCR_ENABLE
+					| DMA4_CCR_SRC_AMODE_DOUBLEINDEX
+					| DMA4_CCR_DST_AMODE_DOUBLEINDEX
+					| DMA4_CCR_PREFETCH;
+
+	return true;
+}
+
+bool sdma_fillrect(overlay *o, fillrect_params *r)
+{
+	uint32_t *oraeor = r->oraeor;
+#ifdef DEBUGLIB
+	if (	(r->left >= o->width)
+		 || (r->top >= o->height)
+		 || (r->right >= o->width)
+		 || (r->bottom >= o->height)
+		 || (r->left > r->right) || (r->bottom > r->top))
+	{
+		dprintf(("", "Bad fill rect? %d,%d -> %d,%d overlay %d,%d\n", r->left, r->top, r->right, r->bottom, o->width, o->height));
+	}
+	if (((uint32_t)oraeor) & 63)
+	{
+		dprintf(("", "Hmm, oraeor isn't 64 byte aligned\n"));
+	}
+#endif
+	uint32_t col = oraeor[1];
+	int row;
+	/* Verify that it's a solid fill
+	   We could handle *some* non-solid fills (e.g. fill every other scanline or every other
+	   pixel), but it would be a bit of a hassle to check for that */
+	for (row = 0; row < 8; ++row)
+	{
+		if ((oraeor[0] != 0xFFFFFFFF) || (oraeor[1] != col))
+			return false;
+		oraeor += 2;
+	}
+	col = ~col;
+	/* Calculate line length & start pos, in bits */
+	uint8_t bpp = overlay_format_bpp[o->format >> OVERLAY_ATTRIBUTES_FORMAT_SHIFT];
+	uint32_t left = r->left * bpp;
+	uint32_t width = (1 + r->right - r->left) * bpp;
+	/* Calculate element size from alignment */
+	uint32_t csdp;
+	uint32_t temp = left | width;
+	/* True if left halfword == right halfword */
+	bool pattern_16bit = ((col ^ (col << 16)) < 65536);
+	/* True if all bytes are identical */
+	bool pattern_8bit = pattern_16bit && ((col ^ (col << 8)) < 0x1000000);
+	if (temp & 7)
+		return false; /* Not byte aligned; abort */
+	if (temp & 8)
+	{
+		if (!pattern_8bit) /* Byte alignment but not byte-size pattern */
+			return false;
+		csdp = DMA4_CSDP_DATA_TYPE_8;
+	}
+	else if ((temp & 16) || ((col & 0xFF000000) && (bpp != 32)))
+	/*
+		COLOR is a 24bit register, with the top byte treated as zero when performing a
+		32bit constant fill. So only allow promotion to 32bit data type if top byte is zero.
+		However we do allow nonzero top byte in 32bpp modes, under the assumption
+		that it doesn't matter if the byte gets trashed.
+	 */
+	{
+		if (!pattern_16bit) /* Halfword alignment but not halfword-size pattern */
+			return false;
+		csdp = DMA4_CSDP_DATA_TYPE_16;
+	}
+	else
+		csdp = DMA4_CSDP_DATA_TYPE_32;
+	/* Make sure previous is complete */
+	sdma_sync();
+	/* Start programming registers */
+	sdmachan->color	= col;
+	sdmachan->cen	= width >> (3 + csdp);
+	sdmachan->cfn	= (r->top - r->bottom) + 1;
+	sdmachan->cdsa	= (left >> 3) + vdu_init + o->stride * (o->height - 1 - r->top);
+	sdmachan->cdei	= 1;
+	sdmachan->cdfi	= (o->stride - (width >> 3)) + 1;
+	sdmachan->csdp	= csdp
+					| DMA4_CSDP_SRC_PACKED
+					| DMA4_CSDP_SRC_BURST_EN_64BYTES
+					| DMA4_CSDP_DST_PACKED
+					| DMA4_CSDP_DST_BURST_EN_64BYTES
+					| DMA4_CSDP_WRITE_MODE_LAST_NONPOSTED;
+	sdmachan->ccr	= DMA4_CCR_ENABLE
+					| DMA4_CCR_DST_AMODE_DOUBLEINDEX
+					| DMA4_CCR_CONST_FILL_ENABLE;
+#ifdef DEBUGLIB
+	sdma_stats[0]++;
+#endif
+	return true;
+}

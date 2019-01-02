@@ -1,0 +1,124 @@
+/* Copyright 2004 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#include <stdint.h>
+#include <stdbool.h>
+#include "pci.h"
+
+#define DISABLE_USB
+
+/* Calling standard mungery - mustn't touch sb/v6 */
+__global_reg(6) void *sb;
+
+bool pci_known_int_line(pci_dev *d, int pin, int *line)
+{
+    #define Device_XINT0 32+27
+
+    if (d->bus == 0)
+    {
+        *line = Device_XINT0 + (((pin - 1) + DEV(d->devfunc)) & 3);
+        return true;
+    }
+
+    if (d->parent->dev.bus == 0 &&
+        d->parent->dev.devfunc == DEVFUNC(8,0) &&
+        (d->devfunc < DEVFUNC(8,0) ||
+         d->devfunc >= DEVFUNC(10,0)))
+    {
+        switch (DEV(d->devfunc))
+        {
+           #define Device_PIC_base 16
+           #define Device_AC97 Device_PIC_base+1
+           #define Device_Modem Device_PIC_base+11
+           #define Device_IDE Device_PIC_base+3
+           #define Device_USB1 Device_PIC_base+5
+           #define Device_USB2 Device_PIC_base+6
+           case  1: *line = Device_AC97; break;
+           case  3: *line = Device_Modem; break;
+           case 10: *line = Device_USB2; break;
+           case 11: *line = Device_IDE; break;
+           case 15: *line = Device_USB1; break;
+           default: *line = Device_XINT0; break;
+        }
+        return true;
+    }
+
+    return false;
+}
+
+void pci_platform_setup(pci_state *pci)
+{
+    /* Manual setup of special Tungsten stuff */
+
+    /* ensure that no video cards have 'decided' to act as AGP */
+    /* by disabling AGP operation on device 0 (which is where agp goes) */
+    /* but is also the 80321 pci port address */
+    /* but only do so if there is a response there */
+    /* removed this 5 12 05 .. i caused more trouble than help */
+/*    if (HAL_PCIReadConfigWord(0, DEVFUNC(0,0), PCI_AGP_COMMAND)!=-1)  */
+/*    HAL_PCIWriteConfigWord(0, DEVFUNC(0,0), PCI_AGP_COMMAND, 0x0);    */
+
+    /* Get the bridge to let config cycles through to the ALI chip */
+    HAL_PCIWriteConfigWord(0, DEVFUNC(8,0), PCI_PRIMARY_BUS, 0x00010100);
+
+    uint32_t bridge_id = HAL_PCIReadConfigWord(0, DEVFUNC(8,0), PCI_VENDOR_ID);
+    #define INTEL_21154      UINT32_C(0xB1548086)
+    #define HINT_HB2         UINT32_C(0x00263388)
+    #define PERICOM_PI7C8154 UINT32_C(0x815412D8)
+
+    switch (bridge_id)
+    {
+        case HINT_HB2:
+            /* Convert 32-bit secondary to 64-bit primary accesses.
+             * Allow delayed reads to complete out-of-order.
+             */
+            //HAL_PCIWriteConfigHalfword(0, DEVFUNC(8,0), 0x46, 0xA814);
+            /* Fall through (common registers) */
+        case PERICOM_PI7C8154:
+        case INTEL_21154:
+            /* Disable secondary clocks 4-9. */
+            HAL_PCIWriteConfigHalfword(0, DEVFUNC(8,0), 0x68, 0xFF00);
+            /* Assign south bridge and PCI bridge to high priority group */
+            HAL_PCIWriteConfigHalfword(0, DEVFUNC(8,0), 0x42, 0x0204);
+            break;
+    }
+    HAL_PCIWriteConfigByte(1, DEVFUNC(2,0), 0x40, 0x19); // Delayed Transactions, DMA Line Buffer
+    HAL_PCIWriteConfigByte(1, DEVFUNC(2,0), 0x42, 0x4B); // 32-bit DMA, PCI/4 ISA
+    HAL_PCIWriteConfigByte(1, DEVFUNC(2,0), 0x44, 0x02); // IDE 1 -> IRQ3
+    HAL_PCIWriteConfigByte(1, DEVFUNC(2,0), 0x45, 0x08); // Delayed Transaction Timeout
+    HAL_PCIWriteConfigByte(1, DEVFUNC(2,0), 0x4B, 0x89); // AC97 -> IRQ1, Modem -> IRQ11
+#ifdef DISABLE_USB
+    HAL_PCIWriteConfigHalfword(1, DEVFUNC(2,0), 0x52, 0x4000); // Disable USB1
+#endif
+    HAL_PCIWriteConfigByte(1, DEVFUNC(2,0), 0x58, 0x4C); // Enable IDE
+    //HAL_PCIWriteConfigHalfword(1, DEVFUNC(2,0), 0x5C, 0x0FFF); // Positive decode only
+    //HAL_PCIWriteConfigByte(1, DEVFUNC(2,0), 0x5F, 0x06); // Audio high priority (don't do this - prevents retries, breaking delayed reads)
+    HAL_PCIWriteConfigByte(1, DEVFUNC(2,0), 0x6D, 0x24); // DMA master retry release
+    HAL_PCIWriteConfigByte(1, DEVFUNC(2,0), 0x74, 0x05); // USB 1 -> IRQ5
+    HAL_PCIWriteConfigByte(1, DEVFUNC(2,0), 0x75, 0x04); // IDE 2 -> IRQ4
+    HAL_PCIWriteConfigByte(1, DEVFUNC(2,0), 0x76, 0x0B); // SCI -> IRQ12
+    HAL_PCIWriteConfigWord(1, DEVFUNC(2,0), 0x78, 0x00000200); // CBLID pins
+    HAL_PCIWriteConfigByte(1, DEVFUNC(2,0), 0x7C, 0x02); // Enable GPO16-19
+    HAL_PCIWriteConfigByte(1, DEVFUNC(12,0), 0xB7, 0x00); // GPO16-19 all low (power to USB)
+#ifdef DISABLE_USB
+    HAL_PCIWriteConfigByte(1, DEVFUNC(2,0), 0x7E, 0x05); // Nix legacy 60/64, audio DMA above 2GB
+#else
+    HAL_PCIWriteConfigByte(1, DEVFUNC(2,0), 0x7E, 0x85); // Enable USB 2
+#endif
+    HAL_PCIWriteConfigWord(1, DEVFUNC(15,0), 0x40, 0x00100000); // read-only sub-ids
+    HAL_PCIWriteConfigWord(1, DEVFUNC(15,0), 0x44, 0x20); // no legacy
+    HAL_PCIWriteConfigWord(1, DEVFUNC(10,0), 0x44, 0x20); // no legacy
+    HAL_PCIWriteConfigByte(1, DEVFUNC(11,0), 0x09, 0xBF); // Native mode IDE
+}
+

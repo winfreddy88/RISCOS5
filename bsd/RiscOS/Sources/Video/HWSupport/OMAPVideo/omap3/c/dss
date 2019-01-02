@@ -1,0 +1,208 @@
+/*
+ * Copyright (c) 2010, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include "dss.h"
+#include "regs.h"
+#include "mouse.h"
+#include "consts.h"
+#include "dsi.h"
+
+#include <stdlib.h>
+#include <time.h>
+
+#include "DebugLib/DebugLib.h"
+
+_kernel_oserror *dss_reset(void)
+{
+	/* Perform system reset as per spruf98d 15.5.1 */
+	dprintf(("","dss_reset\n"));
+
+	/* Make sure the LCD output is disabled */
+	if(dispc->control & DISPC_CONTROL_LCDENABLE)
+	{
+		/* Clear current FRAMEDONE interrupt */
+		dispc->irqstatus = DISPC_IRQ_FRAMEDONE;
+		/* Disable LCD */
+		dispc->control &= ~DISPC_CONTROL_LCDENABLE;
+		/* Wait for new interrupt
+		   Use clock() for our timeout timer this time? */
+		clock_t timeout = clock();
+		while(!(dispc->irqstatus & DISPC_IRQ_FRAMEDONE) && (clock()-timeout < CLOCKS_PER_SEC)) {};
+		if(!(dispc->irqstatus & DISPC_IRQ_FRAMEDONE))
+		{
+			dprintf(("","dss_reset: Timeout waiting for DISPC_IRQ_FRAMEDONE\n"));
+		}
+	}
+	/* The clocks to the DSS are enabled, but for the reset to work we need to enable the VENC clocks (CAUTION in section 15.5.3.1.2.2) */
+	dss->control |= DSS_CONTROL_VENC_CLOCK_4X_ENABLE | DSS_CONTROL_DAC_DEMEN | DSS_CONTROL_DAC_POWERDN_BGZ;
+	/* Now we can safely perform the reset */
+	dss->sysconfig = SYSCONFIG_SOFTRESET;
+	int timeout=1000000;
+	while(!(dss->sysstatus & SYSSTATUS_RESETDONE) && --timeout) {};
+	if(!timeout)
+	{
+		dprintf(("","dss_reset: Timeout waiting for SYSSTATUS_RESETDONE!\n"));
+	}
+	/* Now disable VENC clocks again until we need them */
+	dss->control = 0;
+	/* Enable DISPC functional clock autogating */
+	dispc->config |= DISPC_CONFIG_FUNCGATED;
+	/* Ensure global alpha register is programmed */
+	dispc->global_alpha = 0xff00ff;
+
+	/* DSS reset also causes DSI PLL reset, so reset the cached state */
+	dsi_pll_current_pixel_rate = 0;
+	/* Ensure mouse transparency colour gets reprogrammed */
+	mouse_dirty = true;
+	/* Clear ban flag? */
+	clear_ban(BHUB_OFF);
+
+	return (_kernel_oserror *)0;
+}
+
+#if defined(__CC_NORCROFT_VERSION) && (__CC_NORCROFT_VERSION < 569)
+/* Disable peephole optimisation for this function as workaround for optimisation bugs with 64bit ints */
+#pragma -q8
+#endif
+
+clock_divider_t calculate_dss_clock_divider(uint32_t pixel_rate)
+{
+	/* Calculate DSI_PLL_REGM, DSI_PLL_REGN, DSI_PLL_REGM3 (aka DSS_CLOCK_DIV) values required for the given pixel rate (in Hz)
+	   Output values aren't guaranteed to be within range
+
+	   The full clock flow is as follows:
+	     DSI PLL input = DSI_PLL_REFCLK (= DSS2_ALWON_FCLK = sys_clk)
+	     Data lane freq = DSIPHY = 2*pixel rate*DSI_BPP/DSI_LANES
+	     DSIPHY = 2*DSI_PLL_REGM/(DSI_PLL_REGN+1)*DSI_PLL_REFCLK/(HIGHFREQ+1)
+	     HIGHFREQ = (DSI_PLL_REFCLK>32MHz?1:0) (=0 for all current sys_clk values)
+	   Also, 0.75MHz <= Fint <= 2.1MHz where Fint = DSI_PLL_REFCLK/(DSI_PLL_REGN+1)
+	   DSIPHY is then used as the source for the HSDIVIDER, which does the following:
+	     DSI1_PLL_FCLK = DSIPHY/REGM3
+	     DSI2_PLL_FCLK = DSIPHY/REGM4
+	   Both must be <= 173MHz
+	   DSI2_PLL_FCLK can be used to drive the DSI module, except we don't care much for that
+	   DSI1_PLL_FCLK is what we use to drive the DISPC pixel clock:
+	     pixel rate = (DSI1_PLL_FCLK/LCD)/PCD
+	     1 <= LCD <= 255
+	     2 <= PCD <= 255
+	   We aren't using the DSI output module, so we can ignore the data lane frequency
+	   This increases the number of DSI PLL register combinations available, so to keep this code simple we remove LCD and PCD from the equation by forcing them to their minimal values.
+	   This also helps power usage a bit since DISPC will be clocked with the lowest possible clock (for a given pixel rate). In the future we may need to change this (e.g. for video overlay
+	   downscaling, or for more accurate generation of clocks like 25.175MHz - where LCD*PCD=5 allows accurate generation of 25.175MHz)
+
+	   An algorithm that aims for 100% accurate clock rates was found to be incapable of calculating divider values for most RISC OS screen modes (in particular the 25.175MHz mode used at boot).
+	   Instead, an algorithm that aims to find the closest possible clock rate is used. Most clock rate errors appear to be tiny (within 1kHz of the desired pixel rate), so these errors shouldn't pose any problems. */
+	clock_divider_t best;
+
+	best.regm = 0;
+	best.regn = -1;
+	best.regm4 = best.regm3 = 0; /* Keep compiler quiet */
+	if(!pixel_rate)
+	{
+		return best;
+	}
+	pixel_rate = pixel_rate*2; /* LCD*PCD=2 */
+
+	uint32_t best_error = pixel_rate;
+	/* Search for a satisfactory regn:
+	   - Provides Fint that's within range
+	   - Keeps Fint high
+	*/
+	clock_divider_t current;
+	/* Fint will decrease as REGN increases, so we can calculate the initial REGN from our desired max Fint */
+	current.regn = (hwconfig->sys_clk+2100000-1)/2100000; /* Ensure we round up to avoid Fint starting too high */
+	/* We assume that this starting REGN is valid (sys_clk would need to be 0 or >128*2.1MHz to cause problems) */
+	do
+	{
+		uint32_t Fint = hwconfig->sys_clk/current.regn;
+		if(Fint < 750000) /* Fint too low; nothing else for us to do */
+			break;
+
+		/* Fint and REGN are good; now try all the different REGM3 values
+		   Iterating over REGM3 is better than REGM, since REGM3 has a much smaller range */
+//		dprintf(("","regn=%d Fint=%d\n",current.regn-1,Fint));
+		for(current.regm3=1;current.regm3<=REG_MAX(DSI_PLL_CONFIGURATION1_DSS_CLOCK_DIV)+1;current.regm3++)
+		{
+			/* Find a REGM value:
+			   - First, work out what our desired DSIPHY value is */
+			uint64_t dsiphy=((uint64_t)current.regm3)*pixel_rate;
+
+			/* - Now calculate the REGM value that results in a DSIPHY closest to our goal:
+			       regm = dsiphy/(2*Fint)
+			   - Except we want to add 1/2 to round to nearest:
+			       regm = (dsiphy+Fint)/(2*Fint)
+			   - And we want to get rid of Fint since it's often inaccurate (although the inaccuracy isn't likely to matter for this calculation):
+			       regm = (dsiphy+sys_clk/regn)/(2*sys_clk/regn)
+			       regm*2*sys_clk/regn = dsiphy+sys_clk/regn
+			       regm*2*sys_clk = dsiphy*regm+sys_clk
+			       regm = (dsiphy*regn+sys_clk)/(2*sys_clk)
+			*/
+			current.regm = (dsiphy*current.regn+hwconfig->sys_clk)/(hwconfig->sys_clk<<1);
+
+			/* regm increases with regm3; early exit if we overflow regm3 */
+			if(current.regm>REG_MAX(DSI_PLL_CONFIGURATION1_DSI_PLL_REGM))
+				break;
+			/* Check for underflow (unlikely, would only occur if pixel_rate < Fint) */
+			if(current.regm<1)
+				continue;
+
+			/* Recalculate DSIPHY using our actual REGM value
+			     dsiphy = 2*regm/Fint
+			   Except we want to get rid of Fint again (this time it matters - it helps pick a better approximations for frequencies which can't be generated exactly, e.g. 25.175MHz) */
+			dsiphy = (((uint64_t)(2*current.regm))*hwconfig->sys_clk)/current.regn;
+
+			/* Calculate error value
+			   Note that the error suffers from rounding error - could be eliminated if we stored it as a fraction */
+			uint32_t error = abs(pixel_rate-(dsiphy/current.regm3));
+
+			/* Check if this is better than our last attempt */
+			if(error < best_error)
+			{
+				best_error = error;
+				best.regm = current.regm;
+				best.regn = current.regn-1;
+				best.regm3 = current.regm3-1;
+//				dprintf((""," regm=%d regn=%d regm3=%d dsiphy=%d err=%d\n",best.regm,best.regn,best.regm3,(int)(dsiphy/1000),best_error));
+				/* Aim for a 48MHz DSI1_PLL_FCLK like Linux does. Not sure if this is important or not. */
+				best.regm4 = (uint32_t)(dsiphy/48000000uLL);
+				if(best.regm4 > 0)
+				{
+					best.regm4--;
+					if(best.regm4 > REG_MAX(DSI_PLL_CONFIGURATION1_DSIPROTO_CLOCK_DIV))
+						best.regm4 = REG_MAX(DSI_PLL_CONFIGURATION1_DSIPROTO_CLOCK_DIV);
+				}
+				if(!error)
+					return best;
+			}
+		}
+	} while(++current.regn <= REG_MAX(DSI_PLL_CONFIGURATION1_DSI_PLL_REGN)+1);
+
+	return best;
+}
+#if defined(__CC_NORCROFT_VERSION) && (__CC_NORCROFT_VERSION < 569)
+#pragma -q0
+#endif

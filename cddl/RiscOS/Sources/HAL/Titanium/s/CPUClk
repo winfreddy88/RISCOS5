@@ -1,0 +1,674 @@
+;
+; CDDL HEADER START
+;
+; The contents of this file are subject to the terms of the
+; Common Development and Distribution License (the "Licence").
+; You may not use this file except in compliance with the Licence.
+;
+; You can obtain a copy of the licence at
+; cddl/RiscOS/Sources/HAL/Titanium/LICENCE.
+; See the Licence for the specific language governing permissions
+; and limitations under the Licence.
+;
+; When distributing Covered Code, include this CDDL HEADER in each
+; file and include the Licence file. If applicable, add the
+; following below this CDDL HEADER, with the fields enclosed by
+; brackets "[]" replaced with your own identifying information:
+; Portions Copyright [yyyy] [name of copyright owner]
+;
+; CDDL HEADER END
+;
+;
+; Copyright 2015 Elesar Ltd.  All rights reserved.
+; Use is subject to license terms.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:OSEntries
+        GET     Hdr:HALDevice
+        GET     Hdr:CPUClkDevice
+
+        GET     hdr.RegMap
+        GET     hdr.RegPMIC
+        GET     hdr.StaticWS
+                
+        AREA    |CPUClk$$Code|, CODE, READONLY, PIC
+
+        EXPORT  CPUClkInit
+        EXPORT  CPUClkDeviceInit
+        IMPORT  PMICReadByte
+        IMPORT  PMICWriteByte
+        IMPORT  PMICmVToSMPSVSel
+        IMPORT  memcpy
+        IMPORT  HAL_DebugTXInlineString
+        IMPORT  HAL_DebugTXWord
+        IMPORT  HAL_DebugTXByte
+
+; Datasheet 5.3.2 but note that not all rails support AVS
+LimLoAVSScaler  * 97                    ; Play safe (%)
+LimNomAVSScaler * 100                   ; From fuse registers (%)
+LimHiAVSScaler  * 103                   ; Play safe (%)
+LimDCCOutputMPU * 1400                  ; MHz above which direct PLL output needed
+ABBLDOSettling  * 50                    ; microseconds
+ABBLDOWtCount   * ((ABBLDOSettling * 16) / (ClkOsc0 / 1000000))
+SMPSMPU         * 1                     ; 1+2
+SMPSCore        * 6
+SMPSDSPEVE      * 4                     ; 4+5
+MPUDieTempM10   * 24                    ; Gradient * 10
+MPUDieTempC10   * 6389                  ; Constant * 10
+
+; Speed table entry
+                ^ 0                 
+CPUMHz          # 2
+CPUPLLMult      # 2
+CPUOpPoint      # 1                 
+CPUOpNom        * 0                 
+CPUOpOverDrive  * 1                 
+CPUOpHigh       * 2                 
+CPUPLLDiv       # 1
+CPUPLLDivHS     # 1
+                # 1                     ; Unused
+CPUSpeedSize    # 0
+
+; SOA table entry
+                ^ 0                     
+SOAmVLo         # 2                     
+SOAmVNom        # 2                     
+SOAmVHi         # 2                     
+                # 2                     ; Unused
+SOASize         # 0                     
+
+; Device struct
+                      ^ 0
+                      # HALDevice_CPUClk_Size_0_2
+CPUClk_SpeedIndexNow  # 1
+CPUClk_SpeedIndexNext # 1
+                      # 2               ; Unused
+CPUClkDevice_Size     # 0
+
+        GBLA    CPUSpeedCount
+        GBLA    CPUDefaultIndex
+CPUSpeedCount SETA 0
+        MACRO
+        CPUSpeed $megahertz, $op, $mult, $div, $divhs, $default
+        DCW     $megahertz
+        DCW     $mult
+        DCB     $op
+        DCB     $div
+        DCB     $divhs
+        DCB     0
+      [ "$default" = "default"
+CPUDefaultIndex SETA CPUSpeedCount
+      ]
+        ASSERT  CPUSpeedSize = 8
+CPUSpeedCount SETA CPUSpeedCount + 1
+        MEND
+
+; CPUClkInit
+CPUClkInit ROUT
+        MOV     pc, lr
+
+; CPUClkDeviceInit
+CPUClkDeviceInit ROUT
+        Push    "v1, lr"
+
+        ; Set the biasing for normal
+        MOV     a1, #CPUOpNom
+        BL      CPUClkAdjustABB
+
+        ; Only support clock adjustments if the PMIC is recognised
+        LDR     a1, =PRODUCT_ID_LSB
+        BL      PMICReadByte
+        MOV     v1, a1
+
+        LDR     a1, =PRODUCT_ID_MSB
+        BL      PMICReadByte
+
+        ORR     v1, v1, a1, LSL #8
+        LDR     a1, =0xC035             ; ES1.0 prototype
+        TEQ     a1, v1
+        LDRNE   a1, =0x9039             ; Later revs
+        TEQNE   a1, v1
+        Pull    "v1, pc", NE
+
+        ; Run SMPS12 in multiphase mode all the time to avoid stressing
+        ; one of the two controllers. This powers the MPU, so there's never a
+        ; no load situation to worry about.
+        LDR     a1, =SMPS_CTRL
+        BL      PMICReadByte
+        BIC     a1, a1, #SMPS_CTRL_SMPS123_PHASE_CTRL_MASK
+        ORR     a2, a1, #SMPS_CTRL_SMPS123_PHASE_CTRL_DOUBLE
+        LDR     a1, =SMPS_CTRL
+        BL      PMICWriteByte
+        
+        ; The default HAL clock for MPU uses OPPNOM so set the PMIC to match
+        ; that value now in case someone's unplugged the Portable module.
+        ; This is the safest approach since OPPNOM is the lowest common setting that
+        ; can always be achieved at reset regardless of the state the PMIC was left
+        ; before soft reset.
+        DebugTX "Setting OPPNOM"
+
+        MOV     a1, #CPUOpNom
+        MOV     a2, #SMPSMPU
+        BL      CPUClkAdjustPMIC
+
+      [ {FALSE}
+        ; Errata i852 says it's better to leave the core voltage alone than
+        ; end up with IO timing glitches. Could use the IODELAY peripheral to correct
+        ; this but the trim is so small it's not a worthwhile power saving.
+        MOV     a1, #CPUOpNom
+        MOV     a2, #SMPSCore
+        BL      CPUClkAdjustPMIC
+      ]
+
+        ADR     a1, CPUClkDevice        ; RAM copy needed for sb recovery
+        ADR     a2, CPUClkDeviceTemplate
+        MOV     a3, #CPUClkDevice_Size
+        BL      memcpy
+
+        MOV     a2, a1
+        MOV     a1, #0                  ; No flags
+        CallOS  OS_AddDevice
+
+        Pull    "v1, pc"
+
+; CPUClkDieTemp
+; <= a1 = current die temperature (celcius)
+CPUClkDieTemp ROUT
+        LDR     a4, ControlCore_LogBase
+        ADD     a3, a4, #:INDEX:CTRL_CORE_DTEMP_MPU_0
+        ADD     a4, a4, #:INDEX:CTRL_CORE_DTEMP_MPU_4
+        ASSERT  CTRL_CORE_DTEMP_MPU_0 + 4 = CTRL_CORE_DTEMP_MPU_1
+        ASSERT  CTRL_CORE_DTEMP_MPU_1 + 4 = CTRL_CORE_DTEMP_MPU_2
+        ASSERT  CTRL_CORE_DTEMP_MPU_2 + 4 = CTRL_CORE_DTEMP_MPU_3
+        ASSERT  CTRL_CORE_DTEMP_MPU_3 + 4 = CTRL_CORE_DTEMP_MPU_4
+        MOV     a1, #0
+10
+        LDR     a2, [a3], #4
+        UBFX    a2, a2, #CTRL_CORE_DTEMP_TEMP_SHIFT, #CTRL_CORE_DTEMP_TEMP_BITS
+        ADD     a1, a1, a2
+        CMP     a3, a4
+        BLS     %BT10
+
+        ; Got sum of 5 samples, want DieTemp = (MeanADC - C)/M
+        ;                                    = ((SumADC/5) - C)/M
+        ;                                    = ((2*SumADC) - 10C)/10M
+        LDR     a2, =MPUDieTempM10
+        LDR     a3, =-MPUDieTempC10
+        ADD     a1, a3, a1, LSL #1
+        ADD     a1, a1, a2, ASR #1      ; Half bit round
+        SDIV    a1, a1, a2
+
+        MOV     pc, lr
+
+; CPUClkAdjustABBLDO
+; => a1 = new operating point
+CPUClkAdjustABBLDO ROUT
+        LDR     a4, ControlCore_LogBase
+        ADD     a4, a4, #CTRL_CORE_STD_FUSE_OPP_VMIN_MPU_2
+        ASSERT  CTRL_CORE_STD_FUSE_OPP_VMIN_MPU_2 + 4 = CTRL_CORE_STD_FUSE_OPP_VMIN_MPU_3
+        ASSERT  CTRL_CORE_STD_FUSE_OPP_VMIN_MPU_2 + 8 = CTRL_CORE_STD_FUSE_OPP_VMIN_MPU_4
+        LDR     a2, [a4, a1, LSL #2]
+
+        ; See if the fuse says that this operating point needs LDO override
+        ; When ABB is bypass - normal, follow Vdd
+        ;          is forward biased - run fast, more performance but higher power
+        ;          is reverse biased - run slow, less leakage save power
+        TST     a2, #CTRL_CORE_STD_FUSE_OPP_VMIN_MPU_2_ABB_ENABLE
+        LDR     a4, ControlWakeUp_LogBase
+
+        LDR     a3, [a4, #CTRL_WKUP_LDOVBB_MPU_VOLTAGE_CTRL]
+
+        UBFXNE  a2, a2, #CTRL_CORE_STD_FUSE_OPP_VMIN_MPU_2_ABB_VSET_SHIFT, #CTRL_CORE_STD_FUSE_OPP_VMIN_MPU_2_ABB_VSET_BITS
+        MOVEQ   a2, #0
+        BIC     a3, a3, #CTRL_WKUP_LDOVBB_MPU_VOLTAGE_CTRL_LDOVBBMPU_FBB_VSET_OUT_MASK
+        ORR     a3, a3, a2, LSL #CTRL_WKUP_LDOVBB_MPU_VOLTAGE_CTRL_LDOVBBMPU_FBB_VSET_OUT_SHIFT
+        ORRNE   a3, a3, #CTRL_WKUP_LDOVBB_MPU_VOLTAGE_CTRL_LDOVBBMPU_FBB_MUX_CTRL
+        BICEQ   a3, a3, #CTRL_WKUP_LDOVBB_MPU_VOLTAGE_CTRL_LDOVBBMPU_FBB_MUX_CTRL
+
+        STR     a3, [a4, #CTRL_WKUP_LDOVBB_MPU_VOLTAGE_CTRL]
+
+        MOV     pc, lr
+
+; CPUClkAdjustABB
+; => a1 = new operating point
+CPUClkAdjustABB ROUT
+        Push    "v1-v2, lr"
+
+        MOV     v1, a1
+        LDR     v2, PRMDevice_LogBase
+
+        TEQ     v1, #CPUOpNom           ; Only "fast" or "normal", no "slow" to choose from
+        MOV     a2, #ABBLDOWtCount:SHL:PRM_ABBLDO_MPU_SETUP_SR2_WTCNT_VALUE_SHIFT
+        ORRNE   a2, a2, #PRM_ABBLDO_MPU_SETUP_ACTIVE_FBB_SEL
+        ORR     a2, a2, #PRM_ABBLDO_MPU_SETUP_SR2EN
+        STR     a2, [v2, #PRM_ABBLDO_MPU_SETUP]
+
+        ; When new operating point is fast, set LDO first
+        BLNE    CPUClkAdjustABBLDO
+
+        TEQ     v1, #CPUOpNom           ; Only "fast" or "normal", no "slow" to choose from
+        MOVNE   a2, #PRM_ABBLDO_MPU_CTRL_OPP_CHANGE :OR: PRM_ABBLDO_MPU_CTRL_OPP_SEL_FAST
+        MOVEQ   a2, #PRM_ABBLDO_MPU_CTRL_OPP_CHANGE :OR: PRM_ABBLDO_MPU_CTRL_OPP_SEL_NOMINAL
+        STR     a2, [v2, #PRM_ABBLDO_MPU_CTRL]
+10
+        LDR     a2, [v2, #PRM_ABBLDO_MPU_CTRL]
+        TST     a2, #PRM_ABBLDO_MPU_CTRL_SR2_IN_TRANSITION
+        BNE     %BT10
+
+        ; New operating point is normal, set LDO last
+        TEQ     v1, #CPUOpNom
+        MOVEQ   a1, v1
+        BLEQ    CPUClkAdjustABBLDO
+
+        Pull    "v1-v2, pc"
+
+; CPUClkAdjustPMIC
+; => a1 = new operating point
+;    a2 = SMPS to adjust
+; <= a1 = 0 if success or -1 if failure
+;    Enables interrupts during the IIC transaction
+CPUClkAdjustPMIC ROUT
+        Push    "v1-v2, lr"
+
+        LDR     a4, ControlCore_LogBase
+        ADR     a3, CPUClkFuseOffsets
+        LDR     a3, [a3, a2, LSL #2]
+        ADD     a4, a3, a4
+        LDR     a4, [a4, a1, LSL #2]
+        LDR     a3, =CTRL_CORE_STD_FUSE_OPP_VMIN_MASK
+        AND     v1, a4, a3              ; Target mV
+        MOV     v2, a2                  ; Target SMPS
+        ADR     a3, CPUClkSOAMatrix
+        ASSERT  SOASize = 8
+        ADD     a3, a3, v2, LSL #3
+        LDRH    a1, [a3, #SOAmVLo]
+        CMP     v1, a1
+        LDRCSH  a1, [a3, #SOAmVHi]
+        CMPCS   a1, v1
+        BCC     %FT10                   ; Target out of safe area
+
+        MOV     a1, v1
+        BL      PMICmVToSMPSVSel
+
+        MOVS    a2, a1                  ; Only if VSel can bend that far
+        BMI     %FT10
+
+        MRS     v1, CPSR
+        BIC     ip, v1, #I32_bit
+        MSR     CPSR_c, ip
+
+        ADR     a3, CPUClkSMPSRegs
+        ADD     a3, a3, v2, LSL #1
+        LDRH    a1, [a3]
+        BL      PMICWriteByte
+
+        MSR     CPSR_c, v1
+
+        MOV     a1, #0                  ; Completed OK
+
+        Pull    "v1-v2, pc"
+10
+        DebugTX "Disallow PMIC change"
+        MOV     a1, #-1
+
+        Pull    "v1-v2, pc"
+
+; CPUClkAdjustPLL
+; => a1 = pointer to CPUClkSpeedTable entry
+;    a2 = pointer to the respective PLL
+CPUClkAdjustDPLLTypeA ROUT
+        LDR     a4, [a2, #CM_CLKSEL_DPLL_TYPEA]
+        UBFX    a3, a4, #CM_CLKSEL_DPLL_DIV_SHIFT, #CM_CLKSEL_DPLL_DIV_TYPEA_BITS
+        LDRB    ip, [a1, #CPUPLLDiv]
+        TEQ     ip, a3
+        UBFXEQ  a3, a4, #CM_CLKSEL_DPLL_MULT_SHIFT, #CM_CLKSEL_DPLL_MULT_TYPEA_BITS
+        LDREQH  ip, [a1, #CPUPLLMult]
+        TEQEQ   ip, a3
+        BNE     %FT10                   ; A costly relock is needed
+
+        ; The M2 divider is outside the loop so doesn't need a relock
+        LDR     a4, [a2, #CM_DIV_M2_DPLL_TYPEA]
+        ASSERT  CM_DIV_Mx_DPLL_DIVHS_SHIFT = 0
+        AND     a3, a4, #CM_DIV_Mx_DPLL_DIVHS_MASK
+        LDRB    ip, [a1, #CPUPLLDivHS]
+        TEQ     ip, a3
+        BNE     %FT30
+
+        MOV     pc, lr                  ; No change needed
+10
+        Push    "v1"
+
+        ; Halt interrupts while the clock is warping
+        MRS     v1, CPSR
+        ORR     ip, v1, #F32_bit :OR: I32_bit
+        MSR     CPSR_c, ip
+
+        ; Unlock, program, relock
+        LDR     ip, [a2, #CM_CLKMODE_DPLL_TYPEA]
+        BIC     a3, ip, #CM_CLKMODE_DPLL_EN_MASK
+        ORR     ip, a3, #CM_CLKMODE_DPLL_EN_IDLE_B_LOW_POWER
+        STR     ip, [a2, #CM_CLKMODE_DPLL_TYPEA]
+
+        LDR     a4, =LimDCCOutputMPU
+        LDRH    ip, [a1, #CPUMHz]       
+        CMP     ip, a4                  ; Check if DCC needed
+        LDRB    a4, [a1, #CPUPLLDiv]
+        LDRH    ip, [a1, #CPUPLLMult]
+        ASSERT  CM_CLKSEL_DPLL_DIV_SHIFT = 0
+        ORR     ip, a4, ip, LSL #CM_CLKSEL_DPLL_MULT_SHIFT
+        ORRCS   ip, ip, #CM_CLKSEL_DPLL_DCC_EN
+        STR     ip, [a2, #CM_CLKSEL_DPLL_TYPEA]
+
+        ORR     a3, a3, #CM_CLKMODE_DPLL_EN_LOCK
+        STR     a3, [a2, #CM_CLKMODE_DPLL_TYPEA]
+20
+        LDR     a3, [a2, #CM_IDLEST_DPLL_TYPEA]
+        TST     a3, #CM_IDLEST_DPLL_LOCK
+        BEQ     %BT20
+
+        ; Let interrupts run again
+        MSR     CPSR_c, v1
+
+        Pull    "v1"
+30
+        ; Set the M2 divider
+        LDRB    ip, [a1, #CPUPLLDivHS]
+        STR     ip, [a2, #CM_DIV_M2_DPLL_TYPEA]
+        
+        MOV     pc, lr
+
+CPUClkSpeedTable
+        ; The relationship between MHz and heat dissipation isn't linear but
+        ; since we spend most of the time idling make the 0th entry StrongARM-esque
+        CPUSpeed 250,  CPUOpNom,       50,  0, 4
+        CPUSpeed 625,  CPUOpNom,       125, 1, 2
+        CPUSpeed 750,  CPUOpNom,       75,  0, 2
+        CPUSpeed 1000, CPUOpNom,       50,  0, 1, default
+      [ :LNOT:OneSpeed
+        CPUSpeed 1176, CPUOpOverDrive, 294, 4, 1
+        CPUSpeed 1350, CPUOpHigh,      135, 1, 1
+        CPUSpeed 1500, CPUOpHigh,      75,  0, 1 ; DCC active
+      ]
+CPUClkSMPSRegs
+        ; One row each for SMPS voltage register in PMIC
+        DCW     0                      ; Index filler
+        DCW     SMPS12_VOLTAGE
+        DCW     SMPS12_VOLTAGE
+        DCW     SMPS3_VOLTAGE
+        DCW     SMPS45_VOLTAGE
+        DCW     SMPS45_VOLTAGE
+        DCW     SMPS6_VOLTAGE
+        DCW     SMPS7_VOLTAGE
+        DCW     SMPS8_VOLTAGE
+        DCW     SMPS9_VOLTAGE
+
+CPUClkSOAMatrix
+        ; One row each for SMPS, units are millivolts
+        ;        Lo    Nom   Hi
+        DCW     0,    0,    0,    0    ; Index filler
+        DCW     850,  1110, 1250, 0    ; +MPU
+        DCW     850,  1110, 1250, 0    
+        DCW     1500, 1500, 1500, 0    ; DDR1V5
+        DCW     850,  1060, 1250, 0    ; +DSPEVE
+        DCW     850,  1060, 1250, 0
+        DCW     850,  1060, 1160, 0    ; +CORE
+        DCW     0,    0,    0,    0    ; Unused
+        DCW     1800, 1800, 1800, 0    ; +1V8
+        DCW     0,    0,    0,    0    ; Unused
+        ALIGN
+
+CPUClkFuseOffsets
+        ; One row each for SMPS at nominal
+        DCD     -1                     ; Index filler
+        DCD     CTRL_CORE_STD_FUSE_OPP_VMIN_MPU_2
+        DCD     CTRL_CORE_STD_FUSE_OPP_VMIN_MPU_2
+        DCD     -1
+        DCD     CTRL_CORE_STD_FUSE_OPP_VMIN_DSPEVE_2
+        DCD     CTRL_CORE_STD_FUSE_OPP_VMIN_DSPEVE_2
+        DCD     CTRL_CORE_STD_FUSE_OPP_VMIN_CORE_2
+        DCD     -1
+        DCD     -1
+        DCD     -1
+        ; And the overdrive and high values are adjacent
+        ASSERT  CPUOpNom = 0
+        ASSERT  CTRL_CORE_STD_FUSE_OPP_VMIN_MPU_3 = CTRL_CORE_STD_FUSE_OPP_VMIN_MPU_2 + (4 * CPUOpOverDrive)
+        ASSERT  CTRL_CORE_STD_FUSE_OPP_VMIN_MPU_4 = CTRL_CORE_STD_FUSE_OPP_VMIN_MPU_2 + (4 * CPUOpHigh)
+        ASSERT  CTRL_CORE_STD_FUSE_OPP_VMIN_DSPEVE_3 = CTRL_CORE_STD_FUSE_OPP_VMIN_DSPEVE_2 + (4 * CPUOpOverDrive)
+        ASSERT  CTRL_CORE_STD_FUSE_OPP_VMIN_DSPEVE_4 = CTRL_CORE_STD_FUSE_OPP_VMIN_DSPEVE_2 + (4 * CPUOpHigh)
+
+CPUClkDeviceTemplate
+        DCW     HALDeviceType_SysPeri + HALDeviceSysPeri_CPUClk
+        DCW     HALDeviceID_CPUClk_AM572x
+        DCD     HALDeviceBus_Peri + HALDevicePeriBus_Sonics3220
+        DCD     2                       ; API version 0.2
+        DCD     CPUClkDevice_Desc
+        DCD     0                       ; Address - N/A
+        %       12                      ; Reserved
+        DCD     CPUClkDevice_Activate
+        DCD     CPUClkDevice_Deactivate
+        DCD     CPUClkDevice_Reset
+        DCD     CPUClkDevice_Sleep
+        DCD     -1                      ; Interrupt N/A
+        DCD     0
+        %       8
+        ASSERT  (.-CPUClkDeviceTemplate) = HALDeviceSize
+        DCD     CPUClk_NumSpeeds
+        DCD     CPUClk_Info
+        DCD     CPUClk_Get
+        DCD     CPUClk_Set
+        DCD     CPUClk_Override
+        DCD     CPUClk_GetOverride
+        DCD     CPUClk_GetDieTemperature
+        ASSERT  (.-CPUClkDeviceTemplate) = HALDevice_CPUClk_Size_0_2
+        DCB     CPUDefaultIndex         ; Current speed index
+        DCB     -1                      ; Next speed index
+        DCB     0, 0                    ; Padding
+        ASSERT  (.-CPUClkDeviceTemplate) = ?CPUClkDevice
+
+CPUClkDevice_Desc
+        DCB     "AM572x CPU clock control", 0
+        ALIGN
+
+; CPUClkDevice_Activate
+; => a1 = CPUClk device
+; <= a1 = success when TRUE
+CPUClkDevice_Activate
+        MOV     a1, #1
+        ; Fall through
+
+; CPUClkDevice_Deactivate
+; => a1 = CPUClk device
+CPUClkDevice_Deactivate
+        ; Fall through
+
+; CPUClkDevice_Reset
+; => a1 = CPUClk device
+CPUClkDevice_Reset
+        MOV     pc, lr
+
+; CPUClkDevice_Sleep
+; => a1 = CPUClk device
+;    a2 = state
+; <= a1 = new state
+CPUClkDevice_Sleep
+        MOV     a1, #0
+        MOV     pc, lr
+
+; CPUClk_NumSpeeds
+; => a1 = CPUClk device
+; <= a1 = number of entries in the speed table
+CPUClk_NumSpeeds ROUT
+        MOV     a1, #CPUSpeedCount
+        MOV     pc, lr
+
+; CPUClk_Info
+; => a1 = CPUClk device
+;    a2 = index into speed table
+; <= a1 = speed in MHz for that index
+CPUClk_Info ROUT
+        CMP     a2, #CPUSpeedCount
+        MOVCS   a2, #CPUSpeedCount - 1  ; Bounds check
+        ADR     a3, CPUClkSpeedTable
+        ASSERT  CPUSpeedSize = 8
+        ADD     a3, a3, a2, LSL #3
+        LDRH    a1, [a3, #CPUMHz]
+        MOV     pc, lr
+
+; CPUClk_Get
+; => a1 = CPUClk device
+; <= a1 = current speed index in speed table
+;    Can be called reentrantly, in which case any pending Set must complete first
+CPUClk_Get ROUT
+        Push    "sb, v1-v2, lr"
+
+        SUB     sb, a1, #:INDEX:CPUClkDevice
+        MOV     v1, a1
+        
+        ; Be atomic while reading the real state
+        MRS     v2, CPSR
+        ORR     a4, v2, #I32_bit
+        MSR     CPSR_c, a4
+
+        LDRSB   a2, [a1, #CPUClk_SpeedIndexNext]
+        CMP     a2, #-1
+        BLNE    CPUClk_Set              ; Force that pending change so the result is accurate
+
+        LDRB    a1, [v1, #CPUClk_SpeedIndexNow]
+
+        MSR     CPSR_c, v2
+
+        Pull    "sb, v1-v2, pc"
+
+; CPUClk_Set
+; => a1 = CPUClk device
+;    a2 = index into speed table
+; <= a1 = success when 0, or -1 for failure
+;    Can be called reentrantly, in which case any pending Set is cancelled and the new call wins
+CPUClk_Set ROUT
+        CMP     a2, #CPUSpeedCount
+        MOVCS   a1, #-1                 ; Out of range
+        MOVCS   pc, lr
+
+        Push    "sb, v1-v4, lr"
+
+        SUB     sb, a1, #:INDEX:CPUClkDevice
+        MOV     v1, a1
+
+        ; Be atomic except when IIC gets used to limit the headache
+        MRS     v4, CPSR
+        ORR     ip, v4, #I32_bit
+        MSR     CPSR_c, ip
+
+        ; Convert index to pointer
+        STRB    a2, [a1, #CPUClk_SpeedIndexNext]
+        LDRB    a3, [a1, #CPUClk_SpeedIndexNow]
+        ADR     a4, CPUClkSpeedTable
+        ASSERT  CPUSpeedSize = 8
+        ADD     v2, a4, a2, LSL #3
+        ADD     v3, a4, a3, LSL #3
+
+        ; 3.8.4 DVFS
+        ; You can run at lower operating points while at higher voltages, and
+        ;     can't run at higher operating points while at lower voltages
+        ; so  when going high->low set the voltage last, and
+        ;     when going low->high set the voltage first
+        CMP     a3, a2
+        BCC     %FT10
+        BEQ     %FT30                   ; Now = Next, skip
+
+        ; Now > Next
+        DebugTX "CPUClk H->L"
+        MOV     a1, v2
+        LDR     a2, CMCoreAONCkgen_LogBase
+        ADD     a2, a2, #CM_BASE_DPLL_MPU
+        BL      CPUClkAdjustDPLLTypeA
+
+        LDRB    a1, [v2, #CPUOpPoint]
+        LDRB    a2, [v3, #CPUOpPoint]
+        TEQ     a1, a2
+        BEQ     %FT30                   ; Same operating point, skip
+
+        ; Dial down the power
+        MOV     a2, #SMPSMPU
+        BL      CPUClkAdjustPMIC
+                                        ; PMIC adjust result ignored, it's harmless, just leave it high
+        LDRSB   ip, [v1, #CPUClk_SpeedIndexNext]
+        CMP     ip, #-1
+        MOVEQ   a1, #-1                 ; Someone else reentered and completed before this thread
+        BEQ     %FT50
+
+        ; Trim the die
+        LDRB    a1, [v2, #CPUOpPoint]
+        BL      CPUClkAdjustABB
+        B       %FT30
+10
+        ; Now < Next
+        DebugTX "CPUClk L->H"
+        LDRB    a1, [v2, #CPUOpPoint]
+        LDRB    a2, [v3, #CPUOpPoint]
+        TEQ     a1, a2
+        BEQ     %FT20                   ; Same operating point, skip to the PLL change
+
+        ; Dial up the power
+        MOV     a2, #SMPSMPU
+        BL      CPUClkAdjustPMIC
+
+        LDRSB   ip, [v1, #CPUClk_SpeedIndexNext]
+        CMP     ip, #-1
+        MOVEQ   a1, #-1                 ; Someone else reentered and completed before this thread
+        BEQ     %FT50
+
+        CMP     a1, #-1
+        BEQ     %FT40                   ; PMIC adjust failed, leave it low
+
+        ; Trim the die
+        LDRB    a1, [v2, #CPUOpPoint]
+        BL      CPUClkAdjustABB
+20
+        MOV     a1, v2
+        LDR     a2, CMCoreAONCkgen_LogBase
+        ADD     a2, a2, #CM_BASE_DPLL_MPU
+        BL      CPUClkAdjustDPLLTypeA
+30
+        ; Switch round the semaphore
+        LDRB    a2, [v1, #CPUClk_SpeedIndexNext]
+        STRB    a2, [v1, #CPUClk_SpeedIndexNow]
+        MOV     a1, #0
+40
+        MOV     a3, #-1
+        STRB    a3, [v1, #CPUClk_SpeedIndexNext]
+50
+        MSR     CPSR_c, v4
+        
+        Pull    "sb, v1-v4, pc"
+
+; CPUClk_[Get]Override
+; => a1 = CPUClk device
+;    a2 = pointer to HAL specific override table
+;    a3 = number of entries in the override table
+;    a4 = format of override table
+; <= a1 = success when 0, or -1 for failure
+CPUClk_Override ROUT
+CPUClk_GetOverride ROUT
+        MOV     a1, #-1                 ; Not supported
+        MOV     pc, lr
+
+; CPUClk_GetDieTemperature
+; => a1 = CPUClk device
+; <= a1 = temperature in 0.1K steps
+CPUClk_GetDieTemperature ROUT
+        Push    "sb, lr"
+
+        SUB     sb, a1, #:INDEX:CPUClkDevice
+        BL      CPUClkDieTemp
+
+        MOV     a2, #10
+        MOV     a3, #2730
+        MLA     a1, a1, a2, a3          ; Celcius to 10ths of kelvin
+
+        Pull    "sb, pc"
+
+        END

@@ -1,0 +1,297 @@
+/* Copyright 2007 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/* File:    selectload.c
+ * Purpose: loading a file from a selection
+ * Author:  IDJ
+ * History: 28-Feb-90: IDJ: created
+ *          21-Feb-91: IDJ: major hack to filename munging,
+ *                          this is all very dodgy
+ *
+ *          Re-release
+ *          13-Nov-91: IDJ: allow filenames with non alphanums to be loaded from selection
+ *                          (bug fix DDE-0823)
+ *
+ *          Aquarius
+ *          15-Dec-94: IDJ: bug-fix AQU-00507 (ctrl-l for non-existant file)
+ */
+
+
+#include <string.h>
+#include <stdio.h>
+#include <ctype.h>
+
+#include "txtedit.h"
+#include "txtscrap.h"
+#include "werr.h"
+#include "msgs.h"
+#include "os.h"
+
+#include "multiedit.h"
+#include "languages.h"
+#include "options.h"
+#include "selectload.h"
+#include "canonise.h"
+
+#define min(a,b) (((a)<(b))?a:b)
+
+static char *selectload__searchpath = "";
+
+#define isseparator(c)  (((c) == '.') || ((c) == ':'))
+
+static BOOL selectload__tryfile(char *root, char *main, char *extn)
+{
+   char filename[256];
+   os_filestr f;
+   os_error *e;
+
+   /* assertion:  if there are dots in the filename then main != 0
+                  and extn != 0
+   */
+
+   filename[0] = 0;
+
+   if (main == 0)
+      strncpy(filename, root, 256);
+   else
+   {
+      char *p = root;
+      int i = 0;
+      while (p < min(main,extn) && i < 255)
+      {
+         filename[i++] = *p++;
+         filename[i] = 0;
+      }
+   }
+
+   /* --- stick on main and extn dot-separated --- */
+   if (main != 0 && extn != 0)
+   {
+      char *pp = &filename[strlen(filename)];
+      while (*main != '.' && *main != 0) *pp++ = *main++;
+      *pp++ = '.';
+      while (*extn != '.' && *extn != 0) *pp++ = *extn++;
+      *pp = 0;
+   }
+
+   f.action = 5;  /* see if file exists */
+   f.name = filename;
+   e = os_file(&f);
+   if (e == 0 && f.action == 1 /*file found*/)
+   {
+      canonise_filenamebuffer(filename,sizeof(filename),0);
+      txtedit_state *s = txtedit_new(filename, 0xfff);
+      if (multiedit_closeit()) txtedit_dispose(s);
+      return TRUE;
+   }
+   else
+      return FALSE;
+}
+
+
+
+static void selectload__split_name(char *filename, char **main, char **extn)
+{
+   int l = strlen(filename);
+   char *p = filename;
+   int ndots = 0;
+
+   /* assertion:
+    *     if no dots then set main == extn == 0
+    *     else extn points after "last" dot
+    *     "last" dot gets set to zero
+    *     main points at alphanumerics immediately preceding "last" dot
+   */
+
+   *main = *extn = 0;
+
+   /* --- count dots (yuk) --- */
+   while (*p != 0)
+   {
+      if (*p == '.') ndots++;
+      p++;
+   }
+   if (ndots == 0)
+   {
+      return;
+   }
+
+   /* --- set up extn pointer --- */
+   while (l > 0)
+   {
+      l--;
+      if (filename[l] == '.')
+      {
+         *extn = &filename[l+1];
+         break;
+      }
+   }
+
+   /* --- set up main pointer --- */
+   while (l > 0)
+   {
+      l--;
+      if (isseparator(filename[l]))
+      {
+         *main = &filename[l+1];
+         return;
+      }
+   }
+   *main = &filename[l];
+   return;
+}
+
+
+
+static void selectload__doload(char *selection, char *filename)
+    /* loads a file from a selection
+     * filename refers to the file in which the selection is made
+     */
+{
+   char try_root[256];
+   char *main = 0, *extn = 0, *user_path, *p;
+   int i, j;
+
+   /* try filenames in this order:
+          <selection>
+          <reversed_selection>
+          root<selection>
+          root<reversed_selection>
+          for each element of user search path
+              element<selection>
+              element<reversed_selection>
+          for each element of default search path
+              element<selection>
+              element<reversed_selection>
+    */
+
+   /* --- selection and reverse_selection --- */
+   strncpy(try_root, selection, 256);
+   selectload__split_name(try_root, &main, &extn);
+   if (selectload__tryfile(try_root, main, extn)) return;
+   if (selectload__tryfile(try_root, extn, main)) return;
+
+   /* --- directory containing filename --- */
+   strncpy(try_root, filename, 256);
+   p = &try_root[strlen(try_root)-1];
+   while (p > try_root)
+   {
+      if (isseparator(*p)) break;
+      p--;
+   }
+   if (p == try_root) p--;
+   strcpy(p+1, selection);
+   selectload__split_name(try_root, &main, &extn);
+   if (selectload__tryfile(try_root, main, extn)) return;
+   if (selectload__tryfile(try_root, extn, main)) return;
+
+   /* --- assuming language extn filenames --- */
+   strncpy(try_root, filename, 256);
+   selectload__split_name(try_root, &main, &extn);
+   if (main != 0)
+   {
+      strcpy(main, selection);
+      selectload__split_name(try_root, &main, &extn);
+      if (selectload__tryfile(try_root, main, extn)) return;
+      if (selectload__tryfile(try_root, extn, main)) return;
+   }
+
+   user_path = options_own_search_path();
+   if (user_path[0] != 0)
+   {
+      i = 0; j= 0;
+      while (user_path[i] != 0)
+      {
+          j = 0;
+          while (user_path[i] != 0 && user_path[i] != ',')
+                try_root[j++] = user_path[i++];
+          try_root[j] = '\0';
+          strncat(try_root, selection, 256);
+          main = 0; extn = 0;
+          selectload__split_name(try_root, &main, &extn);
+          if (selectload__tryfile(try_root, main, extn)) return;
+          if (selectload__tryfile(try_root, extn, main)) return;
+          if (user_path[i] != 0) i++;
+      }
+   }
+
+   i = 0; j= 0;
+   while (selectload__searchpath[i] != 0)
+   {
+
+       j = 0;
+       /*
+        *          15-Dec-94: IDJ: bug-fix AQU-00507 (ctrl-l for non-existant file)
+        */
+       while (selectload__searchpath[i] == ' ') i++;
+       while (selectload__searchpath[i] != ',' && selectload__searchpath[i] != 0)
+             try_root[j++] = selectload__searchpath[i++];
+       try_root[j] = '\0';
+       strncat(try_root, selection, 256);
+       main = 0; extn = 0;
+       selectload__split_name(try_root, &main, &extn);
+       if (selectload__tryfile(try_root, main, extn)) return;
+       if (selectload__tryfile(try_root, extn, main)) return;
+       if (selectload__searchpath[i] != 0) i++;
+   }
+
+   /* if we get here no file has been found */
+   werr(FALSE, msgs_lookup("sload1:No file found to match selection"));
+}
+
+
+
+extern void selectload_set_dft_searchpath(char *searchpath)
+    /* sets default search path to be used */
+{
+   if (searchpath != 0)
+       selectload__searchpath = searchpath;
+}
+
+
+
+extern void selectload_load(txtedit_state *s)
+{
+   txt owner;
+
+   /* get selection into a buffer */
+   if ((owner = txtscrap_selectowner()) != 0)
+   {
+      char select[256];
+      char *buffer;
+      int segsize;
+      int n = 0;
+      int size;
+
+      if ((size = txt_selectend(owner) - txt_selectstart(owner)) >= 256)
+           return;
+
+      while (n < size)
+      {
+          txt_arrayseg(owner, txt_selectstart(owner) + n, &buffer, &segsize);
+          segsize = (segsize < size -n) ? segsize : size - n;
+          memcpy(&select[n], buffer, segsize);
+          n += segsize;
+      }
+
+      select[n] = 0;
+
+      /* load from file */
+      selectload__doload(select, s->filename);
+  }
+}
+
+
+/*extern void selectload_init(void)*/
+    /* gets default search path for current language */

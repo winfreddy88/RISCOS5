@@ -1,0 +1,128 @@
+/*
+ * Copyright (c) 2017, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include "defs.h"
+#include "stasis.h"
+#include "SyncLib/synclib.h"
+
+//#define STASIS_DEBUG
+
+#ifdef STASIS_DEBUG
+#include "DebugLib/DebugLib.h"
+#include "thread.h"
+#else
+#define dprintf(a) do {} while (0)
+#endif
+
+void (*StasisFuncPtr)(void) = StasisFunc;
+
+static spinlock_t lock = SPIN_INITIALISER;
+
+static uint32_t state_change(uint32_t cores, uint32_t initial_state, uint32_t desired_state, bool doorbell, bool sync)
+{
+	if (!glob.corews)
+	{
+		return 0; /* Module not fully initialised yet */
+	}
+	dprintf(("stasis","change %x %x %x %d %d\n",cores,initial_state,desired_state,doorbell,sync));
+	spin_lock(&lock);
+	uint32_t affected = 0;
+	cores &= ~(1 << get_corews()->id); /* Don't try and alter our own state */
+	dprintf(("stasis","have lock, cores = %x\n", cores));
+	for(int i=0;i<glob.numcores;i++)
+	{
+		corews_t *ws = glob.corews[i];
+		if (!(cores & (1<<i)) || !ws)
+		{
+			continue;
+		}
+		/* Wait for any previous transition to complete */
+		while (ws->state & CORESTATE_TRANSITION)
+		{
+			dprintf(("stasis","waiting for core %d: state %x\n",i,ws->state));
+			cpuevent_wait();
+			barrier_sync();
+		}
+		dprintf(("stasis","core %d: state %x\n",i,ws->state));
+		if (ws->state == initial_state)
+		{
+			affected |= 1<<i;
+			ws->state = desired_state | CORESTATE_TRANSITION;
+		}
+	}
+	if (affected)
+	{
+		barrier_sync();
+		if (doorbell)
+		{
+			/* Get their attention via doorbell */
+			glob.dbell->Ring(glob.dbell, affected);
+		}
+		else
+		{
+			/* Get their attention via SEV */
+			cpuevent_send();
+		}
+		if (sync)
+		{
+			/* Wait for all cores to acknowledge */
+			for(int i=0;i<glob.numcores;i++)
+			{
+				if (!(affected & (1<<i)))
+				{
+					continue;
+				}
+				corews_t *ws = glob.corews[i];
+#ifdef STASIS_DEBUG
+				int runaway = 1000;
+#endif
+				while (ws->state & CORESTATE_TRANSITION)
+				{
+					dprintf(("stasis","syncing with core %d: state %x irqsema %d\n",i,ws->state,ws->irqsema));
+					cpuevent_wait();
+					barrier_sync();
+#ifdef STASIS_DEBUG
+					if (!--runaway) { thread_dump(); metrics_dump(); do { cpuevent_wait(); } while (1); }
+#endif
+				}
+			}
+		}
+	}
+	dprintf(("stasis","affected: %x\n",affected));
+	spin_unlock(&lock);
+	return affected;
+}
+
+uint32_t stasis_enter(uint32_t cores)
+{
+	return state_change(cores, CORESTATE_RUNNING, CORESTATE_STASIS, true, true);
+}
+
+void stasis_exit(uint32_t cores)
+{
+	state_change(cores, CORESTATE_STASIS, CORESTATE_RUNNING, false, false);
+}

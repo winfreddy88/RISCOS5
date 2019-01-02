@@ -1,0 +1,439 @@
+/*
+ * Copyright (c) 2017, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include <limits.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "utils.h"
+#include "globals.h"
+#include "overlays.h"
+
+#include "Global/GraphicsV.h"
+#include "Global/RISCOS.h"
+
+#include "DebugLib/debuglib.h"
+
+void request_redraw(const overlay_t *o)
+{
+	if ((o->buffer < 0) || (o->window == WINDOW_NONE))
+	{
+		return;
+	}
+	/* Calculate position in OS units */
+	int rect[4];
+	rect[0] = o->x_offset;
+	rect[1] = o->y_offset - (o->height << vduvars.yeig);
+	rect[2] = o->x_offset + (o->width << vduvars.xeig);
+	rect[3] = o->y_offset;
+	if (rect[0] < o->win_clip[0])
+		rect[0] = o->win_clip[0];
+	if (rect[1] < o->win_clip[1])
+		rect[1] = o->win_clip[1];
+	if (rect[2] > o->win_clip[2])
+		rect[2] = o->win_clip[2];
+	if (rect[3] > o->win_clip[3])
+		rect[3] = o->win_clip[3];
+	_swix(Wimp_ForceRedraw,_INR(0,4),o->window,rect[0],rect[1],rect[2] + (1<<vduvars.xeig),rect[3] + (1<<vduvars.yeig));
+}
+
+static bool clip_siblings(wimp_w win,overlay_pos_t *pos)
+{
+	_kernel_oserror *e = _swix(Wimp_Extend,_INR(0,1)|_OUT(1),10,win,&win);
+	wimp_wstate state;
+	int block[100/4];
+	while(!e && (win != -1))
+	{
+		/* Get visible area */
+		state.o.w = win;
+		e = _swix(Wimp_GetWindowState,_INR(1,2),&state,0);
+		if (e)
+		{
+			continue;
+		}
+		/* Get border dimensions */
+		block[0] = win;
+		e = _swix(Wimp_Extend,_INR(0,1),11,block);
+		if (e)
+		{
+			continue;
+		}
+		/* Calculate full visible area for window */
+		state.o.box.x0 -= block[1];
+		state.o.box.y0 -= block[2];
+		state.o.box.x1 += block[3];
+		state.o.box.y1 += block[4];
+		/* Attempt to clip our clipping rectangle by it */
+		if ((state.o.box.y0 <= pos->clip[3]) && (state.o.box.y1 >= pos->clip[1]))
+		{
+			if ((state.o.box.x0 <= pos->clip[0]) && (state.o.box.x1 > pos->clip[0]))
+			{
+				pos->clip[0] = state.o.box.x1;
+			}
+			if ((state.o.box.x1 >= pos->clip[2]) && (state.o.box.x0 < pos->clip[2]))
+			{
+				pos->clip[2] = state.o.box.x0;
+			}
+			if (pos->clip[0] >= pos->clip[2])
+			{
+				/* Fully obscured */
+				return false;
+			}
+		}
+		else if ((state.o.box.x0 <= pos->clip[0]) && (state.o.box.x1 >= pos->clip[2]))
+		{
+			if ((state.o.box.y0 <= pos->clip[3]) && (state.o.box.y1 > pos->clip[3]))
+			{
+				pos->clip[3] = state.o.box.y1;
+			}
+			if ((state.o.box.y1 >= pos->clip[1]) && (state.o.box.y0 < pos->clip[1]))
+			{
+				pos->clip[1] = state.o.box.y0;
+			}
+			if (pos->clip[3] >= pos->clip[1])
+			{
+				/* Fully obscured */
+				return false;
+			}
+		}
+		e = _swix(Wimp_Extend,_INR(0,1)|_OUT(1),10,win,&win);
+	}
+	return true;
+}
+
+overlay_pos_t compute_overlay_pos(const overlay_t *o)
+{
+	overlay_pos_t ret;
+	wimp_wstate state;
+	wimp_w win = o->window;
+	ret.visible = false;
+	/* Initialise clipping rectangle */
+	if (win == WINDOW_NONE)
+	{
+		return ret;
+	}
+	bool first = true;
+	do
+	{
+		/* Get window state, and parent window handle */
+		state.o.w = win;
+		_kernel_oserror *e = _swix(Wimp_GetWindowState,_INR(1,2)|_OUT(3),&state,TASK_MAGIC_VALUE,&win);
+		if (e || !(state.flags & wimp_WOPEN))
+		{
+			return ret;
+		}
+		if (first)
+		{
+			/* Calculate X,Y coords in pixels */
+			int minx = state.o.box.x0 >> vduvars.xeig;
+			int maxy = state.o.box.y1 >> vduvars.yeig;
+			int ofsx = (state.o.x - o->x_offset) >> vduvars.xeig;
+			int ofsy = (state.o.y - o->y_offset) >> vduvars.yeig;
+			ret.x = minx-ofsx;
+			ret.y = (vduvars.ylimit+1)-(maxy-ofsy);
+			/* Convert user clipping rectangle to screen space (but still OS units) */
+			ofsx = state.o.box.x0-state.o.x;
+			ofsy = state.o.box.y1-state.o.y;
+			ret.clip[0] = sat_add(o->win_clip[0], ofsx);
+			ret.clip[1] = sat_add(o->win_clip[3], ofsy);
+			ret.clip[2] = sat_add(o->win_clip[2], ofsx);
+			ret.clip[3] = sat_add(o->win_clip[1], ofsy);
+			first = false;
+		}
+		/* Windows can't appear outside of their parents, so limit our clipping rectangle to the bounds of this parent */
+		if (ret.clip[0] < state.o.box.x0)
+			ret.clip[0] = state.o.box.x0;
+		if (ret.clip[1] > state.o.box.y1)
+			ret.clip[1] = state.o.box.y1;
+		if (ret.clip[2] > state.o.box.x1)
+			ret.clip[2] = state.o.box.x1;
+		if (ret.clip[3] < state.o.box.y0)
+			ret.clip[3] = state.o.box.y0;
+		/* Clip against sibling windows that will appear ontop of it */
+		if (!clip_siblings(o->window,&ret))
+		{
+			return ret;
+		}
+	}
+	while (win != WINDOW_NONE);
+	/* Adjust clipping rectangle to be in screen pixels, relative to overlay */
+	ret.clip[0] = (ret.clip[0] >> vduvars.xeig) - ret.x;
+	ret.clip[1] = ((vduvars.ylimit+1)-(ret.clip[1] >> vduvars.yeig)) - ret.y;
+	ret.clip[2] = (ret.clip[2] >> vduvars.xeig) - ret.x;
+	ret.clip[3] = ((vduvars.ylimit+1)-(ret.clip[3] >> vduvars.yeig)) - ret.y;
+	/* Only say it's visible if the clipping rectangle is vaguely sensible */
+	ret.visible = (ret.clip[0] < ret.clip[2]) && (ret.clip[1] < ret.clip[3]);
+	return ret;
+}
+
+/* Macros for a fake alloca, since we don't have a proper one yet! */
+static void *fake_alloca(size_t len,int **list)
+{
+	int *chunk = (int *) malloc(len+4);
+	*chunk = (int) *list;
+	*list = chunk;
+	return (void *) (chunk+1);
+}
+
+static void fake_alloca_free(int *list)
+{
+	while (list)
+	{
+		int *next = (int *) *list;
+		free(list);
+		list = next;
+	}
+}
+
+#define alloca(X) fake_alloca(X,&fake_alloca_list)
+
+/* Macros for a basic chunked stack data type, allowing "unbounded" growth via alloca
+   For each stack chunk:
+    Word 0 = Link to next chunk, or NULL
+    Words [1,N] = Data
+    Word N+1 = Value N (# entries currently in stack)
+    Word [N+2,LIMIT) = Free space
+   PUSH and POP adjust the value of STACK; STACK always points at Word N+1
+ */
+#define STACK_CHUNK 256
+#define STACK_INIT(OUT,BASE,LIMIT) do { \
+	if (LIMIT-BASE < 3) { \
+		BASE = (int *) alloca(STACK_CHUNK*4); \
+		LIMIT = BASE+STACK_CHUNK; \
+	} \
+	BASE[0] = NULL; \
+	BASE[1] = 0; \
+	OUT = BASE+1; \
+} while (0)
+
+#define STACK_PUSH(STACK,LIMIT,VAL) do { \
+	if (STACK+1 == LIMIT) { \
+		STACK = (int *) alloca(STACK_CHUNK*4); \
+		STACK[0] = (int) (LIMIT-1); \
+		STACK[1] = 0; \
+		LIMIT = STACK+STACK_CHUNK; \
+		STACK++; \
+	} \
+	STACK[1] = STACK[0]+1; \
+	STACK[0] = (int) VAL; \
+	STACK++; \
+} while (0)
+
+/* NULL if stack empty */
+#define STACK_HEAD(STACK) (STACK[-1])
+
+#define STACK_POP(STACK) do { \
+	if (STACK[0] > 1) { \
+		STACK[-1] = STACK[0]-1; \
+		STACK--; \
+	} else { \
+		STACK = (int *) STACK[-2]; \
+	} \
+} while(0)
+
+typedef struct {
+	overlay_t *o;
+	int *stack;
+} overlay_list_entry_t;
+
+/* In:
+    Array entries [base,limit) will have the same window at the top of their stacks
+   Out:
+    Topmost window will have been popped from each stack
+    Array entries will be sorted so that they are now in window paint order, according to the new topmost window of each stack
+    N.B. Sorting only considers the topmost window in each stack
+ */
+static _kernel_oserror *sort_entries(overlay_list_entry_t *base,overlay_list_entry_t *limit,bool top)
+{
+	wimp_w parent = -1;
+	/* If this is the first call, don't pop the top entries from the stacks (and assume that the top entries, if they existed, would have been window -1) */
+	if (!top)
+	{
+		parent = STACK_HEAD(base->stack);
+		for(overlay_list_entry_t *e = base; e != limit; e++)
+		{
+			STACK_POP(e->stack);
+		}
+	}
+	/* Trivial sort algorithm */
+	/* Enumerate the children of the shared parent window to determine the sort order */
+	wimp_w child;
+	_kernel_oserror *err = _swix(Wimp_Extend,_INR(0,1)|_OUT(1),7,parent,&child);
+	while (!err && (child != -1) && (base != limit))
+	{
+		for(overlay_list_entry_t *e = base; (e != limit) && (base != limit); e++)
+		{
+			if (STACK_HEAD(e->stack) == child)
+			{
+				/* Swap into correct place */
+				if (e != base)
+				{
+					overlay_list_entry_t temp = *base;
+					*base = *e;
+					*e = temp;
+				}
+				base++;
+			}
+		}
+		/* Get next sibling */
+		err = _swix(Wimp_Extend,_INR(0,1)|_OUT(1),9,child,&child);
+	}
+	return err;
+}
+
+typedef struct {
+	int count;
+	overlay_list_entry_t list[OVERLAY_MAX];
+} overlay_list_t;
+
+static int compute_zorder(overlay_list_t *list,uint8_t *out)
+{
+	int *fake_alloca_list = NULL;
+	/* For each overlay in the list, build a stack of its parent windows
+	   The head entry in each stack will be the backmost real window
+	   The tail entry will be the overlay window */
+	/* Use the unused part of the list as the base stack chunk */
+	int *stack_base = (int *) &list->list[list->count];
+	int *stack_limit = (int *) &list->list[OVERLAY_MAX];
+	for(int i=0;i<list->count;i++)
+	{
+		int *parents;
+		STACK_INIT(parents,stack_base,stack_limit);
+		wimp_w win = list->list[i].o->window;
+		do
+		{
+			STACK_PUSH(parents,stack_limit,win);
+			if (_swix(Wimp_Extend,_INR(0,1)|_OUT(1),6,win,&win))
+			{
+				fake_alloca_free(fake_alloca_list);
+				return 0;
+			}
+		} while (win != -1);
+		list->list[i].stack = parents;
+		stack_base = parents+1;
+	}
+	/* Do an initial sort operation, to sort the head entries of the stacks */
+	_kernel_oserror *e = sort_entries(&list->list[0],&list->list[list->count],true);
+	if (e)
+	{
+		fake_alloca_free(fake_alloca_list);
+		return 0;
+	}
+	bool sorted;
+	do {
+		/* Scan list, looking for sequential runs of overlays which have the same parent (i.e. same head stack entry)
+		   These indicate overlays which haven't yet been sorted.
+		   N.B. Avoiding recursion to prevent stack overflows */
+		int i=0; /* Start of run */
+		int j=1; /* End of run (+1) */
+		sorted = true;
+		while (i < list->count)
+		{
+			if ((j < list->count) && (STACK_HEAD(list->list[i].stack) == STACK_HEAD(list->list[j].stack)))
+			{
+				/* Run continues */
+			}
+			else
+			{
+				/* Run ends */
+				if ((j != i+1) && STACK_HEAD(list->list[i].stack))
+				{
+					/* Found a run which we can sort */
+					sorted = false; /* Make sure we go round again, to check for any new runs which need sorting */
+					e = sort_entries(&list->list[i],&list->list[j],false); /* Pop the head entries off of each stack (revealing the entries that need sorting), and sort them */
+					if (e)
+					{
+						fake_alloca_free(fake_alloca_list);
+						return 0;
+					}
+				}
+				i = j;
+			}
+			j++;
+		}
+	} while (!sorted);
+	/* Entire array should now be sorted - transfer it to the output */
+	for(int i=0;i<list->count;i++)
+	{
+		out[i] = list->list[i].o->gvoverlay;
+	}
+	fake_alloca_free(fake_alloca_list);
+	return list->count;
+}
+
+static void list_func(overlay_t *o,void *param)
+{
+	overlay_list_t *list = (overlay_list_t *) param;
+	if (o->visible && (o->type == GVOverlayType_ZOrder) && (o->gvoverlay != 0) && (o->window != WINDOW_NONE))
+	{
+		list->list[list->count++] = (overlay_list_entry_t) { o, NULL };
+	}
+}
+
+void update_zorder(void)
+{
+	/* Build a list of the visible z-order overlays */
+	overlay_list_t list;
+	list.count = 0;
+	overlay_iterate(list_func,&list);
+	if (list.count == 0)
+	{
+		return;
+	}
+	uint8_t new_zorder[256];
+	int new_count;
+	if (list.count == 1)
+	{
+		/* Only one overlay active, skip walking the window stack */
+		new_zorder[0] = list.list[0].o->gvoverlay;
+		new_count = 1;
+	}
+	else
+	{
+		new_count = compute_zorder(&list,new_zorder);
+	}
+	static uint8_t last_zorder[256];
+	static int last_zorder_count = 0;
+	if ((new_count != last_zorder_count) || memcmp(new_zorder,last_zorder,new_count))
+	{
+		memcpy(last_zorder,new_zorder,new_count);
+		last_zorder_count = new_count;
+		_swix(OS_CallAVector,_INR(0,1)|_IN(4)|_IN(9),new_zorder,new_count,GraphicsV_SetOverlayZOrder | (vduvars.gvdriver<<24),GraphicsV);
+	}
+}
+
+size_t modeselector_size(const modeselector_t *desc)
+{
+	size_t size = sizeof(modeselector_t) - sizeof(modevarpair_t) + 4;
+	const modevarpair_t *pair = desc->modevars;
+	while (pair->var != -1)
+	{
+		pair++;
+		size += sizeof(modevarpair_t);
+	}
+	return size;
+}

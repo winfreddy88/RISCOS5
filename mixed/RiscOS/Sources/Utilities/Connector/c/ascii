@@ -1,0 +1,277 @@
+/*
+ * Copyright (c) 1995, Andreas Zieringer
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include "Desk/WimpSWIs.h"          /* Low-level WIMP commands         */
+#include "Desk/Window.h"            /* Window handling automation      */
+#include "Desk/Core.h"              /* usefull core functions          */
+#include "Desk/Error.h"             /* Error despatcher                */
+#include "Desk/Event.h"             /* Event despatcher                */
+#include "Desk/Icon.h"              /* Icon handling automation        */
+#include "Desk/Slider.h"            /* "Easy" slider handling          */
+#include "Desk/Time.h"
+#include "Desk/linklist.h"
+#include "Desk/File.h"
+#include "config.h"
+
+#include "global.h"
+#include "misc.h"
+#include "iconnames.h"
+#include "ascii.h"
+#include "timing.h"
+#include "zmisc.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+
+static int start_time;
+static int wait_time;
+static int filelength;
+static char fullname[MAX_PATHLENGTH];
+static char buffer[2048];
+
+static void plot_transferinfo(int rbytes,int force)
+{
+  int prozent;
+  int cps;
+
+  if(Desk_Time_Monotonic()-wait_time>=50 || force)
+  {
+    if( rbytes!=0 && filelength!=0 && rbytes<=filelength)
+    {
+      prozent=(100<<8)/((filelength<<8)/rbytes);
+    }
+    else
+    {
+      if(rbytes<=filelength)
+      {
+        prozent=0;
+      }
+      else
+      {
+        prozent=100;
+      }
+    }
+
+
+    Desk_Icon_SetInteger(filetrans_window,FILETRANS_SIZE,rbytes);
+    //Desk_Icon_SetInteger(filetrans_window,FILETRANS_PRO,prozent);
+    Desk_Slider_SetValue(&filetrans_slider, prozent, NULL, NULL);
+
+    cps=(rbytes*100)/timing(0);
+    Desk_Icon_SetInteger(filetrans_window,FILETRANS_CPS,cps);
+    //show_time(filetrans_window,FILETRANS_ELAPSED,Desk_Time_Monotonic()-start_time,TRUE);
+    if(cps!=0)
+      show_time(filetrans_window,FILETRANS_EXPECTED,timing(0),((filelength-rbytes)*100)/cps,TRUE);
+    wait_time=Desk_Time_Monotonic();
+  }
+}
+
+void delay(int t)
+{
+  if(t==0)
+    return;
+  t+=Desk_Time_Monotonic();
+  while(Desk_Time_Monotonic()<t)
+    Desk_Event_Poll();
+}
+
+void send_ascii(void)
+{
+  Desk_file_handle f;
+  file_des *current;
+
+  int i,j,n,b,z;
+  int bytes_send;
+
+  //Desk_Icon_SetText(filetrans_window,FILETRANS_BYTESCOM,msg[7].text);
+  Desk_Window_SetTitle(filetrans_window,"Ascii send");
+
+  n=Desk_LinkList_ListLength(&Files);
+  if(file_nr!=n)
+    Desk_Error_Report(0,"This error is really not possible ! %d,%d",n,file_nr);
+  current=Desk_LinkList_FirstItem(&Files);
+  for (i=0; i<n; i++)
+  {
+    vfile("Sending...");
+    timing(1);
+    sprintf(fullname,"%s.%s",file_path,current->name);
+    Desk_Icon_SetText(filetrans_window,FILETRANS_FILENAME,current->name);
+    f=Desk_File_Open(fullname,Desk_file_READ);
+    if(f!=NULL)
+    {
+      filelength=Desk_File_GetLength(fullname);
+      //Desk_Icon_SetInteger(filetrans_window,FILETRANS_SIZE,filelength);
+
+      (*driver)(DRIVER_FLUSHTX,portnumber,0,0);
+      (*driver)(DRIVER_FLUSHRX,portnumber,0,0);
+      start_time=Desk_Time_Monotonic();
+      wait_time=Desk_Time_Monotonic();
+      bytes_send=0;
+      while(!Desk_File_EOF(f) && !ascii_abort)
+      {
+        /*
+        c=Desk_File_ReadChar(f);
+        while((*driver)(DRIVER_PUTBYTE,portnumber,c,0)==-1)
+          Desk_Event_Poll();
+        */
+
+        b=Desk_File_ReadBytes(f,buffer,1024);
+        for(z=0;z<(1024-b);z++)
+        {
+          j=buffer[z];
+
+          if(j==0x0a)
+          {
+            switch(ascii_trans)
+            {
+              case 0:
+              break;
+              case 1:
+                j=-1;
+              break;
+              case 2:
+                j=0x0d;
+              break;
+              case 3:
+               while((*driver)(DRIVER_PUTBYTE,portnumber,0x0d,0)==-1 && !ascii_abort)
+                 Desk_Event_Poll();
+               delay(ascii_char_delay);
+               bytes_send++;
+              break;
+            }
+            delay(ascii_line_delay);
+          }
+          if(j!=-1)
+          {
+            while((*driver)(DRIVER_PUTBYTE,portnumber,j,0)==-1 && !ascii_abort)
+              Desk_Event_Poll();
+            delay(ascii_char_delay);
+          }
+          bytes_send++;
+
+        }
+
+        /*
+        while((*driver)(DRIVER_CHECKTX,portnumber,0,0)<serial_output_buffer_size-1);
+          Desk_Event_Poll();
+        */
+        if(Desk_Time_Monotonic()-null_event_time>=10)
+	  Desk_Event_Poll();
+        plot_transferinfo(bytes_send,FALSE);
+
+      }
+        while((*driver)(DRIVER_CHECKTX,portnumber,0,0)<serial_output_buffer_size && !ascii_abort)
+          Desk_Event_Poll();
+      if(!ascii_abort)
+        plot_transferinfo(bytes_send,TRUE);
+      Desk_File_Close(f);
+    }
+    else
+     show_message("couldn't open file");
+  }
+  filetr_finished=1;
+}
+
+void receive_ascii(char *name)
+{
+  Desk_file_handle f;
+  int received_bytes;
+  int b;
+  int flag;
+  int cps;
+  int c;
+
+  
+  Desk_Window_SetTitle(filetrans_window,"Ascii receive");
+
+  sprintf(fullname,"%s.%s",downloads_directory,name);
+  Desk_Icon_SetText(filetrans_window,FILETRANS_FILENAME,name);
+  /*
+  if(name!=NULL && strlen(name)!=0)
+  {
+    sprintf(fullname,"%s.%s",downloads_directory,name);
+    Desk_Icon_SetText(filetrans_window,FILETRANS_FILENAME,name);
+  }
+  else
+  {
+    sprintf(fullname,"%s.%s",downloads_directory,"asciifile");
+    Desk_Icon_SetText(filetrans_window,FILETRANS_FILENAME,"asciifile");
+  }
+  */
+  
+  start_time=Desk_Time_Monotonic();
+  wait_time=Desk_Time_Monotonic();
+  f=Desk_File_Open(fullname,Desk_file_WRITE);
+  if(f!=NULL)
+  {
+    Desk_File_SetType(fullname,0xfff);
+    received_bytes=0;
+    flag=1;
+    vfile("Negotiating...");
+    while(!ascii_abort)
+    {
+      //b=(*driver)(DRIVER_GETBLOCK,portnumber,buffer,2048);
+      b=0;
+      while(b<2048 && ((c=(*driver)(DRIVER_GETBYTE,portnumber,0,0))!=-1))
+      {
+        *(buffer+b)=c;
+        b++;
+      }
+        
+      if(b>0)
+      {
+        Desk_File_WriteBytes(f,buffer,b);
+        received_bytes+=b;
+        if(flag)
+        {
+          timing(1);
+          vfile("Receiving...");
+          flag=0;
+        }
+      }
+
+      if(Desk_Time_Monotonic()-wait_time>=50 && !flag)
+      {
+        Desk_Icon_SetInteger(filetrans_window,FILETRANS_SIZE,received_bytes);
+        cps=(received_bytes*100)/timing(0);
+        Desk_Icon_SetInteger(filetrans_window,FILETRANS_CPS,cps);
+        show_time(filetrans_window,FILETRANS_EXPECTED,timing(0),0,TRUE);
+        wait_time=Desk_Time_Monotonic();
+      }
+      if(Desk_Time_Monotonic()-null_event_time>=10)
+        Desk_Event_Poll();
+
+    }
+    Desk_Icon_SetInteger(filetrans_window,FILETRANS_SIZE,received_bytes);
+    Desk_File_Close(f);
+  }
+  else
+    show_message("couldn't open file");
+}

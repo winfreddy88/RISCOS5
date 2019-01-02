@@ -1,0 +1,135 @@
+/*
+ * Copyright (c) 2010, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include "dsi.h"
+#include "dss.h"
+#include "regs.h"
+
+#include "DebugLib/DebugLib.h"
+
+uint32_t dsi_pll_current_pixel_rate=0;
+
+#ifdef DEBUGLIB
+static const char *cmds[4] = {"OFF","DSI_PLL_ON_HSDIVIDER_OFF","BOTH_ON","BOTH_ON_DSI_COMPLEXIO_OFF"};
+#endif
+
+static void dsi_pll_command(uint32_t cmd)
+{
+	/* DSI_CLK_CTRL can only be written if DSI_CTRL.IF_EN == 0 */
+	dsi->ctrl &= ~DSI_CTRL_IF_EN;
+
+	dsi->clk_ctrl = (dsi->clk_ctrl & ~DSI_CLK_CTRL_PLL_PWR_CMD_MASK) | (cmd<<DSI_CLK_CTRL_PLL_PWR_CMD_SHIFT);
+	int timeout=1000000;
+	while(((dsi->clk_ctrl & DSI_CLK_CTRL_PLL_PWR_STATUS_MASK)>>DSI_CLK_CTRL_PLL_PWR_STATUS_SHIFT != cmd) && --timeout) {};
+	if(!timeout)
+	{
+		dprintf(("","dsi_pll_command: Timeout waiting for cmd %s; current state %s\n",cmds[cmd],cmds[(dsi->clk_ctrl & DSI_CLK_CTRL_PLL_PWR_STATUS_MASK)>>DSI_CLK_CTRL_PLL_PWR_STATUS_SHIFT]));
+	}
+}
+
+void dsi_pll_program_for_dispc(uint32_t pixel_rate)
+{
+	/* Program the DSI PLL for use by DISPC */
+	if(pixel_rate == dsi_pll_current_pixel_rate)
+		return;
+
+	clock_divider_t div = calculate_dss_clock_divider(pixel_rate);
+
+	dprintf(("","dsi_pll_program_for_dispc: Changing pixel rate from %d to %d\n",dsi_pll_current_pixel_rate,pixel_rate));
+
+	dprintf(("","REGM=%d REGN=%d REGM4=%d pcd=%d\n",div.regm,div.regn,div.regm4,div.pcd));
+	/* base init of PLL - do it only once (after complete DSS reset) */
+	if (0 == dsi_pll_current_pixel_rate)
+	{
+		/* check that DSI module is enabled */
+		if (0 == (dsi->ctrl & DSI_CTRL_IF_EN))
+		{
+			/* enable module for getting write access */
+			dsi->ctrl |= DSI_CTRL_IF_EN;
+			/* wait until bit is set */
+			while (0 == (dsi->ctrl & DSI_CTRL_IF_EN))
+			{
+				;
+			}
+		}
+
+		/* SCPClk is required for PLL registers on OMAP4 */
+		dsi->clk_ctrl |= DSI_CLK_CTRL_CIO_CLK_ICG;
+
+		while (!(dsi_pll->status & DSI_PLL_STATUS_DSI_PLLCTRL_RESET_DONE))
+			;
+
+		/* Turn on PLL & HSDIVIDER */
+		dsi_pll_command(DSI_PLL_PWR_CMD_BOTH_ON);
+	}
+
+	/* set manual mode */
+	dsi_pll->control = 0;
+	/* program configuration registers */
+	dsi_pll->configuration1 = (div.regn << DSI_PLL_CONFIGURATION1_DSI_PLL_REGN_SHIFT)
+							| (div.regm << DSI_PLL_CONFIGURATION1_DSI_PLL_REGM_SHIFT)
+							| (div.regm4 << DSI_PLL_CONFIGURATION1_M4_CLOCK_DIV_SHIFT)
+							| DSI_PLL_CONFIGURATION1_DSI_PLL_STOPMODE;
+
+	uint32_t config2 = dsi_pll->configuration2;
+	config2 &= ~(DSI_PLL_CONFIGURATION2_PHY_CLKINEN | DSI_PLL_CONFIGURATION2_M4_CLOCK_EN);
+	config2 |= DSI_PLL_CONFIGURATION2_PLL_REFEN | DSI_PLL_CONFIGURATION2_HSDIVBYPASS;
+	dsi_pll->configuration2 = config2;
+
+	/* 10. Lock */
+	dsi_pll->go = DSI_PLL_GO_DSI_PLL_GO;
+
+	/* 11. Wait for GO bit to clear */
+	int timeout=1000000;
+	while((dsi_pll->go & DSI_PLL_GO_DSI_PLL_GO) && --timeout) {};
+	if(!timeout)
+	{
+		dprintf(("","dsi_pll_program_for_dispc: Timeout waiting for DSI_PLL_GO\n"));
+	}
+
+	/* 12. Wait for PLL to lock */
+	timeout=1000000;
+	while(!(dsi_pll->status & DSI_PLL_STATUS_DSI_PLL_LOCK) && --timeout) {};
+	if(!timeout)
+	{
+		dprintf(("","dsi_pll_program_for_dispc: Timeout waiting for DSI_PLL_LOCK\n"));
+	}
+
+	/* reenable DISPC clock */
+	config2 = dsi_pll->configuration2;
+	config2 &= ~DSI_PLL_CONFIGURATION2_HSDIVBYPASS;
+	config2 |= DSI_PLL_CONFIGURATION2_PHY_CLKINEN | DSI_PLL_CONFIGURATION2_M4_CLOCK_EN;
+	dsi_pll->configuration2 = config2;
+
+	/* set PCD value */
+	dispc->divisor2 = (1 << DISPC_DIVISOR_LCD_SHIFT) | (div.pcd << DISPC_DIVISOR_PCD_SHIFT);
+
+	/* Done! */
+	dsi_pll_current_pixel_rate = pixel_rate;
+
+	dprintf(("","dsi_pll_program_for_dispc: Done\n"));
+}

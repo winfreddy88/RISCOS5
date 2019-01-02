@@ -1,0 +1,995 @@
+/*
+ * Copyright (c) 2010, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include <string.h>
+#include <stddef.h>
+#include "modhead.h"
+#include "swis.h"
+
+#include "Global/RISCOS.h"
+#include "Global/Services.h"
+#include "Global/HALEntries.h"
+#include "Global/GraphicsV.h"
+#include "Global/VduExt.h"
+
+#include "DebugLib/DebugLib.h"
+
+#include "graphicsv.h"
+#include "dispc.h"
+#include "sdma.h"
+#include "gvoverlay.h"
+#include "mouse.h"
+#include "consts.h"
+#include "vars.h"
+#include "globals.h"
+#include "palette.h"
+
+/* Extract the GraphicsV overlay number from a GraphicsV call register block */
+#define GET_OVERLAY(r) (((r->r[4] >> 16) & 255) - TARGET_MAX)
+
+static uint32_t vdu_init = ~0; /* Physical address of current VDU display bank */
+
+#ifdef DEBUGLIB
+/* Keep track of the max duration of GraphicsV calls, separately tracking calls which are made with IRQs disabled and those which are made with IRQs enabled */
+#define NUM_GV_CALLS 32
+static uint32_t gv_durations[NUM_GV_CALLS][2];
+
+void graphicsv_debug(void)
+{
+	for(int i=0;i<NUM_GV_CALLS;i++)
+	{
+		for(int j=0;j<2;j++)
+		{
+			if (gv_durations[i][j])
+			{
+				printf(" GraphicsV %d: %uus, IRQs %s\n",i,gv_durations[i][j],(j ? "off" : "on"));
+				gv_durations[i][j] = 0;
+			}
+		}
+	}
+}
+#endif
+
+static pixelformat getformat(const VIDCList3 *params)
+{
+	pixelformat_t format;
+	format.log2bpp = params->PixelDepth;
+	format.ncolour = (1<<(1<<params->PixelDepth))-1;
+	format.modeflags = (params->PixelDepth==3?ModeFlag_FullPalette:0);
+	const ControlList *c = params->ControlList;
+	while(c->index != -1)
+	{
+		if(c->index == ControlList_NColour)
+			format.ncolour = c->value;
+		else if(c->index == ControlList_ModeFlags)
+			format.modeflags = c->value;
+		c++;
+	}
+	return findformat(format);
+}
+
+/* Return a mask of which overlays can support the given format, for the given target. Doesn't take into account the requirements of any other overlays which may be active. */
+int checkformat(overlaytarget target, pixelformat format)
+{
+	/* If the same feature is required by both the target and format, make sure the settings are identical */
+	const omapformat_t *omapformats = headattrs[target].formats;
+	int mask = omapformats[format].features_mask & headattrs[target].features_mask;
+	if ((omapformats[format].features_val & mask) != (headattrs[target].features_val & mask))
+		return 0;
+	return omapformats[format].overlays;
+}
+
+/* Returns true if an overlay of the given format can co-exist with the current overlays */
+bool canhaveoverlay(pixelformat format, const modelocked_t *modelocked)
+{
+	const omapformat_t *omapformats = headattrs[modelocked->default_display].formats;
+	const features_t *features = features_read_lock();
+
+	int mask = omapformats[format].features_mask & features->head_masks[modelocked->default_display]; /* Features they both care about */
+	bool ok = (omapformats[format].features_val & mask) == (features->head_vals[modelocked->default_display] & mask);
+
+	features_read_unlock();
+
+	return ok;
+}
+
+static int do_null(_kernel_swi_regs *r)
+{
+	/* Nothing */
+	(void) r;
+	return 0;
+}
+
+static int do_vsync(_kernel_swi_regs *r)
+{
+	/* Nothing */
+	(void) r;
+	return 1;
+}
+
+static int do_setmode(_kernel_swi_regs *r)
+{
+	/* Only support head 0 */
+	if (r->r[4] & 0xff0000)
+	{
+		return 1;
+	}
+	/* TODO - Needs updating for display rotation, etc. */
+	/* TODO - Should verify mode and then abort if it's bad? */
+	/* TODO - How best to ensure atomicity? */
+	r->r[4] = 0;
+	const VIDCList3 *params = (const VIDCList3 *) r->r[0];
+	const lcdtimings_t *fixed_timings;
+	overlaytarget default_display;
+	/* TODO - Mark head as disabled so that nothing will interact with it (but, need to avoid fooling code into thinking it needs resetting completely during the mode change) */
+	/* Kill all GraphicsV overlays */
+	gvoverlay_shutdown();
+	{
+		/* Disable and reset all overlays */
+		{
+			modelocked_t *modelocked = modelocked_write_lock();
+			default_display = modelocked->default_display;
+			/* Stop IRQ code from trying to update the overlays while we're performing the mode change */
+			modelocked->overlay_desktop = OVERLAY_MAX;
+			modelocked->overlay_pointer = OVERLAY_MAX;
+			/* Mark the head as disabled, just to make sure nothing tries interacting with it while this mode change is in progress */
+			modelocked->heads[default_display].enabled = false;
+		}
+		const modelocked_t *modelocked = modelocked_write_to_read();
+		irqlocked_t *irqlocked = irqlocked_lock();
+		for(int i=0;i<OVERLAY_MAX;i++)
+		{
+			overlaycfg_t *o = &irqlocked->overlays[i];
+			if (o->target != TARGET_NONE)
+			{
+				if (o->enabled)
+				{
+					o->enabled = false;
+					dispc_update_overlay((overlayidx) i, modelocked, irqlocked);
+				}
+				o->target = TARGET_NONE;
+				omap_update_features((overlayidx) i, TARGET_NONE, PIXELFORMAT_MAX);
+			}
+			overlaycfg_reset(o);
+		}
+		fixed_timings = (headattrs[default_display].fixedtimings)(default_display);
+		irqlocked_unlock();
+		modelocked_read_unlock();
+	}
+	/* Process control list to determine interlace setting */
+	int interlace = 0;
+	for(int i=0;params->ControlList[i].index != ControlList_Terminator;i++)
+		switch(params->ControlList[i].index)
+		{
+		case ControlList_Interlaced:
+			interlace = params->ControlList[i].value;
+			break;
+		}
+	pixelformat format = getformat(params);
+	dprintf(("","do_setmode: format %s\n",pixelformatnames[format]));
+
+	/* Calculate final modelocked_head_t */
+	modelocked_head_t newstate = {0};
+	if(fixed_timings)
+	{
+		/* Use fixed timings */
+		memcpy(&newstate.mode,fixed_timings,sizeof(lcdtimings_t));
+	}
+	else
+	{
+		/* Build lcdtimings struct ready for setting mode
+		   Note that we're converting any interlace timings to progressive here - this will need revising once we have support for HDMI output (add interlace flag to lcdtimings?) */
+		newstate.mode.pixelrate = (params->PixelRate*1000)<<interlace;
+		newstate.mode.hsw = params->HorizSyncWidth;
+		/* We don't yet have anything useful to do with the border values, so just combine them with the porch values like the NVidia module */
+		newstate.mode.hfp = params->HorizFrontPorch+params->HorizRightBorder;
+		newstate.mode.hbp = params->HorizBackPorch+params->HorizLeftBorder;
+		newstate.mode.width = params->HorizDisplaySize;
+		newstate.mode.vsw = params->VertiSyncWidth<<interlace;
+		newstate.mode.vfp = (params->VertiFrontPorch+params->VertiBottomBorder)<<interlace;
+		newstate.mode.vbp = (params->VertiBackPorch+params->VertiTopBorder)<<interlace;
+		newstate.mode.height = params->VertiDisplaySize<<interlace;
+		newstate.mode.syncpol = params->SyncPol;
+		/* Clamp timings if LCD. This should really be done in headattrs[].setmode! */
+		if(headattrs[default_display].flags & HEADATTR_CLAMPTIMINGS)
+		{
+			if(newstate.mode.hsw > hwconfig->max_sync)
+			{
+				dprintf(("","do_setmode: Clamping HSW %d -> %d\n",newstate.mode.hsw,hwconfig->max_sync));
+				newstate.mode.hsw = hwconfig->max_sync;
+			}
+			if(newstate.mode.hfp > hwconfig->max_porch)
+			{
+				dprintf(("","do_setmode: Clamping HFP %d -> %d\n",newstate.mode.hfp,hwconfig->max_porch));
+				newstate.mode.hfp = hwconfig->max_porch;
+			}
+			if(newstate.mode.hbp > hwconfig->max_porch)
+			{
+				dprintf(("","do_setmode: Clamping HBP %d -> %d\n",newstate.mode.hbp,hwconfig->max_porch));
+				newstate.mode.hbp = hwconfig->max_porch;
+			}
+			if(newstate.mode.vsw > hwconfig->max_sync)
+			{
+				dprintf(("","do_setmode: Clamping VSW %d -> %d\n",newstate.mode.vsw,hwconfig->max_sync));
+				newstate.mode.vsw = hwconfig->max_sync;
+			}
+			if(newstate.mode.vfp >= hwconfig->max_porch)
+			{
+				dprintf(("","do_setmode: Clamping VFP %d -> %d\n",newstate.mode.vfp,hwconfig->max_porch-1));
+				newstate.mode.vfp = hwconfig->max_porch-1;
+			}
+			if(newstate.mode.vbp >= hwconfig->max_porch)
+			{
+				dprintf(("","do_setmode: Clamping VBP %d -> %d\n",newstate.mode.vbp,hwconfig->max_porch-1));
+				newstate.mode.vbp = hwconfig->max_porch-1;
+			}
+		}
+	}
+	newstate.dw = newstate.mode.width;
+	newstate.dh = newstate.mode.height;
+	newstate.enabled = true;
+
+	(headattrs[default_display].prepmode)(default_display,&newstate,format);
+
+	/* Set the mode */
+	(headattrs[default_display].setmode)(default_display,&newstate);
+
+	/* Pick which overlays we want to use, and record the new state */
+	{
+		modelocked_t *modelocked = modelocked_write_lock();
+		modelocked->heads[default_display] = newstate;
+		omap_pick_overlays(default_display, format, modelocked);
+	}
+
+	const modelocked_t *modelocked = modelocked_write_to_read();
+
+	/* Update head features */
+	omap_update_features(modelocked->overlay_desktop,default_display,format);
+
+	{
+		irqlocked_t *irqlocked = irqlocked_lock();
+		/* Re-program & re-apply the desktop overlay
+		   The pointer overlay will configure itself as and when required */
+		overlaycfg_t *o = &irqlocked->overlays[modelocked->overlay_desktop];
+		o->buf_w = o->scaled_w = params->HorizDisplaySize;
+		o->buf_h = o->scaled_h = params->VertiDisplaySize<<interlace;
+		o->x = 0;
+		o->y = 0;
+		o->format = format;
+		o->stride = (o->buf_w*pixel_format_bpp[o->format])>>3;
+		o->target = default_display;
+		o->highprio = true; /* TODO: Be more intelligent with how we assign priority (e.g. rotated, downscaled, or high BPP overlay may require more bandwidth per-pixel than desktop) */
+		o->enabled = true;
+		/* Enable the overlay */
+		dispc_update_overlay(modelocked->overlay_desktop, modelocked, irqlocked);
+		irqlocked_unlock();
+	}
+
+	modelocked_read_unlock();
+
+	return 0;
+}
+
+static int do_setblank(_kernel_swi_regs *r)
+{
+	/* Only support head 0 */
+	if (r->r[4] & 0xff0000)
+	{
+		return 1;
+	}
+	r->r[4] = 0;
+	const modelocked_t *modelocked = modelocked_read_lock();
+	(headattrs[modelocked->default_display].setblank)(modelocked->default_display,(r->r[0] != 0),r->r[1]);
+	/* Update overlays to toggle them on/off */
+	{
+		const irqlocked_t *irqlocked = irqlocked_lock();
+		for(int i=0;i<OVERLAY_MAX;i++)
+			dispc_update_overlay((overlayidx)i, modelocked, irqlocked);
+		irqlocked_unlock();
+	}
+	modelocked_read_unlock();
+
+	return 0;
+}
+
+static int do_updatepointer(_kernel_swi_regs *r)
+{
+	/* Only support head 0 */
+	if (r->r[4] & 0xff0000)
+	{
+		return 1;
+	}
+	const modelocked_t *modelocked = modelocked_read_lock();
+	if (modelocked->overlay_pointer == OVERLAY_MAX)
+	{
+		/* Either this is a call that's occurred during a mode change (in which case we can probably safely ignore it), or we're using a software pointer */
+		modelocked_read_unlock();
+		return 1;
+	}
+	mouse_update((const gvupdatepointer_t *) r, modelocked);
+	modelocked_read_unlock();
+	r->r[4] = 0;
+	return 0;
+}
+
+static int do_setdmaaddress(_kernel_swi_regs *r)
+{
+	/* Only support head 0 */
+	if (r->r[4] & 0xff0000)
+	{
+		return 1;
+	}
+	if(r->r[0] == 0)
+	{
+		const modelocked_t *modelocked = modelocked_read_lock();
+		if (modelocked->overlay_desktop != OVERLAY_MAX)
+		{
+			/* If it's OVERLAY_MAX, assume this is an IRQ-triggered call that's occurred during a mode change, and ignore it (since the OS will reset the address once the mode change is complete) */
+			irqlocked_t *irqlocked = irqlocked_lock();
+			irqlocked->overlays[modelocked->overlay_desktop].ba = r->r[1];
+			dispc_update_overlay(modelocked->overlay_desktop, modelocked, irqlocked);
+			irqlocked_unlock();
+		}
+		modelocked_read_unlock();
+	}
+	else if(r->r[0] == 3)
+	{
+		vdu_init = r->r[1];
+	}
+	r->r[4] = 0;
+	return 0;
+}
+
+static int do_vetmode(_kernel_swi_regs *r)
+{
+	/* Only support head 0 */
+	if (r->r[4] & 0xff0000)
+	{
+		return 1;
+	}
+	/* TODO - Needs updating for display rotation, etc. */
+	r->r[4] = 0;
+	const VIDCList3 *params = (const VIDCList3 *) r->r[0];
+	/* Process control list to determine interlace setting */
+	int interlace = 0;
+	for(int i=0;params->ControlList[i].index != ControlList_Terminator;i++)
+		switch(params->ControlList[i].index)
+		{
+		case ControlList_Interlaced:
+			interlace = params->ControlList[i].value;
+			/* Check value is sensible (0 or 1) */
+			if((interlace>>1) != 0)
+				return 1;
+			break;
+		}
+	/* Check colour depth */
+	pixelformat format = getformat(params);
+	if(format == PIXELFORMAT_MAX)
+		return 1;
+
+	const modelocked_t *modelocked = modelocked_read_lock();
+	bool ok = checkformat(modelocked->default_display,format) && (headattrs[modelocked->default_display].vetmode)(modelocked->default_display,params,interlace,format);
+	modelocked_read_unlock();
+
+	if (!ok)
+		return 1;
+	/* Mode looks good */
+	r->r[0] = 0;
+	return 0;
+}
+
+static int do_displayfeatures(_kernel_swi_regs *r)
+{
+	/* Only support head 0 */
+	if (r->r[4] & 0xff0000)
+	{
+		return 1;
+	}
+	r->r[0] = GVDisplayFeature_InterlaceWithProgressiveFramestore;
+	r->r[1] = 0;
+	const modelocked_t *modelocked = modelocked_read_lock();
+	if (modelocked->overlay_pointer != OVERLAY_MAX)
+		r->r[0] |= GVDisplayFeature_HardwarePointer;
+	if(checkformat(modelocked->default_display,PIXELFORMAT_1_PAL))
+		r->r[1] |= 1;
+	if(checkformat(modelocked->default_display,PIXELFORMAT_2_PAL))
+		r->r[1] |= 2;
+	if(checkformat(modelocked->default_display,PIXELFORMAT_4_PAL))
+		r->r[1] |= 4;
+	if(checkformat(modelocked->default_display,PIXELFORMAT_8_PAL))
+		r->r[1] |= 8;
+	if(checkformat(modelocked->default_display,PIXELFORMAT_1555_TBGR))
+		r->r[1] |= 16;
+	if(checkformat(modelocked->default_display,PIXELFORMAT_8888_TBGR))
+		r->r[1] |= 32;
+	modelocked_read_unlock();
+	r->r[2] = 32; /* 32 byte buffer alignment? */
+	r->r[4] = 0;
+	return 0;
+}
+
+static int do_framestoreaddress(_kernel_swi_regs *r)
+{
+	/* Nothing */
+	(void) r;
+	return 1;
+}
+
+static bool writepaletteentries(int type,uint32_t idx,uint32_t c,const uint32_t *pal)
+{
+	switch(type)
+	{
+	case GVPaletteType_Normal:
+		(gfx_palette_func)(pal,idx,c);
+		break;
+	case GVPaletteType_Border:
+		if(!idx && c)
+		{
+			const modelocked_t *modelocked = modelocked_read_lock();
+			irqlocked_t *irqlocked = irqlocked_lock();
+			if (*pal != irqlocked->heads[modelocked->default_display].background)
+			{
+				irqlocked->heads[modelocked->default_display].background = *pal;
+				(headattrs[modelocked->default_display].setbackground)(modelocked->default_display,irqlocked);
+			}
+			irqlocked_unlock();
+			modelocked_read_unlock();
+		}
+		break;
+	case GVPaletteType_Pointer:
+		mouse_palette_write(pal,idx,c);
+		break;
+	default:
+		return false;
+	}
+	return true;
+}
+
+static int do_writepaletteentry(_kernel_swi_regs *r)
+{
+	/* Only support head 0 */
+	if (r->r[4] & 0xff0000)
+	{
+		return 1;
+	}
+	if (writepaletteentries(r->r[0],r->r[2],1,(const uint32_t *) &r->r[1]))
+	{
+		r->r[4] = 0;
+		return 0;
+	}
+	return 1;
+}
+
+static int do_writepaletteentries(_kernel_swi_regs *r)
+{
+	/* Only support head 0 */
+	if (r->r[4] & 0xff0000)
+	{
+		return 1;
+	}
+	uint32_t idx = r->r[2];
+	uint32_t c = r->r[3];
+	const uint32_t *pal = (const uint32_t *) r->r[1];
+	if (writepaletteentries(r->r[0],idx,c,pal))
+	{
+		r->r[4] = 0;
+		return 0;
+	}
+	return 1;
+}
+
+static int do_readpaletteentry(_kernel_swi_regs *r)
+{
+	/* Only support head 0 */
+	if (r->r[4] & 0xff0000)
+	{
+		return 1;
+	}
+	switch(r->r[0])
+	{
+	case GVPaletteType_Normal:
+	case GVPaletteType_Border:
+	case GVPaletteType_Pointer:
+		break;
+	case GVPaletteType_ColourKey:
+		{
+			const modelocked_t *modelocked = modelocked_read_lock();
+			irqlocked_t *irqlocked = irqlocked_lock();
+			pixelformat format = irqlocked->overlays[modelocked->overlay_desktop].format;
+			uint32_t mask = 0;
+			uint32_t val = 0;
+			if ((modelocked->default_display != TARGET_NONE) && (modelocked->overlay_desktop != OVERLAY_MAX))
+			{
+				/* With the current setup, alpha blending is always used (and TCK disabled) if we're in an alpha screen mode
+				   Otherwise, assume TCK is in use */
+				switch(format)
+				{
+				case PIXELFORMAT_4444_ABGR:
+				case PIXELFORMAT_4444_ARGB:
+					mask = 0xf000;
+					break;
+				case PIXELFORMAT_1555_ABGR:
+				case PIXELFORMAT_1555_ARGB:
+					mask = 0x8000;
+					break;
+				case PIXELFORMAT_8888_ABGR:
+				case PIXELFORMAT_8888_ARGB:
+					mask = 0xff000000;
+					break;
+				default:
+					mask = 0xffffff & ((1<<pixel_format_bpp[format])-1);
+					val = irqlocked->heads[modelocked->default_display].transparent;
+					break;
+				}
+			}
+			switch(r->r[2])
+			{
+			case 0:
+				r->r[1] = val & mask;
+				break;
+			case 1:
+				r->r[1] = mask;
+				break;
+			}
+			irqlocked_unlock();
+			modelocked_read_unlock();
+		}
+		break;
+	default:
+		return 1;
+	}
+	r->r[4] = 0;
+	return 0;
+}
+
+static int do_render(_kernel_swi_regs *r)
+{
+	/* Only support head 0 */
+	if (r->r[4] & 0xff0000)
+	{
+		return 1;
+	}
+	/* Grab a copy of the desktop overlay state, to avoid keeping IRQs disabled while we wait for the DMA
+	   The overlay state shouldn't change in any significant way while we're here */
+	overlaycfg_t o;
+	o.target = TARGET_NONE;
+	{
+		const modelocked_t *modelocked = modelocked_read_lock();
+		if (modelocked->overlay_desktop != OVERLAY_MAX)
+		{
+			o = irqlocked_lock()->overlays[modelocked->overlay_desktop];
+			irqlocked_unlock();
+		}
+		modelocked_read_unlock();
+	}
+	if(!sdmachan || (o.target == TARGET_NONE) || (vdu_init == ~0)) /* Protect against (unlikely) event of lack of acceleration, or (likely) event of us not knowing the framebuffer setup yet */
+		return 1;
+	switch(r->r[1])
+	{
+	case GVRender_NOP:
+		goto complete;
+	case GVRender_CopyRectangle:
+		if(!sdma_copyrect(&o,(copyrect_params_t *)r->r[2], vdu_init))
+			break;
+		goto complete;
+	case GVRender_FillRectangle:
+		if(!sdma_fillrect(&o,(fillrect_params_t *)r->r[2], vdu_init))
+			break;
+		goto complete;
+	}
+	if(r->r[0] & GVRender_SyncIfNotComplete)
+		sdma_sync();
+	return 1;
+complete:
+	if(r->r[0] & GVRender_SyncIfComplete)
+		sdma_sync();
+	r->r[4] = 0;
+	return 0;
+}
+
+static int do_iicop(_kernel_swi_regs *r)
+{
+	/* Only support head 0 */
+	if (r->r[4] & 0xff0000)
+	{
+		return 1;
+	}
+	/* Play it safe and don't hold the lock while the IIC op is in progress */
+	overlaytarget default_display = modelocked_read_lock()->default_display;;
+	modelocked_read_unlock();
+	(headattrs[default_display].iicop)(default_display,r);
+	return (r->r[4]?1:0);
+}
+
+static int do_selecthead(_kernel_swi_regs *r)
+{
+	/* TODO? */
+	(void) r;
+	return 1;
+}
+
+static int do_pixelformats(_kernel_swi_regs *r)
+{
+	/* Only support head 0 */
+	if (r->r[4] & 0xff0000)
+	{
+		return 1;
+	}
+	/* Tailor list depending on which head is in use for desktop */
+	/* TODO - In the future, might also want to tailor by which overlay is in use (although this is complicated by omap_pick_overlays - we'd need to look for any of the overlays which can be chosen for the desktop) */
+	static pixelformat_t pixelformats2[PIXELFORMAT_NORMAL_MAX];
+	int j=0;
+	const modelocked_t *modelocked = modelocked_read_lock();
+	for(int i=0;i<PIXELFORMAT_NORMAL_MAX;i++)
+	{
+		if(checkformat(modelocked->default_display,(pixelformat) i))
+			pixelformats2[j++] = pixelformats[i];
+	}
+	modelocked_read_unlock();
+	r->r[0] = (int) pixelformats2;
+	r->r[1] = j;
+	r->r[4] = 0;
+	return 0;
+}
+
+static int do_readinfo(_kernel_swi_regs *r)
+{
+	const void *src = NULL;
+	int len = 0;
+	int version = 0;
+	int controllist[] = {
+		ControlList_Interlaced,
+		ControlList_NColour,
+		ControlList_ModeFlags,
+		ControlList_Terminator
+	};
+	switch(r->r[0])
+	{
+	case GVReadInfo_Version:
+		src = &version;
+		len = sizeof(version);
+		for(int i=0,j=Module_VersionNumber;i<6;i++,j/=10)
+			version |= (j % 10)<<(i*4+8);
+		break;
+	case GVReadInfo_ModuleName: /* Only one module instance assumed */
+	case GVReadInfo_DriverName:
+		src = Module_Title;
+		len = sizeof(Module_Title); /* Includes terminator */
+		break;
+	case GVReadInfo_HardwareName:
+		src = dev->dev.description;
+		len = strlen(src)+1;
+		break;
+	case GVReadInfo_ControlListItems:
+		src = controllist;
+		len = sizeof(controllist);
+		break;
+	case GVReadInfo_MaxOverlays:
+		src = &version;
+		len = sizeof(version);
+		version = GVOVERLAY_MAX;
+		break;
+	}
+	if(!len)
+		return 1;
+	int copy = ((len < r->r[2])?len:r->r[2]);
+	memcpy((void *) r->r[1],src,copy);
+	r->r[2] -= len;
+	r->r[4] = 0;
+	return 0;
+}
+
+static int do_createoverlay(_kernel_swi_regs *r)
+{
+	const modeselector_t *desc = (const modeselector_t *) r->r[0];
+	gvoverlay_create_vet_result_t result;
+	const modelocked_t *modelocked = modelocked_read_lock();
+	_kernel_oserror *e = gvoverlay_create(desc, r->r[1], r->r[2], r->r[3], modelocked, &result, &r->r[0]);
+	modelocked_read_unlock();
+	if (e)
+	{
+		dprintf(("","do_createoverlay: err %08x %s\n",e->errnum,e->errmess));
+		return 1;
+	}
+	r->r[0] += TARGET_MAX; /* Remap internal overlay number to not overlap head numbers */
+	r->r[1] = result.return_flags;
+	r->r[2] = result.min_w;
+	r->r[3] = result.min_h;
+	r->r[4] = 0;
+	r->r[5] = result.max_w;
+	r->r[6] = result.max_h;
+	return 0;
+}
+
+static int do_vetoverlay(_kernel_swi_regs *r)
+{
+	const modeselector_t *desc = (const modeselector_t *) r->r[0];
+	gvoverlay_create_vet_result_t result;
+	const modelocked_t *modelocked = modelocked_read_lock();
+	_kernel_oserror *e = gvoverlay_vet(desc, r->r[1], r->r[2], r->r[3], modelocked, &result);
+	modelocked_read_unlock();
+	if (e)
+	{
+		dprintf(("","do_vetoverlay: err %08x %s\n",e->errnum,e->errmess));
+		return 1;
+	}
+	r->r[1] = result.return_flags;
+	r->r[2] = result.min_w;
+	r->r[3] = result.min_h;
+	r->r[4] = 0;
+	r->r[5] = result.max_w;
+	r->r[6] = result.max_h;
+	return 0;
+}
+
+static int do_destroyoverlay(_kernel_swi_regs *r)
+{
+	_kernel_oserror *e;
+	int min,max;
+	if (r->r[4] & 0xff0000)
+	{
+		min = max = GET_OVERLAY(r);
+	}
+	else
+	{
+		min = 0;
+		max = GVOVERLAY_MAX-1;
+	}
+	const modelocked_t *modelocked = modelocked_read_lock();
+	do
+	{
+		e = gvoverlay_destroy(min, modelocked);
+	} while (!e && (++min <= max));
+	modelocked_read_unlock();
+	if (e)
+	{
+		dprintf(("","do_destroyoverlay: err %08x %s\n",e->errnum,e->errmess));
+		return 1;
+	}
+	r->r[4] = 0;
+	return 0;
+}
+
+static int do_setoverlayposition(_kernel_swi_regs *r)
+{
+	int x,y,bank;
+	switch (r->r[1])
+	{
+	case 0:
+		x=y=0;
+		bank=-1;
+		break;
+	case 1:
+		{
+			int *arr = (int *) r->r[0];
+			if (arr[0] != 0)
+			{
+				dprintf(("","do_setoverlayposition: bad head number\n"));
+				return 1;
+			}
+			x = arr[1];
+			y = arr[2];
+			bank = r->r[2];
+		}
+		break;
+	default:
+		dprintf(("","do_setoverlayposition: bad head count\n"));
+		return 1;
+	}
+	_kernel_oserror *e;
+	const modelocked_t *modelocked = modelocked_read_lock();
+	e = gvoverlay_setposition(GET_OVERLAY(r),x,y,bank,modelocked);
+	modelocked_read_unlock();
+	if (e)
+	{
+		dprintf(("","do_setoverlayposition: err %08x %s\n",e->errnum,e->errmess));
+		return 1;
+	}
+	r->r[4] = 0;
+	return 0;
+}
+
+static int do_mapoverlaybuffer(_kernel_swi_regs *r)
+{
+	_kernel_oserror *e = gvoverlay_map(GET_OVERLAY(r),r->r[0],(gvoverlay_plane_mapping_t **)(&r->r[0]));
+	if (e)
+	{
+		dprintf(("","do_mapoverlaybuffer: err %08x %s\n",e->errnum,e->errmess));
+		return 1;
+	}
+	r->r[4] = 0;
+	return 0;
+}
+
+static int do_unmapoverlaybuffer(_kernel_swi_regs *r)
+{
+	_kernel_oserror *e = gvoverlay_unmap(GET_OVERLAY(r),r->r[0]);
+	if (e)
+	{
+		dprintf(("","do_unmapoverlaybuffer: err %08x %s\n",e->errnum,e->errmess));
+		return 1;
+	}
+	r->r[4] = 0;
+	return 0;
+}
+
+static int do_discardoverlaybuffer(_kernel_swi_regs *r)
+{
+	const modelocked_t *modelocked = modelocked_read_lock();
+	_kernel_oserror *e = gvoverlay_discard(GET_OVERLAY(r),r->r[0],modelocked);
+	modelocked_read_unlock();
+	if (e)
+	{
+		dprintf(("","do_discardoverlaybuffer: err %08x %s\n",e->errnum,e->errmess));
+		return 1;
+	}
+	r->r[4] = 0;
+	return 0;
+}
+
+static int do_setoverlaytransform(_kernel_swi_regs *r)
+{
+	const modelocked_t *modelocked = modelocked_read_lock();
+	_kernel_oserror *e = gvoverlay_settransform(GET_OVERLAY(r),(gvoverlay_transform_t *) r->r,modelocked);
+	modelocked_read_unlock();
+	if (e)
+	{
+		dprintf(("","do_setoverlaytransform: err %08x %s\n",e->errnum,e->errmess));
+		return 1;
+	}
+	r->r[4] = 0;
+	return 0;
+}
+
+static int do_setoverlayzorder(_kernel_swi_regs *r)
+{
+	const modelocked_t *modelocked = modelocked_read_lock();
+	_kernel_oserror *e = gvoverlay_setzorder((const uint8_t *) r->r[0],r->r[1],modelocked);
+	modelocked_read_unlock();
+	if (e)
+	{
+		dprintf(("","do_setoverlayzorder: err %08x %s\n",e->errnum,e->errmess));
+		return 1;
+	}
+	r->r[4] = 0;
+	return 0;
+}
+
+#ifdef DEBUGLIB
+#define GVOVERLAYTRACE
+#endif
+
+int graphicsv_handler(_kernel_swi_regs *r,void *pw)
+{
+	(void) pw;
+	if((((uint32_t)r->r[4])>>24) != graphicsv_driver_number)
+		return 1;
+	uint16_t func = (uint16_t) r->r[4];
+#ifdef GVOVERLAYTRACE
+	/* Output BASIC commands to allow activity to be replayed for easier debugging */
+	if ((func == GraphicsV_CreateOverlay)
+	 || (func == GraphicsV_SetOverlayPosition)
+	 || (func == GraphicsV_SetOverlayTransform)
+	 || (func == GraphicsV_SetOverlayZOrder))
+	{
+		int datlen = 0;
+		if (func == GraphicsV_CreateOverlay)
+		{
+			datlen = sizeof(modeselector_t) + 64;
+		}
+		else if (func == GraphicsV_SetOverlayZOrder)
+		{
+			datlen = r->r[1];
+		}
+		else if (func == GraphicsV_SetOverlayPosition)
+		{
+			datlen = r->r[1]*12;
+		}
+		int i=0;
+		const uint8_t *dat = (const uint8_t *) r->r[0];
+		while (i < (datlen&~3))
+		{
+			dprintf(("","TRACE: b%%!%d=&%02x%02x%02x%02x\n",i,dat[i+3],dat[i+2],dat[i+1],dat[i]));
+			i += 4;
+		}
+		while (i < datlen)
+		{
+			dprintf(("","TRACE: b%%?%d=&%02x\n",i,dat[i]));
+			i++;
+		}
+		if (func == GraphicsV_CreateOverlay)
+		{
+			dprintf(("","TRACE: SYS \"OS_CallAVector\",b%%,&%x,&%x,&%x,&%x,,,,,42 TO o%%\n",r->r[1],r->r[2],r->r[3],r->r[4]));
+		}
+		else if (datlen)
+		{
+			/* R0 = buffer, R1, R2 = arguments */
+			dprintf(("","TRACE: SYS \"OS_CallAVector\",b%%,&%x,&%x,,&%x + (o%%<<16),,,,,42\n",r->r[1],r->r[2],r->r[4] & ~0xff0000));
+		}
+		else if (func == GraphicsV_SetOverlayTransform)
+		{
+			/* R0-R7 = arguments */
+			dprintf(("","TRACE: SYS \"OS_CallAVector\",&%x,&%x,&%x,&%x,&%x + (o%%<<16),&%x,&%x,&%x,,42\n",r->r[0],r->r[1],r->r[2],r->r[3],r->r[4] & ~0xff0000,r->r[5],r->r[6],r->r[7]));
+		}
+		else
+		{
+			/* R0-R2 = arguments */
+			dprintf(("","TRACE: SYS \"OS_CallAVector\",&%x,&%x,&%x,,&%x + (o%%<<16),,,,,42\n",r->r[0],r->r[1],r->r[2],r->r[4] & ~0xff0000));
+		}
+		dprintf(("","TRACE: PROCstep\n"));
+	}
+#endif
+	int ret = 1;
+#ifdef DEBUGLIB
+	uint32_t time = ((func < NUM_GV_CALLS) ? timer_read() : 0);
+#endif
+	switch(func)
+	{
+	case GraphicsV_Complete:		ret = do_null(r); break;
+	case GraphicsV_VSync:			ret = do_vsync(r); break;
+	case GraphicsV_SetMode:			ret = do_setmode(r); break;
+	case GraphicsV_SetBlank:		ret = do_setblank(r); break;
+	case GraphicsV_UpdatePointer:		ret = do_updatepointer(r); break;
+	case GraphicsV_SetDMAAddress:		ret = do_setdmaaddress(r); break;
+	case GraphicsV_VetMode:			ret = do_vetmode(r); break;
+	case GraphicsV_DisplayFeatures:		ret = do_displayfeatures(r); break;
+	case GraphicsV_FramestoreAddress:	ret = do_framestoreaddress(r); break;
+	case GraphicsV_WritePaletteEntry:	ret = do_writepaletteentry(r); break;
+	case GraphicsV_WritePaletteEntries:	ret = do_writepaletteentries(r); break;
+	case GraphicsV_ReadPaletteEntry:	ret = do_readpaletteentry(r); break;
+	case GraphicsV_Render:			ret = do_render(r); break;
+	case GraphicsV_IICOp:			ret = do_iicop(r); break;
+	case GraphicsV_SelectHead:		ret = do_selecthead(r); break;
+	case GraphicsV_PixelFormats:		ret = do_pixelformats(r); break;
+	case GraphicsV_ReadInfo:		ret = do_readinfo(r); break;
+	case GraphicsV_CreateOverlay:		ret = do_createoverlay(r); break;
+	case GraphicsV_DestroyOverlay:		ret = do_destroyoverlay(r); break;
+	case GraphicsV_SetOverlayPosition:	ret = do_setoverlayposition(r); break;
+	case GraphicsV_MapOverlayBuffer:	ret = do_mapoverlaybuffer(r); break;
+	case GraphicsV_UnmapOverlayBuffer:	ret = do_unmapoverlaybuffer(r); break;
+	case GraphicsV_DiscardOverlayBuffer:	ret = do_discardoverlaybuffer(r); break;
+	case GraphicsV_VetOverlay:		ret = do_vetoverlay(r); break;
+	case GraphicsV_SetOverlayTransform:	ret = do_setoverlaytransform(r); break;
+	case GraphicsV_SetOverlayZOrder:	ret = do_setoverlayzorder(r); break;
+
+	case GraphicsV_StartupMode:		/* Unimplemented */
+	case GraphicsV_SetInterlace:		/* Deprecated */
+	default:				ret = 1; break;
+	}
+#ifdef DEBUGLIB
+	if (time)
+	{
+		time = time - timer_read();
+		int idx = (_kernel_irqs_disabled() ? 1 : 0);
+		if (gv_durations[func][idx] < time)
+		{
+			gv_durations[func][idx] = time;
+		}
+	}
+#endif
+	return ret;
+}

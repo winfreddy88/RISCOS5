@@ -1,0 +1,220 @@
+; Copyright 1997 Acorn Computers Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+
+
+; module.s
+
+; - required to handle removing patches on a Service_PreReset
+; - also removes patches when rmkill'ed, but this should be used with caution
+; - designed for insertion into RMA (not ROM-able)
+; - has local cache/TLB flushing code, currently copes with ARM 6,7,StrongARM
+; - suitable for 3.50, 3.60, 3.70, 3.71 & Ursula
+
+        AREA    |main|, CODE, READONLY
+
+        EXPORT  |myflush|
+
+        EXPORT  |module|
+        EXPORT  |modDAhandler|
+        EXPORT  |moddata|
+        EXPORT  |moduleend|
+        EXPORT  |adfs354_word|
+
+              GBLS   VersionString
+VersionString SETS   "2.07 (20 Nov 2017)"
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:Services
+        GET     UK/messages.s
+
+module
+        DCD     0               ; start entry
+        DCD     0               ; init entry
+        DCD     module_bye      - module
+        DCD     module_service  - module
+        DCD     module_title    - module
+        DCD     module_helpstr  - module
+        DCD     0               ; command table
+        DCD     0               ; swi chunk
+        DCD     0               ; swi code
+        DCD     0               ; swi strings
+        DCD     0               ; swi name decode code
+
+module_title
+        DCB    "ROMPatches",0
+        ALIGN
+module_helpstr
+        DCB    "ROM Patches",9,VersionString,0
+        ALIGN
+
+module_service
+        TEQ     r1, #Service_PreReset
+        TEQNE   r1, #Service_DynamicAreaRenumber
+        MOVNE   pc, r14
+        TEQ     r1, #Service_PreReset
+        BEQ     serv_prereset
+
+;Service_DynamicAreaRenumber
+        Push    "r14"
+        LDR     r14,modDAN
+        CMP     r14,#0
+        Pull    "pc", EQ
+        CMP     r14,r2
+        STREQ   r3,modDAN
+        Pull    "pc"
+
+;Service_PreReset
+serv_prereset
+        Push    "r14"
+        BL      unpatchrom
+        Pull    "pc"
+
+module_bye
+        Push    "r0-r1, r14"
+        BL      unpatchrom
+        MOV     r0,#1
+        LDR     r1,modDAN
+        CMP     r1,#0
+        SWINE   XOS_DynamicArea       ;remove dynamic area
+        MOV     r1,#0
+        STR     r1,modDAN             ;mark as removed
+        Pull    "r0-r1, pc"
+
+unpatchrom
+        Push    "r0-r4, lr"
+        LDR     r0,modL1PT
+        CMP     r0,#0
+        BEQ     unpatchromdone
+        ADR     r1,modL1PTentries
+        LDR     r2,modROMsections     ;up to 4x1M sections
+        MOV     r4,pc
+        ORR     r3,r4,#I_bit
+        TEQP    r3,#0                 ;disable interrupts
+unpatchromloop
+        LDR     r3,[r1],#4
+        STR     r3,[r0],#4
+        SUBS    r2,r2,#1
+        BNE     unpatchromloop
+        BL      myflush
+        TEQP    r4,#0                 ;restore IRQ state
+        MOV     r0,#0
+        STR     r0,modL1PT            ;mark as unpatched
+unpatchromdone
+        Pull    "r0-r4, pc"
+
+
+;flush cache(s) and TLB(s), without using any ROM code, since
+;ROM mapping is being messed about with
+;
+;copes with ARM 6,7 or StrongARM (not currently ARM 8)
+;
+;this routine is part of module, but also called by app
+;
+myflush
+        Push    "r0-r4, lr"
+        MRC     p15,0,r4,c0,c0,0    ;read ID reg
+        AND     r4,r4,#&F000
+;flush cache
+        CMP     r4,#&A000
+        MCRNE   p15,0,r0,c7,c0,0    ;flush ARM 6/7 cache
+        BNE     flushTLB
+;StrongARM then (must also therefore be RISC OS 3.70 or later)
+        LDR     r2,modFlipFlop
+        LDR     r1,[r2]
+        EOR     r1,r1,#16*1024      ;next cleaner area
+        STR     r1,[r2]       
+        ADD     r2,r1,#16*1024      ;16k data cache
+cleanDCloop
+        LDR     r3,[r1],#32         ;read (clean/flush) next cache line
+        TEQ     r2,r1
+        BNE     cleanDCloop
+        MCR     p15,0,r0,c7,c10,4   ;drain WB
+        MCR     p15,0,r0,c7,c5,0    ;flush IC
+        NOP
+        NOP
+        NOP
+        NOP
+flushTLB
+        CMP     r4,#&A000
+        MCREQ   p15,0,r0,c8,c7,0    ;flush StrongARM TLB(s)
+        MCRNE   p15,0,r0,c5,c0,0    ;flush ARM 6/7 TLB
+        Pull    "r0-r4, pc"
+
+modDAhandler
+        CMP     r0,#2           ;preshrink?
+        BEQ     mdah_preshrink
+        CMP     r0,#0           ;pregrow?  (NB clears V)
+        MOVNE   pc,r14
+;pregrow
+        Push    "r0-r3"
+        LDR     r0,modnextpageneeded
+        LDR     r3,modfirstpagenotneeded
+        CMP     r0,r3           ;allow pregrow only if not fully grown yet
+        BHS     mdah_pregrowerror
+mdah_pregrowloop
+        STR     r0,[r1],#12     ;fill in next required page number in block
+        ADD     r0,r0,#1
+        SUBS    r2,r2,#1
+        BNE     mdah_pregrowloop
+        STR     r0,modnextpageneeded
+        Pull    "r0-r3"
+        MOV     pc,r14
+mdah_pregrowerror
+        ADR     r0,errorNaffOff
+        CMP     pc,#&80000000   ;refuse (set V flag)
+        Pull    "r0-r3"
+        MOV     pc,r14
+;
+mdah_preshrink
+        LDR     r0,modL1PT
+        CMP     r0,#0           ;refuse preshrink unless patches removed
+        MOVEQ   r0,#2           ;restore r0=2 reason code, preshrink allowed
+        MOVNE   r3,#0           ;no shrinkage
+        ADRNE   r0,errorNaffOff
+        CMPNE   pc,#&80000000   ;refuse (set V flag)
+        MOV     pc,r14
+
+errorNaffOff
+        DCD     0
+        DCB     HandlerSaysNaffOff,0
+        ALIGN
+
+;values will be poked in by C (after module is inserted, and copied to RMA)
+moddata
+modnextpageneeded            ;next page number required for DA on next grow
+        DCD     0
+modfirstpagenotneeded        ;pages modfirstpageneeded..modfirstpagenotneeded-1 still required
+        DCD     0
+modDAN
+        DCD     0            ;dynamic area number for patches
+modFlipFlop
+        DCD     0            ;StrongARM cache maintenance
+modROMsections
+        DCD     0            ;number of sections the unpatched ROM occupies
+modL1PT
+        DCD     0            ;L1PT address for ROM
+modL1PTentries
+        DCD     0            ;up to 4 entries to map unpatched ROM as 4 sections
+        DCD     0
+        DCD     0
+        DCD     0
+adfs354_word
+        DCD     0            ;Writable word needed by ADFS "disc error 20" patch
+
+moduleend
+
+        END

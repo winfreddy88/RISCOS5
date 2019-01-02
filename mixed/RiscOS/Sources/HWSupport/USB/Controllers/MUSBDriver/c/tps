@@ -1,0 +1,271 @@
+/*
+ * Copyright (c) 2004, 2009 The NetBSD Foundation, Inc.
+ * All rights reserved.
+ *
+ * This code is derived from software contributed to The NetBSD Foundation
+ * by Lennart Augustsson (lennart@augustsson.net), Charles M. Hannum, and
+ * Jeffrey Lee (me@phlamethrower.co.uk)
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. All advertising materials mentioning features or use of this software
+ *    must display the following acknowledgement:
+ *        This product includes software developed by the NetBSD
+ *        Foundation, Inc. and its contributors.
+ * 4. Neither the name of The NetBSD Foundation nor the names of its
+ *    contributors may be used to endorse or promote products derived
+ *    from this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE NETBSD FOUNDATION, INC. AND CONTRIBUTORS
+ * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE FOUNDATION OR CONTRIBUTORS
+ * BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include "modhead.h"
+#include "swis.h"
+#include <limits.h>
+#include <machine/bus.h>
+
+#include <sys/malloc.h>
+#include <sys/queue.h>
+#include <sys/types.h>
+#include <sys/systm.h>
+
+#include <dev/usb/usb.h>
+#include <dev/usb/usbdi.h>
+#include <dev/usb/usbdivar.h>
+
+#include "Global/RISCOS.h"
+#include "Global/HALEntries.h"
+#include "cmodule.h"
+
+/* Have to avoid including stdio as there's a clash with the BSD stuff */
+#define __stdio_h
+
+#include "musb.h"
+#include "tps.h"
+
+/* Bits of bad code in this file:
+   - HFCLK_FREQ in PM_MASTER_CFG_BOOT is initialised here, using the BeagleBoard value of 26MHz. Really the HAL should initialise this clock for us.
+   - This entire file obviously assumes that a TPS65950/TWL4030 is present on IIC bus 0
+   - Potential for reentry in tps_ticker() if IIC is too slow?
+   */
+
+extern void delay(int d);
+
+// Read n bytes
+static int tps_read(tps_state *state,int tpsreg,void *buf,int count)
+{
+	iic_transfer tran[2];
+	state->lastreg = tpsreg;
+	memset(tran,0,sizeof(tran));
+	tran[0].addr = tpsreg>>8;
+	tran[0].retry = 1;
+	tran[0].d.data = &tpsreg;
+	tran[0].len = 1;
+	tran[1].addr = (tpsreg>>8) | 1;
+	tran[1].d.data = buf;
+	tran[1].len = count;
+	return do_iicop(tran,2);
+}
+
+#if 0
+// Write n bytes
+static int tps_write(tps_state *state,int tpsreg,void *buf,int count)
+{
+	iic_transfer tran[2];
+	state->lastreg = tpsreg;
+	memset(tran,0,sizeof(tran));
+	tran[0].addr = tpsreg>>8;
+	tran[0].retry = 1;
+	tran[0].d.data = &tpsreg;
+	tran[0].len = 1;
+	tran[1].addr = tpsreg>>8;
+	tran[1].nostart = 1;
+	tran[1].d.data = buf;
+	tran[1].len = count;
+	return do_iicop(tran,2);
+}
+#endif
+
+// Write 0-4 bytes from int
+static int tps_writeval(tps_state *state,int tpsreg,int val,int count)
+{
+	iic_transfer tran[2];
+	state->lastreg = tpsreg;
+	memset(tran,0,sizeof(tran));
+	tran[0].addr = tpsreg>>8;
+	tran[0].retry = 1;
+	tran[0].d.data = &tpsreg;
+	tran[0].len = 1;
+	tran[1].addr = tpsreg>>8;
+	tran[1].nostart = 1;
+	tran[1].d.data = &val;
+	tran[1].len = count;
+	return do_iicop(tran,2);
+}
+
+static void tps_enableclock(tps_state *state)
+{
+	if(state->dpll_clk_state++)
+		return;
+	tps_writeval(state,TPS_USB_PHY_CLK_CTRL,7,1); /* ULPI register clock gating enabled, 32KHz clock enabled, request IIC clock */ 
+	/* wait for clocks */
+	int count=100;
+	while(count--)
+	{
+		int val;
+		delay(1000);
+		if(tps_read(state,TPS_USB_PHY_CLK_CTRL_STS,&val,1) && (val&1))
+			return;
+	}
+	/* Else timeout waiting for PHY DPLL! */
+	DPRINTF(("tps_enableclock: Timeout!\n"));
+}
+
+static void tps_disableclock(tps_state *state)
+{
+	if(state->dpll_clk_state)
+	{
+		state->dpll_clk_state--;
+		if(!state->dpll_clk_state)
+			tps_writeval(state,TPS_USB_PHY_CLK_CTRL,6,1);
+	}
+}
+
+static void tps_ticker(void *h)
+{
+	tps_state *state = (tps_state *) h;
+	/* Read STS_HW_CONDITIONS to find the state of VBUS & ID */
+	int val;
+	int s;
+	if(!tps_read(state,TPS_PM_MASTER_STS_HW_CONDITIONS,&val,1))
+	{
+		/* Oh noes! IIC op failed. This probably shouldn't happen, unless it's possible for callbacks to trigger inside OS_IICOp?
+		   For the moment just ignore the problem, there'll be another ticker event soon enough
+		*/
+		DPRINTF(("tps_ticker: STS_HW_CONDITIONS read failed! panic!\n"));
+		goto ret;
+	}
+	/* Work out what state we're in */
+	s = splbio();
+	DPRINTFN(15,("tps_ticker: STS_HW_CONDITIONS = %02x\n",val&0xff));
+	if((val & 0x84) == 0x4)
+	{
+		/* If just the ID pin is present, we poke the MUSB controller to begin a session, waking it from sleep and causing it to enter host mode (which will later trigger a nice host-mode CONNECT interrupt)
+		   We also reset the vbus overcurrent retry counter, which may or may not be a good thing to do... */
+		DPRINTF(("tps_ticker: ID pin present, waking MUSB\n"));
+		state->retry_counter = 3;
+		state->musb->musb_base->devctl |= DEVCTL_SESSION;
+	}
+	else if(((val & 0x4) == 0) && ((state->musb->musb_base->devctl & (DEVCTL_BDEVICE|DEVCTL_SESSION)) == DEVCTL_SESSION))
+	{
+		/* The ID pin isn't present, but we're acting as an A device. Clear the session bit to switch back to B mode */
+		DPRINTF(("tps_ticker: ID pin vanished, cancelling host-mode session\n"));
+		state->musb->musb_base->devctl = 0; /* Only HOSTREQ & SESSION are writeable, and we want neither */
+	} 
+	splx(s);
+ret:
+	/* Wake up again in 1 second */
+	callout_reset(&(state->ticker),1000,tps_ticker,state);
+}
+
+void tps_init(tps_state *state,struct musb_softc *musb)
+{
+	int val;
+	state->dpll_clk_state = 0;
+	state->lastreg = -1;
+	state->retry_counter = 3;
+	state->musb = musb;
+	callout_init(&(state->ticker),0);
+	/* Enable writing to power config registers */
+	if(!tps_writeval(state,TPS_PM_MASTER_PROTECT_KEY,0xC0,1)) goto err2;
+	if(!tps_writeval(state,TPS_PM_MASTER_PROTECT_KEY,0x0C,1)) goto err2;
+	/* Check if HFCLK_FREQ has been configured yet. If not, host mode won't work! */
+	if(!tps_read(state,TPS_PM_MASTER_CFG_BOOT,&val,1)) goto err2;
+	if(!(val & 0x3))
+	{
+		if(!tps_writeval(state,TPS_PM_MASTER_CFG_BOOT,val | 0x2,1)) goto err2; /* Configure for 26MHz HFCLKIN (as used by BeagleBoard) */
+		/* Note that DEFAULT_MADC_CLK_EN might need changing if HFCLKIN is not 26MHz on some machines (page 120, swcu050d.pdf) */
+	}
+	/* Put VUSB3V1 LDO in active state */
+	if(!tps_writeval(state,TPS_PM_RECEIVER_VUSB_DEDICATED2,0,1)) goto err2;
+	/* Set VBAT as VUSB3V1 input */
+	if(!tps_writeval(state,TPS_PM_RECEIVER_VUSB_DEDICATED1,0x14,1)) goto err2;
+	/* Turn on 3.1V, 1.5V, 1.8V regulators */
+	if(!tps_writeval(state,TPS_PM_RECEIVER_VUSB3V1_DEV_GRP,0x20,1)) goto err2;
+	if(!tps_writeval(state,TPS_PM_RECEIVER_VUSB3V1_TYPE,0,1)) goto err2;
+	if(!tps_writeval(state,TPS_PM_RECEIVER_VUSB1V5_DEV_GRP,0x20,1)) goto err2;
+	if(!tps_writeval(state,TPS_PM_RECEIVER_VUSB1V5_TYPE,0,1)) goto err2;
+	if(!tps_writeval(state,TPS_PM_RECEIVER_VUSB1V8_DEV_GRP,0x20,1)) goto err2;
+	if(!tps_writeval(state,TPS_PM_RECEIVER_VUSB1V8_TYPE,0,1)) goto err2;
+	/* Disable access to power config registers */
+	tps_writeval(state,TPS_PM_MASTER_PROTECT_KEY,0,1);
+
+	/* Clear the power-down bit from PHY_PWR_CTRL */
+	if(!tps_read(state,TPS_USB_PHY_PWR_CTRL,&val,1)) goto err3;
+	if(!tps_writeval(state,TPS_USB_PHY_PWR_CTRL,val&~1,1)) goto err3;
+
+	/* Now the USB module has power, we can properly configure it */
+	tps_enableclock(state);
+
+	/* Configure TPS USB for mode 1 (USB ULPI) */
+	if(!tps_writeval(state,TPS_USB_MCPC_CTRL2_CLR,1,1)) goto err;
+	// OTHER_IFC_CTRL must come before IFC_CTRL to avoid 'an unexpected serial mode' according to the manual
+	if(!tps_writeval(state,TPS_USB_OTHER_IFC_CTRL_CLR,0x7c,1)) goto err;
+	if(!tps_writeval(state,TPS_USB_IFC_CTRL_CLR,6,1)) goto err;
+	if(!tps_writeval(state,TPS_USB_CARKIT_CTRL_CLR,0x7d,1)) goto err;
+	if(!tps_writeval(state,TPS_USB_CARKIT_PLS_CTRL_CLR,0x7,1)) goto err;
+//	if(!tps_writeval(state,TPS_USB_OTHER_IFC_CTRL_CLR,0x7c,1)) goto err; (moved up, see note above)
+	if(!tps_writeval(state,TPS_USB_MCPC_CTRL_CLR,0x7d,1)) goto err;
+	if(!tps_writeval(state,TPS_USB_MCPC_IO_CTRL_CLR,0x38,1)) goto err;
+	if(!tps_writeval(state,TPS_USB_MCPC_IO_CTRL_SET,0x4,1)) goto err;
+	if(!tps_writeval(state,TPS_USB_OTHER_IFC_CTRL2_CLR,0xc,1)) goto err;
+	/* Ensure it's actually powered up */
+	if(!tps_writeval(state,TPS_USB_POWER_CTRL_SET,0x20,1)) goto err;
+	if(!tps_writeval(state,TPS_USB_FUNC_CTRL_CLR,0x1b,1)) goto err;
+
+	/* We're now done with the USB registers */
+	tps_disableclock(state);
+
+	/* todo - we should wait here until the VBUS & ID comparators have warmed up? */
+
+	/* Check the initial state of the ID pin
+	   This will also start the ticker running periodically */
+	tps_ticker(state);
+
+	DPRINTF(("tps_init: Done\n"));
+	return;
+err3:
+	DPRINTF(("tps_init: Error, last reg = %04x\n",state->lastreg));
+	return;
+err2:
+	DPRINTF(("tps_init: Error, last reg = %04x\n",state->lastreg));
+	tps_writeval(state,TPS_PM_MASTER_PROTECT_KEY,0,1);
+	return;
+err:
+	DPRINTF(("tps_init: Error, last reg = %04x\n",state->lastreg));
+	tps_disableclock(state);
+	return;
+}
+
+void tps_shutdown(tps_state *state)
+{
+	/* Get rid of ticker event */
+	callout_stop(&(state->ticker));
+
+	/* TODO - Shutdown power */
+}

@@ -1,0 +1,4235 @@
+/* Copyright 1997 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/**************************************************************/
+/* File   : Redraw.c                                          */
+/*          (C) 2000 Pace Micro Technology PLC                */
+/*          All rights reserved                               */
+/*                                                            */
+/* Purpose: Redraw functions for the browser.                 */
+/*                                                            */
+/* Author : A.D.Hodgkinson                                    */
+/*                                                            */
+/* History: 29-Nov-1996 (ADH): Created.                       */
+/*          24-Feb-2000 (ADH): Headers and footers nearly     */
+/*                             done, 64-wide comments with    */
+/*                             Pace (C) started.              */
+/*          24-May-2000 (ADH): 64-wide comments finished.     */
+/**************************************************************/
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+
+#include <kernel.h>
+#include <swis.h>
+#include <tboxlibs/flex.h>
+
+#include <HTMLLib/HTMLLib.h>
+
+#include <tboxlibs/wimp.h>
+#include <tboxlibs/wimplib.h>
+#include <tboxlibs/event.h>
+
+#include "Global.h"
+#include "FromROSLib.h"
+#include "MiscDefs.h"
+#include "Utils.h"
+
+#include "Browser.h"
+#include "ChoiceDefs.h"
+#include "CSIM.h"
+#include "Fetch.h" /* (Which itself includes URLstat.h) */
+#include "FontManage.h"
+#include "Forms.h"
+#include "Frames.h"
+#include "Images.h"
+#include "Object.h"
+#include "Printing.h" /* Only for the PrintSplitFraction definition at present */
+#include "PrintStyle.h"
+#include "Reformat.h"
+#include "Scale.h"
+#include "Tables.h"
+#include "TokenUtils.h"
+#include "Toolbars.h"
+
+#ifdef UNIFONT
+  #include <Unicode/iso10646.h>
+  #include "Unifont.h"
+#endif
+
+#include "Redraw.h"
+
+/* Static function prototypes */
+
+static _kernel_oserror * redraw_read_section
+                         (
+                           browser_data                * restrict b,
+                           const HStream               * restrict t
+                         );
+
+static _kernel_oserror * redraw_plinth_border
+                         (
+                           const browser_data          * restrict b,
+                           const BBox                  * restrict user_box,
+                           unsigned int                           border,
+                           const unsigned int                     topleft_colour,
+                           const unsigned int                     bottomright_colour
+                         );
+
+static _kernel_oserror * redraw_page_background
+                         (
+                           browser_data                * restrict b,
+                           const WimpRedrawWindowBlock * restrict r
+                         );
+
+static _kernel_oserror * redraw_input_field
+                         (
+                           const browser_data          * restrict b,
+                           const HStream               * restrict t,
+                           const BBox                  * restrict box,
+                           unsigned int                           colour
+                         );
+
+static _kernel_oserror * redraw_menu_field
+                         (
+                           const browser_data          * restrict b,
+                           const HStream               * restrict t,
+                           const BBox                  * restrict box
+                         );
+
+static _kernel_oserror * redraw_button
+                         (
+                           const browser_data          * restrict b,
+                           const HStream               * restrict t,
+                           const BBox                  * restrict box,
+                           const unsigned int                     in
+                         );
+
+static _kernel_oserror * redraw_switch
+                         (
+                           const browser_data          * restrict b,
+                           const HStream               * restrict t,
+                           int                                    x,
+                           int                                    y,
+                           const char                  * restrict name
+                         );
+
+static _kernel_oserror * redraw_bullet
+                         (
+                           const browser_data          * restrict b,
+                           int                                    x,
+                           int                                    y,
+                           unsigned int                           bullet
+                         );
+
+static _kernel_oserror * redraw_image_and_border
+                         (
+                           browser_data                * restrict b,
+                           const HStream               * restrict tp,
+                           const HStream               * restrict nocontent,
+                           const WimpRedrawWindowBlock *          r,
+                           int                                    mp_x,
+                           int                                    mp_y
+                         );
+
+static _kernel_oserror * redraw_object_and_border
+                         (
+                           browser_data                * restrict b,
+                           const HStream               * restrict tp,
+                           const HStream               * restrict nocontent,
+                           const WimpRedrawWindowBlock *          r,
+                           int                                    mp_x,
+                           int                                    mp_y
+                         );
+
+static _kernel_oserror * redraw_empty_message
+                         (
+                           unsigned int                           toplevel,
+                           browser_data                * restrict b,
+                           const WimpRedrawWindowBlock * restrict r
+                         );
+
+/* Used for printing. Needed because redraw_token_colour takes no "noback" flag. */
+/* Could add it, but it'd hit efficiency to add a parameter to such a commonly   */
+/* called function - a static is hacky but faster and means far fewer changes.   */
+
+static unsigned int use_noback = 0;
+
+/* Internal recursive functions. These do the actual work that their */
+/* similarly named and oft externally visible counterparts claim to  */
+/* do, but are part of the recursive code needed for e.g. tables.    */
+/* Everything is driven by redraw_draw_r, which calls upon the other */
+/* various service functions as black boxes that just break things   */
+/* up into more manageable units for maintenance.                    */
+
+static _kernel_oserror * redraw_table
+                         (
+                           browser_data                * restrict b,
+                           const table_stream          * restrict table,
+                           const WimpRedrawWindowBlock * restrict r,
+                           int                                    mp_line_win_x,
+                           int                                    mp_line_win_y,
+                           int                                    mp_line_scr_x,
+                           int                                    mp_line_scr_y,
+                           unsigned int                           os_line_height,
+                           int                         * restrict nextline,
+                           unsigned int                           noback,
+                           const HStream               * restrict nocontent
+                         );
+
+static _kernel_oserror * redraw_draw_r
+                         (
+                           unsigned int                           toplevel,
+                           int                                    mp_origin_win_x,
+                           int                                    mp_origin_win_y,
+                           browser_data                * restrict b,
+                           const reformat_cell         *          d,
+                           WimpRedrawWindowBlock       * restrict r,
+                           int                         * restrict nextline,
+                           unsigned int                           noback,
+                           const HStream               * restrict nocontent
+                         );
+
+static _kernel_oserror * redraw_content_stream
+                         (
+                           unsigned int                           toplevel,
+                           int                                    mp_origin_win_x,
+                           int                                    mp_origin_win_y,
+                           browser_data                * restrict b,
+                           const reformat_cell         *          d,
+                           const WimpRedrawWindowBlock * restrict r,
+                           int                         * restrict nextline,
+                           int                         * restrict earlyexit,
+                           unsigned int                           noback,
+                           const HStream               * restrict nocontent
+                         );
+
+
+/**************************************************************/
+/* redraw_jmptbl_line()                                       */
+/*                                                            */
+/* Veneer function for the redraw table. Draws to the screen  */
+/* converting user-points to OS units.                        */
+/*                                                            */
+/* Parameters: See redraw_line_fn_ptr_t, Redraw.h.            */
+/*                                                            */
+/* Returns:    See redraw_line_fn_ptr_t, Redraw.h.            */
+/**************************************************************/
+
+_kernel_oserror * redraw_jmptbl_line
+                  (
+                    const browser_data * restrict b,
+                    const BBox         * restrict ends,
+                    unsigned int                  colour,
+
+                    size_t             * restrict r_size
+                  )
+{
+  if (r_size == NULL)
+  {
+    BBox os;
+
+    scale_box_user_to_os(b, ends, &os);
+
+    redraw_set_colour(colour);
+
+    (void) bbc_move(os.xmin, os.ymin);
+    return bbc_draw(os.xmax, os.ymax);
+  }
+  else
+  {
+    *r_size = 0;
+    return NULL;
+  }
+}
+
+/**************************************************************/
+/* redraw_jmptbl_rectangle()                                  */
+/*                                                            */
+/* Veneer function for the redraw table. Draws to the screen  */
+/* converting user-points to OS units.                        */
+/*                                                            */
+/* Parameters: See redraw_rectangle_fn_ptr_t, Redraw.h.       */
+/*                                                            */
+/* Returns:    See redraw_rectangle_fn_ptr_t, Redraw.h.       */
+/**************************************************************/
+
+_kernel_oserror * redraw_jmptbl_rectangle
+                  (
+                    const browser_data * restrict b,
+                    const BBox         * restrict rect,
+                    unsigned int         colour,
+                    unsigned int         border,
+
+                    size_t             * restrict r_size
+                  )
+{
+  if (r_size == NULL)
+  {
+    BBox         os;
+    unsigned int width, height;
+    int          dx = wimpt_dx() - 1;
+    int          dy = wimpt_dy() - 1;
+
+    scale_box_user_to_os(b, rect, &os);
+    redraw_set_colour(colour);
+
+    /* Worry about pixels! Suppose the left hand edge rounds to a given   */
+    /* pixel and when the border thickness is added it rounds to the same */
+    /* pixel; but the right hand edge rounds to the rightmost edge of a   */
+    /* given pixel, so with the border thickness added it spills to the   */
+    /* adjacent pixel too. One edge will appear thicker than the other.   */
+    /* Always round down; table border routines rely on it.               */
+
+    os.xmin &= ~dx;
+    os.ymin &= ~dy;
+    os.xmax &= ~dx;
+    os.ymax &= ~dy;
+
+    /* The VDU routines take bottom left X and Y plus width and height, */
+    /* but this is used to produce the top right *inclusive* coordinate */
+    /* - so we calculate width, height and border thickness minus 1.    */
+
+    width  = os.xmax - os.xmin - 1;
+    height = os.ymax - os.ymin - 1;
+
+    if (border != 0)
+    {
+      unsigned int thickness;
+
+      thickness = scale_user_to_os(b, border);
+
+      if (dx > dy) thickness &= ~dx;
+      else         thickness &= ~dy;
+
+      if (thickness > 0) thickness--;
+      else thickness = 1;
+
+      RetError(bbc_rectanglefill(os.xmin,                 os.ymin,                 width,     thickness));
+      RetError(bbc_rectanglefill(os.xmin,                 os.ymin,                 thickness, height));
+      RetError(bbc_rectanglefill(os.xmin,                 os.ymax - thickness - 1, width,     thickness));
+      return   bbc_rectanglefill(os.xmax - thickness - 1, os.ymin,                 thickness, height);
+    }
+    else
+    {
+      return   bbc_rectanglefill(os.xmin, os.ymin, width, height);
+    }
+  }
+  else
+  {
+    *r_size = 0;
+    return NULL;
+  }
+}
+
+/**************************************************************/
+/* redraw_jmptbl_triangle()                                   */
+/*                                                            */
+/* Veneer function for the redraw table. Draws to the screen  */
+/* converting user-points to OS units.                        */
+/*                                                            */
+/* Parameters: See redraw_triangle_fn_ptr_t, Redraw.h.        */
+/*                                                            */
+/* Returns:    See redraw_triangle_fn_ptr_t, Redraw.h.        */
+/**************************************************************/
+
+_kernel_oserror * redraw_jmptbl_triangle
+                  (
+                    const browser_data * restrict b,
+                    int                           x1,
+                    int                           y1,
+                    int                           x2,
+                    int                           y2,
+                    int                           x3,
+                    int                           y3,
+                    unsigned int                  colour,
+
+                    size_t             * restrict r_size
+                  )
+{
+  if (r_size == NULL)
+  {
+    int os_x1, os_y1;
+    int os_x2, os_y2;
+    int os_x3, os_y3;
+
+    scale_pair_user_to_os(b, x1, y1, &os_x1, &os_y1);
+    scale_pair_user_to_os(b, x2, y2, &os_x2, &os_y2);
+    scale_pair_user_to_os(b, x3, y3, &os_x3, &os_y3);
+
+    redraw_set_colour(colour);
+
+    return bbc_trianglefill(os_x1, os_y1,
+                            os_x2, os_y2,
+                            os_x3, os_y3);
+  }
+  else
+  {
+    *r_size = 0;
+    return NULL;
+  }
+}
+
+/**************************************************************/
+/* redraw_jmptbl_circle()                                     */
+/*                                                            */
+/* Veneer function for the redraw table. Draws to the screen  */
+/* converting user-points to OS units.                        */
+/*                                                            */
+/* Parameters: See redraw_circle_fn_ptr_t, Redraw.h.          */
+/*                                                            */
+/* Returns:    See redraw_circle_fn_ptr_t, Redraw.h.          */
+/**************************************************************/
+
+_kernel_oserror * redraw_jmptbl_circle
+                  (
+                    const browser_data * restrict b,
+                    int                           x,
+                    int                           y,
+                    unsigned int                  radius,
+                    unsigned int                  colour,
+
+                    size_t             * restrict r_size
+                  )
+{
+  if (r_size == NULL)
+  {
+    int os_x, os_y, os_radius;
+
+    scale_pair_user_to_os(b, x, y, &os_x, &os_y);
+    os_radius = scale_user_to_os(b, radius);
+
+    redraw_set_colour(colour);
+
+    return bbc_circlefill(os_x, os_y, os_radius);
+  }
+  else
+  {
+    *r_size = 0;
+    return NULL;
+  }
+}
+
+/**************************************************************/
+/* redraw_jmptbl_text()                                       */
+/*                                                            */
+/* Veneer function for the redraw table. Draws to the screen  */
+/* converting user-points to millipoints.                     */
+/*                                                            */
+/* Parameters: See redraw_text_fn_ptr_t, Redraw.h.            */
+/*                                                            */
+/* Returns:    See redraw_text_fn_ptr_t, Redraw.h.            */
+/**************************************************************/
+
+_kernel_oserror * redraw_jmptbl_text
+                  (
+                    const browser_data * restrict b,
+                    fm_face                       handle,
+                    int                           x,
+                    int                           y,
+                    const char         * restrict string,
+                    unsigned int                  numbytes,
+                    unsigned int                  fgcolour,
+                    unsigned int                  bgcolour,
+                    unsigned int                  blend,
+
+                    size_t             * restrict r_size
+                  )
+{
+  if (r_size == NULL)
+  {
+    int mp_x, mp_y;
+
+    scale_pair_user_to_millipoints(b, x, y, &mp_x, &mp_y);
+
+    RetError(fm_set_font_colour(handle,
+                                fgcolour,
+                                bgcolour));
+
+    return fm_putsl(handle,
+                    mp_x,
+                    mp_y,
+                    string,
+                    numbytes,
+                    0,
+                    blend);
+  }
+  else
+  {
+    *r_size = 0;
+    return NULL;
+  }
+}
+
+/**************************************************************/
+/* redraw_jmptbl_image()                                      */
+/*                                                            */
+/* Veneer function for the redraw table. Draws to the screen  */
+/* converting user-points to OS units.                        */
+/*                                                            */
+/* Parameters: See redraw_image_fn_ptr_t, Redraw.h.           */
+/*                                                            */
+/* Returns:    See redraw_image_fn_ptr_t, Redraw.h.           */
+/**************************************************************/
+
+_kernel_oserror * redraw_jmptbl_image
+                  (
+                    const browser_data * restrict b,
+                    const unsigned int            image,
+                    int                           x,
+                    int                           y,
+                    unsigned int                  width,
+                    unsigned int                  height,
+
+                    size_t             * restrict r_size
+                  )
+{
+  if (r_size == NULL)
+  {
+    int os_x, os_y, os_width, os_height;
+
+    scale_pair_user_to_os(b, x,     y,      &os_x,     &os_y);
+    scale_pair_user_to_os(b, width, height, &os_width, &os_height);
+
+    return image_redraw_primitive(b,
+                                  image,
+                                  os_x,
+                                  os_y,
+                                  os_width,
+                                  os_height);
+  }
+  else
+  {
+    *r_size = 0;
+    return NULL;
+  }
+}
+
+/**************************************************************/
+/* redraw_jmptbl_sprite()                                     */
+/*                                                            */
+/* Veneer function for the redraw table. Draws to the screen  */
+/* converting user-points to OS units.                        */
+/*                                                            */
+/* Parameters: See redraw_sprite_fn_ptr_t, Redraw.h.          */
+/*                                                            */
+/* Returns:    See redraw_sprite_fn_ptr_t, Redraw.h.          */
+/**************************************************************/
+
+_kernel_oserror * redraw_jmptbl_sprite
+                  (
+                    const browser_data * restrict b,
+                    const char         * restrict name,
+                    int                           x,
+                    int                           y,
+
+                    size_t             * restrict r_size
+                  )
+{
+  if (r_size == NULL)
+  {
+    _kernel_oserror * e;
+
+    int             * address;
+    unsigned char   * translation = NULL;
+
+    unsigned int      flags;
+    unsigned int      type, sprite_type;
+    unsigned int      size, log2bpp, mask;
+    int               w, h;
+
+    unsigned int      sca [4];
+    unsigned char     trp [256];
+
+    /* Convert the plot coordinates into OS units */
+
+    scale_pair_user_to_os(b, x, y, &x, &y);
+
+    /* Get the address of the sprite. */
+
+    RetError(_swix(OS_SpriteOp,
+                   _INR(0,2) | _OUT(2),
+
+                   256 + 24,
+                   sprite_block,
+                   name,
+
+                   &address));
+
+    /* Work out the number of colours as log2bpp */
+
+    RetError(_swix(OS_SpriteOp,
+                   _INR(0,2) | _OUTR(3,6),
+
+                   512 + 40,
+                   sprite_block,
+                   address,
+
+                   &w, &h,
+                   &mask,
+                   &type));
+
+    convert_pair_to_points(w, h, &w, &h);
+
+    sprite_type = (type & 0xf8000000) >> 27;
+
+    /* If the lower bit is set, this is either a mode number, or new type word */
+    /* - bit 27-31 hold the sprite type in the latter case; if these are all   */
+    /* zero, it's a mode number. Delightful interface.                         */
+
+    if ((type & (1u<<0)) != 0 && sprite_type != 0)
+    {
+      switch (sprite_type)
+      {
+        case 1:
+        case 2:
+        case 3:
+        case 4:
+        case 5:
+        case 6: log2bpp = sprite_type - 1; break;
+
+        default: return NULL;
+      }
+    }
+
+    /* OK, the above test failed so 'type' holds a mode number or selector */
+
+    else
+    {
+      unsigned int colours;
+
+      RetError(_swix(OS_ReadModeVariable,
+                     _INR(0,1) | _OUT(2),
+
+                     type,
+                     3,
+
+                     &colours));
+
+      switch (colours)
+      {
+        case 1:     log2bpp = 0; break;
+        case 3:     log2bpp = 1; break;
+        case 15:    log2bpp = 2; break;
+        case 63:
+        case 255:   log2bpp = 3; break;
+        case 65535: log2bpp = 4; break;
+
+        default:    log2bpp = 5; break;
+      }
+    }
+
+    /* Scaling details */
+
+    RetError(_swix(Wimp_ReadPixTrans,
+                   _INR(0,2) | _INR(6,7),
+
+                   512,
+                   sprite_block,
+                   address,
+                   sca,
+                   trp));
+
+    /* Work out the colour translation stuff for >= 8bpp */
+
+    if (log2bpp > 2)
+    {
+      flags = (1u<<0) || (1u<<1) ; /* Sprite address in R1; use current palette (rather than default) if sprite doesn't have one */
+
+      RetError(_swix(ColourTrans_SelectTable,
+                     _INR(0,5) | _OUT(4),
+
+                     sprite_block,
+                     address,
+                     -1, -1, 0,
+                     flags,
+
+                     &size));
+
+      translation = malloc(size);
+      if (translation == NULL) return make_no_memory_error(5);
+
+      e = _swix(ColourTrans_SelectTable,
+                _INR(0,5),
+
+                sprite_block,
+                address,
+                -1,
+                -1,
+                translation,
+                flags);
+
+      if (e != NULL)
+      {
+        free(translation);
+        return e;
+      }
+    }
+    else translation = trp;
+
+    /* Plot the sprite */
+
+    e = _swix(OS_SpriteOp,
+              _INR(0,7),
+
+              564,
+              sprite_block,
+              address,
+              x,
+              y,
+              mask == 0 ? 0 : 8, /* Plot mode 0 = overwrite, 8 = use mask */
+              sca,
+              translation);
+
+    if (log2bpp > 2) free(translation);
+    return e;
+  }
+  else
+  {
+    *r_size = 0;
+    return NULL;
+  }
+}
+
+/**************************************************************/
+/* redraw_jmptbl_clipping()                                   */
+/*                                                            */
+/* Veneer function for the redraw table. Draws to the screen  */
+/* converting user-points to OS units.                        */
+/*                                                            */
+/* Parameters: See redraw_clipping_fn_ptr_t, Redraw.h.        */
+/*                                                            */
+/* Returns:    See redraw_clipping_fn_ptr_t, Redraw.h.        */
+/**************************************************************/
+
+_kernel_oserror * redraw_jmptbl_clipping
+                  (
+                    const browser_data * restrict b,
+                    const BBox         * restrict desired,
+
+                    size_t             * restrict r_size
+                  )
+{
+  if (r_size == NULL)
+  {
+    BBox os_desired;
+
+    scale_box_user_to_os(b, desired, &os_desired);
+
+    RetError(bbc_gwindow(os_desired.xmin,
+                         os_desired.ymin,
+                         os_desired.xmax - 1,
+                         os_desired.ymax - 1));
+
+    return NULL;
+  }
+  else
+  {
+    *r_size = 0;
+    return NULL;
+  }
+}
+
+/**************************************************************/
+/* redraw_header()                                            */
+/*                                                            */
+/* Returns the header type (<H1>, <H2> etc. as a number from  */
+/* 1 - 7) extracted from the flags bits of an HStream         */
+/* structure.                                                 */
+/*                                                            */
+/* Parameters: The 'style' field of an HStream.               */
+/*                                                            */
+/* Returns:    A number from 1-7 for the heading level, or 0  */
+/*             if the flags are not for a heading item. Note  */
+/*             that flags from table stream structures should */
+/*             not be passed in.                              */
+/**************************************************************/
+
+unsigned int redraw_header(unsigned int flags)
+{
+  /* H_MASK and H_SHIFT are defined in HTMLLib/tags.h */
+
+  flags &= H_MASK;
+  flags = (flags >> H_SHIFT);
+
+  return flags;
+}
+
+/**************************************************************/
+/* redraw_read_section()                                      */
+/*                                                            */
+/* Read a section heading into the given browser_data         */
+/* structure's inferred_section field, from a heading line.   */
+/*                                                            */
+/* Parameters: Pointer to a browser_data struct relevant to   */
+/*             the section heading in question;               */
+/*                                                            */
+/*             Pointer to a token representing the first of   */
+/*             one or many forming a single heading line.     */
+/*                                                            */
+/* Returns:    Fills in the inferred_section field of the     */
+/*             given browser with the section text. Returns   */
+/*             error indications directly.                    */
+/**************************************************************/
+
+static _kernel_oserror * redraw_read_section
+                         (
+                           browser_data  * restrict b,
+                           const HStream * restrict t
+                         )
+{
+  unsigned int h2 = redraw_header(t->style);
+  unsigned int ln = 0;
+
+  /* Store inferred section */
+
+  free (b->inferred_section), b->inferred_section = NULL;
+
+  while (
+          t != NULL                     &&
+          reformat_istext(t)            &&
+          redraw_header(t->style) == h2 &&
+          t->tagno != TAG_BR
+        )
+  {
+    if (t->text != NULL && *t->text != '\0')
+    {
+      char * isec;
+
+      ln += strlen(t->text);
+      isec = realloc(b->inferred_section, ln + 1);
+
+      if (isec != NULL)
+      {
+        if (b->inferred_section == NULL) strcpy(isec, t->text);
+        else                             strcat(isec, t->text);
+
+        b->inferred_section = isec;
+      }
+      else return make_no_memory_error(49);
+    }
+
+    t = t->next;
+  }
+
+  /* Inform interested parties by callback */
+
+  return redrawcore_section_cb(b, b->inferred_section);
+}
+
+/**************************************************************/
+/* redraw_backcol()                                           */
+/*                                                            */
+/* Small function to return the actual background colour of a */
+/* browser window.                                            */
+/*                                                            */
+/* Parameters: A pointer to a browser_data structure          */
+/*             associated with the window in question.        */
+/**************************************************************/
+
+unsigned int redraw_backcol(const browser_data * restrict b)
+{
+  /* If the background colour isn't set or the Choices say  */
+  /* to override document colours, return the default; else */
+  /* return the document-specified background colour.       */
+
+  dprintf(("Redr", "redraw_backcol: Called with choices.background_colour = %p\n",(void *) choices.background_colour));
+
+  return (((b->background_colour == -1) || (!b->use_source_cols)) ? (choices.background_colour) : (b->background_colour));
+}
+
+/**************************************************************/
+/* redraw_background_colour()                                 */
+/*                                                            */
+/* Returns a background colour hint for text of a given       */
+/* foreground colour.                                         */
+/*                                                            */
+/* Parameters: Pointer to a browser_data struct holding the   */
+/*             background info;                               */
+/*                                                            */
+/*             A foreground colour (as a palette entry, for   */
+/*             more details see redraw_set_colour()).         */
+/*                                                            */
+/* Returns:    A background colour.                           */
+/**************************************************************/
+
+unsigned int redraw_background_colour
+             (
+               const browser_data * restrict b,
+               const unsigned int            foregroundcolour
+             )
+{
+  if (!b->show_background) return redraw_backcol(b);
+
+  switch (b->antialias_colour)
+  {
+    /* Defeat anti-aliasing by giving the same background colour */
+    /* as the foreground if antialias_colour is -1.              */
+
+    case -1: return foregroundcolour;
+
+    /* If antialias_colour is -2, return the background colour from the */
+    /* browser_data struct unless this is -1, in which case return the  */
+    /* foreground colour again.                                         */
+
+    case -2: return (b->background_colour == -1 ? foregroundcolour : b->background_colour);
+  }
+
+  /* Return either the default background colour or the anti-alias */
+  /* colour, depending on whether document colour overriding is    */
+  /* on or off respectively.                                       */
+
+  return (!b->use_source_cols ? choices.background_colour : b->antialias_colour);
+}
+
+/**************************************************************/
+/* redraw_token_colour()                                      */
+/*                                                            */
+/* Returns the colour to plot a token in, on the assumption   */
+/* that it contains some sort of text                         */
+/*                                                            */
+/* Parameters: Pointer to a browser_data struct with details  */
+/*             of the token stream within it;                 */
+/*                                                            */
+/*             Pointer to the token.                          */
+/*                                                            */
+/* Returns:    The colour to plot in, as a palette entry (see */
+/*             redraw_set_colour()).                          */
+/**************************************************************/
+
+unsigned int redraw_token_colour
+             (
+               const browser_data * restrict b,
+               const HStream      * restrict t
+             )
+{
+  if (t->tagno == TAG_INPUT || t->tagno == TAG_TEXTAREA || t->tagno == TAG_SELECT) return 0;
+
+  /* If we're printing, see if the Print Style dictates that any */
+  /* text should be black.                                       */
+
+  if (printing)
+  {
+    if (printstyle_always_use_black()) return Redraw_Colour_Black;
+
+    if (
+         printstyle_black_no_background() &&
+         use_noback                       &&
+         tokenutils_background_colour(b, t) == -1
+       )
+       return Redraw_Colour_Black;
+  }
+
+  /* If the token represents a link, use different colours according */
+  /* to the state of that link (followed, unfollowed etc).           */
+
+  if (ISLINK(t))
+  {
+    /* If tokens are selected, return the appropriate colour */
+
+    if (redraw_selected(b, t)) return (b->use_source_cols ? b->selected_colour : choices.selected_colour);
+
+    /* If the token has attached specific colour information, return that */
+
+    if ((t->type & TYPE_COLOURED) && b->use_source_cols) return (t->colour << 8);
+
+    /* If tokens are highlighted, return the appropriate colour */
+
+    if (b->highlight) return (b->use_source_cols ? b->followed_colour : choices.followed_colour);
+
+    /* If the token has been followed in the past, give the used colour */
+    /* - otherwise give the unfollowed link colour.                     */
+
+    if (!printing && (t->flags & HFlags_LinkVisited)) return (b->use_source_cols ? b->used_colour : choices.used_colour);
+
+    return (b->use_source_cols ? b->link_colour : choices.link_colour);
+  }
+
+  /* If the token has attached specific colour information, return that */
+
+  if ((t->type & TYPE_COLOURED) && b->use_source_cols) return (t->colour << 8);
+
+  /* If the token is just text, return the normal text colour */
+
+  return (b->use_source_cols ? b->text_colour : choices.text_colour);
+}
+
+/**************************************************************/
+/* redraw_set_colour()                                        */
+/*                                                            */
+/* Sets the foreground colour for future plots.               */
+/*                                                            */
+/* Parameters: A 32-bit colour number in the form BBGGRRcc    */
+/*             where cc = GCOL, or BBGGRR are blue, green and */
+/*             red components.                                */
+/**************************************************************/
+
+void redraw_set_colour(unsigned int colour)
+{
+  dprintf(("Redr", "redraw_set_colour: Called with colour = %p\n",(void *) colour));
+
+  /* Don't use dithering if anti-twittering redraws */
+
+  #ifdef ANTI_TWITTER
+
+    _swix(ColourTrans_SetGCOL,
+          _IN(0) | _INR(3,4),
+
+          colour, /* Colour to change to */
+          0,      /* No dithering        */
+          0);     /* GCOL action 0       */
+
+  #else
+
+    _swix(ColourTrans_SetGCOL,
+          _IN(0) | _INR(3,4),
+
+          colour, /* Colour to change to                            */
+          1<<8,   /* Use ECFs (dithering) for better representation */
+          0);     /* GCOL action 0                                  */
+
+  #endif
+}
+
+/**************************************************************/
+/* redraw_display_width()                                     */
+/*                                                            */
+/* Returns the available display width for a given browser    */
+/* redraw cell, in OS units.                                  */
+/*                                                            */
+/* Parameters: Pointer to a browser_data struct relevant to   */
+/*             the cell;                                      */
+/*                                                            */
+/*             Pointer to a reformat_cell struct representing */
+/*             the redraw cell.                               */
+/*                                                            */
+/* Returns:    The display width, in OS units.                */
+/**************************************************************/
+
+int redraw_display_width
+    (
+      const browser_data  * restrict b,
+      const reformat_cell *          d
+    )
+{
+  if (!d || !d->table) return b->display_width;
+  else
+  {
+    int osw;
+
+    convert_to_os(d->cellwidth, &osw);
+
+    return osw;
+  }
+}
+
+/**************************************************************/
+/* redraw_display_height()                                    */
+/*                                                            */
+/* Returns the available display height for a given browser   */
+/* redraw cell, in OS units; for a base browser window, it    */
+/* will subtract the toolbar heights as required.             */
+/*                                                            */
+/* Parameters: Pointer to a browser_data struct relevant to   */
+/*             the cell;                                      */
+/*                                                            */
+/*             Pointer to a reformat_cell struct representing */
+/*             the redraw cell.                               */
+/*                                                            */
+/* Returns:    The display width, in OS units.                */
+/**************************************************************/
+
+int redraw_display_height
+    (
+      const browser_data  * restrict b,
+      const reformat_cell *          d
+    )
+{
+  if (!d || !d->table)
+  {
+    /* Subtract a bit for aesthetics and to account for the */
+    /* amount a line might naturally be overheight, so that */
+    /* (say) images scaled to 100% height don't lead to a   */
+    /* vertically scrollable page.                          */
+
+    return b->display_height - b->leading * 3;
+  }
+  else
+  {
+    int osh;
+
+    convert_to_os(d->cellheight, &osh);
+
+    return osh;
+  }
+}
+
+/**************************************************************/
+/* redraw_left_margin()                                       */
+/*                                                            */
+/* Returns the left hand margin width for a given browser     */
+/* redraw cell, in millipoints.                               */
+/*                                                            */
+/* Parameters: Pointer to a browser_data struct relevant to   */
+/*             the cell;                                      */
+/*                                                            */
+/*             Pointer to a reformat_cell struct representing */
+/*             the redraw cell.                               */
+/*                                                            */
+/* Returns:    The left hand margin, in millipoints.          */
+/**************************************************************/
+
+int redraw_left_margin
+    (
+      const browser_data  * restrict b,
+      const reformat_cell *          d
+    )
+{
+  if (!d || !d->table) return b->left_margin;
+  else
+  {
+    /* Left margin -> cellpadding for a table cell */
+
+    int cellpadmp = d->table->cellpadding * 2; /* 1 'web pixel' = 2 OS units */
+
+    convert_to_points(cellpadmp, &cellpadmp);
+
+    return cellpadmp;
+  }
+}
+
+/**************************************************************/
+/* redraw_right_margin()                                      */
+/*                                                            */
+/* Returns the right hand margin width for a given browser    */
+/* redraw cell, in millipoints.                               */
+/*                                                            */
+/* Parameters: Pointer to a browser_data struct relevant to   */
+/*             the cell;                                      */
+/*                                                            */
+/*             Pointer to a reformat_cell struct representing */
+/*             the redraw cell.                               */
+/*                                                            */
+/* Returns:    The right hand margin, in millipoints.         */
+/**************************************************************/
+
+int redraw_right_margin
+    (
+      const browser_data  * restrict b,
+      const reformat_cell *          d
+    )
+{
+  if (!d || !d->table) return b->right_margin;
+  else
+  {
+    /* Left margin -> cellpadding for a table cell */
+
+    int cellpadmp = d->table->cellpadding * 2; /* 1 'web pixel' = 2 OS units */
+
+    convert_to_points(cellpadmp, &cellpadmp);
+
+    return cellpadmp;
+  }
+}
+
+/**************************************************************/
+/* redraw_left_gap()                                          */
+/*                                                            */
+/* Works out the left hand indented margin for a given        */
+/* browser redraw cell, in millipoints. This will be          */
+/* redraw_left_margin plus a value dependent upon the given   */
+/* token (to allow e.g. list items to be indented).           */
+/*                                                            */
+/* Parameters: Pointer to a browser_data struct relevant to   */
+/*             the cell;                                      */
+/*                                                            */
+/*             Pointer to a reformat_cell struct representing */
+/*             the redraw cell;                               */
+/*                                                            */
+/*             Pointer to a token holding indentation         */
+/*             information.                                   */
+/*                                                            */
+/* Returns:    The left hand margin, taking account of list   */
+/*             indentations etc., in millipoints.             */
+/**************************************************************/
+
+int redraw_left_gap
+    (
+      const browser_data  * restrict b,
+      const reformat_cell *          d,
+      const HStream       * restrict t
+    )
+{
+  int s, i;
+
+  s = t->style;
+  i = t->indent * b->left_indent;
+
+  /* Play about outdenting bullets and numbered list items. */
+
+  if (t->tagno == TAG_LI)
+  {
+    if (t->text)
+    {
+      _kernel_oserror * e;
+      fm_face           h;
+      int               width, bytes;
+
+      /* We need to right-align the text. Find out its width... */
+
+      h = fm_find_token_font(NULL, t, 0);
+
+      e = fm_get_string_width(h,
+                              t->text,
+                              0x40000000,
+                              0x40000000,
+                              -1,
+                              &bytes,
+                              &width);
+
+      if (!e) i -= width;
+
+      fm_lose_font(NULL, h);
+    }
+    else
+    {
+      int bullet_width;
+
+      /* Outdent the bullet */
+
+      convert_to_points(reformat_bullet_width(t->indent), &bullet_width);
+
+      i -= bullet_width;
+    }
+  }
+
+  /* Add an amount for block quote or address text */
+
+  if (s & (BLOCKQUOTE | ADDRESS)) i += b->quote_margin;
+
+  /* Return the calculated left indent plus the left */
+  /* margin value.                                   */
+
+  i += redraw_left_margin(b, d);
+
+  return i > 0 ? i : 0;
+}
+
+/**************************************************************/
+/* redraw_right_gap()                                         */
+/*                                                            */
+/* As redraw_left_gap, but for the right hand edge of a given */
+/* redraw browser cell.                                       */
+/*                                                            */
+/* Parameters: Pointer to a browser_data struct relevant to   */
+/*             the cell;                                      */
+/*                                                            */
+/*             Pointer to a reformat_cell struct representing */
+/*             the redraw cell;                               */
+/*                                                            */
+/*             Pointer to a token holding indentation         */
+/*             information.                                   */
+/*                                                            */
+/* Returns:    The right hand margin, taking account of block */
+/*             quote indents etc., in millipoints.            */
+/**************************************************************/
+
+int redraw_right_gap
+    (
+      const browser_data  * restrict b,
+      const reformat_cell *          d,
+      const HStream       * restrict t
+    )
+{
+  int i = 0;
+
+  /* Add an amount for block quote text */
+
+  if (t->style & BLOCKQUOTE) i += b->quote_margin;
+
+  /* Return the calculated right indent plus the right */
+  /* margin value.                                     */
+
+  i += redraw_right_margin(b, d);
+
+  return i > 0 ? i : 0;
+}
+
+/**************************************************************/
+/* redraw_start_x()                                           */
+/*                                                            */
+/* Examines current token and line structure information      */
+/* within a redraw cell to return an indent from the left     */
+/* edge of the page at which something should be drawn -      */
+/* handles centre and right aligning of lines.                */
+/*                                                            */
+/* Parameters: Pointer to a browser_data struct relevant to   */
+/*             the cell;                                      */
+/*                                                            */
+/*             Pointer to a reformat_cell struct representing */
+/*             the redraw cell;                               */
+/*                                                            */
+/*             Pointer to an HStream (token) so that a margin */
+/*             can be found;                                  */
+/*                                                            */
+/*             Line number which the x offset needs to be     */
+/*             found for.                                     */
+/*                                                            */
+/* Returns:    The x offset to plot at, in OS units.          */
+/**************************************************************/
+
+int redraw_start_x
+    (
+      const browser_data  * restrict b,
+      const reformat_cell *          cell,
+      const HStream       * restrict t,
+      const unsigned int             line
+    )
+{
+  int          x, align = 0;
+  unsigned int cn;
+
+  if (!cell) cell = b->cell;
+
+  cn = cell->ldata[line].chunks;
+
+  /* If the token isn't centred just return the margin value; */
+  /* else work out centre or right alignment indentation.     */
+
+  if      ((t->style & CENTER) || (t->type & TYPE_ALIGN_MASK) == TYPE_CENTRE) align = 1;
+  else if ((t->style & RIGHT)  || (t->type & TYPE_ALIGN_MASK) == TYPE_RIGHT)  align = 2;
+
+  if (align)
+  {
+    unsigned int i;
+    int          left  = redraw_left_gap (b, cell, t);
+    int          right = redraw_right_gap(b, cell, t);
+
+    /* Get the window's display width in millipoints */
+
+    convert_to_points(redraw_display_width(b, cell), &x);
+
+    /* Subtract the width of each chunk from this value */
+
+    for (i = 0; i < cell->ldata[line].n; x -= cell->cdata[cn].w, i++, cn++);
+
+    /* Subtract the right hand gap value */
+
+    x -= right;
+
+    /* For centred objects, center between the margins */
+
+    if (align == 1) x = left + ((x - left) / 2);
+
+    /* Sanity check */
+
+    if (x < left) x = left;
+
+    /* Convert back to OS units */
+
+    convert_to_os(x, &x);
+
+    return x;
+  }
+
+  convert_to_os(redraw_left_gap(b, cell, t), &x);
+
+  return x;
+}
+
+/**************************************************************/
+/* redraw_token_x()                                           */
+/*                                                            */
+/* Examines current token and line structure information      */
+/* within a redraw cell to return an indent from the left     */
+/* edge of the page at which a specific token should be       */
+/* drawn.                                                     */
+/*                                                            */
+/* Parameters: Pointer to a browser_data struct relevant to   */
+/*             the cell;                                      */
+/*                                                            */
+/*             Pointer to a reformat_cell struct representing */
+/*             the redraw cell;                               */
+/*                                                            */
+/*             Pointer to the token;                          */
+/*                                                            */
+/*             Line number which the token lies in;           */
+/*                                                            */
+/* Returns:    The x offset from the left of the page that    */
+/*             the token starts at, in OS units.              */
+/**************************************************************/
+
+int redraw_token_x
+    (
+      const browser_data  * restrict b,
+      const reformat_cell *          cell,
+      const HStream       * restrict t,
+      const unsigned int             line
+    )
+{
+  int          x;
+  unsigned int chunk, mchunk;
+
+  if (!cell) cell = b->cell;
+
+  /* Find the starting left hand edge */
+
+  convert_to_points(redraw_start_x(b,
+                                   cell,
+                                   cell->cdata[cell->ldata[line].chunks].t,
+                                   line),
+                    &x);
+
+  /* Add up chunk widths */
+
+  chunk  = cell->ldata[line].chunks;
+  mchunk = cell->ldata[line].n + chunk;
+
+  while (
+          chunk < mchunk         &&
+          cell->cdata[chunk].t != t
+        )
+        x += cell->cdata[chunk].w, chunk++;
+
+  convert_to_os(x, &x);
+
+  /* Return the total */
+
+  return x;
+}
+
+/**************************************************************/
+/* redraw_chunk_x()                                           */
+/*                                                            */
+/* Examines current token and line structure information      */
+/* within a redraw cell to return an indent from the left     */
+/* edge of the page at which a specific chunk should be drawn */
+/* (i.e. as redraw_token_x, but you supply a chunk number     */
+/* rather than a token).                                      */
+/*                                                            */
+/* Parameters: Pointer to a browser_data struct relevant to   */
+/*             the cell;                                      */
+/*                                                            */
+/*             Pointer to a reformat_cell struct representing */
+/*             the redraw cell;                               */
+/*                                                            */
+/*             The chunk number;                              */
+/*                                                            */
+/*             Line number the chunk lies in.                 */
+/*                                                            */
+/* Returns:    The x offset from the left of the page that    */
+/*             the chunk starts at, in OS units.              */
+/*                                                            */
+/* Assumes:    That the given line does indeed include the    */
+/*             given chunk.                                   */
+/**************************************************************/
+
+int redraw_chunk_x
+    (
+      const browser_data  * restrict b,
+      const reformat_cell *          cell,
+      const unsigned int             chunk,
+      const unsigned int             line
+    )
+{
+  int          x;
+  unsigned int cchunk, mchunk;
+
+  if (!cell) cell = b->cell;
+
+  /* Find the starting left hand edge */
+
+  convert_to_points(redraw_start_x(b,
+                                   cell,
+                                   cell->cdata[cell->ldata[line].chunks].t,
+                                   line),
+                    &x);
+
+  /* Add up chunk widths */
+
+  cchunk = cell->ldata[line].chunks;
+  mchunk = cchunk + cell->ldata[line].n;
+
+  while (
+          cchunk < mchunk &&
+          cchunk < chunk
+        )
+        x += cell->cdata[cchunk].w, cchunk++;
+
+  convert_to_os(x, &x);
+
+  /* Return the total */
+
+  return x;
+}
+
+/**************************************************************/
+/* redraw_selected()                                          */
+/*                                                            */
+/* Looks at the 'selected' field for the given browser_data   */
+/* struct, and returns 1 if the given token should be part of */
+/* the selection that 'selected' lies in.                     */
+/*                                                            */
+/* This is for whole token selection, e.g. when keyboard      */
+/* navigating a page - it isn't part of a more general        */
+/* mouse-driven text selection model.                         */
+/*                                                            */
+/* Parameters: Pointer to a browser_data struct relevant to   */
+/*             the selection; Pointer to the token to         */
+/*             compare.                                       */
+/*                                                            */
+/* Returns:    1 if the token is part of the selection, else  */
+/*             0.                                             */
+/**************************************************************/
+
+unsigned int redraw_selected
+             (
+               const browser_data * restrict b,
+               const HStream      * restrict t
+             )
+{
+  HStream            * top;
+  HStream            * end;
+  const browser_data * owner;
+  const browser_data * ancestor = utils_ancestor(b);
+  int                  found    = 0;
+
+  /* If printing, don't want to show anything as selected */
+
+  if (printing) return 0;
+
+  /* Otherwise, find out if the token is part of a selection. */
+
+  owner = ancestor->selected_owner;
+
+  if (!ancestor->selected) return 0;
+  if (ancestor->selected == t) return 1;
+
+  tokenutils_anchor_range(owner,
+                          ancestor->selected,
+                          &top,
+                          &end);
+
+  if (top && end)
+  {
+    do
+    {
+      if (t == top) found = 1;
+      else top = top->next;
+    }
+    while (top && top != end->next && !found);
+  }
+
+  return found;
+}
+
+/**************************************************************/
+/* redraw_border_around_box()                                 */
+/*                                                            */
+/* Draws a 2 pixel thick border around a given bounding box,  */
+/* in a given colour. Usually used for selection highlights.  */
+/*                                                            */
+/* Parameters: Pointer to a browser_data struct relevant to   */
+/*             the data being redrawn;                        */
+/*                                                            */
+/*             Pointer to the BBox (inclusive bottom left,    */
+/*             exclusive top right, OS units);                */
+/*                                                            */
+/*             Colour to use, as a palette entry (for more    */
+/*             details see redraw_set_colour()).              */
+/**************************************************************/
+
+_kernel_oserror * redraw_border_around_box
+                  (
+                    const browser_data * restrict b,
+                    const BBox         * restrict os_box,
+                    const unsigned int            colour
+                  )
+{
+  int  user_border;
+  BBox user_box;
+
+  /* Usual assumption is 1 pixel = 2 OS units, so get a 2 pixel border */
+
+  user_border = scale_os_to_user(b, 4);
+  scale_box_os_to_user(b, os_box, &user_box);
+
+  /* Want the border drawn *around* the box */
+
+  user_box.xmin -= user_border;
+  user_box.ymin -= user_border;
+  user_box.xmax += user_border;
+  user_box.ymax += user_border;
+
+  /* OK, draw it */
+
+  return redrawcore_rectangle(b,
+                              &user_box,
+                              colour,
+                              user_border);
+}
+
+/**************************************************************/
+/* redraw_plinth_border()                                     */
+/*                                                            */
+/* Draw a 3D-style plinth border just inside the given        */
+/* bounding box.                                              */
+/*                                                            */
+/* Parameters: Pointer to a browser_data struct relevant to   */
+/*             the data being redrawn;                        */
+/*                                                            */
+/*             Bounding box coordinates in user-points,       */
+/*             (xmin,ymin) bottom left inclusive, (xmax,ymax) */
+/*             top right exclusive;                           */
+/*                                                            */
+/*             Border width in user points;                   */
+/*                                                            */
+/*             Top and left edge colour;                      */
+/*                                                            */
+/*             Bottom and right edge colour.                  */
+/**************************************************************/
+
+static _kernel_oserror * redraw_plinth_border
+                         (
+                           const browser_data * restrict b,
+                           const BBox         * restrict user_box,
+                           unsigned int                  border,
+                           const unsigned int            topleft_colour,
+                           const unsigned int            bottomright_colour
+                         )
+{
+  BBox rounded_box;
+  int  rounded_border = scale_user_to_os(b, border);
+  int  x[4], y[4];
+  int  dx = wimpt_dx() - 1;
+  int  dy = wimpt_dy() - 1;
+
+  /* To ensure a reliable fit to the visible pixel grid, we do lots of rounding */
+  /* here - for more accurate output devices, output will be quantised.         */
+
+  scale_box_user_to_os(b, user_box, &rounded_box);
+
+  rounded_box.xmin &= ~dx;
+  rounded_box.ymin &= ~dy;
+  rounded_box.xmax &= ~dx;
+  rounded_box.ymax &= ~dy;
+
+  border &= ~(dx > dy ? dx : dy);
+  if (border == 0) border = 1;
+
+  /* There are 8 corners to a plinth,  6------4  */
+  /* we draw using 8 triangles. Work   |\    /|  */
+  /* these out first in the arrays     | 7--5 |  */
+  /* declared above to make the        | |  | |  */
+  /* plotting code tidier and avoid    | 1--3 |  */
+  /* unnecessary recalculation of      |/    \|  */
+  /* corner coordinates.               0------2  */
+  /*                                             */
+  /* Note how there are only 4 unique x or y     */
+  /* values, so that's all we need to work out.  */
+
+  x[0] = rounded_box.xmin;
+  x[1] = rounded_box.xmin + rounded_border - 1;
+  x[2] = rounded_box.xmax - rounded_border;
+  x[3] = rounded_box.xmax - 1;
+
+  y[0] = rounded_box.ymin;
+  y[1] = rounded_box.ymin + rounded_border - 1;
+  y[2] = rounded_box.ymax - rounded_border;
+  y[3] = rounded_box.ymax - 1;
+
+  scale_pair_os_to_user(b, x[0], y[0], &x[0], &y[0]);
+  scale_pair_os_to_user(b, x[1], y[1], &x[1], &y[1]);
+  scale_pair_os_to_user(b, x[2], y[2], &x[2], &y[2]);
+  scale_pair_os_to_user(b, x[3], y[3], &x[3], &y[3]);
+
+  /* OK, now do the drawing. We need to be careful about  */
+  /* the direction that the drawing occurs to ensure that */
+  /* adjacent diagonal lines meet up correctly.           */
+
+  /* Bottom edge */
+
+  RetError(redrawcore_triangle(b, x[0], y[0], x[1], y[1], x[3], y[0], bottomright_colour)); /* 0 -> 1 -> 2 */
+  RetError(redrawcore_triangle(b, x[1], y[1], x[3], y[0], x[2], y[1], bottomright_colour)); /* 1 -> 2 -> 3 */
+
+  /* Right edge */
+
+  RetError(redrawcore_triangle(b, x[3], y[0], x[2], y[1], x[3], y[3], bottomright_colour)); /* 2 -> 3 -> 4 */
+  RetError(redrawcore_triangle(b, x[2], y[1], x[3], y[3], x[2], y[2], bottomright_colour)); /* 3 -> 4 -> 5 */
+
+  /* Top edge */
+
+  RetError(redrawcore_triangle(b, x[3], y[3], x[2], y[2], x[0], y[3], topleft_colour));     /* 4 -> 5 -> 6 */
+  RetError(redrawcore_triangle(b, x[2], y[2], x[0], y[3], x[1], y[2], topleft_colour));     /* 5 -> 6 -> 7 */
+
+  /* Left edge */
+
+  RetError(redrawcore_triangle(b, x[0], y[3], x[1], y[2], x[0], y[0], topleft_colour));     /* 6 -> 7 -> 0 */
+  return   redrawcore_triangle(b, x[1], y[2], x[0], y[0], x[1], y[1], topleft_colour);      /* 7 -> 0 -> 1 */
+}
+
+/**************************************************************/
+/* redraw_page_background()                                   */
+/*                                                            */
+/* Redraw a page background's images or solid region.         */
+/*                                                            */
+/* Parameters: Pointer to a browser_data struct relevant to   */
+/*             the page being redrawn;                        */
+/*                                                            */
+/*             Pointer to a fully initialised Wimp redraw     */
+/*             block. Tiling is carried out over the redraw   */
+/*             area (graphics window) with the origin of the  */
+/*             tile worked out from the visible area and      */
+/*             scroll information.                            */
+/**************************************************************/
+
+static _kernel_oserror * redraw_page_background
+                         (
+                           browser_data                * restrict b,
+                           const WimpRedrawWindowBlock * restrict r
+                         )
+{
+  unsigned int htop;
+
+  /* Calculate toolbar height including the toolbar's window border */
+
+  if (!controls.swap_bars) htop = toolbars_button_height(b) + toolbars_url_height(b);
+  else                     htop = toolbars_status_height(b);
+
+  if (htop) htop += wimpt_dy();
+
+  /* If background images are not to be shown, or there's no image */
+  /* to tile on the background, set the background to a uniform    */
+  /* colour. The 'if' statement implicitly calls the background    */
+  /* image tiler.                                                  */
+
+  if (
+       !b->show_background ||
+       !image_tile_window(b,
+                          r,
+                          0,
+                          -htop)
+     )
+  {
+    BBox user_box;
+
+    scale_box_os_to_user(b, &r->redraw_area, &user_box);
+
+    return redrawcore_rectangle(b,
+                                &user_box,
+                                redraw_backcol(b),
+                                0);
+  }
+
+  return NULL;
+}
+
+/**************************************************************/
+/* redraw_input_field()                                       */
+/*                                                            */
+/* For forms, redraws an input field element.                 */
+/*                                                            */
+/* Parameters: Pointer to a browser_data struct relevant to   */
+/*             the element;                                   */
+/*                                                            */
+/*             Pointer to the token representing this         */
+/*             element;                                       */
+/*                                                            */
+/*             BBox of the field, in window coords (and thus  */
+/*             OS units);                                     */
+/*                                                            */
+/*             Border colour (as a palette entry, for more    */
+/*             details see redraw_set_colour());              */
+/**************************************************************/
+
+static _kernel_oserror * redraw_input_field
+                         (
+                           const browser_data * restrict b,
+                           const HStream      * restrict t,
+                           const BBox         * restrict box,
+                           unsigned int                  colour
+                         )
+{
+  int  user_border;
+  BBox user_box;
+
+  /* If the token is selected, draw the border in the selection colour */
+
+  if (redraw_selected(b, t)) colour = b->selected_colour;
+
+  /* Usual assumption is 1 pixel = 2 OS units, so get a 2 pixel border */
+
+  user_border = scale_os_to_user(b, 4);
+  scale_box_os_to_user(b, box, &user_box);
+
+  /* Redraw the inside in white */
+
+  RetError(redrawcore_rectangle(b,
+                                &user_box,
+                                Redraw_Colour_White,
+                                0));
+
+  /* Redraw the border */
+
+  return redrawcore_rectangle(b,
+                              &user_box,
+                              colour,
+                              user_border);
+
+// This might need bringing back if the browser ever supports changing the
+// border colour of an INPUT/TEXTAREA element at a token level; at the time
+// of writing it would always be black, so changing to the selection colour
+// to highlight input fields makes a lot of sense.
+//
+//  /* Selection border */
+//
+//  if (redraw_selected(b, t)) return redraw_border_around_box(b, box, b->selected_colour);
+//  else                       return NULL;
+}
+
+/**************************************************************/
+/* redraw_menu_field()                                        */
+/*                                                            */
+/* For forms, redraws a menu (SELECT) field element.          */
+/*                                                            */
+/* Parameters: Pointer to a browser_data struct relevant to   */
+/*             the element;                                   */
+/*                                                            */
+/*             Pointer to the token representing this         */
+/*             element;                                       */
+/*                                                            */
+/*             BBox of the field, in window coords (and thus  */
+/*             OS units).                                     */
+/**************************************************************/
+
+static _kernel_oserror * redraw_menu_field
+                         (
+                           const browser_data * restrict b,
+                           const HStream      * restrict t,
+                           const BBox         * restrict box
+                         )
+{
+  int  sw, sh, offset;
+  BBox shorter;
+
+  shorter = *box;
+
+  RetError(utils_read_sprite_size("fgright", &sw, &sh));
+
+  shorter.xmax -= (sw + 8);
+
+  if (shorter.xmax < shorter.xmin) shorter.xmax = shorter.xmin + sw;
+
+  /* Redraw the display region as a slabbed button */
+
+  RetError(redraw_button(b, t, &shorter, 2));
+
+  /* Allow for a border or gap around the sprite - 2 OS units */
+  /* each side.                                               */
+
+  sw += 4;
+  sh += 4;
+
+  /* Work out the vertical offset and from that the bounding box */
+
+  offset = (box->ymax - box->ymin - sh) / 2;
+
+  shorter.xmin = box->xmax - sw;
+  shorter.ymin = box->ymin + offset;
+  shorter.xmax = box->xmax;
+  shorter.ymax = box->ymin + offset + sh;
+
+  RetError(redrawcore_sprite(b,
+                             "fgright",
+                             scale_os_to_user(b, shorter.xmin + 2),
+                             scale_os_to_user(b, shorter.ymin + 2)));
+
+  /* Thin black border */
+
+  RetError(redrawcore_rectangle(b,
+                                &shorter,
+                                Redraw_Colour_Black,
+                                scale_os_to_user(b, 2)));
+
+  /* Navigation selection border */
+
+  if (redraw_selected(b, t)) return redraw_border_around_box(b, &shorter, b->selected_colour);
+  else                       return NULL;
+}
+
+/**************************************************************/
+/* redraw_button()                                            */
+/*                                                            */
+/* For forms, redraws a button element.                       */
+/*                                                            */
+/* Parameters: Pointer to a browser_data struct relevant to   */
+/*             the element;                                   */
+/*                                                            */
+/*             Pointer to the token representing this         */
+/*             element;                                       */
+/*                                                            */
+/*             BBox of the field, in window coords (and thus  */
+/*             OS units);                                     */
+/*                                                            */
+/*             1 to be slabbed in, 2 to be slabbed in but     */
+/*             with a light grey background rather than dark, */
+/*             else 0.                                        */
+/**************************************************************/
+
+static _kernel_oserror * redraw_button
+                         (
+                           const browser_data * restrict b,
+                           const HStream      * restrict t,
+                           const BBox         * restrict box,
+                           const unsigned int            in
+                         )
+{
+  unsigned int colour;
+  int          border;
+  BBox         user_box;
+
+  /* Usual assumption is 1 pixel = 2 OS units, so get a 2 pixel border */
+
+  border = scale_os_to_user(b, 4);
+  scale_box_os_to_user(b, box, &user_box);
+
+  /* Draw the background */
+
+  colour = (in == 1) ? Redraw_Colour_MidGrey : Redraw_Colour_BackGrey;
+
+  RetError(redrawcore_rectangle(b,
+                                &user_box,
+                                colour,
+                                0));
+
+  /* Border */
+
+  RetError(redraw_plinth_border(b,
+                                &user_box,
+                                border,
+                                in ? Redraw_Colour_PlinthGrey : Redraw_Colour_AlmostWhite,
+                                in ? Redraw_Colour_AlmostWhite : Redraw_Colour_PlinthGrey));
+
+  /* Selection border */
+
+  if (redraw_selected(b, t)) return redraw_border_around_box(b, box, b->selected_colour);
+  else                       return NULL;
+}
+
+/**************************************************************/
+/* redraw_switch()                                            */
+/*                                                            */
+/* For forms, redraws a switch (radio or option) element.     */
+/*                                                            */
+/* Parameters: Pointer to a browser_data struct relevant to   */
+/*             the element;                                   */
+/*                                                            */
+/*             Pointer to the token representing this         */
+/*             element;                                       */
+/*                                                            */
+/*             x coordinate (points, in screen coords) of     */
+/*             left hand edge;                                */
+/*                                                            */
+/*             y coordinate (points, in screen coords) of     */
+/*             bottom edge;                                   */
+/*                                                            */
+/*             Pointer to sprite name to use.                 */
+/**************************************************************/
+
+static _kernel_oserror * redraw_switch
+                         (
+                           const browser_data * restrict b,
+                           const HStream      * restrict t,
+                           int                           x,
+                           int                           y,
+                           const char         * restrict name
+                         )
+{
+  int ox, oy, ux, uy;
+
+  /* Convert the plot position to user-points then to OS units, */
+  /* so we have the plot position in both coordinate spaces.    */
+
+  scale_pair_millipoints_to_user (b, x,  y,  &ux, &uy);
+  scale_pair_user_to_os          (b, ux, uy, &ox, &oy);
+
+  /* Correct the Y offset (aesthetics). */
+
+  oy -= 8;
+
+  /* Convert the updated corner coordinates back to user-points */
+  /* for the plot function.                                     */
+
+  scale_pair_os_to_user(b, ox, oy, &ux, &uy);
+
+  /* Plot the sprite */
+
+  RetError(redrawcore_sprite(b, name, ux, uy));
+
+  /* If this token is selected, draw a border around the sprite. */
+
+  if (redraw_selected(b, t))
+  {
+    BBox sprite;
+    int  w, h;
+
+    /* Make a sprite bounding box in OS units - needed for the */
+    /* border plot below.                                      */
+
+    if (utils_read_sprite_size(name, &w, &h)) w = h = 44;
+
+    sprite.xmin = ox;
+    sprite.ymin = oy;
+    sprite.xmax = sprite.xmin + w;
+    sprite.ymax = sprite.ymin + h;
+
+    return redraw_border_around_box(b, &sprite, b->selected_colour);
+  }
+
+  return NULL;
+}
+
+/**************************************************************/
+/* redraw_bullet()                                            */
+/*                                                            */
+/* Redraws a bullet point.                                    */
+/*                                                            */
+/* Parameters: Pointer to a browser_data struct relevant to   */
+/*             the bullet;                                    */
+/*                                                            */
+/*             x coordinate (points, in screen coords) of     */
+/*             left hand edge;                                */
+/*                                                            */
+/*             y coordinate (points, in screen coords) of     */
+/*             bottom edge;                                   */
+/*                                                            */
+/*             The bullet number.                             */
+/**************************************************************/
+
+static _kernel_oserror * redraw_bullet
+                         (
+                           const browser_data * restrict b,
+                           int                           x,
+                           int                           y,
+                           unsigned int                  bullet
+                         )
+{
+  char name[32];
+
+  /* Convert the coordinates to user-points */
+
+  scale_pair_millipoints_to_user(b, x, y, &x, &y);
+
+  /* Build the name of the sprite */
+
+  if (printing)
+  {
+    int w,h;
+
+    /* Try a higher resolution bullet point, but revert back */
+    /* to the normal one if it's not present.                */
+
+    sprintf(name, "b%dp", (bullet + bullets - 1) % bullets);
+
+    if (utils_read_sprite_size(name, &w, &h))
+    {
+      sprintf(name, "b%d", (bullet + bullets - 1) % bullets);
+    }
+  }
+  else
+  {
+    sprintf(name, "b%d", (bullet + bullets - 1) % bullets);
+  }
+
+  /* Plot the sprite, ignoring errors. */
+
+  return redrawcore_sprite(b, name, x, y);
+}
+
+/**************************************************************/
+/* redraw_image_and_border()                                  */
+/*                                                            */
+/* Redraw an item containing an image (an IMG tag or INPUT    */
+/* TYPE="image" item) including any HTML-specified border and */
+/* navigation selection border.                               */
+/*                                                            */
+/* The token image position information in the image store    */
+/* may be updated.                                            */
+/*                                                            */
+/* Parameters: Pointer to a browser_data struct relevant to   */
+/*             the image being redrawn - font handle data may */
+/*             be updated;                                    */
+/*                                                            */
+/*             Pointer to the token representing the image;   */
+/*                                                            */
+/*             Pointer to the "no content" token for drawing  */
+/*             navigation selection borders without redrawing */
+/*             the selected item again - if same as the       */
+/*             previous token pointer, only a selection       */
+/*             border will be drawn;                          */
+/*                                                            */
+/*             A WimpRedrawWindowBlock pointer, used to       */
+/*             convert the screen coordinates given below     */
+/*             into work area coordinates;                    */
+/*                                                            */
+/*             Bottom left X coordinate, millipoints, screen  */
+/*             origin;                                        */
+/*                                                            */
+/*             Bottom left Y coordinate, millipoints, screen  */
+/*             origin.                                        */
+/**************************************************************/
+
+static _kernel_oserror * redraw_image_and_border
+                         (
+                           browser_data                * restrict b,
+                           const HStream               * restrict tp,
+                           const HStream               * restrict nocontent,
+                           const WimpRedrawWindowBlock *          r,
+                           int                                    mp_x,
+                           int                                    mp_y
+                         )
+{
+  BBox box;
+
+  /* The function returns an image bounding box that includes its */
+  /* border and hspace/vspace allocation.                         */
+
+  if (!reformat_get_image_size(b, tp, &box))
+  {
+    int user_imagex, user_imagey, user_hspace, user_vspace, user_border;
+    int os_imagex,   os_imagey,   os_hspace,   os_vspace,   os_border;
+
+    /* Correct coordinates for plotting, H/V space and border. The */
+    /* box returned from the above call includes all of these, so  */
+    /* the actual image sits offset by the border/spacing amount.  */
+
+    user_imagex = scale_millipoints_to_user (b, mp_x);
+    user_imagey = scale_millipoints_to_user (b, mp_y);
+    user_hspace = scale_web_to_user         (b, HtmlIMGhspace(tp));
+    user_vspace = scale_web_to_user         (b, HtmlIMGvspace(tp));
+    user_border = scale_web_to_user         (b, (tp->style & IMG) != 0 ? HtmlIMGborder(tp) : 0);
+
+    os_imagex   = scale_user_to_os          (b, user_imagex);
+    os_imagey   = scale_user_to_os          (b, user_imagey);
+    os_hspace   = scale_user_to_os          (b, user_hspace);
+    os_vspace   = scale_user_to_os          (b, user_vspace);
+    os_border   = scale_user_to_os          (b, user_border);
+
+    /* Borders and selection highlights want to be inside spacing, */
+    /* rather than outside it, so correct for that as well as      */
+    /* shifting the bounding box to produce redraw coordinates.    */
+
+    box.xmin   += os_imagex + os_hspace;
+    box.ymin   += os_imagey + os_vspace;
+    box.xmax   += os_imagex - os_hspace;
+    box.ymax   += os_imagey - os_vspace;
+
+    /* Finally get the corner of the image within its border area. */
+
+    os_imagex   = box.xmin + os_border;
+    os_imagey   = box.ymin + os_border;
+
+    /* Ensure the image has the plotting position recorded within  */
+    /* its associated image_info structure so that update routines */
+    /* elsewhere will know where to plot it.                       */
+
+    image_set_token_image_position(b,
+                                   tp,
+                                   coords_x_toworkarea(os_imagex, r),
+                                   coords_y_toworkarea(os_imagey, r));
+
+    /* Draw the border if required */
+
+    if (user_border != 0 && nocontent != tp)
+    {
+      BBox user_box;
+
+      scale_box_os_to_user(b, &box, &user_box);
+
+      /* Box and therefore user_box is already set up to be the exterior */
+      /* bounding box of image plus border.                              */
+
+      RetError(redrawcore_rectangle(b,
+                                    &user_box,
+                                    redraw_token_colour(b, tp),
+                                    user_border));
+    }
+
+    /* Draw the selection highlight outside the image boundary */
+
+    if (redraw_selected(b, tp))
+    {
+      RetError(redraw_border_around_box(b, &box, b->selected_colour));
+
+// Hmm. Need to find a
+// way of invoking this
+// reliably, and clearing
+// the highlight without
+// flicking horribly.
+//
+//    /* Things get rather more complicated for client side maps, if */
+//    /* the pointer is over them.                                   */
+//
+//    if (b->pointer_over == tp && (tp->type & TYPE_ISCLIENTMAP))
+//    {
+//      /* Ask the client side map handler to do this bit */
+//
+//      csim_highlight_region(b, b->selected_colour, box.xmin + o, box.ymax - o);
+//    }
+   }
+
+    /* Redraw the image itself */
+
+    if (nocontent != tp) RetError(image_redraw(b,
+                                               tp,
+                                               os_imagex,
+                                               os_imagey,
+                                               &r->redraw_area));
+  }
+
+  return NULL;
+}
+
+/**************************************************************/
+/* redraw_object_and_border()                                 */
+/*                                                            */
+/* Redraw an item containing an OBJECT including any HTML-    */
+/* specified border and navigation selection border.          */
+/*                                                            */
+/* The token object position information in the object store  */
+/* may be updated.                                            */
+/*                                                            */
+/* Parameters: Pointer to a browser_data struct relevant to   */
+/*             the object being redrawn - font handle data    */
+/*             may be updated;                                */
+/*                                                            */
+/*             Pointer to the token representing the object;  */
+/*                                                            */
+/*             Pointer to the "no content" token for drawing  */
+/*             navigation selection borders without redrawing */
+/*             the selected item again - if same as the       */
+/*             previous token pointer, only a selection       */
+/*             border will be drawn;                          */
+/*                                                            */
+/*             A WimpRedrawWindowBlock pointer, used to       */
+/*             convert the screen coordinates given below     */
+/*             into work area coordinates;                    */
+/*                                                            */
+/*             Bottom left X coordinate, millipoints, screen  */
+/*             origin;                                        */
+/*                                                            */
+/*             Bottom left Y coordinate, millipoints, screen  */
+/*             origin.                                        */
+/**************************************************************/
+
+static _kernel_oserror * redraw_object_and_border
+                         (
+                           browser_data                * restrict b,
+                           const HStream               * restrict tp,
+                           const HStream               * restrict nocontent,
+                           const WimpRedrawWindowBlock *          r,
+                           int                                    mp_x,
+                           int                                    mp_y
+                         )
+{
+  BBox box;
+
+  /* The function returns an image bounding box that includes its */
+  /* border and hspace/vspace allocation.                         */
+
+  if (!reformat_get_object_size(b, tp, &box))
+  {
+    int user_objectx, user_objecty, user_hspace, user_vspace, user_border;
+    int os_objectx,   os_objecty,   os_hspace,   os_vspace,   os_border;
+
+    /* Correct coordinates for plotting, H/V space and border. The */
+    /* box returned from the above call includes all of these, so  */
+    /* the actual object sits offset by the border/spacing amount. */
+
+    user_objectx = scale_millipoints_to_user (b, mp_x);
+    user_objecty = scale_millipoints_to_user (b, mp_y);
+    user_hspace  = scale_web_to_user         (b, HtmlOBJECThspace(tp));
+    user_vspace  = scale_web_to_user         (b, HtmlOBJECTvspace(tp));
+    user_border  = scale_web_to_user         (b, HtmlOBJECTborder(tp));
+
+    os_objectx   = scale_user_to_os          (b, user_objectx);
+    os_objecty   = scale_user_to_os          (b, user_objecty);
+    os_hspace    = scale_user_to_os          (b, user_hspace);
+    os_vspace    = scale_user_to_os          (b, user_vspace);
+    os_border    = scale_user_to_os          (b, user_border);
+
+    /* Borders and selection highlights want to be inside spacing, */
+    /* rather than outside it, so correct for that as well as      */
+    /* shifting the bounding box to produce redraw coordinates.    */
+
+    box.xmin    += os_objectx + os_hspace;
+    box.ymin    += os_objecty + os_vspace;
+    box.xmax    += os_objectx - os_hspace;
+    box.ymax    += os_objecty - os_vspace;
+
+    /* Finally get the corner of the object within its border area. */
+
+    os_objectx   = box.xmin + os_border;
+    os_objecty   = box.ymin + os_border;
+
+    /* Ensure the object has the plotting position recorded within  */
+    /* its associated object_info structure so that update routines */
+    /* elsewhere will know where to plot it.                        */
+
+    object_set_token_object_position(b,
+                                     tp,
+                                     coords_x_toworkarea(os_objectx, r),
+                                     coords_y_toworkarea(os_objecty, r));
+
+    /* Draw the border if required */
+
+    if (user_border != 0 && nocontent != tp)
+    {
+      BBox user_box;
+
+      scale_box_os_to_user(b, &box, &user_box);
+
+      /* Box and therefore user_box is already set up to be the exterior */
+      /* bounding box of object plus border.                              */
+
+      RetError(redrawcore_rectangle(b,
+                                    &user_box,
+                                    redraw_token_colour(b, tp),
+                                    user_border));
+    }
+
+    /* Draw the selection highlight outside the object boundary */
+
+    if (redraw_selected(b, tp))
+    {
+      RetError(redraw_border_around_box(b, &box, b->selected_colour));
+   }
+
+    /* Redraw the object itself */
+
+    if (nocontent != tp) RetError(object_redraw(b,
+                                                tp,
+                                                os_objectx,
+                                                os_objecty,
+                                                &r->redraw_area));
+  }
+
+  return NULL;
+}
+
+/**************************************************************/
+/* redraw_draw_placeholder()                                  */
+/*                                                            */
+/* Redraws a slabbed in place holder (unless the item is very */
+/* small, in which case just at thin black border is plotted) */
+/* for a given token, with optional text inside.              */
+/*                                                            */
+/* Parameters: A pointer to a browser_data structure relevant */
+/*             to the redraw;                                 */
+/*                                                            */
+/*             Pointer to a BBox conventionally initialised   */
+/*             to describe the current graphics window or     */
+/*             redraw area in OS units (e.g. from the         */
+/*             'redraw_area' field of a Wimp redraw block);   */
+/*                                                            */
+/*             Pointer to a BBox in which xmin and ymin hold  */
+/*             the screen coords for the bottom left hand     */
+/*             corner, and xmax and ymax hold the width and   */
+/*             height of the placeholder in OS units;         */
+/*                                                            */
+/*             Pointer to the HStream struct the placeholder  */
+/*             is to represent;                               */
+/*                                                            */
+/*             Pointer to a null-terminated piece of to plot  */
+/*             inside, or NULL.                               */
+/**************************************************************/
+
+_kernel_oserror * redraw_draw_placeholder
+                  (
+                    browser_data  * restrict b,
+                    const BBox    * restrict gfxwin,
+                    const BBox    * restrict holder,
+                    const HStream * restrict token,
+                    const char    * restrict text
+                  )
+{
+  BBox os_box = *holder;
+  BBox user_box;
+  int  os_border, user_border;
+  int  os_adjust, user_adjust;
+
+  /* Zero width/height items are invisible */
+
+  if (!os_box.xmax || !os_box.ymax) return NULL;
+
+  /* Get the bounding box in user-points */
+
+  scale_box_os_to_user(b, holder, &user_box);
+
+  /* The original OS unit input box has width and height in the max */
+  /* fields. Convert into exclusive corner ooordinates.             */
+
+  user_box.xmax += user_box.xmin;
+  user_box.ymax += user_box.ymin;
+
+  /* A slabbed box if the size is great enough */
+
+  if (os_box.xmax > 8 && os_box.ymax > 30)
+  {
+    BBox user_shrink = user_box;
+
+    /* Border will be 4 OS units (2 pixels) wide - a standard plinth. */
+    /* Shrink the bounding box by the equivalent of 2 OS units in all */
+    /* directions. Keeping the 3D border just inside its bounding box */
+    /* looks much better when placeholders abut each other.           */
+
+    os_border   = 4;
+    os_adjust   = 2;
+    user_border = scale_os_to_user(b, os_border);
+    user_adjust = scale_os_to_user(b, os_adjust);
+
+    user_shrink.xmin += user_adjust;
+    user_shrink.ymin += user_adjust;
+    user_shrink.xmax -= user_adjust;
+    user_shrink.ymax -= user_adjust;
+
+    RetError(redraw_plinth_border(b,
+                                  &user_shrink,
+                                  user_border,
+                                  Redraw_Colour_MidGrey,
+                                  Redraw_Colour_AlmostWhite));
+  }
+
+  /* Otherwise a thin black frame */
+
+  else
+  {
+    /* Border will be 4 OS units (2 pixels) wide with no adjustment */
+    /* for items which abut each other.                             */
+
+    os_border   = 2;
+    os_adjust   = 0;
+    user_border = scale_os_to_user(b, os_border);
+    user_adjust = 0;
+
+    RetError(redrawcore_rectangle(b,
+                                  &user_box,
+                                  Redraw_Colour_Black,
+                                  user_border));
+  }
+
+  /* Plot any text that there is */
+
+  if (text && *text)
+  {
+    /* Find out the bounding box needed to contain the text */
+
+    int          h, xpos, vcent, stringwidth;
+    int          user_offset, user_pad, user_total;
+    unsigned int stringheight, size;
+    BBox         fbox;
+
+    fbox.xmin = fbox.ymin = 0;
+
+    /* Claim the font */
+
+    size = (fm_size(token->fontsize) * 80) / 100;
+    h    = fm_find_font(b,
+                        "sans",
+                        size,
+                        size,
+                        0,
+                        0);
+
+    /* Find the string width of the ALT text */
+
+    fm_get_string_width(h,
+                        text,
+                        Reformat_AsWideAsPossible_MP,
+                        strlen(text),
+                        -1,
+                        NULL,
+                        &stringwidth);
+
+    stringwidth = scale_millipoints_to_user(b, stringwidth);
+
+    /* Find the font height */
+
+    fm_font_box(h, &fbox);
+
+    scale_box_os_to_user(b, &fbox, &fbox);
+    stringheight = fbox.ymax - fbox.ymin;
+
+    /* Set xpos to the horizontal offset to plot at. */
+    /* Remember that 'box' contains the bottom       */
+    /* left coordinates of the image, then the width */
+    /* and height in OS units in xmax and ymax.      */
+
+    /* Similarly, centre vertically */
+
+    user_offset = scale_os_to_user(b, 10); /* Minimum distance       */
+    user_pad    = scale_os_to_user(b, 2);  /* Padding inside borders */
+
+    vcent = (user_box.ymax - user_box.ymin - stringheight + 1) / 2 - fbox.ymin;
+    if (vcent < user_offset) vcent = user_offset;
+    vcent += user_box.ymin;
+
+    xpos = (user_box.xmax - user_box.xmin - stringwidth + 1) / 2;
+    if (xpos < user_offset) xpos = user_offset;
+    xpos += user_box.xmin;
+
+    /* Now set the graphics window to the image bounding box,    */
+    /* taking account of the slabbed border already drawn above. */
+    /* Need to set this to the intersection of the current       */
+    /* graphics window though, or could end up scribbling over   */
+    /* things that aren't meant to be touched.                   */
+
+    user_total = user_border + user_adjust + user_pad;
+
+    fbox.xmin = user_box.xmin + user_total;
+    fbox.xmax = user_box.xmax - user_total;
+    fbox.ymin = user_box.ymin + user_total;
+    fbox.ymax = user_box.ymax - user_total;
+
+    /* If the max coordinates are less than the min, the image BBox */
+    /* is too small to fit anything in. Don't proceed, as the       */
+    /* attempt to set the graphics rectangle would fail, default to */
+    /* the whole screen, and then random bits of ALT text would get */
+    /* scribbled all over the place...                              */
+
+    if (fbox.xmin < fbox.xmax && fbox.ymin < fbox.ymax)
+    {
+      BBox user_gfxwin;
+      BBox user_intersect;
+
+      scale_box_os_to_user(b, gfxwin, &user_gfxwin);
+
+      /* Need to ensure a graphics window is set up for the plot, as  */
+      /* text may be clipped, but this needs to take the current      */
+      /* redraw rectangle into account too - hence the function call. */
+
+      if (utils_intersection(&fbox, &user_gfxwin, &user_intersect))
+      {
+        unsigned int colour = redraw_token_colour(b, token);
+
+        RetError(redrawcore_clipping(b, &user_intersect));
+
+        RetError(redrawcore_text(b,
+                                 h,
+                                 xpos,   vcent,
+                                 text,
+                                 0,
+                                 colour, redraw_background_colour(b, colour),
+                                 1));
+
+        /* Underline text if it's a link and the browser is set to underline links */
+
+        if (b->underline_links && ISLINK(token))
+        {
+          BBox ends;
+          int  user_offset = scale_os_to_user(b, 7);
+
+          ends.xmin             = xpos;
+          ends.xmax             = xpos + stringwidth - 1; /* Endpoints are inclusive coordinates */
+          ends.ymin = ends.ymax = vcent - user_offset;
+
+          if (ends.xmax >= user_intersect.xmax) ends.xmax = user_intersect.xmax - 1;
+          if (ends.ymin >= user_intersect.ymin)
+          {
+            RetError(redrawcore_line(b,
+                                     &ends,
+                                     colour));
+          }
+        }
+
+        RetError(redrawcore_clipping(b, &user_gfxwin));
+      }
+    }
+  }
+
+  return NULL;
+}
+
+/**************************************************************/
+/* redraw_empty_message()                                     */
+/*                                                            */
+/* Draw a "this page is empty" message in a browser window.   */
+/*                                                            */
+/* Parameters: 1 for a top level call, else 0 if being called */
+/*             as part of a recursive redraw invocation;      */
+/*                                                            */
+/*             Pointer to a browser_data struct with the      */
+/*             empty document;                                */
+/*                                                            */
+/*             A WimpRedrawWindowBlock pointer, with window   */
+/*             area and redraw rectangle details filled in.   */
+/**************************************************************/
+
+static _kernel_oserror * redraw_empty_message
+                         (
+                           unsigned int                           toplevel,
+                           browser_data                * restrict b,
+                           const WimpRedrawWindowBlock * restrict r
+                         )
+{
+  if (!printing || !toplevel)
+  {
+    /* Set the graphics background colour to the default  */
+    /* and clear the graphics rectangle [to this colour]. */
+
+    redraw_set_colour(choices.background_colour);
+
+    bbc_rectanglefill(r->redraw_area.xmin,
+                      r->redraw_area.ymin,
+                      r->redraw_area.xmax - r->redraw_area.xmin,
+                      r->redraw_area.ymax - r->redraw_area.ymin);
+  }
+
+  /* If there's a fetch URL but no stream, the document was empty */
+
+  if (browser_current_url(b) && !fetch_fetching(b))
+  {
+    fm_face h;
+    int     x, y, htop;
+    BBox    size;
+
+    /* Claim a font */
+
+    h = fm_find_font(b,
+                     "sans",
+                     (int) (choices.font_size * 1.5),
+                     (int) (choices.font_size * 1.5),
+                     0,
+                     1);
+
+    /* Find the height of the tallest character */
+
+    fm_font_box(h, &size);
+
+    /* Use that height, and the toolbar sizes to work out the y coordinate to plot at */
+
+    if (!controls.swap_bars) htop = toolbars_button_height(b) + toolbars_url_height(b);
+    else                     htop = toolbars_status_height(b);
+
+    if (htop) htop += wimpt_dy();
+
+    y = coords_y_toscreen(htop - size.ymax - size.ymin - 40, r); /* -40 = arbitrary constant, aesthetic consideration */
+
+    /* The x coordinate has a fixed offset from the left */
+
+    x = coords_x_toscreen(32, r);
+
+    dprintf(("Redr", "redraw_empty_message_r: Empty page, claimed font %p\n"
+                     "                        Plotting x,y %d,%d\n",
+
+                                              (void *) h,
+                                              x, y));
+
+    /* Set a black-on-grey font colour */
+
+    fm_set_font_colour(h,
+                       choices.text_colour,
+                       choices.background_colour);
+
+    /* Write the string */
+
+    fm_puts(h,
+            x,
+            y,
+            lookup_token("NoData:The server returned a blank page.",
+                         0,
+                         0),
+            1,
+            1);
+  }
+
+  return NULL;
+}
+
+/**************************************************************/
+/* redraw_table()                                             */
+/*                                                            */
+/* Redraw a table, including inner and outer borders and the  */
+/* contents - the latter involving a call to redraw_draw_r,   */
+/* which is at the time of writing always a recursive call.   */
+/*                                                            */
+/* Parameters: Pointer to the browser_data struct relevant to */
+/*             the table being drawn;                         */
+/*                                                            */
+/*             Pointer to a table_stream representing the     */
+/*             table - usually a cast HStream pointer;        */
+/*                                                            */
+/*             Pointer to a Wimp redraw block containing the  */
+/*             information on the current redraw environment; */
+/*                                                            */
+/*             X offset of the table's bottom left corner in  */
+/*             millipoints relative to the window/outer cell; */
+/*                                                            */
+/*             Y offset of the table's bottom left corner in  */
+/*             millipoints relative to the window/outer cell; */
+/*                                                            */
+/*             X offset of the table's bottom left corner in  */
+/*             millipoints relative to the screen origin;     */
+/*                                                            */
+/*             Y offset of the table's bottom left corner in  */
+/*             millipoints relative to the screen origin;     */
+/*                                                            */
+/*             Height of line containing the table in OS      */
+/*             units;                                         */
+/*                                                            */
+/*             Pointer to an int, updated on exit during      */
+/*             printing (global "printing" flag is set) with  */
+/*             the y-coordinate of the top of the line that   */
+/*             is to be printed next, in OS units, or zero if */
+/*             there are no more lines - may be NULL if not   */
+/*             interested;                                    */
+/*                                                            */
+/*             1 to plot no backgrounds at all, else they     */
+/*             will be shown;                                 */
+/*                                                            */
+/*             0 for normal redraw, else pointer to a token   */
+/*             where no content is to be drawn - only the     */
+/*             elements that are needed to indicate selection */
+/*             should be shown. This is used mostly for       */
+/*             things like removing borders around images; if */
+/*             bits of the image have to be redrawn this can  */
+/*             make the removal slow. Only one token is       */
+/*             allowed as any adjacent images must be redrawn */
+/*             if the border was plotted over them, or redraw */
+/*             anomalies will be seen as 'holes' are left     */
+/*             behind. There is some intelligence to give     */
+/*             different behaviour if selecting or            */
+/*             deselecting things.                            */
+/**************************************************************/
+
+static _kernel_oserror * redraw_table
+                         (
+                           browser_data                * restrict b,
+                           const table_stream          * restrict table,
+                           const WimpRedrawWindowBlock * restrict r,
+                           int                                    mp_line_win_x,
+                           int                                    mp_line_win_y,
+                           int                                    mp_line_scr_x,
+                           int                                    mp_line_scr_y,
+                           unsigned int                           os_line_height,
+                           int                         * restrict nextline,
+                           unsigned int                           noback,
+                           const HStream               * restrict nocontent
+                         )
+{
+  reformat_cell  * cellarray = table->cells;
+  reformat_cell  * cell;
+  table_row      * row;
+  table_headdata * head;
+
+  unsigned int     cellindex;
+  unsigned int     cellcount;
+  unsigned int     cellmax    = table->ColSpan * table->RowSpan;
+
+  BBox user_cellbox,  mp_cellbox;
+  BBox user_tablebox, mp_tablebox;
+  BBox user_gfxwin;
+
+  int              user_cellspacing, mp_cellspacing;
+  int              user_h,           mp_h;
+
+  unsigned int     border_2d  = 0;
+  int              dx         = wimpt_dx();
+  int              dy         = wimpt_dy();
+  int              max;
+  int              user_border;
+
+  unsigned int     oldback    = 0;
+  unsigned int     oldaa      = 0;
+  int              oldbgimage = -1;
+  unsigned int     t_noback;
+
+  /* Redraw block copy used for table cell rectangle redraws */
+
+  WimpRedrawWindowBlock local_r = *r;
+
+  /* Get the line height in user-points and millipoints */
+
+  user_h = scale_os_to_user          (b, os_line_height);
+  mp_h   = scale_user_to_millipoints (b, user_h);
+
+  /* Get the graphics window (redraw area) in user-points */
+
+  scale_box_os_to_user(b, &r->redraw_area, &user_gfxwin);
+
+  /* Find out the overall bounding box of the table, and put this in */
+  /* 'mp_tablebox'.                                                  */
+
+  mp_tablebox.xmin = mp_tablebox.ymin = 0x7fffffff;
+  mp_tablebox.xmax = mp_tablebox.ymax = 0;
+
+  cellcount = 0;
+  row       = table->List;
+
+  while (row && cellcount < cellmax)
+  {
+    head = row->List;
+
+    while (head && cellcount < cellmax)
+    {
+      switch (head->Tag)
+      {
+        case TagTableData:
+        case TagTableHead:
+        {
+          cellindex = head->RowOffs * table->ColSpan + head->ColOffs;
+
+          if (cellindex < cellmax)
+          {
+            BBox cbox;
+
+            cell = &cellarray[cellindex];
+
+            /* Calculate the coordinates of the cell corners */
+
+            cbox.xmin = mp_line_scr_x + cell->x;
+            cbox.xmax = cbox.xmin + cell->cellwidth;
+
+            cbox.ymax = mp_line_scr_y + cell->y + mp_h;
+            cbox.ymin = cbox.ymax - cell->cellheight;
+
+            /* Update the table bounding box as required */
+
+            if (cbox.xmin < mp_tablebox.xmin) mp_tablebox.xmin = cbox.xmin;
+            if (cbox.ymin < mp_tablebox.ymin) mp_tablebox.ymin = cbox.ymin;
+            if (cbox.xmax > mp_tablebox.xmax) mp_tablebox.xmax = cbox.xmax;
+            if (cbox.ymax > mp_tablebox.ymax) mp_tablebox.ymax = cbox.ymax;
+
+          /* Closure of 'if (cellindex < cellmax)' */
+          }
+
+        /* Closure of specific 'case' item */
+        }
+        break;
+
+      /* Closure of 'switch (head->Tag)' */
+      }
+
+      cellcount ++;
+      head = head->Next;
+
+    /* Closure of 'while (head && ...)' */
+    }
+
+    row = row->Next;
+
+  /* Closure of 'while (row && ...)' */
+  }
+
+  /* Interior cell spacing is included above because the X and Y */
+  /* coordinates of cells have already been set up with spacing  */
+  /* included. Must include the spacing between the outer cells  */
+  /* and the outer table border, though.                         */
+  /*                                                             */
+  /* Note that mp_tablebox now contains a bounding box of the    */
+  /* table contents, with the table border going *outside* this. */
+
+  user_cellspacing = scale_web_to_user         (b, table->cellspacing);
+  mp_cellspacing   = scale_user_to_millipoints (b, user_cellspacing);
+
+  mp_tablebox.xmin -= mp_cellspacing;
+  mp_tablebox.ymin -= mp_cellspacing;
+  mp_tablebox.xmax += mp_cellspacing;
+  mp_tablebox.ymax += mp_cellspacing;
+
+  scale_box_millipoints_to_user (b, &mp_tablebox, &user_tablebox);
+
+  /* Work out the border width for cell borders. This needs to be */
+  /* 1 pixel wide in normal 90DPI screen modes, or 2 OS units, or */
+  /* the equivalent for higher resolution output.                 */
+
+  if (dx > dy) max = dx;
+  else         max = dy;
+
+  if (max < 2 || printing) max = 2;
+
+  user_border = scale_os_to_user(b, max);
+
+  /* If the table has a background colour, draw this */
+
+  if (TABLE_HAS_BGCOL(table) && !noback && b->use_source_cols)
+  {
+    RetError(redrawcore_rectangle(b,
+                                  &user_tablebox,
+                                  TABLE_BGCOL(table),
+                                  0));
+  }
+
+  /* Now redraw the table cells */
+
+  cellcount = 0;
+  row       = table->List;
+
+  while (row && cellcount < cellmax)
+  {
+    head = row->List;
+
+    while (head && cellcount < cellmax)
+    {
+      switch (head->Tag)
+      {
+        case TagTableData:
+        case TagTableHead:
+        {
+          cellindex = head->RowOffs * table->ColSpan + head->ColOffs;
+
+          if (cellindex < cellmax)
+          {
+            BBox user_intersect;
+
+            cell = &cellarray[cellindex];
+
+            if (TD_HAS_BGCOL(head))
+            {
+              oldback              = b->background_colour;
+              oldaa                = b->antialias_colour;
+              oldbgimage           = b->background_image;
+              b->background_colour = TD_BGCOL(head);
+              b->antialias_colour  = b->background_colour;
+              b->background_image  = -1; /* For now, no background images in table cells. */
+
+              t_noback = 0;
+            }
+            else t_noback = 1;
+
+            /* Set the graphics rectangle up for the redraw */
+
+            mp_cellbox.xmin = mp_line_scr_x + cell->x;
+            mp_cellbox.xmax = mp_cellbox.xmin + cell->cellwidth;
+
+            mp_cellbox.ymax = mp_line_scr_y + cell->y + mp_h;
+            mp_cellbox.ymin = mp_cellbox.ymax - cell->cellheight;
+
+            /* Get the box in user-points and OS units */
+
+            scale_box_millipoints_to_user(b, &mp_cellbox, &user_cellbox);
+
+            /* See if the cell redraw box has non-zero dimensions and   */
+            /* intersects the overall redraw rectangle. If so, draw it. */
+
+            if (
+                 user_cellbox.xmin != user_cellbox.xmax &&
+                 user_cellbox.ymin != user_cellbox.ymax &&
+
+                 utils_intersection(&user_cellbox,
+                                    &user_gfxwin,
+                                    &user_intersect) != 0
+               )
+            {
+              /* Other routines that set the graphics window do it the same way as */
+              /* here - they assume the redraw rectangle = the graphics window, as */
+              /* during printing it's not possible to read the VDU variables to    */
+              /* obtain the actual window. To ensure that this holds true, before  */
+              /* recursively calling the redraw functions, the redraw rectangle    */
+              /* must be set to match the graphics rectangle using a local copy of */
+              /* the redraw block.                                                 */
+
+              scale_box_user_to_os(b, &user_intersect, &local_r.redraw_area);
+
+              /* Recursive call to redraw the cell contents */
+
+              RetError(redrawcore_clipping(b, &user_intersect));
+
+              RetError(redraw_draw_r(0, /* 0 = recursive rather than top-level call */
+                                     mp_line_win_x + cell->x,
+                                     mp_line_win_y + cell->y + mp_h,
+                                     b,
+                                     cell,
+                                     &local_r,
+                                     nextline,
+                                     t_noback,
+                                     nocontent));
+
+              /* Restore print loop noback flag. Since noback is a parameter it stacks and */
+              /* unstacks as we call the redraw function recursively, but the static       */
+              /* use_noback doesn't. So we have to ensure it is kept in step with noback   */
+              /* after any recursive redraw calls.                                         */
+
+              use_noback = noback;
+
+              RetError(redrawcore_clipping(b, &user_gfxwin));
+            }
+
+            #ifdef TRACE
+              if (tl & (1u<<11))
+              {
+                /* Outline the cell BBox. Note that this will draw with *unrounded* */
+                /* coordinates so the boxes may not exactly match the normal table  */
+                /* borders, which run through the rounded coord rectangle routines. */
+
+                BBox os_cellbox;
+
+                scale_box_user_to_os(b, &user_cellbox, &os_cellbox);
+
+                redraw_set_colour(0xff00aa00);
+                bbc_rectangle(os_cellbox.xmin, os_cellbox.ymin, os_cellbox.xmax - os_cellbox.xmin - 1, os_cellbox.ymax - os_cellbox.ymin - 1);
+
+                redraw_set_colour(0xff22cc00);
+                bbc_rectangle(os_cellbox.xmin + 2, os_cellbox.ymin + 2, os_cellbox.xmax - os_cellbox.xmin - 5, os_cellbox.ymax - os_cellbox.ymin - 5);
+              }
+            #endif
+
+            /* Restore any data altered in b */
+
+            if (!t_noback)
+            {
+              b->background_colour = oldback;
+              b->antialias_colour  = oldaa;
+              b->background_image  = oldbgimage;
+            }
+
+            /* Draw the slabbed in cell border. */
+
+            if (TABLE_BORDER(table) && choices.table_inner != Choices_TableInner_Never)
+            {
+              BBox user_cellborder;
+
+              /* Obtain a rectangle including the cell plus its border, for borders  */
+              /* drawn outside the cell contents (i.e. whenever cell spacing permits */
+              /* this).                                                              */
+
+              user_cellborder.xmin = user_cellbox.xmin - user_border;
+              user_cellborder.ymin = user_cellbox.ymin - user_border;
+              user_cellborder.xmax = user_cellbox.xmax + user_border;
+              user_cellborder.ymax = user_cellbox.ymax + user_border;
+
+              /* For tables with a cell spacing wide enough to fit in two lots */
+              /* of border at least, so preferably with a gap (3D plinths must */
+              /* not overlap, unlike the 2D borders), use the 3D plinth. Allow */
+              /* Choices settings to override this.                            */
+
+              if (
+                   choices.table_inner != Choices_TableInner_Always2D &&
+                   (
+                     user_cellspacing > user_border * 2 ||
+                     choices.table_inner == Choices_TableInner_Always3D
+                   )
+                 )
+              {
+                border_2d = 0; /* Flag is used for table outer border too */
+
+                RetError(redraw_plinth_border(b,
+                                              user_cellspacing >= user_border * 2 ? &user_cellborder
+                                                                                  : &user_cellbox,
+                                              user_border,
+                                              Redraw_Colour_PlinthGrey,
+                                              Redraw_Colour_AlmostWhite));
+              }
+
+              /* Otherwise use a black 2D border. If cell spacing permits, put this in */
+              /* the user_cellborder box - outside the cell contents. Otherwise we use */
+              /* the cell bounding box, drawing over the outer edge of the contents.   */
+
+              else
+              {
+                border_2d = 1; /* Flag is used for table outer border too */
+
+                RetError(redrawcore_rectangle(b,
+                                              user_cellspacing >= user_border ? &user_cellborder
+                                                                              : &user_cellbox,
+                                              Redraw_Colour_Black,
+                                              user_border));
+              }
+            }
+
+          /* Closure of 'if (cellindex < cellmax)' */
+          }
+
+        /* Closure of specific 'case' item */
+        }
+        break;
+
+      /* Closure of 'switch (head->Tag)' */
+      }
+
+      cellcount ++;
+
+      head = head->Next;
+
+    /* Closure of 'while (head && ...)' */
+    }
+
+    row = row->Next;
+
+  /* Closure of 'while (row && ...)' */
+  }
+
+  /* Right, now redraw the slabbed out outer table border */
+
+  if (TABLE_BORDER(table) && choices.table_outer != Choices_TableOuter_Never)
+  {
+    int user_border = scale_web_to_user(b, TABLE_BORDER(table));
+
+    /* The existing table box doesn't account for the exterior border */
+
+    user_tablebox.xmin -= user_border;
+    user_tablebox.ymin -= user_border;
+    user_tablebox.xmax += user_border;
+    user_tablebox.ymax += user_border;
+
+    /* Use the same 2D/3D style as we used for the cells, unless */
+    /* the Choices settings override it.                         */
+
+    if (border_2d == 0 || choices.table_outer == Choices_TableOuter_Always3D)
+    {
+      RetError(redraw_plinth_border(b,
+                                    &user_tablebox,
+                                    user_border,
+                                    Redraw_Colour_AlmostWhite,
+                                    Redraw_Colour_PlinthGrey));
+    }
+    else
+    {
+      RetError(redrawcore_rectangle(b,
+                                    &user_tablebox,
+                                    Redraw_Colour_Black,
+                                    user_border));
+    }
+  }
+
+  return NULL;
+}
+
+/**************************************************************/
+/* redraw_draw()                                              */
+/*                                                            */
+/* The main browser redraw engine.                            */
+/*                                                            */
+/* Parameters: A pointer to a browser_data structure relevant */
+/*             to the redraw;                                 */
+/*                                                            */
+/*             A WimpRedrawWindowBlock pointer, with window   */
+/*             area and redraw rectangle details filled in;   */
+/*                                                            */
+/*             Pointer to an int, updated on exit during      */
+/*             printing (global "printing" flag is set) with  */
+/*             the y-coordinate of the top of the line that   */
+/*             is to be printed next, in OS units, or zero if */
+/*             there are no more lines - may be NULL if not   */
+/*             interested;                                    */
+/*                                                            */
+/*             1 to plot no backgrounds at all, else they     */
+/*             will be shown;                                 */
+/*                                                            */
+/*             0 for normal redraw, else pointer to a token   */
+/*             where no content is to be drawn - only the     */
+/*             elements that are needed to indicate selection */
+/*             should be shown. This is used mostly for       */
+/*             things like removing borders around images; if */
+/*             bits of the image have to be redrawn this can  */
+/*             make the removal slow. Only one token is       */
+/*             allowed as any adjacent images must be redrawn */
+/*             if the border was plotted over them, or redraw */
+/*             anomalies will be seen as 'holes' are left     */
+/*             behind. There is some intelligence to give     */
+/*             different behaviour if selecting or            */
+/*             deselecting things.                            */
+/**************************************************************/
+
+_kernel_oserror * redraw_draw
+                  (
+                    browser_data          * restrict b,
+                    WimpRedrawWindowBlock * restrict r,
+                    int                   * restrict nextline,
+                    unsigned int                     noback,
+                    const HStream         * restrict nocontent
+                  )
+{
+  use_noback = noback;
+
+  return redraw_draw_r(1, /* 1 for top level, 0 for recursive call */
+                       0, /* X origin, millipoints in window space */
+                       0, /* Y origin, millipoints in window space */
+                       b,
+                       b->cell,
+                       r,
+                       nextline,
+                       noback,
+                       nocontent);
+}
+
+/**************************************************************/
+/* redraw_draw_r()                                            */
+/*                                                            */
+/* Recursive back-end to redraw_draw.                         */
+/*                                                            */
+/* Parameters: 1 for a top level call, else 0 if being called */
+/*             recursively;                                   */
+/*                                                            */
+/*             X origin for plotting (window coords but in    */
+/*             millipoints) - usually used for cell contents  */
+/*             that are offset relative to a parent cell;     */
+/*                                                            */
+/*             Y origin for plotting (window coords but in    */
+/*             millipoints);                                  */
+/*                                                            */
+/*             A pointer to a browser_data structure relevant */
+/*             to the redraw;                                 */
+/*                                                            */
+/*             Pointer to a reformat_cell struct holding the  */
+/*             lines and chunks to redraw;                    */
+/*                                                            */
+/*             A WimpRedrawWindowBlock pointer, with window   */
+/*             area and redraw rectangle details filled in;   */
+/*                                                            */
+/*             Pointer to an int, updated on exit during      */
+/*             printing (global "printing" flag is set) with  */
+/*             the y-coordinate of the top of the line that   */
+/*             is to be printed next, in OS units, or zero if */
+/*             there are no more lines - may be NULL if not   */
+/*             interested;                                    */
+/*                                                            */
+/*             1 to plot no backgrounds at all, else they     */
+/*             will be shown;                                 */
+/*                                                            */
+/*             0 for normal redraw, else pointer to a token   */
+/*             where no content is to be drawn - only the     */
+/*             elements that are needed to indicate selection */
+/*             should be shown. This is used mostly for       */
+/*             things like removing borders around images; if */
+/*             bits of the image have to be redrawn this can  */
+/*             make the removal slow. Only one token is       */
+/*             allowed as any adjacent images must be redrawn */
+/*             if the border was plotted over them, or redraw */
+/*             anomalies will be seen as 'holes' are left     */
+/*             behind. There is some intelligence to give     */
+/*             different behaviour if selecting or            */
+/*             deselecting things.                            */
+/*                                                            */
+/* Assumes:    Pointers to items may NOT be NULL unless       */
+/*             explicitly stated above.                       */
+/**************************************************************/
+
+static _kernel_oserror * redraw_draw_r
+                         (
+                           unsigned int                     toplevel,
+                           int                              mp_origin_win_x,
+                           int                              mp_origin_win_y,
+                           browser_data          * restrict b,
+                           const reformat_cell   *          d,
+                           WimpRedrawWindowBlock * restrict r,
+                           int                   * restrict nextline,
+                           unsigned int                     noback,
+                           const HStream         * restrict nocontent
+                         )
+{
+  int more = 0;
+
+  dprintf(("Redr", "\nredraw_draw_r: Called\n"));
+
+  /* Start redraw */
+
+  do
+  {
+    if (b->nchildren)
+    {
+      /* If this browser has children, it has no directly redrawable content;  */
+      /* however, the frames it contains may need borders drawing around them. */
+
+      dprintf(("Redr", "redraw_draw_r: Have children\n"));
+
+      frames_redraw_borders(b, r);
+    }
+    else
+    {
+      /* If the browser doesn't have child frames, want to draw */
+      /* the document it holds instead.                         */
+
+      dprintf(("Redr", "redraw_draw_r: Have no children\n"));
+
+      if (b->stream)
+      {
+        int earlyexit = 0;
+
+        /* There is a non-empty document - draw the contents */
+
+        RetError(redraw_content_stream(toplevel,
+                                       mp_origin_win_x,
+                                       mp_origin_win_y,
+                                       b,
+                                       d,
+                                       r,
+                                       nextline,
+                                       &earlyexit,
+                                       noback,
+                                       nocontent));
+
+        /* If we're working in a paginated context the exit flag  */
+        /* tells us when to bail out sooner than the redraw block */
+        /* might otherwise indicate.                              */
+
+        if (earlyexit != 0) return NULL;
+      }
+      else
+      {
+        /* The document is empty - draw an appropriate warning */
+
+        RetError(redraw_empty_message(toplevel,
+                                      b,
+                                      r));
+
+        if (printing)
+        {
+          if (nextline != NULL) *nextline = 0;
+          return NULL;
+        }
+      }
+    }
+
+    if (!printing && toplevel)
+    {
+      #ifdef ANTI_TWITTER
+        anti_twitter(r);
+      #endif
+
+      wimp_get_rectangle(r, &more);
+    }
+  }
+  while (more);
+
+  /* Finished... */
+
+  return NULL;
+}
+
+/**************************************************************/
+/* redraw_content_stream()                                    */
+/*                                                            */
+/* Redraw an actual content stream. Assumes b->stream is not  */
+/* NULL and b->nchildren is zero.                             */
+/*                                                            */
+/* Parameters: 1 for a top level call, else 0 if being called */
+/*             as part of a recursive redraw invocation;      */
+/*                                                            */
+/*             X origin for plotting (window coords but in    */
+/*             millipoints) - usually used for cell contents  */
+/*             that are offset relative to a parent cell;     */
+/*                                                            */
+/*             Y origin for plotting (window coords but in    */
+/*             millipoints);                                  */
+/*                                                            */
+/*             A pointer to a browser_data structure relevant */
+/*             to the redraw;                                 */
+/*                                                            */
+/*             Pointer to a reformat_cell struct holding the  */
+/*             lines and chunks to redraw;                    */
+/*                                                            */
+/*             A WimpRedrawWindowBlock pointer, with window   */
+/*             area and redraw rectangle details filled in;   */
+/*                                                            */
+/*             Pointer to an int, updated on exit during      */
+/*             printing (global "printing" flag is set) with  */
+/*             the y-coordinate of the top of the line that   */
+/*             is to be printed next, in OS units, or zero if */
+/*             there are no more lines - may be NULL if not   */
+/*             interested;                                    */
+/*                                                            */
+/*             Pointer to a related int, the int set to zero  */
+/*             before calling, which will be updated to non-  */
+/*             zero on exit if the function believes a higher */
+/*             level redraw loop should exit prematurely      */
+/*             because a split point has been found - may be  */
+/*             NULL if not interested;                        */
+/*                                                            */
+/*             1 to plot no backgrounds at all, else they     */
+/*             will be shown;                                 */
+/*                                                            */
+/*             0 for normal redraw, else pointer to a token   */
+/*             where no content is to be drawn - only the     */
+/*             elements that are needed to indicate selection */
+/*             should be shown. This is used mostly for       */
+/*             things like removing borders around images; if */
+/*             bits of the image have to be redrawn this can  */
+/*             make the removal slow. Only one token is       */
+/*             allowed as any adjacent images must be redrawn */
+/*             if the border was plotted over them, or redraw */
+/*             anomalies will be seen as 'holes' are left     */
+/*             behind. There is some intelligence to give     */
+/*             different behaviour if selecting or            */
+/*             deselecting things.                            */
+/*                                                            */
+/* Assumes:    Pointers to items may NOT be NULL unless       */
+/*             explicitly stated above.                       */
+/**************************************************************/
+
+static _kernel_oserror * redraw_content_stream
+                         (
+                           unsigned int                           toplevel,
+                           int                                    mp_origin_win_x,
+                           int                                    mp_origin_win_y,
+                           browser_data                * restrict b,
+                           const reformat_cell         *          d,
+                           const WimpRedrawWindowBlock * restrict r,
+                           int                         * restrict nextline,
+                           int                         * restrict earlyexit,
+                           unsigned int                           noback,
+                           const HStream               * restrict nocontent
+                         )
+{
+  browser_data * ancestor = utils_ancestor(b);
+  unsigned int   l        = 0;
+
+  int            page_bottom, page_height;
+
+  int            user_origin_win_x, os_origin_win_x;
+  int            user_origin_win_y, os_origin_win_y;
+  int            user_bgap,         os_bgap,         mp_bgap;
+  BBox           user_gfxwin,       os_gfxwin,       mp_gfxwin;
+
+  BBox           os_workarea;
+
+  /* There is an HTML stream, so there is something to redraw. Put */
+  /* the x and y origin in OS units into os_xorg and os_yorg and   */
+  /* user-points in user_origin_win_x and user_origin_win_y.       */
+
+  scale_pair_millipoints_to_user (b, mp_origin_win_x,    mp_origin_win_y,    &user_origin_win_x, &user_origin_win_y);
+  scale_pair_user_to_os          (b, user_origin_win_x,  user_origin_win_y,  &os_origin_win_x,   &os_origin_win_y);
+
+  /* Do the same thing for the graphics window, held to start with */
+  /* in OS screen coordinates in the redraw_area field of 'r'.     */
+
+  os_gfxwin = r->redraw_area;
+
+  scale_box_os_to_user           (b, &os_gfxwin,    &user_gfxwin);
+  scale_box_user_to_millipoints  (b, &user_gfxwin,  &mp_gfxwin);
+
+  /* Get a work area coordinate equivalent of r->redraw_area */
+
+  os_workarea = os_gfxwin;
+  coords_box_toworkarea(&os_workarea, r);
+
+  /* When redrawing objects with a navigation selection border, the  */
+  /* border often falls outside the strict bounding box of the token */
+  /* so if the line and chunk scanning loops worked purely off the   */
+  /* redraw coordinates they'd only redraw a border if the redraw    */
+  /* region happened to intersect with the object inside - so you    */
+  /* could "rub out" the border by dragging (say) a menu carefully   */
+  /* over just the border region without touching the interior.      */
+  /*                                                                 */
+  /* We could just hack the redraw area to make it wider - instead,  */
+  /* if there is a selected token and we're not printing, calculate  */
+  /* a gap to take into account equal to the border width.           */
+
+  if (!printing && (utils_ancestor(b))->selected != NULL)
+  {
+    user_bgap = scale_os_to_user          (b, Redraw_SelectedBorder_OS);
+    os_bgap   = scale_user_to_os          (b, user_bgap);
+    mp_bgap   = scale_user_to_millipoints (b, user_bgap);
+  }
+  else
+  {
+    user_bgap = os_bgap = mp_bgap = 0;
+  }
+
+  /* Get the page bottom in work area coordinates, and the page height. */
+  /* This is really a printing only concept, where the visible_area     */
+  /* BBox will in fact hold the entire page bounding box. The variables */
+  /* aren't used for anything else (at present, hence no 'if' wrapper). */
+
+  page_bottom = coords_y_toworkarea(r->visible_area.ymin, r);
+  page_height = r->visible_area.ymax - r->visible_area.ymin;
+
+  /* If printing, handle display style override for backgrounds */
+
+  if (printing)
+  {
+    /* Force background off for some cases... */
+
+    if      (printstyle_show_none()) noback = 1;
+    else if (printstyle_show_in_tables_only)
+    {
+      if (toplevel) noback = 1;
+      else
+      {
+        /* Need to work out if this table cell has a background colour */
+
+        if (d->cdata && d->cdata[0].t->parent)
+        {
+          if (TD_HAS_BGCOL(d->cdata[0].t->parent)) noback = 0;
+          else                                     noback = 1;
+        }
+      }
+    }
+
+    /* ...and on for others */
+
+    if (printstyle_show_all() && toplevel) noback = 0;
+  }
+
+  use_noback = noback;
+
+  /* If we've *not* been told *not* to plot any backgrounds... */
+
+  if (!noback)
+  {
+    /* For cells, browser legacy code made it really difficult to change all  */
+    /* points where background colours were read to get it from a cell rather */
+    /* than a browser. Many years ago, the hacky solution which still exists  */
+    /* today was to update the browser_data structure's background and anti-  */
+    /* alias colour records with the values from each table cell just before  */
+    /* the recursive redraw call for that cell, then restore them after. This */
+    /* call below, then, redraws both page backgrounds and cell backgrounds.  */
+
+    RetError(redraw_page_background(b, r));
+  }
+
+  #ifdef TRACE
+
+    if (tl & (1u<<23))
+    {
+      BBox rectangle = r->redraw_area;
+
+      redraw_set_colour(0xff884400);
+      bbc_rectangle(rectangle.xmin,rectangle.ymin,rectangle.xmax-rectangle.xmin-1,rectangle.ymax-rectangle.ymin-1);
+
+      redraw_set_colour(0xffaa6600);
+      bbc_rectangle(rectangle.xmin+2,rectangle.ymin+2,rectangle.xmax-rectangle.xmin-5,rectangle.ymax-rectangle.ymin-5);
+
+      redraw_set_colour(0xffcc8800);
+      bbc_rectangle(rectangle.xmin+4,rectangle.ymin+4,rectangle.xmax-rectangle.xmin-9,rectangle.ymax-rectangle.ymin-9);
+    }
+
+  #endif
+
+  /* Loop over every line in this cell. */
+
+  for (l = 0; l < d->nlines; l++)
+  {
+    /* If there are line chunks for this line, and the bounding box y */
+    /* coordinates lie within the redraw rectangle, process the line. */
+
+    if (
+         d->ldata[l].n                                                                &&
+         os_origin_win_y + d->ldata[l].y                 < os_workarea.ymax + os_bgap &&
+         os_origin_win_y + d->ldata[l].y + d->ldata[l].h > os_workarea.ymin - os_bgap
+       )
+    {
+      HStream      * tp;                           /* Token pointer */
+      fm_face        h;
+      int            mp_line_scr_x, mp_line_scr_y; /* Line's bottom left corner, screen origin, millipoints */
+      int            mp_line_win_x, mp_line_win_y; /* Line's bottom left corner, window origin, millipoints */
+      int            mp_line_base;                 /* Line's baseline offset in millipoints                 */
+      int            mp_line_base_scr_y;           /* Bottom edge plus baseline, screen origin, millipoints */
+      unsigned int   i;                            /* Line iterator                                         */
+      unsigned int   cn;                           /* Chunk Number                                          */
+      char         * dp;                           /* Data Pointer                                          */
+
+      if (printing == 1 && toplevel) /* 1 = may force page break, 2 = don't */
+      {
+        /* If printing = 1, it signals that we're not to split lines */
+        /* over the bottom of the page. So if this line will drop    */
+        /* off the bottom, we need to be careful. This gets a bit    */
+        /* hacky now...                                              */
+        /*                                                           */
+        /* To signal to the printing loop that a line was about to   */
+        /* be split but wasn't drawn, the top coord of the line is   */
+        /* returned in the nextline integer. The printing routines   */
+        /* use this to work out from where to start the next redraw. */
+        /*                                                           */
+        /* If you add code here, remember that nextline must be      */
+        /* filled in eventually or the printing loop will exit,      */
+        /* assuming there's no more page to draw.                    */
+
+        HStream * split_token;
+        int       split_y;
+        int       store;
+
+        split_token = print_find_splitting_point(d,
+                                                 os_origin_win_y,
+                                                 l,
+                                                 page_bottom,
+                                                 page_height,
+                                                 &split_y,
+                                                 &store);
+
+        if (split_token != NULL)
+        {
+          if (nextline  != NULL) *nextline  = split_y;
+          if (earlyexit != NULL) *earlyexit = 1;
+
+          if (store == 1) RetError(redraw_read_section(b, split_token));
+
+          return NULL;
+        }
+      }
+
+      /* Put the base address of the line's chunks into cp, */
+      /* and point to the first associated token in tp.     */
+
+      cn = d->ldata[l].chunks;
+      tp = d->cdata[cn].t;
+
+      /* Get the x and y coordinates of the bottom left of the line in   */
+      /* millipoints into mp_line_win_x and mp_line_win_y. This means we */
+      /* have the line position in millipoints relative to the cell      */
+      /* origin in workarea-style coordinates.                           */
+
+      convert_pair_to_points(redraw_start_x(b, d, tp, l),
+                             d->ldata[l].y,
+                             &mp_line_win_x,
+                             &mp_line_win_y);
+
+      /* Offset the line x and y coordinates by the location of the cell */
+      /* being redrawn, to get the line origin in window coordinates, in */
+      /* milli-points.                                                   */
+
+      mp_line_win_x += mp_origin_win_x;
+      mp_line_win_y += mp_origin_win_y;
+
+      /* Find the window origin (0,0) in screen coordinates, convert into  */
+      /* points, and add the line X and Y coordinate calculated above to   */
+      /* get the screen X and Y coordinates of its bottom left corner.     */
+
+      convert_pair_to_points(coords_x_toscreen(0, r),
+                             coords_y_toscreen(0, r),
+                             &mp_line_scr_x,
+                             &mp_line_scr_y);
+
+      mp_line_scr_x += mp_line_win_x;
+      mp_line_scr_y += mp_line_win_y;
+
+      /* Set 'mp_line_base' to hold the baseline offset in millipoints */
+
+      convert_to_points(d->ldata[l].b, &mp_line_base);
+
+      /* The Y coordinate offset by the baseline is used a lot, so */
+      /* calculate it up-front to avoid doing it many times below. */
+
+      mp_line_base_scr_y = mp_line_scr_y + mp_line_base;
+
+      /* Loop round for up to all the line chunks whilst staying */
+      /* within the redraw rectangle horizontally.               */
+
+      for (
+            i = 0;
+
+            i < d->ldata[l].n &&
+            mp_line_scr_x < mp_gfxwin.xmax + mp_bgap;
+
+            mp_line_scr_x += d->cdata[cn].w, i++, cn++
+          )
+      {
+        /* If this chunk is to the left of the redraw area, move on */
+        /* to the next one.                                         */
+
+        if (mp_line_scr_x + d->cdata[cn].w <= mp_gfxwin.xmin - mp_bgap) continue;
+
+        /* If we reach here, the chunk is visible. Get its token address. */
+
+        tp = d->cdata[cn].t;
+
+        /* If the token represents a link, inform others by callback; if  */
+        /* it represents a named anchor, use another callback.            */
+        /*                                                                */
+        /* The 'printing' check is a way of determining whether or not    */
+        /* the redraw is 'paginated', in accordance with RedrawCore.h's   */
+        /* description of how the callbacks are used. Besides, at the     */
+        /* moment, there are no callbacks for any redraw tables used out  */
+        /* of print loops, so there's no point calling them.              */
+
+        if (printing && (ISLINK(tp) || ((tp->style & A) && tp->name)))
+        {
+          BBox bounds;
+          int  height;
+
+          convert_to_points(d->ldata[l].h, &height);
+
+          bounds.xmin = mp_line_scr_x;
+          bounds.xmax = mp_line_scr_x + d->cdata[cn].w;
+          bounds.ymin = mp_line_scr_y;
+          bounds.ymax = mp_line_scr_y + height;
+
+          scale_box_millipoints_to_user(b, &bounds, &bounds);
+
+          /* A single token can include both a link and a name */
+
+          if (ISLINK(tp))
+          {
+            RetError(redrawcore_link_cb(b,
+                                        tp->anchor,
+                                        &bounds));
+          }
+
+          if ((tp->style & A) && tp->name)
+          {
+            RetError(redrawcore_name_cb(b,
+                                        tp->name,
+                                        &bounds));
+          }
+        }
+
+        /* If 'selected' is not NULL, and nocontent is specifying th at a */
+        /* token shouldn't have its contents drawn, then a borders-only   */
+        /* redraw is in progress. For removing a border, when 'selected'  */
+        /* *is* NULL, want to not draw the contents of the given token    */
+        /* but must redraw all others fully, else edge effects will occur */
+        /* where tokens directly abut the given one (bits can get knocked */
+        /* out as the border goes but the tokens it was plotted over are  */
+        /* not redraw).                                                   */
+        /*                                                                */
+        /* However, for a borders-only redraw when something is being     */
+        /* selected, don't want to draw the contents of *anything* as the */
+        /* border wants to overplot it. To effect this, set the nocontent */
+        /* token to always be the same as the current one.                */
+
+        if (ancestor->selected && nocontent) nocontent = tp;
+
+        /* Deal with tables with at least 1 cell (ISTABLE - Fetch.h - ensures */
+        /* this condition).                                                   */
+
+        if (ISTABLE(tp))
+        {
+          RetError(redraw_table(b,
+                                (table_stream *) tp,
+                                r,
+                                mp_line_win_x, mp_line_win_y,
+                                mp_line_scr_x, mp_line_scr_y,
+                                d->ldata[l].h,
+                                nextline,
+                                noback,
+                                nocontent));
+        }
+
+        /* Forms elements */
+
+        else if (ISINPUT(tp) || ISTEXTAREA(tp) || ISSELECT(tp))
+        {
+          /* A text-based element - SELECTs, TEXTAREAs or certain */
+          /* INPUT types.                                         */
+
+          if (
+               ISTEXTAREA(tp)                          ||
+               ISSELECT(tp)                            ||
+               HtmlINPUTtype(tp) == inputtype_TEXT     ||
+               HtmlINPUTtype(tp) == inputtype_PASSWORD
+             )
+          {
+            BBox    box;
+            int     ox, oy;
+            fm_face fh;
+
+            convert_pair_to_os(mp_line_scr_x,
+                               mp_line_base_scr_y,
+                               &ox,
+                               &oy);
+
+            fh = fm_find_token_font(b, tp, 0);
+            fm_font_box(fh, &box);
+
+            /* Set up the bounding box for a text area, with a minimum of 2 rows */
+
+            if (tp->tagno == TAG_TEXTAREA)
+            {
+              unsigned int r;
+              int          lh, lb;
+
+              form_get_linesize(&box, &lh, &lb);
+
+              r = tp->rows;
+              if (r < 2) r = 2;
+
+              box.ymin -= lh * (r - 1); /* ymin is already below the first line, so want to drop it by (rows - 1) more */
+            }
+
+            /* Account for the borders */
+
+            box.ymin = box.ymin + oy - 8;
+            box.ymax = box.ymax + oy + 8;
+            box.xmin = ox + 4;
+
+            convert_to_os(mp_line_scr_x + d->cdata[cn].w, &box.xmax);
+
+            /* Account for a border */
+
+            box.xmax -= 4;
+
+            if (nocontent != tp)
+            {
+              if (tp->tagno == TAG_SELECT) RetError(redraw_menu_field  (b, tp, &box));
+              else                         RetError(redraw_input_field (b, tp, &box, redraw_token_colour(b, tp)));
+
+              RetError(form_textarea_redraw(b,
+                                            d->cdata[cn].t,
+                                            &box,
+                                            &r->redraw_area,
+                                            fh,
+                                            tp->tagno == TAG_TEXTAREA,
+                                            tp->tagno == TAG_INPUT && HtmlINPUTtype(tp) == inputtype_PASSWORD,
+                                            redraw_token_colour(b, tp),
+                                            (tp->tagno == TAG_SELECT) ? Redraw_Colour_BackGrey : Redraw_Colour_White));
+            }
+          }
+          else switch(HtmlINPUTtype(tp))
+          {
+            /* Graphics-based forms elements */
+
+            case inputtype_CHECKBOX:
+            {
+              if (nocontent != tp) RetError(redraw_switch(b,
+                                                          tp,
+                                                          mp_line_scr_x,
+                                                          mp_line_base_scr_y,
+                                                          form_get_field(b, d->cdata[cn].t) -> checked ? "fopton" : "foptoff"));
+            }
+            break;
+
+            case inputtype_RADIO:
+            {
+              if (nocontent != tp) RetError(redraw_switch(b,
+                                                          tp,
+                                                          mp_line_scr_x,
+                                                          mp_line_base_scr_y,
+                                                          form_get_field(b, d->cdata[cn].t) -> checked ? "fradioon" : "fradiooff"));
+            }
+            break;
+
+            case inputtype_IMAGE:
+            {
+              RetError(redraw_image_and_border(b,
+                                               tp,
+                                               nocontent,
+                                               r,
+                                               mp_line_scr_x,
+                                               mp_line_base_scr_y));
+            }
+            break;
+
+            case inputtype_HIDDEN: break;
+
+            case inputtype_SUBMIT: /* SUBMIT same as RESET: no break */
+            case inputtype_BUTTON: /* Again, no break                */
+            case inputtype_RESET:
+            {
+              BBox           box;
+              int            fh, ox, oy;
+              unsigned int   back_colour;
+              const char   * p;
+
+              p = form_button_text(tp);
+
+              convert_pair_to_os(mp_line_scr_x,
+                                 mp_line_base_scr_y,
+                                 &ox,
+                                 &oy);
+
+              fh = fm_find_token_font(b, tp, 0);
+
+              fm_font_box(fh,&box);
+
+              box.ymin = box.ymin + oy - 8;
+              box.ymax = box.ymax + oy + 8;
+              box.xmin = ox + 4;
+
+              convert_to_os(mp_line_scr_x + d->cdata[cn].w,&box.xmax);
+
+              /* Account for a border */
+
+              box.xmax -= 4;
+
+              /* Draw the button's plinth */
+
+              if (b->highlight == tp)
+              {
+                RetError(redraw_button(b, tp, &box, 1));
+                back_colour = Redraw_Colour_MidGrey;
+              }
+              else
+              {
+                RetError(redraw_button(b, tp, &box, 0));
+                back_colour = Redraw_Colour_BackGrey;
+              }
+
+              /* Plot the text, centred horizontally */
+
+              if (p)
+              {
+                unsigned int length, end;
+                int          width;
+
+                length = strlen(p);
+                end    = 0;
+
+                while(end < length && p[end] != '\n') end++;
+
+                RetError(fm_get_string_width(fh,
+                                             p,
+                                             0x1000000,
+                                             end - d->cdata[cn].o,
+                                             -1,
+                                             NULL,
+                                             &width));
+
+                width = (d->cdata[cn].w - width) / 2 + 4;
+                if (width < 0) width = 0;
+
+                RetError(redrawcore_text(b, fh,
+                                         scale_millipoints_to_user(b, mp_line_scr_x + width),
+                                         scale_millipoints_to_user(b, mp_line_base_scr_y),
+                                         p, end - d->cdata[cn].o,
+                                         redraw_token_colour(b, tp),
+                                         back_colour,
+                                         1));
+              }
+            }
+            break;
+          }
+        }
+
+        /* Plot an image */
+
+        else if (tp->style & IMG) /* IMG or INPUT TYPE="IMAGE" */
+        {
+          RetError(redraw_image_and_border(b,
+                                           tp,
+                                           nocontent,
+                                           r,
+                                           mp_line_scr_x,
+                                           mp_line_base_scr_y));
+        }
+
+        /* Plot an OBJECT, EMBED or APPLET tag */
+
+        else if (ISOBJECT(tp))
+        {
+          RetError(redraw_object_and_border(b,
+                                            tp,
+                                            nocontent,
+                                            r,
+                                            mp_line_scr_x,
+                                            mp_line_base_scr_y));
+        }
+
+        /* Plot a horizontal rule */
+
+        else if (tp->style & HR)
+        {
+          int  ox, oy = 0;
+          int  w,  h;
+          int  lmarg;
+          int  dx = wimpt_dx() - 1;
+          int  dy = wimpt_dy() - 1;
+          BBox user_box;
+
+          lmarg = redraw_start_x(b, d, tp, l);
+
+          convert_to_os(mp_line_scr_y,  &oy);
+          convert_to_os(d->cdata[cn].w, &w);
+
+          /* Round width to evenn pixels and limit check it.   */
+          /* Allow sizes greater than the available width, in  */
+          /* which case align to the left and draw to whatever */
+          /* width was requested.                              */
+
+          if (w < 2) w = 2;
+          w = w & ~dx;
+
+          /* Deal with a size (height) specifier */
+
+          if (HR_HAS_SIZE(tp))
+          {
+            /* Currently only recognise pixels */
+
+            switch (HR_SIZE_UNITS(tp))
+            {
+              case UNITS_PIXELS: h = HR_SIZE(tp); break;
+              default:           h = 2; break;
+            }
+          }
+          else h = 2;
+
+          /* Limit the height and convert to OS units */
+
+          if (h < 1) h = 1;
+
+          h = scale_web_to_user(b, h);
+          h = scale_user_to_os(b, h);
+
+          /* Sort out the horizontal and vertical plotting offsets; */
+          /* centre vertically, and align horizontally as specified */
+          /* in the token.                                          */
+
+          oy += ((d->ldata[l].h - h) / 2) & ~dy - 4;
+          oy += 6;
+
+          ox = (coords_x_toscreen(lmarg + os_origin_win_x, r) & ~dx);
+
+          /* Get the HR bounding box in user-points, with all rounding */
+          /* and deductions done in OS units first.                    */
+
+          scale_pair_os_to_user(b, ox,     oy,     &user_box.xmin, &user_box.ymin);
+          scale_pair_os_to_user(b, ox + w, oy + h, &user_box.xmax, &user_box.ymax);
+
+          /* Plot a black rule if NOSHADE is specified or the height */
+          /* or width are less than 2 pixels, else plot a '3D' rule. */
+
+          if (HR_NOSHADE(tp) || h < (dy + 1) * 2 || w < (dx + 1) * 2)
+          {
+            RetError(redrawcore_rectangle(b,
+                                          &user_box,
+                                          Redraw_Colour_Black,
+                                          0));
+          }
+          else
+          {
+            RetError(redraw_plinth_border(b,
+                                          &user_box,
+                                          scale_os_to_user(b, 2), /* 2 OS unit thick border */
+                                          Redraw_Colour_MidGrey,
+                                          Redraw_Colour_AlmostWhite));
+          }
+        }
+
+        /* Plot a bullet point */
+
+        else if(ISBULLET(tp))
+        {
+          RetError(redraw_bullet(b,
+                                 mp_line_scr_x,
+                                 mp_line_base_scr_y,
+                                 tp->indent));
+        }
+
+        /* Plot some text */
+
+        else
+        {
+          dp = d->cdata[cn].t->text;
+
+          if (dp)
+          {
+            BBox         size;
+            unsigned int c;
+            int          yofs, height;
+            int          user_x, user_y;
+
+            /* Find the font handle for the token, and its colour */
+
+            h = fm_find_token_font  (b, tp, 0);
+            c = redraw_token_colour (b, tp);
+
+            /* Find the text height in OS units */
+
+            fm_font_box(h, &size);
+            height = size.ymax - size.ymin;
+
+            /* Work out the y offset to plot at */
+
+            if (ISSUP(tp))
+            {
+              /* Shift baseline up for superscript text. The following */
+              /* will be for the SUP size text, remember...            */
+
+              convert_to_points(height, &yofs);
+
+              /* SUP height = normht * 3 / 5, so to get normal  */
+              /* height from SUP do height * 5 / 3. Then want   */
+              /* to get the height remaining and use this as an */
+              /* addition for the y positioning, so need to add */
+              /* (normht - hormht * 3 / 5) = normht * 2 / 5.    */
+              /* This all simplifies out to height * 2 / 3, but */
+              /* this looks too high in practice, so it's taken */
+              /* down a bit from that!                          */
+
+              yofs = mp_line_base_scr_y + (yofs / 2);
+            }
+            else if (ISSUB(tp))
+            {
+              /* Shift the baseline down a bit for subscript text */
+
+              yofs = mp_line_scr_y + (mp_line_base * 4) / 5;
+            }
+            else yofs = mp_line_base_scr_y;
+
+            /* Set the font colour and plot the text */
+
+            scale_pair_millipoints_to_user(b, mp_line_scr_x, yofs, &user_x, &user_y);
+
+            RetError(redrawcore_text(b,
+                                     h,
+                                     user_x, user_y,
+                                     dp + d->cdata[cn].o,
+                                     d->cdata[cn].l,
+                                     c, redraw_background_colour(b, c),
+                                     b->background_image >= 0 && b->show_background));
+
+            /* Deal with underlining. The position should not be affected */
+            /* by SUB or SUP text.                                        */
+
+            if (
+                 (
+                   (
+                     ISLINK(tp) &&
+                     b->underline_links
+                   )
+                   || ISUNDERLINE(tp)
+                 )
+                 && !(tp->tagno == TAG_TABLE)
+               )
+            {
+              BBox user_ends;
+
+              /* Work out the coordinates  */
+
+              scale_pair_millipoints_to_user(b,
+                                             mp_line_scr_x,
+                                             mp_line_base_scr_y,
+                                             &user_ends.xmin,
+                                             &user_ends.ymin);
+
+              user_ends.ymin -= scale_os_to_user(b, 7); /* A 7 OS unit gap looks about right */
+
+              /* Finish point includes the width */
+
+              user_ends.xmax = user_ends.xmin + scale_millipoints_to_user(b, d->cdata[cn].w);
+              user_ends.ymax = user_ends.ymin;
+
+              /* Draw the line */
+
+              RetError(redrawcore_line(b,
+                                       &user_ends,
+                                       redraw_token_colour(b, tp)));
+            }
+
+            /* Deal with STRIKE text. This needs to have the strikethrough */
+            /* line through the text middle, as opposed to following the   */
+            /* body text font baseline (so SUB and SUP *will* have an      */
+            /* effect on the positioning).                                 */
+
+            if (ISSTRIKE(tp) && !(tp->tagno == TAG_TABLE))
+            {
+              BBox user_ends;
+              int  ox, oy;
+              int  hs;
+
+              convert_pair_to_os(mp_line_scr_x, yofs, &ox, &oy);
+              hs = height / 4;
+              oy += hs;
+
+              scale_pair_os_to_user(b, ox, oy, &user_ends.xmin, &user_ends.ymin);
+              user_ends.xmax = scale_millipoints_to_user(b, mp_line_scr_x + d->cdata[cn].w);
+              user_ends.ymax = user_ends.ymin;
+
+              /* Draw the line */
+
+              RetError(redrawcore_line(b,
+                                       &user_ends,
+                                       redraw_token_colour(b, tp)));
+            }
+          }
+        }
+
+        // Plot the bounding box of any object; green to
+        // mark an image, else red
+
+        #ifdef TRACE
+
+          if ((tl & (1u<<11)) || (tl & (1u<<19)))
+          {
+            int ox, oy, ow, oh;
+
+            convert_pair_to_os(mp_line_scr_x,
+                               mp_line_scr_y,
+                               &ox,
+                               &oy);
+
+            convert_to_os(d->cdata[cn].w, &ow);
+
+            oh = d->ldata[l].h;
+
+            if (tl & (1u<<11))
+            {
+              _swix(Wimp_SetColour,
+                    _IN(0),
+
+                    (tp->style & IMG) ? 10 : 11);
+
+              bbc_rectangle(ox, oy, ow - 1, oh - 1);
+            }
+
+            // Mark tokens with no lower bits set in the type word
+            // (so not head, body, frameset etc.) and a NULL text
+            // field, with a magenta dot in the bottom *right* of
+            // the token BBox and a cyan dot in the top right of the
+            // BBox respectively.
+
+            if (tl & (1u<<19))
+            {
+              if (!(tp->type & 0xff))
+              {
+                redraw_set_colour(0xff00ff00);
+                bbc_circlefill(ox + ow - 1, oy, 6);
+                redraw_set_colour(0);
+                bbc_circle(ox + ow - 1, oy, 6);
+              }
+
+              if (!tp->text)
+              {
+                redraw_set_colour(0xffff0000);
+                bbc_circlefill(ox + ow - 1, oy + oh - 1, 6);
+                redraw_set_colour(0);
+                bbc_circle(ox + ow - 1, oy + oh - 1, 6);
+              }
+            }
+          }
+        #endif
+
+      /* Closure of 'for' looping round chunks on a given line */
+      /* that lies partially or entirely within the redraw     */
+      /* area.                                                 */
+      }
+
+      /* For printing, tell the print routines where we were up to. */
+      /* This would be quite straightforward, except we have to     */
+      /* account for gaps between lines.                            */
+
+      if (
+           printing != 0 &&
+           toplevel
+         )
+      {
+        int bottom = os_origin_win_y + d->ldata[l].y;
+
+        /* Correct for a possible gap */
+
+        if (l + 1 < d->nlines)
+        {
+          bottom -= d->ldata[l].y -
+                    (
+                      d->ldata[l + 1].y +
+                      d->ldata[l + 1].h
+                    );
+        }
+
+        if (bottom < page_bottom && nextline != NULL)
+        {
+          *nextline = os_origin_win_y + page_bottom;
+        }
+      }
+
+    /* Closure of long 'if' checking if the current line lies */
+    /* partially or entirely within the redraw area. The code */
+    /* above executes if it does.                             */
+    }
+
+  /* Closure of 'for' looping for all lines in the document. */
+  }
+
+  return NULL;
+}

@@ -1,0 +1,975 @@
+/* Copyright 1998 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*---------------------------------------------------------------------------*/
+/* File:    sound.c                                                          */
+/* Purpose: Sound specific code                                              */
+/* Author:  Richard Leggett                                                  */
+/* History: 29-Jan-98: RML: Begun.                                           */
+/*                                                                           */
+/* Copyright © 1998 Acorn Computers Ltd., Cambridge, UK.                     */
+/*---------------------------------------------------------------------------*/
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include "Global/OsBytes.h"
+#include "Global/FileTypes.h"
+#include "Global/CMOS.h"
+#include "Interface/HighFSI.h"
+#include "Interface/MixerDevice.h"
+#include "Interface/Sound.h"
+#include "swis.h"
+#include "toolbox.h"
+#include "gadgets.h"
+#include "common.h"
+#include "defines.h"
+#include "sound.h"
+
+#ifndef SoundCtrl_ExamineMixer
+#define SoundCtrl_ExamineMixer (0x50000)
+#endif
+#ifndef SoundCtrl_SetMix
+#define SoundCtrl_SetMix       (0x50001)
+#endif
+#ifndef SoundCtrl_GetMix
+#define SoundCtrl_GetMix       (0x50002)
+#endif
+
+controller_list_entry_t *original_controller = NULL;
+controller_list_entry_t *configured_controller = NULL;
+controller_list_entry_t *selected_controller = NULL;
+controller_list_entry_t *controllers = NULL;
+BOOL vidcmix;
+BOOL multidevice;
+unsigned int maxchannels = 0;
+
+static int   menu_to_voice_map[16];
+static int   cmos_sound, cmos_loud;
+
+typedef struct
+{
+    unsigned short flags;
+    signed short category;
+    int mingain;
+    int maxgain;
+    int step;
+} mixer_features;
+
+
+
+/*---------------------------------------------------------------------------*
+ * sound_detect_mix_mode                                                     *
+ *                                                                           *
+ * Find if this is an old style VIDC system or a full mixing desk.           *
+ *---------------------------------------------------------------------------*/
+
+void sound_detect_mix_mode(void)
+{
+    multidevice = FALSE;
+    if (_swix(OS_CLI, _IN(0), "RMEnsure SoundControl 1.00") == NULL)
+    {
+        vidcmix = FALSE;
+        int result,flags;
+        if (!_swix(Sound_ReadSysInfo, _IN(0)|_OUTR(0,1), Sound_RSI_Features, &result, &flags))
+        {
+            if (!result && (flags & Sound_RSI_Feature_ControllerSelection))
+            {
+                multidevice = TRUE;
+            }
+        }
+    }
+    else
+    {
+        int dummy;
+
+        if ((_swix(OS_Memory, _INR(0,1) | _OUT(1), 9, 3<<8, &dummy) == NULL) &&
+            (dummy != 0))
+        {
+            vidcmix = TRUE;
+        }
+        else
+        {
+            /* No sound mixer module and no VIDC, that's fatal */
+            error_trap(common_error(messages_lookup("NoSoundCtl")), 1);
+        }
+    }
+}
+
+
+/*---------------------------------------------------------------------------*
+ * sound_db_to_volume                                                        *
+ *                                                                           *
+ * Translate a dB*16 setting into a volume.                                  *
+ *---------------------------------------------------------------------------*/
+
+static int sound_db_to_volume(int db)
+{
+    int volume;
+
+    /* Round down to nearest step multiple of 3dB*16 */
+    db = (db - 47) / 48;
+
+    /* Every 3dB is a volume step of 16 */
+    volume = 127 + (16 * db);
+    if (volume <= 0) volume = 1;
+    if (volume > 127) volume = 127;
+
+    return volume;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * sound_volume_to_db                                                        *
+ *                                                                           *
+ * Translate a volume setting into dB*16s.                                   *
+ *---------------------------------------------------------------------------*/
+
+static int sound_volume_to_db(int volume)
+{
+    int db;
+
+    /* Round down to nearest step of 16 */
+    volume = (volume - 15) / 16;
+
+    /* Every 16 is a step of -3dB*16 */
+    db = 0 - (48 * (7 - volume));
+
+    return db;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * sound_read_channel_info                                                   *
+ *                                                                           *
+ * Read the fixed characteristics of the mixer into the controller struct    *
+ *---------------------------------------------------------------------------*/
+
+static void sound_read_channel_info(controller_list_entry_t *controller)
+{
+    size_t space_needed;
+    size_t block_size;
+
+    if (vidcmix)
+    {
+        static channel_t vidcchannel = { VIDC_CHANNEL };
+        const char *name;
+        char nametoken[10] = "name";
+        int  volume;
+        
+        /* Just fill in the one static channel */
+        controller->nchannels = maxchannels = 1;
+        controller->channels = &vidcchannel;
+        strcat(nametoken, controller->channels[0].token_suffix);
+        name = messages_lookup_withparam(nametoken, "");
+        if ((controller->channels[0].name = malloc(strlen(name) + 1)) != NULL)
+        {
+            strcpy(controller->channels[0].name, name);
+        }
+
+        /* Original state retrieved from *VOLUME setting */
+        error_trap(_swix(Sound_Volume, _IN(0) | _OUT(0), 0, &volume), 0);
+        controller->channels[0].original_gain = sound_volume_to_db(volume);
+        controller->channels[0].original_mute = FALSE;
+
+        return;
+    }
+
+    /* Query the mixable channels and levels */
+    error_trap(_swix(SoundCtrl_ExamineMixer, _INR(0,2)|_OUTR(2,3),
+                     controller->mixer_id,
+                     NULL,
+                     0,
+                     &space_needed,
+                     &block_size), 1);
+    controller->nchannels = -space_needed / block_size;
+    if (controller->nchannels > MAX_CHANNELS) controller->nchannels = MAX_CHANNELS;
+    if (controller->nchannels > maxchannels) maxchannels = controller->nchannels;
+    controller->channels = (channel_t *) malloc(sizeof(channel_t)*controller->nchannels);
+    if (!controller->channels)
+    {
+        error_trap(common_error(messages_lookup("NotEnoughMemory")), 1);
+    }
+    char buffer[controller->nchannels*block_size];
+    error_trap(_swix(SoundCtrl_ExamineMixer, _INR(0,2)|_OUT(4),
+                     controller->mixer_id,
+                     buffer,
+                     sizeof buffer,
+                     &controller->nchannels), 1);
+    for (int i = 0; i < controller->nchannels; i++)
+    {
+        mixer_features *info = (mixer_features *) (buffer+(block_size*i));
+        controller->channels[i].category = info->category;
+        controller->channels[i].index = -1;
+        controller->channels[i].muted_by_default = info->flags & 4;
+        controller->channels[i].fixed = info->flags & 1;
+        controller->channels[i].mono = info->flags & 2;
+        if (block_size >= 16)
+        {
+            controller->channels[i].mingain = info->mingain;
+            controller->channels[i].maxgain = info->maxgain;
+            controller->channels[i].step = info->step;
+        }
+        else
+        {
+            /* Use old limits of +0/-34.5, step 24 */
+            controller->channels[i].mingain = (int) (-34.5*16);
+            controller->channels[i].maxgain = 0;
+            controller->channels[i].step = 24;
+        }
+        if (controller->channels[i].step <= 0)
+            controller->channels[i].step = 1;
+        /* Limit minimum gain to arbitrarily chosen value of -40dB
+           This is to avoid too much of the bar being taken up by negative
+           values if the mixer is capable of high attenuation (e.g. OMAP3 can
+           go from -80 to +24, but the +ve range is the one we're interested in
+           since it's a quiet system overall) */
+        if (controller->channels[i].mingain < -40*16)
+        {
+            /* Ensure new value is still a multiple of the step size */
+            int steps = (40*16+controller->channels[i].step-1)/controller->channels[i].step;
+            controller->channels[i].mingain = -steps*controller->channels[i].step;
+        }
+        /* Sanity check */
+        if (controller->channels[i].mingain >= controller->channels[i].maxgain)
+            controller->channels[i].mingain = controller->channels[i].maxgain-16;
+    }
+    while (controller->nchannels > 0)
+    {
+        int i = 0;
+        while (i < controller->nchannels && controller->channels[i].index != -1) i++;
+        if (i == controller->nchannels) break;
+        int category = controller->channels[i].category;
+        unsigned int index = 0;
+        for (int j = i; j < controller->nchannels; j++)
+        {
+            if (controller->channels[j].category == category)
+            {
+                controller->channels[j].index = index++;
+                unsigned int mute;
+                error_trap(_swix(SoundCtrl_GetMix, _INR(0,2)|_OUTR(3,4),
+                                 controller->mixer_id,
+                                 controller->channels[j].category,
+                                 controller->channels[j].index,
+                                 &mute,
+                                 &controller->channels[j].original_gain), 1);
+                controller->channels[j].original_mute = mute;
+            }
+        }
+        for (int j = i; j < controller->nchannels; j++)
+        {
+            if (controller->channels[j].category == category)
+            {
+                controller->channels[j].token_suffix[0] = category < 0 ? 'O' : 'I';
+                controller->channels[j].token_suffix[1] = abs(category) + '0';
+                controller->channels[j].token_suffix[2] = controller->channels[j].mono ? 'm' : 's';
+                controller->channels[j].token_suffix[3] = controller->channels[j].index + '0';
+                controller->channels[j].token_suffix[4] = index + '0';
+                controller->channels[j].token_suffix[5] = '\0';
+                char nametoken[10] = "name";
+                strcat(nametoken, controller->channels[j].token_suffix);
+                char param[4];
+                if (index == 1)
+                {
+                    param[0] = '\0';
+                }
+                else
+                {
+                    sprintf(param, " %d", controller->channels[j].index + 1);
+                }
+                const char *name = messages_lookup_withparam(nametoken, param);
+                if ((controller->channels[j].name = malloc(strlen(name) + 1)) != NULL)
+                {
+                    strcpy(controller->channels[j].name, name);
+                }
+            }
+        }
+    }
+}
+
+
+/*---------------------------------------------------------------------------*
+ * sound_switch_device                                                       *
+ *                                                                           *
+ * Switch the current device selection to selected_controller                *
+ *---------------------------------------------------------------------------*/
+
+static void sound_switch_device(void)
+{
+    if (!multidevice || !selected_controller)
+    {
+        return;
+    }
+    error_trap(_swix(Sound_SelectDefaultController, _IN(0), selected_controller->config_id), 0);
+}
+
+/*---------------------------------------------------------------------------*
+ * sound_enumerate_devices                                                   *
+ *                                                                           *
+ * Enumerate the available devices and read their state                      *
+ *---------------------------------------------------------------------------*/
+
+void sound_enumerate_devices(void)
+{
+    if (!multidevice)
+    {
+        original_controller = configured_controller = selected_controller = controllers = (controller_list_entry_t *) malloc(sizeof(controller_list_entry_t) + 1);
+        if (!selected_controller)
+        {
+            error_trap(common_error(messages_lookup("NotEnoughMemory")), 1);
+        }
+        memset(selected_controller,0,sizeof(controller_list_entry_t));
+        strcpy(selected_controller->config_id, "0");
+        sound_read_channel_info(selected_controller);
+        return;
+    }
+
+    char *current = NULL;
+
+    _kernel_swi_regs r;
+    r.r[0] = Sound_RSI_DefaultController;
+    r.r[1] = 0;
+    r.r[2] = 0;
+    _kernel_swi(Sound_ReadSysInfo, &r, &r);
+    if (!r.r[0] && r.r[2] && ((current = (char *) malloc(r.r[2])) != NULL))
+    {
+        r.r[0] = Sound_RSI_DefaultController;
+        r.r[1] = (int)current;
+        _kernel_swi(Sound_ReadSysInfo, &r, &r);
+        if (r.r[0])
+        {
+            free(current);
+            current = NULL;
+        }
+    }
+
+    const char *cont = NULL;
+
+    do
+    {
+        r.r[0] = (int) cont;
+        r.r[1] = 0;
+        r.r[2] = 0;
+        _kernel_swi(Sound_EnumerateControllers, &r, &r);
+        if (r.r[2] <= 1)
+        {
+            break;
+        }
+        controller_list_entry_t *entry = (controller_list_entry_t *) malloc(sizeof(controller_list_entry_t) + r.r[2]);
+        if (!entry)
+        {
+            error_trap(common_error(messages_lookup("NotEnoughMemory")), 1);
+        }
+        memset(entry, 0, sizeof(controller_list_entry_t));
+        entry->index = -1;
+        entry->next = controllers;
+        entry->mixer_id = entry->config_id;
+        r.r[0] = (int) cont;
+        r.r[1] = (int) entry->config_id;
+        error_trap(_kernel_swi(Sound_EnumerateControllers, &r, &r), 1);
+        controllers = entry;
+        cont = entry->config_id;
+
+        sound_read_channel_info(entry);
+
+        if (!original_controller)
+        {
+            if (!current || !strcmp(current, entry->config_id))
+            {
+                original_controller = selected_controller = entry;
+            }
+        }
+    } while (true);
+
+    free(current);
+}
+
+
+/*---------------------------------------------------------------------------*
+ * sound_make_voices_menu                                                    *
+ *                                                                           *
+ * Make a menu of voice modules available.                                   *
+ *                                                                           *
+ * In: window_id - Toolbox ID of the configuration window                    *
+ *---------------------------------------------------------------------------*/
+
+void sound_make_voices_menu(int window_id)
+{
+    char  strings[1024];
+    char* name;
+    char* first = 0;
+    char* name_local;
+    int   i, m;
+    
+    memset(strings, 0, sizeof(strings));
+
+    /* menu_to_voice_map maps from menu item number to internal voice number */
+    for (m=15; m>=0; m--) menu_to_voice_map[m] = -1;
+
+    /* Only read first 16 voices, as 16 is maximum value which can be stored in 4 CMOS bits */
+    m=0;
+    for (i=1; i<=16; i++)
+    {
+        _swix(Sound_InstallVoice, _INR(0,1)|_OUTR(2,3), 2, i, &name, &name_local);
+        if (name!=0)
+        {
+            if (strlen(strings) > 0) strcat(strings, ",");
+            if (strlen(strings) == 0) first = name_local;
+            strcat(strings, name_local);
+            menu_to_voice_map[m++] = i;
+        }
+    }
+    
+    error_trap(stringset_set_available(0, window_id, VoicesStringSet, strings), 0);
+}
+
+
+/*---------------------------------------------------------------------------*
+ * sound_make_devices_menu                                                   *
+ *                                                                           *
+ * Make a menu of audio devices available.                                   *
+ *                                                                           *
+ * In: window_id - Toolbox ID of the configuration window                    *
+ *---------------------------------------------------------------------------*/
+
+void sound_make_devices_menu(int window_id)
+{
+    char  strings[1024];
+    int   ofs = 0, idx = 0, len;
+
+    if (!multidevice)
+    {
+        return;
+    }
+    
+    memset(strings, 0, sizeof(strings));
+
+    controller_list_entry_t *cont = controllers;
+
+    while (cont)
+    {
+        /* Read display name into stringset buffer */
+        if (ofs)
+        {
+          strings[ofs-1] = ',';
+        }
+
+        error_trap(_swix(Sound_ControllerInfo, _INR(0,3)|_OUT(2), cont->config_id, strings + ofs, sizeof(strings) - ofs, Sound_CtlrInfo_DisplayName, &len), 1);
+        ofs += len;
+
+        cont->index = idx++;
+        cont = cont->next;
+    }
+    
+    error_trap(stringset_set_available(0, window_id, DeviceStringSet, strings), 0);
+
+    /* Set current selection */
+    if (selected_controller)
+    {
+        error_trap(stringset_set_selected(1, window_id, DeviceStringSet, (char*) selected_controller->index), 0);
+    } 
+}
+
+
+/*---------------------------------------------------------------------------*
+ * sound_read_write_cmos_settings                                            *
+ *                                                                           *
+ * Read or write the CMOS settings for volume and voice, then update the     *
+ * appropriate window gadgets.                                               *
+ *                                                                           *
+ * In: condition_code = ReadCMOSSettings or WriteCMOSSettings                *
+ *     window_id = toolbox ID of the configuration window                    *
+ *---------------------------------------------------------------------------*/
+
+void sound_read_write_cmos_settings(int condition_code, int window_id)
+{
+    int voice = -1;
+    int n = -1;
+    int cmos_errors = read_cmos_value(WimpFlagsCMOS);
+    int cmos_soundsys = read_cmos_value(PrintSoundCMOS);
+
+    /* Are we reading or writing CMOS? */
+    if (condition_code == ReadCMOSSettings)
+    {
+        cmos_sound = read_cmos_value(SoundCMOS);
+        cmos_loud = read_cmos_value(DBTBCMOS);
+
+        voice = 1 + (cmos_sound & 0x0f);
+        
+        /* Try to find the name in the stringset to match the CMOS-set channel */
+        error_trap(stringset_set_selected(0, window_id, VoicesStringSet, ""), 0);
+        for (n=0; n<15; n++)
+        {
+            if (menu_to_voice_map[n] == voice)
+            {
+                error_trap(stringset_set_selected(1, window_id, VoicesStringSet, (char*)n), 0);
+            }
+        }
+        
+        /* Is beep quiet or loud? */
+        error_trap(radiobutton_set_state(0, window_id, cmos_loud & 2 ? LoudRadio : QuietRadio, 1), 0);
+
+        /* Error boxes go beep? */
+        error_trap(optionbutton_set_state(0, window_id, BeepingErrorsOption, cmos_errors & 16 ? 0 : 1), 0);
+
+        if (vidcmix)
+        {
+            /* Extra hardware options */
+            error_trap(optionbutton_set_state(0, window_id, OversamplingOption, cmos_soundsys & 0x80 ? 1 : 0), 0);
+            error_trap(optionbutton_set_state(0, window_id, SixteenBitOption, cmos_soundsys & 0x60 ? 1 : 0), 0);
+        }
+    }
+    else if (condition_code == WriteCMOSSettings)
+    {
+        char command[32];
+
+        error_trap(stringset_get_selected(1, window_id, VoicesStringSet, &n), 0);
+        if (n != -1) voice = menu_to_voice_map[n] - 1;
+        if (voice >= 0)
+        {
+            cmos_sound &= ~0x0f;
+            cmos_sound |= voice;
+            write_cmos_value(SoundCMOS, cmos_sound);
+        }
+        
+        error_trap(radiobutton_get_state(0, window_id, LoudRadio, &n, NULL), 0);
+        cmos_loud &= ~2;
+        cmos_loud |= 2 * n;
+        write_cmos_value(DBTBCMOS, cmos_loud);
+
+        error_trap(optionbutton_get_state(0, window_id, BeepingErrorsOption, &n), 0);
+        cmos_errors &= ~16;
+        cmos_errors |= 16 * (1 - n);
+        sprintf(command, "CONFIGURE WIMPFLAGS %d", cmos_errors);
+        _swix(OS_CLI, _IN(0), command); /* This gives an instant effect, unlike poking CMOS */
+
+        if (vidcmix)
+        {
+            error_trap(optionbutton_get_state(0, window_id, OversamplingOption, &n), 0);
+            cmos_soundsys &= ~0x80;
+            cmos_soundsys |= 0x80 * n;
+            error_trap(optionbutton_get_state(0, window_id, SixteenBitOption, &n), 0);
+            cmos_soundsys &= ~0x60;
+            cmos_soundsys |= 0x20 * n; /* DAC clk slave, use ext clk, per Risc PC & A7000(+) */
+            write_cmos_value(PrintSoundCMOS, cmos_soundsys);
+        }
+    }
+}
+
+
+/*---------------------------------------------------------------------------*
+ * sound_read_choices                                                        *
+ *                                                                           *
+ * Read the sound choices from the Choices file.                             *
+ *---------------------------------------------------------------------------*/
+
+void sound_read_choices(void)
+{
+    FILE *fp;
+    char  buffer[256], id[256];
+    bool more = true;
+    int category;
+    unsigned int index;
+    unsigned char mute;
+    int gain;
+
+    if (vidcmix)
+    {
+        int volume;
+
+        /* Comes from CMOS rather than Choices: */
+        volume = 1 + (18 * ((cmos_sound >> 4) & 7));
+        configured_controller->channels[0].selected_gain = configured_controller->channels[0].configured_gain = sound_volume_to_db(volume + 15);
+        configured_controller->channels[0].selected_mute = configured_controller->channels[0].configured_mute = FALSE;
+
+        return;
+    }
+
+    /* Start with hard defaults */
+    for (controller_list_entry_t *controller = controllers; controller; controller = controller->next)
+    {
+        for (int i = 0; i < controller->nchannels; i++)
+        {
+            controller->channels[i].selected_gain = controller->channels[i].configured_gain = 0;
+            controller->channels[i].selected_mute = controller->channels[i].configured_mute = controller->channels[i].muted_by_default;
+        }
+    }
+    configured_controller = controllers;
+
+    fp = fopen(ChoicesRead, "r");
+    if (fp != NULL)
+    {
+        while (more)
+        {
+            /* Get next string */
+            more = fgets(buffer, sizeof(buffer), fp);
+            if (more)
+            {
+                /* Check for a suitable looking line */
+                if (sscanf(buffer, "MixVolume %s %d %u %c %d", id, &category, &index, &mute, &gain) == 5 && (mute -= '0') <= 1)
+                {
+                    controller_list_entry_t *controller = controllers;
+                    while (controller && strcmp(id, controller->config_id))
+                    {
+                        controller = controller->next;
+                    }
+                    if (multidevice && !controller && !strcmp(id, "0"))
+                    {
+                        /* Attempt to recover settings from old files */
+                        controller = configured_controller;
+                    }
+                    if (controller)
+                    {
+                        /* Apply it to the channel array */
+                        for (int i = 0; i < controller->nchannels; i++)
+                        {
+                            if (controller->channels[i].category == category && index-- == 0)
+                            {
+                                if (gain < controller->channels[i].mingain)
+                                {
+                                   gain = controller->channels[i].mingain;
+                                }
+                                else if (gain > controller->channels[i].maxgain)
+                                {
+                                   gain = controller->channels[i].maxgain;
+                                }
+                                controller->channels[i].selected_gain = controller->channels[i].configured_gain = gain;
+                                controller->channels[i].selected_mute = controller->channels[i].configured_mute = mute;
+                                break;
+                            }
+                        }
+                    }
+                }
+                else if (sscanf(buffer, "X Audio %s", id) == 1)
+                {
+                    controller_list_entry_t *controller = controllers;
+                    while (controller && strcmp(id, controller->config_id))
+                    {
+                        controller = controller->next;
+                    }
+                    if (controller)
+                    {
+                        configured_controller = controller;
+                    }
+                }
+            }
+        }
+        
+        fclose(fp);
+    }
+
+    selected_controller = configured_controller;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * sound_save_choices                                                        *
+ *                                                                           *
+ * Write the volume levels choices file.                                     *
+ *---------------------------------------------------------------------------*/
+
+void sound_save_choices(void)
+{
+    FILE *fp;
+    FILE *fp2;
+    char buffer[256];
+    
+    if (vidcmix)
+    {
+        int volume;
+        
+        /* Turn dB*16 back into 3dB per 16 volume */
+        configured_controller->channels[0].original_gain = configured_controller->channels[0].selected_gain;
+        volume = sound_db_to_volume(configured_controller->channels[0].original_gain);
+
+        /* Cram into 3 sound CMOS bits */
+        volume = (volume - 1) / 18;
+        cmos_sound &= ~0x70;
+        cmos_sound |= (volume << 4);
+        write_cmos_value(SoundCMOS, cmos_sound);
+
+        return;
+    }
+
+    fp = fopen(ChoicesWrite, "w");
+    if (fp != NULL)
+    {
+        fp2 = fopen(BlankChoices, "r");
+        if (fp2 != NULL)
+        {
+            bool more;
+            do
+            {
+                more = fgets(buffer, sizeof buffer, fp2);
+                if (more) fputs(buffer, fp);
+            }
+            while (more);
+            fclose(fp2);
+        }
+        if (multidevice && selected_controller)
+        {
+            original_controller = selected_controller;
+            fprintf(fp, "X Audio %s\n", original_controller->config_id);
+        }
+        for (controller_list_entry_t *controller = controllers; controller; controller = controller->next)
+        {
+            for (int i = 0; i < controller->nchannels; i++)
+            {
+                controller->channels[i].original_gain = controller->channels[i].selected_gain;
+                controller->channels[i].original_mute = controller->channels[i].selected_mute;
+                fprintf(fp, "MixVolume %s %d %u %c %d\n", controller->config_id, controller->channels[i].category, controller->channels[i].index, controller->channels[i].original_mute + '0', controller->channels[i].original_gain);
+            }
+        }
+        fclose(fp);
+    }
+    _swix(OS_File, _INR(0,2),
+          OSFile_SetType,
+          ChoicesWrite,
+          FileType_Obey);
+}
+
+
+/*-------------------------------------------------------------------------------*
+ * sound_reflect_gadget_state                                                    *
+ *                                                                               *
+ * Fade muted sliders, change help messages and set volumes etc to match display *
+ *                                                                               *
+ * In: window_id = toolbox ID of sound configuration window.                     *
+ *-------------------------------------------------------------------------------*/
+
+int sound_reflect_gadget_state(int event_code, ToolboxEvent *event_block, IdBlock *id_block, void *handle)
+{
+    int window_id = id_block->self_id;
+    (void)handle;
+    (void)event_code;
+    (void)event_block;
+
+    int voiceindex = -1;
+    error_trap(stringset_get_selected(1, window_id, VoicesStringSet, &voiceindex), 0);
+    int voiceslot;
+    if (voiceindex != -1 && (voiceslot = menu_to_voice_map[voiceindex]) != -1)
+    {
+        _swix(Sound_AttachVoice, _INR(0,1), 1, voiceslot);
+    }
+    int quiet;
+    error_trap(radiobutton_get_state(0, window_id, QuietRadio, &quiet, NULL), 0);
+    int old_volume;
+    _swix(OS_Byte, _INR(0,2)|_OUT(1),
+          OsByte_RW_BELLVolume,
+          0,
+          255,
+          &old_volume);
+    if (quiet && old_volume != 0xD0)
+    {
+        _swix(OS_Byte, _INR(0,2),
+              OsByte_RW_BELLVolume,
+              0xD0,
+              0);
+    }
+    else if (!quiet && old_volume != 0x90)
+    {
+        _swix(OS_Byte, _INR(0,2),
+              OsByte_RW_BELLVolume,
+              0x90,
+              0);
+    }
+
+    if (multidevice)
+    {
+        int controllerindex = -1;
+        error_trap(stringset_get_selected(1, window_id, DeviceStringSet, &controllerindex), 0);
+        if ((controllerindex != -1) && (!selected_controller || (selected_controller->index != controllerindex)))
+        {
+            selected_controller = controllers;
+            while (selected_controller && (selected_controller->index != controllerindex))
+            {
+                selected_controller = selected_controller->next;
+            }
+            sound_switch_device();
+            /* Set up sliders for this new controller */
+            setup_sliders();
+            return 1;
+        }
+    }
+        
+    /* Controller not changed, so make controller state match sliders */
+    if (!selected_controller)
+    {
+        return 1;
+    }
+    for (int i = 0; i < selected_controller->nchannels; i++)
+    {
+        int gain;
+        int mute;
+        unsigned int slider_flags;
+        error_trap(slider_get_value(0, window_id, 2 + i * 4, &gain), 0);
+        error_trap(optionbutton_get_state(0, window_id, 3 + i * 4, &mute), 0);
+        error_trap(gadget_get_flags(0, window_id, 2 + i * 4, &slider_flags), 0);
+        if (!selected_controller->channels[i].fixed && (slider_flags & Gadget_Faded) && !mute)
+        {
+            slider_flags &= ~Gadget_Faded;
+            error_trap(gadget_set_flags(0, window_id, 2 + i * 4, slider_flags), 0);
+            char token[11] = "HelpS";
+            strcat(token, selected_controller->channels[i].token_suffix);
+            char *help_message = (char *)messages_lookup_withparam(token, selected_controller->channels[i].name);
+            error_trap(gadget_set_help_message(0, window_id, 2 + i * 4, help_message), 0);
+        }
+        else if (!(slider_flags & Gadget_Faded) && mute)
+        {
+            slider_flags |= Gadget_Faded;
+            error_trap(gadget_set_flags(0, window_id, 2 + i * 4, slider_flags), 0);
+            char token[12] = "HelpSM";
+            strcat(token, selected_controller->channels[i].token_suffix);
+            char *help_message = (char *)messages_lookup_withparam(token, selected_controller->channels[i].name);
+            error_trap(gadget_set_help_message(0, window_id, 2 + i * 4, help_message), 0);
+        }
+        if (!selected_controller->channels[i].fixed)
+        {
+            selected_controller->channels[i].selected_gain = gain;
+            selected_controller->channels[i].selected_mute = mute;
+        }
+    }
+
+    /* Apply settings for all controllers, not just the visible one (required when e.g. restoring defaults) */
+    for (controller_list_entry_t *controller = controllers; controller; controller = controller->next)
+    {
+        for (int i = 0; i < controller->nchannels; i++)
+        {        
+            if (!controller->channels[i].fixed)
+            {
+                if (vidcmix)
+                {
+                    error_trap(_swix(Sound_Volume, _IN(0), sound_db_to_volume(controller->channels[0].selected_gain)), 0);
+                }
+                else
+                {
+                    error_trap(_swix(SoundCtrl_SetMix, _INR(0,4),
+                                     controller->mixer_id,
+                                     controller->channels[i].category,
+                                     controller->channels[i].index,
+                                     controller->channels[i].selected_mute,
+                                     controller->channels[i].selected_gain), 0);
+                }
+            }
+        }
+    }
+
+    return 1;
+}
+
+
+/*-------------------------------------------------------------------------------*
+ * sound_reset_to_configured                                                     *
+ *                                                                               *
+ * Sets window to reflect the configured settings                                *
+ *                                                                               *
+ * In: window_id = toolbox ID of sound configuration window.                     *
+ *-------------------------------------------------------------------------------*/
+
+void sound_reset_to_configured(int window_id)
+{
+    sound_read_write_cmos_settings(ReadCMOSSettings, window_id);
+    sound_read_choices();
+
+    if (selected_controller)
+    {
+        if (multidevice)
+        {
+            error_trap(stringset_set_selected(1, window_id, DeviceStringSet, (char*) selected_controller->index), 0);
+            sound_switch_device();
+        }
+
+        setup_sliders();
+    }
+
+    sound_reflect_gadget_state(0, NULL, &(IdBlock){ .self_id = window_id }, NULL);
+}
+
+
+/*-------------------------------------------------------------------------------*
+ * sound_reset_to_defaults                                                       *
+ *                                                                               *
+ * Sets window to reflect the default settings                                   *
+ *                                                                               *
+ * In: window_id = toolbox ID of sound configuration window.                     *
+ *-------------------------------------------------------------------------------*/
+
+void sound_reset_to_defaults(int window_id)
+{
+    for (controller_list_entry_t *controller = controllers; controller; controller = controller->next)
+    {
+        for (int i = 0; i < controller->nchannels; i++)
+        {
+            if (!controller->channels[i].fixed)
+            {
+                controller->channels[i].selected_gain = 0;
+                controller->channels[i].selected_mute = controller->channels[i].muted_by_default;
+            }
+        }
+    }
+
+    setup_sliders();
+
+    error_trap(stringset_set_selected(1, window_id, VoicesStringSet, 0), 0);
+    error_trap(radiobutton_set_state(0, window_id, QuietRadio, 1), 0);
+    sound_reflect_gadget_state(0, NULL, &(IdBlock){ .self_id = window_id }, NULL);
+}
+
+
+/*-------------------------------------------------------------------------------*
+ * sound_restore_original_settings                                               *
+ *                                                                               *
+ * Sets sound system back how it was before we started, or when the user last    *
+ * clicked Set. For use when the user clicks Cancel                              *
+ *-------------------------------------------------------------------------------*/
+
+void sound_restore_original_settings(void)
+{
+    if (vidcmix)
+    {
+        _swix(Sound_Volume, _IN(0), sound_db_to_volume(original_controller->channels[0].original_gain));
+    }
+    else
+    {
+        if (multidevice)
+        {
+            selected_controller = original_controller;
+            sound_switch_device();
+        }
+        for (controller_list_entry_t *controller = controllers; controller; controller = controller->next)
+        {
+            for (int i = 0; i < controller->nchannels; i++)
+            {
+                if (!controller->channels[i].fixed)
+                {
+                    _swix(SoundCtrl_SetMix, _INR(0,4),
+                          controller->mixer_id,
+                          controller->channels[i].category,
+                          controller->channels[i].index,
+                          controller->channels[i].original_mute,
+                          controller->channels[i].original_gain);
+                }
+            }
+        }
+    }
+    _swix(Sound_AttachVoice, _INR(0,1),
+          1,
+          1 + (cmos_sound & 0x0f));
+    _swix(OS_Byte, _INR(0,2),
+          OsByte_RW_BELLVolume,
+          cmos_loud & 2 ? 0x90 : 0xD0,
+          0);
+}
+
+

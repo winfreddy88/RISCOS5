@@ -1,0 +1,615 @@
+/** @file
+
+  Implements FTDIDriver DeviceFS driver incl. IOTCL Operations.
+
+  */
+/* Created 28.04.2010 T. Milius
+   Changed 28.04.2011 T. Milius wrong pins at reading of ioctl corrected
+   Changed 03.11.2012 T. Milius Enable/Disable DTR/RTS */
+/* Copyright (c) 2011 by Thomas Milius Stade, Germany
+* All rights reserved.
+*
+* Redistribution and use in source and binary forms, with or without
+* modification, are permitted provided that the following conditions are met:
+*     * Redistributions of source code must retain the above copyright
+*       notice, this list of conditions and the following disclaimer.
+*     * Redistributions in binary form must reproduce the above copyright
+*       notice, this list of conditions and the following disclaimer in the
+*       documentation and/or other materials provided with the distribution.
+*     * Neither the name of Thomas Milius Stade, Germany nor the
+*       names of its contributors may be used to endorse or promote products
+*       derived from this software without specific prior written permission.
+*
+* THIS SOFTWARE IS PROVIDED BY Thomas Milius Stade, Germany ``AS IS'' AND ANY
+* EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+* WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+* DISCLAIMED. IN NO EVENT SHALL Thomas Milius Stade, Germany BE LIABLE FOR ANY
+* DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+* (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+* LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+* ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+* (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+* SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE. */
+/* RISC OS */
+
+/* !!!!!!!!!! libraries !!!!!!!!!! */
+/* ---------- ANSI-C ---------- */
+
+/* ------------ RISC OS ------------ */
+/* Missing in oslib. */
+#define DeviceFSCallDevice_MonitorTX 0x0C
+#define DeviceFSCallDevice_MonitorRX 0x0D
+#include "USBDevFS.h"
+
+/* ------------ Own ------------ */
+#include "error.h"
+#include "serial.h"
+#include "callback.h"
+#ifdef DEBUG
+#include "debug.h"
+#endif
+#include "driver.h"
+
+/* !!!!!!!!!!! definitions !!!!!!!!!! */
+
+/* !!!!!!!!!! data structures !!!!!!!!!! */
+
+/* !!!!!!!!!! support functions !!!!!!!!!! */
+/* ---------- IOTCL operations ---------- */
+/** Performs IOCTL Operations determined by a given IOCTL_Block on a given FTDI Device.
+    Returns NULL if all ok or a pointer to a RISC OS error block. */
+_kernel_oserror *perform_ioctl(struct ftdi_device_structure *ftdi_device,
+                               int *ioctl_block)
+{
+bool read_recognized;
+int ioctl_result;
+_kernel_oserror *error_os;
+
+if (!ioctl_block) return generate_error(FTDI_ERROR_IOCTL_BLOCK);
+/* lets assume that serial has reason group code 0 even
+   original serial driver can cope with arbitrary groups
+   if passed to the driver. */
+if (ioctl_block[0] == 0x00000000) {
+  /* Do nothing */
+  return NULL;
+  }
+if (ftdi_device->risc_os_ftdi->ftdi.actual_bitmode[ftdi_device->ftdi_port_number] == 0) {
+  /* Some commands must be performed at reading and writing.
+     Some are independent of this */
+  switch (ioctl_block[0] & 0x3FFFFFFF) {
+    case 0x0000000A: {
+      /* Flush buffer */
+      /* ??? Pure task of DeviceFS. */
+      }
+    break;
+    case 0x0000000B: {
+      /* Clear buffer */
+      if (!ftdi_usb_purge_buffers(&ftdi_device->risc_os_ftdi->ftdi,
+                                  ftdi_device->ftdi_port_number)) {
+        return generate_error(FTDI_ERROR_PURGE_BUFFERS);
+        }
+      }
+    break;
+    default: {
+      read_recognized=false;
+      /* Read first and then write new value if desired. */
+      /* Read operations */
+      switch(ioctl_block[0] & 0x7FFFFFFF) {
+        case 0x40000006: {
+          /* Read control lines */
+          unsigned char pin_info;
+
+          if (!ftdi_usb_read_pins(&ftdi_device->risc_os_ftdi->ftdi,
+                                  &pin_info,
+                                  ftdi_device->ftdi_port_number)) {
+            return generate_error(FTDI_ERROR_READ_PINS);
+            }
+          /* Convert FTDI to RISC OS IOCTL*/
+          ioctl_result=0;
+          if (pin_info & 0x01) ioctl_result|=0x00000001;
+          if (pin_info & 0x02) ioctl_result|=0x00000002;
+          if (pin_info & 0x10) ioctl_result|=0x00010000;
+          if (pin_info & 0x20) ioctl_result|=0x00020000;
+          if (pin_info & 0x40) ioctl_result|=0x00040000;
+          if (pin_info & 0x80) ioctl_result|=0x00080000;
+          /* FIFO info? */
+          read_recognized=true;
+          }
+        break;
+        case 0x40000008: {
+          /* Read number of allowed baud rates */
+          ioctl_result=ftdi_device->risc_os_ftdi->ftdi.allowed_configurations.serial[ftdi_device->ftdi_port_number].number_of_baudrates;
+          read_recognized=true;
+          }
+        break;
+        case 0x40000009: {
+          /* Read a certain allowed baud rate */
+          if (ioctl_block[1] >= ftdi_device->risc_os_ftdi->ftdi.allowed_configurations.serial[ftdi_device->ftdi_port_number].number_of_baudrates) {
+            return generate_error(FTDI_ERROR_INVALID_BAUDRATE);
+            }
+          ioctl_result=ftdi_device->risc_os_ftdi->ftdi.allowed_configurations.serial[ftdi_device->ftdi_port_number].baudrate[ioctl_block[1]];
+          read_recognized=true;
+          }
+        break;
+        }
+      /* Write operations */
+      switch(ioctl_block[0] & 0xBFFFFFFF) {
+        case 0x80000001: {
+          /* Set baud rate */
+          if ((error_os=set_baudrate(&ftdi_device->risc_os_ftdi->ftdi,
+                                     ioctl_block[1],
+                                     ftdi_device->ftdi_port_number)) != NULL) {
+            return error_os;
+            }
+          }
+        break;
+        case 0x80000002: {
+          /* Set data format */
+          if ((error_os=set_data_format(&ftdi_device->risc_os_ftdi->ftdi,
+                                        ioctl_block[1] & 0x000000FF,
+                                        (ioctl_block[1] & 0x0000FF00)>>8,
+                                        (ioctl_block[1] & 0x00FF0000)>>16,
+                                        ftdi_device->ftdi_port_number)) != NULL) {
+            return error_os;
+            }
+          }
+        break;
+        case 0x80000003: {
+          /* Set handshaking */
+          if ((error_os=set_flowcontrol(&ftdi_device->risc_os_ftdi->ftdi,
+                                        ioctl_block[1],
+                                        ftdi_device->ftdi_port_number)) != NULL) {
+            return error_os;
+            }
+          }
+        break;
+        case 0x80000004: {
+          /* Set buffer size */
+          /* Can't be influenced, so ignore. */
+          }
+        break;
+        case 0x80000005: {
+          /* Set buffer threshold */
+          /* Can't be influenced, so ignore. */
+          }
+        break;
+        case 0x80000006: {
+          /* Set control lines */
+          bool result, pin_on;
+
+          result=true;
+          /* Two pins are output.
+             RISC OS comes in but FTDI must be given. */
+          if ((ioctl_block[1] & 0x00000001) == 0) pin_on=false;
+          else pin_on=true;
+          if (!ftdi_usb_set_pins(&ftdi_device->risc_os_ftdi->ftdi,
+                                 FTDI_PINS_DTR,
+                                 pin_on,
+                                 ftdi_device->ftdi_port_number)) {
+            result=false;
+            }
+          if ((ioctl_block[1] & 0x00000002) == 0) pin_on=false;
+          else pin_on=true;
+          if (!ftdi_usb_set_pins(&ftdi_device->risc_os_ftdi->ftdi,
+                                 FTDI_PINS_RTS,
+                                 pin_on,
+                                 ftdi_device->ftdi_port_number)) {
+            result=false;
+            }
+          if (!result) {
+            return generate_error(FTDI_ERROR_SET_PINS);
+            }
+          }
+        break;
+        case 0x80000007: {
+          /* Set fifo threshold */
+          /* Can't be influenced, so ignore. */
+          }
+        break;
+        default: {
+          if (!read_recognized) {
+            return generate_error(FTDI_ERROR_IOCTL_INVALID_OP);
+            }
+          }
+        }
+      if (read_recognized) {
+        /* Return temporarily stored result */
+        ioctl_block[1]=ioctl_result;
+        }
+      }
+    }
+  /* For ignored operations etc. */
+  return NULL;
+  }
+return generate_error(FTDI_ERROR_UNSUPPORTED_MODE);
+}
+
+/* !!!!!!!!!! functions !!!!!!!!!! */
+_kernel_oserror *driver_internal(struct common_structure *common,
+                                 _kernel_swi_regs *regs,
+                                 void *pw)
+{
+int irq_state;
+int *special_field_info;
+int io_info;
+struct ftdi_device_structure *ftdi_device;
+_kernel_oserror *error_os;
+
+#ifdef DEBUG
+debug_writef(DEBUG_LEVEL_TRANSMISSION,
+             "Driver Action %x Ref %x %x PW %x\n",
+             regs->r[0],
+             regs->r[2],
+             regs->r[8],
+             pw);
+#endif
+/* Device determined by private word.
+   The handle is used for the the streams as IO. */
+ftdi_device=(struct ftdi_device_structure *) regs->r[8];
+/* Only the lowest 2 Bits are of interest. */
+io_info=regs->r[2] & 0x00000003;
+if (ftdi_device == NULL) return generate_error(FTDI_ERROR_NO_DEVICE);
+switch (regs->r[0]) {
+  case DeviceFSCallDevice_Initialise: {
+    /* Device determined by private word as setup during
+       registration. */
+    if ((regs->r[3] & 0x00000001) == 0) {
+      ftdi_device->input.file_handle=FTDI_NO_FILE_HANDLE;
+      ftdi_device->input.devicefs_stream_handle=regs->r[2];
+      /* I handle. However for Stream created Upcall a unique reference is required therefore mix in
+         a pointer to device structure which is word aligned and lowest 2 Bits free. */
+      regs->r[2]=(int) ftdi_device | 1;
+      }
+    else {
+      ftdi_device->output.file_handle=FTDI_NO_FILE_HANDLE;
+      ftdi_device->output.devicefs_stream_handle=regs->r[2];
+      /* O handle. However for Stream created Upcall a unique reference is required therefore mix in
+         a pointer to device structure which is word aligned and lowest 2 Bits free. */
+      regs->r[2]=(int) ftdi_device | 2;
+      }
+#ifdef DEBUG
+      debug_writef(DEBUG_LEVEL_STREAM,
+                   "Stream initalize %x %d\n",
+                   ftdi_device->input.devicefs_stream_handle,
+                   regs->r[2]);
+#endif
+    if (regs->r[6] != NULL) {
+      /* Evaluate special field */
+      special_field_info=(int *) regs->r[6];
+      if (special_field_info[0] != 0xDEADDEAD) {
+        if ((error_os=set_baudrate(&ftdi_device->risc_os_ftdi->ftdi,
+                                   special_field_info[0],
+                                   (unsigned char) ftdi_device->ftdi_port_number)) != NULL) {
+          return error_os;
+          }
+        }
+/* ??? Datenformat noch unklar. Alle oder auch einzelne. */
+      if ((special_field_info[1] != 0xDEADDEAD) &&
+          (special_field_info[2] != 0xDEADDEAD) &&
+          (special_field_info[3] != 0xDEADDEAD)) {
+        if ((error_os=set_data_format(&ftdi_device->risc_os_ftdi->ftdi,
+                                      (unsigned char) special_field_info[1],
+                                      (unsigned char) special_field_info[2],
+                                      (unsigned char) special_field_info[3],
+                                      (unsigned char) ftdi_device->ftdi_port_number)) != NULL) {
+          return error_os;
+          }
+        }
+      if (special_field_info[4] != 0xDEADDEAD) {
+        if ((error_os=set_flowcontrol(&ftdi_device->risc_os_ftdi->ftdi,
+                                      special_field_info[4],
+                                      (unsigned char) ftdi_device->ftdi_port_number)) != NULL) {
+          return error_os;
+          }
+        }
+#ifdef DEBUG
+      debug_writef(DEBUG_LEVEL_STREAM,
+                   "Stream initialize performed %x\n",
+                   ftdi_device);
+#endif
+      }
+    }
+  break;
+  case DeviceFSCallDevice_Terminate: {
+    /* Disable handshake lines.*/
+    ftdi_usb_set_pins(&ftdi_device->risc_os_ftdi->ftdi,
+                                     FTDI_PINS_RTS,
+                                     false,
+                                     ftdi_device->ftdi_port_number);
+    ftdi_usb_set_pins(&ftdi_device->risc_os_ftdi->ftdi,
+                                     FTDI_PINS_DTR,
+                                     false,
+                                     ftdi_device->ftdi_port_number);
+    /* FTDI Driver is registered for each device.
+       So it will be called for each registration.
+       This means that it is not allowed to close all
+       connections. The local handles are I or O
+       for each device indicated by R8. R2=0 will close them all. */
+    if (io_info == 0) {
+      /* Close all related streams. */
+      io_info=0x00000003;
+      }
+    if (((io_info & 0x00000001) != 0) &&
+        /* Necassary if device is plugged off and no stream has been opened. */
+        (ftdi_device->input.stream_valid)) {
+      ftdi_device->input.stream_valid=false;
+      ftdi_device->input.file_handle=FTDI_NO_FILE_HANDLE;
+      ftdi_device->input.bytes_requested=0;
+      upcall_translation_remove(&common->upcall_translation,
+                                ftdi_device->input.risc_os_buffer_info.handle);
+      }
+    if (((io_info & 0x00000002) != 0) &&
+        (ftdi_device->output.stream_valid)){
+      ftdi_device->output.stream_valid=false;
+      ftdi_device->output.file_handle=FTDI_NO_FILE_HANDLE;
+      }
+#ifdef DEBUG
+    debug_writef(DEBUG_LEVEL_STREAM,
+                 "Stream terminated %x\n",
+                 ftdi_device);
+#endif
+    }
+  break;
+  case DeviceFSCallDevice_TxWakeUp: {
+#ifdef DEBUG
+    debug_writef(DEBUG_LEVEL_TRANSMISSION,
+                 "Transfer send wakeup %x %d\n",
+                 ftdi_device,
+                 regs->r[3]);
+#endif
+    if ((irq_state=_kernel_irqs_disabled()) == 0) _kernel_irqs_off;
+    if ((error_os=callback_generate(ftdi_device->risc_os_ftdi,
+                                    FTDI_UPCALL_IO_O,
+                                    common->ws)) != NULL) {
+      if (irq_state == 0) _kernel_irqs_on;
+      return error_os;
+      }
+    if (irq_state == 0) _kernel_irqs_on;
+    }
+  break;
+  case DeviceFSCallDevice_RxWakeUp: {
+#ifdef DEBUG
+    debug_writef(DEBUG_LEVEL_TRANSMISSION,
+                 "Transfer read wakeup %x %d\n",
+                 ftdi_device,
+                 regs->r[3]);
+#endif
+    if ((irq_state=_kernel_irqs_disabled()) == 0) _kernel_irqs_off;
+    /* Note number of requested Bytes as a hint how much data
+       may be fetched. */
+    /* taken from USB-driver:
+       total length has always been passed in R3, although not documented */
+    ftdi_device->input.bytes_requested=regs->r[3];
+    if ((error_os=callback_generate(ftdi_device->risc_os_ftdi,
+                                    FTDI_UPCALL_IO_I,
+                                    common->ws)) != NULL) {
+      if (irq_state == 0) _kernel_irqs_on;
+      return error_os;
+      }
+    if (irq_state == 0) _kernel_irqs_on;
+    }
+  break;
+  case DeviceFSCallDevice_RxSleep: {
+    /* Ignore */
+    }
+  break;
+  case DeviceFSCallDevice_EnumDir: {
+    /* Ignore */
+    }
+  break;
+  case DeviceFSCallDevice_TxCreateBuffer: {
+    /* ??? Ignore */
+    }
+  break;
+  case DeviceFSCallDevice_RxCreateBuffer: {
+    /* ??? Ignore */
+    }
+  break;
+  case DeviceFSCallDevice_Halt: {
+/* ??? Müßte XON/XOFF bzw. RTS Manipulation sein. Merken des status
+   Kommt aber durch die ganzen Puffer nicht exakt. --> Sollte
+   ich evt. selbst in die Hand nehmen.
+   Stall auf USB Seite wg. Mehrfachkanalnutzung auch
+   nicht besonders sinnvoll. Außerdem läuft auf FTDI-Chip-Seite
+   irgendwann der Puffer über. ??? */
+    }
+  break;
+  case DeviceFSCallDevice_Resume: {
+/* ??? siehe oben. */
+    }
+  break;
+  case DeviceFSCallDevice_EndOfData: {
+    /* Hypothetical because there is a permanent polling of data.
+       So every time data may alert.
+       Concept to provide non blocking with Fileswitch DeviceFS:
+       To provide return in case that no data is pending the device
+       is registered with ParentFlag_MonitorEOF and the DeviceFS EOF default will be kept.
+       This also works for OS_GBPB. Non blocking is also a parameter but it is evaluated
+       one step after EOF. We don't worry about. */
+    }
+  break;
+  case DeviceFSCallDevice_StreamCreated: {
+#ifdef DEBUG
+    debug_writef(DEBUG_LEVEL_STREAM,
+                 "Stream created %x %d %x\n",
+                 ftdi_device,
+                 io_info,
+                 regs->r[3]);
+#endif
+    /* Enable handshake lines.*/
+    ftdi_usb_set_pins(&ftdi_device->risc_os_ftdi->ftdi,
+                                     FTDI_PINS_DTR,
+                                     true,
+                                     ftdi_device->ftdi_port_number);
+    ftdi_usb_set_pins(&ftdi_device->risc_os_ftdi->ftdi,
+                                     FTDI_PINS_RTS,
+                                     true,
+                                     ftdi_device->ftdi_port_number);
+    /* Enable transfer */
+    if ((io_info & 0x00000001) != 0) {
+      if ((error_os=get_buffer_info(regs->r[3],
+                                    &ftdi_device->input.risc_os_buffer_info)) != NULL) {
+        return error_os;
+        }
+      if ((error_os=upcall_translation_add(&common->upcall_translation,
+                                           ftdi_device->input.risc_os_buffer_info.handle,
+                                           FTDI_UPCALL_IO_I_DFS,
+                                           ftdi_device->risc_os_ftdi)) != NULL) {
+        return error_os;
+        }
+      ftdi_device->input.stream_valid=true;
+      ftdi_device->input.bytes_requested=0;
+      }
+    if ((io_info & 0x00000002) != 0) {
+      if ((error_os=get_buffer_info(regs->r[3],
+                                    &ftdi_device->output.risc_os_buffer_info)) != NULL) {
+        return error_os;
+        }
+      ftdi_device->output.stream_valid=true;
+      }
+    }
+  break;
+  case DeviceFSCallDevice_MonitorTX: {
+    /* Not implemented yet */
+    }
+  break;
+  case DeviceFSCallDevice_MonitorRX: {
+    /* Not implemented yet */
+    }
+  break;
+  case DeviceFSCallDevice_IOCtl: {
+    return perform_ioctl(ftdi_device,
+                         (int *) regs->r[3]);
+    }
+  break;
+  /* Device specific operations */
+  case FTDI_CALLDEVICE_RESET: {
+    if (!ftdi_usb_reset(&ftdi_device->risc_os_ftdi->ftdi,
+                        ftdi_device->ftdi_port_number)) {
+      return generate_error(FTDI_ERROR_FTDI_RESET);
+      }
+    }
+  break;
+  case FTDI_CALLDEVICE_FLOW_CHARS: {
+    unsigned long flow_xon_char;
+    unsigned long flow_xoff_char;
+
+    /* Note old values */
+    flow_xon_char=regs->r[3];
+    flow_xoff_char=regs->r[4];
+    /* Set new values */
+    ftdi_device->risc_os_ftdi->ftdi.allowed_configurations.serial[ftdi_device->ftdi_port_number].flow_xon_char=regs->r[3];
+    ftdi_device->risc_os_ftdi->ftdi.allowed_configurations.serial[ftdi_device->ftdi_port_number].flow_xoff_char=regs->r[4];
+    /* Return old values */
+    regs->r[3]=flow_xon_char;
+    regs->r[4]=flow_xoff_char;
+    }
+  break;
+  case FTDI_CALLDEVICE_MODEM_STATUS: {
+    if (!ftdi_usb_read_modem_status(&ftdi_device->risc_os_ftdi->ftdi,
+                                    (unsigned char *) &regs->r[3],
+                                    ftdi_device->ftdi_port_number)) {
+      return generate_error(FTDI_ERROR_READ_MODEM_STATUS);
+      }
+    }
+  break;
+  case FTDI_CALLDEVICE_EVENT_CHAR: {
+    if (!ftdi_usb_set_event_char(&ftdi_device->risc_os_ftdi->ftdi,
+                                 (unsigned char) regs->r[3],
+                                 true,
+                                 ftdi_device->ftdi_port_number)) {
+      return generate_error(FTDI_ERROR_EVENT_CHAR);
+      }
+    }
+  break;
+  case FTDI_CALLDEVICE_ERROR_CHAR: {
+    if (!ftdi_usb_set_error_char(&ftdi_device->risc_os_ftdi->ftdi,
+                                 (unsigned char) regs->r[3],
+                                 true,
+                                 ftdi_device->ftdi_port_number)) {
+      return generate_error(FTDI_ERROR_ERROR_CHAR);
+      }
+    }
+  break;
+  case FTDI_CALLDEVICE_LATENCY_TIMER: {
+    if (regs->r[3] == 0) {
+      /* read */
+      unsigned char timer;
+
+      if (!ftdi_usb_get_latency_timer(&ftdi_device->risc_os_ftdi->ftdi,
+                                      &timer,
+                                      ftdi_device->ftdi_port_number)) {
+        return generate_error(FTDI_ERROR_GET_LATENCY_TIMER);
+        }
+      regs->r[3]=timer;
+      }
+    else {
+      /* write */
+      if (!ftdi_usb_set_latency_timer(&ftdi_device->risc_os_ftdi->ftdi,
+                                      (unsigned char) regs->r[3],
+                                      ftdi_device->ftdi_port_number)) {
+        return generate_error(FTDI_ERROR_SET_LATENCY_TIMER);
+        }
+      }
+    }
+  break;
+  case FTDI_CALLDEVICE_BITMODE: {
+    bool result;
+
+    switch(regs->r[3]) {
+      case 0: {
+        result=ftdi_usb_enable_io_mode(&ftdi_device->risc_os_ftdi->ftdi,
+                                       ftdi_device->ftdi_port_number);
+
+        }
+      break;
+      default: {
+        return generate_error(FTDI_ERROR_DRIVER_WRONG_PARAMS);
+        }
+      }
+    if (!result) {
+      return generate_error(FTDI_ERROR_UNSUPPORTED_MODE);
+      }
+    }
+  break;
+  case FTDI_CALLDEVICE_GET_EEPROM: {
+    if ((regs->r[3] == NULL) ||
+        (regs->r[4] == 0)) {
+      return generate_error(FTDI_ERROR_DRIVER_WRONG_PARAMS);
+      }
+    if (!ftdi_usb_read_eeprom(&ftdi_device->risc_os_ftdi->ftdi,
+                              (unsigned char *) regs->r[3],
+                              (unsigned short) regs->r[4],
+                              (unsigned short) regs->r[5])) {
+      return generate_error(FTDI_ERROR_EEPROM_READ);
+      }
+    }
+  break;
+  case FTDI_CALLDEVICE_SET_EEPROM: {
+    if (!ftdi_device->risc_os_ftdi->ftdi.allowed_configurations.eeprom_writeable) {
+      return generate_error(FTDI_ERROR_EEPROM_RIGHTS);
+      }
+    if (regs->r[3] == NULL) {
+      return generate_error(FTDI_ERROR_DRIVER_WRONG_PARAMS);
+      }
+    if (!ftdi_usb_write_eeprom(&ftdi_device->risc_os_ftdi->ftdi,
+                               (unsigned char *) regs->r[3])) {
+      return generate_error(FTDI_ERROR_EEPROM_WRITE);
+      }
+    }
+  break;
+  case FTDI_CALLDEVICE_EREASE_EEPROM: {
+    if (!ftdi_device->risc_os_ftdi->ftdi.allowed_configurations.eeprom_writeable) {
+      return generate_error(FTDI_ERROR_EEPROM_RIGHTS);
+      }
+    if (!ftdi_usb_erase_eeprom(&ftdi_device->risc_os_ftdi->ftdi)) {
+      return generate_error(FTDI_ERROR_EEPROM_ERASE);
+      }
+    }
+  break;
+  default: {
+    return generate_error(FTDI_ERROR_DRIVER_INVALID_COMMAND);
+    }
+  }
+return NULL;
+}

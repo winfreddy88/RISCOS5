@@ -1,0 +1,541 @@
+/* Copyright 2003 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*-*-C-*-
+ *
+ * Drag-n-drop
+ *
+ * This module implements the "sender" side of drag-n-drop, as well
+ * as some handy functions for the "receiver" side to use.  The
+ * "receiver" side is mostly handled by individual code for document,
+ * etc.
+ */
+
+#include "resed.h"
+
+static Bool truesize;
+static RectRec dragbbox;            /* pointer-relative, millipoints */
+static DragDropCallback callback;
+static Bool dragfinished;
+
+static DragDropCallbackRec dd;
+
+/*
+ ****************************************************************
+ * SENDER
+ ****************************************************************
+ */
+
+
+/*
+ * Reset the mouse pointer to its default
+ */
+
+static void reset_pointer (void)
+{
+    (void) _swix(Wimp_SetPointerShape, _INR(0,1),
+                 1, -1);
+}
+
+
+/*
+ * Do a dragbox, using the millipoint-specified
+ * pointer-relative box 'dragbbox'.  Handles types 0, 5 and 7.
+ */
+
+static error * do_dragbox (int type)
+{
+    if (type == 0)
+        return _swix(Wimp_DragBox, _IN(1),
+                     0);
+
+    if (type == 5 || type == 7)
+    {
+        PointerInfoRec mouse;
+        DragBoxRec box;
+
+        ER ( _swix(Wimp_GetPointerInfo, _IN(1),
+                   &mouse) );
+        box.type = type;
+        box.initial.minx = dragbbox.minx / 400 + mouse.position.x;
+        box.initial.maxx = dragbbox.maxx / 400 + mouse.position.x;
+        box.initial.miny = dragbbox.miny / 400 + mouse.position.y;
+        box.initial.maxy = dragbbox.maxy / 400 + mouse.position.y;
+        box.constrain.minx = box.constrain.miny = -1000000;
+        box.constrain.maxx = box.constrain.maxy =  1000000;
+        return _swix(Wimp_DragBox, _IN(1),
+                     &box);
+    }
+    return NULL;
+}
+
+
+/*
+ * Interactor for drag and drop
+ */
+
+static error * dd_interactor (unsigned int event, int *buf, void *closure, Bool *consumed)
+{
+    int messbuf[64];
+    MessageDraggingPtr msg = (MessageDraggingPtr) messbuf;
+
+    if (buf == NULL)            /* forcibly cancelled */
+    {
+        /* If there is a claimant, inform it that we're backing out */
+
+        dprintf("Aborting drag ");
+        if (dd.claimant != -1)
+        {
+            dprintf("& telling claimant ");
+            msg->header.yourref = dd.claimantsref;
+            msg->header.messageid = MESSAGE_DRAGGING;
+            msg->flags = BIT(4);
+            msg->header.size = sizeof (MessageDraggingRec);
+            (void) _swix(Wimp_SendMessage, _INR(0,2),
+                         EV_USER_MESSAGE, msg, dd.claimant);
+            dd.claimant = -1;
+
+            if (dd.claimantsflags & BIT(0))
+                reset_pointer ();
+        }
+
+dprintf("\n");
+        return do_dragbox (0);
+    }
+
+dprintf("dd_interactor in ");
+    switch (event)
+    {
+    case EV_NULL_REASON_CODE:
+        block
+        {
+            *consumed = TRUE;
+dprintf("NULL ");
+            ER ( _swix(Wimp_GetPointerInfo, _IN(1),
+                       &dd.mouse) );
+            msg->header.yourref = (dd.claimant == -1 ? 0 : dd.claimantsref);
+            msg->header.messageid = MESSAGE_DRAGGING;
+            msg->windowhandle = dd.mouse.windowhandle;
+            msg->iconhandle = dd.mouse.iconhandle;
+            msg->position = dd.mouse.position;
+            msg->flags = dd.dragflags;
+            if (truesize)
+                msg->bbox = dragbbox;
+            else
+            {
+                msg->bbox.minx = msg->bbox.miny = 1;
+                msg->bbox.maxx = msg->bbox.maxy = 0;
+            }
+            block
+            {
+                int n = 0;
+                do
+                {
+                    msg->filetypes[n] = dd.filetypes[n];
+                } while (dd.filetypes[n++] != -1);
+                msg->header.size = sizeof(MessageDraggingRec) + (n - 1) * sizeof(int);
+            }
+dprintf("Sending MESSAGE_DRAGGING to %d\n" _ dd.claimant);
+            if (dd.claimant != -1)
+                return _swix(Wimp_SendMessage, _INR(0,2),
+                             EV_USER_MESSAGE_RECORDED, msg, dd.claimant);
+            else
+                return _swix(Wimp_SendMessage, _INR(0,3),
+                             dragfinished ? EV_USER_MESSAGE_RECORDED : EV_USER_MESSAGE, msg, dd.mouse.windowhandle, dd.mouse.iconhandle);
+        }
+        break;
+
+    case EV_USER_DRAG_BOX:
+dprintf("Drag Finished; sending final msg...\n");
+        dragfinished = TRUE;
+        return dd_interactor (EV_NULL_REASON_CODE, buf, closure, consumed);
+        break;
+
+    case EV_USER_MESSAGE:                  
+        block
+        {
+            MessageDragClaimPtr msg = (MessageDragClaimPtr) buf;
+            if (msg->header.messageid == MESSAGE_DRAG_CLAIM)
+            {
+                dprintf(" Received MESSAGE_DRAG_CLAIM ");
+                *consumed = TRUE;
+                dprintf("Claimant=%d, ref %d, flags %d\n" _ msg->header.taskhandle _ msg->header.myref _ msg->flags);
+                if ((dd.claimantsflags & ~(msg->flags)) & BIT(0))
+                    reset_pointer ();
+                if ((dd.claimantsflags & ~(msg->flags)) & BIT(1))
+                    do_dragbox (5);
+                else if ((msg->flags & ~(dd.claimantsflags)) & BIT(1))
+                    do_dragbox (7);
+                dd.claimant = msg->header.taskhandle;
+                dd.claimantsref = msg->header.myref;
+                dd.claimantsflags = msg->flags;
+                dd.claimantstypes = msg->filetypes;
+
+                if (dragfinished)
+                {
+dprintf("DRAGFINISHED; calling callback\n");
+                    if (dd.claimantsflags & BIT(0))
+                        reset_pointer ();
+                    interactor_remove ();
+                    return (*callback) (closure, &dd);
+                }
+            }
+        }
+        break;
+            
+    case EV_USER_MESSAGE_ACKNOWLEDGE:
+        block
+        {
+            MessageDraggingPtr msg = (MessageDraggingPtr) buf;
+            if (msg->header.messageid == MESSAGE_DRAGGING)
+            {
+dprintf("MESSAGE_DRAGGING BOUNCED: ");
+                *consumed = TRUE;
+                if (dd.claimant != -1)
+                {
+dprintf("%s Claimaint == %d, resending to window/icon %d %d\n" _ dragfinished ? "DRAGFINISHED" : "" _ dd.claimant _ dd.mouse.windowhandle _ dd.mouse.iconhandle);
+                    if (dd.claimantsflags & BIT(0))
+                        reset_pointer ();
+                    if (dd.claimantsflags & BIT(1))
+                        do_dragbox (5);
+                    dd.claimant = -1;
+                    dd.claimantsflags = 0;
+                    dd.claimantsref = 0;
+                    msg->header.yourref = 0;
+                    return _swix(Wimp_SendMessage, _INR(0,3),
+                                 dragfinished ? EV_USER_MESSAGE_RECORDED : EV_USER_MESSAGE, msg, dd.mouse.windowhandle, dd.mouse.iconhandle);
+                }
+                else
+                {
+dprintf("NO CLAIMANT ");
+                    if (dragfinished)
+                    {
+dprintf("DRAGFINISHED, calling callback\n");
+                        interactor_remove ();
+                        return (*callback) (closure, &dd);
+                    }
+dprintf("\n");
+                }
+            }
+        }
+        break;
+default:
+dprintf("Other %d\n" _ event);
+break;
+    }
+
+    return NULL;
+}
+
+
+/*
+ * Start a drag-n-drop.  Handles the message protocol between sender
+ * and receiver, and calls the sender back if the data needs to be
+ * transmitted.  The 'filetypes' array must have a lifetime outside
+ * this call - the interactor will be using it.  In practise this means
+ * that it probably needs to be static.
+ */
+ 
+error * dragdrop_start (RectPtr bbox,           /* screen-relative, in OS Units */
+                        Bool truesz,            /* TRUE -> size of bbox is data's real size */
+                        unsigned int dragflags, /* as for Message_Dragging */
+                        int *filetypes,         /* -1 terminated */
+                        DragDropCallback cback,
+                        void *closure)
+{
+    interactor_cancel ();
+
+    truesize = truesz;
+    dd.dragflags = dragflags;
+    dd.filetypes = filetypes;
+    dd.claimant = -1;
+    dd.claimantsflags = 0;
+    dd.claimantsref = 0;
+    dd.claimantstypes = NULL;
+
+    dragfinished = FALSE;
+    callback = cback;
+
+    ER ( _swix(Wimp_GetPointerInfo, _IN(1),
+               &dd.mouse) );
+    dragbbox.minx = (bbox->minx - dd.mouse.position.x) * 400;
+    dragbbox.maxx = (bbox->maxx - dd.mouse.position.x) * 400;
+    dragbbox.miny = (bbox->miny - dd.mouse.position.y) * 400;
+    dragbbox.maxy = (bbox->maxy - dd.mouse.position.y) * 400;
+
+    ER ( do_dragbox (5) );
+
+    interactor_install (dd_interactor, closure);
+    interactor_enable_events (BIT(EV_NULL_REASON_CODE));
+    interactor_set_timeout (25);
+    return NULL;
+}
+
+
+
+/*
+ ****************************************************************
+ * RECEIVER
+ ****************************************************************
+ */
+
+
+static int claimref = 0;        /* non-zero if we're claiming */
+static int claimwin;            /* window handle if claiming */
+
+
+/*
+ * Notify window-type-specific code about Message_Dragging.  Pass msg == NULL
+ * to inform code that the operation is over (so it can undraw any
+ * feedback, etc).  If the message is claimed, then claimref will have
+ * been updated to hold the claimant's reply's myref, zero otherwise.
+ */
+
+static error * dragdrop_offer (int windowhandle, MessageDraggingPtr msg)
+{
+    void *closure;
+    RegistryType type = registry_lookup_window (windowhandle, &closure);
+    switch (type)
+    {
+    case Document:
+        return document_claim_drag ((DocumentPtr) closure, windowhandle, msg, &claimref);
+        break;
+    case Template:
+        return template_claim_drag ((ResourcePtr) closure, windowhandle, msg, &claimref);
+        break;
+    }
+    claimref = 0;
+    return NULL;
+}
+
+
+/*
+ * Return the claimant's reference, or 0 if unclaimed.
+ */
+
+int dragdrop_claimref (void)
+{
+    return claimref;
+}
+
+
+int dragdrop_claimwin (void)
+{
+    return claimwin;
+}
+
+
+/*
+ * Sender can call this if it detects that the destination
+ * is itself; it must then arrange for transfer to happen
+ * internally rather than using DataSave.  Also used by
+ * receiver if it is told that the sender is backing out
+ * of the transaction.
+ */
+
+error * dragdrop_cancel (void)
+{
+dprintf ("(Receive Cancelled).");
+    if (claimref)
+        return dragdrop_offer (claimwin, NULL);
+    return NULL;
+}
+
+
+/*
+ * Offer the Message_Dragging to the current claiming window,
+ * and if that doesn't want it, offer it to the one mentioned in the
+ * message.  Window-type-specific code gets called by dragdrop_offer
+ * and is responsible for sending the Message_DragClaim.
+ */
+
+error * dragdrop_message_dragging (MessageDraggingPtr msg)
+{
+    if (msg->flags & BIT(4))
+        return dragdrop_cancel();
+
+    if (claimref)
+    {
+dprintf("**OFFERING TO OLD\n");
+        ER ( dragdrop_offer (claimwin, msg) );
+        if (claimref)
+            return NULL;        /* claimed by current claimant */
+    }
+dprintf("**OFFERING TO NEW\n");
+    ER (dragdrop_offer (msg->windowhandle, msg) );
+    if (claimref)
+    {
+        claimwin = msg->windowhandle; /* new claimant */
+    }
+    return NULL;
+}
+
+
+
+/*
+ * Auto-scroll support
+ */
+
+
+#define AUTOSCROLL_DELTA 20          /* Must move less than this much to trigger scroll */
+#define AUTOSCROLL_MAX_MARGIN 80     /* Be within this distance of window edge to trigger scroll */
+#define AUTOSCROLL_START_DELAY 10    /* Don't start scrolling for this many cs */
+#define AUTOSCROLL_REPEAT_DELAY 10   /* Once scrolling take a step this often */
+
+/*
+ * Position is in screen coordinates and is known to be within the window.
+ * Return TRUE if scrolling occurred, else FALSE.
+ */
+
+static Bool perhaps_scroll (WindowPtr window, PointPtr position)
+{
+    int vis, margin, dist;
+    PointRec newoffset = window->scrolloffset;
+    WindowRec state;
+
+    state.handle = window->handle;
+    _swix(Wimp_GetWindowState, _IN(1),
+          &state);
+
+    /* X */
+
+    if (state.flags & WF_HSCROLL)
+    {
+        vis = window->visarea.maxx - window->visarea.minx;
+        margin = vis / 4;
+        if (margin > AUTOSCROLL_MAX_MARGIN)
+            margin = AUTOSCROLL_MAX_MARGIN;
+
+        dist = position->x - (window->visarea.maxx - margin);
+        if (dist > 0)
+        {
+            newoffset.x += dist;
+            if (newoffset.x > window->workarea.maxx - vis)
+                newoffset.x = window->workarea.maxx - vis;
+        }
+
+        dist = position->x - (window->visarea.minx + margin);
+        if (dist < 0)
+        {
+            newoffset.x += dist;
+            if (newoffset.x < window->workarea.minx)
+                newoffset.x = window->workarea.minx;
+        }
+    }
+    /* Y */
+
+    if (state.flags & WF_VSCROLL)
+    {
+        vis = window->visarea.maxy - window->visarea.miny;
+        margin = vis / 4;
+        if (margin > AUTOSCROLL_MAX_MARGIN)
+            margin = AUTOSCROLL_MAX_MARGIN;
+
+        dist = position->y - (window->visarea.maxy - margin);
+        if (dist > 0)
+        {
+            newoffset.y += dist;
+            if (newoffset.y > window->workarea.maxy)
+                newoffset.y = window->workarea.maxy;
+        }
+
+        dist = position->y - (window->visarea.miny + margin);
+        if (dist < 0)
+        {
+            newoffset.y += dist;
+            if (newoffset.y < window->workarea.miny + vis)
+                newoffset.y = window->workarea.miny + vis;
+        }
+    }
+    
+    if (newoffset.x != window->scrolloffset.x ||
+        newoffset.y != window->scrolloffset.y)
+    {
+        state.scrolloffset = window->scrolloffset = newoffset;
+        window->behind = state.behind;
+        (void) _swix(Wimp_SendMessage, _INR(0,2),
+                     EV_OPEN_WINDOW_REQUEST, &state, state.handle);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+
+#include <math.h>
+
+static int distance (PointPtr a, PointPtr b)
+{
+    int dx = a->x - b->x, dy = a->y - b->y;
+    /* MAX(abs(dx), abs(dy)) would probably do, really */
+    return (int) sqrt ((double) ((dx * dx) + (dy * dy)));
+}
+
+
+Bool dragdrop_scroll (WindowPtr win, PointPtr position, Bool *removeptr)
+{
+    static Bool mouseposvalid = FALSE;
+    static PointRec mousepos;
+    static unsigned int nexttime;
+    Bool scrolled = FALSE;
+
+    if (win == NULL)
+    {
+        mouseposvalid = FALSE;
+        if (removeptr) *removeptr = TRUE;
+        return NULL;
+    }
+
+    if (removeptr) *removeptr = FALSE;
+
+    /* Decide if auto-scroll might be appropriate */
+    if (mouseposvalid)
+    {
+        unsigned int now;
+        (void) _swix(OS_ReadMonotonicTime, _OUT(0),
+                     &now);
+        if (now > nexttime)
+        {
+            if (distance(&mousepos, position) < AUTOSCROLL_DELTA)
+            {
+                if (perhaps_scroll (win, position))
+                {
+                    nexttime = now + AUTOSCROLL_REPEAT_DELAY;
+                    mousepos = *position;
+                    scrolled = TRUE;
+                }
+                else
+                {
+                    mouseposvalid = FALSE;
+                    if (removeptr) *removeptr = TRUE;
+                }
+            }
+            else
+            {
+                mouseposvalid = FALSE;
+                if (removeptr) *removeptr = TRUE;
+            }
+        }
+    }
+    else
+    {
+        mouseposvalid = TRUE;
+        mousepos = *position;
+        (void) _swix(OS_ReadMonotonicTime, _OUT(0),
+                     &nexttime);
+        nexttime += AUTOSCROLL_START_DELAY;
+    }
+
+    return scrolled;
+}
+

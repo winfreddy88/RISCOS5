@@ -1,0 +1,469 @@
+/* Copyright 2012 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*---------------------------------------------------------------------------*/
+/* File:    calpopup.c                                                       */
+/* Purpose: Calendar date popup window                                       */
+/*---------------------------------------------------------------------------*/
+#include <stdint.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include "swis.h"
+#include "Global/Sprite.h"
+#include "Global/OsBytes.h"
+#include "toolbox.h"
+#include "gadgets.h"
+#include "wimp.h"
+#include "wimplib.h"
+#include "event.h"
+#include "window.h"
+#include "defines.h"
+#include "common.h"
+#include "calpopup.h"
+#include "main.h"
+
+/* Global variables */
+int       *spritearea;
+
+/* Local variables */
+static int fonthandle = -1, deskhandle = 0;
+static int nudgex, nudgey;
+static int dayoffset, daysinmonth, monthsinyear;
+static int adjleft, adjright;
+static BOOL       polling;
+static ordinals_t basedate;
+static int64_t    shown5byte;
+static ordinals_t showndate;
+static modevars_t mode;
+
+
+/*---------------------------------------------------------------------------*
+ * calpopup_paint                                                            *
+ *                                                                           *
+ * Convert the shown 5 byte and ordinals into a sprite and update the popup  *
+ *---------------------------------------------------------------------------*/
+
+static void calpopup_paint(void)
+{
+    int  depth;
+    int  info[12];
+    int  day, today, wday_start, wday_end;
+    int  row, column, offset;
+    int  previous[4];
+    char name[ButtonMonthLen];
+    _kernel_oserror *error;
+
+    /* Find out about this week and month */
+    error_trap(_swix(Territory_ReadCalendarInformation, _INR(0,2),
+                     -1, &shown5byte, info), 1);
+    wday_start   = info[0];
+    wday_end     = info[1];
+    monthsinyear = info[2];
+    daysinmonth  = info[3];
+    if ((showndate.year == basedate.year) && (showndate.month == basedate.month))
+    {
+        today = basedate.dayofmonth;
+    }
+    else
+    {
+        today = -1;
+    }
+    dayoffset = showndate.dayofweek - (showndate.dayofmonth % 7);
+    if (dayoffset < 0) dayoffset = dayoffset + 7;
+    if (dayoffset == 7) dayoffset = 0;
+
+    /* Lookup the month name */
+    error_trap(_swix(Territory_ConvertDateAndTime, _INR(0,4),
+                     -1, &shown5byte, name, ButtonMonthLen, "%MO"), 0);
+                      
+    /* Make a sprite with up to 256 colours and a palette */
+    spritearea[0] = CALPOPUP_PALETTED_SIZE;
+    spritearea[1] = 0;
+    spritearea[2] = SpriteAreaCBsize;
+    spritearea[3] = SpriteAreaCBsize;
+    switch (mode.log2bpp)
+    {
+        case 0:
+            depth = SpriteType_New1bpp << 27;
+            break;
+        case 1:
+            depth = SpriteType_New2bpp << 27;
+            break;
+        case 2:
+            depth = SpriteType_New4bpp << 27;
+            break;
+        case 3:
+        default:
+            depth = SpriteType_New8bpp << 27;
+            break;
+    }
+    depth = depth | ((180 >> mode.yeigen) << 14) | ((180 >> mode.xeigen) << 1) | 1;
+    error_trap(_swix(OS_SpriteOp, _INR(0,6), 256 + SpriteReason_CreateSprite,
+                     spritearea, "grid", (mode.log2bpp > 3) ? 0 : 1,
+                     CALPOPUP_WIDTH_OSUNITS >> mode.xeigen,
+                     CALPOPUP_HEIGHT_OSUNITS >> mode.yeigen, depth), 1);
+
+    /* For true colour modes add palette later because the create operation stupidly derives
+     * its palette from the first 256 entries of the true colour mode, not the sprite's
+     */
+    if (mode.log2bpp > 3)
+    {
+        error_trap(_swix(OS_SpriteOp, _INR(0,3), 256 + SpriteReason_CreateRemovePalette,
+                         spritearea, "grid", 1), 0);
+    }
+          
+    /* Switch output into sprite and flood fill the background */
+    error = _swix(OS_SpriteOp, _INR(0,3) | _OUTR(0,3), 256 + SpriteReason_SwitchOutputToSprite,
+                  spritearea, "grid", 1,
+                  &previous[0], &previous[1], &previous[2], &previous[3]);
+    if (error != NULL)
+    {
+        error_trap(error, 0);
+        return;
+    }
+    if (error == NULL) error = _swix(ColourTrans_SetGCOL, _IN(0) | _INR(3,4),
+                                     CALPOPUP_BG_COLOUR, 1 << 7, 0);
+    if (error == NULL) error = _swix(OS_WriteC, _IN(0), 16 /* CLG */);
+    if (error == NULL) error = _swix(OS_WriteC, _IN(0), 5  /* Join text cursors */);
+
+    /* Draw the grid starting with an initial offset */
+    day = 1;
+    offset = dayoffset;
+    for (row = CALPOPUP_ROWS - 1; (row >= 0) && (daysinmonth >= day); row--)
+    {
+        for (column = offset; (column < CALPOPUP_COLUMNS) && (daysinmonth >= day); column++)
+        {
+            uint32_t colour, underline;
+            uint8_t  dayofweek = (column % 7) + 1;
+            char     temp[8];
+
+            /* Apply colouring and (for those in monochrome) underline */
+            colour = CALPOPUP_WEND_COLOUR;
+            underline = 0;
+            if ((dayofweek >= wday_start) && (dayofweek <= wday_end))
+            {
+                colour = CALPOPUP_DAY_COLOUR;
+            }
+            if (day == today)
+            {
+                colour = CALPOPUP_TODAY_COLOUR;
+                underline = 16;
+            }
+            if (deskhandle == 0)
+            {
+                /* System font */
+                if (error == NULL) error = _swix(ColourTrans_SetGCOL, _IN(0) | _INR(3,4),
+                                                 colour, 0, 0);
+                if (error == NULL) error = _swix(OS_Plot, _INR(0,2), 64 + 4, /* Move */
+                                                 (CALPOPUP_COLUMN_WIDTH * column) + nudgex,
+                                                 (CALPOPUP_ROW_HEIGHT * row) + nudgey); 
+                printf("%d", day);
+                if (underline && (error == NULL))
+                {
+                    error = _swix(OS_Plot, _INR(0,2), 64 + 4, /* Move */
+                                  (CALPOPUP_COLUMN_WIDTH * column) + nudgex,
+                                  (CALPOPUP_ROW_HEIGHT * row) + nudgey + ((CALPOPUP_ULINE * nudgey) / 256));
+                    printf("_%s", (day > 9) ? "_" : "");
+                }
+            }
+            else
+            {
+                /* Outline font */
+                if (error == NULL) error = _swix(ColourTrans_SetFontColours, _INR(0,3),
+                                                 fonthandle, CALPOPUP_BG_COLOUR, colour, 8);
+                sprintf(temp, "\x19%c%c%d", CALPOPUP_ULINE, underline, day);
+                if (error == NULL) error = _swix(Font_Paint, _INR(0,4), fonthandle,
+                                                 temp, (1 << 4) | (1 << 8), /* OS Units */
+                                                 (CALPOPUP_COLUMN_WIDTH * column) + nudgex,
+                                                 (CALPOPUP_ROW_HEIGHT * row) + nudgey);
+            }
+            offset = 0;
+            day++;
+        }
+    }
+
+    /* Switch back and report any error */ 
+    _swix(OS_SpriteOp, _INR(0,3), previous[0], previous[1], previous[2], previous[3]);
+    if (error != NULL)
+    {
+        error_trap(error, 0);
+    }
+
+#if 0
+    char cmd[64];
+    sprintf(cmd, "SAVE $.grid %x +%x", &spritearea[1], spritearea[0]);
+    _swix(OS_CLI, _IN(0), cmd);
+    _swix(OS_CLI, _IN(0), "SETTYPE $.grid ff9");
+#endif
+
+    /* Force a redraw */
+    error_trap(button_set_value(0, calendar_window, ButtonMonth, name), 0);
+    sprintf(name, "%d", showndate.year);
+    error_trap(button_set_value(0, calendar_window, ButtonYear, name), 0);
+    error_trap(button_set_value(0, calendar_window, SpriteMap, "grid"), 0);
+}
+
+
+/*---------------------------------------------------------------------------*
+ * calpopup_open                                                             *
+ *                                                                           *
+ * About to open the popup, do any one off preparation.                      *
+ *---------------------------------------------------------------------------*/
+
+void calpopup_open(int64_t initial)
+{
+    int dummy;
+
+    /* Find out the mode specifics */
+    mode.vdu5xsize = 162;
+    mode.vdu5ysize = 163;
+    mode.xeigen = 4;
+    mode.yeigen = 5;
+    mode.log2bpp = 9;
+    mode.end = -1;
+    error_trap(_swix(OS_ReadVduVariables, _INR(0,1), &mode, &mode), 1);
+
+    /* Try a free incase this is a reopen */
+    calpopup_release();
+
+    /* Get the underlying icon numbers for the adjusters */
+    error_trap(gadget_get_icon_list(0, calendar_window, AdjusterLastMonth, &adjleft, sizeof(adjleft), &dummy), 0);
+    error_trap(gadget_get_icon_list(0, calendar_window, AdjusterNextMonth, &adjright, sizeof(adjright), &dummy), 0);
+
+    /* Find out which desktop font is in use */
+    error_trap(_swix(Wimp_ReadSysInfo, _IN(0) | _OUT(0), 8, &deskhandle), 0);
+    if (deskhandle == 0)
+    {
+         /* System font */
+         nudgex = (mode.vdu5xsize << mode.xeigen) / CALPOPUP_MONTH_DIGITS;
+         nudgey = mode.vdu5ysize << mode.yeigen;
+    }
+    else
+    {
+         int  maxh, maxw;
+         int  blx, bly, trx, try;
+         int  i;
+         char name[50];
+
+         /* Outline font */
+         error_trap(_swix(Font_ReadDefn, _INR(0,1) | _IN(3),
+                          deskhandle, name, 0), 1);
+         error_trap(_swix(Font_FindFont, _INR(1,5) | _OUT(0),
+                          name, CALPOPUP_FONT_PTS * 16, CALPOPUP_FONT_PTS * 16, 0, 0,
+                          &fonthandle), 1);
+         maxh = maxw = 0;
+         for (i = 0; i < 10; i++)
+         {
+             /* Look for the widest and tallest bounding box */
+             _swix(Font_CharBBox, _INR(0,2) | _OUTR(1,4),
+                   fonthandle, i + '0', 0,
+                   &blx, &bly, &trx, &try);
+             _swix(Font_ConverttoOS, _INR(1,2) | _OUTR(1,2),
+                   blx, bly, &blx, &bly);  
+             _swix(Font_ConverttoOS, _INR(1,2) | _OUTR(1,2),
+                   trx, try, &trx, &try);
+             maxh = MAX(maxh, try - bly);
+             maxw = MAX(maxw, trx - blx);
+         }
+
+         /* Work out the nudge required to centre the font on the grid */
+         nudgex = (CALPOPUP_COLUMN_WIDTH - (maxw * CALPOPUP_MONTH_DIGITS)) / 2;
+         nudgey = (CALPOPUP_ROW_HEIGHT - maxh) / 2;
+    }
+
+    /* Use the initial 5 byte time as the basis for the shown date */
+    error_trap(_swix(Territory_ConvertTimeToOrdinals, _INR(0,2),
+                     -1, (const uint8_t *)&initial, &basedate), 1);
+    showndate = basedate;
+    shown5byte = initial;
+                     
+    /* Paint the first */
+    calpopup_paint();
+}
+
+
+/*---------------------------------------------------------------------------*
+ * calpopup_release                                                          *
+ *                                                                           *
+ * The popup was closed, possibly without having selected anything           *
+ *---------------------------------------------------------------------------*/
+
+void calpopup_release(void)
+{
+    /* Free the font */
+    if (fonthandle != -1)
+    {
+        _swix(Font_LoseFont, _IN(0), fonthandle);
+        fonthandle = -1;
+    }
+}
+
+
+/*---------------------------------------------------------------------------*
+ * calpopup_picked                                                           *
+ *                                                                           *
+ * Button pressed on the calendar, select that date                          *
+ *---------------------------------------------------------------------------*/
+
+BOOL calpopup_picked(int x, int y, int64_t *newtime)
+{
+    int gridx, gridy, box;
+
+    /* Work in natural numbers */
+    gridx = 1 + (x / (CALPOPUP_WIDTH_OSUNITS / CALPOPUP_COLUMNS));
+    gridy = CALPOPUP_ROWS - (y / (CALPOPUP_HEIGHT_OSUNITS / CALPOPUP_ROWS));
+    box = gridx + ((gridy - 1) * CALPOPUP_COLUMNS);
+    if ((box <= dayoffset) || (box > (dayoffset + daysinmonth)))
+    {
+        return FALSE;
+    }
+
+    /* Hit a valid day of the month, so can now resolve the date fully */
+    showndate.dayofmonth = box - dayoffset;
+    error_trap(_swix(Territory_ConvertOrdinalsToTime, _INR(0,2),
+                     -1, &shown5byte, &showndate), 0);
+    *newtime = shown5byte;
+    
+    return TRUE;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * calpopup_button_poll                                                      *
+ *                                                                           *
+ * Idle check for mouse button release over the auto repeating adjusters     *
+ *---------------------------------------------------------------------------*/
+
+void calpopup_button_poll(void)
+{
+    WimpGetPointerInfoBlock pointer;
+    WimpSetIconStateBlock   state;
+
+    if (!polling) return; /* Shouldn't be possible */
+
+    wimp_get_pointer_info(&pointer);
+    if ((pointer.button_state & (Wimp_MouseButtonAdjust | Wimp_MouseButtonSelect)) == 0)
+    {
+        /* Buttons released, pop out the chevrons */
+        error_trap(window_get_wimp_handle(0, calendar_window, &state.window_handle), 0);
+        state.EOR_word = 0;
+        state.clear_word = WimpIcon_Selected;
+
+        state.icon_handle = adjleft;
+        error_trap(wimp_set_icon_state(&state), 0);
+
+        state.icon_handle = adjright;
+        error_trap(wimp_set_icon_state(&state), 0);
+
+        /* Turn back off null events */
+        error_trap(event_set_mask(Wimp_Poll_NullMask), 0);
+        polling = FALSE;
+    }
+}
+
+
+/*---------------------------------------------------------------------------*
+ * calpopup_chevron                                                          *
+ *                                                                           *
+ * Fake a double chevron by marking the given icon as selected               *
+ *---------------------------------------------------------------------------*/
+static void calpopup_chevron(int icon, int opposite)
+{
+    WimpGetPointerInfoBlock pointer;
+    WimpSetIconStateBlock   state;
+
+    if (polling) return; /* Already highlighted */
+
+    wimp_get_pointer_info(&pointer);
+    error_trap(window_get_wimp_handle(0, calendar_window, &state.window_handle), 0);
+    state.icon_handle   = (pointer.button_state & Wimp_MouseButtonAdjust) ? opposite
+                                                                          : icon;
+    state.EOR_word      = WimpIcon_Selected;
+    state.clear_word    = WimpIcon_Selected;
+    error_trap(wimp_set_icon_state(&state), 0);
+
+    /* Start polling the mouse for a release */
+    polling = (event_set_mask(0) == NULL);
+}
+
+
+/*---------------------------------------------------------------------------*
+ * calpopup_adjust                                                           *
+ *                                                                           *
+ * Nudge the calendar                                                        *
+ *---------------------------------------------------------------------------*/
+
+void calpopup_adjust(int direction, BOOL faster)
+{
+    int64_t previous = shown5byte;
+    
+    /* Up by a month (years when faster) */
+    if (direction == Adjuster_Increment)
+    {
+        if (faster)
+        {
+            showndate.year++;
+            calpopup_chevron(adjright, adjleft);
+        }
+        else
+        {
+            showndate.month++;
+            if (showndate.month > monthsinyear)
+            {
+                showndate.month = 1;
+                showndate.year++;
+            }
+        }
+    }
+
+    /* Down by a month (years when faster) */
+    if (direction == Adjuster_Decrement)
+    {
+        if (faster)
+        {
+            showndate.year--;
+            calpopup_chevron(adjleft, adjright);
+        }
+        else
+        {
+            showndate.month--;
+            if (showndate.month < 1)
+            {
+                showndate.month = monthsinyear;
+                showndate.year--;
+            }
+        }
+    }
+
+    /* Bound */
+    if (showndate.year < 1900)
+    {
+        showndate.year = 1900;
+        showndate.month = 1;
+    }
+    if (showndate.year > 2247)
+    {
+        showndate.year = 2247;
+        showndate.month = monthsinyear;
+    }
+    showndate.dayofmonth = 1;
+
+    /* Repack to get the day numbers right, then refresh */
+    error_trap(_swix(Territory_ConvertOrdinalsToTime, _INR(0,2),
+                     -1, &shown5byte, &showndate), 0);
+    error_trap(_swix(Territory_ConvertTimeToOrdinals, _INR(0,2),
+                     -1, &shown5byte, &showndate), 0);
+    if (shown5byte != previous) calpopup_paint();
+}

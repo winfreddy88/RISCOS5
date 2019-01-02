@@ -1,0 +1,388 @@
+/*
+ * Copyright (c) 2017, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <time.h>
+#include "kernel.h"
+#include "swis.h"
+
+#include "Global/OSMem.h"
+#include "SyncLib/synclib.h"
+#include "DebugLib/DebugLib.h"
+
+#include "init.h"
+#include "armops.h"
+#include "halcalls.h"
+#include "bootstrap.h"
+#include "asm.h"
+#include "defs.h"
+#include "thread.h"
+#include "errors.h"
+#ifdef BOOTSTRAP_DEBUG
+#include "smpkernel.h"
+#endif
+#ifndef ROM
+#include "stasis.h"
+#endif
+
+#define PAGES(X) (((X+4095)&~4095)>>12)
+
+#define OSAP_Full 0 // user r/w/x, priv r/w/x
+#define OSAP_Read 1 // user r/x, priv r/w/x
+#define OSAP_None 2 // user none, priv r/w/x
+#define OSAP_ROM  3 // user r/x, priv r/x
+
+typedef struct
+{
+	void *myL1PT_log; /* Log & phys addr of temp L1PT used for bootstrapping */
+	uint32_t myL1PT_phys;
+	void *bootstrap_log; /* Log & phys addr of bootstrap code */
+	uint32_t bootstrap_phys;
+	int pmp;
+	uint32_t pmp_log; /* Log addr of PMP base */
+	uint32_t os_ttbr0; /* OS's TTBR0 value */
+	uint32_t relocoffsets[2];
+} initdata_t;
+
+static void *pmp_alloc(initdata_t *initdata, int pages, int align, uint32_t flags)
+{
+	uint32_t physsize;
+	_swix(OS_DynamicArea, _INR(0,1)|_OUT(6), DAReason_PMP_GetInfo, initdata->pmp, &physsize);
+	/* Grow the PMP by the requested amount */
+	_swix(OS_DynamicArea, _INR(0,2), DAReason_PMP_Resize, initdata->pmp, pages);
+	/* Allocate the physical pages */
+	uint32_t list[pages*4];
+	for (int i=0;i<pages;i++)
+	{
+		list[i*3] = physsize+i; /* PMP page index */
+		list[i*3+1] = -2; /* Phys page number */
+		list[i*3+2] = flags & PageFlags_Unavailable; /* Page flags */
+	}
+	_swix(OS_DynamicArea, _INR(0,3), DAReason_PMP_PhysOp, initdata->pmp, list, pages);
+	/* Find a logical area at the correct alignment that's unmapped */
+	/* TODO: Ensure there are gaps between logical regions to protect against e.g. stack overflows */
+	uint32_t logaddr = (initdata->pmp_log + ((1<<align)-1)) & ~((1<<align)-1);
+	uint32_t logidx = (logaddr-initdata->pmp_log)>>12;
+	while (true)
+	{
+		for (int i=0;i<pages;i++)
+		{
+			list[i*4] = -1; /* PMP page index */
+			list[i*4+1] = -1; /* Phys page number */
+			list[i*4+2] = logidx+i; /* DA page index */
+		}
+		_swix(OS_DynamicArea, _INR(0,3), DAReason_PMP_GetPages, initdata->pmp, list, pages);
+		bool ok = true;
+		for (int i=0;i<pages;i++)
+		{
+			if (list[i*4] != -1)
+			{
+				ok = false;
+				break;
+			}
+		}
+		if (ok)
+		{
+			break;
+		}
+		/* Step forward to next possible location */
+		logidx += 1<<(align-12);
+		logaddr += 1<<align;
+	}
+	dprintf(("", "pmp_alloc: Alloced %d pages @ %d align @ %08x (idx %d)\n", pages, align, logaddr, logidx));
+	/* Map memory to this location */
+	for (int i=0;i<pages;i++)
+	{
+		list[i*3] = logidx+i; /* DA page index */
+		list[i*3+1] = physsize+i; /* PMP page index */
+		list[i*3+2] = flags; /* Page flags */
+	}
+	_kernel_oserror *e = _swix(OS_DynamicArea, _INR(0,3), DAReason_PMP_LogOp, initdata->pmp, list, pages);
+	if (e)
+	{
+		dprintf(("", "err: %08x %s\n", e->errnum, e->errmess));
+	}
+	/* Zero the block for convenience */
+	memset((void *) logaddr, 0, pages<<12);
+	/* Return pointer to base of region */
+	return (void *) logaddr;
+}
+
+static void pmp_free(initdata_t *initdata, void *addr, int pages)
+{
+	/* TODO: Free this logical region of PMP */
+	/* Could just assume that it's the last few PMP pages? */
+}
+
+static void init_procvec_redirect(void **vecs)
+{
+	/* Fill in the processor vectors redirection block */
+	vecs[0] = (void *) &Kernel_ASM_ResetVec;
+	vecs[1] = (void *) &Kernel_ASM_UndVec;
+	vecs[2] = (void *) &Kernel_ASM_SWIVec;
+	vecs[3] = (void *) &Kernel_ASM_PrefetchAbortVec;
+	vecs[4] = (void *) &Kernel_ASM_DataAbortVec;
+	vecs[5] = (void *) &Kernel_ASM_AddrExVec;
+	vecs[6] = (void *) &Kernel_ASM_IRQVec;
+	vecs[7] = (void *) &Kernel_ASM_FIQVec;
+}
+
+static void init_procvecs_and_corews(initdata_t *initdata)
+{
+	int size = 32; /* Shared processor vector redirection block */
+	size += PROCVEC_SIZE*(glob.numcores-1); /* Per-core processor vectors */
+	size += sizeof(corews_t)*glob.numcores; /* Per-core workspace */
+#ifndef ROM
+	size += stasis_end - stasis_start; /* Safe copy of stasis code */
+#endif
+	uint32_t stuff = (uint32_t) pmp_alloc(initdata, PAGES(size), 12, OSAP_None+PageFlags_Unavailable);
+	init_procvec_redirect((void **) stuff);
+	stuff += 32;
+	/* Calculate start of core workspace block */
+	corews_t *corews = (corews_t *) (stuff + PROCVEC_SIZE*(glob.numcores-1));
+	/* Fill in the processor vectors & core ws pointers */
+	uint32_t ldm_pc = 0xe51ff028; /* LDR PC, .-32 */
+	glob.corews[0] = corews;
+	corews++;
+	for (int i=1;i<glob.numcores;i++)
+	{
+		glob.corews[i] = corews;
+		corews->procvecs = (void *) stuff;
+		dprintf(("", "core %d: procvecs @ %08x, corews @ %08x\n", i, corews->procvecs, corews));
+		for (int j=0;j<8;j++)
+		{
+			((uint32_t *) stuff)[j] = ldm_pc;
+		}
+		corews++;
+		stuff += PROCVEC_SIZE; /* Update vectors ptr */
+		ldm_pc += PROCVEC_SIZE; /* Update LDR offset */
+	}
+	stuff += sizeof(corews_t)*glob.numcores;
+#ifndef ROM
+	/* Copy the stasis function */
+	dprintf(("","Stasis function installed at %08x\n",stuff));
+	memcpy((void *) stuff, stasis_start, stasis_end - stasis_start);
+	StasisFuncPtr = (void (*)(void)) (void *) stuff;
+	stuff += stasis_end - stasis_start;
+#endif
+}
+
+static uint32_t log2phys(void *log)
+{
+	uint32_t block[3];
+	block[1] = (uint32_t) log;
+	if (_swix(OS_Memory, _INR(0,2), OSMemReason_Convert+(1<<9)+(1<<13), block, 1))
+	{
+		return -1;
+	}
+	return block[2];
+}
+
+static void init_bootstrap(initdata_t *initdata, corews_t *corews)
+{
+	/* Copy over the code */
+	memcpy(initdata->bootstrap_log, bootstrap_start, bootstrap_len);
+	/* Set up the variables */
+	bootstrapdata_t *bs = (bootstrapdata_t *) (((uint32_t) initdata->bootstrap_log) + bootstrap_dataoffset);
+	bs->BootstrapLog = initdata->bootstrap_log;
+	bs->MyL1PT = initdata->myL1PT_phys;
+	bs->OSL1PT = initdata->os_ttbr0;
+	bs->CoreWS = corews;
+	bs->Kernel = (void *) &Kernel_ASM_Entry;
+#ifdef BOOTSTRAP_DEBUG
+	bs->DebugTX = HAL_DebugTX_p;
+	bs->HALWS = hal_sb;
+#endif
+	/* Flush it from our cache */
+	Cache_CleanInvalidateRange(initdata->bootstrap_log, (void *) ((((uint32_t) initdata->bootstrap_log) + bootstrap_len + 4095) & ~4095)); /* Just align to page boundary for simplicity */
+}
+
+static _kernel_oserror *launch_core(initdata_t *initdata, int core)
+{
+	dprintf(("", "launch_core: core %d\n", core));
+	glob.corews[core]->state = CORESTATE_RUNNING | CORESTATE_TRANSITION;
+	asm_dsb_isb(); /* Should we require the HAL to do this for us? */
+	_swix(OS_Hardware, _INR(0,1)|_INR(8,9), core, initdata->bootstrap_phys+bootstrap_bootoffset, OSHW_CallHAL, EntryNo_HAL_SMPStartup);
+	/* Wait for confirmation of startup */
+	clock_t start = clock();
+	while ((glob.corews[core]->state & CORESTATE_TRANSITION) && ((clock()-start) < CLOCKS_PER_SEC))
+	{
+		cpuevent_wait();
+		barrier_sync();
+	}
+	dprintf(("", "launch_core: done, state = %08x\n", glob.corews[core]->state));
+	if (glob.corews[core]->state & CORESTATE_TRANSITION)
+	{
+		return ERROR(Timeout);
+	}
+	return NULL;
+}
+
+_kernel_oserror *init_cores(void)
+{
+	initdata_t initdata;
+	_kernel_oserror *e;
+
+	/* Locate OS L1PT */
+	__asm
+	{
+		mrc p15,0,initdata.os_ttbr0,c2,c0,0
+	}
+
+	/* Get IRQ count */
+	glob.numirq = HAL_IRQMax();
+
+	/* Allocate core WS ptr array */
+	glob.corews = (corews_t **) calloc(sizeof(corews_t *),glob.numcores);
+
+	/* Create a PMP which will contain all the bits of special memory (MB-aligned stacks and locked pages) */
+	int logsize = (1<<20)+((3<<20)*(glob.numcores-1))+(NUM_THREADS<<20); /* 3x MB-aligned stacks per core (ABT/UND/IRQ), plus NUM_THREADS * MB-aligned SVC stacks */
+	e = _swix(OS_DynamicArea, _INR(0,9)|_OUT(1)|_OUT(3), DAReason_Create, -1, 0, -1, DynAreaFlags_NotUserDraggable + DynAreaFlags_NeedsSpecificPages + DynAreaFlags_PMP, logsize, pmphandler, NULL, "SMP", 0, &initdata.pmp, &initdata.pmp_log);
+	if (e)
+	{
+		return e;
+	}
+
+	/* Get the C relocation offsets */
+	__asm
+	{
+		ldr r0, [sl, #-540]
+		ldr r1, [sl, #-536]
+		mov initdata.relocoffsets[0], r0
+		mov initdata.relocoffsets[1], r1
+	}
+
+	dprintf(("","init_cores: os_ttbr0 = %08x, numirq = %d, DA num = %d, base %08x, reloc %08x %08x\n", initdata.os_ttbr0, glob.numirq, initdata.pmp, initdata.pmp_log, initdata.relocoffsets[0], initdata.relocoffsets[1]));
+
+	/* Allocate all the per-core memory */
+	for (int i=1;i<glob.numcores;i++)
+	{
+		void *undstack = pmp_alloc(&initdata, PAGES(UNDSTACK_SIZE), 20, OSAP_None);
+		if (i == 1)
+		{
+			/* Now that we've allocated one MB-aligned block, it should be safe to allocate an unaligned block without fear of preventing the allocation of any of the other MB-aligned blocks */
+			init_procvecs_and_corews(&initdata);
+			/* Fill in core 0 workspace */
+			corews_t *corews = glob.corews[0];
+			memcpy(corews->relocoffsets, initdata.relocoffsets, sizeof(corews->relocoffsets));
+			/* And set TPIDRPRW */
+			__asm
+			{
+				mcr p15, 0, corews, c13, c0, 4
+			}
+		}
+		corews_t *corews = glob.corews[i];
+		memcpy(corews->relocoffsets, initdata.relocoffsets, sizeof(corews->relocoffsets));
+		corews->id = i;
+		corews->thread = NULL; /* Not running any thread yet */
+
+		corews->undstack = (void *) (((uint32_t) undstack) + UNDSTACK_SIZE);
+		corews->abtstack = (void *) (((uint32_t) pmp_alloc(&initdata, PAGES(ABTSTACK_SIZE), 20, OSAP_None)) + ABTSTACK_SIZE);
+		corews->irqstack = (void *) (((uint32_t) pmp_alloc(&initdata, PAGES(IRQSTACK_SIZE), 20, OSAP_None)) + IRQSTACK_SIZE);
+		corews->svcstack = (void *) (((uint32_t) pmp_alloc(&initdata, PAGES(SVCSTACK_SIZE), 20, OSAP_None)) + SVCSTACK_SIZE);
+
+
+		/* TODO: allocate message queues */
+		dprintf(("", "core %d stacks: UND %08x ABT %08x IRQ %08x SVC %08x\n", i, corews->undstack, corews->abtstack, corews->irqstack, corews->svcstack));
+	}
+
+	/* Allocate all the thread SVC stacks (yuck) */
+	for (int i=0;i<NUM_THREADS;i++)
+	{
+		/* The first few thread IDs correspond to the idle threads, stacks may have already been allocated for use as the default core stack */
+		void *stack;
+		if ((i < glob.numcores) && glob.corews[i])
+		{
+			stack = glob.corews[i]->svcstack;
+		}
+		else
+		{
+			dprintf(("", "thread %d: ", i));
+			stack = (void *) (((uint32_t) pmp_alloc(&initdata, PAGES(SVCSTACK_SIZE), 20, OSAP_None)) + SVCSTACK_SIZE);
+		}
+		thread_set_svcstack(i, stack);
+	}
+
+	/* Allocate the memory for the bootstrap code */
+	/* This is assumed to fit within one page, to guarantee contiguity (s.Bootstrap will assert that this is the case) */
+	initdata.bootstrap_log = pmp_alloc(&initdata, 1, 12, OSAP_None + PageFlags_Unavailable);
+	initdata.bootstrap_phys = log2phys(initdata.bootstrap_log);
+	dprintf(("", "bootstrap log %08x phys %08x\n",initdata.bootstrap_log, initdata.bootstrap_phys));
+
+	/* Allocate a 16K block for L1PT, and a 1K block for L2PT */
+	e = _swix(PCI_RAMAlloc, _INR(0,2)|_OUTR(0,1), 17<<10, 16<<10, 0, &initdata.myL1PT_log, &initdata.myL1PT_phys);
+	if (e)
+	{
+		return e;
+	}
+	dprintf(("", "myL1PT log %08x phys %08x\n", initdata.myL1PT_log, initdata.myL1PT_phys));
+	memset(initdata.myL1PT_log, 0, 17<<10);
+
+	/* TODO: Lock module pages if softload? Or is this safe now that we have the stasis system? */
+
+	/* Init page tables */
+	init_l1pt(initdata.myL1PT_log, initdata.myL1PT_phys, initdata.bootstrap_log, initdata.bootstrap_phys);
+	/* TODO: Do we need an ARMop DSB here? */
+
+	/* Init the IRQ despatcher (no turning back once this is done, due to patching of kernel) */
+	glob.irqdespatch = irq_alloc();
+
+#ifdef BOOTSTRAP_DEBUG
+	CPUInfo(CPUInfo_OutFunc);
+#endif
+
+	/* Init bootstrap + launch for each core */
+	for (int i=1;i<glob.numcores;i++)
+	{
+		init_bootstrap(&initdata, glob.corews[i]);
+		e = launch_core(&initdata, i);
+		if (e)
+		{
+#ifdef BOOTSTRAP_DEBUG
+			/* Hide the error from the outer layers so that we don't quit the module */
+			dprintf(("", "%s\n",e->errmess));
+			e = NULL;
+#else
+			/* TODO: Deal with error more sensibly */
+#endif
+			return e;
+		}
+	}
+
+	/* Free page tables */
+	_swix(PCI_RAMFree, _IN(0), initdata.myL1PT_log);
+
+	/* Free bootstrap */
+	pmp_free(&initdata, initdata.bootstrap_log, 1);
+
+	dprintf(("", "init_cores: done\n"));
+
+	return NULL;
+}

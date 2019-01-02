@@ -1,0 +1,188 @@
+/* Copyright 2003 Tematic Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#include <stddef.h>
+#include <stdio.h>
+
+#include "swis.h"
+#include "debuglib/debuglib.h"
+#include "callx/callx.h"
+#include "Global/Services.h"
+#include "Global/Variables.h"
+
+#include "header.h"
+#include "scsiswitch.h"
+#include "module.h"
+
+void *module_wsp;
+void (*irqtrigger)(void);
+static int msg_struct[4];
+static _kernel_oserror msg_buff;
+#ifdef DEBUGLIB
+#define DEBUG
+#endif
+#ifdef DEBUG
+#undef dprintf
+#define dprintf(...) _dprintf("",__VA_ARGS__)  
+#else
+#undef dprintf
+#define dprintf(...) (void) 0
+#endif
+
+const char *module_lookup(const char *token)
+{
+    if (_swix(MessageTrans_Lookup, _INR(0,7),
+              msg_struct, token, &msg_buff, sizeof(msg_buff), 0, 0, 0, 0) != NULL)
+    {
+        return "";
+    }
+    return (const char *)&msg_buff;
+}
+
+_kernel_oserror *module_error(unsigned err)
+{
+    struct {
+        int errnum;
+        char errmess[8];
+    } token;
+
+    if (err > 256) return (_kernel_oserror *) err;
+
+    token.errnum = SCSI_ErrorBase + err;
+    sprintf(token.errmess, "E%02x", err);
+    return _swix(MessageTrans_ErrorLookup, _INR(0,3),
+              &token, msg_struct, &msg_buff, sizeof(msg_buff));
+}
+
+_kernel_oserror *module_initialise(const char *cmd_tail, int podule_base, void *pw)
+{
+    (void) cmd_tail;
+    (void) podule_base;
+    _kernel_oserror *err = NULL;
+    uint32_t flags;
+
+    module_wsp = pw;
+    debug_initialise ("SCSIDriver", "", 0);
+    debug_set_device(DADEBUG_OUTPUT);
+//    debug_set_device(PRINTF_OUTPUT);
+    debug_set_unbuffered_files (TRUE);
+    debug_set_stamp_debug (TRUE);
+    dprintf("SCSI starting\n");
+
+#ifndef ROM
+    err = _swix(ResourceFS_RegisterFiles, _IN(0), Resources());
+    if (err != NULL) goto failinit;
+#endif
+    err = _swix(MessageTrans_OpenFile, _INR(0,2), msg_struct, Module_MessagesFile, 0);
+    if (err != NULL) goto faildereg;
+
+    /* Transitionary */
+    static const char aliasto[] = "%SCSIDevices";
+    _swix(OS_SetVarVal, _INR(0,4), "Alias$Devices", aliasto, sizeof(aliasto) - 1,
+                                                    0, VarType_LiteralString);
+                                   
+    callx_init(pw);
+
+    if(!_swix(OS_PlatformFeatures,_IN(0)|_OUTR(0,1),0,&flags,&irqtrigger))
+    {
+      if(!(flags & 2))
+        irqtrigger = NULL;
+    }
+
+    _swix(OS_ServiceCall, _IN(1), Service_SCSIStarting);
+
+    return NULL;
+
+faildereg:
+#ifndef ROM
+    _swix(ResourceFS_DeregisterFiles, _IN(0), Resources());
+failinit:
+#endif
+    return err;
+}
+
+_kernel_oserror *module_finalise(int fatal, int podule, void *pw)
+{
+    (void) fatal;
+    (void) podule;
+    (void) pw;
+
+    _swix(OS_ServiceCall, _IN(1), Service_SCSIDying);
+
+    scsi_deregister_all();
+
+    callx_remove_all_callbacks();
+    callx_remove_all_callafters();
+    callx_remove_all_calleverys();
+
+    /* Tidy up the messages (and deregister from ResourceFS if not in ROM) */
+    _swix(MessageTrans_CloseFile, _IN(0), msg_struct);
+#ifndef ROM
+    _swix(ResourceFS_DeregisterFiles, _IN(0), Resources());
+#endif
+
+    return NULL;
+}
+
+void module_service_handler(int service_number, _kernel_swi_regs *r, void *pw)
+{
+    (void) pw;
+#ifndef ROM
+    if (service_number == Service_ResourceFSStarting)
+    {
+        /* Reregister our resources */
+        (*(void (*)(void *, void *, void *, void *))r->r[2])(Resources(), 0, 0, (void *)r->r[3]);
+    }
+#else
+    (void) service_number;
+    (void) r;
+#endif
+}
+
+_kernel_oserror *module_swi_handler(int swi_offset, _kernel_swi_regs *r, void *pw)
+{
+    (void) pw;
+
+    switch (swi_offset)
+    {
+        case SCSI_Version - SCSI_00:
+            return scsi_version(r);
+        case SCSI_Initialise - SCSI_00:
+            return scsi_initialise(r);
+        case SCSI_Control - SCSI_00:
+            return scsi_control(r);
+        case SCSI_Op - SCSI_00:
+            return scsi_op(r);
+        case SCSI_Status - SCSI_00:
+            return scsi_status(r);
+        case SCSI_Reserve - SCSI_00:
+            return scsi_reserve(r);
+        case SCSI_Deregister - SCSI_00:
+            return scsi_deregister(r);
+        case SCSI_Register - SCSI_00:
+            return scsi_register(r);
+    }
+    return module_error(SCSI_SWIunkn);
+}
+
+_kernel_oserror *module_cmd_handler(const char *arg_string, int argc, int cmd_no, void *pw)
+{
+    (void) arg_string;
+    (void) argc;
+    (void) cmd_no;
+    (void) pw;
+
+    /* Only *SCSIDevices */
+    return scsi_devices();
+}

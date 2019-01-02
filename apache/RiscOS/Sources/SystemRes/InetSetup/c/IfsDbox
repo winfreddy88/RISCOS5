@@ -1,0 +1,1177 @@
+/* Copyright 1997 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#include <string.h>
+#include <stdio.h>
+
+#include "window.h"
+#include "gadget.h"
+#include "label.h"
+#include "button.h"
+#include "optionbutton.h"
+#include "ActionButton.h"
+#include "writablefield.h"
+#include "radiobutton.h"
+#include "displayfield.h"
+#include "slider.h"
+#include "Territory.h"
+
+#include "event.h"
+#include "Load.h"
+#include "Gadgets.h"
+#include "IfsDbox.h"
+#include "Main.h"
+#include "ModUtils.h"
+#include "Versions.h"
+
+#include "socklib.h"
+#include "sys/types.h"
+#include "sys/dcistructs.h"
+#include "sys/socket.h"
+#include "sys/sockio.h"
+#include "net/if.h"
+#include "netinet/in.h"
+#include "net/route.h"
+#include "arpa/inet.h"
+
+#include "my_swis.h"
+
+#ifdef PlugIn
+extern toolbox_o InternetObject;
+#endif
+extern toolbox_o InterfacesObject;
+toolbox_o interface_object[16];
+toolbox_o interface_statistics[16];
+toolbox_c interface_addrtype[16];
+static struct
+{
+    struct in_addr ip;
+    struct in_addr gateway;
+    struct in_addr mask;
+    struct in_addr remote;
+    unsigned long  tx_sum;
+    unsigned long  rx_sum;
+    unsigned char *eui_ptr;
+    struct
+    {
+        unsigned char st_interface_type;
+        unsigned char st_link_status;
+        unsigned char st_link_polarity;
+    } live;
+#define HAS_CHANGED(thing) (init || (interface_lastlive[i].thing != (thing)))
+#define NOTE_CHANGE(thing) (interface_lastlive[i].thing = (thing))
+} interface_lastlive[16];
+
+static void FillInterfaceDbox(toolbox_o, int);
+static void FillStatisticsDbox(int, const Dib *, struct in_addr, osbool);
+static bool FillStatisticsDboxes(wimp_event_no, wimp_block *, toolbox_block *, void *);
+static bool ifs_enable_handler(bits, toolbox_action *, toolbox_block *, void *);
+static bool ifs_close_handler(bits, toolbox_action *, toolbox_block *, void *);
+static bool if_button_handler(bits, toolbox_action *, toolbox_block *, void *);
+static bool if_option_handler(bits, toolbox_action *, toolbox_block *, void *);
+static bool ifs_action_handler(bits, toolbox_action *, toolbox_block *, void *);
+static bool if_action_handler(bits, toolbox_action *, toolbox_block *, void *);
+static bool if_close_handler(bits, toolbox_action *, toolbox_block *, void *);
+static bool default_netmask_handler(bits, toolbox_action *, toolbox_block *, void *);
+
+void MakeIfsDbox(toolbox_block *id)
+{
+    int i, w;
+    int label_width = 80, close_width;
+    int name_width = 0, config_width, stats_width;
+    os_box box;
+    toolbox_position pos;
+#ifndef PlugIn
+    toolbox_resource_file_object *obj;
+    window_object *win;
+#endif
+#ifdef OSLib_4_8
+    static my_gadget_OBJECT(4) g;
+#else
+    static gadget_OBJECT(4) g;
+#endif
+
+    InterfacesObject = toolbox_create_object(0, (toolbox_id) "Interfaces");
+    event_register_toolbox_handler (InterfacesObject, action_ACTION_BUTTON_SELECTED, ifs_action_handler, 0);
+
+    for (i=0; i < interfaces; i++)
+    {
+        /* RISC OS 3.5 SWI */
+        if (WimpVersion >= 350) w = wimptextop_string_width(interface_location[i], 0);
+        else w = strlen(interface_location[i]) * 16;
+        if (w > label_width) label_width = w;
+
+        if (WimpVersion >= 350) w = wimptextop_string_width(interface_name[i], 0);
+        else w = strlen(interface_name[i]) * 16;
+        if (w > name_width) name_width = w;
+    }
+
+    label_width += 12;
+    name_width += 24 + 44;
+    if (WimpVersion >= 350) config_width = wimptextop_string_width(msgs_lookup("Conf"), 0) + 32;
+    else config_width = strlen(msgs_lookup("Conf")) * 16 + 32;
+    if (WimpVersion >= 350) stats_width = wimptextop_string_width(msgs_lookup("Stat"), 0) + 32;
+    else stats_width = strlen(msgs_lookup("Stat")) * 16 + 32;
+
+    gadget_get_bbox(0, InterfacesObject, ifs_Close, &box);
+    close_width = box.x1 - box.x0;
+
+    box.y1 = -8 - (52+8) * interfaces - 8;
+    box.y0 = box.y1 - 68;
+    box.x1 = 12 + label_width + 8 + name_width + 8 + config_width + 8 + stats_width;
+    box.x0 = box.x1 - close_width;
+
+    gadget_move_gadget(0, InterfacesObject, ifs_Close, &box);
+
+    for (i = 0; i < interfaces; i++)
+    {
+        int have_driver;
+        char buffer[256];
+
+        sprintf(buffer, "System:Modules.Network.%s", interface_filename[i]);
+        have_driver = RMFind(interface_module[i], buffer, interface_version[i]);
+
+        /* Location label */
+        g.flags = label_NO_BOX | label_RJUSTIFIED;
+        if (!have_driver)
+            g.flags |= gadget_FADED;
+        g.class_no_and_size = class_LABEL;
+        g.bbox.x0 = 12;
+        g.bbox.x1 = 12 + label_width;
+        g.bbox.y1 = -8 - (52+8) * i;
+        g.bbox.y0 = g.bbox.y1 - 52;
+        g.cmp = (i << 8) + 1;
+        g.help_message = 0;
+        g.help_limit = 0;
+#ifdef OSLib_4_8
+        ((label_object *) g.gadget)->label = interface_location[i];
+#else
+        ((label_gadget *) g.gadget)->label = interface_location[i];
+#endif
+        window_add_gadget(0, InterfacesObject, (gadget_object *) &g);
+
+        /* Should the conf/stat buttons be faded or not? */
+        g.flags = actionbutton_IS_LOCAL;
+
+        if (interface_address[i][0] == '\0' &&
+            interface_addrtype[i] == 0 ||
+            !have_driver)
+            g.flags |= gadget_FADED;
+
+        /* PPP will allow blank fields so gadget will not be faded if interface type is PPP and it was found on startup */
+        if (interface_is_pp[i] == 2 &&
+            interface_has_section[i]) g.flags &= ~gadget_FADED;
+
+        /* Add the configure button for each interface */
+        g.class_no_and_size = class_ACTION_BUTTON;
+        g.bbox.x0 = 12 + label_width + 8 + name_width + 8;
+        g.bbox.x1 = g.bbox.x0 + config_width;
+        g.bbox.y1 = -8 - (52+8) * i;
+        g.bbox.y0 = g.bbox.y1 - 52;
+        g.cmp = (i << 8) + 2;
+        sprintf(buffer, msgs_lookup("IfsHelp1"), interface_name[i]);
+        g.help_message = buffer;
+        g.help_limit = strlen(buffer)+1;
+#ifdef OSLib_4_8
+        ((actionbutton_object *) g.gadget)->text = msgs_lookup("Conf");
+        ((actionbutton_object *) g.gadget)->text_limit =
+          strlen(((actionbutton_object *) g.gadget)->text) + 1;
+        ((actionbutton_object *) g.gadget)->click_show = 0;
+        ((actionbutton_object *) g.gadget)->action = 0;
+#else
+        ((actionbutton_gadget *) g.gadget)->text = msgs_lookup("Conf");
+        ((actionbutton_gadget *) g.gadget)->text_limit =
+          strlen(((actionbutton_gadget *) g.gadget)->text) + 1;
+        ((actionbutton_gadget *) g.gadget)->click_show = 0;
+        ((actionbutton_gadget *) g.gadget)->action = 0;
+#endif
+        window_add_gadget(0, InterfacesObject, (gadget_object *) &g);
+
+        /* Add the statistics button for each interface */
+        g.class_no_and_size = class_ACTION_BUTTON;
+        g.bbox.x0 = 12 + label_width + 8 + name_width + 8 + config_width + 8;
+        g.bbox.x1 = g.bbox.x0 + stats_width;
+        g.bbox.y1 = -8 - (52+8) * i;
+        g.bbox.y0 = g.bbox.y1 - 52;
+        g.cmp = (i << 8) + 3;
+        sprintf(buffer, msgs_lookup("IfsHelp3"), interface_name[i]);
+        g.help_message = buffer;
+        g.help_limit = strlen(buffer)+1;
+#ifdef OSLib_4_8
+        ((actionbutton_object *) g.gadget)->text = msgs_lookup("Stat");
+        ((actionbutton_object *) g.gadget)->text_limit =
+          strlen(((actionbutton_object *) g.gadget)->text) + 1;
+        ((actionbutton_object *) g.gadget)->click_show = 0;
+        ((actionbutton_object *) g.gadget)->action = 0;
+#else
+        ((actionbutton_gadget *) g.gadget)->text = msgs_lookup("Stat");
+        ((actionbutton_gadget *) g.gadget)->text_limit =
+          strlen(((actionbutton_gadget *) g.gadget)->text) + 1;
+        ((actionbutton_gadget *) g.gadget)->click_show = 0;
+        ((actionbutton_gadget *) g.gadget)->action = 0;
+#endif
+        window_add_gadget(0, InterfacesObject, (gadget_object *) &g);
+
+        g.flags = 1; /* Generate events */
+        if (!have_driver)
+            g.flags |= gadget_FADED;
+        else if (Set(interface_address[i]) || interface_addrtype[i])
+            g.flags |= 4; /* Selected */
+
+        /* PPP will allow blank fields so gadget will be ticked if interface type is PPP and it was found on startup*/
+        if (interface_is_pp[i] == 2 &&
+            interface_has_section[i]) g.flags |= 4; /* Selected */
+
+        /* Add the enable option for each interface */
+        g.class_no_and_size = class_OPTION_BUTTON;
+        g.bbox.x0 = 12 + label_width + 8;
+        g.bbox.x1 = g.bbox.x0 + name_width;
+        g.bbox.y1 = -8 - (52+8) * i - 4;
+        g.bbox.y0 = g.bbox.y1 - 44;
+        g.cmp = (i << 8) + 4;
+        g.help_message = msgs_lookup("IfsHelp2");
+        g.help_limit = strlen(g.help_message)+1;
+#ifdef OSLib_4_8
+        ((optionbutton_object *) g.gadget)->label = interface_name[i];
+        ((optionbutton_object *) g.gadget)->label_limit = strlen(interface_name[i]) + 1;
+        ((optionbutton_object *) g.gadget)->action = 0;
+#else
+        ((optionbutton_gadget *) g.gadget)->label = interface_name[i];
+        ((optionbutton_gadget *) g.gadget)->label_limit = strlen(interface_name[i]) + 1;
+        ((optionbutton_gadget *) g.gadget)->action = 0;
+#endif
+        window_add_gadget(0, InterfacesObject, (gadget_object *) &g);
+
+        /* Create copies of the respective windows to open */
+        interface_object[i] = toolbox_create_object(0, (toolbox_id)
+                                (interface_is_pp[i] ? "InterfacePP" : "Interface"));
+        interface_statistics[i] = toolbox_create_object(0, (toolbox_id)
+                                                                      "ShowStat");
+        sprintf(buffer, "%s: %s", interface_location[i], interface_name[i]);
+        window_set_title(0, interface_object[i], buffer);
+        window_set_title(0, interface_statistics[i], buffer);
+
+        /* Modify stats window for PPP or not */
+        if (interface_is_pp[i])
+        {
+            window_remove_gadget(0, interface_statistics[i], stat_HWAddr);
+            gadget_set_help_message(0, interface_statistics[i], stat_DisplayHWRemAddr,
+                                    msgs_lookup("HRemAddr"));
+        }
+        else
+        {
+            window_remove_gadget(0, interface_statistics[i], stat_RemAddr);
+            gadget_set_help_message(0, interface_statistics[i], stat_DisplayHWRemAddr,
+                                    msgs_lookup("HHWAddr"));
+        }
+
+        /* Associate events with the new gadgets */
+        FillInterfaceDbox(interface_object[i], i);
+        event_register_toolbox_handler(interface_object[i],
+                                       action_RADIO_BUTTON_STATE_CHANGED,
+                                       if_button_handler, (void *) i);
+        event_register_toolbox_handler(interface_object[i],
+                                       action_OPTION_BUTTON_STATE_CHANGED,
+                                       if_option_handler, (void *) i);
+        event_register_toolbox_handler(interface_object[i],
+                                       action_ACTION_BUTTON_SELECTED,
+                                       if_action_handler, (void *) i);
+        event_register_toolbox_handler(interface_statistics[i],
+                                       action_WINDOW_DIALOGUE_COMPLETED,
+                                       if_close_handler, NULL);
+    }
+
+    event_register_toolbox_handler(InterfacesObject,
+                                   action_OPTION_BUTTON_STATE_CHANGED,
+                                   ifs_enable_handler, 0);
+
+    event_register_toolbox_handler(InterfacesObject,
+                                   action_WINDOW_DIALOGUE_COMPLETED,
+                                   ifs_close_handler, 0);
+
+    event_register_toolbox_handler(event_ANY,
+                                   action_DefaultNetmask,
+                                   default_netmask_handler, 0);
+
+    /* Fake a first fill */
+    FillStatisticsDboxes(wimp_NULL_REASON_CODE, NULL, NULL, NULL);
+    event_register_wimp_handler(event_ANY, wimp_NULL_REASON_CODE, FillStatisticsDboxes, 0);
+
+    if (id)
+    {
+#ifdef PlugIn
+      wimp_window_state state;
+      show_window_from_component(InterfacesObject, InternetObject, internet_Interfaces);
+      state.w = window_get_wimp_handle (0, InterfacesObject);
+      wimp_get_window_state (&state);
+      pos.full.visible.x0 = state.visible.x0;
+      pos.full.visible.x1 = pos.full.visible.x0 + 12 + label_width + 8 + name_width + 8 + config_width + 8 + stats_width + 12;
+      pos.full.visible.y1 = state.visible.y1;
+      pos.full.visible.y0 = pos.full.visible.y1 - 8 - (52+8) * interfaces - 8 - 68 - 12;
+      pos.full.xscroll = state.xscroll;
+      pos.full.yscroll = state.yscroll;
+      pos.full.next = wimp_TOP;
+
+      toolbox_show_object(0, InterfacesObject, toolbox_POSITION_FULL, &pos,
+                          id->this_obj, id->this_cmp);
+#else
+      obj = (toolbox_resource_file_object *) toolbox_template_look_up(0, "Interfaces");
+      win = (window_object *) obj->object;
+  
+      pos.full.visible.x0 = win->window.visible.x0;
+      pos.full.visible.x1 = pos.full.visible.x0 + 12 + label_width + 8 + name_width + 8 + config_width + 8 + stats_width + 12;
+      pos.full.visible.y1 = win->window.visible.y1;
+      pos.full.visible.y0 = pos.full.visible.y1 - 8 - (52+8) * interfaces - 8 - 68 - 12;
+      pos.full.xscroll = win->window.xscroll;
+      pos.full.yscroll = win->window.yscroll;
+      pos.full.next = wimp_TOP;
+
+      toolbox_show_object(0, InterfacesObject, toolbox_POSITION_FULL, &pos,
+                          id->this_obj, id->this_cmp);
+#endif
+    }
+}
+
+static void FillInterfaceDbox(toolbox_o o, int i)
+{
+    if (interface_addrtype[i] == if_FromHostname)
+        /* Because host name might have been changed... */
+        writablefield_set_value(0, o, if_Address, HostName);
+    else
+        writablefield_set_value(0, o, if_Address, interface_address[i]);
+    writablefield_set_value(0, o, if_Netmask, interface_netmask[i]);
+    if (interface_is_pp[i])
+        writablefield_set_value(0, o, if_LinkAddr, interface_linkaddr[i]);
+    optionbutton_set_state(0, o, if_Primary, primary_interface == i);
+    if (interface_addrtype[i] == if_BOOTP || interface_addrtype[i] == if_RevARP || interface_addrtype[i] == if_DHCP)
+    {
+        char *msg;
+        switch (interface_addrtype[i])
+        {
+           case if_BOOTP: msg = "BOOTP"; break;
+           case if_DHCP: msg= "DHCP"; break;
+           default: msg = "RevARP"; break;
+        }
+        /* RG: I believe the netmask box should be faded for BOOTP/DHCP	*/
+        if (interface_addrtype[i] == if_BOOTP || interface_addrtype[i] == if_DHCP)
+        {
+            gadget_set_flags(0, o, if_Netmask, gadget_FADED);
+            window_set_default_focus(0, o, (toolbox_c) -2);
+        }
+        gadget_set_flags(0, o, if_ICMP, 0);
+        writablefield_set_value(0, o, if_Address, msgs_lookup(msg));
+    }
+
+    if (interface_addrtype[i] == 0)
+        interface_addrtype[i] = if_Manual;
+
+    radiobutton_set_state(0, o, interface_addrtype[i], TRUE);
+
+#ifdef OSLib_4_8
+    if (!my_radiobutton_get_state(0, o, if_Manual, 0))
+        gadget_set_flags(0, o, if_Address, gadget_FADED);
+#else
+    if (!radiobutton_get_state(0, o, if_Manual, 0))
+        gadget_set_flags(0, o, if_Address, gadget_FADED);
+#endif
+
+    if (!interface_is_pp[i])
+        gadget_set_flags(0, o, if_FromCMOS, CMOSIP ? 0 : gadget_FADED);
+
+    if (!interface_is_pp[i] && !Exists("Inet:bin.IfRConfig"))
+    {
+        gadget_set_flags(0, o, if_RevARP, gadget_FADED);
+        gadget_set_flags(0, o, if_BOOTP, gadget_FADED);
+    }
+
+    if (!interface_is_pp[i] && (!RMFind("DHCP", "System:Modules.Network.DHCP", v_DHCP) ||
+                                !RMFind("Internet", "System:Modules.Network.Internet", v_InternetDHCP)))
+    {
+        gadget_set_flags(0, o, if_DHCP, gadget_FADED);
+    }
+
+    if (strcmp(interface_netmask[i], "zzzz") == 0)
+    {
+        strcpy(interface_netmask[i], "default");
+        writablefield_set_value(0, o, if_Netmask, msgs_lookup("ICMPReq"));
+        gadget_set_flags(0, o, if_Netmask, gadget_FADED);
+        if (!interface_is_pp[i])
+            optionbutton_set_state(0, o, if_ICMP, TRUE);
+        window_set_default_focus(0, o, (toolbox_c) -2);
+    }
+
+    if (strcmp(interface_unit[i], "ec0") == 0)
+        gadget_set_flags(0, o, if_Primary, gadget_FADED);
+    else if (interfaces == 1)
+    {
+        gadget_set_flags(0, o, if_Primary, gadget_FADED);
+        optionbutton_set_state(0, o, if_Primary, TRUE);
+    }
+}
+
+static bool ifs_close_handler(bits event_code, toolbox_action *event,
+                               toolbox_block *id, void *handle)
+{
+    int i;
+
+    for (i = 0; i < interfaces; i++)
+    {
+        toolbox_hide_object(0, interface_object[i]);
+        toolbox_hide_object(0, interface_statistics[i]);
+    }
+
+    return FALSE;
+}
+
+static bool ifs_enable_handler(bits event_code, toolbox_action *event,
+                               toolbox_block *id, void *handle)
+{
+    optionbutton_action_state_changed *optevent =
+                     (optionbutton_action_state_changed *) &event->data;
+
+    gadget_set_flags(0, id->this_obj, id->this_cmp - 1 /* Stat */, optevent->on ? 0 : gadget_FADED);
+    gadget_set_flags(0, id->this_obj, id->this_cmp - 2 /* Conf */, optevent->on ? 0 : gadget_FADED);
+    if (!optevent->on)
+    {
+        toolbox_hide_object(0, interface_object[id->this_cmp >> 8]);
+        interface_has_section[id->this_cmp >> 8] = 0;   /* ppp will NOT be saved */
+        /*
+         * RG: If an interface is disabled, set its addrype to 'manual' to prevent
+         * an RMEnsure command being written to the setup file.
+        */
+        interface_addrtype[id->this_cmp >> 8] = 6;
+    } else
+    {
+        interface_has_section[id->this_cmp >> 8] = 1;   /* ppp will be saved */
+    }
+
+
+    return TRUE;
+}
+
+static bool ifs_action_handler(bits event_code, toolbox_action *event,
+                              toolbox_block *id, void *handle)
+{
+    int i = (id->this_cmp) >> 8;
+    wimp_poll_flags mask;
+
+    switch (id->this_cmp & 0xFF)
+    {
+        case 2: /* Conf */
+#ifdef PlugIn
+            show_window_from_component(interface_object[i], InterfacesObject, id->this_cmp);
+#else
+            toolbox_show_object(0, interface_object[i], toolbox_POSITION_DEFAULT, 0, id->this_obj, id->this_cmp);
+#endif
+            break;
+        case 3: /* Stat */
+#ifdef PlugIn
+            show_window_from_component(interface_statistics[i], InterfacesObject, id->this_cmp);
+#else
+            toolbox_show_object(0, interface_statistics[i], toolbox_POSITION_DEFAULT, 0, id->this_obj, id->this_cmp);
+#endif
+            /* One or more stats windows open, enable polling */
+            event_get_mask(&mask);
+            event_set_mask(mask & ~wimp_MASK_NULL);
+            break;
+    }
+    return TRUE;
+}
+
+/****************************************************************************
+ *
+ * Interface configuration handlers
+ *
+ ****************************************************************************/
+static bool if_action_handler(bits event_code, toolbox_action *event,
+                              toolbox_block *id, void *handle)
+{
+    int i = (int) handle;
+
+    if (event->flags & actionbutton_SELECTED_DEFAULT)
+    {
+        writablefield_get_value(0, interface_object[i], if_Address,
+                                interface_address[i], sizeof interface_address[i]);
+        writablefield_get_value(0, interface_object[i], if_Netmask,
+                                interface_netmask[i], sizeof interface_netmask[i]);
+        if (interface_is_pp[i])
+            writablefield_get_value(0, interface_object[i], if_LinkAddr,
+                                    interface_linkaddr[i], sizeof interface_linkaddr[i]);
+        if (optionbutton_get_state(0, interface_object[i], if_Primary))
+            primary_interface = i;
+        else if (primary_interface == i)
+            primary_interface = -1;
+#ifdef OSLib_4_8
+        my_radiobutton_get_state(0, interface_object[i], if_Manual,
+                              &interface_addrtype[i]);
+#else
+        radiobutton_get_state(0, interface_object[i], if_Manual,
+                              &interface_addrtype[i]);
+#endif
+
+        return TRUE;
+    }
+    if (event->flags & actionbutton_SELECTED_CANCEL)
+    {
+        toolbox_action action;
+        radiobutton_action_state_changed *r =
+                          (radiobutton_action_state_changed *) &action.data;
+        optionbutton_action_state_changed *opt =
+                          (optionbutton_action_state_changed *) &action.data;
+
+        writablefield_set_value(0, id->this_obj, if_Address, interface_address[i]);
+        writablefield_set_value(0, id->this_obj, if_Netmask, interface_netmask[i]);
+        if (interface_is_pp[i])
+            writablefield_set_value(0, id->this_obj, if_LinkAddr, interface_linkaddr[i]);
+
+        action.size = 16 + 8;
+        action.action_no = action_RADIO_BUTTON_STATE_CHANGED;
+        action.flags = radiobutton_STATE_CHANGED_SELECT;
+        r->on = FALSE;
+#ifdef OSLib_4_8
+        my_radiobutton_get_state(0, id->this_obj, if_Manual, &r->previous_on);
+#else
+        radiobutton_get_state(0, id->this_obj, if_Manual, &r->previous_on);
+#endif
+        radiobutton_set_state(0, id->this_obj, interface_addrtype[i], TRUE);
+        toolbox_raise_toolbox_event(0, id->this_obj, r->previous_on, &action);
+
+        r->on = TRUE;
+        toolbox_raise_toolbox_event(0, id->this_obj, interface_addrtype[i], &action);
+
+        action.size = 16 + 4;
+        action.action_no = action_OPTION_BUTTON_STATE_CHANGED;
+        action.flags = optionbutton_STATE_CHANGED_SELECT;
+        opt->on = primary_interface == i;
+        optionbutton_set_state(0, id->this_obj, if_Primary, opt->on);
+        toolbox_raise_toolbox_event(0, id->this_obj, if_Primary, &action);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static bool if_button_handler(bits event_code, toolbox_action *event,
+                              toolbox_block *id, void *handle)
+{
+    radiobutton_action_state_changed *r = (radiobutton_action_state_changed *) &event->data;
+
+    switch (id->this_cmp)
+    {
+      case if_FromHostname:
+        if (r->on)
+        {
+            int i;
+            writablefield_set_value(0, id->this_obj, if_Address, HostName);
+            gadget_set_flags(0, id->this_obj, if_Netmask, 0);
+            for (i = 0; i < interfaces; i++)
+#ifdef OSLib_4_8
+                if (i != (int) handle &&
+                       my_radiobutton_get_state(0, interface_object[i], if_FromHostname, 0))
+#else
+                if (i != (int) handle &&
+                       radiobutton_get_state(0, interface_object[i], if_FromHostname, 0))
+#endif
+                {
+                    radiobutton_set_state(0, interface_object[i], if_Manual, TRUE);
+                    gadget_set_flags(0, interface_object[i], if_Address, 0);
+                }
+        }
+        break;
+
+      case if_Manual:
+        gadget_set_flags(0, id->this_obj, if_Address, r->on ? 0 : gadget_FADED);
+        gadget_set_flags(0, id->this_obj, if_Netmask, 0);
+        if (r->on)
+        {
+            writablefield_set_value(0, id->this_obj, if_Address,
+                                    interface_address[(int) handle]);
+            if (toolbox_get_object_info(0, id->this_obj) & toolbox_INFO_SHOWING)
+                gadget_set_focus(0, id->this_obj, if_Address);
+        }
+        else
+            writablefield_get_value(0, id->this_obj, if_Address,
+                                    interface_address[(int) handle],
+                                    sizeof interface_address[(int) handle]);
+        break;
+
+      case if_RevARP:
+        if (r->on)
+        {
+            writablefield_set_value(0, id->this_obj, if_Address, msgs_lookup("RevARP"));
+            if (r->previous_on != if_RevARP)
+            {
+                gadget_set_flags(0, id->this_obj, if_ICMP, 0);
+                if (optionbutton_get_state(0, id->this_obj, if_ICMP))
+                {
+                    gadget_set_flags(0, id->this_obj, if_Netmask, gadget_FADED);
+                }
+                else
+                {
+                    gadget_set_flags(0, id->this_obj, if_Netmask, 0);
+                    gadget_set_focus(0, id->this_obj, if_Netmask);
+                }
+            }
+        }
+        break;
+
+      case if_DHCP:
+        if (r->on)
+        {
+            writablefield_set_value(0, id->this_obj, if_Address, msgs_lookup("DHCP"));
+            writablefield_set_value(0, id->this_obj, if_Netmask, "default");
+            gadget_set_flags(0, id->this_obj, if_Netmask, gadget_FADED);
+            window_set_default_focus(0, id->this_obj, (toolbox_c) -2);
+        }
+        break;
+
+      case if_BOOTP:
+        if (r->on)
+        {
+            writablefield_set_value(0, id->this_obj, if_Address, msgs_lookup("BOOTP"));
+            writablefield_set_value(0, id->this_obj, if_Netmask, "default");
+            gadget_set_flags(0, id->this_obj, if_Netmask, gadget_FADED);
+            window_set_default_focus(0, id->this_obj, (toolbox_c) -2);
+        }
+        break;
+
+      case if_FromCMOS:
+        if (r->on)
+        {
+            /* Silliness */
+            struct in_addr in;
+            in.s_addr = CMOSIP;
+            writablefield_set_value(0, id->this_obj, if_Address, inet_ntoa(in));
+        }
+    }
+
+
+    if ( ((id->this_cmp != if_DHCP) && (id->this_cmp != if_BOOTP))
+         &&
+         ((r->previous_on == if_DHCP) || (r->previous_on == if_BOOTP))
+       )
+    {
+       writablefield_set_value(0, id->this_obj, if_Netmask, interface_netmask[(int) handle]);
+    }
+
+
+    if ((id->this_cmp != if_RevARP) && (r->previous_on == if_RevARP))
+    {
+        gadget_set_flags(0, id->this_obj, if_ICMP, gadget_FADED);
+//        gadget_set_flags(0, id->this_obj, if_Netmask, 0);
+//        window_set_default_focus(0, id->this_obj, if_Address);
+        if (optionbutton_get_state(0, id->this_obj, if_ICMP))
+        {
+            optionbutton_set_state(0, id->this_obj, if_ICMP, FALSE);
+            if ((id->this_cmp == if_DHCP) && (id->this_cmp == if_BOOTP))
+            {
+                writablefield_set_value(0, id->this_obj, if_Netmask, interface_netmask[(int) handle]);
+            }
+        }
+    }
+
+    return TRUE;
+}
+
+static bool if_option_handler(bits event_code, toolbox_action *event,
+                              toolbox_block *id, void *handle)
+{
+    optionbutton_action_state_changed *r = (optionbutton_action_state_changed *) &event->data;
+
+    switch (id->this_cmp)
+    {
+      case if_Primary:
+        if (r->on)
+        {
+            int i;
+
+            for (i = 0; i < interfaces; i++)
+            {
+                if (interface_object[i] == id->this_obj)
+                    continue;
+
+                optionbutton_set_state(0, interface_object[i], if_Primary, FALSE);
+            }
+        }
+        break;
+      case if_ICMP:
+        if (r->on)
+        {
+            xwimp_set_caret_position(window_get_wimp_handle(0, id->this_obj),
+                                     (wimp_i) -1, 0, 0, (1<<25), 0);
+            gadget_set_flags(0, id->this_obj, if_Netmask, gadget_FADED);
+            writablefield_get_value(0, id->this_obj, if_Netmask, interface_netmask[(int) handle], sizeof interface_netmask[(int) handle]);
+            writablefield_set_value(0, id->this_obj, if_Netmask, msgs_lookup("ICMPReq"));
+            window_set_default_focus(0, id->this_obj, (toolbox_c) -2);
+        }
+        else
+        {
+            gadget_set_flags(0, id->this_obj, if_Netmask, 0);
+            writablefield_set_value(0, id->this_obj, if_Netmask, interface_netmask[(int) handle]);
+            gadget_set_focus(0, id->this_obj, if_Netmask);
+            window_set_default_focus(0, id->this_obj, if_Address);
+        }
+        break;
+    }
+
+    return TRUE;
+}
+
+static bool default_netmask_handler(bits event_code, toolbox_action *event,
+                                    toolbox_block *id, void *handle)
+{
+    writablefield_set_value(0, id->ancestor_obj, if_Netmask, "default");
+    gadget_set_flags(0, id->ancestor_obj, if_Netmask, 0);
+    xoptionbutton_set_state(0, id->ancestor_obj, if_ICMP, FALSE);
+
+    return TRUE;
+}
+
+/****************************************************************************
+ *
+ * Interface statistics handlers
+ *
+ ****************************************************************************/
+
+static bool if_close_handler(bits event_code, toolbox_action *event,
+                             toolbox_block *id, void *handle)
+{
+    wimp_poll_flags mask;
+    int i;
+
+    /* A statistics box was closed, if it was the last, stop polling */
+    for (i = 0; i < interfaces; i++)
+    {
+        if (toolbox_get_object_info(0, interface_statistics[i]) & toolbox_INFO_SHOWING)
+        {
+            return FALSE;
+        }
+    }
+    event_get_mask(&mask);
+    event_set_mask(mask | wimp_MASK_NULL);
+
+    return FALSE;
+}
+
+static char *stat_to_string(unsigned long val, char *buff, const char *sep, const char *grp)
+{
+    char *in, *out, *rev;
+    char  raw[10 + 1];
+    char  grouped[20 + 1];
+    int   count;
+
+    in = raw + sprintf(raw, "%lu", val);
+    out = grouped;
+    do
+    {
+        /* As %lu can't output 255 chars, this deals with 'no grouping' too */
+        for (count = 0; (count < *grp) && (in != raw); count++)
+        {
+            in--; *out = *in; out++;
+        }
+
+        /* Next group, unless it's a repeat group */
+        if (grp[1]) grp++;
+        if (in != raw) *out++ = *sep;
+    } while (in != raw);
+
+    /* Reverse result */
+    rev = buff;
+    do
+    {
+        out--; *rev = *out; rev++;
+    } while (out != grouped);
+    *rev = 0; /* Terminate */
+
+    return buff;
+}
+
+static int stat_to_bargraph(osbool implemented,
+                            unsigned long frames, unsigned long errors)
+{
+    if (implemented)
+    {
+        /* The bargraph is scaled 0-255 so divide by shifting until in range */
+        while ((frames > UINT8_MAX) && errors)
+        {
+            frames = frames >> 1;
+            errors = errors >> 1;
+        }
+    }
+    else
+    {
+        errors = 0;
+    }
+    return (int)errors;
+}
+
+static void stat_gw_address(struct in_addr *gateway)
+{
+    int   route, sent, recv;
+    int   seq, mask;
+    pid_t pid;
+    char *tail;
+    union
+    {
+        struct
+        {
+            struct rt_msghdr hdr;
+            struct sockaddr_in dest;
+            struct sockaddr_in mask;
+        } req;
+        struct
+        {
+            struct rt_msghdr hdr;
+            char   data[256];
+        } rsp;
+    } msg;
+ 
+    /* Default to unset */
+    gateway->s_addr = INADDR_ANY;
+
+    /* Build a request to get the route to any INET address */
+    pid = (pid_t)toolboxgetsysinfo_task();
+    seq = 99;
+    memset(&msg.req, 0, sizeof(msg.req));
+    msg.req.hdr.rtm_msglen = sizeof(msg.req);
+    msg.req.hdr.rtm_version = RTM_VERSION;
+    msg.req.hdr.rtm_type = RTM_GET;
+    msg.req.hdr.rtm_flags = RTF_UP | RTF_GATEWAY | RTF_HOST | RTF_STATIC;
+    msg.req.hdr.rtm_pid = pid;
+    msg.req.hdr.rtm_addrs = RTA_DST | RTA_NETMASK;
+    msg.req.hdr.rtm_seq = seq;
+    msg.req.dest.sin_len = sizeof(msg.req.dest);
+    msg.req.dest.sin_family = AF_INET;
+    msg.req.dest.sin_addr.s_addr = INADDR_ANY;
+    msg.req.mask.sin_len = sizeof(msg.req.mask);
+    msg.req.mask.sin_family = AF_INET;
+    msg.req.mask.sin_addr.s_addr = INADDR_ANY;
+ 
+    /* Send the request to the route table */
+    route = socket(AF_ROUTE, SOCK_RAW, PF_INET);
+    if (route < 0) return;
+    sent = socketwrite(route, &msg.req, sizeof(msg.req));
+    if (sent < 0) goto tidyup;
+    if (sent != sizeof(msg.req))
+    {
+        goto tidyup;
+    }
+ 
+    /* Wait for the reply */
+    do
+    {
+        memset(&msg.rsp, 0, sizeof(msg.rsp));
+        recv = socketread(route, &msg.rsp, sizeof(msg.rsp));
+        if (recv < 0) goto tidyup;
+    } while ((msg.rsp.hdr.rtm_seq != seq) || (msg.rsp.hdr.rtm_pid != pid));
+ 
+    if ((msg.rsp.hdr.rtm_version != RTM_VERSION) ||
+        (msg.rsp.hdr.rtm_msglen > recv) ||
+        (msg.rsp.hdr.rtm_errno != 0))
+    {
+        goto tidyup;
+    }
+ 
+    /* Walk over the results looking for the gateway */
+    tail = msg.rsp.data;
+    for (mask = 1; mask != 0; mask = mask << 1)
+    {
+        struct sockaddr *sa = (struct sockaddr *)tail;
+        struct sockaddr_in *gw = (struct sockaddr_in *)tail;
+ 
+        switch (msg.rsp.hdr.rtm_addrs & mask)
+        {
+            case RTA_GATEWAY:
+                /* Bingo */
+                gateway->s_addr = gw->sin_addr.s_addr;
+                goto tidyup;
+ 
+            case 0:
+                /* Not returned in rtm_addrs */
+                break;
+ 
+#define ALIGN(k) ((char *)(((uintptr_t)(k) + 3) & ~3))
+            default:
+                /* Skip over something we're not interested in */
+                if (sa->sa_len)
+                {
+                    tail = ALIGN(tail + sa->sa_len);
+                }
+                else
+                {
+                    tail = ALIGN(tail + sizeof(sa->sa_len));
+                }
+                break;
+        }
+    }
+
+tidyup:
+    socketclose(route);
+}
+
+static void stat_if_addresses(const char *name, struct in_addr *ip,
+                              struct in_addr *mask, struct in_addr *remote)
+{
+    int    datagram;
+    struct ifreq ifr;
+
+    /* Ensure everything returns 0 => 'Unset' in case of error */
+    ip->s_addr = INADDR_ANY;
+    mask->s_addr = INADDR_ANY;
+    remote->s_addr = INADDR_ANY;
+
+    strncpy(ifr.ifr_name, name, sizeof(ifr.ifr_name));
+    datagram = socket(AF_INET, SOCK_DGRAM, PF_UNSPEC);
+    if (datagram < 0) return;
+
+    /* Get the addresses for the given ifname */
+    if (socketioctl(datagram, SIOCGIFADDR, &ifr) >= 0)
+    {
+        ip->s_addr = ((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr.s_addr;
+    } 
+    if (socketioctl(datagram, SIOCGIFDSTADDR, &ifr) >= 0)
+    {
+        remote->s_addr = ((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr.s_addr;
+    } 
+    if (socketioctl(datagram, SIOCGIFNETMASK, &ifr) >= 0)
+    {
+        mask->s_addr = ((struct sockaddr_in *)&ifr.ifr_addr)->sin_addr.s_addr;
+    }
+
+    socketclose(datagram);
+}
+
+static bool FillStatisticsDboxes(wimp_event_no event_code, wimp_block *event,
+                                 toolbox_block *id, void *handle)
+{
+    int   i;
+    char  unit[16];
+    const Dib   *devices[16];
+    const ChDib *chd, *prev;
+    struct in_addr gateway;
+
+    /* Some defaults, incase the driver is not yet loaded */
+    for (i = 0; i < interfaces; i++)
+    {
+        devices[i] = NULL;
+    }
+
+    /* Request the default gateway once for all interfaces */
+    stat_gw_address(&gateway);
+
+    service_enumerate_network_drivers(&chd);
+    while (chd != NULL)
+    {
+        /* DCI4 requires the Dib to be static storage, but the chain is
+         * from the RMA. Match them to interfaces here so they can be freed
+         * before any error-causing Toolbox functions might cause an RMA leak.
+         */
+        sprintf(unit, "%s%u", chd->chd_dib->dib_name, chd->chd_dib->dib_unit);
+        for (i = 0; i < interfaces; i++)
+        {
+            if (strcmp(unit, interface_unit[i]) == 0) devices[i] = chd->chd_dib;
+        }
+        prev = chd;
+        chd = chd->chd_next;
+        xosmodule_free((void *)prev);
+    }
+
+    for (i = 0; i < interfaces; i++)
+    {
+        FillStatisticsDbox(i, devices[i], gateway, id == NULL);
+    }
+
+    return TRUE;
+}
+
+static void FillStatisticsDbox(int i, const Dib *d, struct in_addr gateway, osbool init)
+{
+    struct stats imp, live;
+    const char *sep;
+    const char *grp;
+    char        buffer[128];
+    toolbox_o   o;
+    int         mbps = 0;
+    osbool      implemented;
+    unsigned long  tx_sum, rx_sum;
+    unsigned char *eui_ptr;
+    struct in_addr ip, mask, remote;
+
+    sep = territory_read_string_symbols(territory_CURRENT, territory_SYMBOL_GROUP_SEPARATOR);
+    grp = territory_read_string_symbols(territory_CURRENT, territory_SYMBOL_GROUPING_LIST);
+    o = interface_statistics[i];
+
+    /* Ask this interface's driver for some stats for the i'th interface */
+    if (d == NULL)
+    {
+        memset(&imp, 0, sizeof(imp));
+    }
+    else
+    {
+        network_driver_implemented_stats(d->dib_swibase, d->dib_unit, &imp);
+        network_driver_return_stats(d->dib_swibase, d->dib_unit, &live);
+    }
+
+    /* Transmit statistics */
+    tx_sum = live.st_tx_frames + live.st_tx_general_errors;
+    if (HAS_CHANGED(tx_sum))
+    {
+        NOTE_CHANGE(tx_sum);
+        displayfield_set_value(0, o, stat_DisplayTxFrames, (imp.st_tx_frames == UINT32_MAX)
+                               ? stat_to_string(live.st_tx_frames, buffer, sep, grp)
+                               : msgs_lookup("UnImp"));
+        displayfield_set_value(0, o, stat_DisplayTxErrors, (imp.st_tx_general_errors == UINT32_MAX)
+                               ? stat_to_string(live.st_tx_general_errors, buffer, sep, grp)
+                               : msgs_lookup("UnImp"));
+        implemented = (imp.st_tx_frames == UINT32_MAX) && (imp.st_tx_general_errors == UINT32_MAX);
+        gadget_set_flags(0, o, stat_TxBarGraph, implemented ? 0 : gadget_FADED);
+        slider_set_value(0, o, stat_TxBarGraph,
+                         stat_to_bargraph(implemented, live.st_tx_frames, live.st_tx_general_errors));
+    }
+
+    /* Receive statistics */
+    rx_sum = live.st_rx_frames + live.st_rx_general_errors;
+    if (HAS_CHANGED(rx_sum))
+    {
+        NOTE_CHANGE(rx_sum);
+        displayfield_set_value(0, o, stat_DisplayRxFrames, (imp.st_rx_frames == UINT32_MAX)
+                               ? stat_to_string(live.st_rx_frames, buffer, sep, grp)
+                               : msgs_lookup("UnImp"));
+        displayfield_set_value(0, o, stat_DisplayRxErrors, (imp.st_rx_general_errors == UINT32_MAX)
+                               ? stat_to_string(live.st_rx_general_errors, buffer, sep, grp)
+                               : msgs_lookup("UnImp"));
+        implemented = (imp.st_rx_frames == UINT32_MAX) && (imp.st_rx_general_errors == UINT32_MAX); 
+        gadget_set_flags(0, o, stat_RxBarGraph, implemented ? 0 : gadget_FADED);
+        slider_set_value(0, o, stat_RxBarGraph,
+                         stat_to_bargraph(implemented, live.st_rx_frames, live.st_rx_general_errors));
+    }
+
+    /* Link flags */
+    if (HAS_CHANGED(live.st_link_status) || HAS_CHANGED(live.st_link_polarity))
+    {
+        NOTE_CHANGE(live.st_link_polarity);
+        NOTE_CHANGE(live.st_link_status);
+        button_set_value(0, o, stat_Polarity, (imp.st_link_polarity == UINT8_MAX)
+                         ? (live.st_link_polarity & ST_LINK_POLARITY_CORRECT) ? "yes"
+                                                                              : "no"
+                         : "dontcare");
+        button_set_value(0, o, stat_FullDuplex, (imp.st_link_status == UINT8_MAX)
+                         ? (live.st_link_status & ST_STATUS_FULL_DUPLEX) ? "yes"
+                                                                         : "no"
+                         : "dontcare");
+        button_set_value(0, o, stat_OK, (imp.st_link_status == UINT8_MAX)
+                         ? (live.st_link_status & ST_STATUS_OK) ? "yes"
+                                                                : "no"
+                         : "dontcare");
+        button_set_value(0, o, stat_Active, (imp.st_link_status == UINT8_MAX)
+                         ? (live.st_link_status & ST_STATUS_ACTIVE) ? "yes"
+                                                                    : "no"
+                         : "dontcare");
+    }
+
+    /* Some network addresses */
+    stat_if_addresses(interface_unit[i], &ip, &mask, &remote);
+    if (HAS_CHANGED(ip.s_addr) || HAS_CHANGED(mask.s_addr))
+    {
+        NOTE_CHANGE(ip);
+        NOTE_CHANGE(mask);
+        displayfield_set_value(0, o, stat_DisplayIPAddr,
+                               ip.s_addr == INADDR_ANY ? msgs_lookup("Unset")
+                                                       : inet_ntoa(ip));
+        displayfield_set_value(0, o, stat_DisplayNetmask,
+                               mask.s_addr == INADDR_ANY ? msgs_lookup("Unset")
+                                                         : inet_ntoa(mask));
+    }
+    if (HAS_CHANGED(gateway.s_addr))
+    {
+        NOTE_CHANGE(gateway);
+        displayfield_set_value(0, o, stat_DisplayGateway,
+                               gateway.s_addr == INADDR_ANY ? msgs_lookup("Unset")
+                                                            : inet_ntoa(gateway));
+    }
+
+    /* PPP interface modifiers */
+    if (interface_is_pp[i])
+    {
+        /* Remote address */
+        if (HAS_CHANGED(remote.s_addr))
+        {
+            NOTE_CHANGE(remote);
+            displayfield_set_value(0, o, stat_DisplayHWRemAddr,
+                                   remote.s_addr == INADDR_ANY ? msgs_lookup("Unset")
+                                                               : inet_ntoa(remote));
+        }
+    }
+    else
+    {
+        /* Hardware address */
+        eui_ptr = (d == NULL) ? NULL : d->dib_address;
+        if (HAS_CHANGED(eui_ptr))
+        {
+            NOTE_CHANGE(eui_ptr);
+            if (d == NULL)
+            {
+                strcpy(buffer, msgs_lookup("UnImp"));
+            }
+            else
+            {
+                sprintf(buffer, "%02X:%02X:%02X:%02X:%02X:%02X",
+                        d->dib_address[0], d->dib_address[1], d->dib_address[2], 
+                        d->dib_address[3], d->dib_address[4], d->dib_address[5]);
+            }
+            displayfield_set_value(0, o, stat_DisplayHWRemAddr, buffer);
+        }
+    }
+
+    /* Set the speed */
+    if (HAS_CHANGED(live.st_interface_type))
+    {
+        NOTE_CHANGE(live.st_interface_type);
+        switch (live.st_interface_type)
+        {
+            case ST_TYPE_10BASE5:
+            case ST_TYPE_10BASE2:
+            case ST_TYPE_10BASET:
+            case ST_TYPE_10BASE5N2:
+            case ST_TYPE_10BASE2NT:
+            case ST_TYPE_RSQUELCH10BASET:
+            case ST_TYPE_10BASE5N2NT:
+            case ST_TYPE_10BASEFX:
+                mbps = 10;
+                break;
+    
+            case ST_TYPE_100BASETX:
+            case ST_TYPE_100BASEVG:
+            case ST_TYPE_100BASET4:
+            case ST_TYPE_100BASEFX:
+                mbps = 100;
+                break;
+    
+            case ST_TYPE_1000BASESX:
+            case ST_TYPE_1000BASET:
+            case ST_TYPE_1000BASELX:
+            case ST_TYPE_1000BASECX:
+                mbps = 1000;
+                break;
+        }
+        if (interface_is_pp[i] || (mbps == 0) || (live.st_interface_type == UINT8_MAX))
+        {
+            strcpy(buffer, msgs_lookup("ActPP"));
+        }
+        else
+        {
+            sprintf(buffer, msgs_lookup("ActMb"), mbps);
+        }
+        button_set_value(0, o, stat_ActivitySpeed, buffer);
+    }
+}

@@ -1,0 +1,322 @@
+/*
+ * Copyright (c) 2017, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include <stdlib.h>
+#include <stdio.h>
+
+#include "buffer.h"
+#include "gvoverlay.h"
+#include "pmp.h"
+#include "consts.h"
+
+#define ERROR_BAD_BUFFER ((_kernel_oserror*)"\0\0\0\0Bad buffer")
+#define ERROR_BAD_BANK ((_kernel_oserror*)"\0\0\0\0Bad bank")
+#define ERROR_BAD_DESC ((_kernel_oserror*)"\0\0\0\0Buffer descriptor unacceptable")
+
+/* Basic buffer interface - for unrotated buffers */
+
+typedef struct {
+	buffer_t base;
+	uint32_t stride;
+	uint32_t uv_offset;
+	uint32_t size;
+	pmp_block_t *banks[GVBANK_MAX];
+} basic_buffer_t;
+
+static bool basic_vet(const buffer_desc_t *desc);
+static _kernel_oserror *basic_create(const buffer_desc_t *desc,buffer_t **out_buffer);
+static _kernel_oserror *basic_destroy(buffer_t *buffer);
+static _kernel_oserror *basic_config_gpu(buffer_t *buffer,uint32_t bank,uint32_t *out_pa,uint32_t *out_pa2,uint32_t *out_stride);
+static _kernel_oserror *basic_release_gpu(buffer_t *buffer,uint32_t bank);
+static _kernel_oserror *basic_config_cpu(buffer_t *buffer,uint32_t bank,void **out_la,void **out_la2,uint32_t *out_stride);
+static _kernel_oserror *basic_release_cpu(buffer_t *buffer,uint32_t bank);
+static _kernel_oserror *basic_discard(buffer_t *buffer,uint32_t bank);
+#ifdef DEBUGLIB
+static void basic_describe(buffer_t *buffer);
+#endif
+
+static buffer_if_t basic_if = 
+{
+	.vet = basic_vet,
+	.create = basic_create,
+	.destroy = basic_destroy,
+	.config_gpu = basic_config_gpu,
+	.release_gpu = basic_release_gpu,
+	.config_cpu = basic_config_cpu,
+	.release_cpu = basic_release_cpu,
+	.discard = basic_discard,
+#ifdef DEBUGLIB
+	.describe = basic_describe,
+#endif
+};
+
+static bool basic_vet(const buffer_desc_t *desc)
+{
+	if (desc->rotation || (desc->maxbank >= GVBANK_MAX))
+	{
+		return false;
+	}
+	return true;
+}
+
+static _kernel_oserror *basic_create(const buffer_desc_t *desc,buffer_t **out_buffer)
+{
+	if (!basic_vet(desc))
+	{
+		return ERROR_BAD_DESC;
+	}
+	basic_buffer_t *b = calloc(1,sizeof(basic_buffer_t));
+	if (!b)
+	{
+		return (_kernel_oserror *)"\0\0\0\0No memory";
+	}
+	b->base.iface = &basic_if;
+	b->stride = (desc->width*pixel_format_bpp[desc->format])>>3;
+	b->size = b->stride*desc->height;
+	if (FORMAT_IS_NV12(desc->format))
+	{
+		b->uv_offset = b->size;
+		/* Y plane is 8bpp
+		   2x2 scaling on UV plane means it's essentially 4bpp */
+		b->size += b->size>>1;
+	}
+	*out_buffer = &b->base;
+	return NULL;
+}
+
+static _kernel_oserror *basic_destroy(buffer_t *buffer)
+{
+	basic_buffer_t *b = (basic_buffer_t *) buffer;
+	for(int i=0;i<GVBANK_MAX;i++)
+	{
+		if (b->banks[i])
+		{
+			_kernel_oserror *e = basic_discard(buffer,i);
+			if (e)
+			{
+				return e;
+			}
+		}
+	}
+	free(b);
+	return NULL;
+}
+
+static _kernel_oserror *basic_config_gpu(buffer_t *buffer,uint32_t bank,uint32_t *out_pa,uint32_t *out_pa2,uint32_t *out_stride)
+{
+	basic_buffer_t *b = (basic_buffer_t *) buffer;
+	if (bank >= GVBANK_MAX)
+	{
+		return ERROR_BAD_BANK;
+	}
+	if (!b->banks[bank])
+	{
+		_kernel_oserror *e = pmp_alloc(b->size,&b->banks[bank]);
+		if (e)
+		{
+			return e;
+		}
+	}
+	*out_pa = b->banks[bank]->pa;
+	if (out_pa2)
+	{
+		*out_pa2 = b->banks[bank]->pa + b->uv_offset;
+	}
+	*out_stride = b->stride;
+	return NULL;
+}
+
+static _kernel_oserror *basic_release_gpu(buffer_t *buffer,uint32_t bank)
+{
+	(void) buffer;
+	(void) bank;
+	/* NOP */
+	return NULL;
+}
+
+static _kernel_oserror *basic_config_cpu(buffer_t *buffer,uint32_t bank,void **out_la,void **out_la2,uint32_t *out_stride)
+{
+	basic_buffer_t *b = (basic_buffer_t *) buffer;
+	if (bank >= GVBANK_MAX)
+	{
+		return ERROR_BAD_BANK;
+	}
+	if (!b->banks[bank])
+	{
+		_kernel_oserror *e = pmp_alloc(b->size,&b->banks[bank]);
+		if (e)
+		{
+			return e;
+		}
+	}
+	if (!b->banks[bank]->la)
+	{
+		_kernel_oserror *e = pmp_map(b->banks[bank]);
+		if (e)
+		{
+			return e;
+		}
+	}
+	*out_la = (void *) b->banks[bank]->la;
+	if (out_la2)
+	{
+		*out_la2 = (void *) (b->banks[bank]->la + b->uv_offset);
+	}
+	*out_stride = b->stride;
+	return NULL;
+}
+
+static _kernel_oserror *basic_release_cpu(buffer_t *buffer,uint32_t bank)
+{
+	basic_buffer_t *b = (basic_buffer_t *) buffer;
+	if (bank >= GVBANK_MAX)
+	{
+		return ERROR_BAD_BANK;
+	}
+	if (!b->banks[bank])
+	{
+		return NULL;
+	}
+	return pmp_unmap(b->banks[bank]);
+}
+
+static _kernel_oserror *basic_discard(buffer_t *buffer,uint32_t bank)
+{
+	basic_buffer_t *b = (basic_buffer_t *) buffer;
+	if (bank >= GVBANK_MAX)
+	{
+		return ERROR_BAD_BANK;
+	}
+	if (!b->banks[bank])
+	{
+		return NULL;
+	}
+	_kernel_oserror *e = pmp_free(b->banks[bank]);
+	if (!e)
+	{
+		b->banks[bank] = NULL;
+	}
+	return e;
+}
+
+#ifdef DEBUGLIB
+static void basic_describe(buffer_t *buffer)
+{
+	basic_buffer_t *b = (basic_buffer_t *) buffer;
+	printf(" basic buffer:\n");
+	printf("  stride %08x uv_offset %08x size %08x\n",b->stride,b->uv_offset,b->size);
+	for(int i=0;i<GVBANK_MAX;i++)
+	{
+		if (b->banks[i])
+		{
+			printf("  bank %d pa %08x la %08x\n",i,b->banks[i]->pa,b->banks[i]->la);
+		}
+	} 
+}
+#endif
+
+buffer_if_t *buffer_rotation_if = NULL;
+
+bool buffer_vet(const buffer_desc_t *desc)
+{
+	buffer_if_t *iface = (desc->rotation ? buffer_rotation_if : &basic_if);
+	return iface && (iface->vet(desc));
+}
+
+_kernel_oserror *buffer_create(const buffer_desc_t *desc,buffer_t **out_buffer)
+{
+	buffer_if_t *iface = (desc->rotation ? buffer_rotation_if : &basic_if);
+	if (!iface)
+	{
+		return ERROR_BAD_DESC;
+	}
+	return iface->create(desc,out_buffer);
+}
+
+_kernel_oserror *buffer_destroy(buffer_t *buffer)
+{
+	if (buffer)
+	{
+		return buffer->iface->destroy(buffer);
+	}
+	return NULL;
+}
+
+_kernel_oserror *buffer_config_gpu(buffer_t *buffer,uint32_t bank,uint32_t *out_pa,uint32_t *out_pa2,uint32_t *out_stride)
+{
+	if (buffer)
+	{
+		return buffer->iface->config_gpu(buffer,bank,out_pa,out_pa2,out_stride);
+	}
+	return ERROR_BAD_BUFFER;
+}
+
+_kernel_oserror *buffer_release_gpu(buffer_t *buffer,uint32_t bank)
+{
+	if (buffer)
+	{
+		return buffer->iface->release_gpu(buffer,bank);
+	}
+	return ERROR_BAD_BUFFER;
+}
+
+_kernel_oserror *buffer_config_cpu(buffer_t *buffer,uint32_t bank,void **out_la,void **out_la2,uint32_t *out_stride)
+{
+	if (buffer)
+	{
+		return buffer->iface->config_cpu(buffer,bank,out_la,out_la2,out_stride);
+	}
+	return ERROR_BAD_BUFFER;
+}
+
+_kernel_oserror *buffer_release_cpu(buffer_t *buffer,uint32_t bank)
+{
+	if (buffer)
+	{
+		return buffer->iface->release_cpu(buffer,bank);
+	}
+	return ERROR_BAD_BUFFER;
+}
+
+_kernel_oserror *buffer_discard(buffer_t *buffer,uint32_t bank)
+{
+	if (buffer)
+	{
+		return buffer->iface->discard(buffer,bank);
+	}
+	return ERROR_BAD_BUFFER;
+}
+
+#ifdef DEBUGLIB
+void buffer_describe(buffer_t *buffer)
+{
+	if (buffer && buffer->iface->describe)
+	{
+		buffer->iface->describe(buffer);
+	}
+}
+#endif

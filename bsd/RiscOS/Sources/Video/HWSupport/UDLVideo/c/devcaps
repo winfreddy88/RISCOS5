@@ -1,0 +1,216 @@
+/*
+ * Copyright (c) 2014, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include "devcaps.h"
+#include "DebugLib/DebugLib.h"
+
+/* Determine the capabilities of a DisplayLink device
+   Adapted from the information in http://markmail.org/thread/wch4zf4m6nosspns
+*/
+
+static const uint32_t default_caps[] =
+{
+	1024, 1024*600,  // DL115
+	1440, 1400*1050, // DL120,
+	1440, 1400*1050, // DL125,
+	1680, 1600*1200, // DL160,
+	1920, 1920*1080, // DL165,
+	1920, 1920*1200, // DL190, (Might be wrong?)
+	2048, 2048*1152, // DL195,
+};
+
+static devcaps_t devcaps_get_from_descriptor(const uint8_t *desc,uint8_t len)
+{
+	devcaps_t caps = { .chip = DLUNK };
+	/* After the descriptor's header comes a list of key-value pairs.
+	   Two byte key ID, one byte data length, N bytes of data */
+	while(len > 3)
+	{
+		int keyid = desc[0] | (desc[1]<<8);
+		int datalen = desc[2];
+
+		desc += 3;
+		len -= 3;
+
+		dprintf(("","keyid %04x len %02x\n",keyid,datalen));
+
+		if(datalen > len)
+			break;
+
+		if(datalen <= 4)
+		{
+			uint32_t value = 0;
+			for(int i=0;i<datalen;i++)
+				value |= desc[i] << (i<<3);
+			dprintf(("","value %x\n",value));
+	
+			switch(keyid | (datalen<<16))
+			{
+			case 0x10005: caps.diff_mode = value; break;
+			case 0x40200: caps.max_total_pixels = value; break;
+			case 0x40201: caps.max_width = value; break;
+			case 0x40300: caps.mem_start = value; break;
+			case 0x40301: caps.mem_end = value; break;
+			case 0x40400: caps.chip_id = value; break;
+			}
+		}
+
+		desc += datalen;
+		len -= datalen;
+	}
+
+	if(len)
+	{
+		/* Corrupt descriptor, discard results */
+		caps = (devcaps_t) { .chip = DLUNK };
+	}
+	else
+	{
+		dprintf(("","devcaps_get_from_descriptor: Found capabilities:\n"));
+		dprintf(("","  diff_mode = %02x\n",caps.diff_mode));
+		dprintf(("","  max_total_pixels = %d\n",caps.max_total_pixels));
+		dprintf(("","  max_width = %d\n",caps.max_width));
+		dprintf(("","  mem_start = %06x\n",caps.mem_start));
+		dprintf(("","  mem_end = %06x\n",caps.mem_end));
+		dprintf(("","  chip_id = %08x\n",caps.chip_id));
+	}
+
+	return caps;
+}
+
+static devcaps_t devcaps_get_from_descriptors(const uint8_t *desc,uint16_t len)
+{
+	devcaps_t caps =
+	{
+	.chip = DLUNK,
+	.mem_end = 0xffffff,
+	};
+
+	/* Look for the vendor descriptor
+	   Note that we scan all descriptors with no consideration for the device/config/interface hierarchy - so we should be able to spot the vendor descriptor no matter where it's hiding */
+	while(len > 2)
+	{
+		uint8_t desc_len = desc[0];
+		if((desc_len > len) || (desc_len < 2))
+			break;
+		if((desc_len >= 4) && ((desc[1] & 0x5f) == 0x5f) && (desc[2] == 0x01) && (desc[3] == 0x00) && (desc[4] == desc_len-2))
+		{
+			devcaps_t caps2 = devcaps_get_from_descriptor(desc+5,desc_len-5);
+			if(caps2.diff_mode)
+				caps.diff_mode = caps2.diff_mode;
+			if(caps2.max_total_pixels)
+				caps.max_total_pixels = caps2.max_total_pixels;
+			if(caps2.max_width)
+				caps.max_width = caps2.max_width;
+			if(caps2.mem_start)
+				caps.mem_start = caps2.mem_start;
+			if(caps2.mem_end)
+				caps.mem_end = caps2.mem_end;
+			if(caps2.chip_id)
+				caps.chip_id = caps2.chip_id;
+		}
+		desc += desc_len;
+	}
+
+	return caps;
+}
+
+devcaps_t devcaps_get(const uint8_t *ddesc,uint16_t desclen,uint32_t status,uint32_t version,uint8_t dl120_160)
+{
+	/* Start off by looking for the vendor descriptor */
+	devcaps_t caps = devcaps_get_from_descriptors(ddesc,desclen);
+
+	/* Map the chip ID to a chip type */
+	switch(caps.chip_id)
+	{
+	case 0x00010007: caps.chip = DL120; break;
+	case 0x01010007: caps.chip = DL160; break; /* Or DL190 */
+	case 0x20020010:
+	case 0x90020010:
+	case 0x80020010:
+		caps.chip = DLUNSUPPORTED;
+		break;
+	case 0x70030001: caps.chip = DL115; break;
+	case 0x60030001: caps.chip = DL125; break;
+	case 0xb0030001: caps.chip = DL165; break;
+	case 0xc0030001: caps.chip = DL195; break;
+	}
+
+	/* If the chip is unknown, guess it by looking at the other registers */
+	if(caps.chip == DLUNK)
+	{
+		switch(status>>24)
+		{
+		case 0xf0: /* 'Alex' chips, i.e. DL1x0 */
+			if(dl120_160 & 1)
+			{
+				caps.chip = DL160;
+				if(caps.max_total_pixels >= 1920*1200)
+					caps.chip = DL190;
+			}
+			else
+				caps.chip = DL120;
+			break;
+		case 0xf1: /* 'Ollie' chips, i.e. DL1x5 */
+			switch(version>>28)
+			{
+			case 0xC:
+				caps.chip = DL195;
+				break;
+			case 0xD:
+				caps.chip = DL165;
+				break;
+			case 0x6:
+				caps.chip = DL125;
+				break;
+			case 0x7:
+				caps.chip = DL115;
+				break;
+			}
+			break;
+		}
+	}
+
+	/* Give up if we still don't know the type */
+	if((caps.chip == DLUNK) || (caps.chip == DLUNSUPPORTED))
+	{
+		return caps;
+	}
+
+	/* Use the chip type to fill in some other details */
+	if(!caps.max_width)
+		caps.max_width = default_caps[caps.chip*2];
+	if(!caps.max_total_pixels)
+		caps.max_total_pixels = default_caps[caps.chip*2+1];
+
+	/* DL1x0 chips have tight rules on how huffman data streams should be
+	   structured */
+	if((caps.chip == DL120) || (caps.chip == DL160) || (caps.chip == DL190))
+		caps.fussy_huffman = true; 
+
+	return caps;
+}

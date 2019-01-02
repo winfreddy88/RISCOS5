@@ -1,0 +1,827 @@
+/* Copyright 2004 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/**************************************************************/
+/* File:    info.c                                            */
+/*                                                            */
+/* Purpose: Implements the *EKInfo command, and also provides */
+/*          some formatted text output routines used by other */
+/*          commands.                                         */
+/*                                                            */
+/* Author:  J.R.Byrne.                                        */
+/**************************************************************/
+
+#include <stdio.h>
+#include <string.h>
+#include <locale.h>
+
+#include "em_riscos.h"
+#include "if_em.h"
+#include "em_device.h"
+#include "msgs.h"
+
+#include "info.h"
+
+/**************************************************************/
+/* straddrlevel()                                             */
+/*                                                            */
+/* Return a string describing a filtering address level.      */
+/*                                                            */
+/* Parameters: DCI 4 address level.                           */
+/*                                                            */
+/* Returns:    Pointer to a suitable display string.          */
+/**************************************************************/
+
+static const char * straddrlevel(int addrlevel)
+{
+    switch (addrlevel)
+    {
+        case ADDRLVL_SPECIFIC:    return "(specific)   ";
+        case ADDRLVL_NORMAL:      return "(normal)     ";
+        case ADDRLVL_MULTICAST:   return "(multicast)  ";
+        case ADDRLVL_PROMISCUOUS: return "(promiscuous)";
+        default:                  return "";
+    }
+}
+
+/**************************************************************/
+/* format_num()                                               */
+/*                                                            */
+/* Format a number for display using information from         */
+/* localeconv(). If the buffer passed to this function is     */
+/* too small for the formatted number but large enough for    */
+/* the unformatted number the number is returned unformatted. */
+/*                                                            */
+/* Parameters: Pointer to a buffer for the result.            */
+/*                                                            */
+/*             Size of the output buffer.                     */
+/*                                                            */
+/*             The number to be formatted.                    */
+/*                                                            */
+/* Returns:    The number of characters that were written to  */
+/*             the buffer, if it was large enough, or the     */
+/*             minimum buffer size to hold the number         */
+/*             unformatted, if it was too small.              */
+/**************************************************************/
+
+static int format_num(char * buffer, size_t size, unsigned long long num)
+{
+    struct lconv * l = localeconv();
+    char         * p = buffer + size;
+    char         * p2;
+    const char   * sep = l->thousands_sep;
+    const char   * group = l->grouping;
+    int            seplen = strlen(sep);
+    int            n;
+
+    n = snprintf(buffer, size, "%llu", num);
+    if (n < 0 || n >= size)
+        return n;
+
+    p2 = buffer + n - 1;
+
+    n = *group;
+    *--p = '\0';
+
+    while (p2 >= buffer)
+    {
+        if (n != CHAR_MAX)
+            n--;
+        if (n >= 0)
+        {
+            *--p = *p2--;
+        }
+        else
+        {
+            p -= seplen;
+            if (p <= p2)
+                break;
+            memcpy(p, sep, seplen);
+            n = *++group;
+            if (n == 0)
+                n = *--group;
+        }
+    }
+
+    if (p > p2)
+    {
+        n = buffer + size - p - 1;
+        memmove(buffer, p, n+1);
+    }
+    else
+    {
+        n = strlen(buffer);
+    }
+
+    return n;
+}
+
+/**************************************************************/
+/* info_indent()                                              */
+/*                                                            */
+/* Print a number of spaces to indent *EKInfo output.         */
+/*                                                            */
+/* Parameters: The indentation level.                         */
+/**************************************************************/
+
+static void info_indent(int indent)
+{
+    for (int i = 0; i < indent * 2; i++)
+        putchar(' ');
+}
+
+/**************************************************************/
+/* info_print_num()                                           */
+/*                                                            */
+/* Look up a token using MessageTrans then print it, indented */
+/* to the given level and followed by a colon, a space and    */
+/* a formatted number.                                        */
+/*                                                            */
+/* Parameters: The indentation level;                         */
+/*                                                            */
+/*             Pointer to the message token;                  */
+/*                                                            */
+/*             The number to print.                           */
+/**************************************************************/
+
+static void info_print_num(int indent, const char * token, uint64_t val)
+{
+    char buf[80];
+
+    info_indent(indent);
+    messages_lookup(buf, sizeof(buf), token, 0);
+    for (int i = 0; buf[i] != 0 && buf[i] != 10; i++)
+        putchar(buf[i]);
+    format_num(buf, sizeof(buf), val);
+    printf(": %s\n", buf);
+}
+
+/**************************************************************/
+/* info_print_stat()                                          */
+/*                                                            */
+/* Print a *EKInfo statistic. If this is the first statistic  */
+/* to be printed in a particular block, print the block       */
+/* heading as well. Statistics with a value of zero are not   */
+/* printed.                                                   */
+/*                                                            */
+/* Parameters: Pointer to a pointer to the message token for  */
+/*             the block heading. If printed, the pointer     */
+/*             will be set to NULL;                           */
+/*                                                            */
+/*             The indentation level;                         */
+/*                                                            */
+/*             Pointer to the token for the statistic         */
+/*             description;                                   */
+/*                                                            */
+/*             The statistic value.                           */
+/**************************************************************/
+
+static void info_print_stat(const char ** head_tok, int indent,
+    const char * token, uint64_t val)
+{
+    if (val != 0)
+    {
+        if (*head_tok != NULL)
+        {
+            putchar('\n');
+            info_print(indent, *head_tok, 0);
+            *head_tok = NULL;
+        }
+
+        info_print_num(indent + 1, token, val);
+    }
+}
+
+/**************************************************************/
+/* info_print()                                               */
+/*                                                            */
+/* Look up a message token with MessageTrans and parameter    */
+/* substitution and print the resulting string, indented to   */
+/* the given level.                                           */
+/*                                                            */
+/* Assumptions: The expanded string will be no more than 80   */
+/* characters in length. Longer strings will be truncated.    */
+/*                                                            */
+/* Parameters: The indentation level;                         */
+/*                                                            */
+/*             Pointer to the message token;                  */
+/*                                                            */
+/*             Number of parameters to be substituted;        */
+/*                                                            */
+/*             Pointers to substitute strings (if any).       */
+/**************************************************************/
+
+void info_print(int indent, const char * token, int nparams, ...)
+{
+    va_list ap;
+    char    buf[80];
+
+    va_start(ap, nparams);
+    messages_vlookup(buf, sizeof(buf), token, nparams, ap);
+    va_end(ap);
+
+    info_indent(indent);
+    puts(buf);
+}
+
+/**************************************************************/
+/* info_vprintf()                                             */
+/*                                                            */
+/* Equivalent to info_printf, but with the variable argument  */
+/* list replaced by a variable argument list pointer.         */
+/* See the description of info_printf() for details of how    */
+/* this function is used.                                     */
+/*                                                            */
+/* Assumptions: The expanded string will be no more than 80   */
+/* characters in length. Longer strings will be truncated.    */
+/*                                                            */
+/* Parameters: The indentation level;                         */
+/*                                                            */
+/*             Pointer to the message token;                  */
+/*                                                            */
+/*             Pointer to the format string;                  */
+/*                                                            */
+/*             Variable argument list pointer that has been   */
+/*             initialised by the va_start macro.             */
+/**************************************************************/
+
+void info_vprintf(int indent, const char * token, const char * format,
+    va_list ap)
+{
+    char buf[80];
+
+    messages_vlookupf(buf, sizeof(buf), token, format, ap);
+    info_indent(indent);
+    puts(buf);
+}
+
+/**************************************************************/
+/* info_printf()                                              */
+/*                                                            */
+/* Look up a message token using MessageTrans, substituting   */
+/* parameters with elements from a printf() style formatted   */
+/* string, then print the result, indented to the given       */
+/* level. The format string and its parameters are processed  */
+/* by sprintf() first, then the resulting string is split at  */
+/* any line feed characters within it. Each of the resulting  */
+/* strings becomes one parameter for the MessageTrans         */
+/* parameter substitution.                                    */
+/*                                                            */
+/* For example, if the message string for the token was       */
+/* "First %0, then %1", the format string was "a=%d\nb=%d"    */
+/* and the parameters were '1' and '2' then the result would  */
+/* be "First a=1, then b=2".                                  */
+/*                                                            */
+/* Assumptions: The expanded string will be no more than 80   */
+/* characters in length. Longer strings will be truncated.    */
+/*                                                            */
+/* Parameters: The indentation level;                         */
+/*                                                            */
+/*             Pointer to the message token;                  */
+/*                                                            */
+/*             Pointer to the format string;                  */
+/*                                                            */
+/*             Arguments (if any)                             */
+/**************************************************************/
+
+void info_printf(int indent, const char * token, const char * format, ...)
+{
+    va_list ap;
+
+    va_start(ap, format);
+    info_vprintf(indent, token, format, ap);
+    va_end(ap);
+}
+
+/**************************************************************/
+/* info_output()                                              */
+/*                                                            */
+/* Output the *EKInfo message for a given device.             */
+/*                                                            */
+/* Parameters: Pointer to the relevant device structure;      */
+/*                                                            */
+/*             Whether or not to display 'verbose' output.    */
+/*                                                            */
+/* Returns:    Error pointer.                                 */
+/**************************************************************/
+
+_kernel_oserror * info_output(device_t dev, bool verbose)
+{
+    putchar('\n');
+    info_printf(0, "Inf_Unit", "%d\n%s", dev->dib.dib_unit, dev->dib.dib_location);
+    if (!dev->initialised)
+    {
+        info_printf(1, "Inf_Failed", "%d", dev->dib.dib_unit);
+    }
+    else
+    {
+        struct adapter *   adapter = &dev->adapter;
+        int                s;
+        struct em_hw_stats stats;
+        struct em_phy_info phy_info;
+        char               buf[80];
+        const char       * p1;
+        const char       * p2;
+        const char       * p3;
+        int                len, max_len;
+        int                filters_active = 0;
+
+        /* Do the things that em_local_timer() does */
+
+        s = splimp();
+
+        em_check_for_link(&adapter->hw);
+        em_print_link_status(adapter);
+        em_update_stats_counters(adapter);
+
+        /* Grab a copy of the stats, as they may be updated under interrupt */
+        stats = adapter->stats;
+
+        splx(s);
+
+        /* MAC address */
+
+        info_printf(1, "Inf_Addr", "%02X:%02X:%02X:%02X:%02X:%02X",
+               adapter->hw.mac_addr[0], adapter->hw.mac_addr[1],
+               adapter->hw.mac_addr[2], adapter->hw.mac_addr[3],
+               adapter->hw.mac_addr[4], adapter->hw.mac_addr[5]);
+
+        if (verbose)
+        {
+            /* Controller type */
+
+            snprintf(buf, sizeof(buf), "Inf_Chip%d", adapter->hw.mac_type);
+            info_print(1, "Inf_Chip", 1, messages_return_message(buf));
+
+            /* Bus details */
+
+            switch (adapter->hw.bus_type)
+            {
+                case em_bus_type_pci:
+                    p1 = "PCI";
+                    break;
+                case em_bus_type_pcix:
+                    p1 = "PCI-X";
+                    break;
+                default:
+                    p1 = messages_return_message("Inf_Unknown");
+                    break;
+            }
+
+            switch (adapter->hw.bus_speed)
+            {
+                case em_bus_speed_33:
+                    p2 = "33MHz";
+                    break;
+                case em_bus_speed_66:
+                    p2 = "66MHz";
+                    break;
+                case em_bus_speed_100:
+                    p2 = "100MHz";
+                    break;
+                case em_bus_speed_133:
+                    p2 = "133MHz";
+                    break;
+                default:
+                    p2 = messages_return_message("Inf_Unknown");
+                    break;
+            }
+
+            switch (adapter->hw.bus_width)
+            {
+                case em_bus_width_32:
+                    p3 = "32-bit";
+                    break;
+                case em_bus_width_64:
+                    p3 = "64-bit";
+                    break;
+                default:
+                    p3 = messages_return_message("Inf_Unknown");
+                    break;
+            }
+
+            info_print(1, "Inf_Bus", 3, p1, p2, p3);
+
+            /* Media type */
+
+            snprintf(buf, sizeof(buf), "Inf_Media%d", adapter->hw.media_type);
+            info_print(1, "Inf_Media", 1, messages_return_message(buf));
+        }
+
+        /* Link status */
+
+        if (adapter->link_active)
+        {
+            info_printf(1, "Inf_LinkUp", "%d\n%s",
+                adapter->link_speed,
+                messages_return_message((adapter->link_duplex == FULL_DUPLEX) ? "Inf_LinkFull" : "Inf_LinkHalf"));
+        }
+        else
+        {
+            info_print(1, "Inf_LinkDown", 0);
+        }
+
+        /* Controller mode */
+
+        if (adapter->interface_data.ac_if.if_flags & IFF_RUNNING)
+        {
+            snprintf(buf, sizeof(buf), "Inf_Mode%d", (dev->stats.st_link_status >> 2) & 3);
+            p1 = buf;
+        }
+        else
+        {
+            p1 = "Inf_ModeOff";
+        }
+
+        p2 = "Inf_ModeErr0"; /* NB hard coded - accepting frames with errors isn't supported yet */
+
+        info_print(1, "Inf_Mode", 2, messages_return_message(p1), messages_return_message(p2));
+
+        if (verbose && adapter->hw.tbi_compatibility_en)
+        {
+            /* TBI compatibility */
+            info_print(1, "Inf_TBI", 1,
+                messages_return_message(adapter->hw.tbi_compatibility_on ? "Inf_On" : "Inf_Off"));
+        }
+
+        /* Frame types */
+
+        putchar('\n');
+        info_print(1, "Inf_Frames", 0);
+
+        if (dev->ieeefilter)
+        {
+            ++filters_active;
+            printf("    IEEE 802.3       %s handler=(%08X,%08X)\n",
+                   straddrlevel(dev->ieeefilter->fs_addrlevel),
+                   (uint32_t)dev->ieeefilter->fs_handler, dev->ieeefilter->fs_pwptr);
+        }
+
+        if (dev->e2monitor)
+        {
+            ++filters_active;
+            printf("    Ethernet Monitor %s handler=(%08X,%08X)\n",
+                   straddrlevel(dev->e2monitor->fs_addrlevel),
+                   (uint32_t)dev->e2monitor->fs_handler, dev->e2monitor->fs_pwptr);
+        }
+
+        if (dev->e2sink)
+        {
+            ++filters_active;
+            printf("    Ethernet Sink    %s handler=(%08X,%08X)\n",
+                   straddrlevel(dev->e2sink->fs_addrlevel),
+                   (uint32_t)dev->e2sink->fs_handler, dev->e2sink->fs_pwptr);
+        }
+
+        if (dev->e2specific)
+        {
+            FilterChainRef  fc = dev->e2specific;
+
+            ++filters_active;
+
+            while (fc)
+            {
+                printf("    Ethernet %04x    %s handler=(%08X,%08X)\n", fc->fc_type,
+                       straddrlevel(fc->fc_filter.fs_addrlevel),
+                       (uint32_t)fc->fc_filter.fs_handler, fc->fc_filter.fs_pwptr);
+                fc = fc->fc_next;
+            }
+        }
+
+        if (!filters_active)
+        {
+            printf("    (none)\n");
+        }
+
+        /* Multicast filters */
+
+        /*
+        putchar('\n');
+        info_print(1, "Inf_Mcast", 0);
+
+        !!!TODO!!!
+        */
+
+        /* Hardware stats summary */
+
+        putchar('\n');
+        info_print(1, "Inf_HWSummHead", 0);
+
+        /* Transmitted bytes will be the longest number (unless it has wrapped) */
+        max_len = format_num(buf, sizeof(buf), (stats.gotch << 32) + stats.gotcl);
+
+        len = format_num(buf, sizeof(buf), stats.gptc);
+        while (len < max_len)
+            buf[len++] = ' ';
+        if (len > max_len)
+            max_len = len;
+        buf[len++] = 0;
+        format_num(buf + len, sizeof(buf) - len, stats.gprc);
+        info_print(2, "Inf_HWSumm1", 2, buf, buf + len);
+
+        len = format_num(buf, sizeof(buf), (stats.gotch << 32) + stats.gotcl);
+        while (len < max_len)
+            buf[len++] = ' ';
+        buf[len++] = 0;
+        format_num(buf + len, sizeof(buf) - len, (stats.gorch << 32) + stats.gorcl);
+        info_print(2, "Inf_HWSumm2", 2, buf, buf + len);
+
+        len = format_num(buf, sizeof(buf), stats.ecol + stats.latecol);
+        while (len < max_len)
+            buf[len++] = ' ';
+        buf[len++] = 0;
+        format_num(buf + len, sizeof(buf) - len,
+            stats.rxerrc + stats.crcerrs + stats.algnerrc + stats.rlec +
+            stats.rnbc + stats.mpc + stats.cexterr);
+        info_print(2, "Inf_HWSumm3", 2, buf, buf + len);
+
+        /* Driver statistics */
+
+        p1 = "Inf_DSHead";
+        info_print_stat(&p1, 1, "Inf_DSRXF", adapter->rx_pkts);
+        info_print_stat(&p1, 1, "Inf_DSDrop", adapter->dropped_pkts);
+        info_print_stat(&p1, 1, "Inf_DSRej", dev->stats.st_unwanted_frames);
+        info_print_stat(&p1, 1, "Inf_DSMbuf", adapter->mbuf_alloc_failed);
+        info_print_stat(&p1, 1, "Inf_DSNoTXD", adapter->no_tx_desc_avail1);
+        info_print_stat(&p1, 1, "Inf_DSTXBig", adapter->oversize_tx_pkts);
+        info_print_stat(&p1, 1, "Inf_DSTXReEnt", adapter->tx_re_ent_fails);        
+        info_print_stat(&p1, 1, "Inf_DSResets", adapter->watchdog_resets);
+        if (verbose)
+        {
+            info_print_stat(&p1, 1, "Inf_DSMaxTXDU", adapter->max_txd_used);
+        }
+
+        /* Debug statistics */
+
+#ifdef DBG_STATS
+        putchar('\n');
+        info_print(1, "X:Debug Statistics", 0);
+        info_print_num(2, "X:Interrupts with received packets", adapter->rx_interrupts);
+        if (adapter->rx_interrupts != 0)
+        {
+            info_print_num(2, "X:Average packets received per interrupt", (uint64_t)adapter->rx_pkts / adapter->rx_interrupts);
+            info_print_num(2, "X:Most packets received in one interrupt", adapter->max_rx_pkts);
+            info_print_num(2, "X:Average interrupt time with received packets", (uint64_t)adapter->rx_irq_time / adapter->rx_interrupts);
+            info_print_num(2, "X:Max interrupt time with received packets", adapter->max_rx_irq_time);
+        }
+        info_print_num(2, "X:Interrupts without received packets", adapter->non_rx_interrupts);
+        if (adapter->non_rx_interrupts != 0)
+        {
+            info_print_num(2, "X:Average interrupt time without received packets", (uint64_t)adapter->non_rx_irq_time / adapter->non_rx_interrupts);
+            info_print_num(2, "X:Max interrupt time without received packets", adapter->max_non_rx_irq_time);
+        }
+        info_print_num(2, "X:Transmit calls", adapter->tx_calls);
+        info_print_num(2, "X:Transmit call errors", adapter->tx_call_errors);
+        if (adapter->tx_calls != 0)
+        {
+            info_print_num(2, "X:Average time in transmit routine", (uint64_t)adapter->tx_time / adapter->tx_calls);
+            info_print_num(2, "X:Max time in transmit routine", adapter->max_tx_time);
+        }
+#endif
+
+        if (!verbose)
+            return NULL;
+
+        /* Hardware configuration */
+
+        putchar('\n');
+        info_print(1, "Inf_HWCfgHead", 0);
+        info_print_num(2, "Inf_HWCfgTXD", adapter->num_tx_desc);
+        info_print_num(2, "Inf_HWCfgRXD", adapter->num_rx_desc);
+        info_print_num(2, "Inf_HWCfgTIDV", E1000_READ_REG(&adapter->hw, TIDV));
+        if (adapter->hw.mac_type >= em_82540)
+            info_print_num(2, "Inf_HWCfgTADV", E1000_READ_REG(&adapter->hw, TADV));
+        info_print_num(2, "Inf_HWCfgRIDV", E1000_READ_REG(&adapter->hw, RDTR));
+        if (adapter->hw.mac_type >= em_82540)
+            info_print_num(2, "Inf_HWCfgRADV", E1000_READ_REG(&adapter->hw, RADV));
+        info_print_num(2, "Inf_HWCfgITR", E1000_READ_REG(&adapter->hw, ITR));
+
+        /* Detailed hardware statistics */
+
+        putchar('\n');
+        info_print(1, "Inf_HWFullHead", 0);
+
+        p1 = "Inf_HWRXHead";
+        info_print_stat(&p1, 2, "Inf_tor", (stats.torh << 32) + stats.torl);
+        info_print_stat(&p1, 2, "Inf_tpr", stats.tpr);
+        info_print_stat(&p1, 2, "Inf_gorc", (stats.gorch << 32) + stats.gorcl);
+        info_print_stat(&p1, 2, "Inf_gprc", stats.gprc);
+        info_print_stat(&p1, 3, "Inf_prc64", stats.prc64);
+        info_print_stat(&p1, 3, "Inf_prc127", stats.prc127);
+        info_print_stat(&p1, 3, "Inf_prc255", stats.prc255);
+        info_print_stat(&p1, 3, "Inf_prc511", stats.prc511);
+        info_print_stat(&p1, 3, "Inf_prc1023", stats.prc1023);
+        info_print_stat(&p1, 3, "Inf_prc1522", stats.prc1522);
+        info_print_stat(&p1, 2, "Inf_bprc", stats.bprc);
+        info_print_stat(&p1, 2, "Inf_mprc", stats.mprc);
+
+        p1 = "Inf_HWTXHead";
+        info_print_stat(&p1, 2, "Inf_tot", (stats.toth << 32) + stats.totl);
+        info_print_stat(&p1, 2, "Inf_tpt", stats.tpt);
+        info_print_stat(&p1, 2, "Inf_gotc", (stats.gotch << 32) + stats.gotcl);
+        info_print_stat(&p1, 2, "Inf_gptc", stats.gptc);
+        info_print_stat(&p1, 3, "Inf_ptc64", stats.ptc64);
+        info_print_stat(&p1, 3, "Inf_ptc127", stats.ptc127);
+        info_print_stat(&p1, 3, "Inf_ptc255", stats.ptc255);
+        info_print_stat(&p1, 3, "Inf_ptc511", stats.ptc511);
+        info_print_stat(&p1, 3, "Inf_ptc1023", stats.ptc1023);
+        info_print_stat(&p1, 3, "Inf_ptc1522", stats.ptc1522);
+        info_print_stat(&p1, 2, "Inf_mptc", stats.mptc);
+        info_print_stat(&p1, 2, "Inf_bptc", stats.bptc);
+
+        p1 = "Inf_HWFCHead";
+        info_print_stat(&p1, 2, "Inf_xonrxc", stats.xonrxc);
+        info_print_stat(&p1, 2, "Inf_xontxc", stats.xontxc);
+        info_print_stat(&p1, 2, "Inf_xoffrxc", stats.xoffrxc);
+        info_print_stat(&p1, 2, "Inf_xofftxc", stats.xofftxc);
+        info_print_stat(&p1, 2, "Inf_fcruc", stats.fcruc);
+
+        p1 = "Inf_RXErrHead";
+        info_print_stat(&p1, 2, "Inf_mpc", stats.mpc);
+        info_print_stat(&p1, 2, "Inf_rnbc", stats.rnbc);
+        info_print_stat(&p1, 2, "Inf_rxerrc", stats.rxerrc);
+        info_print_stat(&p1, 2, "Inf_algnerrc", stats.algnerrc);
+        info_print_stat(&p1, 2, "Inf_crcerrs", stats.crcerrs);
+        info_print_stat(&p1, 2, "Inf_rlec", stats.rlec);
+        info_print_stat(&p1, 3, "Inf_ruc", stats.ruc);
+        info_print_stat(&p1, 3, "Inf_rfc", stats.rfc);
+        info_print_stat(&p1, 3, "Inf_roc", stats.roc);
+        info_print_stat(&p1, 3, "Inf_rjc", stats.rjc);
+        info_print_stat(&p1, 2, "Inf_cexterr", stats.cexterr);
+
+        p1 = "Inf_RXInfHead";
+        info_print_stat(&p1, 2, "Inf_symerrs", stats.symerrs);
+        info_print_stat(&p1, 2, "Inf_sec", stats.sec);
+
+        p1 = "Inf_TXErrHead";
+        info_print_stat(&p1, 2, "Inf_ecol", stats.ecol);
+        info_print_stat(&p1, 2, "Inf_latecol", stats.latecol);
+
+        p1 = "Inf_TXInfHead";
+        info_print_stat(&p1, 2, "Inf_scc", stats.scc);
+        info_print_stat(&p1, 2, "Inf_mcc", stats.mcc);
+        info_print_stat(&p1, 2, "Inf_colc", stats.colc);
+        info_print_stat(&p1, 2, "Inf_dc", stats.dc);
+        info_print_stat(&p1, 2, "Inf_tncrs", stats.tncrs);
+
+        p1 = "Inf_MPHead";
+        info_print_stat(&p1, 2, "Inf_mgprc", stats.mgprc);
+        info_print_stat(&p1, 2, "Inf_mgpdc", stats.mgpdc);
+        info_print_stat(&p1, 2, "Inf_mgptc", stats.mgptc);
+
+        p1 = "Inf_MiscHead";
+        info_print_stat(&p1, 2, "Inf_tsctc", stats.tsctc);
+        info_print_stat(&p1, 2, "Inf_tsctfc", stats.tsctfc);
+
+        /* PHY information */
+
+        if (adapter->hw.media_type != em_media_type_copper)
+            return NULL;
+
+        /* Read the PHY information now */
+        if (em_phy_get_info(&adapter->hw, &phy_info) < 0)
+            return NULL;
+
+        putchar('\n');
+        info_print(1, "Inf_PHY", 0);
+
+        /* Extended 10BaseT distance */
+        switch (phy_info.extended_10bt_distance)
+        {
+            case em_10bt_ext_dist_enable_normal:
+                p1 = "Inf_Disabled";
+                break;
+            case em_10bt_ext_dist_enable_lower:
+                p1 = "Inf_Enabled";
+                break;
+            default:
+                p1 = "Inf_Unknown";
+                break;
+        }
+        info_print(2, "Inf_PHYExt10btD", 1, messages_return_message(p1));
+
+        /* Polarity correction */
+        switch (phy_info.polarity_correction)
+        {
+            case em_polarity_reversal_disabled:
+                p1 = "Inf_Disabled";
+                break;
+            case em_polarity_reversal_enabled:
+                p1 = "Inf_Enabled";
+                break;
+            default:
+                p1 = "Inf_Unknown";
+                break;
+        }
+        info_print(2, "Inf_PHYPolC", 1, messages_return_message(p1));
+
+        /* Polarity */
+        switch (phy_info.cable_polarity)
+        {
+            case em_rev_polarity_normal:
+                p1 = "Inf_Normal";
+                break;
+            case em_rev_polarity_reversed:
+                p1 = "Inf_Reversed";
+                break;
+            default:
+                p1 = "Inf_Unknown";
+                break;
+        }
+        info_print(2, "Inf_PHYPol", 1, messages_return_message(p1));
+
+        /* MDI-X mode */
+        switch (phy_info.mdix_mode)
+        {
+            case em_auto_x_mode_manual_mdi:
+                p1 = "MDI";
+                break;
+            case em_auto_x_mode_manual_mdix:
+                p1 = "MDI-X";
+                break;
+            default:
+                p1 = messages_return_message("Inf_Unknown");
+                break;
+        }
+        info_print(2, "Inf_PHYMDIX", 1, p1);
+
+        /* The remaining items are only valid at 1000Mbps */
+
+        /* [Actually, the spec says that the cable length feature works */
+        /* at 100Mbps, but the code in if_em_hw.c disagrees.]           */
+        if (adapter->link_speed != 1000)
+            return NULL;
+
+        /* Cable length */
+        switch (phy_info.cable_length)
+        {
+            case em_cable_length_50:
+                p1 = "0-50";
+                break;
+            case em_cable_length_50_80:
+                p1 = "50-80";
+                break;
+            case em_cable_length_80_110:
+                p1 = "80-110";
+                break;
+            case em_cable_length_110_140:
+                p1 = "110-140";
+                break;
+            case em_cable_length_140:
+                p1 = "> 140";
+                break;
+            default:
+                p1 = messages_return_message("Inf_Unknown");
+                break;
+        }
+        info_print(2, "Inf_PHYCableLen", 1, p1);
+
+        /* Local receiver status */
+        switch (phy_info.local_rx)
+        {
+            case em_1000t_rx_status_not_ok:
+                p1 = "Inf_NotOK";
+                break;
+            case em_1000t_rx_status_ok:
+                p1 = "Inf_OK";
+                break;
+            default:
+                p1 = "Inf_Unknown";
+                break;
+        }
+        info_print(2, "Inf_PHYLocalRX", 1, messages_return_message(p1));
+
+        /* Remote receiver status */
+        switch (phy_info.remote_rx)
+        {
+            case em_1000t_rx_status_not_ok:
+                p1 = "Inf_NotOK";
+                break;
+            case em_1000t_rx_status_ok:
+                p1 = "Inf_OK";
+                break;
+            default:
+                p1 = "Inf_Unknown";
+                break;
+        }
+        info_print(2, "Inf_PHYRemoteRX", 1, messages_return_message(p1));
+
+        /* Idle errors and receive errors */
+        p1 = NULL;
+        info_print_stat(&p1, 1, "Inf_PHYIdleErr", adapter->phy_stats.idle_errors);
+        info_print_stat(&p1, 1, "Inf_PHYRXErr", adapter->phy_stats.receive_errors);
+    }
+
+    return NULL;
+}

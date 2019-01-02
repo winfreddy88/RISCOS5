@@ -1,0 +1,874 @@
+; 
+; Copyright (c) 2012, RISC OS Open Ltd
+; All rights reserved.
+; 
+; Redistribution and use in source and binary forms, with or without
+; modification, are permitted provided that the following conditions are met: 
+;     * Redistributions of source code must retain the above copyright
+;       notice, this list of conditions and the following disclaimer.
+;     * Redistributions in binary form must reproduce the above copyright
+;       notice, this list of conditions and the following disclaimer in the
+;       documentation and/or other materials provided with the distribution.
+;     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+;       may be used to endorse or promote products derived from this software
+;       without specific prior written permission.
+; 
+; THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+; AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+; IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+; ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+; LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+; CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+; SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+; INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+; CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+; ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+; POSSIBILITY OF SUCH DAMAGE.
+; 
+
+        AREA    |!!!ModuleHeader|, CODE, READONLY, PIC
+
+Module_BaseAddr
+        &       0
+        &       InitModule - Module_BaseAddr
+        &       KillModule - Module_BaseAddr
+        &       0
+        &       ModuleTitle - Module_BaseAddr
+        &       HelpString - Module_BaseAddr
+        &       0
+        &       0
+        &       0
+        &       0
+        &       0
+        &       0
+        &       ModuleFlags - Module_BaseAddr
+
+HelpString
+        =       "BCMSound", 9, "$Module_MajorVersion ($Module_Date)"
+        [       Module_MinorVersion <> ""
+        =       " $Module_MinorVersion"
+        ]
+        =       0
+ModuleTitle
+        =       "BCMSound", 0
+AudioDesc
+        =       "VCHIQ audio service controller", 0
+MixerDesc
+        =       "VCHIQ audio service mixer", 0
+RTPriority
+        =       "BCMSound:120", 0 ; Note - it seems to be important for the priority of our thread to be below that of VCHIQ (128). I suspect there's some synchronisation missing from our VCHIQ port?
+        ALIGN
+        
+ModuleFlags
+        &       ModuleFlag_32bit
+
+; Workspace
+
+                      ^ 0, wp
+AudioDevice           # HALDevice_Audio_Size_2
+MixerDevice           # HALDevice_Mixer_Size_0_1
+VCHIQInstance         # 4
+VCHIQService          # 4
+Running               # 1 ; true/false for whether SoundDMA thinks sound is running (and therefore whether we're allowed to call it)
+                      # 1 ; spare
+GotResult             # 1 ; Got message result yet?
+BuffIndex             # 1 ; Next buffer we should send to VC
+BuffSize              # 4 ; DMA buffer size
+Buff0                 # 4 ; Buffer ptrs
+Buff1                 # 4
+IdleBytes             # 4 ; How many bytes have been returned from a partial buffer
+IdleBuffers           # 4 ; How many full buffers have been returned
+Result                # 4 ; Result value from some VCHIQ messages
+DMACallback           # 4 ; SoundDMA callback
+DMAParam              # 4
+SampleRate            # 4 ; Current sample rate setting (Hz)
+ [ OutputControl
+MixSettings           # 16 ; Current gain setting + mute flag for both outputs (in RISC OS units)
+ |
+MixSettings           # 8
+ ]
+RTIdle                # 4 ; Nonzero if RTSupport routine is idle and therefore safe to kill
+RTHandle              # 4 ; RTSupport routine handle
+VCHIQMutex            # 4 ; Mutex to ensure exclusive access to VCHIQ SWIs
+IRQTrigger            # 4 ; IRQ trigger routine from OS_PlatformFeatures
+RTStack               # 512 ; SYS mode stack
+WSSize                * :INDEX: @
+
+; VCHIQ audio service definitions
+
+VC_AUDIO_MSG_TYPE_RESULT         * 0
+VC_AUDIO_MSG_TYPE_COMPLETE       * 1
+VC_AUDIO_MSG_TYPE_CONFIG         * 2
+VC_AUDIO_MSG_TYPE_CONTROL        * 3
+VC_AUDIO_MSG_TYPE_OPEN           * 4
+VC_AUDIO_MSG_TYPE_CLOSE          * 5
+VC_AUDIO_MSG_TYPE_START          * 6
+VC_AUDIO_MSG_TYPE_STOP           * 7
+VC_AUDIO_MSG_TYPE_WRITE          * 8
+
+                     ^ 0
+VC_AUDIO_MSG_T_TYPE  # 4
+VC_AUDIO_MSG_T_DATA  # 16 ; Up to 16 bytes of data, depending on message type
+VC_AUDIO_MSG_T_SIZE  # 0
+
+AUDIO_DEST_AUTO       * 0
+AUDIO_DEST_HEADPHONES * 1
+ADUIO_DEST_HDMI       * 2
+
+; Module code
+
+InitModule
+        Entry   "r7-r11", VCHIQ_Service_Size
+        ASSERT  VCHIQ_Service_Size >= VC_AUDIO_MSG_T_SIZE
+        ; Allocate workspace
+        MOV     r3, #WSSize
+        MOV     r0, #6
+        SWI     XOS_Module
+        EXIT    VS
+        Debug_Open
+        STR     r2, [r12]
+        MOV     r12, r2
+        MOV     r0, #0
+10
+        SUBS    r3, r3, #4
+        STR     r0, [r2], #4
+        BNE     %BT10
+        ; Get IRQTrigger routine
+        MOV     r0, #0
+        SWI     XOS_PlatformFeatures
+        MOVVS   r0, #0
+        TST     r0, #2
+        ADREQL  r1, NullFunc ; Just use NullFunc if no trigger needed
+        STR     r1, IRQTrigger
+        ; Init VCHIQ
+        MOV     r0, r12
+        SWI     XVCHIQ_Initialise
+        MOVVS   r7, r0
+        BVS     %FT20
+        STR     r0, VCHIQInstance
+        MOV     r2, r0
+        MOV     r1, #0
+        MOV     r0, #0
+        SWI     XVCHIQ_Connect
+        MOVVS   r7, r0
+        BVS     %FT19
+        MOV     r0, #2
+        STR     r0, [sp, #VCHIQ_Service_Version]
+        MOV     r0, #1
+        STR     r0, [sp, #VCHIQ_Service_Version_Min]
+        LDR     r0, =&41554453 ; 'AUDS'
+        STR     r0, [sp, #VCHIQ_Service_Id]
+        MOV     r0, #0
+        STR     r0, [sp, #VCHIQ_Service_Reserved]
+        STR     r0, [sp, #VCHIQ_Service_RxFifoSize]
+        STR     r0, [sp, #VCHIQ_Service_TxFifoSize]
+        ADRL    r0, VCHIQCallback
+        STR     r0, [sp, #VCHIQ_Service_Callback]
+        MOV     r0, #0
+        STR     r0, [sp, #VCHIQ_Service_CallbackParam]
+        STR     r0, [sp, #VCHIQ_Service_WantUnalignedBulkRx]
+        STR     r0, [sp, #VCHIQ_Service_WantUnalignedBulkTx]
+        STR     r0, [sp, #VCHIQ_Service_WantCRC]
+        LDR     r0, VCHIQInstance
+        MOV     r1, sp
+        SWI     XVCHIQ_ServiceOpen
+        MOVVS   r7, r0
+        BVS     %FT19
+        STR     r0, VCHIQService
+        ; Open audio service
+        MOV     r1, #VC_AUDIO_MSG_TYPE_OPEN
+        STR     r1, [sp]
+        MOV     r1, sp
+        MOV     r2, #VC_AUDIO_MSG_T_SIZE
+        MOV     r3, #VCHI_FLAGS_BLOCK_UNTIL_QUEUED
+        SWI     XVCHIQ_MsgQueue
+        ; Finished with the service for now
+        SWI     XVCHIQ_ServiceRelease
+        MOVVS   r7, r0
+        BVS     %FT18
+
+        STR     pc, RTIdle
+        ; Register with RTSupport
+        MOV     r0, #0
+        ADRL    r1, BufferCallback
+        MOV     r2, #0
+        MOV     r3, r12
+        ADR     r4, IdleBuffers
+        ADRL    r6, RTStack+?RTStack
+        ADRL    r7, RTPriority
+        SWI     XRT_Register
+        MOVVS   r7, r0
+        BVS     %FT17
+        STR     r0, RTHandle
+        ; Initialise mutex
+        STR     pc, VCHIQMutex
+        
+        ; Create HAL devices
+        ADR     r0, AudioDevice
+        ADR     r2, MixerDevice
+
+        ; Audio device
+        LDR     r1, =HALDeviceType_Audio+HALDeviceAudio_AudC
+        STRH    r1, [r0, #HALDevice_Type]
+        LDR     r1, =HALDeviceID_AudC_VCHIQ
+        STRH    r1, [r0, #HALDevice_ID]
+        LDR     r1, =HALDeviceBus_Sys + HALDeviceSysBus_AHB ; Arbitrary choice
+        STR     r1, [r0, #HALDevice_Location]
+        LDR     r1, =2:SHL:16 ; API 2.0
+        STR     r1, [r0, #HALDevice_Version]
+        ADRL    r1, AudioDesc
+        STR     r1, [r0, #HALDevice_Description]
+        ADRL    r1, AudioActivate
+        STR     r1, [r0, #HALDevice_Activate]
+        ADRL    r1, AudioDeactivate
+        STR     r1, [r0, #HALDevice_Deactivate]
+        ADRL    r1, AudioReset
+        STR     r1, [r0, #HALDevice_Reset]
+        ADRL    r1, AudioSleep
+        STR     r1, [r0, #HALDevice_Sleep]
+        MVN     r1, #0
+        STR     r1, [r0, #HALDevice_Device]
+        STR     r2, [r0, #HALDevice_AudioMixer]
+        MOV     r1, #1
+        STR     r1, [r0, #HALDevice_AudioChannelsOut]
+        ADRL    r1, AudioPreDisable
+        STR     r1, [r0, #HALDevice_AudioPreDisable]
+        ADRL    r1, NullFunc
+        STR     r1, [r0, #HALDevice_AudioPostDisable]
+        MOV     r1, #(AudioRateTable_End-AudioRateTable)/AudioRateTableSize
+        STR     r1, [r0, #HALDevice_AudioNumRates]
+        ADRL    r1, AudioRateTable
+        STR     r1, [r0, #HALDevice_AudioRateTable]
+        ADRL    r1, AudioSetRate
+        STR     r1, [r0, #HALDevice_AudioSetRate]
+        ADRL    r1, AudioCustomDMAEnable
+        STR     r1, [r0, #HALDevice_AudioCustomDMAEnable]
+        MOV     r1, #AudioFlag_StereoReverse
+        STR     r1, [r0, #HALDevice_AudioFlags]
+        MOV     r1, #256*4 ; This appears to the the smallest buffer size we can safely use at all frequencies. However it seems like the amount of data the VC has buffered also affects playback (see 50ms buffering in AudioCustomDMAEnable)
+        STR     r1, [r0, #HALDevice_AudioMinBuffSize]
+
+        ; Mixer device
+        LDR     r1, =HALDeviceType_Audio+HALDeviceAudio_Mixer
+        STRH    r1, [r2, #HALDevice_Type]
+        LDR     r1, =HALDeviceID_Mixer_VCHIQ
+        STRH    r1, [r2, #HALDevice_ID]
+        LDR     r1, =HALDeviceBus_Sys + HALDeviceSysBus_AHB ; Arbitrary choice
+        STR     r1, [r2, #HALDevice_Location]
+        LDR     r1, =1 ; API 0.1
+        STR     r1, [r2, #HALDevice_Version]
+        ADRL    r1, MixerDesc
+        STR     r1, [r2, #HALDevice_Description]
+        ADRL    r1, MixerActivate
+        STR     r1, [r2, #HALDevice_Activate]
+        ADRL    r1, MixerDeactivate
+        STR     r1, [r2, #HALDevice_Deactivate]
+        ADRL    r1, MixerReset
+        STR     r1, [r2, #HALDevice_Reset]
+        ADRL    r1, MixerSleep
+        STR     r1, [r2, #HALDevice_Sleep]
+        MVN     r1, #0
+        STR     r1, [r2, #HALDevice_Device]
+        STR     r0, [r2, #HALDevice_MixerCtrlr]
+ [ OutputControl
+        MOV     r1, #2
+ |
+        MOV     r1, #1
+ ]
+        STR     r1, [r2, #HALDevice_MixerChannels]
+        ADRL    r1, MixerGetFeatures
+        STR     r1, [r2, #HALDevice_MixerGetFeatures]
+        ADRL    r1, MixerSetMix
+        STR     r1, [r2, #HALDevice_MixerSetMix]
+        ADRL    r1, MixerGetMix
+        STR     r1, [r2, #HALDevice_MixerGetMix]
+        ADRL    r1, MixerGetMixLimits
+        STR     r1, [r2, #HALDevice_MixerGetMixLimits]
+        
+        ; Register
+        MOV     r8, #2
+        SWI     XOS_Hardware
+        MOVVS   r7, r0
+        BVS     %FT16
+        MOV     r0, r2
+        SWI     XOS_Hardware
+        MOVVS   r7, r0
+        BVS     %FT15
+        Debug   mod, "Initialised OK"
+        EXIT
+
+        ; Error handling assumed to have error ptr in r7
+15
+        MOV     r8, #3
+        ADR     r0, AudioDevice
+        SWI     XOS_Hardware
+16
+        ; Wait for RTSupport routine to become idle
+        ADR     r1, RTIdle
+        SWI     XRT_Yield
+        ; Destroy
+        MOV     r0, #0
+        LDR     r1, RTHandle
+        SWI     XRT_Deregister
+        ; Claim VCHIQ mutex
+        BL      MutexClaim
+17
+        LDR     r0, VCHIQService
+        SWI     XVCHIQ_ServiceUse
+18
+        LDR     r0, VCHIQService
+        SWI     XVCHIQ_ServiceClose
+19
+        LDR     r0, VCHIQInstance
+        SWI     XVCHIQ_Disconnect
+20
+        MOV     r0, #7
+        MOV     r2, r12
+        SWI     XOS_Module
+        MOV     r0, r7
+        Debug_Close
+        SETV
+        EXIT
+
+KillModule
+        Entry   "r7-r11", VC_AUDIO_MSG_T_SIZE
+        LDR     wp, [r12]
+        ; Release devices. SoundDMA will stop sound if necessary.
+        ADR     r0, AudioDevice
+        MOV     r8, #3
+        SWI     XOS_Hardware
+        ADR     r0, MixerDevice
+        SWI     XOS_Hardware
+        ; Wait for RTSupport routine to become idle
+        ADR     r1, RTIdle
+        SWI     XRT_Yield
+        ; Destroy
+        MOV     r0, #0
+        LDR     r1, RTHandle
+        SWI     XRT_Deregister
+        ; Claim mutex
+        BL      MutexClaim
+        ; Send close message & wait for response
+        LDR     r0, VCHIQService
+        SWI     XVCHIQ_ServiceUse
+        MOV     r0, #VC_AUDIO_MSG_TYPE_CLOSE
+        STR     r0, [sp]
+        BL      SendWithResult
+        ; Release VCHIQ
+        LDR     r0, VCHIQService
+        SWI     XVCHIQ_ServiceClose
+        LDR     r0, VCHIQInstance
+        SWI     XVCHIQ_Disconnect
+        ; Release workspace
+        MOV     r0, #7
+        MOV     r2, r12
+        SWI     XOS_Module
+        Debug_Close
+        CLRV
+        EXIT
+
+        InsertNDRDebugRoutines
+
+; Audio device
+
+AudioActivate
+        Debug   audc, "AudioActivate"
+        MOV     a1, #1
+        MOV     pc, lr
+
+AudioDeactivate
+        Debug   audc, "AudioDeactivate"
+        MOV     pc, lr
+
+AudioReset
+        Debug   audc, "AudioReset"
+        MOV     pc, lr
+
+AudioSleep
+        Debug   audc, "AudioSleep"
+        MOV     a1, #0
+        MOV     pc, lr
+
+AudioPreDisable
+        Entry   , VC_AUDIO_MSG_T_SIZE
+        Debug   audc, "AudioPreDisable"
+        SUB     r12, r0, #:INDEX:AudioDevice
+        MOV     r0, #0
+        STRB    r0, Running
+        ; Wait until RT support thread is idle
+        ADR     r1, RTIdle
+        SWI     XRT_Yield
+        BL      MutexClaim
+        ; Stop VCHIQ
+        LDR     r0, VCHIQService
+        SWI     XVCHIQ_ServiceUse
+        MOV     r0, #VC_AUDIO_MSG_TYPE_STOP
+        MOV     r1, #0
+        Debug   audc, "Send message", r0, r1
+        STMIA   sp, {r0-r1}
+        MOV     r1, sp
+        LDR     r0, VCHIQService
+        MOV     r2, #VC_AUDIO_MSG_T_SIZE
+        MOV     r3, #VCHI_FLAGS_BLOCK_UNTIL_QUEUED
+        SWI     XVCHIQ_MsgQueue
+        LDR     r0, VCHIQService
+        SWI     XVCHIQ_ServiceRelease
+        BL      MutexRelease
+        EXIT
+
+NullFunc
+        MOV     pc, lr
+
+AudioSetRate
+        ; r1 = sample rate index (0-based)
+        Entry   "r1", VC_AUDIO_MSG_T_SIZE
+        Debug   audc, "AudioSetRate", r1
+        SUB     r12, r0, #:INDEX:AudioDevice
+        BL      MutexClaim
+        LDR     r0, VCHIQService
+        SWI     XVCHIQ_ServiceUse
+      [ {TRUE}
+        ; Close & re-open the service - seems to be required for things to work properly with recent firmware: https://github.com/raspberrypi/firmware/issues/97
+        MOV     r0, #VC_AUDIO_MSG_TYPE_CLOSE
+        STR     r0, [sp]
+        BL      SendWithResult
+        LDR     r0, VCHIQService
+        MOV     r1, #VC_AUDIO_MSG_TYPE_OPEN
+        STR     r1, [sp]
+        MOV     r1, sp
+        MOV     r2, #VC_AUDIO_MSG_T_SIZE
+        MOV     r3, #VCHI_FLAGS_BLOCK_UNTIL_QUEUED
+        SWI     XVCHIQ_MsgQueue
+        LDR     r1, [sp, #VC_AUDIO_MSG_T_SIZE]
+      ]  
+        ADRL    r2, AudioRateTable+AudioRateTable_Frequency
+        ASSERT  AudioRateTableSize = 8
+        LDR     r2, [r2, r1, LSL #3]
+        MOV     r0, #VC_AUDIO_MSG_TYPE_CONFIG
+        MOV     r1, #2
+        MOV     r2, r2, LSR #10
+        STR     r2, SampleRate
+        MOV     r3, #16
+        Debug   audc, "Send message", r0, r1, r2, r3
+        STMIA   sp, {r0-r3}
+        BL      SendWithResult
+        ; TODO - do something with result!
+        LDR     r0, VCHIQService
+        SWI     XVCHIQ_ServiceRelease
+        BL      MutexRelease
+        EXIT
+
+SendWithResult
+        ; Entry: sp contains message to send
+        ; Exit: V clear, R0 = result from VC
+        ;       V set, R0 = error
+        ; Will forcibly enable IRQs!
+        ; In theory this is safe as the SoundDMA SWIs have undefined re-entrancy & IRQ states
+        Entry   "r1-r3"
+        MOV     r0, #0
+        STRB    r0, GotResult
+        ADD     r1, sp, #16
+        LDR     r0, VCHIQService
+        MOV     r2, #VC_AUDIO_MSG_T_SIZE
+        MOV     r3, #VCHI_FLAGS_BLOCK_UNTIL_QUEUED
+        SWI     XVCHIQ_MsgQueue
+        EXIT    VS
+        ; Wait for response
+        Debug   vc, "Waiting for result"
+        ; TODO - Sleep
+        MRS     r1, CPSR
+        BIC     r2, r1, #I32_bit
+        MSR     CPSR_c, r2
+10
+        LDRB    r0, GotResult
+        TEQ     r0, #0
+        BEQ     %BT10
+        MSR     CPSR_c, r1
+        LDR     r0, Result
+        Debug   vc, "Result", r0
+        EXIT
+
+AudioCustomDMAEnable
+        ; r1 = buffer size
+        ; r2, r3 = buffer pointers
+        ; sp+0 = callback param
+        ; sp+4 = callback func
+        Debug   audc, "AudioCustomDMAEnable", r1, r2, r3
+        SUB     r12, r0, #:INDEX:AudioDevice
+        STR     r1, BuffSize
+        STR     r2, Buff0
+        STR     r3, Buff1
+        LDMIA   sp, {r0-r1}
+        Debug   audc, "", r0, r1
+        STR     r0, DMAParam
+        STR     r1, DMACallback
+        Entry   , VC_AUDIO_MSG_T_SIZE
+        ; Start audio output
+        BL      MutexClaim
+        MOV     r0, #1
+        STRB    r0, Running
+        MOV     r0, #0
+        STRB    r0, BuffIndex
+        STR     r0, IdleBytes
+        STR     r0, IdleBuffers
+        LDR     r0, VCHIQService
+        SWI     XVCHIQ_ServiceUse
+        MOV     r0, #VC_AUDIO_MSG_TYPE_START
+        Debug   audc, "Send message", r0
+        STR     r0, [sp]
+        LDR     r0, VCHIQService
+        MOV     r1, sp
+        MOV     r2, #VC_AUDIO_MSG_T_SIZE
+        MOV     r3, #VCHI_FLAGS_BLOCK_UNTIL_QUEUED
+        SWI     XVCHIQ_MsgQueue
+        ; Send the initial buffers
+        ; It looks like the videocore is only happy if it thinks it has at least 50ms of data available?
+        LDR     r1, BuffSize
+        LDR     r2, SampleRate
+        MOV     r0, #0
+        ADD     r1, r1, r1, LSL #2 ; BuffSize*5, since we want SampleRate*0.05/(BuffSize/4) -> SampleRate/(BuffSize*5)
+        Debug   audc, "Rate", r2
+        ; Hack - 8kHz seems to need extra?
+        ; 16kHz also needs extra, but only at some buffer sizes!
+        CMP     r2, #8000
+        CMPNE   r2, #16000
+        ADDEQ   r0, r0, #2
+10
+        SUBS    r2, r2, r1
+        ADD     r0, r0, #1 ; Always round up buffer count
+        BGT     %BT10
+        ; Round up to multiple of two to ensure buffer fills are in sync with SoundDMA
+        TST     r0, #1
+        ADDNE   r0, r0, #1
+        ; And minimum of two buffers
+        CMP     r0, #2
+        MOVLT   r0, #2
+        Debug   audc, "Initial buffers", r0
+        STR     r0, IdleBuffers
+        MOV     r0, #0
+        STRB    r0, BuffIndex
+        LDR     r0, VCHIQService
+        SWI     XVCHIQ_ServiceRelease
+        BL      MutexRelease
+        MOV     r0, #0
+        EXIT
+
+MutexClaim      ROUT
+        ; Claim VCHIQMutex
+        Entry   "r0-r3"
+        MRS     r3, CPSR
+05
+        ORR     r2, r3, #I32_bit
+        MSR     CPSR_c, r2
+        LDR     r0, VCHIQMutex
+        CMP     r0, #0
+        BNE     %FT10
+        ; Block on mutex, with IRQs enabled. IRQs must be enabled to avoid deadlock, as RTSupport doesn't have any IRQ-enabled "idle" thread to drop into when all others are blocked.
+        BIC     r2, r3, #I32_bit
+        MSR     CPSR_c, r2
+        ADR     r1, VCHIQMutex
+        SWI     XRT_Yield
+        BVS     %FT10 ; Error typically means we're in an IRQ (which shouldn't happen for us). But to avoid problems just go ahead and claim the mutex anyway.
+        ADR     lr, %BT05
+        LDR     pc, IRQTrigger        
+10
+        MOV     r0, #0
+        STR     r0, VCHIQMutex
+        MSR     CPSR_c, r3
+        EXIT
+
+MutexRelease
+        ; Release VCHIQMutex
+        Entry   "r0-r1"
+        STR     pc, VCHIQMutex
+        ; Wake anything that was blocking on it
+        ADR     r1, pollword_1
+        SWI     XRT_Yield
+        EXIT
+
+pollword_1 DCD 1
+
+        LTORG
+
+        MACRO
+$lab    cdf     $freq, $per, $mode      ; CD-derived rate ($freq in Hz, since all integral)
+$lab    DCD     $freq*1024              ; frequency value as reported by Sound_SampleRate
+        DCB     $per                    ; period as reported via Sound_Configure
+        %       3                       ; padding to 8 bytes
+        MEND
+
+        ; TODO - Find what's really possible. The ALSA driver suggests that
+        ; the audio service will resample any data we give it, so we could claim
+        ; we support VIDC sample rates. Unfortunately the fact that sample
+        ; rates are specified in Hz means playback won't be as accurate as it
+        ; could be (especially since the PWM driver used for the headphone
+        ; output is capable of reproducing VIDC rates exactly)
+AudioRateTable
+        cdf     8000, 125               ;  8kHz     (125usec)  AC97/6
+        cdf     11025, 91               ; 11.025kHz (~91 usec) CD/4
+        cdf     12000, 83               ; 12kHz     (~83 usec) AC97/4
+        cdf     16000, 63               ; 16kHz     (~63 usec) AC97/3
+        cdf     22050, 45               ; 22.05kHz  (~45 usec) CD/2
+        cdf     24000, 42               ; 24kHz     (~42 usec) AC97/2
+        cdf     32000, 31               ; 32kHz     (~31 usec) AC97*2/3
+        cdf     44100, 23               ; 44.1kHz   (~23 usec) CD/1
+        cdf     48000, 21               ; 48kHz     (~21 usec) AC97/1
+AudioRateTable_End
+
+VCHIQCallback   ROUT
+        ; r0 = user parameter (unused)
+        ; r1 = reason
+        ; r2 = message handle (unused)
+        ; r12 = private word
+        Debug   vc, "VCHIQCallback", r1
+        CMP     r1, #VCHI_CALLBACK_MSG_AVAILABLE
+        MOVNE   pc, lr
+        Entry   , VC_AUDIO_MSG_T_SIZE
+        LDR     r0, VCHIQService
+        MOV     r1, sp
+        MOV     r2, #VC_AUDIO_MSG_T_SIZE
+        MOV     r3, #0
+        SWI     XVCHIQ_MsgDequeue
+        BVS     %FT90
+        LDR     r0, [sp, #VC_AUDIO_MSG_T_TYPE]
+        Debug   vc, "Type", r0
+        CMP     r0, #VC_AUDIO_MSG_TYPE_RESULT
+        BEQ     %FT50
+        CMP     r0, #VC_AUDIO_MSG_TYPE_COMPLETE
+        BNE     %FT90
+        LDRB    r0, Running
+        CMP     r0, #0
+        BEQ     %FT90
+        LDMIB   sp, {r0-r2}
+        Debug   vc, "Result", r0, r1, r2
+        ; The audio service typically sends multiple VC_AUDIO_MSG_TYPE_COMPLETE
+        ; responses to each buffer we send
+        ; r0 contains the number of bytes consumed by this message, with bit 30
+        ; acting as a 'audio starved' flag. If bit 30 is set, it's a bad thing,
+        ; as it means there'll be noise on the output.
+        ; r1 & r2 are the 'callback' and 'cookie' params from the last buffer we
+        ; sent - not the buffer which the audio has been taken from
+        MOV     r0, r0, LSL #8
+        MOVS    r2, r0, ASR #8 ; Mask out top bits
+        ; Log the number of consumed bytes and handle any completed buffers
+        MRS     r0, CPSR
+        ORR     r1, r0, #I32_bit
+        MSR     CPSR_c, r1
+        LDR     r1, IdleBytes
+        LDR     r3, IdleBuffers
+        MOVLT   r2, r3 ; For negative results, just treat as one buffer being returned?
+        Debug   vc, "IdleBytes, IdleBuffers", r1, r3
+        LDR     lr, BuffSize
+        ADD     r1, r1, r2
+        MOV     r2, r3
+10
+        CMP     r1, lr
+        SUBGE   r1, r1, lr
+        ADDGE   r2, r2, #1
+        BGT     %BT10
+        Debug   vc, "Now", r1, r2
+        STR     r1, IdleBytes
+        STR     r2, IdleBuffers
+        ; If buffer count went up, wake callback & tell SoundDMA
+        MSR     CPSR_c, r0
+        SUBS    r2, r2, r3
+        BEQ     %FT40
+        ADR     r1, pollword_1
+        SWI     XRT_Yield
+        ; Now tell SoundDMA about the buffer(s)
+        MOV     r0, #0
+        LDR     r1, DMAParam
+        LDR     r3, DMACallback
+20
+        Push    "r0-r3"
+        MOV     lr, pc
+        MOV     pc, r3 ; Note - corrupts r0-r3, r12
+        Pull    "r0-r3"
+        SUBS    r2, r2, #1
+        BNE     %BT20
+        EXIT
+
+40
+        MSR     CPSR_c, r0
+        EXIT
+
+50
+        LDR     r0, [sp, #VC_AUDIO_MSG_T_DATA]
+        Debug   vc, "Success", r0
+        STR     r0, Result
+        MOV     r0, #1
+        STRB    r0, GotResult
+90
+        EXIT
+
+BufferCallback  ROUT
+        Entry   "r0-r7",VC_AUDIO_MSG_T_SIZE
+        ; Are we still running?
+        LDRB    r0, Running
+        Debug   audc, "BufferCallback running", r0
+        CMP     r0, #0
+        STREQ   r0, IdleBuffers ; Clear our pollword
+        BEQ     %FT90
+        MOV     r0, #0
+        STR     r0, RTIdle
+        BL      MutexClaim
+        LDR     r0, VCHIQService
+        SWI     XVCHIQ_ServiceUse
+10
+        ; Decrement idle buffer count
+        MRS     r0, CPSR
+        ORR     r1, r0, #I32_bit
+        MSR     CPSR_c, r1
+        LDR     r1, IdleBuffers
+        Debug   audc, "IdleBuffers", r1
+        SUBS    r1, r1, #1
+        BLT     %FT80
+        STR     r1, IdleBuffers
+        LDRB    r7, BuffIndex
+        EOR     r2, r7, #1
+        STRB    r2, BuffIndex
+        MSR     CPSR_c, r0
+        ; Let the audio service know some data is coming
+        MOV     r0, #VC_AUDIO_MSG_TYPE_WRITE
+        LDR     r1, BuffSize
+        MOV     r2, #0
+        MOV     r3, #0
+        MOV     r4, #0
+        Debug   audc, "Send message", r0, r1, r2, r3, r4
+        STMIA   sp, {r0-r4}
+        LDR     r0, VCHIQService
+        MOV     r1, sp
+        MOV     r2, #VC_AUDIO_MSG_T_SIZE
+        MOV     r3, #VCHI_FLAGS_BLOCK_UNTIL_QUEUED
+        SWI     XVCHIQ_MsgQueue
+        ; Now write the data
+        LDR     r0, VCHIQService
+        ADR     r1, Buff0
+        LDR     r1, [r1, r7, LSL #2]
+        LDR     r2, BuffSize
+        MOV     r3, #VCHI_FLAGS_BLOCK_UNTIL_QUEUED
+        MOV     r4, #0
+        SWI     XVCHIQ_BulkQueueTransmit
+        B       %BT10
+80
+        MSR     CPSR_c, r0
+        LDR     r0, VCHIQService
+        SWI     XVCHIQ_ServiceRelease
+        BL      MutexRelease
+        STR     pc, RTIdle
+90
+        EXIT
+        
+
+; Mixer device
+
+MixerActivate
+        Debug   mix, "MixerActivate"
+        MOV     a1, #1
+        MOV     pc, lr
+
+MixerDeactivate
+        Debug   mix, "MixerDeactivate"
+        MOV     pc, lr
+
+MixerReset
+        Debug   mix, "MixerReset"
+        MOV     pc, lr
+
+MixerSleep
+        Debug   mix, "MixerSleep"
+        MOV     a1, #0
+        MOV     pc, lr
+
+MixerGetFeatures
+        ; a2 = channel
+        ADR     a1, MixerFeaturesTab
+        LDR     a1, [a1, a2, LSL #2]
+        MOV     pc, lr
+
+MixerFeaturesTab
+   [ OutputControl
+        ASSERT AUDIO_DEST_HDMI = AUDIO_DEST_HEADPHONES+1
+        ; Headphone/3.5mm output
+        DCW    0
+        DCW    MixerCategory_Headphones
+        ; HDMI output
+        DCW    0
+        DCW    MixerCategory_Speaker
+   |
+        ; Just say it's the system volume
+        DCW    0
+        DCW    MixerCategory_System
+   ]
+
+; ALSA driver uses limits of +400 to -10239
+; These are measured in 1/100dB units (I believe)
+; The videocore uses units measured in 1/256dB (with sign reversed), i.e. -1024 max and 26211 min
+; RISC OS uses units measured in 1/16dB, so our conversion to videocore units is somewhat simpler
+MIN_GAIN       * -1638 ; (RO units)
+MAX_GAIN       * 4*16  ; (RO units)
+MUTE_GAIN      * 26214*2 ; (VC units). Note ALSA uses 26214, but that doesn't result in a complete mute (at least not for headphone output). Luckily higher values seem to work without the videocore complaining.
+
+MixerSetMix
+        ; a2 = channel
+        ; a3 = mute flag
+        ; a4 = gain
+        Entry   "v1-v2", VC_AUDIO_MSG_T_SIZE
+        SUB     r12, a1, #:INDEX:MixerDevice
+        Debug   mix, "MixerSetMix", a2, a3, a4
+        ; Clamp to within range
+        CMP     a4, #MAX_GAIN
+        MOVGT   a4, #MAX_GAIN
+        LDR     v1, =MIN_GAIN
+        CMP     a4, v1
+        MOVLT   a4, v1
+        ; Check against stored values
+        ADR     a1, MixSettings
+        ADD     a1, a1, a2, LSL #3
+        LDMIA   a1, {v1-v2}
+        CMP     v1, a3
+        CMPEQ   v2, a4
+        EXIT    EQ ; No change, ignore
+        STMIA   a1, {a3-a4}
+        ; Convert to videocore units
+        RSB     a4, a4, #0
+        MOVS    a4, a4, LSL #4
+        MOVEQ   a4, #1 ; Setting a gain of 0 doesn't result in a change! Bug or feature?
+        ; Check mute flag
+        CMP     a3, #0
+        LDRNE   a4, =MUTE_GAIN
+        ; Apply
+        MOV     a1, #VC_AUDIO_MSG_TYPE_CONTROL
+      [ OutputControl
+        ADD     v1, a2, #AUDIO_DEST_HEADPHONES
+      |
+        MOV     v1, #AUDIO_DEST_AUTO
+      ]
+        Debug   mix, "Send message", a1, a4, v1
+        STMIA   sp, {a1,a4,v1}
+        BL      MutexClaim
+        LDR     r0, VCHIQService
+        SWI     XVCHIQ_ServiceUse
+        BL      SendWithResult
+        Debug   mix, "Result", a1
+        ; TODO - do something with result!
+        LDR     r0, VCHIQService
+        SWI     XVCHIQ_ServiceRelease
+        BL      MutexRelease
+        EXIT
+
+MixerGetMix
+        SUB     r12, a1, #:INDEX:MixerDevice
+        ADR     a1, MixSettings
+        ADD     a1, a1, a2, LSL #3
+        LDMIA   a1, {a1, a2}
+        MOV     pc, lr
+
+MixerGetMixLimits
+        LDR     a1, =MIN_GAIN
+        LDR     a2, =MAX_GAIN
+        MOV     a4, #1
+        STMIA   a3, {a1-a2,a4}
+        MOV     pc, lr
+
+        END

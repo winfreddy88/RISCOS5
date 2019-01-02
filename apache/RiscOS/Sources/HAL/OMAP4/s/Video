@@ -1,0 +1,267 @@
+; Copyright 2011 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:Machine.<Machine>
+        GET     Hdr:ImageSize.<ImageSize>
+        $GetIO
+        GET     Hdr:Proc
+
+        GET     Hdr:OSEntries
+        GET     Hdr:HALEntries
+
+        GET     hdr.omap4430
+        GET     hdr.StaticWS
+        GET     hdr.PRCM
+        GET     hdr.GPIO
+        GET     hdr.Timers
+
+        AREA    |Asm$$Code|, CODE, READONLY, PIC
+
+        EXPORT  Video_Init
+        EXPORT  VideoDevice_Init
+        EXPORT  Video_Power_VBC_DVI
+
+        IMPORT  memcpy
+        IMPORT  GPIOx_SetAsOutput
+        IMPORT  GPIOx_SetOutput
+
+; A brief rundown of OMAP4430 video output modes:
+; The display subsystem (DSS) provides the logic to display a video frame from the
+; memory frame buffer on a LCD panel or a TV set.
+; DSS can display different pictures simultaneously by using the primary LCD1 and
+; secondary LCD2 outputs, in addition to the TV output.
+; The primary LCD output can be one of the following:
+;   DSI  - Display serial interface using MIPI DSI
+;   RFBI - Parallel interface using MIPI DBI protocol 2.0
+; The secondary LCD output can be one of the following:
+;   DPI  - Parallel CMOS output (MIPI DPI 1.0)
+;   DSI  - Display serial interface using MIPI DSI
+;   RFBI - Parallel interface using MIPI DBI protocol 2.0
+; The TV output can be one of the following:
+;   Composite signal
+;   HDMI - High definition multimedia interface
+
+; The modules integrated in the DSS are:
+;   Display controller (DISPC)
+;     1 direct memory access (DMA) engine
+;     2 LCD outputs + 1 TV output
+;     1 graphics pipeline (GFX), 3 video pipelines + 1 write-back pipeline
+;   RFBI (Remote Frame Buffer Interface)
+;     8-, 9-, 16-bit parallel interface
+;     programmable pixel memory formats
+;     programmable output formats on one or multiple cycles per pixel
+;  2 DSI protocol engines
+;     4-data lane complex I/O for DSI1, 2-data lane I/O for DSI2
+;     bidirectional data link support
+;     supports video mode + command mode
+;     supports data interleaving
+;   NTSC/PAL video encoder (VENC)
+;     composite output signal through external video DAC
+;   HDMI protocol engine
+;     supports HDMI 1.3
+;     30-bit RGB color
+;     HDCP key protection
+;     deep color mode support
+
+; Currently this code only supports the RFBI bypass mode, as used to interface with
+; the TFP410 DVI framer used on the pandaboard. Luckily this is also the simplest
+; interface of the lot. This mode is only available for LCD2.
+
+; Video is handled by OMAP4Video module ==> no HAL implementation
+
+; -------------------------------------------------------------------------
+
+
+Video_Init
+        Push    "lr"
+
+        ; Configure GPIO pins as DISPC2 signals
+        LDR     a1, L4_Core_Log
+        LDR     a2, =(L4_SYSCTRL_PADCONF_CORE - L4_Core)
+        ADD     a1, a2, a1
+        ADD     a3, a1, #0x100
+        ; Configure DVI framer pin (Panda)
+        LDRB    a4, [sb, #BoardConfig_VideoGPIO]
+        CMP     a4, #0                  ; check for GPIO_0
+        LDREQ   a4, =0x11B              ; output: IEN + PullUp + Mode 3 (GPIO)
+        STREQH  a4, [a3, #0x084]        ; GPIO_0 at offset 0x184
+        LDR     a2, =0x00050005
+        STRH    a2, [a3, #0x0D4]        ; GPIO_191/DISPC2_DATA0
+        STR     a2, [a1, #0x1D0]        ; GPIO_190/DISPC2_DATA1 + GPIO_28/DISPC2_DATA2
+        STR     a2, [a1, #0x1CC]        ; GPIO_27/DISPC2_DATA3 + GPIO_26/DISPC2_DATA4
+        STR     a2, [a1, #0x1C8]        ; GPIO_25/DISPC2_DATA5 + GPIO_24/DISPC2_DATA6
+        STR     a2, [a1, #0x1C4]        ; GPIO_23/DISPC2_DATA7 + GPIO_22/DISPC2_DATA8
+        STR     a2, [a1, #0x1C0]        ; GPIO_21/DISPC2_DE + GPIO_20/DISPC2_VSYNC
+        STR     a2, [a1, #0x1BC]        ; GPIO_19/DISPC2_PCLK + GPIO_18/DISPC2_HSYNC
+        STR     a2, [a1, #0x1B8]        ; GPIO_17/DISPC2_DATA17 + GPIO_16/DISPC2_DATA16
+        STR     a2, [a1, #0x1B4]        ; GPIO_15/DISPC2_DATA9 + GPIO_14/DISPC2_DATA10
+        STR     a2, [a1, #0x174]        ; GPIO_168/DISPC2_DATA11 + GPIO_167/DISPC2_DATA12
+        STR     a2, [a1, #0x170]        ; GPIO_166/DISPC2_DATA13 + GPIO_165/DISPC2_DATA14
+        STR     a2, [a1, #0x16C]        ; GPIO_164/DISPC2_DATA15 + GPIO_163/DISPC2_DATA18
+        STR     a2, [a1, #0x168]        ; GPIO_162/DISPC2_DATA19 + GPIO_161/DISPC2_DATA20
+        STR     a2, [a1, #0x164]        ; GPIO_160/DISPC2_DATA21 + GPIO_159/DISPC2_DATA22
+        STRH    a2, [a3, #0x062]        ; GPIO_158/DISPC2_DATA23
+
+        ; Configure GPIO pins so we can turn the DVI framer on/off
+        LDRB    a1, [sb, #BoardConfig_VideoGPIO]
+        CMP     a1, #255
+        MOV     a2, #0
+        BLNE    GPIOx_SetAsOutput       ; Turn DVI framer off
+
+        ; Enable DSS power domain
+        LDR     a1, L4_PowerMan_Log
+        ADD     a1, a1, #DSS_PRM
+        LDR     a2, [a1, #PM_DSS_PWRSTCTRL]
+        ORR     a2, a2, #3              ; ON state
+        STR     a2, [a1, #PM_DSS_PWRSTCTRL]
+
+        ; Activate Thermal Sensor Clock (not done by U-Boot 2014)
+        ; Is there a better place to do it?
+        ; I'm doing it here because it is the only location where L4_PowerMan is used.
+        ADD     a1, a1, #(WKUP_CM - DSS_PRM)
+        LDR     a2, [a1, #CM_WKUP_BANDGAP_CLKCTRL]
+        ORR     a2, a2, #(1 << 8)       ; OPTFCLKEN_TS_FCLK
+        STR     a2, [a1, #CM_WKUP_BANDGAP_CLKCTRL]
+
+        ; Activate DSS specific clocks
+        LDR     a1, L4_ClockMan2_Log
+        ADD     a1, a1, #DSS_CM2
+        LDR     a2, =((0xF << 8) + 2)   ; OPTFCLKEN_* + enable module
+        STR     a2, [a1, #CM_DSS_DSS_CLKCTRL]
+        MOV     a2, #2                  ; SW_WKUP
+        STR     a2, [a1, #CM_DSS_CLKSTCTRL]
+
+        Pull    "pc"
+
+VideoDevice_Init
+        ; Not much to do here - just register our HAL device
+        Push    "v1,lr"
+        ADRL    v1, VideoDevice
+        MOV     a1, v1
+        ADR     a2, VideoDeviceTemplate
+        MOV     a3, #Video_DeviceSize
+        BL      memcpy
+        LDR     a1, L4_Display_Log
+        STR     a1, [v1, #HALDevice_Address]
+        ADRL    a3, VideoBoardConfig
+        STR     a3, [v1, #HALDevice_VDUDeviceSpecificField]
+        STR     sb, [v1, #:INDEX:VideoWorkspace]
+        ; Fill in the board config
+        LDR     a2, sys_clk
+        STR     a2, [a3, #VideoBoardConfig_sys_clk]
+        BL      Determine_PorchSync_Limits
+        STRH    a1, [a3, #VideoBoardConfig_Max_Porch]
+        STRH    a2, [a3, #VideoBoardConfig_Max_Sync]
+        LDR     a2, L4_sDMA_Log
+        STR     a2, [a3, #VideoBoardConfig_DMA_Ptr]
+        MOV     a2, #SDMA_IRQ_1
+        STR     a2, [a3, #VideoBoardConfig_DMA_Device]
+        ASSERT  SDMA_NumDevices = 31
+        MOV     a2, #&80000000
+        STR     a2, [a3, #VideoBoardConfig_DMA_Chans]
+        LDRB    a2, [sb, #BoardConfig_VBC_Flags]
+        STRB    a2, [a3, #VideoBoardConfig_Flags]
+        LDRB    a2, [sb, #BoardConfig_VBC_LCDNum]
+        STRB    a2, [a3, #VideoBoardConfig_Num_LCDs]
+        LDR     a2, [sb, #BoardConfig_VBC_LCDPtr]
+        STR     a2, [a3, #VideoBoardConfig_LCD_Configs]
+        MOV     a1, #0
+        MOV     a2, v1
+        CallOS  OS_AddDevice
+        Pull    "v1,pc"
+
+VideoDeviceTemplate
+        DCW     HALDeviceType_Video + HALDeviceVideo_VDU
+        DCW     HALDeviceID_VDU_OMAP4
+        DCD     HALDeviceBus_Sys + HALDeviceSysBus_NoC
+        DCD     0               ; API version 0
+        DCD     VideoDevice_Desc
+        DCD     0               ; Address - filled in later
+        %       12              ; Reserved
+        DCD     VideoDevice_Activate
+        DCD     VideoDevice_Deactivate
+        DCD     VideoDevice_Reset
+        DCD     VideoDevice_Sleep
+        DCD     VIDEO_IRQ       ; Device interrupt
+        DCD     0               ; TestIRQ cannot be called
+        %       8
+        DCD     0               ; Pointer to board config stuff - filled in later
+        ASSERT (. - VideoDeviceTemplate) = HALDevice_VDU_Size
+        DCD     0               ; HAL workspace pointer - filled in later
+        ASSERT (. - VideoDeviceTemplate) = Video_DeviceSize
+
+VideoDevice_Desc
+        =       "OMAP4 video controller", 0
+        ALIGN
+
+VideoDevice_Activate
+        Entry   "sb"
+        LDR     sb, VideoWorkspace
+        ; Enable DSS power (if not already activated)
+        LDR     a1, L4_ClockMan2_Log
+        ADD     a1, a1, #DSS_CM2
+        LDR     a2, [a1, #CM_DSS_DSS_CLKCTRL]
+        ANDS    a2, a2, #(3 << 16)      ; IDLEST
+        BEQ     %FT10
+        MOV     a2, #2                  ; SW_WKUP
+        STR     a2, [a1, #CM_DSS_CLKSTCTRL]
+        ; Wait until module is active
+05
+        LDR     a2, [a1, #CM_DSS_DSS_CLKCTRL]
+        ANDS    a2, a2, #(3 << 16)      ; IDLEST
+        BNE     %BT05
+
+10
+        MOV     a1, #1
+        EXIT
+
+VideoDevice_Deactivate
+VideoDevice_Reset
+        MOV     pc, lr
+
+VideoDevice_Sleep
+        MOV     a1, #0
+        MOV     pc, lr
+
+Video_Power_VBC_DVI
+        ; a1 = HAL device
+        ; a2 = brightness 0-65536, which we treat as a simple on/off flag
+        Entry   "sb"
+        LDR     sb, VideoWorkspace
+  [ DebugTiming
+        CMP     a2, #0
+        BEQ     %FT10
+        DebugTime a1, "Video on @ "
+10
+  ]
+        ; Just set the GPIO to the right value
+        LDRB    a1, [sb, #BoardConfig_VideoGPIO]
+        CMP     a1, #255
+        BLNE    GPIOx_SetOutput
+        EXIT
+
+Determine_PorchSync_Limits
+        ; Returns:
+        ; a1 = max porch value
+        ; a2 = max sync value
+        ; OMAP44xx has fixed values
+        MOV     a1, #(1 << 12)
+        MOV     a2, #(1 << 8)
+        MOV     pc, lr
+
+        END

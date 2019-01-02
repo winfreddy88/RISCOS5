@@ -1,0 +1,896 @@
+; Copyright 2015 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:Machine.<Machine>
+        GET     Hdr:ImageSize.<ImageSize>
+        $GetIO
+
+        GET     Hdr:OSEntries
+        GET     Hdr:HALEntries
+
+        GET     hdr.omap543x
+        GET     hdr.StaticWS
+        GET     hdr.Timers
+        GET     hdr.PRCM
+
+        AREA    |Asm$$Code|, CODE, READONLY, PIC
+
+        EXPORT  I2C_Init
+
+        EXPORT  HAL_IICBuses
+        EXPORT  HAL_IICType
+        EXPORT  HAL_IICDevice
+        EXPORT  HAL_IICTransfer
+        EXPORT  HAL_IICMonitorTransfer
+        EXPORT  HAL_VideoIICOp
+        EXPORT  IIC_DoOp_Poll
+
+        IMPORT  HAL_CounterDelay
+
+; The OMAP543x has 7 I2C controllers:
+; (usage on ISEE IGEPv5 board)
+; I2C1 - connected to the TWL6037 (power) and TWL6040 (audio) companion chip
+;        RISC OS sees it as I2C bus 0.
+;   used I2C addresses
+;        TWL6037: 0x48, 0x49, 0x4A; TWL6040: 0x4B; EEPROM: 0x50; [0x3B, 0x5B (??)]
+; I2C2 - routed to Temperature Sensor and expansion connectors JX10 and JC31 (camera)
+;        RISC OS sees it as I2C bus 1.
+; I2C3 - routed to USB Hub (U1100) and expansion connector JC30 (camera)
+;        RISC OS sees it as I2C bus 2.
+; I2C4 - routed to IO expander (TCA6416) and expansion connector JD41 (display)
+;        This means it can be used for reading EDID/DDC data.
+;        RISC OS sees it as I2C bus 3.
+;   used I2C addresses
+;        TCA6416 (GPIO Expander): 0x21
+; I2C5 - routed to USB Hub (U1000) and expansion connectors JD30 (DSI port) and J1201 (SATA)
+;        RISC OS sees it as I2C bus 4.
+; I2C6 - used for SmartReflex control (part of PRCM) in connection with TWL6037 power chip
+;        RISC OS does not see this bus at all.
+; I2C7 - used inside HDMI module for reading EDID/DDC data
+;        RISC OS does not see this bus at all.
+;
+; (usage on OMAP5 UEVM board)
+; I2C1 - connected to the TWL6037 (power) and TWL6040 (audio) companion chip
+;        RISC OS sees it as I2C bus 0.
+;   used I2C addresses
+;        TWL6037: 0x48, 0x49, 0x4A; TWL6040: 0x4B; EEPROM: 0x50;
+; I2C2 - routed to expansion connectors J20 (Ext. LCD), J17 and J18 (camera)
+;        RISC OS sees it as I2C bus 1.
+; I2C3 - routed to camera expansion connector J2 and JC30 (camera)
+;        RISC OS sees it as I2C bus 2.
+; I2C4 - routed to main expansion connector J20 (Display or Audio Expansion)
+;        This means it can be used for reading EDID/DDC data.
+;        RISC OS sees it as I2C bus 3.
+; I2C5 - routed to IO expander (TCA6424A) and USB Host Port Bridge
+;   used I2C addresses
+;        TCA6424A (GPIO Expander): 0x22; USB3503A: 0x08
+;        RISC OS sees it as I2C bus 4.
+; I2C6 - used for SmartReflex control (part of PRCM) in connection with TWL6037 power chip
+;        RISC OS does not see this bus at all.
+; I2C7 - used inside HDMI module for reading EDID/DDC data
+;        RISC OS does not see this bus at all.
+
+                GBLL    I2CDebug
+I2CDebug        SETL    {FALSE} :LAND: Debug
+
+                GBLL    I2CDebugData ; Display bytes sent & received?
+I2CDebugData    SETL    {FALSE} :LAND: I2CDebug
+
+                GBLL    I2CDebugError ; Debug unexpected_error occurences
+I2CDebugError   SETL    {FALSE} :LAND: Debug
+
+; ubuntu-omap5 does not use FIFO (and I2C does not work with FIFO enabled!)
+                GBLL    I2C_USE_FIFO
+I2C_USE_FIFO    SETL    {FALSE}
+
+; definition of IIC transfer flags
+IICTransfer_Retry               *       (1 << 29)
+IICTransfer_ChecksumOnly        *       (1 << 30)
+IICTransfer_NoStart             *       (1 << 31)
+
+
+I2C_Init
+        Push    "v1-v3,lr"
+ [ I2CDebug
+        DebugTX "I2C_Init"
+ ]
+
+
+;       ; 1. Make sure clocks are enabled
+;        clocks are already activated by u-boot
+
+  [ {TRUE} ; test for OMAP5 UEVM (not all U-Boots configure the I2C pads)
+        ; 1a configure pads
+        ; remark: I2C1 needs no configuration (already done; PMIC interface)
+        LDR     v1, L4_Core_Log
+        LDR     v2, =(L4_CTRL_MODULE_CORE_PAD - L4_Core)
+        ADD     v1, v2, v1
+        ADD     v3, v1, #0x100          ; add common offset
+        LDR     v2, =0x01000100         ; input + Mode 6
+        STR     v2, [v1, #0x00F8]       ; I2C4_SDA + I2C4_SCL
+        STRH    v2, [v3, #0x007A]       ; I2C3_SCL
+        STRH    v2, [v3, #0x007C]       ; I2C3_SDA
+        STR     v2, [v1, #0x01B8]       ; I2C2_SDA + I2C2_SCL
+        STRH    v2, [v3, #0x00C6]       ; I2C5_SCL
+        STRH    v2, [v3, #0x00C8]       ; I2C5_SDA
+  ]
+
+        ; 2. Initialise each I2C controller
+        MOV     v1, #MaxI2CControllers  ; max # of supported I2C interfaces
+        ADR     v2, I2C_Table
+10
+ [ I2CDebug
+        DebugReg  v1, "remaining busses: "
+ ]
+        LDR     v3, [v2, #I2C_HW]
+        CMP     v3, #0
+        BEQ     %FT30 ; Skip unused busses
+        ; First we'll reset the controller
+        LDRH    a4, [v3, #I2C_CON]
+        TST     a4, #I2C_CON_EN
+        BEQ     %FT20
+        MOV     a4, #0
+        STRH    a4, [v3, #I2C_CON]
+20
+        MOV     a4, #I2C_SYSC_SRST      ; soft reset
+        STRH    a4, [v3, #I2C_SYSC]
+        MOV     a4, #I2C_CON_EN
+        STRH    a4, [v3, #I2C_CON]
+20
+        LDRH    a4, [v3, #I2C_SYSS]
+        TST     a4, #I2C_SYSS_RDONE     ; reset done
+        BEQ     %BT20
+        ; Now disable the controller again so we can program it properly
+        MOV     a4, #0
+        STRH    a4, [v3, #I2C_CON]
+
+        ; setup clock values according Table 23-6 and 23-7 (OMAP543x TRM Rev. Y)
+        ; based on I2Cn_FCLK 96 MHz
+        ;
+        ; fInternal = I2Cn_FCLK / (PSC + 1)
+        ; tLow  = (SCLL + 7) * 1 / fInternal
+        ; tHigh = (SCLH + 5) * 1 / fInternal
+        ; fI2Cn = 1 / (tLow + tHigh)
+        ; tLow == tHigh ==> valSCL = fInternal / (2 * fI2Cn)
+        ;
+        ;          PSC   SCLL   SCLH  fInternal  valSCL
+        ; 100 kHz:  23     13     15    4.0 MHz      20
+        ; 400 kHz:   9      5      7    9.6 MHz      12
+        ;
+        ; Run at 400kbps for now. TODO - Add support for higher speeds!
+        MOV     a4, #(10 - 1)           ; 9.6 MHz
+        STRH    a4, [v3, #I2C_PSC]
+        MOV     a4, #(12 - 7)
+        STRH    a4, [v3, #I2C_SCLL]
+        MOV     a4, #(12 - 5)
+        STRH    a4, [v3, #I2C_SCLH]
+        ; Program own address
+        MOV     a4, #1
+        STRH    a4, [v3, #I2C_OA]
+        ; Set FIFO thresholds
+  [ I2C_USE_FIFO
+        LDRH    a4, [v3, #I2C_BUFSTAT]
+        ADR     a3, fifo_thresholds
+        AND     a4, a4, #I2C_BUFSTAT_FIFODEPTH  ; Get FIFO size
+        LDR     a4, [a3, a4, LSR #12]
+  |
+        MOV     a4, #0
+  ] ; I2C_USE_FIFO
+        STRH    a4, [v3, #I2C_BUF]
+        ; Enable auto idle, smart idle. Both clocks off when in idle mode?
+        MOV     a4, #(I2C_SYSC_AUTOIDLE + I2C_SYSC_IDLEMODE_SMART)
+        STRH    a4, [v3, #I2C_SYSC]
+        ; Enable the controller
+        MOV     a4, #I2C_CON_EN
+        STRH    a4, [v3, #I2C_CON]
+        ; Next!
+        SUBS    v1, v1, #1
+        ADD     v2, v2, #I2CBlockSize
+        BNE     %BT10
+        ; Done
+30
+ [ I2CDebug
+        DebugTX "I2C_Init complete"
+ ]
+        Pull    "v1-v3,pc"
+
+  [ I2C_USE_FIFO
+fifo_thresholds
+        DCD     &0606 ; 8 byte FIFO: Threshold at 7 bytes
+        DCD     &0B0B ; 16 byte FIFO: Threshold at 12 bytes
+        DCD     &1B1B ; 32 byte FIFO: Threshold at 28 bytes
+        DCD     &3B3B ; 64 byte FIFO: Threshold at 60 bytes
+  ] ; I2C_USE_FIFO
+
+HAL_IICBuses
+        LDRB    a1, [sb, #BoardConfig_NumI2C]
+        MOV     pc, lr
+
+HAL_IICType
+        ; todo - set the 'missing flags' alluded to in Kernel.Docs.HAL.MoreEnts?
+        ;        (multi-master & slave operation)
+        LDRB    a2, [sb, #BoardConfig_NumI2C]
+        CMP     a1, a2
+        MOVHS   a1, #0
+        LDRLO   a1, =IICFlag_HighLevel+IICFlag_Fast+IICFlag_Background+IICFlag_HighSpeed+(210:SHL:20)
+        MOV     pc, lr
+
+; HAL_IICDevice
+; in:
+;       r0 = bus number
+; out:
+;       r0 = device number
+
+HAL_IICDevice
+        LDRB    a3, [sb, #BoardConfig_NumI2C]
+        CMP     a1, a3
+        MOVHS   a1, #-1
+        ADDLO   a3, sb, #BoardConfig_HALI2CIRQ
+        LDRLOB  a1, [a3, a1]
+        MOV     pc, lr
+
+; HAL_IICTransfer
+; in:
+;      r0 = bus number
+;      r1 = number of transfers
+;      r2 = iic_transfer array ptr
+; out:
+;      r0 = IICStatus return code
+; Transfer list format:
+;      typedef struct iic_transfer
+;      {
+;        unsigned addr:8;
+;        unsigned :22;
+;        unsigned checksumonly:1;
+;        unsigned nostart:1;
+;        union
+;        {   unsigned checksum;
+;            void *data;
+;        } d;
+;        unsigned len;
+;      } iic_transfer;
+
+HAL_IICTransfer
+        LDRB    a4, [sb, #BoardConfig_NumI2C]
+        CMP     a1, a4
+        MOVHS   a1, #IICStatus_Error
+        MOVHS   pc, lr
+        ; Quickly validate the transfer list
+        ; We have several constraints:
+        ; 1. Must have 1 or more iic_transfers
+        ; 2. First transfer must not have nostart bit set
+        ; 3. Between start bits (and between the last start bit and the end of the list)
+        ;    there must be between 1 and 65536 bytes of data (but for the moment we do allow
+        ;    individual iic_transfers to be 0-length)
+        CMP     a2, #0
+        MOVLT   a1, #IICStatus_Error
+        MOVLT   pc, lr
+        LDR     a4, [a3]
+        TST     a4, #IICTransfer_NoStart        ; First transfer has nostart set!
+        MOVNE   a1, #IICStatus_Error
+        MOVNE   pc, lr
+        STMFD   sp!, {v1-v5,lr}
+        ADD     a4, a3, a2, LSL #3
+        ADD     a4, a4, a2, LSL #2
+        MOV     v1, a3
+30
+        MOV     v5, #-1
+10
+        LDMIB   v1!, {v2-v4}    ; data ptr & length from current transfer, flags from next
+        ADD     v5, v5, v3
+        CMP     v1, a4
+        BEQ     %FT20           ; Last transfer just read
+        TST     v4, #IICTransfer_NoStart
+        BNE     %BT10           ; Still more data in this transfer
+20
+        CMP     v5, #65536
+        MOVHS   a1, #IICStatus_Error    ; Too much (or too little) data
+        LDMHSIA sp! ,{v1-v5,pc}
+        CMP     v1, a4
+        BNE     %BT30
+_IICTransfer_Video ; Entry point for HAL_VideoIICOp
+ [ I2CDebug
+        DebugTX "HAL_IICTransfer"
+        DebugReg a1, "bus="
+        DebugReg a2, "num="
+        DebugReg a3, "iic_transfer="
+ ]
+        ADR     v5, I2C_Table
+        MOV     v4, #I2CBlockSize
+        MLA     v5, a1, v4, v5
+        MRS     ip, CPSR
+        ORR     a4, ip, #I32_bit
+        MSR     CPSR_c, a4              ; disable interrupts for atomic claim
+        LDR     a4, [v5, #I2C_XStart]
+        TEQ     a4, #0                  ; in use already?
+        STREQ   a3, [v5, #I2C_XStart]   ; if not, claim it
+        MSR     CPSR_c, ip
+        MOVNE   a1, #IICStatus_Busy     ; if it is, return "BUSY"
+ [ I2CDebug
+        BEQ     %FT10
+        DebugReg a4, "BUSY: XStart="
+        LDMFD   sp!, {v1-v5,pc}
+10
+        DebugTX "OK"
+ |
+        LDMNEFD sp!, {v1-v5,pc}
+ ]
+        SUB     a2, a2, #1              ; a2 = transfers - 1 (needed below)
+        ADD     v1, a3, a2, LSL #3
+        ADD     v1, v1, a2, LSL #2
+        STR     v1, [v5, #I2C_XEnd]
+        LDR     v4, [v5, #I2C_HW]
+        ; Make sure controller is enabled, since we don't do any initialisation atm!
+        LDRH    a4, [v4, #I2C_CON]
+        TST     a4, #I2C_CON_EN
+        LDREQH  v3, [v4, #I2C_IRQSTATUS_RAW]
+ [ I2CDebugError
+        BNE     %FT10
+        DebugTX "Controller not enabled!"
+        B       unexpected_error
+10
+ |
+        BEQ     unexpected_error
+ ]
+        MOV     v1, a3
+start_transfer ; Start the transfer in v1
+        ; a1-a4 free
+        ; v1 = iic_transfer to start
+        ; v2-v3 free
+        ; v4 = I2C controller ptr
+        ; v5 = I2C state ptr
+ [ I2CDebug
+        DebugReg v1, "start_transfer: "
+ ]
+        STR     v1, [v5, #I2C_XCurrent]
+        MOV     lr, #0
+        STR     lr, [v5, #I2C_XBytes]
+        ; Get its info
+        LDMIA   v1, {a1-a3}
+ [ I2CDebug
+        DebugReg a1, "addr="
+        DebugReg a2, "data="
+        DebugReg a3, "len ="
+ ]
+        ; If it's a 'checksum-only' read, clear the checksum to 0
+        TST     a1, #IICTransfer_ChecksumOnly
+        TSTNE   a1, #1
+        MOVNE   a2, #0
+        STRNE   a2, [v1, #4]
+        ; Wait for the controller to be fully idle - if two iic_transfer lists are executed
+        ; back-to-back then there's a chance the controller won't have yet sent the stop bit
+        ; from the previous transfer. Thus we must wait here for the bit to be sent.
+        MOV     v2, #50*1024 ; timeout - this should be more than adequate (with a CPU of 500MHz, there'd be 1250 CPU clock cycles per 400kbps I2C clock cycle)
+10
+        LDRH    a4, [v4, #I2C_CON]
+        TST     a4, #(I2C_CON_STT + I2C_CON_STP)
+        ; Check STT and STP (Although we're primarily interested in STP, the manual warns
+        ; about bad things happening if STT is cleared)
+        BEQ     %FT20
+        SUBS    v2, v2, #1
+        BNE     %BT10
+ [ I2CDebug
+        DebugReg a4, "ISC_CON timeout: "
+ ]
+        MOV     a1, #IICStatus_Busy
+        MOV     v3, #0
+        STR     v3, [v5, #I2C_XStart]
+        LDMFD   sp!, {v1-v5,pc}
+20
+        ; Configure controller
+        ; 1. I2C_CON.MST, ISC_CON.TRX
+        BIC     a4, a4, #(I2C_CON_STT+I2C_CON_STP+I2C_CON_XOA3+I2C_CON_XOA2+I2C_CON_XOA1+I2C_CON_XOA0)
+        BIC     a4, a4, #(I2C_CON_STB+I2C_CON_MST+I2C_CON_TRX+I2C_CON_XSA)
+        ORR     a4, a4, #I2C_CON_MST    ; Set MST (slave mode not supported ATM)
+        TST     a1, #1
+        ORREQ   a4, a4, #I2C_CON_TRX    ; Set transmitter mode if appropriate
+        STRH    a4, [v4, #I2C_CON]
+        ; Clear any pending interrupts, just in case?
+        LDRH    v2, [v4, #I2C_IRQSTATUS_RAW]
+        STRH    v2, [v4, #I2C_IRQSTATUS]
+        ; 2. I2C_IE.XRDY_IE, I2C_IE.RRDY
+        MOVEQ   v2, #(I2C_INT_AL + I2C_INT_NACK + I2C_INT_ARDY + I2C_INT_XRDY)
+        MOVNE   v2, #(I2C_INT_AL + I2C_INT_NACK + I2C_INT_ARDY + I2C_INT_RRDY)
+  [ I2C_USE_FIFO
+        ORREQ   v2, v2, #I2C_INT_XDR
+        ORRNE   v2, v2, #I2C_INT_RDR
+  ] ; I2C_USE_FIFO
+        STRH    v2, [v4, #I2C_IRQENABLE_SET]
+        ; 3. Ignore DMA for now
+        ; 4. I2C_SA, I2C_CNT
+        MOV     v2, a1, LSR #1
+        AND     v2, v2, #&7F
+        STRH    v2, [v4, #I2C_SA]
+
+        ; The I2C controller doesn't seem to like it if we don't send a start bit - it simply
+        ; ignores I2C_CNT and goes straight to sending the stop bit (or sits there and does
+        ; nothing if no stop bit was wanted).
+        ; So to get around this we scan forward through the iic_transfer list and set I2C_CNT
+        ; to the number of bytes to transmit before the next start/stop bit is required
+        MOV     v2, v1
+        LDR     ip, [v5, #I2C_XEnd]
+10
+        CMP     ip, v2
+        ORREQ   a4, a4, #I2C_CON_STP    ; Last transfer in list; set stop bit
+
+        BEQ     %FT20
+        ADD     v2, v2, #12 ; Increment after compare, just in case some crazy person creates an iic_transfer that wraps from &FFF.... to &000...
+        LDMIA   v2,{a1-a2,v3} ; Get transfer info
+        TST     a1, #IICTransfer_NoStart
+        ADDNE   a3, a3, v3 ; nostart is set; increment length and loop around
+        BNE     %BT10
+20
+ [ I2CDebug
+        DebugReg a3, "I2C_CNT="
+ ]
+        STRH    a3, [v4, #I2C_CNT]
+        ; 5. Wait for I2C_IRQSTATUS_RAW.BB to 0 (but only if this is the first iic_transfer of a
+        ;    sequence - otherwise we'll be stuck waiting to unlock a bus we already own)
+        LDR     v2, [v5, #I2C_XStart]
+        CMP     v1, v2 ; v1 = I2C_XCurrent from earlier
+        BNE     %FT20
+        MOV     v2, #50*1024 ; timeout
+10
+        LDRH    v3, [v4, #I2C_IRQSTATUS_RAW]
+        TST     v3, #I2C_INT_BB
+        BEQ     %FT20
+        SUBS    v2, v2, #1
+        BNE     %BT10
+ [ I2CDebug
+        DebugReg v3, "BB timeout: I2C_IRQSTATUS_RAW="
+ ]
+        MOV     a1, #IICStatus_Busy
+        B       clear_and_return
+20
+        ; 6. configure I2C_CON.STT=1, I2C_CON.STP=0/1
+;       ORR     a4, a4, #(I2C_CON_STT + I2C_CON_STP)
+        ORR     a4, a4, #(I2C_CON_STT)
+        STRH    a4, [v4, #I2C_CON]
+        ; Now we just sit back and wait for the interrupts?
+ [ I2CDebug
+        DebugTX "Transfer started"
+ ]
+        MOV     a1, #IICStatus_InProgress
+        LDMFD   sp!, {v1-v5,pc}
+
+        ; For receive:
+        ; 1. Use I2C_IE.RRDY_IE
+        ; 2. Except we use I2C_IE.RDR_IE if the receive size doesn't match the RX FIFO
+        ;    threshold?
+        ; For transmit:
+        ; 1. Use I2C_IE.XRDY_IE
+        ; 2. Except we use I2C_IE.XDR_IE if the length doesn't match the TX FIFO threshold?
+
+; Return IICStatus state for transfer on bus r0
+; Called on appropriate interrupt
+HAL_IICMonitorTransfer
+        ; Process the interrupts, according to figures 18-31/18-32 in spruf98b
+        STMFD   sp!, {v1-v5,lr}
+ [ I2CDebug
+        DebugReg a1, "HAL_IICMonitorTransfer: bus "
+ ]
+        ADR     v5, I2C_Table
+        MOV     v4, #I2CBlockSize
+        MLA     v5, a1, v4, v5
+        LDR     v4, [v5, #I2C_HW]
+        LDR     a1, [v5, #I2C_XStart]
+ [ I2CDebug
+        DebugReg a1, "XStart="
+ ]
+        LDRH    v3, [v4, #I2C_IRQSTATUS_RAW]
+        TEQ     a1, #0 ; If no transfer, shut off all interrupts
+        ASSERT  IICStatus_Completed=0
+ [ I2CDebug
+        BNE     %FT10
+        DebugTX "No XStart!"
+        TEQ     a1, #0 ; reset EQ condition
+10
+ ]
+        MOVEQ   a1, #-1
+        STREQH  a1, [v4, #I2C_IRQENABLE_CLR]
+        STREQH  v3, [v4, #I2C_IRQSTATUS]
+        LDMEQFD sp!, {v1-v5,pc}
+ [ I2CDebug
+        DebugReg v3, "I2C_IRQSTATUS_RAW="
+ ]
+        TST     v3, #I2C_INT_NACK
+        BNE     i2c_nack
+        TST     v3, #I2C_INT_AL
+        BNE     i2c_al
+        TST     v3, #I2C_INT_ARDY
+        BNE     i2c_ardy
+        TST     v3, #I2C_INT_XDR
+        BNE     i2c_xdr
+        TST     v3, #I2C_INT_XRDY
+        BNE     i2c_xrdy
+        TST     v3, #I2C_INT_RDR
+        BNE     i2c_rdr
+        TST     v3, #I2C_INT_RRDY
+        BNE     i2c_rrdy
+        ; Did anything actually happen?
+        BIC     v3, v3, #(I2C_INT_BB+I2C_INT_ROVR+I2C_INT_XUDF+I2C_INT_BF)
+        ; Clear XUDF, ROVR, BB, BF - they're status bits and don't indicate anything
+        ; we care about here
+        CMP     v3, #0
+        MOVEQ   a1, #IICStatus_InProgress ; If nothing interesting happened, claim everything is OK (required for polling-mode transfers, e.g. HAL_VideoIICOp)
+        LDMEQFD sp!, {v1-v5,pc}
+        ; Else bad stuff - unhandled interrupt
+ [ I2CDebugError
+        DebugReg v3, "Unhandled IRQ - "
+ ]
+unexpected_error
+        MOV     a1, #IICStatus_Error
+        ; recover from error situation
+recover_from_error
+        MOV     v2, #0
+        STRH    v2, [v4, #I2C_CON]
+        MOV     v3, #-1
+        STRH    v3, [v4, #I2C_IRQSTATUS]
+        STRH    v3, [v4, #I2C_IRQENABLE_CLR]
+        STR     v2, [v5, #I2C_XStart]
+        STRH    v2, [v4, #I2C_CNT]
+        MOV     v2, #I2C_CON_EN
+        STRH    v2, [v4, #I2C_CON]
+        LDMFD   sp!, {v1-v5,pc}
+clear_and_return
+ [ I2CDebug
+        DebugReg a1, "clear_and_return: "
+ ]
+        CMP     a1, #IICStatus_InProgress
+        BHI     recover_from_error
+        STRH    v3, [v4, #I2C_IRQSTATUS]
+        MOV     v3, #-1
+        STRH    v3, [v4, #I2C_IRQENABLE_CLR]
+        MOV     v3, #0
+        STR     v3, [v5, #I2C_XStart]
+        STRH    v3, [v4, #I2C_CNT]
+        LDMFD   sp!, {v1-v5,pc}
+
+i2c_nack
+        ; No ack was received - give up and return error
+        MOV     a1, #IICStatus_NoACK
+        B       clear_and_return
+
+i2c_al
+        ; Arbitration lost - restart the transfer list
+        STRH    v3, [v4, #I2C_IRQSTATUS]
+        LDR     v1, [v5, #I2C_XStart]
+        B       start_transfer
+
+i2c_ardy
+        ; Previous transfer has completed successfully; start a new one
+        LDR     a3, [v5, #I2C_XCurrent]
+        LDR     a2, [v5, #I2C_XBytes]
+        LDR     ip, [a3, #8]
+        CMP     a2, ip
+ [ I2CDebugError
+        BEQ     %FT10
+        DebugTX "HW requested wrong byte count"
+        DebugReg a2, "I2C_XBytes="
+        DebugReg ip, "xfer len="
+        B       unexpected_error
+10
+ |
+        BNE     unexpected_error ; Hardware hasn't requested the full number of bytes
+ ]
+        LDR     a4, [v5, #I2C_XEnd]
+        CMP     a3, a4
+        MOVEQ   a1, #IICStatus_Completed
+        BEQ     clear_and_return
+        ; Skip any zero-length nostart transfers that follow this one
+        ADD     v1, a3, #12
+10
+        LDMIA   v1, {a1-a3}
+        TST     a1, #IICTransfer_NoStart
+        STREQH  v3, [v4, #I2C_IRQSTATUS]
+        BEQ     start_transfer
+        CMP     a3, #0
+ [ I2CDebugError
+        BEQ     %FT5
+        DebugReg a3, "nostart transfer with nonzero length, length="
+        B       unexpected_error
+5
+ |
+        BNE     unexpected_error ; nostart transfer with nonzero length = hardware hasn't requested full number of bytes
+ ]
+        CMP     v1, a4
+        MOVEQ   a1, #IICStatus_Completed
+        BEQ     clear_and_return
+        ADD     v1, v1, #12
+        B       %BT10
+
+
+i2c_xdr
+  [ I2C_USE_FIFO
+        ; Transfer I2C_BUFSTAT[5:0] bytes
+        LDRH    a4, [v4, #I2C_BUFSTAT]
+        AND     a4, a4, #I2C_BUFSTAT_TXSTAT
+  |
+        MOV     a4, #1
+  ] ; I2C_USE_FIFO
+        B       send_bytes
+
+i2c_xrdy
+  [ I2C_USE_FIFO
+        ; Transfer I2C_BUF[5:0]+1 bytes
+        LDRH    a4, [v4, #I2C_BUF]
+        AND     a4, a4, #I2C_BUF_TXTRSH
+        ADD     a4, a4, #1
+  |
+        MOV     a4, #1
+  ] ; I2C_USE_FIFO
+send_bytes
+ [ I2CDebug
+        DebugReg  a4, "send_bytes: "
+ ]
+        LDR     v2, [v5, #I2C_XCurrent]
+        LDR     a3, [v5, #I2C_XBytes] ; Get bytes sent
+        LDMIB   v2, {a2,ip} ; Get data ptr, transfer length
+10
+        ; Check if we need to advance to the next iic_transfer
+        CMP     a3, ip
+        BEQ     %FT20
+        LDRB    v1, [a2,a3]
+ [ I2CDebugData
+        DebugRegByte v1
+ ]
+        ADD     a3, a3, #1
+        SUBS    a4, a4, #1
+        STRB    v1, [v4, #I2C_DATA]
+        BNE     %BT10
+ [ I2CDebugData
+        DebugTX ""
+ ]
+        STR     a3, [v5, #I2C_XBytes]
+        MOV     a1, #IICStatus_InProgress
+        STRH    v3, [v4, #I2C_IRQSTATUS]
+        LDMIA   sp!, {v1-v5,pc}
+20
+        ; Advance to next iic_transfer
+        LDR     a3, [v5, #I2C_XEnd]
+        CMP     a3, v2
+ [ I2CDebugError
+        BNE     %FT5
+        DebugTX "End of transfer list but hardware wants more"
+        B       unexpected_error
+5
+ |
+        BEQ     unexpected_error ; Hardware is asking for more data than we can give
+ ]
+        ADD     v2, v2, #12
+        STR     v2, [v5, #I2C_XCurrent]
+        MOV     a3, #0
+        STR     a3, [v5, #I2C_XBytes]
+        LDMIA   v2, {a1-a2,ip}
+        TST     a1, #IICTransfer_NoStart
+        BNE     %BT10
+ [ I2CDebugError
+        DebugTX "nostart reached but hardware wants more"
+ ]
+        B       unexpected_error ; Hardware is asking for more data than we can give
+
+i2c_rdr
+  [ I2C_USE_FIFO
+        ; Read I2C_BUFSTAT[13:8] bytes
+        LDRH    a4, [v4, #I2C_BUFSTAT]
+        ANDS    a4, a4, #I2C_BUFSTAT_RXSTAT ; ERRATA - sometimes RDR is set when there's no data. So, don't attempt to read from the empty buffer.
+        MOVNE   a4, a4, LSR #I2C_BUFSTAT_RXSTAT_SHIFT
+        BEQ     %FT15
+  |
+        MOV     a4, #1
+  ] ; I2C_USE_FIFO
+        B       read_bytes
+
+i2c_rrdy
+  [ I2C_USE_FIFO
+        ; Read I2C_BUF[13:8]+1 bytes
+        LDRH    a4, [v4, #I2C_BUF]
+        AND     a4, a4, #I2C_BUF_RXTRSH
+        MOV     a4, a4, LSR #I2C_BUF_RXTRSH_SHIFT
+        ADD     a4, a4, #1
+  |
+        MOV     a4, #1
+  ] ; I2C_USE_FIFO
+read_bytes
+ [ I2CDebug
+        DebugReg  a4, "read_bytes: "
+ ]
+        LDR     v2, [v5, #I2C_XCurrent]
+        LDMIA   v2, {a1-a2,ip} ; Get checksum flag, data ptr/checksum, transfer length
+        LDR     a3, [v5, #I2C_XBytes] ; Get bytes received
+10
+        ; Check if we need to advance to the next iic_transfer
+        CMP     a3, ip
+        BEQ     %FT20
+        TST     a1, #IICTransfer_ChecksumOnly
+        LDRB    v1, [v4, #I2C_DATA]
+        ADDNE   a2, a2, v1      ; adjust checksum
+        STREQB  v1, [a2, a3]
+ [ I2CDebugData
+        DebugRegByte    v1
+ ]
+        SUBS    a4, a4, #1
+        ADD     a3, a3, #1
+        BNE     %BT10
+ [ I2CDebugData
+        DebugTX ""
+ ]
+        STR     a2, [v2, #4]    ; Update checksum
+        STR     a3, [v5, #I2C_XBytes]
+15
+        MOV     a1, #IICStatus_InProgress
+        STRH    v3, [v4, #I2C_IRQSTATUS]
+        LDMIA   sp!, {v1-v5,pc}
+20
+        ; Advance to next iic_transfer
+        LDR     a3, [v5, #I2C_XEnd]
+        CMP     a3, v2
+ [ I2CDebugError
+        BNE     %FT5
+        DebugTX "End of transfer list but hardware received more data"
+        B       unexpected_error
+5
+ |
+        BEQ     unexpected_error ; Hardware is receiving more data than we want
+ ]
+        ADD     v2, v2, #12
+        STR     v2, [v5, #I2C_XCurrent]
+        MOV     a3, #0
+        STR     a3, [v5, #I2C_XBytes]
+        LDMIA   v2, {a1-a2,ip}
+        TST     a1, #IICTransfer_NoStart
+ [ I2CDebugError
+        BNE     %FT5
+        DebugTX "nostart reached but hardware received more data"
+        B       unexpected_error
+5
+ |
+        BEQ     unexpected_error ; Hardware is receiving more data than we want
+ ]
+        TST     a1, #IICTransfer_ChecksumOnly
+        MOVNE   a2, #0 ; Start with zero checksum (as per start_transfer)
+        B       %BT10
+
+
+; int HAL_VideoIICOp(uint32_t op, uint8_t *buffer, uint32_t *size)
+; in:
+;      r0 = b0-15 offset within IIC device to start at
+;           b16-23 base IICAddress
+;           b24-31 zero
+;      r1 = buffer to read from/write to
+;      r2 = pointer to number of bytes to transfer
+; returns:
+;      r0 = IICStatus return code
+;      size = bytes successfully transferred (prior to any error)
+
+HAL_VideoIICOp
+        ; Make sure we've got a valid IIC bus to use
+        LDRB    a4, [sb, #BoardConfig_VideoI2C]
+        CMP     a4, #255
+        MOV     ip, #0
+        STREQ   ip, [a3]
+        MOVEQ   a1, #IICStatus_Error
+        MOVEQ   pc, lr
+        ; Check if this is an EDID read or write
+        UBFX    a4, a1, #16, #8
+        TEQ     a4, #&a0 ; Don't allow writing to EDID for safety reasons
+        STREQ   ip, [a3]
+        MOVEQ   a1, #IICStatus_Error
+        MOVEQ   pc, lr
+        TEQ     a4, #&a1
+        TSTNE   a1, #&ff00 ; If not EDID read, limit to 0-255 offset in device
+        STRNE   ip, [a3]
+        MOVNE   a1, #IICStatus_Completed
+        MOVNE   pc, lr
+        Push    "a1-a3,lr"
+        LDR     a3, [a3]
+
+        ; Build a set of iic_transfer blocks and call RISCOS_IICOpV
+        ; We construct (up to) three iic_transfer blocks
+        ; - First block is an (optional) single byte write to the EDID segment pointer
+        ; - Second block is a single byte write containing the start address (lower 8 bits of r0)
+        ; - Third block is a read. r2 bytes written to r1.
+        ; The E-EDID EEPROM spec says that the segment pointer should auto-increment when
+        ; a sequential (i.e. block) read occurs, so we shouldn't have to worry about splitting
+        ; requests into 256 byte blocks and manually writing the pointer each time.
+        ; Block 3:
+        UBFX    a1, a1, #16, #8 ; Extract base IICAddress
+        Push    "a1-a3"         ; Push the block on the stack (a2 & a3 are already correct)
+        ; Block 2:
+        BIC     a1, a1, #1      ; Clear RnW of base address
+        ADD     a2, sp, #12     ; sp+12 should point to the 8 bit offset
+        MOV     a3, #1
+        Push    "a1-a3"
+        ; Block 1:
+        MOV     a1, #&60        ; Write to segment pointer
+        ADD     a2, a2, #1      ; With bits 8-15 of the offset
+        Push    "a1-a3"
+        ; Work out if block 1 is needed or not
+        LDR     a2, [sp, #36]   ; Get r0
+        TST     a2, #&ff00      ; If segment == 0
+        MOVEQ   a2, #0          ; ... then avoid matching address &A0/&A1
+        AND     a2, a2, #&fe0000
+        TEQ     a2, #&a00000
+        ; Now attempt to start the transfer
+        LDRB    a2, [sb, #BoardConfig_VideoI2C]
+        MOV     a2, a2, LSL #24
+        ADD     a2, a2, #3
+        MOV     a1, sp
+        SUBNE   a2, a2, #1      ; Skip block 1 if segment == 0 or not EDID addr
+        ADDNE   a1, a1, #12
+        ; If HAL_Init isn't done yet, we can't use RISCOS_IICOpV
+        LDR     a3, HALInitialised
+        CMP     a3, #0
+        BEQ     %FT10
+        LDR     a3, OSentries+4*OS_IICOpV
+        BLX     a3
+        B       %FT20
+10
+        BL      IIC_DoOp_Poll
+20
+        ; In case of error, assume nothing got transferred at all
+        CMP     a1, #IICStatus_Completed
+        LDREQ   a4, [sp, #(12*2)+(2*4)] ; Block 3 request size
+        MOVNE   a4, #0
+        ADD     sp, sp, #12*3           ; Junk the iic_transfer blocks
+        STR     a1, [sp, #0]            ; Propagate return code
+        LDR     a3, [sp, #8]
+        STR     a4, [a3]                ; Actual transfer size
+        Pull    "a1-a3,pc"
+
+IIC_DoOp_Poll
+        ; IIC transfer function that performs a polling transfer, similar to HAL_VideoIICOp
+        ; This allows us to do IIC transfers before RISC OS is fully initialised
+        ; (e.g. from inside HAL_Init)
+        ; Parameters are identical to RISCOS_IICOpV:
+        ; r0 = iic_transfer array ptr
+        ; r1 = bits 0-23: iic_transfer count
+        ;      bits 24-31: bus number
+        ; Returns IICStatus return code in R0 (0 success, anything else failure)
+        Push    "v1,lr"
+ [ {FALSE}
+        ; If IRQs and IIC IRQ are enabled, panic
+        Push    "a1-a4"
+        MRS     a1, CPSR
+        TST     a1, #I32_bit
+        BNE     %FT10
+        ADR     a1, BoardConfig_HALI2CIRQ
+        LDRB    a1, [a1, a2, LSR #24]
+        IMPORT  HAL_IRQDisable
+        BL      HAL_IRQDisable
+        CMP     a1, #0
+        BEQ     %FT10
+        DebugTX "Warning - IIC_DoOp_Poll called with IIC IRQ enabled!"
+        B       .
+10
+        Pull    "a1-a4"
+ ]
+        MOV     a3, a1
+        MOV     a1, a2, LSR #24
+        BIC     a2, a2, #&ff000000
+        MOV     v1, a1
+        BL      HAL_IICTransfer
+        ; Now just poll until we're done
+10
+        CMP     a1, #IICStatus_InProgress ; Done?
+        Pull    "v1,pc", NE
+        ADR     lr, %BT10
+        MOV     a1, v1
+        B       HAL_IICMonitorTransfer
+
+        END

@@ -1,0 +1,195 @@
+; Copyright 2009 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:Machine.<Machine>
+        GET     Hdr:ImageSize.<ImageSize>
+        $GetIO
+
+        GET     Hdr:OSEntries
+        GET     Hdr:HALEntries
+
+        GET     hdr.omap3530
+        GET     hdr.StaticWS
+        GET     hdr.Timers
+        GET     hdr.PRCM
+        GET     hdr.USB
+        GET     hdr.GPIO
+
+        AREA    |Asm$$Code|, CODE, READONLY, PIC
+
+        EXPORT  USB_Init
+        
+        EXPORT  HAL_USBControllerInfo
+
+        IMPORT  HAL_CounterDelay
+        IMPORT  GPIOx_SetAsOutput
+        IMPORT  GPIOx_SetOutput
+
+; USB PHY power is controlled via GPIO
+;USB2_PHY_GPIO * 147  -> board config
+USB2_PHY_Reset_delay * 10000 ; 10msec
+
+OHCI_IRQ  * 76
+EHCI_IRQ  * 77
+MUSB_IRQ  * 92
+
+USB_Init
+        Push    "lr"
+        ; Initialise USB
+        ; This assumes we're running on a rev C beagleboard, i.e. we're using EHCI via an external PHY
+        ; This provides us with two ports, although the board only has a transceiver & connector for one (port #2)
+        ; This code is roughly the same as omap_start_ehc() in the linux sources, except DPLL5 will already be running (initialised in PRCM_SetClocks)
+        LDR     a1, L4_ClockMan_Log
+        ; Set up autoidle/sleep mode stuff for USBHOST
+        MOV     a2, #0
+        LDR     a3, =CM_AUTOIDLE_USBHOST
+        STR     a2, [a1, a3]
+        LDR     a3, =CM_SLEEPDEP_USBHOST
+        STR     a2, [a1, a3]
+        LDR     a3, =CM_CLKSTCTRL_USBHOST
+        STR     a2, [a1, a3]
+        ; Enable the clocks
+        MOV     a2, #1
+        LDR     a3, =CM_ICLKEN_USBHOST
+        STR     a2, [a1, a3]
+        MOV     a2, #3
+        LDR     a3, =CM_FCLKEN_USBHOST
+        STR     a2, [a1, a3]
+        ; Bring the external PHY out of reset
+        LDRB    a1, [sb, #BoardConfig_USBGPIO]
+        CMP     a1, #255
+        BEQ     %FT10 ; Do nothing if no GPIO?
+        MOV     a2, #0 ; Set pin to 0 to place PHY in reset
+        BL      GPIOx_SetAsOutput
+        ; Wait a while
+        LDR     a1, =USB2_PHY_Reset_delay
+        BL      HAL_CounterDelay
+        ; Disable the integrated STP pull-up resistor
+        LDR     a1, L4_USB_Host_Log
+        ADD     a2, a1, #EHCI_BASE
+        LDR     a3, =&81870090 ; Write 0x90 to port 1 addr 7 (surely this should be port 2?)
+        STR     a3, [a2, #EHCI_INSNREG05_ULPI]
+        ; Wait
+5
+        LDR     a3, [a2, #EHCI_INSNREG05_ULPI]
+        TST     a3, #&80000000
+        BEQ     %BT5
+        ; Force PHY to HS
+        LDR     a3, =&81840040 ; Write 0x40 to port 1 addr 4
+        STR     a3, [a2, #EHCI_INSNREG05_ULPI]
+        ; Wait
+5
+        LDR     a3, [a2, #EHCI_INSNREG05_ULPI]
+        TST     a3, #&80000000
+        BEQ     %BT5
+        ; Enable USBHOST TLL clocks
+        LDR     a1, L4_ClockMan_Log
+        LDR     a2, =CM_FCLKEN3_CORE
+        LDR     a3, [a1, a2]
+        ORR     a3, a3, #1:SHL:2 ; EN_USBTLL
+        STR     a3, [a1, a2]
+        LDR     a2, =CM_ICLKEN3_CORE
+        LDR     a3, [a1, a2]
+        ORR     a3, a3, #1:SHL:2 ; EN_USBTLL
+        STR     a3, [a1, a2]
+        ; Disable auto-idle
+        LDR     a2, =CM_AUTOIDLE3_CORE
+        LDR     a3, [a1, a2]
+        BIC     a3, a3, #1:SHL:2
+        STR     a3, [a1, a2]
+        ; Wait for TLL to become active
+5
+        LDR     a2, =CM_IDLEST3_CORE
+        LDR     a3, [a1, a2]
+        TST     a3, #1:SHL:2
+        BNE     %BT5
+        ; TLL soft reset
+        LDR     a1, L4_USBTLL_Log
+        MOV     a2, #2
+        STR     a2, [a1, #USBTLL_SYSCONFIG]
+5
+        LDR     a2, [a1, #USBTLL_SYSSTATUS]
+        TST     a2, #1
+        BEQ     %BT5               
+        ; Disable auto-idle (TODO - why?), enable wakeup
+        MOV     a2, #&10C
+        STR     a2, [a1, #USBTLL_SYSCONFIG]
+        ; Now configure UHH
+        ; no auto-idle/standby (TODO - why?)
+        LDR     a1, L4_USB_Host_Log
+        LDR     a2, =&110C
+        STR     a2, [a1, #UHH_SYSCONFIG]
+        ; Configure for UPLI PHY mode
+        MOV     a2, #&1C ; ULPI bypass enabled, INCR4/8/16 bursts enabled 
+        STR     a2, [a1, #UHH_HOSTCONFIG]
+5
+        LDR     a2, [a1, #UHH_HOSTCONFIG]
+        TST     a2, #1
+        BNE     %BT5
+        ; Wait for things to settle
+        LDR     a1, =USB2_PHY_Reset_delay
+        BL      HAL_CounterDelay
+        ; Now wake up the PHY
+        LDRB    a1, [sb, #BoardConfig_USBGPIO]
+        MOV     a2, #1
+        BL      GPIOx_SetOutput
+        ; Success!
+
+
+10
+        Pull    "pc"
+
+        ; a1 = interface #
+        ; a2 = usbinfo ptr
+        ; a3 = sizeof(usbinfo)
+        ; Return sizeof(usbinfo) or 0 for no more devices
+        ; If supplied size isn't large enough, only the controller type will be filled in
+HAL_USBControllerInfo
+        CMP     a1, #1
+        MOVHI   a1, #0
+        MOVHI   pc, lr
+        BEQ     %FT10
+        ; Fill in the usbinfo struct
+        MOV     a1, #HALUSBControllerType_EHCI
+        STR     a1, [a2, #HALUSBControllerInfo_Type]
+        CMP     a3, #HALUSBControllerInfo_SizeOf
+        MOV     a1, #HALUSBControllerInfo_SizeOf
+        MOVLO   pc, lr
+        MOV     a4, #HALUSBControllerFlag_32bit_Regs ; EHCI did seem to work OK without forcing 32bit register access, but it is technically needed so I'll leave it set.
+        STR     a4, [a2, #HALUSBControllerInfo_Flags]
+        LDR     a4, L4_USB_Host_Log
+        ADD     a4, a4, #EHCI_BASE
+        STR     a4, [a2, #HALUSBControllerInfo_HW]
+        MOV     a4, #EHCI_IRQ
+        STR     a4, [a2, #HALUSBControllerInfo_DevNo]
+        MOV     pc, lr
+10
+        MOV     a1, #HALUSBControllerType_MUSBMHDRC
+        STR     a1, [a2, #HALUSBControllerInfo_Type]
+        CMP     a3, #HALUSBControllerInfo_SizeOf
+        MOV     a1, #HALUSBControllerInfo_SizeOf
+        MOVLO   pc, lr
+        MOV     a4, #0
+        STR     a4, [a2, #HALUSBControllerInfo_Flags]
+        LDR     a4, L4_USB_OTG_Log
+        STR     a4, [a2, #HALUSBControllerInfo_HW]
+        MOV     a4, #MUSB_IRQ
+        STR     a4, [a2, #HALUSBControllerInfo_DevNo]
+        MOV     pc, lr
+
+        END

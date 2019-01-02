@@ -1,0 +1,355 @@
+/*
+ * Copyright (c) 1995, Andreas Zieringer
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
+#include "Desk/Time.h"
+#include "iconnames.h"
+#include "global.h"
+#include "zmodem.h"
+#include "zmisc.h"
+#include "stdio.h"
+#include "stdarg.h"
+#include "signal.h"
+
+#include <time.h>
+
+
+int Zmodem=0;		/* ZMODEM protocol requested */
+unsigned Baudrate = 2400;
+int errors;
+
+int Zctlesc;	/* Encode control characters */
+int Nozmodem = 0;	/* If invoked as "sb" */
+char *Progname = "sz";
+int Zrwindow = 1400;	/* RX window size (controls garbage count) */
+int no_timeout=FALSE;
+char ztrans;		/* ZMODEM file transport request */
+char zconv;		/* ZMODEM file conversion request */
+char Lzmanag;	/* Local ZMODEM file management request */
+int Eofseen;		/* EOF seen on input set by zfilbuf */
+int Quiet=0;		/* overrides logic that would otherwise set verbose */
+int Restricted=1;	/* restricted; no /.. or ../ in filenames */
+char Crcflg;
+char Lastrx;
+char zmanag;		/* ZMODEM file management request */
+
+
+int timeleft=0;
+long rxbytes;
+long last_bps=0;
+long Bytesleft;
+long filesize;
+int resume_filesize;
+
+//char filetransfer_type[80];
+//char disc_buffer[16384];
+char *disc_buffer=NULL;
+char send_disc_buffer[16384];
+
+char linbuf[BUFFER_SIZE];
+int Lleft=0;
+int Readnum = BUFFER_SIZE;
+
+/*
+#define BUFFER_SIZE 1024
+unsigned char buffer[BUFFER_SIZE];
+int buffer_pos=0,buffer_left=0;
+*/
+
+
+
+/*
+ * mode(n)
+ *  3: save old tty stat, set raw mode with flow control
+ *  2: set XON/XOFF for sb/sz with ZMODEM or YMODEM-g
+ *  1: save old tty stat, set raw mode
+ *  0: restore original tty mode
+ */
+
+int mode(int n)
+{
+	Baudrate = baud[dial_baud_nr].value;
+        //buffer_left=0;
+	switch(n)
+	{
+		case 0:
+			return OK;
+		break;
+		case 1:
+			return OK;
+		break;
+		case 2:
+			//serial_port->SetFlowControl(B_SOFTWARE_CONTROL);
+			return OK;
+		break;
+		case 3:
+			//serial_port->SetFlowControl(B_SOFTWARE_CONTROL);
+			return OK;
+		break;
+		default:
+		  return ZERROR;
+	}
+}
+
+void sendbrk(void)
+{
+}
+
+void flushmo(void)
+{
+/*
+  if(rx_check && !serialbufferempty())
+  {
+     //Desk_Error_Report(0,"hier: %d,%d",Lleft,(*driver)(DRIVER_EXAMINE,portnumber,0,0));
+     //Desk_Icon_SetText(unten_window,UNTEN_LSTATUS,"raise");
+     //Desk_Error_Report(0,"hier");
+     //raise(SIGINT);
+     longjmp(rxjmp,1);
+  }
+*/
+
+  while((*driver)(DRIVER_CHECKTX,portnumber)<serial_output_buffer_size && !filetr_abort)
+  {
+    //if(Desk_Time_Monotonic()-null_event_time>=5)
+      Desk_Event_Poll();
+  }
+  
+  //(*driver)(DRIVER_FLUSHTX,portnumber,0,0);
+
+	//fflush(stdout);
+	//printf("flush modem \n");
+	//while(serial_port->read_byte()!=-1);
+}
+
+void zperr(char *s,...)
+{
+	va_list va;
+
+	va_start(va, s);
+	vsprintf(gstring, s, va);
+	va_end(va);
+
+        //sprintf(gstring,"%s #%d",gstring,errors);
+        Desk_Icon_SetForeColour(filetrans_window,FILETRANS_STATUS,11);
+        Desk_Icon_SetText(filetrans_window,FILETRANS_STATUS,gstring);
+        // errors
+}
+
+void vfile(char *s,...)
+{
+	va_list va;
+
+	va_start(va, s);
+	vsprintf(gstring, s, va);
+	va_end(va);
+
+	Desk_Icon_SetForeColour(filetrans_window,FILETRANS_STATUS,7);
+	Desk_Icon_SetText(filetrans_window,FILETRANS_STATUS,gstring);
+}
+
+
+/*
+ * This version of readline is reasoably well suited for
+ * reading many characters.
+ *  (except, currently, for the Regulus version!)
+ *
+ * timeout is in tenths of seconds
+ */
+
+
+int readline(int timeout)
+{
+ 	static char *cdq;
+	int t;
+	int c;
+
+//Desk_Error_Report(0,"read: %d",Lleft);
+
+        if (--Lleft >= 0)
+          return (*cdq++ & 0377);
+
+	if(!filetr_abort)
+        {
+          // GETBLOCK GEHT NICHT MIT PIPES !!!!!!!!!
+          
+          //Lleft=(*driver)(DRIVER_GETBLOCK,portnumber,cdq=linbuf,Readnum);
+         
+          
+          Lleft=0;
+          cdq=linbuf;
+          while(Lleft<Readnum && ((c=(*driver)(DRIVER_GETBYTE,portnumber,0,0))!=-1))
+          {
+            *(cdq+Lleft)=c;
+            Lleft++;
+          }
+          
+	  if(Lleft!=0)
+	  {
+	        Desk_Event_Poll();  // ohne Event_Poll ist XYModem (cache off) schneller
+	    	--Lleft;
+	    	return (*cdq++ & 0377);
+          }
+        }
+        else
+        {
+          (*driver)(DRIVER_FLUSHRX,portnumber,0,0);
+          Desk_Event_Poll();
+          Lleft=0;
+	  return(TIMEOUT);
+        }
+
+	t=Desk_Time_Monotonic()+timeout*10;
+	//while((Lleft=(*driver)(DRIVER_GETBLOCK,portnumber,cdq=linbuf,Readnum))==0)
+	while((*driver)(DRIVER_CHECKRX,portnumber,0,0)==0)
+	{
+		if(Desk_Time_Monotonic()>t || filetr_abort)
+		{
+		  	Lleft=0;
+			return(TIMEOUT);
+		}
+		if(Desk_Time_Monotonic()-null_event_time>=20)
+        	  Desk_Event_Poll();
+        }
+        //Lleft=(*driver)(DRIVER_GETBLOCK,portnumber,cdq=linbuf,Readnum);
+        Lleft=0;
+        cdq=linbuf;
+        while(Lleft<Readnum && ((c=(*driver)(DRIVER_GETBYTE,portnumber,0,0))!=-1))
+        {
+          *(cdq+Lleft)=c;
+          Lleft++;
+        }
+        Desk_Event_Poll();
+        --Lleft;
+        return (*cdq++ & 0377);
+}
+
+
+/*
+	  if((*driver)(DRIVER_RXERRORS,portnumber,0,0)>0)
+	    Desk_Error_Report(0,"rx error");
+	  if((*driver)(DRIVER_CHECKRX,portnumber)>16000)
+	    Desk_Error_Report(0,"buffer full");
+	  */
+
+/*
+int readline(int timeout)
+{
+	register int c;
+	int t;
+
+        if(!filetr_abort)
+        {
+	  c=(*driver)(DRIVER_GETBYTE,portnumber,0,0);
+	  if(c!=-1)
+	    return(c & 0377);
+	}
+	else
+	{
+	  //c=(*driver)(DRIVER_GETBYTE,portnumber,0,0);
+	  (*driver)(DRIVER_FLUSHRX,portnumber,0,0);
+	  Desk_Event_Poll();
+	  return(TIMEOUT);
+        }
+	t=Desk_Time_Monotonic()+timeout*10;
+	while((c=(*driver)(DRIVER_GETBYTE,portnumber,0,0))==-1)
+	{
+		if(Desk_Time_Monotonic()>t || filetr_abort)
+		{
+			return(TIMEOUT);
+		}
+		if(Desk_Time_Monotonic()-null_event_time>=EVENT_TIME)
+        	  Desk_Event_Poll();
+        }
+        Desk_Event_Poll();
+	return(c & 0377);
+}
+*/
+
+/*
+ * Purge the modem input queue of all characters
+ */
+void purgeline(void)
+{
+	//while((*driver)(DRIVER_GETBYTE,portnumber,0,0)!=-1);
+	Lleft=0;
+	(*driver)(DRIVER_FLUSHRX,portnumber,0,0);
+	//buffer_left=0;
+}
+
+
+
+/* End of zmisc.c */
+
+
+/* send cancel string to get the other end to shut up */
+void canit(void)
+{
+  int i;
+	static char canistr[] = {
+	 24,24,24,24,24,24,24,24,24,24,8,8,8,8,8,8,8,8,8,8,0
+	};
+        (*driver)(DRIVER_FLUSHTX,portnumber,0,0);
+	//(*driver)(DRIVER_PUTBLOCK,portnumber,canistr,strlen(canistr));
+	for(i=0;i<strlen(canistr);i++)
+	{
+	  while((*driver)(DRIVER_PUTBYTE,portnumber,canistr[i],0)==-1)
+            Desk_Event_Poll();
+	}
+	flushmo();
+	Lleft=0;
+	//Desk_Icon_printf(unten_window,UNTEN_LSTATUS,"canit !!");
+}
+
+/*
+void waitforreadbytes(void)
+{
+  while((*driver)(DRIVER_CHECKRX,portnumber)<1000 && !filetr_abort)
+    Desk_Event_Poll();
+
+}
+*/
+
+int serialbufferempty(void)
+{
+  //return( (Lleft==0) && ((*driver)(DRIVER_EXAMINE,portnumber,0,0)==-1) );
+  return((*driver)(DRIVER_CHECKRX,portnumber,0,0)==0);
+  //return(buffer_left==0);
+}
+
+
+/*
+void  waitforsentbytes(void)
+{
+
+   while((*driver)(DRIVER_CHECKTX,portnumber)<serial_output_buffer_size && !filetr_abort)
+   {
+     if(Desk_Time_Monotonic()-null_event_time>=5)
+       Desk_Event_Poll();
+   }
+}
+*/
+

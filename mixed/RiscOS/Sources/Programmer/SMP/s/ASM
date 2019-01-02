@@ -1,0 +1,112 @@
+; 
+; Copyright (c) 2017, RISC OS Open Ltd
+; All rights reserved.
+; 
+; Redistribution and use in source and binary forms, with or without
+; modification, are permitted provided that the following conditions are met: 
+;     * Redistributions of source code must retain the above copyright
+;       notice, this list of conditions and the following disclaimer.
+;     * Redistributions in binary form must reproduce the above copyright
+;       notice, this list of conditions and the following disclaimer in the
+;       documentation and/or other materials provided with the distribution.
+;     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+;       may be used to endorse or promote products derived from this software
+;       without specific prior written permission.
+; 
+; THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+; AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+; IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+; ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+; LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+; CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+; SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+; INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+; CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+; ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+; POSSIBILITY OF SUCH DAMAGE.
+; 
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:Proc
+        GET     Hdr:ModHand
+        GET     Hdr:OSMem
+        GET     Hdr:OSMisc
+        GET     Hdr:OSRSI6
+        GET     Hdr:Machine.<Machine>
+        GET     Hdr:MEMM.VMSAv6
+        GET     Hdr:PCI
+        GET     Hdr:HALEntries
+        GET     Hdr:HALDevice
+        GET     Hdr.Defs
+
+        AREA    ASM, CODE, READONLY, PIC
+
+        EXPORT  init_l1pt
+        EXPORT  pmphandler
+        EXPORT  asm_dsb_isb
+        EXPORT  asm_invoke_swi
+
+; void init_l1pt(void *myL1PT_log, uint32_t myL1PT_phys, void *bootstrap_log, uint32_t bootstrap_phys)
+; This function could easily be rewritten in C if MEMM.VMSAv6 was available
+init_l1pt ROUT
+        Entry   "r4-r5"
+        ; Set L2PT pointers for both the logical and physical mappings of the bootstrap code
+        ; We'll cheat and have them point to the same L2PT - so we don't have to worry about the case where they do exist in the same MB
+        ; This excessive mapping should be fine, considering that the mappings won't be cacheable
+        MOV     r4, r2, LSR #20
+        MOV     r5, r3, LSR #20
+        ORR     r1, r1, #L1_Page
+        ADD     r1, r1, #16<<10
+        STR     r1, [r0, r4, LSL #2] ; Logical mapping
+        STR     r1, [r0, r5, LSL #2] ; Flat physical mapping
+        ; Now make the corresponding entries in L2PT point to the bootstrap code
+        ; This assumes the bootstrap code is page aligned (and only one page in size)
+        LDR     r4, =L2_SmallPage + AP_None*L2_APMult + L2_S + (1:SHL:L2_TEXShift) ; Normal, non-cacheable
+        ORR     r4, r3, r4 ; L2PT entry
+        ADD     r0, r0, #16<<10 ; Logical L2PT
+        UBFX    r2, r2, #10, #10 ; L2PT offsets
+        UBFX    r3, r3, #10, #10
+        STR     r4, [r0, r2] ; Logical mapping
+        STR     r4, [r0, r3] ; Flat physical mapping
+        EXIT
+
+; PMP DA handler
+; No need to implement any reason codes
+pmphandler ROUT
+        MOV     r0, #0
+        SETV
+        MOV     pc, lr
+
+asm_dsb_isb ROUT
+        DSB
+        ISB
+        MOV     pc, lr
+
+; void asm_invoke_swi(armcontext_t *ctx, int r11, swihandler_t *handler);
+asm_invoke_swi ROUT
+        Push    "r0, r4-r11, lr"
+        ; Prepare for call
+        MOV     r11, r1
+        MOV     r12, r2 ; Private word ptr is first member of swihandler_t
+        ; On 32bit OS's the NZCV flags are undefined on SWI entry
+        ; However some kernel SWIs need to manipulate the PSR or other context details, so pass the context ptr in r10
+        MOV     r10, r0
+        ; Load up input registers
+        ASSERT  ARMCtx_Regs = 4
+        LDMIB   r0, {r0-r9}
+        ; Invoke SWI
+        MOV     lr, pc
+        LDR     pc, [r12, #4] ; r10-r12 corrupt
+        Pull    "r10"
+        ; Store output registers
+        STMIB   r10, {r0-r9}
+        ; NZCV on exit should be passed back to caller
+        MRS     r12, CPSR
+        LDR     r11, [r10, #ARMCtx_PSR]
+        BFI     r12, r11, #0, #28
+        STR     r12, [r10, #ARMCtx_PSR]
+        Pull    "r4-r11, pc"
+
+        END
+

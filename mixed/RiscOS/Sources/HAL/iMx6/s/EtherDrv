@@ -1,0 +1,711 @@
+; Copyright 2017 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+; Initialise ethernet hardware, pins, etc to make device available later
+
+        GET     ListOpts
+        GET     Macros
+        GET     System
+        GET     Machine.<Machine>
+        GET     ImageSize.<ImageSize>
+        $GetIO
+
+        GET     OSEntries
+        GET     HALEntries
+        GET     HALDevice
+        GET     EtherDevice
+        GET     ENET
+        GET     Proc
+
+        GET     iMx6q
+        GET     StaticWS
+
+        AREA    |Asm$$Code|, CODE, READONLY, PIC
+ [ Debug
+        IMPORT  DebugHALPrint
+        IMPORT  DebugHALPrintReg
+        IMPORT  DebugHALPrintByte
+ ]
+        IMPORT  GPIO_SetAsInput
+        IMPORT  GPIO_SetAsOutput
+        IMPORT  GPIO_DeviceNumber
+        IMPORT  GPIO_SetAndEnableIRQ
+        IMPORT  GPIO_DisableIRQ
+        IMPORT  GPIO_IRQClear
+        IMPORT  GPIO_ReadBit
+        IMPORT  GPIO_WriteBit
+        IMPORT  GPIO_ReadBitAddr
+        IMPORT  memcpy
+        IMPORT  udivide
+
+        EXPORT  Ether_Init
+        EXPORT  GetIPGClk
+        EXPORT  ENET_CheckForPhy
+
+        MACRO
+        CallOS  $entry, $tailcall
+        ASSERT  $entry <= HighestOSEntry
+ [ "$tailcall"=""
+        MOV     lr, pc
+ |
+   [ "$tailcall"<>"tailcall"
+        ! 0, "Unrecognised parameter to CallOS"
+   ]
+ ]
+        LDR     pc, OSentries + 4*$entry
+        MEND
+
+; For the record this sets up 2 different types of Phy, and accounts for 2 differnt builds
+; on iMx6 wandboard  earlier devices had AR8031 phys, but RevD boards use the AR8035
+; the CuBox variant also uses the AR8035, but driven through some different pins
+; The real 'interest' is in ensuring the Phy config pins are in the correct state when the
+; hardware reset pin is released.
+; AR8031        AR8035     WandboardB/C pad/GPIO       WandboardD pad/GPIO      CuBox pad/GPIO
+; PhyAdd0       PhyAdd0    RGMII_RXD0/6-25             RGMII_RXD0/6-25          RGMII_RXD0/6-25
+; PhyAdd1       PhyAdd1    RGMII_RXD1/6-27             RGMII_RXD1/6-27          RGMII_RXD1/6-27
+; PhyAdd2       PhyAdd2    LED/ACT                     LED/ACT                  pull down
+; Mode0         Mode0      RGMII_RXDV/6-24             RGMII_RXDV/6-24          RGMII_RXDV/6-24
+; Mode1         Mode1      RGMII_RXD2/6-28             RGMII_RXD2/6-28          RGMII_RXD2/6-28
+; Mode2         Mode2      RGMII_RXClk/6-30            LED1000 pulldown         pull down
+; Mode3         Mode3      RGMII_RXD3/6-29             RGMII_RXD3/6-29          RGMII_RXD3/6-29
+; IRQSel                   LED1000 pull down           -
+;               I/Ovolts                               RGMII_RXClk/6-30         RGMII_RXClk/6-30
+;                          
+; Additionally, on CuBox  ENET_CRS_DV, ENET_RD0, ENET_RD1 are wired to the config pins, so set as inert
+
+; set up pads and clocks to expose the ethernet hardware
+; create the correct HAL device too
+Ether_Init
+        Entry   "a1-a3"
+        ldr     a2, IOMUXC_Base
+        bl      Ether_InitPins
+        bl      AddEtherTHDevice
+
+        EXIT
+
+; Pin initialisation.. needs done early for Phy config
+Ether_InitPins
+        Entry   "a1-a3"
+        ldr     a2, IOMUXC_Base
+ [ CuBox
+        ; CuBox phy pad drive is tuned to give best power up config state
+        ; for the phy as some strapping isnt provided
+        ldr     a3, =IOMuxENETMDIO          ; pad drive stuff
+        str     a3, [a2,#IOMUXC_SW_PAD_CTL_PAD_ENET_MDIO-IOMUXC_BASE_ADDR]     ;
+        ldr     a3, =IOMuxENETMDC          ; pad drive stuff
+        str     a3, [a2,#IOMUXC_SW_PAD_CTL_PAD_ENET_MDC-IOMUXC_BASE_ADDR]     ;
+        ldr     a3, =IOMuxENETPhyIrq          ; pad drive stuff
+        str     a3, [a2,#IOMUXC_SW_PAD_CTL_PAD_DI0_PIN2-IOMUXC_BASE_ADDR]
+        ldr     a3, =IOMuxENETPhyRST          ; pad drive stuff
+        str     a3, [a2,#IOMUXC_SW_PAD_CTL_PAD_KEY_ROW4-IOMUXC_BASE_ADDR]
+        ldr     a3, =IOMuxENETHiZPU          ; pad drive stuff
+        str     a3, [a2,#IOMUXC_SW_PAD_CTL_PAD_ENET_CRS_DV-IOMUXC_BASE_ADDR]
+        str     a3, [a2,#IOMUXC_SW_PAD_CTL_PAD_ENET_RXD0-IOMUXC_BASE_ADDR]
+        str     a3, [a2,#IOMUXC_SW_PAD_CTL_PAD_ENET_RXD1-IOMUXC_BASE_ADDR]
+        ldr     a3, =IOMuxENETRefClkOut          ; pad drive stuff
+        str     a3, [a2,#IOMUXC_SW_PAD_CTL_PAD_ENET_REF_CLK-IOMUXC_BASE_ADDR]  ; enet ref clk ip
+        ldr     a3, =IOMuxENETPU          ; pad drive stuff
+        str     a3, [a2,#IOMUXC_SW_PAD_CTL_PAD_RGMII_TD0-IOMUXC_BASE_ADDR]     ;
+        str     a3, [a2,#IOMUXC_SW_PAD_CTL_PAD_RGMII_TD1-IOMUXC_BASE_ADDR]     ;
+        str     a3, [a2,#IOMUXC_SW_PAD_CTL_PAD_RGMII_TD2-IOMUXC_BASE_ADDR]     ;
+        str     a3, [a2,#IOMUXC_SW_PAD_CTL_PAD_RGMII_TD3-IOMUXC_BASE_ADDR]     ;
+        str     a3, [a2,#IOMUXC_SW_PAD_CTL_PAD_RGMII_TX_CTL-IOMUXC_BASE_ADDR]     ;
+        str     a3, [a2,#IOMUXC_SW_PAD_CTL_PAD_RGMII_RXC-IOMUXC_BASE_ADDR]     ;
+        str     a3, [a2,#IOMUXC_SW_PAD_CTL_PAD_RGMII_RD2-IOMUXC_BASE_ADDR]     ;
+        str     a3, [a2,#IOMUXC_SW_PAD_CTL_PAD_RGMII_RD3-IOMUXC_BASE_ADDR]     ;
+        ldr     a3, =IOMuxENETPD          ; pad drive stuff
+        str     a3, [a2,#IOMUXC_SW_PAD_CTL_PAD_RGMII_TXC-IOMUXC_BASE_ADDR]     ;
+        str     a3, [a2,#IOMUXC_SW_PAD_CTL_PAD_RGMII_RD0-IOMUXC_BASE_ADDR]     ;
+        str     a3, [a2,#IOMUXC_SW_PAD_CTL_PAD_RGMII_RD1-IOMUXC_BASE_ADDR]     ;
+        str     a3, [a2,#IOMUXC_SW_PAD_CTL_PAD_RGMII_RX_CTL-IOMUXC_BASE_ADDR]     ;
+ |
+        ldr     a3, =IOMuxPadEnet             ; pad drive stuff other ENET
+        str     a3, [a2,#IOMUXC_SW_PAD_CTL_PAD_ENET_MDC-IOMUXC_BASE_ADDR]     ;
+        str     a3, [a2,#IOMUXC_SW_PAD_CTL_PAD_ENET_MDIO-IOMUXC_BASE_ADDR]     ;
+        str     a3, [a2,#IOMUXC_SW_PAD_CTL_PAD_ENET_REF_CLK-IOMUXC_BASE_ADDR]  ; enet ref clk ip
+        str     a3, [a2,#IOMUXC_SW_PAD_CTL_PAD_EIM_D29-IOMUXC_BASE_ADDR]       ; phy nrst
+        str     a3, [a2,#IOMUXC_SW_PAD_CTL_PAD_GPIO_18-IOMUXC_BASE_ADDR]       ; D1 phy power
+
+        ldr     a3, =IOMuxPadRGMII             ; pad drive stuff RGMII
+        str     a3, [a2,#IOMUXC_SW_PAD_CTL_PAD_RGMII_TD0-IOMUXC_BASE_ADDR]     ;
+        str     a3, [a2,#IOMUXC_SW_PAD_CTL_PAD_RGMII_TD1-IOMUXC_BASE_ADDR]     ;
+        str     a3, [a2,#IOMUXC_SW_PAD_CTL_PAD_RGMII_TD2-IOMUXC_BASE_ADDR]     ;
+        str     a3, [a2,#IOMUXC_SW_PAD_CTL_PAD_RGMII_TD3-IOMUXC_BASE_ADDR]     ;
+        str     a3, [a2,#IOMUXC_SW_PAD_CTL_PAD_RGMII_TXC-IOMUXC_BASE_ADDR]     ;
+        str     a3, [a2,#IOMUXC_SW_PAD_CTL_PAD_RGMII_TX_CTL-IOMUXC_BASE_ADDR]     ;
+        str     a3, [a2,#IOMUXC_SW_PAD_CTL_PAD_RGMII_RD0-IOMUXC_BASE_ADDR]     ;
+        str     a3, [a2,#IOMUXC_SW_PAD_CTL_PAD_RGMII_RD1-IOMUXC_BASE_ADDR]     ;
+        str     a3, [a2,#IOMUXC_SW_PAD_CTL_PAD_RGMII_RD2-IOMUXC_BASE_ADDR]     ;
+        str     a3, [a2,#IOMUXC_SW_PAD_CTL_PAD_RGMII_RD3-IOMUXC_BASE_ADDR]     ;
+        str     a3, [a2,#IOMUXC_SW_PAD_CTL_PAD_RGMII_RXC-IOMUXC_BASE_ADDR]     ;
+        str     a3, [a2,#IOMUXC_SW_PAD_CTL_PAD_RGMII_RX_CTL-IOMUXC_BASE_ADDR]     ;
+  ]
+
+        mov     a3, #0          ; select daisychain stuff for RGMII mode
+        str     a3, [a2,#IOMUXC_ENET_IPP_IND_MAC0_MDIO_SELECT_INPUT-IOMUXC_BASE_ADDR]
+        str     a3, [a2,#IOMUXC_ENET_IPP_IND_MAC0_RXCLK_SELECT_INPUT-IOMUXC_BASE_ADDR]
+        str     a3, [a2,#IOMUXC_ENET_IPP_IND_MAC0_RXDATA_0_SELECT_INPUT-IOMUXC_BASE_ADDR]
+        str     a3, [a2,#IOMUXC_ENET_IPP_IND_MAC0_RXDATA_1_SELECT_INPUT-IOMUXC_BASE_ADDR]
+        str     a3, [a2,#IOMUXC_ENET_IPP_IND_MAC0_RXDATA_2_SELECT_INPUT-IOMUXC_BASE_ADDR]
+        str     a3, [a2,#IOMUXC_ENET_IPP_IND_MAC0_RXDATA_3_SELECT_INPUT-IOMUXC_BASE_ADDR]
+        str     a3, [a2,#IOMUXC_ENET_IPP_IND_MAC0_RXEN_SELECT_INPUT-IOMUXC_BASE_ADDR]
+
+        mov     a3, #1                  ; alt 1, sion off
+        str     a3, [a2,#IOMUXC_SW_MUX_CTL_PAD_ENET_MDIO-IOMUXC_BASE_ADDR]
+        str     a3, [a2,#IOMUXC_SW_MUX_CTL_PAD_ENET_MDC-IOMUXC_BASE_ADDR]
+        str     a3, [a2,#IOMUXC_SW_MUX_CTL_PAD_RGMII_TXC-IOMUXC_BASE_ADDR]
+        str     a3, [a2,#IOMUXC_SW_MUX_CTL_PAD_RGMII_TD0-IOMUXC_BASE_ADDR]
+        str     a3, [a2,#IOMUXC_SW_MUX_CTL_PAD_RGMII_TD1-IOMUXC_BASE_ADDR]
+        str     a3, [a2,#IOMUXC_SW_MUX_CTL_PAD_RGMII_TD2-IOMUXC_BASE_ADDR]
+        str     a3, [a2,#IOMUXC_SW_MUX_CTL_PAD_RGMII_TD3-IOMUXC_BASE_ADDR]
+        str     a3, [a2,#IOMUXC_SW_MUX_CTL_PAD_RGMII_TX_CTL-IOMUXC_BASE_ADDR]
+        str     a3, [a2,#IOMUXC_SW_MUX_CTL_PAD_RGMII_RX_CTL-IOMUXC_BASE_ADDR]
+        str     a3, [a2,#IOMUXC_SW_MUX_CTL_PAD_RGMII_RD0-IOMUXC_BASE_ADDR]
+        str     a3, [a2,#IOMUXC_SW_MUX_CTL_PAD_RGMII_RD1-IOMUXC_BASE_ADDR]
+        str     a3, [a2,#IOMUXC_SW_MUX_CTL_PAD_RGMII_RD2-IOMUXC_BASE_ADDR]
+        str     a3, [a2,#IOMUXC_SW_MUX_CTL_PAD_RGMII_RD3-IOMUXC_BASE_ADDR]
+        str     a3, [a2,#IOMUXC_SW_MUX_CTL_PAD_RGMII_RXC-IOMUXC_BASE_ADDR]
+        str     a3, [a2,#IOMUXC_SW_MUX_CTL_PAD_ENET_REF_CLK-IOMUXC_BASE_ADDR]   ; enet tx clk
+ [ CuBox
+        mov     a3, #&2                  ; alt 2, sion off
+        str     a3, [a2,#IOMUXC_SW_MUX_CTL_PAD_GPIO_16-IOMUXC_BASE_ADDR]       ; send enet clock
+        mov     a3, #SEL_GPIO_16_ALT2
+        str     a3, [a2,#IOMUXC_ENET_IPG_CLK_RMII_SELECT_INPUT-IOMUXC_BASE_ADDR]     ;enet clk
+
+        mov     a3, #5
+; these are patched across to the rgmii lines, so set as input (hence inert)
+        str     a3, [a2,#IOMUXC_SW_MUX_CTL_PAD_ENET_CRS_DV-IOMUXC_BASE_ADDR]
+        str     a3, [a2,#IOMUXC_SW_MUX_CTL_PAD_ENET_RXD0-IOMUXC_BASE_ADDR]
+        str     a3, [a2,#IOMUXC_SW_MUX_CTL_PAD_ENET_RXD1-IOMUXC_BASE_ADDR]
+        mov     a1, #(1<<5) + 25
+        bl      GPIO_SetAsInput                 ; GPIO1 bit 25 (linked to mode0)
+        mov     a1, #(1<<5) + 26
+        bl      GPIO_SetAsInput                 ; GPIO1 bit 26 (linked to Phyadd0)
+        mov     a1, #(1<<5) + 27
+        bl      GPIO_SetAsInput                 ; GPIO1 bit 27 (linked to PhyAdd1)
+
+ |
+        mov     a3, #SEL_RGMII_TX_CTL_ALT7
+        str     a3, [a2,#IOMUXC_ENET_IPG_CLK_RMII_SELECT_INPUT-IOMUXC_BASE_ADDR]     ;enet clk
+ ]
+        mov     a3, #5
+ [ CuBox
+                                        ; alt 5, sion off route RGMII_IRQ to GPIO4_IO18
+        str     a3, [a2,#IOMUXC_SW_MUX_CTL_PAD_DI0_PIN2-IOMUXC_BASE_ADDR]
+                                        ; alt 5 GPIO4_IO15 drives RGMII_nrst  GPIO4_IO15
+        str     a3, [a2,#IOMUXC_SW_MUX_CTL_PAD_KEY_ROW4-IOMUXC_BASE_ADDR]
+ |
+                                        ; alt 5, sion off route RGMII_IRQ to GPIO1_IO28
+        str     a3, [a2,#IOMUXC_SW_MUX_CTL_PAD_ENET_TX_EN-IOMUXC_BASE_ADDR]
+                                        ; alt 5 GPIO3_IO29 drives RGMII_nrst
+        str     a3, [a2,#IOMUXC_SW_MUX_CTL_PAD_EIM_D29-IOMUXC_BASE_ADDR]
+                                        ; alt 5 GPIO7_IO13 active low turns on phy on revD1 board
+        str     a3, [a2,#IOMUXC_SW_MUX_CTL_PAD_GPIO_18-IOMUXC_BASE_ADDR]
+ ]
+
+; set phy irq pin as input
+ [ CuBox
+        mov     a1, #(4<<5) + 18
+        bl      GPIO_SetAsInput                 ; GPIO4 bit 18 is irq input
+        mov     a1, #(4<<5) + (15) + (0<<8)     ; GPIO4 bit 15 as o/p, val 0 hold reset
+        bl      GPIO_SetAsOutput
+ |
+        mov     a1, #(1<<5) + 28                ; GPIO1 bit 28 is irq input
+        bl      GPIO_SetAsInput
+        mov     a1, #(3<<5) + (29) + (0<<8)     ; GPIO3 bit 29 as o/p, val 0 hold reset
+        bl      GPIO_SetAsOutput
+        mov     a1, #(7<<5) + (13) + (1<<8)     ; GPIO7 bit 13 as o/p, val 1 turn off revD1 phy
+        bl      GPIO_SetAsOutput
+ ]
+        mov     a3, #8<<16                      ; 1p2v_io setting
+        str     a3, [a2,#IOMUXC_SW_PAD_CTL_GRP_DDR_TYPE_RGMII-IOMUXC_BASE_ADDR]
+
+        mov     a3, #0                  ; term disabled
+        str     a3, [a2,#IOMUXC_SW_PAD_CTL_GRP_RGMII_TERM-IOMUXC_BASE_ADDR]
+; enet PLL .. set with care, SATA is dependant on this too
+        ldr     a2, CCMAn_Log
+        mov     a3, #1<<16              ; bypass pll
+        str     a3, [a2,#HW_CCM_ANALOG_PLL_ENET_ADDR]
+        mov     a3, #1<<13              ; enable clock o/p, remove bypass
+                                        ; (enet ref clk is 25mhz with above)
+ [ :LNOT: CuBox
+        orr     a3, a3, #1              ; so.. set for 50MHz enet ref clock
+ ]
+        orr     a3, a3, #1<<20          ; 100MHZ clk en bit (sata)
+        str     a3, [a2,#HW_CCM_ANALOG_PLL_ENET_ADDR]
+111
+        ldr     a3, [a2,#HW_CCM_ANALOG_PLL_ENET_ADDR]
+;  DebugReg a3, "pll ready? "
+        tst     a3, #1<<31
+        beq     %bt111                  ; wait for PLL Lock
+        ldr     a2, [sb, #:INDEX:IOMUXC_Base]
+        ldr     a3, [a2,#IOMUXC_GPR1-IOMUXC_BASE_ADDR]     ;
+        orr     a3, a3, #1<<21                             ; enet ref clock from internal
+        str     a3, [a2,#IOMUXC_GPR1-IOMUXC_BASE_ADDR]     ; and o/p signal
+
+        EXIT
+
+; on entry a1 = correct info for GPIO_WriteBit call to clear reset to 1
+; assumes sb initialised
+PhyResetRelease
+        Entry    "a1-a4"
+        ldr     a2, IOMUXC_Base
+        mov     a4, a1
+        eor     a1, a1, #1<<8                             ; toggle to ensure reset asserted
+        bl      GPIO_SetAsOutput                          ; ensure we're in reset state
+        ; set mode pins to i/o
+        mov     a3, #5
+        str     a3, [a2,#IOMUXC_SW_MUX_CTL_PAD_RGMII_RD0-IOMUXC_BASE_ADDR]     ;
+        str     a3, [a2,#IOMUXC_SW_MUX_CTL_PAD_RGMII_RD1-IOMUXC_BASE_ADDR]     ;
+        str     a3, [a2,#IOMUXC_SW_MUX_CTL_PAD_RGMII_RD2-IOMUXC_BASE_ADDR]     ;
+        str     a3, [a2,#IOMUXC_SW_MUX_CTL_PAD_RGMII_RD3-IOMUXC_BASE_ADDR]     ;
+        str     a3, [a2,#IOMUXC_SW_MUX_CTL_PAD_RGMII_RX_CTL-IOMUXC_BASE_ADDR]  ;
+; [ CuBox
+        str     a3, [a2,#IOMUXC_SW_MUX_CTL_PAD_RGMII_RXC-IOMUXC_BASE_ADDR]     ; ;;only on cubox. wandboard defaults OK
+; ]
+        mov     a1, #(6<<5) + (25) + (1<<8)   ; rd0 GPIO6 bit25 as o/p, val 1 hold till Phy reset- Phy address0
+        bl      GPIO_SetAsOutput
+        mov     a1, #(6<<5) + (27) + (0<<8)   ; rd1 GPIO6 bit27 as o/p, val 0 hold till Phy reset- Phy address1
+        bl      GPIO_SetAsOutput
+        mov     a1, #(6<<5) + (24) + (0<<8)   ; rxdv GPIO6 bit24  o/p,  val 0 hold till Phy reset- Phy mode0
+        bl      GPIO_SetAsOutput
+        mov     a1, #(6<<5) + (28) + (0<<8)   ; rd2 GPIO6 bit28 as o/p, val 0 hold till Phy reset- Phy mode1
+        bl      GPIO_SetAsOutput
+ [ CuBox
+        mov     a1, #(6<<5) + (29) + (1<<8)   ; rd3 GPIO6 bit29 as o/p, val 1 hold till Phy reset- Phy mode3
+        bl      GPIO_SetAsOutput
+        mov     a1, #(6<<5) + (30) + (1<<8)   ; rxc GPIO6 bit30 as o/p, val 1 hold till Phy reset- Phy I/O volts
+        bl      GPIO_SetAsOutput
+ |
+        mov     a1, #(6<<5) + (29) + (0<<8)   ; rd3 GPIO6 bit29 as o/p, val 0 hold till Phy reset- Phy mode3
+        bl      GPIO_SetAsOutput
+; this pin needs to be 0 for revB and C (ar8033), but 1 for revD (ar8035).
+; set for revD if we know its revD, else set for revB/C
+;        ldr     a1, BoardDetectInfo           ; phy type flags
+;
+;        and     a1, a1, #7
+;        teq     a1, #1                        ; check for earlier phy type (0)
+;
+;        moveq   a1, #(6<<5) + (30) + (0<<8)  ; rxc GPIO6 bit30 as o/p, val 0 hold till Phy reset- Phy I/O volts
+;        movne   a1, #(6<<5) + (30) + (1<<8)  ; rxc GPIO6 bit30 as o/p, val 1 hold till Phy reset- Phy I/O volts
+;        bl      GPIO_SetAsOutput
+        ldr     a3, =IOMuxENETHiZPU          ; pad drive stuff
+        str     a3, [a2,#IOMUXC_SW_PAD_CTL_PAD_RGMII_RXC-IOMUXC_BASE_ADDR]
+        mov     a1, #(6<<5) + (30)           ; rxc GPIO6 bit30 as i/p, val 1 hold till Phy reset- Phy I/O volts
+        bl      GPIO_SetAsInput
+ ]
+        ; set relevant bits to 0
+        ; pause
+        ; release reset
+        ; revert pins
+        Push    "a1-a3"
+        MOV     a1, #&1000000                 ; slight delay
+1       DMB
+        SUBS    a1, a1, #1
+        bgt     %bt1                           ; loop a while to let it settle
+        Pull    "a1-a3"
+
+        mov     a1, a4                        ; now release the reset pin
+        bl      GPIO_SetAsOutput
+
+        Push    "a1-a3"
+        MOV     a1, #&1000000                 ; slight delay
+1       DMB
+        SUBS    a1, a1, #1
+        bgt     %bt1                       ; loop a while to let it settle
+        Pull    "a1-a3"
+        ldr     a2, IOMUXC_Base
+        ; revert pins
+        ; set relevant bits to i/p
+        mov     a1, #(6<<5) + (25)   ; rd0 GPIO6 bit25 as i/p, val 1 hold till Phy reset- Phy address0
+        bl      GPIO_SetAsInput
+        mov     a1, #(6<<5) + (27)   ; rd1 GPIO6 bit27 as i/p, val 0 hold till Phy reset- Phy address1
+        bl      GPIO_SetAsInput
+        mov     a1, #(6<<5) + (24)   ; rxdv GPIO6 bit24  i/p,  val 0 hold till Phy reset- Phy mode0
+        bl      GPIO_SetAsInput
+        mov     a1, #(6<<5) + (28)   ; rd2 GPIO6 bit28 as i/p, val 0 hold till Phy reset- Phy mode1
+        bl      GPIO_SetAsInput
+        mov     a1, #(6<<5) + (29)   ; rd3 GPIO6 bit29 as i/p, val 1 hold till Phy reset- Phy mode3
+        bl      GPIO_SetAsInput
+; [ CuBox
+        mov     a1, #(6<<5) + (30)   ; rxc GPIO6 bit30 as i/p, val 1 hold till Phy reset- Phy I/O volts
+        bl      GPIO_SetAsInput
+; ]
+ [ :LNOT: CuBox
+        ldr     a3, =IOMuxPadRGMII          ; pad drive stuff
+        str     a3, [a2,#IOMUXC_SW_PAD_CTL_PAD_RGMII_RXC-IOMUXC_BASE_ADDR]
+ ]
+        ; set mode pins to rgmii again
+        mov     a3, #1
+        str     a3, [a2,#IOMUXC_SW_MUX_CTL_PAD_RGMII_RD0-IOMUXC_BASE_ADDR]     ;
+        str     a3, [a2,#IOMUXC_SW_MUX_CTL_PAD_RGMII_RD1-IOMUXC_BASE_ADDR]     ;
+        str     a3, [a2,#IOMUXC_SW_MUX_CTL_PAD_RGMII_RD2-IOMUXC_BASE_ADDR]     ;
+        str     a3, [a2,#IOMUXC_SW_MUX_CTL_PAD_RGMII_RD3-IOMUXC_BASE_ADDR]     ;
+        str     a3, [a2,#IOMUXC_SW_MUX_CTL_PAD_RGMII_RX_CTL-IOMUXC_BASE_ADDR]  ;
+; [ CuBox
+        str     a3, [a2,#IOMUXC_SW_MUX_CTL_PAD_RGMII_RXC-IOMUXC_BASE_ADDR]     ; ;;only on cubox. wandboard defaults OK
+; ]
+         EXIT
+
+; See if we can check a RevD board presence by powering up and down the phy
+; MUST preserve all registers
+; This can be called before any other Ethernet initialisation has taken place..
+; need to control all inits...
+; assumes sb initialised
+ENET_CheckForPhy
+        Entry   "a1-a4"
+        ldr     a2, IOMUXC_Base
+        mov     a1, #01
+        str     a1, BoardDetectInfo                        ; init phy type unknown
+        bl      Ether_InitPins
+
+; now set all data path pads to GPIO
+        mov     a3, #5                  ; alt 5 (GPIO, sion off
+        str     a3, [a2,#IOMUXC_SW_MUX_CTL_PAD_ENET_MDIO-IOMUXC_BASE_ADDR]
+        str     a3, [a2,#IOMUXC_SW_MUX_CTL_PAD_ENET_MDC-IOMUXC_BASE_ADDR]
+ [ CuBox
+        mov     a1, #(4<<5) + (15) + (1<<8)    ; val 1, nreset clear
+ |
+        mov     a1, #(7<<5) + (13) + (0<<8)    ; val 0 turn on revD1 phy
+        bl      GPIO_WriteBit
+
+        Push    "a1-a3"
+        MOV     a1, #&1000000                  ; slight delay
+1       DMB                                 
+        SUBS    a1, a1, #1                  
+        bgt     %bt1                           ; loop a while to let it settle
+        Pull    "a1-a3"
+
+        mov     a1, #(3<<5) + (29) + (1<<8)    ; val 1, nreset clear
+ ]
+        bl      PhyResetRelease
+
+        ldr     a4, = MDIORdIDL1            ; command to read IDL on phy addr 1
+        bl      DoPhyCmd
+        ldr     a2, = PhyAR8031
+        teq     a2, a4
+        moveq   a1, #0
+        beq     %ft1
+        ldr     a2, = PhyAR8035
+        teq     a2, a4
+        moveq   a1, #1                     ; flag later Phy detected addr1
+        beq     %ft1
+        ldr     a4, = MDIORdIDL5           ; command to read IDL on phy addr 5
+        bl      DoPhyCmd
+        ldr     a2, = PhyAR8031
+        teq     a2, a4
+        moveq   a1, #5
+        beq     %ft1                       ; earlier phy address 5
+        ldr     a2, = PhyAR8035
+        teq     a2, a4
+        moveq   a1, #5                     ; flag later Phy detected addr5
+        beq     %ft1
+        movne   a1, #7                     ; default later Phy,bad detect addr5
+
+1
+        orr     a1, a1, a4, lsl #16
+        str     a1, BoardDetectInfo        ; flag appropriately
+        and     a1, a1, #4
+        add     a1, a1, #1
+        str     a1, PhyAddress             ; remember detected address
+
+
+; restore desired padmux to ethernet
+        ldr     a2, IOMUXC_Base
+        mov     a3, #1                  ; alt 1, sion off
+        str     a3, [a2,#IOMUXC_SW_MUX_CTL_PAD_ENET_MDIO-IOMUXC_BASE_ADDR]
+        str     a3, [a2,#IOMUXC_SW_MUX_CTL_PAD_ENET_MDC-IOMUXC_BASE_ADDR]
+
+
+        EXIT
+
+; Phy address 1
+MDIORdIDH1 *     ((2_01)<<30) +((2_10)<<28)+((&1)<<23)+((&2)<<18)+((2_10)<<16) ; ReadID1 (IDH)reg
+MDIORdIDL1 *     ((2_01)<<30) +((2_10)<<28)+((&1)<<23)+((&3)<<18)+((2_10)<<16) ; ReadID2 (IDL)reg
+; Phy address 5
+MDIORdIDH5 *     ((2_01)<<30) +((2_10)<<28)+((&5)<<23)+((&2)<<18)+((2_10)<<16) ; ReadID1 (IDH)reg
+MDIORdIDL5 *     ((2_01)<<30) +((2_10)<<28)+((&5)<<23)+((&3)<<18)+((2_10)<<16) ; ReadID2 (IDL)reg
+
+; send command in a4 to Phy, and return response in a4
+
+DoPhyCmd
+        Entry   "a1-a3"
+        mov     a1, #(1<<5) + (31) + (1<<8)  ; GPIO1 bit 31 val 1 MDC on/hi
+        bl      GPIO_SetAsOutput
+        mov     a1, #(1<<5) + (22) + (1<<8)  ; GPIO1 bit 22 val 1 MDIO on/hi
+        bl      GPIO_SetAsOutput
+
+        mov     a3, #64                    ; need 64 logic 1
+11      bl      ClockMDC                   ; rising edge clocks data
+        subs    a3, a3, #1
+        bgt     %bt11                      ; 64 bit preamble
+
+        mov     a3, #16                    ; 16 bit to write
+cmdloop mov     a1, #(1<<5) + (22) + 0<<8  ; GPIO1 bit MDIO databit lo
+        movs    a4, a4, lsl #1             ; do we need a 1
+        orrcs   a1, a1, #1<<8              ; yes
+        bl      GPIO_WriteBit
+        bl      ClockMDC                   ; clocked in on rising edge
+        subs    a3, a3, #1
+        bgt     cmdloop
+; now read 16 bits
+        mov     a1, #(1<<5) + (22)         ; GPIO1 bit databit as input MDIO
+        bl      GPIO_SetAsInput
+        mov     a4, #0
+        mov     a3, #16
+rdloop  mov     a1, #(1<<5) + (22)         ; GPIO1 bit databit as input MDIO
+        bl      GPIO_ReadBit               ; returns 1 or 0
+        orr     a4, a1, a4, lsl #1         ; build it up
+        bl      ClockMDC                   ; rising edge samples data
+        subs    a3, a3, #1
+        bgt     rdloop
+        EXIT
+
+
+; put out low-hi clock cycle
+ClockMDC
+        Entry   "a1-a3"
+        mov     a1, #(1<<5) + (31) + 0<<8  ; GPIO1 bit 31 val 0  MDC lo
+        bl      GPIO_WriteBit
+        MOV     a1, #&8                 ; slight delay
+13      DMB
+        SUBS    a1, a1, #1
+        bgt     %bt13                      ; loop a while to let it settle
+        mov     a1, #(1<<5) + (31) + 1<<8  ; GPIO1 bit 31 val 1  MDC hi
+        bl      GPIO_WriteBit
+        MOV     a1, #&8                 ; slight delay
+14      DMB
+        SUBS    a1, a1, #1
+        bgt     %bt14                      ; loop a while to let it settle
+        EXIT
+
+; the following 3 entry points are to be invoked from the
+; ethernet driver, and have the HAL SB value passed in a2
+
+; a1 = 1 for enable, 0 for disable
+; a2 on entry is HAL sb value as taken from the hal device table
+EtherTHPhyIRQEn
+        Entry   "sb"
+        mov     sb, a2
+; DebugReg a1, "EPhyIRQa1 "
+        teq     a1, #0
+ [ CuBox
+        mov     a1, #(4<<5) + 18 + (0<<8)       ; active low detect
+ |
+        mov     a1, #(1<<5) + 28 + (0<<8)       ; active low detect
+ ]
+        adr     lr, %ft1
+        beq     GPIO_DisableIRQ
+        b       GPIO_SetAndEnableIRQ
+1
+        EXIT
+
+EtherTHPhyIRQTest
+        Entry   "a1,sb"
+        mov     sb, a2
+ [ CuBox
+        mov     a1, #(4<<5) + 18        ; active low detect
+ |
+        mov     a1, #(1<<5) + 28        ; active low detect
+ ]
+        bl      GPIO_ReadBit
+        eor     a1, a1, #1                      ; return a 1 if IRQ present
+        EXIT
+
+EtherTHPhyIRQClr
+        Entry   "sb"
+        mov     sb, a2
+; DebugTX "EPhyIRQClr"
+ [ CuBox
+        mov     a1, #(4<<5) + 18        ; active low detect
+ |
+        mov     a1, #(1<<5) + 28        ; active low detect
+ ]
+        bl      GPIO_IRQClear
+        EXIT
+
+; a1 bit0 = 1 for power enable, 0 for disable
+; a1 bit1 = 1 for reset set, 0 for reset clear
+; a2 on entry is HAL sb value as taken from the hal device table
+; if a1 bit7 set then test call  instead
+EtherTHPhyPwrRst
+        Entry   "sb"
+        mov     sb, a2
+        tst     a1, #1<<7
+        bne     TestCall
+        mov     a3, a1
+ [ CuBox
+        tst     a3, #1<<1
+        movne   a1, #(4<<5) + (15) + (0<<8)       ; val 1, nreset set
+        moveq   a1, #(4<<5) + (15) + (1<<8)       ; val 0, nreset clear
+        beq     ReleaseReset                      ; more complicated, but done here
+ |
+        tst     a3, #1<<0
+        movne   a1, #(7<<5) + (13) + (0<<8)       ; val 0 turn on revD1 phy
+        moveq   a1, #(7<<5) + (13) + (1<<8)       ; val 1 turn off revD1 phy
+        bl      GPIO_WriteBit
+        tst     a3, #1<<1                         ; resetbit clear request?
+        movne   a1, #(3<<5) + (29) + (0<<8)       ; val 1, nreset set
+        moveq   a1, #(3<<5) + (29) + (1<<8)       ; val 0, nreset clear
+; the 'active' reset release still not happy on wandboard revD
+;        beq     ReleaseReset                      ; more complicated, but done here
+ ]
+        bl      GPIO_WriteBit
+        EXIT
+; invoke a test call to the Phy Type Presence detect code
+TestCall
+        bl      ENET_CheckForPhy
+        EXIT
+
+; release phy reset pin, ensuring that phy mode pins are correctly held
+; a1 = correct info for GPIO_WriteBit call
+ReleaseReset
+ [ CuBox
+        bl      ENET_CheckForPhy   ; check for current phy address
+                                   ;  this will release the reset too
+ |
+        bl      PhyResetRelease
+ ]
+        EXIT
+
+;
+;
+
+
+AddEtherTHDevice
+        Entry   "a3, a4, v1"
+        ADRL    v1, EtherTH_Device
+        MOV     a1, v1
+        ADR     a2, EtherTHDeviceTemplate
+        MOV     a3, #HALDevice_ENET_Size
+        BL      memcpy
+        ldr     a1, ENET_Log
+        str     a1, [v1, #ethaddr-EtherTHDeviceTemplate]
+ [ CuBox
+        mov     a1, #(4<<5) + 18
+ |
+        mov     a1, #(1<<5) + 28
+ ]
+        bl      GPIO_DeviceNumber
+        str     a1, [v1, #etphyd-EtherTHDeviceTemplate]
+ [ CuBox
+        mov     a1, #(4<<5)
+ |
+        mov     a1, #(1<<5)
+ ]
+        bl      GPIO_ReadBitAddr
+        add     a1, a1, #GPIO_ISR_OFFSET-GPIO_DR_OFFSET
+        str     a1, [v1, #etrdba-EtherTHDeviceTemplate]
+ [ CuBox
+        mov     a1, #1<<18      ; create bit test mask
+ |
+        mov     a1, #1<<28      ; create bit test mask
+ ]
+        str     a1, [v1, #etrdbn-EtherTHDeviceTemplate]
+        bl      GetIPGClk
+        str     a1, [v1, #ethclk-EtherTHDeviceTemplate]
+        adrl    a1, PhyAddress
+        str     a1, [v1, #phyaddr-EtherTHDeviceTemplate]
+        str     sb, [v1, #ethws-EtherTHDeviceTemplate]
+; DebugReg a1, "Computed Clk  "
+; DebugReg v1, "Eth Dev Addr  "
+        MOV     a1, #0
+        MOV     a2, v1
+        CallOS  OS_AddDevice
+        EXIT
+
+; Out: a1 = IPG clock rate
+GetIPGClk
+        Entry   "a2-a4"
+        ldr     a1, CCM_Base
+        ldr     a4, [a1, #CCM_CBCMR_OFFSET]
+        and     a4, a4, #3<<18
+        adr     a2, pll2_clocks
+        add     a4, a2, a4, lsr #16
+
+        ldr     a2, [a1, #CCM_CBCDR_OFFSET]
+; DebugReg a2, "CBCDR  "
+; add a1, a1, #CCM_CBCDR_OFFSET
+; DebugReg a1, "CBCDR addr  "
+        and     a3, a2, #&3<<8          ; ipg_podf bits
+        mov     a3, a3, lsr #8
+        and     a1, a2, #7<<10          ; ahb_podf bits
+        mov     a1, a1, lsr #10
+        add     a1, a1, #1
+        ldr     a2, [a4]                ; retrieve actual pll2 clock rate
+; DebugReg a2, "pll Clk  "
+        bl      udivide
+; DebugReg a1, "pll Clk 1st div "
+        mov     a2, a1
+        add     a1, a3, #1
+        bl      udivide
+        EXIT
+
+pll2_clocks
+        DCD     528000000
+        DCD     396000000
+        DCD     352000000
+        DCD     198000000
+
+EtherTHDeviceTemplate
+        DCW     HALDeviceType_Comms + HALDeviceComms_EtherNIC
+        DCW     HALDeviceID_EtherNIC_IMX6
+        DCD     HALDeviceBus_Sys + HALDeviceSysBus_AXI
+        DCD     0               ; API version 0
+        DCD     EtherTHDevice_Desc
+ethaddr DCD     0               ; Address - filled in later
+        %       12              ; Reserved
+        DCD     EtherTHDevice_Activate
+        DCD     EtherTHDevice_Deactivate
+        DCD     EtherTHDevice_Reset
+        DCD     EtherTHDevice_Sleep
+        DCD     IMX_INT_ENET    ; Device interrupt
+        DCD     0               ; TestIRQ cannot be called
+        DCD     0               ; ClrIRQ cannot be called
+        %       4               ; reserved
+        ASSERT (. - EtherTHDeviceTemplate) = HALDeviceSize
+etphyd  DCD     0                       ; IRQ dev number for phy irq (shared)
+        DCD     EtherTHPhyIRQEn         ; phy irq enable/disable
+        DCD     EtherTHPhyIRQTest       ; phy irq test active
+        DCD     EtherTHPhyIRQClr        ; phy irq acknowledge
+                                        ; (still need a HAL_IRQClr)
+etrdba  DCD     0                       ; irq active bit test address
+etrdbn  DCD     0                       ; irq active bit test bit
+ethws   DCD     0               ; HAL workspace pointer - filled in later
+ethclk  DCD     0               ; ethernet clock - filled later
+        DCD     EtherTHPhyPwrRst        ; phy power enable and reset
+phyaddr DCD     0                       ; pointer to Phy address (e.g. 1 or 5)
+        ASSERT (. - EtherTHDeviceTemplate) = HALDevice_ENET_Size
+
+EtherTHDevice_Desc
+        =       "iMx6 ethernet controller", 0
+        ALIGN
+
+EtherTHDevice_Activate
+        Entry   "sb"
+        MOV     a1, #1
+        EXIT
+
+EtherTHDevice_Deactivate
+EtherTHDevice_Reset
+        MOV     pc, lr
+
+EtherTHDevice_Sleep
+        MOV     a1, #0
+        MOV     pc, lr
+
+
+
+
+        END

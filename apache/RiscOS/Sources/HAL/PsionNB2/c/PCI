@@ -1,0 +1,919 @@
+/* Copyright 2005 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*#define DEBUG*/
+
+/*****************************************************************************
+* Copyright 2003 Tematic Ltd.  All rights reserved.
+*
+* The copyright in this material is owned by Tematic Limited ("Tematic")
+* This material is regarded as a highly confidential trade secret of Tematic.
+* It may not be reproduced, used, sold or in any other way exploited
+* or transferred to any third party without the prior written permission of
+* Tematic.
+*****************************************************************************/
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include "swis.h"
+#include "pci.h"
+#include "pciconf.h"
+
+#define DISABLE_USB
+
+/* Calling standard mungery - mustn't touch sb/v6 */
+__global_reg(6) void *sb;
+
+#ifndef UINT_LEAST24_MAX
+typedef uint_least32_t uint_least24_t;
+#endif
+
+#ifndef STAILQ_FOREACH
+#define STAILQ_FOREACH(var, head, field) \
+        for (var = STAILQ_FIRST(head); var; var = STAILQ_NEXT(var, field))
+#endif
+
+#define for_every_device(d) \
+                         STAILQ_FOREACH((d), &pci->devices, global_list)
+#define for_each_bus_device(b, d) \
+                         STAILQ_FOREACH((d), &(b)->devices, bus_list)
+#define for_each_bus_address(b, a) \
+                         STAILQ_FOREACH((a), &(b)->addresses, bus_list)
+#define for_each_device_address(d, a) \
+                         STAILQ_FOREACH((a), &(d)->addresses, dev_list)
+
+typedef struct pci_bus pci_bus;
+typedef struct pci_addr pci_addr;
+
+#ifdef DEBUG
+#define dprintf(...) printf(__VA_ARGS__)
+#else
+#define dprintf(...)
+#endif
+
+struct pci_addr
+{
+    STAILQ_ENTRY(pci_addr) bus_list;
+    STAILQ_ENTRY(pci_addr) dev_list;
+    pci_dev *dev;
+    uint8_t bar;
+    uint8_t type;
+    uint32_t addr;
+    uint32_t size;
+    uint32_t align;
+};
+
+#define IO 0
+#define NonPrefetchable 1
+#define Prefetchable 2
+#define Unknown 255
+
+#define ADDR_UNASSIGNED UINT32_C(0xFFFFFFFF)
+#define ADDR_FAILED     UINT32_C(0xFFFFFFFE)
+
+#define LATENCY_SETTING 32
+#define CACHELINE_SETTING 8
+
+typedef struct pci_state
+{
+    STAILQ_HEAD(devlist, pci_dev) devices;
+    pci_bridge host_bridge;
+} pci_state;
+
+#define ROUND_UP(addr, align) (((addr) + (align)-1) &~ ((align)-1))
+#define ROUND_DOWN(addr, align) ((addr) &~ ((align)-1))
+
+static void pci_enumerate_bus(pci_state *pci, pci_bridge *bridge, int bus, int *highest_bus);
+
+extern void *hal_alloc(size_t);
+extern pci_state *pci_get_state(void);
+extern void pci_set_state(pci_state *);
+
+#define pci_read_config_byte      HAL_PCIReadConfigByte
+#define pci_read_config_halfword  HAL_PCIReadConfigHalfword
+#define pci_read_config_word      HAL_PCIReadConfigWord
+#define pci_write_config_byte     HAL_PCIWriteConfigByte
+#define pci_write_config_halfword HAL_PCIWriteConfigHalfword
+#define pci_write_config_word     HAL_PCIWriteConfigWord
+
+uint8_t pci_read_config_byte_dev(pci_dev *dev, uint8_t address)
+{
+    return HAL_PCIReadConfigByte(dev->bus, dev->devfunc, address);
+}
+
+uint16_t pci_read_config_halfword_dev(pci_dev *dev, uint8_t address)
+{
+    return HAL_PCIReadConfigHalfword(dev->bus, dev->devfunc, address);
+}
+
+uint32_t pci_read_config_word_dev(pci_dev *dev, uint8_t address)
+{
+    return HAL_PCIReadConfigWord(dev->bus, dev->devfunc, address);
+}
+
+void pci_write_config_byte_dev(pci_dev *dev, uint8_t address, uint8_t value)
+{
+    HAL_PCIWriteConfigByte(dev->bus, dev->devfunc, address, value);
+}
+
+void pci_write_config_halfword_dev(pci_dev *dev, uint8_t address, uint16_t value)
+{
+    HAL_PCIWriteConfigHalfword(dev->bus, dev->devfunc, address, value);
+}
+
+void pci_write_config_word_dev(pci_dev *dev, uint8_t address, uint32_t value)
+{
+    HAL_PCIWriteConfigWord(dev->bus, dev->devfunc, address, value);
+}
+
+/*
+ * 1: Find bridges and bus numbers (to allow configuration cycles to work)
+ */
+static pci_dev *pci_add_device(pci_state *pci, pci_bridge *parent, int bus, int devfunc, bool bridge)
+{
+    pci_dev *d = hal_alloc(bridge ? sizeof(pci_bridge) : sizeof(pci_dev));
+
+    STAILQ_INSERT_TAIL(&pci->devices, d, global_list);
+    STAILQ_INSERT_TAIL(&parent->devices, d, bus_list);
+    STAILQ_INIT(&d->addresses);
+    d->parent = parent;
+    d->bus = bus;
+    d->devfunc = devfunc;
+    d->iobad = false;
+    d->membad = false;
+    d->bridge = bridge;
+    d->fastb2b = false;
+    if (bridge)
+    {
+        pci_bridge *b = (pci_bridge *) d;
+        b->root = false;
+        b->window[IO] =
+        b->window[NonPrefetchable] =
+        b->window[Prefetchable] = NULL;
+        STAILQ_INIT(&b->devices);
+        STAILQ_INIT(&b->addresses);
+    }
+
+    dprintf("Added bus %d, dev %d, fun %d\n", bus, devfunc >> 3, devfunc & 7);
+
+    return d;
+}
+
+static void pci_enumerate_device(pci_state *pci, int *highest_bus,
+                                 pci_bridge *bridge,
+                                 int bus, int devfunc,
+                                 uint32_t vend_dev, uint8_t headertype)
+{
+    uint_least24_t class;
+    uint16_t status;
+
+    #ifdef IGNORE_SOME_DEVICES
+    if (pci_ignore_device(vend_dev)) return;
+    #endif
+
+    dprintf("Enumerating bus %d, dev %d, func %d\n", bus, devfunc >> 3, devfunc & 7);
+
+    /* Take the opportunity to shut down all devices */
+    uint16_t cmd;
+    cmd = pci_read_config_halfword(bus, devfunc, PCI_COMMAND);
+    cmd &=~(PCI_CMD_IO | PCI_CMD_MEMORY | PCI_CMD_MASTER | PCI_CMD_SPECIAL |
+            PCI_CMD_MWI | PCI_CMD_VGAPAL | PCI_CMD_STEP | PCI_CMD_FASTB2B);
+    cmd |= (PCI_CMD_PERR | PCI_CMD_SERR);
+    pci_write_config_halfword(bus, devfunc, PCI_COMMAND, cmd);
+
+    class = pci_read_config_word(bus, devfunc, PCI_CLASS_REV) >> 8;
+
+    /* Add it to the global list of devices */
+    pci_dev *d = pci_add_device(pci, bridge, bus, devfunc, (class >> 8) == PCI_CLASS_BRIDGE_PCI);
+
+    pci_write_config_byte_dev(d, PCI_LATENCY, LATENCY_SETTING);
+    pci_write_config_byte_dev(d, PCI_CL_SIZE, CACHELINE_SETTING);
+
+    status = pci_read_config_halfword_dev(d, PCI_STATUS);
+    d->fastb2b = status & PCI_STA_FASTB2B;
+    d->capabilities = status & PCI_STA_CAP;
+    d->vendor = vend_dev;
+    d->devid = vend_dev >> 16;
+    d->class = class;
+    d->headertype = headertype & 0x7F;
+
+    if ((class >> 8) == PCI_CLASS_BRIDGE_PCI)
+    {
+        pci_bridge *b = (pci_bridge *) d;
+        status = pci_read_config_halfword_dev(d, PCI_SECONDARY_STATUS);
+        b->fastb2b_sec = status & PCI_STA_FASTB2B;
+        b->secondary = ++*highest_bus;
+        /* primary, secondary, subordinate bus + 2ary latency all form 1
+         * word */
+        pci_write_config_word_dev(d, PCI_PRIMARY_BUS,
+                                     bus |                   /* primary */
+                                     (b->secondary << 8) | /* secondary */
+                                     (255 << 16) |       /* subordinate */
+                                     (LATENCY_SETTING << 24) /* latency */
+                                  );
+        if (d->parent->supports_prefetch)
+        {
+            pci_write_config_word_dev(d, PCI_PREFETCHABLE_BASE, 0x0000ffff);
+            b->supports_prefetch =
+               pci_read_config_word_dev(d, PCI_PREFETCHABLE_BASE) != 0;
+        }
+        else
+            b->supports_prefetch = false;
+        pci_enumerate_bus(pci, b, b->secondary, highest_bus);
+        b->subordinate = *highest_bus;
+        pci_write_config_byte_dev(d, PCI_SUBORDINATE_BUS, b->subordinate);
+        uint16_t bcr;
+        bcr = pci_read_config_halfword_dev(d, PCI_BRIDGE_CONTROL);
+        bcr &=~(PCI_BCR_ISA | PCI_BCR_VGA | PCI_BCR_MABT | PCI_BCR_RST |
+                PCI_BCR_FASTB2B | PCI_BCR_PRIMARY_DISCARD |
+                PCI_BCR_SECONDARY_DISCARD | PCI_BCR_DISCARD_STATUS |
+                PCI_BCR_DISCARD_SERR);
+        bcr |= (PCI_BCR_PERR | PCI_BCR_SERR);
+        pci_write_config_halfword_dev(d, PCI_BRIDGE_CONTROL, bcr);
+    }
+}
+
+static void pci_enumerate_bus(pci_state *pci, pci_bridge *bridge,
+                              int bus, int *highest_bus)
+{
+    for (int dev = 0; dev < 32; dev++)
+    {
+        int funcs = 1;
+        uint8_t headertype;
+        for (int func = 0; func < funcs; func++)
+        {
+            uint32_t vend_dev;
+            int devfunc = DEVFUNC(dev, func);
+
+            vend_dev = pci_read_config_word(bus, devfunc, PCI_VENDOR_ID);
+            if (vend_dev == UINT32_C(0xFFFFFFFF)) continue;
+            if (func == 0)
+            {
+                headertype = pci_read_config_byte(bus, devfunc, PCI_HEADER_TYPE);
+                if (headertype & 0x80) funcs = 8;
+            }
+            pci_enumerate_device(pci, highest_bus, bridge, bus, devfunc, vend_dev, headertype);
+        }
+    }
+}
+
+static void pci_enumerate_devices(pci_state *pci)
+{
+    STAILQ_INIT(&pci->devices);
+
+    STAILQ_INIT(&pci->host_bridge.dev.addresses);
+    STAILQ_INIT(&pci->host_bridge.devices);
+    STAILQ_INIT(&pci->host_bridge.addresses);
+    pci->host_bridge.dev.parent = NULL;
+    pci->host_bridge.root = true;
+    pci->host_bridge.secondary = 0;
+
+    int highest_bus = 0;
+    pci_enumerate_bus(pci, &pci->host_bridge, 0, &highest_bus);
+    pci->host_bridge.subordinate = highest_bus;
+}
+
+/*
+ * 2: Note the address claims of each device.
+ */
+static pci_addr *pci_add_address(pci_dev *d, int bar)
+{
+    pci_addr *a = hal_alloc(sizeof *a);
+
+    STAILQ_INSERT_TAIL(&d->addresses, a, dev_list);
+    if (d->parent)
+        STAILQ_INSERT_TAIL(&d->parent->addresses, a, bus_list);
+    a->dev = d;
+    a->bar = bar;
+    a->type = Unknown;
+    a->addr = ADDR_UNASSIGNED;
+    a->size = a->align = 0;
+
+    return a;
+}
+
+static bool poweroftwo(uint32_t a)
+{
+    return a != 0 && (a & (a-1)) == 0;
+}
+
+static void pci_note_addresses(pci_dev *d)
+{
+    int bus = d->bus, devfunc = d->devfunc;
+    int bar, end, rombar;
+    uint32_t addr;
+    switch (d->headertype)
+    {
+        case 0: bar = PCI_BASE_ADDRESS_0;
+                end = bar + 6*4;
+                rombar = PCI_ROM_ADDR;
+                break;
+        case 1: bar = PCI_BASE_ADDRESS_0;
+                end = bar + 2*4;
+                rombar = PCI_BRIDGE_ROM_ADDR;
+                break;
+        default:d->membad = true;
+                d->iobad = true;
+                return;
+    }
+
+    /* Special for the southbridge */
+    if (d->parent->dev.bus == 0 &&
+        d->parent->dev.devfunc == DEVFUNC(8,0) &&
+        devfunc == DEVFUNC(2,0))
+    {
+        pci_addr *a = pci_add_address(d, 0);
+        a->type = IO;
+        a->size = 0x800;
+        a->align = 0x10000; /* High alignment forces it to low address */
+    }
+
+    for (; bar<end; bar+=4)
+    {
+        pci_write_config_word(bus, devfunc, bar, UINT32_C(0xFFFFFFFF));
+        addr = pci_read_config_word(bus, devfunc, bar);
+
+        if (addr == 0) continue;
+
+        pci_addr *a = pci_add_address(d, bar);
+
+        if (PCI_BAR_IS_IO(addr))
+        {
+            if ((addr & 0xFFFF0000) == 0)
+                addr |= 0xFFFF0000;
+            a->type = IO;
+            a->size = a->align = ~PCI_BAR_IO_ADDRESS(addr) + 1;
+            if (a->size > 256 || !poweroftwo(a->size))
+            {
+                a->size = a->align = 0;
+                a->addr = ADDR_FAILED;
+                d->iobad = true;
+                continue;
+            }
+        }
+        else if (PCI_BAR_IS_MEM20(addr))
+        {
+            a->addr = ADDR_FAILED;
+            a->type = NonPrefetchable;
+            d->membad = true;
+            continue;
+        }
+        else if (PCI_BAR_IS_MEM(addr)) /* 32-bit or 64-bit */
+        {
+            a->size = a->align = ~PCI_BAR_MEM_ADDRESS(addr) + 1;
+            a->type = PCI_BAR_IS_PREFETCHABLE(addr) &&
+                            d->parent->supports_prefetch ? Prefetchable
+                                                         : NonPrefetchable;
+
+            /* Zero & skip top 32 bits of 64-bit addresses - we're 32-bit */
+            if (PCI_BAR_IS_MEM64(addr))
+                pci_write_config_word(bus, devfunc, bar+=4, 0);
+
+            /* Requests of 4GB or more come out as a->size = 0, which fails
+             * the poweroftwo test.
+             */
+            if (!poweroftwo(a->size))
+            {
+                a->size = a->align = 0;
+                a->addr = ADDR_FAILED;
+                d->membad = true;
+                continue;
+            }
+        }
+        else
+        {
+            a->addr = ADDR_FAILED;
+            a->type = Unknown;
+            d->iobad = true;
+            d->membad = true;
+            continue;
+        }
+    }
+
+    /* Also the ROM */
+    pci_write_config_word(bus, devfunc, rombar, UINT32_C(0xFFFFFFFF));
+    addr = pci_read_config_word(bus, devfunc, rombar);
+    if (addr == 0) return;
+    pci_write_config_word(bus, devfunc, rombar, 0);
+
+    pci_addr *a = pci_add_address(d, rombar);
+    a->size = a->align = ~PCI_BAR_ROM_ADDRESS(addr) + 1;
+    a->type = ROM_TYPE;
+    if (a->size > 16*1024*1024 || !poweroftwo(a->size))
+    {
+        a->size = a->align = 0;
+        a->addr = ADDR_FAILED;
+    }
+}
+
+/*
+ * 3: Calculate the size and alignment requirements of each bridge window
+ */
+static void pci_calc_bridge_windows(pci_bridge *bridge, int type)
+{
+    pci_dev *d;
+    for_each_bus_device(bridge, d)
+    {
+        if (d->bridge)
+        {
+            pci_calc_bridge_windows((pci_bridge *) d, type);
+        }
+    }
+
+    dprintf("Calculating window type %d for bus %d\n", type, bridge->secondary);
+
+    pci_addr *a;
+    uint32_t maxalign = type == IO ? 0x1000 : 0x100000;
+    for_each_bus_address(bridge, a)
+    {
+        if (a->type != type) continue;
+        if (a->align > maxalign) maxalign = a->align;
+    }
+
+    uint32_t size = 0, align;
+    for (align = maxalign; align; align >>= 1)
+    {
+        for_each_bus_address(bridge, a)
+        {
+            if (a->type != type || a->align != align) continue;
+            size = ROUND_UP(size, align);
+            size += a->size;
+            dprintf("(%08x,%08x)\n", a->size, a->align);
+        }
+    }
+
+    if (type == IO)
+        size = ROUND_UP(size, 0x1000);
+    else
+        size = ROUND_UP(size, 0x100000);
+
+    dprintf("Alignment = %x\n", maxalign);
+    dprintf("Size = %x\n", size);
+
+    if (size > 0)
+    {
+        bridge->window[type] = a = pci_add_address((pci_dev *) bridge, 0);
+        a->type = type;
+        a->size = size;
+        a->align = maxalign;
+    }
+}
+
+static void pci_calc_windows(pci_state *pci)
+{
+    pci_calc_bridge_windows(&pci->host_bridge, IO);
+    pci_calc_bridge_windows(&pci->host_bridge, NonPrefetchable);
+    pci_calc_bridge_windows(&pci->host_bridge, Prefetchable);
+}
+
+/*
+ * 4: Allocate the addresses for each device
+ */
+static uint32_t pci_allocate_bus(pci_bridge *bridge, int type,
+                                 uint32_t min, uint32_t max, int dir)
+{
+    uint32_t align, addr;
+
+    addr = dir > 0 ? min : max + 1;
+
+    if (!bridge->window[type]) return addr;
+
+    /* For all buses except the primary, the address space is aligned
+     * (at the top or bottom) to the highest alignment requirement
+     * of everything in that bus. Thus we just start with the
+     * highest aligned address claim, and work our way down.
+     *
+     * The primary bus is unfortunately different, as the memory
+     * space can't start at 0, as some cards interpret that
+     * as a null pointer. Thus we will end up with holes; we deal
+     * with these holes by recursively using the same algorithm in the
+     * opposite direction in the hole.
+     *
+     * This ultimately means that the size of the actual
+     * memory window of the primary bus may be larger than
+     * that allocated by pci_calc_bridge_windows, but it doesn't
+     * matter - we return the highest (or lowest) address used.
+     */
+
+    for (align = bridge->window[type]->align; align; align >>= 1)
+    {
+        pci_addr *a;
+        for_each_bus_address(bridge, a)
+        {
+            uint32_t newaddr;
+            if (a->type != type || a->align != align ||
+                a->addr != ADDR_UNASSIGNED) continue;
+
+            if (dir > 0)
+                newaddr = ROUND_UP(addr, align);
+            else
+                newaddr = ROUND_DOWN(addr, align) - a->size;
+
+            if (newaddr > max || newaddr < min ||
+                newaddr + a->size - 1 > max ||
+                newaddr + a->size - 1 < min)
+                continue;
+
+            a->addr = newaddr;
+
+            if (dir > 0)
+            {
+                if (a->addr > addr)
+                    pci_allocate_bus(bridge, type, addr, a->addr - 1, -1);
+                addr = a->addr + a->size;
+            }
+            else
+            {
+                if (a->addr + a->size < addr)
+                    pci_allocate_bus(bridge, type, a->addr + a->size, addr - 1, +1);
+                addr = a->addr;
+            }
+            dprintf("[%02d,%02d,%02d,%02x] = %08x-%08x\n", a->dev->bus, a->dev->devfunc >> 3, a->dev->devfunc & 7, a->bar, a->addr, a->addr+a->size-1);
+
+            /* If we've just allocated a bridge window, allocate its
+             * addresses now (in the same direction, for alignment).
+             */
+            if (a->dev->bridge)
+            {
+                pci_bridge *b = (pci_bridge *) a->dev;
+                if (b->window[type] == a)
+                    pci_allocate_bus(b, type, a->addr, a->addr + a->size - 1, dir);
+            }
+        }
+    }
+
+    return addr;
+}
+
+static void pci_allocate_addresses(pci_state *pci)
+{
+    pci_allocate_bus(&pci->host_bridge, IO, IO_MIN, IO_MAX, +1);
+    uint32_t pfstart =
+    pci_allocate_bus(&pci->host_bridge, NonPrefetchable, MEM_MIN, MEM_MAX, +1);
+    pci_allocate_bus(&pci->host_bridge, Prefetchable, pfstart, MEM_MAX, -1);
+}
+
+static void pci_find_addresses(pci_state *pci)
+{
+    pci_dev *d;
+    for_every_device(d)
+        pci_note_addresses(d);
+}
+
+/*
+ * 5: Program the base address and window registers for each device
+ */
+static void pci_program_windows(pci_bridge *b)
+{
+    uint32_t min, max;
+    if (b->window[IO])
+    {
+        min = b->window[IO]->addr;
+        max = b->window[IO]->addr + b->window[IO]->size - 1;
+    }
+    else
+        min = 0xFFFF, max = 0x0000;
+
+    pci_write_config_halfword_dev(&b->dev, PCI_IO_BASE,
+                                  (max & 0xFF00) | (min >> 8));
+    pci_write_config_word_dev(&b->dev, PCI_IO_BASE_UPPER, 0);
+
+    if (b->window[NonPrefetchable])
+    {
+        min = b->window[NonPrefetchable]->addr;
+        max = b->window[NonPrefetchable]->addr +
+              b->window[NonPrefetchable]->size - 1;
+    }
+    else
+        min = 0xFFFFFFFF, max = 0x00000000;
+
+    pci_write_config_word_dev(&b->dev, PCI_MEMORY_BASE,
+                          (max & 0xFFFF0000) | (min >> 16));
+
+    if (b->window[Prefetchable])
+    {
+        min = b->window[Prefetchable]->addr;
+        max = b->window[Prefetchable]->addr +
+              b->window[Prefetchable]->size - 1;
+    }
+    else
+        min = 0xFFFFFFFF, max = 0x00000000;
+
+    pci_write_config_word_dev(&b->dev, PCI_PREFETCHABLE_BASE,
+                          (max & 0xFFFF0000) | (min >> 16));
+    pci_write_config_word_dev(&b->dev, PCI_PREFETCHABLE_BASE_UPPER, 0);
+
+}
+
+static void pci_program_addresses(pci_state *pci)
+{
+    pci_dev *d;
+    for_every_device(d)
+    {
+        pci_addr *a;
+        for_each_device_address(d, a)
+        {
+            if (a->bar != 0)
+                pci_write_config_word_dev(a->dev, a->bar, a->addr);
+        }
+
+        if (d->bridge)
+            pci_program_windows((pci_bridge *) d);
+
+        uint16_t cmd = pci_read_config_halfword_dev(d, PCI_COMMAND);
+        cmd &=~ (PCI_CMD_IO | PCI_CMD_MEMORY);
+        if (!d->membad) cmd |= PCI_CMD_MEMORY;
+        if (!d->iobad)  cmd |= PCI_CMD_IO;
+        cmd |= PCI_CMD_MASTER;
+        pci_write_config_halfword_dev(d, PCI_COMMAND, cmd);
+    }
+}
+
+/*
+ * 6: Activate fast back-to-back cycles on each bus that supports them
+ */
+extern void pci_set_host_fastb2b(bool);
+
+static void pci_calc_fastb2b_for_bus(pci_bridge *b, bool host)
+{
+    pci_dev *d;
+    if (b->fastb2b_sec)
+    {
+        bool fastb2b = true;
+        for_each_bus_device(b, d)
+        {
+            if (!d->fastb2b)
+            {
+                fastb2b = false;
+                break;
+            }
+        }
+        if (fastb2b)
+        {
+            for_each_bus_device(b, d)
+            {
+                uint16_t cmd = pci_read_config_halfword_dev(d, PCI_COMMAND);
+                cmd |= PCI_CMD_FASTB2B;
+                pci_write_config_halfword_dev(d, PCI_COMMAND, cmd);
+            }
+            if (host)
+                pci_set_host_fastb2b(true);
+            else
+            {
+                uint16_t bcr;
+                bcr = pci_read_config_halfword_dev(&b->dev, PCI_BRIDGE_CONTROL);
+                bcr |= PCI_BCR_FASTB2B;
+                pci_write_config_halfword_dev(&b->dev, PCI_BRIDGE_CONTROL, bcr);
+            }
+        }
+    }
+    for_each_bus_device(b, d)
+        if (d->bridge)
+            pci_calc_fastb2b_for_bus((pci_bridge *) d, false);
+}
+
+static void pci_set_fastb2b(pci_state *pci)
+{
+    pci_calc_fastb2b_for_bus(&pci->host_bridge, true);
+}
+
+/*
+ * 7: Program the interrupt pin register of each device
+ */
+static void pci_program_interrupts(pci_state *pci)
+{
+    pci_dev *d, *d1;
+    for_every_device(d)
+    {
+        int line = 255;
+        int pin;
+        pin = pci_read_config_byte_dev(d, PCI_INT_PIN);
+        if (pin >= 1 && pin <= 4)
+        {
+            d1 = d;
+            while (!pci_known_int_line(d1, pin, &line))
+            {
+                pin = (((pin - 1) + DEV(d1->devfunc)) & 3) + 1;
+                d1 = &d1->parent->dev;
+            }
+        }
+        pci_write_config_byte_dev(d, PCI_INT_LINE, line);
+    }
+}
+
+#ifdef MSI_SUPPORT
+/*
+ * 8: Set up the MSI address and data registers for all MSI devices
+ */
+static void pci_process_msi(pci_state *pci)
+{
+    pci_dev *d;
+    for_every_device(d)
+    {
+        unsigned msi = pci_find_capability(d, PCI_CAP_MSI);
+        d->msi = msi;
+        if (msi)
+        {
+            unsigned ctrl = pci_read_config_halfword_dev(d, msi + PCI_MSI_CTRL);
+            d->messages = 1 << ((ctrl & PCI_MSI_MMCAP) >> PCI_MSI_MMCAP_SHIFT);
+            pci_write_config_halfword_dev(d, msi + PCI_MSI_CTRL, 0);
+            pci_write_config_word_dev(d, msi + PCI_MSI_ADDR, 0);
+            if (ctrl & PCI_MSI_64BIT)
+            {
+                pci_write_config_word_dev(d, msi + PCI_MSI_ADDR+4, 0);
+                pci_write_config_halfword_dev(d, msi + PCI_MSI_DATA64, 0);
+                d->msi64 = true;
+            }
+            else
+            {
+                pci_write_config_halfword_dev(d, msi + PCI_MSI_DATA32, 0);
+                d->msi64 = false;
+            }
+            if (d->messages > 32) d->messages = 0;
+        }
+        else
+            d->messages = 0;
+    }
+
+    extern uint32_t pci_msi_addr(void);
+
+    unsigned ptr = MSI_MIN;
+    for (int align = 5; align >= 0; align--)
+    {
+        for_every_device(d)
+        {
+            if (d->messages != (1 << align)) continue;
+            if (ptr <= MSI_MAX+1 - (1 << align))
+            {
+                /* Note that MSI is not enabled yet - it is only enabled
+                 * later by the PCI manager when a MSI-compatible device
+                 * driver attaches to it.
+                 */
+                pci_write_config_halfword_dev(d, d->msi + PCI_MSI_CTRL,
+                                                 align << PCI_MSI_MMENA_SHIFT);
+                pci_write_config_word_dev(d, d->msi + PCI_MSI_ADDR,
+                                             pci_msi_addr());
+                pci_write_config_halfword_dev(d, d->msi +
+                                              (d->msi64 ? PCI_MSI_DATA64
+                                                        : PCI_MSI_DATA32),
+                                              ptr);
+                ptr += (1 << align);
+            }
+            else
+                d->messages >>= 1;
+        }
+    }
+}
+#endif
+
+static void pci_tungsten_setup(pci_state *pci)
+{
+    /* Manual setup of special Tungsten stuff */
+
+    /* Get the bridge to let config cycles through to the ALI chip */
+    HAL_PCIWriteConfigWord(0, DEVFUNC(8,0), PCI_PRIMARY_BUS, 0x00010100);
+
+    uint32_t bridge_id = HAL_PCIReadConfigWord(0, DEVFUNC(8,0), PCI_VENDOR_ID);
+    #define INTEL_21154      UINT32_C(0xB1548086)
+    #define HINT_HB2         UINT32_C(0x00263388)
+    #define PERICOM_PI7C8154 UINT32_C(0x815412D8)
+
+    switch (bridge_id)
+    {
+        case HINT_HB2:
+            /* Convert 32-bit secondary to 64-bit primary accesses.
+             * Allow delayed reads to complete out-of-order.
+             */
+            //HAL_PCIWriteConfigHalfword(0, DEVFUNC(8,0), 0x46, 0xA814);
+            /* Fall through (common registers) */
+        case PERICOM_PI7C8154:
+        case INTEL_21154:
+            /* Disable secondary clocks 4-9. */
+            HAL_PCIWriteConfigHalfword(0, DEVFUNC(8,0), 0x68, 0xFF00);
+            /* Assign south bridge and PCI bridge to high priority group */
+            HAL_PCIWriteConfigHalfword(0, DEVFUNC(8,0), 0x42, 0x0204);
+            break;
+    }
+    HAL_PCIWriteConfigByte(1, DEVFUNC(2,0), 0x40, 0x19); // Delayed Transactions, DMA Line Buffer
+    HAL_PCIWriteConfigByte(1, DEVFUNC(2,0), 0x42, 0x4B); // 32-bit DMA, PCI/4 ISA
+    HAL_PCIWriteConfigByte(1, DEVFUNC(2,0), 0x44, 0x02); // IDE 1 -> IRQ3
+    HAL_PCIWriteConfigByte(1, DEVFUNC(2,0), 0x45, 0x08); // Delayed Transaction Timeout
+    HAL_PCIWriteConfigByte(1, DEVFUNC(2,0), 0x4B, 0x89); // AC97 -> IRQ1, Modem -> IRQ11
+#ifdef DISABLE_USB
+    HAL_PCIWriteConfigHalfword(1, DEVFUNC(2,0), 0x52, 0x4000); // Disable USB1
+#endif
+    HAL_PCIWriteConfigByte(1, DEVFUNC(2,0), 0x58, 0x4C); // Enable IDE
+    //HAL_PCIWriteConfigHalfword(1, DEVFUNC(2,0), 0x5C, 0x0FFF); // Positive decode only
+    //HAL_PCIWriteConfigByte(1, DEVFUNC(2,0), 0x5F, 0x06); // Audio high priority (don't do this - prevents retries, breaking delayed reads)
+    HAL_PCIWriteConfigByte(1, DEVFUNC(2,0), 0x6D, 0x24); // DMA master retry release
+    HAL_PCIWriteConfigByte(1, DEVFUNC(2,0), 0x74, 0x05); // USB 1 -> IRQ5
+    HAL_PCIWriteConfigByte(1, DEVFUNC(2,0), 0x75, 0x04); // IDE 2 -> IRQ4
+    HAL_PCIWriteConfigByte(1, DEVFUNC(2,0), 0x76, 0x0B); // SCI -> IRQ12
+    HAL_PCIWriteConfigWord(1, DEVFUNC(2,0), 0x78, 0x00000200); // CBLID pins
+    HAL_PCIWriteConfigByte(1, DEVFUNC(2,0), 0x7C, 0x02); // Enable GPO16-19
+    HAL_PCIWriteConfigByte(1, DEVFUNC(12,0), 0xB7, 0x00); // GPO16-19 all low (power to USB)
+#ifdef DISABLE_USB
+    HAL_PCIWriteConfigByte(1, DEVFUNC(2,0), 0x7E, 0x05); // Nix legacy 60/64, audio DMA above 2GB
+#else
+    HAL_PCIWriteConfigByte(1, DEVFUNC(2,0), 0x7E, 0x85); // Enable USB 2
+#endif
+    HAL_PCIWriteConfigWord(1, DEVFUNC(15,0), 0x40, 0x00100000); // read-only sub-ids
+    HAL_PCIWriteConfigWord(1, DEVFUNC(15,0), 0x44, 0x20); // no legacy
+    HAL_PCIWriteConfigWord(1, DEVFUNC(10,0), 0x44, 0x20); // no legacy
+    HAL_PCIWriteConfigByte(1, DEVFUNC(11,0), 0x09, 0xBF); // Native mode IDE
+}
+
+static pci_state *pci_initialise_state(void)
+{
+    pci_state *pci = hal_alloc(sizeof *pci);
+
+    STAILQ_INIT(&pci->devices);
+
+    STAILQ_INIT(&pci->host_bridge.dev.addresses);
+    STAILQ_INIT(&pci->host_bridge.devices);
+    STAILQ_INIT(&pci->host_bridge.addresses);
+    pci->host_bridge.dev.parent = NULL;
+    pci->host_bridge.root = true;
+    pci->host_bridge.supports_prefetch = true;
+    pci->host_bridge.secondary = 0;
+
+    pci_set_state(pci);
+
+    return pci;
+}
+
+void pci_initialise(void)
+{
+    pci_state *pci = pci_initialise_state();
+
+    /* State-of-the-art procedural programming techniques */
+    pci_tungsten_setup(pci);
+    pci_enumerate_devices(pci);
+    pci_find_addresses(pci);
+    pci_calc_windows(pci);
+    pci_allocate_addresses(pci);
+    pci_program_addresses(pci);
+    pci_set_fastb2b(pci);
+    pci_program_interrupts(pci);
+    #ifdef MSI_SUPPORT
+    pci_process_msi(pci);
+    #endif
+}
+
+pci_dev *pci_find_by_class(pci_state *pci,
+                           uint_least24_t class,
+                           uint_least24_t mask,
+                           const pci_dev *from)
+{
+    const pci_dev *d = from ? STAILQ_NEXT(from, global_list)
+                            : STAILQ_FIRST(&pci->devices);
+
+    class &= mask;
+    for (; d; d = STAILQ_NEXT(d, global_list))
+        if ((d->class & mask) == class)
+            return (pci_dev *) d;
+
+    return NULL;
+}
+
+void *pci_find_class_address(unsigned int class, int *device)
+{
+    pci_dev *d = (struct pci_dev *) *device;
+    d = pci_find_by_class(pci_get_state(), class, 0xffffff, d);
+    *(pci_dev **)device = d;
+    if (!d) return NULL;
+    extern void *mapinio(int flags, uint32_t addr, uint32_t size);
+    pci_addr *a = STAILQ_FIRST(&d->addresses);
+    return mapinio(0, a->addr, a->size);
+}
+
+uint8_t pci_find_capability(pci_dev *d, uint8_t cap)
+{
+    if (d->headertype >= 2 || !d->capabilities) return 0;
+
+    uint8_t ptr;
+    unsigned id_next;
+
+    for (ptr = pci_read_config_byte_dev(d, PCI_CAP_PTR) & 0xFC;
+         ptr != 0;
+         ptr = (id_next >> 8) & 0xFC)
+    {
+        id_next = pci_read_config_halfword_dev(d, ptr);
+        if ((id_next & 0xFF) == cap)
+            break;
+    }
+
+    return ptr;
+}

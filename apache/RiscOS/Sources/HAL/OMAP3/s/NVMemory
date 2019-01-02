@@ -1,0 +1,593 @@
+; Copyright 2011 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+; NVMemory functions
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:OSEntries
+        GET     Hdr:HALEntries
+        GET     hdr.omap3530
+        GET     hdr.StaticWS
+        GET     hdr.GPIO
+
+        AREA    |Asm$$Code|, CODE, READONLY, PIC
+
+        EXPORT  NVMemory_Init
+        EXPORT  NVMemory_InitDevice
+        EXPORT  HAL_NVMemoryType
+        EXPORT  HAL_NVMemorySize
+        EXPORT  HAL_NVMemoryPageSize
+        EXPORT  HAL_NVMemoryProtectedSize
+        EXPORT  HAL_NVMemoryProtection
+        EXPORT  HAL_NVMemoryRead
+        EXPORT  HAL_NVMemoryWrite
+
+        IMPORT  memcpy
+        IMPORT  HAL_CounterDelay
+
+        ; Autodetect the EEPROM at runtime in the range 2kbit to 16kbit
+        GBLL    ProbeEESize
+ProbeEESize     SETL {TRUE}
+
+        ; If no EEPROM found, permit FAT loaded CMOS image in SRAM by u-boot
+        GBLL    TryLoadedCMOS
+TryLoadedCMOS   SETL {TRUE}
+
+        ; Assume u-boot loads at the top of the internal SRAM
+        ASSERT  BoardConfig_Size <= &F000
+                ^ 0
+                # &F000
+FATLoadedCMOS   # 2048 + 4
+
+EE_Read_Addr    * 2_10100001
+EE_Write_Addr   * 2_10100000
+EE_SCL_Line     * 31       ; SCL on EMU1 on GPIO31
+EE_SDA_Line     * 11       ; SDA on EMU0 on GPIO11
+EE_Clock_Speed  * 10       ; microseconds
+
+        MACRO
+        SCLLow
+        ; Actively drive low
+        GPIO_SetOutput0  v1, v2
+        MOV     a1, #EE_Clock_Speed:SHR:1
+        BL      HAL_CounterDelay
+        MEND
+
+        MACRO
+        SCLHigh
+        ; Actively drive high
+        GPIO_SetOutput1  v1, v2
+        MOV     a1, #EE_Clock_Speed:SHR:1
+        BL      HAL_CounterDelay
+        MEND
+
+        MACRO
+        SDALow
+        ; Actively drive low
+        GPIO_SetOutput0  v1, v3
+        GPIO_SetAsOutput v1, v3, a4
+        MOV     a1, #EE_Clock_Speed:SHR:1
+        BL      HAL_CounterDelay
+        MEND
+
+        MACRO
+        SDAHigh
+        ; Float high
+        GPIO_SetAsInput  v1, v3, a4
+        MOV     a1, #EE_Clock_Speed:SHR:1
+        BL      HAL_CounterDelay
+        MEND
+
+HAL_NVMemoryType
+        LDR     a2, NVMemoryFound
+        TEQ     a2, #0
+        MOV     a1, #NVMemoryFlag_HAL
+        ORR     a1, a1, #NVMemoryFlag_LowRead :OR: NVMemoryFlag_LowWrite
+      [ :LNOT: TryLoadedCMOS
+        ; There's nothing, not even fake CMOS
+        MOVEQ   a1, #NVMemoryFlag_None
+      ]
+        MOV     pc, lr
+
+HAL_NVMemorySize
+        LDR     a1, NVMemoryFound
+      [ TryLoadedCMOS
+        ; Pretend there is some
+        TEQ     a1, #0
+        MOVEQ   a1, #?FATLoadedCMOS:AND:&FF00
+      ]
+        MOV     pc, lr
+
+HAL_NVMemoryPageSize
+        MOV     a1, #16    ; Try it the same size as the original
+        MOV     pc, lr
+
+HAL_NVMemoryProtectedSize
+        MOV     a1, #0     ; No protected memory
+        MOV     pc, lr
+
+HAL_NVMemoryProtection
+        MOV     pc, lr     ; No memory protection, nothing to do
+
+HAL_NVMemoryRead
+        ; In:  a1 = physical address
+        ;      a2 = destination buffer
+        ;      a3 = count
+        ; Out: a1 = number of bytes read
+        Push    "v1-v4, lr"
+        MOV     v1, a1
+        MOV     v2, a2
+        MOV     v3, a3
+        MOV     v4, #0     ; Bytes read
+10
+        LDR     a3, NVMemoryFound
+        TEQ     a3, #0
+
+        ADD     a1, v1, v4
+      [ TryLoadedCMOS
+        LDREQ   a3, IntSRAM_Log
+        ADDEQ   a3, a3, #:INDEX:FATLoadedCMOS
+        LDREQB  a1, [a3, a1]
+      |
+        MOVEQ   a1, #-1
+      ]
+        BLNE    NVMemory_BGet
+        CMP     a1, #-1
+        STRNEB  a1, [v2], #1
+        ADDNE   v4, v4, #1
+        SUBNES  v3, v3, #1
+        BNE     %BT10
+
+        MOV     a1, v4
+        Pull    "v1-v4, pc"
+
+HAL_NVMemoryWrite
+        ; In:  a1 = physical address
+        ;      a2 = source buffer
+        ;      a3 = count
+        ; Out: a1 = number of bytes written
+        Push    "v1-v4, lr"
+        MOV     v1, a1
+        MOV     v2, a2
+        MOV     v3, a3
+        MOV     v4, #0     ; Bytes written
+10
+        LDR     a3, NVMemoryFound
+        TEQ     a3, #0
+
+        ADD     a1, v1, v4
+        LDRB    a2, [v2], #1
+      [ TryLoadedCMOS
+        LDREQ   a3, IntSRAM_Log
+        ADDEQ   a3, a3, #:INDEX:FATLoadedCMOS
+        STREQB  a2, [a3, a1]
+        MOVEQ   a1, #0     ; Success
+      |
+        MOVEQ   a1, #-1
+      ]
+        BLNE    NVMemory_BPut
+        CMP     a1, #-1
+        ADDNE   v4, v4, #1
+        SUBNES  v3, v3, #1
+        BNE     %BT10
+
+        MOV     a1, v4
+        Pull    "v1-v4, pc"
+
+NVMemory_Init
+        Push    "v1-v3, lr"
+
+        ; Read DSCR to check if ARM debugging is enabled
+        ; This is the best method we have of working out if a JTAG cable is
+        ; connected?
+        MRC     p14, 0, a1, c0, c1, 0
+        TST     a1, #&c000 ; Check halting debug & monitor debug enable bits
+        MOVNE   a1, #-1
+        BNE     %FT05
+        
+        ; Set EMU0 and EMU1 as bidir GPIO with no pullups
+        ; nor off state nor wakeup
+        LDR     a1, L4_Core_Log
+        ADD     a1, a1, #&2A00
+        ADD     a1, a1, #&0024
+        LDR     a2, =&01040104
+        STR     a2, [a1]   ; CONTROL_PADCONF_JTAG_EMU0 and EMU1
+
+        ; Drive SCL high, float SDA high
+        ASSERT  (EE_SCL_Line:SHR:5) = (EE_SDA_Line:SHR:5)
+        GPIO_PrepareC a1, a2, EE_SCL_Line
+        GPIO_PrepareC a1, a3, EE_SDA_Line
+        GPIO_SetOutput1 a1, a2
+        GPIO_SetOutput1 a1, a3
+        GPIO_SetAsOutput a1, a2, a4
+        GPIO_SetAsInput a1, a3, a4
+
+        MOV     a1, #0
+        BL      NVMemory_BGet
+05
+        CMP     a1, #-1
+        MOVEQ   v3, #0     ; No reply
+        MOVNE   v3, #256   ; Must be at least 256
+
+      [ ProbeEESize
+        LDR     v2, IntSRAM_Log
+        ADD     v2, v2, #:INDEX:FATLoadedCMOS
+        BEQ     %FT30
+
+        ; So there's an EEPROM of at least 256 bytes present
+        MOV     v1, #255
+10
+        MOV     a1, v1
+        BL      NVMemory_BGet
+        STRB    a1, [v2, v1]
+        SUBS    v1, v1, #1
+        BPL     %BT10
+15
+        ; Compare blocks of 2048 bits in powers of 2 until alias found
+        ; This has 2 weaknesses
+        ; - when the chip is initially blank it will appear to be 256 bytes
+        ;   for the first boot (done during the factory test anyway)
+        ; - it may underreport if the chip is filled with exact copies of the
+        ;   first 256 bytes for reason (unlikely, versus a destructive test)
+        MOV     v1, #255
+20
+        ADD     a1, v1, v3
+        BL      NVMemory_BGet
+        LDRB    a2, [v2, v1]
+        TEQ     a1, a2
+        BNE     %FT25
+        SUBS    v1, v1, #1
+        BPL     %BT20
+
+        ; All 256 matched, it's an alias
+        B       %FT30
+25
+        ; Non match, not an alias, try next power of 2
+        MOV     v3, v3, LSL #1
+
+        ; Stop probing when address wont fit in the address byte
+        CMP     v3, #2_11100000000
+        BLS     %BT15
+30
+      ]
+        STR     v3, NVMemoryFound
+    [ TryLoadedCMOS
+        TEQ     v3, #0
+        BNE     %FT50
+
+        ; Check the loaded CMOS is from the 5.xx era
+      [ :LNOT: ProbeEESize
+        LDR     v2, IntSRAM_Log
+      ]
+        LDR     a1, [v2, #?FATLoadedCMOS - 4]
+        SUB     a1, a1, #500
+        CMP     a1, #100
+
+        ; Go unpickle the CMOS data file logical to physical addresses
+        BCC     %FT40
+
+        ; Looks dodgy, make it a blank chip
+        MOV     a1, #-1
+        MOV     a3, #?FATLoadedCMOS - 4
+35
+        SUBS    a3, a3, #4
+        STRPL   a1, [v2, a3]
+        BNE     %BT35
+40
+        ; Roll top 4 by 1 step to get [00-BF][F0-FF][C0-EF]
+        ADD     a1, v2, #&C0
+        MOV     a2, #4
+        BL      NVMemory_Barrel16
+
+        ; Roll bottom 16 by 4 steps to get [F0-FF][C0-EF][00-BF]
+        MOV     v1, #4
+45
+        MOV     a1, v2
+        MOV     a2, #16
+        BL      NVMemory_Barrel16
+        SUBS    v1, v1, #1
+        BNE     %BT45
+50
+    ]
+        Pull    "v1-v3, pc"
+        
+NVMemory_Barrel16
+        ; void NVMemory_Barrel16(uint32_t *base, size_t wrapsize)
+        ; Moves 16 bytes up in memory, wrapping what fell off the top
+        Push    "v1-v2, lr"
+
+        ; Pick up the end data to keep
+        ADD     ip, a1, a2, LSL #4
+        LDMDB   ip, {a3-a4, v1-v2}
+        Push    "a3-a4, v1-v2"
+10
+        ; And the move part
+        SUBS    a2, a2, #1
+        ADDNE   ip, a1, a2, LSL #4
+        LDMNEDB ip, {a3-a4, v1-v2}
+        STMNEIA ip, {a3-a4, v1-v2}
+        BNE     %BT10
+
+        ; Replace the wrapped bit
+        Pull    "a3-a4, v1-v2"
+        STMIA   a1, {a3-a4, v1-v2}
+
+        Pull    "v1-v2, pc"
+
+NVMemory_InitDevice
+        ; void NVMemory_InitDevice(void)
+        LDR     a3, NVMemoryFound
+        TEQ     a3, #0
+        MOVEQ   pc, lr
+        Push    "a3, lr"
+
+        ; Copy over template
+        ADRL    a1, NVRAMWS
+        ADR     a2, NVMemory_Device_Template
+        MOV     a3, #HALDeviceSize
+        BL      memcpy
+
+        ; Map 256/512/1024/2048 to table index 0/1/2/3
+        MOV     a2, a1
+        Pull    "a3, lr"
+        CLZ     a1, a3
+        RSB     a1, a1, #31 - 8
+
+        ADR     a4, NVMemory_Device_IDs
+        MOV     a3, a1, LSL #1
+        LDRH    a3, [a4, a3]
+        STRH    a3, [a2, #HALDevice_ID]
+
+        ADR     a4, NVMemory_Device_Descs
+        MOV     a3, #1 + :LEN:"24Cxx EEPROM"
+        MLA     a3, a3, a1, a4
+        STR     a3, [a2, #HALDevice_Description]
+
+        ; Tail call the OS to add it
+        MOV     a1, #0
+        LDR     pc, OSentries + 4*OS_AddDevice
+
+NVMemory_Device_Template
+        DCW     HALDeviceType_SysPeri + HALDeviceSysPeri_NVRAM
+        DCW     &1234           ; ID filled at runtime
+        DCD     HALDeviceBus_Ser + HALDeviceSerBus_IIC
+        DCD     0               ; API version 0
+        DCD     &12345678       ; Description filled at runtime
+        DCD     0               ; Address - N/A
+        %       12              ; Reserved
+        DCD     NVMemory_Device_Activate
+        DCD     NVMemory_Device_Deactivate
+        DCD     NVMemory_Device_Reset
+        DCD     NVMemory_Device_Sleep
+        DCD     -1
+        DCD     0
+        %       8
+        ASSERT  (. - NVMemory_Device_Template) = HALDeviceSize
+
+NVMemory_Device_Activate
+        MOV     a1, #1
+        MOV     pc, lr
+NVMemory_Device_Sleep
+        MOV     a1, #0
+NVMemory_Device_Deactivate
+NVMemory_Device_Reset
+        MOV     pc, lr
+NVMemory_Device_IDs
+        DCW    HALDeviceID_NVRAM_24C02
+        DCW    HALDeviceID_NVRAM_24C04
+        DCW    HALDeviceID_NVRAM_24C08
+        DCW    HALDeviceID_NVRAM_24C16
+NVMemory_Device_Descs
+        DCB    "24C02 EEPROM", 0
+        DCB    "24C04 EEPROM", 0
+        DCB    "24C08 EEPROM", 0
+        DCB    "24C16 EEPROM", 0
+        ALIGN
+        
+NVMemory_BGet
+        ; int32_t NVMemory_BGet(uint32_t loc)
+        ; Returns -1 if no ACK otherwise the byte read
+        Push    "v1, v3, lr"
+        MOV     v1, a1
+        MOV     v3, #-1
+
+        BL      BashIIC_Start
+
+      [ ProbeEESize
+        ; Take bits 8-10 to be the device id
+        AND     a2, v1, #2_11100000000
+        MOV     a2, a2, LSR #7
+        ORR     a1, a2, #EE_Write_Addr
+      |
+        ; The device id is zero
+        MOV     a1, #EE_Write_Addr
+      ]
+        BL      BashIIC_Out
+        BL      BashIIC_ACKIn
+        CMP     a1, #-1
+        BNE     %FT10
+
+        AND     a1, v1, #255
+        BL      BashIIC_Out
+        BL      BashIIC_ACKIn
+        CMP     a1, #-1
+        BNE     %FT10
+
+        BL      BashIIC_Start
+
+      [ ProbeEESize
+        ; Take bits 8-10 to be the device id
+        AND     a2, v1, #2_11100000000
+        MOV     a2, a2, LSR #7
+        ORR     a1, a2, #EE_Read_Addr
+      |
+        ; The device id is zero
+        MOV     a1, #EE_Read_Addr
+      ]
+        BL      BashIIC_Out
+        BL      BashIIC_ACKIn
+        CMP     a1, #-1
+        BNE     %FT10
+
+        BL      BashIIC_In
+        MOV     v3, a1
+
+        BL      BashIIC_NACK
+10        
+        BL      BashIIC_Stop
+        MOV     a1, v3
+        Pull    "v1, v3, pc"
+        
+NVMemory_BPut
+        ; int32_t NVMemory_BPut(uint32_t loc, uint8_t byte)
+        ; Returns -1 if no ACK
+        Push    "v1-v3, lr"
+        MOV     v1, a1
+        MOV     v2, a2
+        MOV     v3, #-1
+
+        BL      BashIIC_Start
+
+      [ ProbeEESize
+        ; Take bits 8-10 to be the device id
+        AND     a2, v1, #2_11100000000
+        MOV     a2, a2, LSR #7
+        ORR     a1, a2, #EE_Write_Addr
+      |
+        ; The device id is zero
+        MOV     a1, #EE_Write_Addr
+      ]
+        BL      BashIIC_Out
+        BL      BashIIC_ACKIn
+        CMP     a1, #-1
+        BNE     %FT10
+
+        AND     a1, v1, #255
+        BL      BashIIC_Out
+        BL      BashIIC_ACKIn
+        CMP     a1, #-1
+        BNE     %FT10
+        
+        MOV     a1, v2
+        BL      BashIIC_Out
+        BL      BashIIC_ACKIn
+        CMP     a1, #-1
+        BNE     %FT10
+
+        BL      BashIIC_Stop
+05
+        ; Poll for completion (any address will do)
+        BL      BashIIC_Start
+        MOV     a1, #EE_Write_Addr
+        BL      BashIIC_Out
+        BL      BashIIC_ACKIn
+        MOV     v2, a1
+        BL      BashIIC_Stop
+        CMP     v2, #-1
+        BNE     %BT05
+
+        MOV     v3, #0
+10
+        MOV     a1, v3
+        Pull    "v1-v3, pc"
+
+BashIIC_Out
+        ; Clock out a byte MSB first
+        Push    "v1-v2, lr"
+        MOV     v1, a1, LSL #24
+        MOV     v2, #8
+10
+        MOVS    v1, v1, LSL #1
+        BCC     %FT20
+        BL      BashIIC_NACK
+        B       %FT30
+20
+        BL      BashIIC_ACK
+30
+        SUBS    v2, v2, #1
+        BNE     %BT10
+        Pull    "v1-v2, pc"
+        
+BashIIC_In
+        ; Clock in a byte MSB first
+        Push    "v1-v2, lr"
+        MOV     v1, #0
+        MOV     v2, #8
+10
+        BL      BashIIC_ACKIn
+        MOV     v1, v1, LSL #1
+        TEQ     a1, #0
+        ORREQ   v1, v1, #1
+        SUBS    v2, v2, #1
+        BNE     %BT10
+        MOV     a1, v1
+        Pull    "v1-v2, pc"
+        
+BashIIC_Start
+        Push    "v1-v3, lr"
+        ; SCL ensure high, SDA falls
+        GPIO_PrepareC v1, v2, EE_SCL_Line
+        GPIO_PrepareC v1, v3, EE_SDA_Line
+        SCLLow
+        SDAHigh
+        SCLHigh
+        SDALow
+        Pull    "v1-v3, pc"
+
+BashIIC_Stop
+        Push    "v1-v3, lr"
+        ; SCL ensure high, SDA rises
+        GPIO_PrepareC v1, v2, EE_SCL_Line
+        GPIO_PrepareC v1, v3, EE_SDA_Line
+        SCLLow
+        SDALow
+        SCLHigh
+        SDAHigh
+        Pull    "v1-v3, pc"
+
+BashIIC_ACK
+        Push    "v1-v3, lr"
+        ; Clock low, data low, clock high
+        GPIO_PrepareC v1, v2, EE_SCL_Line
+        GPIO_PrepareC v1, v3, EE_SDA_Line
+        SCLLow
+        SDALow
+        SCLHigh
+        Pull    "v1-v3, pc"
+
+BashIIC_NACK
+        Push    "v1-v3, lr"
+        ; Clock low, data high, clock high
+        GPIO_PrepareC v1, v2, EE_SCL_Line
+        GPIO_PrepareC v1, v3, EE_SDA_Line
+        SCLLow
+        SDAHigh
+        SCLHigh
+        Pull    "v1-v3, pc"
+
+BashIIC_ACKIn
+        ; Clock in a bit (SCL high on entry) by sampling SDA
+        Push    "v1-v3, lr"
+        GPIO_PrepareC v1, v2, EE_SCL_Line
+        GPIO_PrepareC v1, v3, EE_SDA_Line
+        SCLLow
+        GPIO_SetAsInput v1, v3, a4
+        SCLHigh
+        GPIO_GetInput a1, v1, v3
+        EORS    a1, a1, v3
+        MOVNE   a1, #-1
+        Pull    "v1-v3, pc"
+
+        END

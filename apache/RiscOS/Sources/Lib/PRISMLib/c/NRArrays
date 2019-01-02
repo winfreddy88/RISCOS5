@@ -1,0 +1,362 @@
+/* Copyright 2005 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/**************************************************************/
+/* File:    NRArrays.c                                        */
+/*          (C) 2005 Tematic Ltd.                             */
+/*          All rights reserved                               */
+/*                                                            */
+/* Purpose: Array management, originally from ARLib routines  */
+/*          by S.J.Middleton.                                 */
+/*                                                            */
+/*          Simple, non-reentrant routines.                   */
+/*                                                            */
+/* Author:  S.J.Middleton (1992), A.D.Hodgkinson.             */
+/*                                                            */
+/* History: 29-Apr-2005 (ADH): Created from ARLib's array.c.  */
+/**************************************************************/
+
+/* External inclusions */
+
+#include <stdlib.h>
+#include <string.h>
+#include <stdbool.h>
+
+/* PRISMLib inclusions */
+
+#include "Errors.h"
+#include "FuncTypes.h"
+#include "Internal.h"
+
+#include "NRArrays.h"
+
+/* Local macros */
+
+#define PTR(v, a) ((char *)(v)->data + (a) * (v)->elem_size)
+
+/**************************************************************/
+/* prismlib_nrarrays_create()                                 */
+/*                                                            */
+/* Create a new array structure.                              */
+/*                                                            */
+/* Parameters: Initial number of elements to hold in array;   */
+/*                                                            */
+/*             Size of each element;                          */
+/*                                                            */
+/*             Pointer to a function to use as 'realloc' or   */
+/*             NULL for standard 'realloc';                   */
+/*                                                            */
+/*             Pointer to a function to use as 'free' or      */
+/*             NULL for standard 'free';                      */
+/*                                                            */
+/* Returns:    Pointer to the base of the array, or NULL if   */
+/*             out of memory.                                 */
+/**************************************************************/
+
+prismlib_nrarray_t * prismlib_nrarrays_create
+                     (
+                       int                       initial_n,
+                       size_t                    elem_size,
+                       prismlib_realloc_fn_ptr_t reallocfn,
+                       prismlib_free_fn_ptr_t    freefn
+                     )
+{
+  prismlib_nrarray_t       * v;
+  prismlib_realloc_fn_ptr_t  reallocf = (reallocfn != NULL) ? reallocfn : realloc;
+  prismlib_free_fn_ptr_t     freef    = (freefn    != NULL) ? freefn    : free;
+
+  if (initial_n < 0 || elem_size == 0) return NULL;
+
+  v = (prismlib_nrarray_t *) reallocf(NULL, sizeof(struct prismlib_internal_nrarray));
+
+  if (v != NULL)
+  {
+    void * data;
+
+    v->n         = initial_n;
+    v->elem_size = elem_size;
+    v->realloc   = reallocf;
+    v->free      = freef;
+    v->data      = NULL;
+
+    if (initial_n != 0)
+    {
+      data = reallocf(NULL, elem_size * initial_n);
+
+      if (data == NULL) prismlib_nrarrays_destroy(&v);
+      else              v->data = data;
+    }
+  }
+
+  return v;
+}
+
+/**************************************************************/
+/* prismlib_nrarrays_extend()                                 */
+/*                                                            */
+/* Add a number of elements to the end of an array, or remove */
+/* a number of elements from the end of the array.            */
+/*                                                            */
+/* Parameters: Pointer to the array management structure;     */
+/*                                                            */
+/*             Number of elements to add if positive, number  */
+/*             of elements to remove if negative.             */
+/**************************************************************/
+
+_kernel_oserror * prismlib_nrarrays_extend
+                  (
+                    prismlib_nrarray_t * restrict v,
+                    int32_t                       n
+                  )
+{
+  int    new_n;
+  void * data;
+
+  if (v == NULL || (new_n = v->n + n) < 0)
+  {
+    return prismlib_make_error(prism_error_INVALID_PARAMETERS,
+                               1,
+                               "prismlib_nrarrays_extend()");
+  }
+
+  if (new_n > 0)
+  {
+    data = v->realloc(v->data, new_n * v->elem_size);
+
+    if (data == NULL) return prismlib_make_error(prism_error_MEMORY_EXHAUSTED, 0);
+    else v->data = data;
+  }
+  else
+  {
+    v->free(v->data);
+    v->data = NULL;
+  }
+
+  v->n = new_n;
+
+  return NULL;
+}
+
+/**************************************************************/
+/* prismlib_nrarrays_insert()                                 */
+/*                                                            */
+/* Insert a number of elements into an array.                 */
+/*                                                            */
+/* Parameters: Pointer to the array management structure;     */
+/*                                                            */
+/*             Number of elements to add;                     */
+/*                                                            */
+/*             Index that the first new element is to take    */
+/*             (so a value between zero, to add right at the  */
+/*             start of the array and shuffle up all other    */
+/*             entries, to the maximum valid array index plus */
+/*             one, to add to the end of the array in the     */
+/*             same way as prismlib_nrarrays_extend when used */
+/*             to add elements).                              */
+/**************************************************************/
+
+_kernel_oserror * prismlib_nrarrays_insert
+                  (
+                    prismlib_nrarray_t * restrict v,
+                    int                           n,
+                    int                           at
+                  )
+{
+  int old_n;
+
+  if (v == NULL || n <= 0 || at < 0 || at > v->n)
+  {
+    return prismlib_make_error(prism_error_INVALID_PARAMETERS,
+                               1,
+                               "prismlib_nrarrays_insert()");
+  }
+
+  old_n = v->n;
+
+  PRISMLIB_RETERR(prismlib_nrarrays_extend(v, n));
+
+  if (old_n != at) memmove(PTR(v, at + n), PTR(v, at), (old_n - at) * v->elem_size);
+  return NULL;
+}
+
+/**************************************************************/
+/* prismlib_nrarrays_delete()                                 */
+/*                                                            */
+/* Delete a number of elements from an array.                 */
+/*                                                            */
+/* Parameters: Pointer to the array management structure;     */
+/*                                                            */
+/*             Number of elements to delete;                  */
+/*                                                            */
+/*             Index of the first item to be deleted.         */
+/**************************************************************/
+
+_kernel_oserror * prismlib_nrarrays_delete
+                  (
+                    prismlib_nrarray_t * restrict v,
+                    int                           n,
+                    int                           at
+                  )
+{
+  int new_n;
+
+  if (v == NULL || n <= 0 || at < 0 || at + n > v->n)
+  {
+    return prismlib_make_error(prism_error_INVALID_PARAMETERS,
+                               1,
+                               "prismlib_nrarrays_delete()");
+  }
+
+  new_n = v->n - n;
+
+  if (new_n != at) memmove(PTR(v, at), PTR(v,at + n), (new_n - at) * v->elem_size);
+  return prismlib_nrarrays_extend(v, -n);
+}
+
+/**************************************************************/
+/* prismlib_nrarrays_destroy()                                */
+/*                                                            */
+/* Destroy an entire array.                                   */
+/*                                                            */
+/* Parameters: Pointer to a pointer to the array management   */
+/*             structure, updated on exit with NULL if        */
+/*             successful.                                    */
+/**************************************************************/
+
+void prismlib_nrarrays_destroy
+     (
+       prismlib_nrarray_t ** restrict pv
+     )
+{
+  prismlib_nrarray_t * restrict v = (pv == NULL) ?
+                                    NULL         :
+                                    *pv;
+
+  if (v != NULL)
+  {
+    prismlib_free_fn_ptr_t freefn = v->free;
+
+    freefn(v->data);
+    freefn(v);
+
+    *pv = NULL;
+  }
+}
+
+/**************************************************************/
+/* prismlib_nrarrays_size()                                   */
+/*                                                            */
+/* Find out how many elements are currently held in an array. */
+/*                                                            */
+/* Parameters: Pointer to the array management structure.     */
+/*                                                            */
+/* Returns:    Number of elements in the array.               */
+/**************************************************************/
+
+int prismlib_nrarrays_size
+    (
+      prismlib_nrarray_t * restrict v
+    )
+{
+  return v == NULL ? 0 : v->n;
+}
+
+/**************************************************************/
+/* prismlib_nrarrays_read()                                   */
+/*                                                            */
+/* Obtain a pointer to an array element.                      */
+/*                                                            */
+/* Parameters: Pointer to the array management structure;     */
+/*                                                            */
+/*             Array index of element of interest.            */
+/*                                                            */
+/* Returns:    Pointer to the element, or NULL if the input   */
+/*             parameters were invalid.                       */
+/**************************************************************/
+
+void * prismlib_nrarrays_read
+       (
+         prismlib_nrarray_t * restrict v,
+         int                           entry
+       )
+{
+  if (v != NULL && entry >= 0 && entry < v->n) return PTR(v, entry);
+  else                                         return NULL;
+}
+
+/**************************************************************/
+/* prismlib_nrarrays_sort()                                   */
+/*                                                            */
+/* Sort an array.                                             */
+/*                                                            */
+/* Parameters: Pointer to the array management structure;     */
+/*                                                            */
+/*             Pointer to a compare function to pass to C     */
+/*             library 'qsort'.                               */
+/**************************************************************/
+
+void prismlib_nrarrays_sort
+     (
+       prismlib_nrarray_t        * restrict v,
+       prismlib_compare_fn_ptr_t            comp_fn
+     )
+{
+  if (v != NULL && comp_fn != NULL) qsort(PTR(v, 0),
+                                    v->n,
+                                    v->elem_size,
+                                    comp_fn);
+}
+
+/**************************************************************/
+/* prismlib_nrarrays_search()                                 */
+/*                                                            */
+/* Search an array. The array must first be sorted using      */
+/* prismlib_nrarrays_sort.                                    */
+/*                                                            */
+/* Parameters: Pointer to the array management structure;     */
+/*                                                            */
+/*             Pointer to data that the compare function (see */
+/*             below) will compare against array elements;    */
+/*                                                            */
+/*             Pointer to a compare function to pass to C     */
+/*             library 'bsearch'.                             */
+/*                                                            */
+/* Returns:    Array index of found element, or -1 if no      */
+/*             match is made.                                 */
+/**************************************************************/
+
+int prismlib_nrarrays_search
+    (
+      prismlib_nrarray_t        * restrict v,
+      const void                *          key,
+      prismlib_compare_fn_ptr_t            comp_fn
+    )
+{
+  if (v != NULL && comp_fn != NULL)
+  {
+    void * r = (v->n == 0) ?
+               NULL        :
+               bsearch(key,
+                       PTR(v, 0),
+                       v->n,
+                       v->elem_size,
+                       comp_fn);
+
+    return (r == NULL) ?
+           -1          :
+           (((char *) r - (char *) PTR(v, 0)) / v->elem_size);
+  }
+
+  return -1;
+}

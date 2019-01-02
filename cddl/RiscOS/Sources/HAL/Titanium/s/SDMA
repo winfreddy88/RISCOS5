@@ -1,0 +1,900 @@
+;
+; CDDL HEADER START
+;
+; The contents of this file are subject to the terms of the
+; Common Development and Distribution License (the "Licence").
+; You may not use this file except in compliance with the Licence.
+;
+; You can obtain a copy of the licence at
+; cddl/RiscOS/Sources/HAL/Titanium/LICENCE.
+; See the Licence for the specific language governing permissions
+; and limitations under the Licence.
+;
+; When distributing Covered Code, include this CDDL HEADER in each
+; file and include the Licence file. If applicable, add the
+; following below this CDDL HEADER, with the fields enclosed by
+; brackets "[]" replaced with your own identifying information:
+; Portions Copyright [yyyy] [name of copyright owner]
+;
+; CDDL HEADER END
+;
+;
+; Copyright 2015 Elesar Ltd.  All rights reserved.
+; Use is subject to license terms.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:OSEntries
+        GET     Hdr:HALEntries
+        GET     Hdr:DMADevice
+        GET     Hdr:DMA
+        
+        GET     hdr.RegMap
+        GET     hdr.StaticWS
+                
+        AREA    |SDMA$$Code|, CODE, READONLY, PIC
+
+        EXPORT  SDMAInit
+        EXPORT  SDMADeviceInit
+        IMPORT  memcpy
+        IMPORT  HAL_IRQClear
+
+; There are 32 channels on 1 controller assigned arbitrarily
+SDMACount       * 32
+
+; Count calls to the runtime DMA functions at the top of FIQ workspace
+        MACRO
+        DMACallStats $where, $tmp1, $tmp2
+      [ {FALSE}
+        MOV     $tmp1, #0
+        LDR     $tmp2, [$tmp1, #$where]
+        ADD     $tmp2, $tmp2, #1
+        STR     $tmp2, [$tmp1, #$where]
+      ]
+        MEND
+
+; Controller struct
+                     ^ 0
+                     # HALDevice_DMAC_Size_0_1
+SDMADMAC_SB          # 4
+SDMADMAC_Allocated   # 4
+SDMADMAC_ChannelPtrs # 4 * SDMACount
+SDMADevice_DMAC_Size # 0
+
+; Channel struct (buffer or list)
+                     ^ 0
+                     # HALDevice_DMA_Size
+SDMADMA_Regs         # 4
+SDMADMA_CtrlRegs     # 4
+SDMADMA_SB           # 4
+SDMADMA_IRQBit       # 4
+SDMADMA_LastFlags    # 0
+SDMADMA_LastSetWasB  # 1
+SDMADMA_LastSetNext  # 1
+                     # 2
+SDMADevice_DMA_Size  # 0
+
+; SDMAInit
+SDMAInit ROUT
+        Push    "lr"
+
+        ; Map in the SDMA controller
+        MOV     a1, #0
+        LDR     a2, =SDMA_PhysBase
+        MOV     a3, #SDMA_PhysSize
+        CallOS  OS_MapInIO
+        STR     a1, SDMA_LogBase        ; Assigned logical base
+
+        ; Set the clocks to auto run and auto idle
+        LDR     a2, CMCoreCore_LogBase
+        MOV     a3, #CM_DMA_CLKSTCTRL_CLKTRCTRL_HW_AUTO
+        STR     a3, [a2, #CM_DMA_CLKSTCTRL]
+        LDR     a3, =DMA4_OCP_SYSCONFIG_AUTOIDLE :OR: \
+                     DMA4_OCP_SYSCONFIG_SIDLEMODE_SMART_IDLE :OR: \
+                     DMA4_OCP_SYSCONFIG_MIDLEMODE_SMART_STANDBY
+        STR     a3, [a1, #DMA4_OCP_SYSCONFIG]
+
+        ; There's no soft reset bit, at least disable interrupts & channels
+        MOV     a3, #0
+        STR     a3, [a1, #DMA4_IRQENABLE_L0]
+        STR     a3, [a1, #DMA4_IRQENABLE_L1]
+        STR     a3, [a1, #DMA4_IRQENABLE_L2]
+        STR     a3, [a1, #DMA4_IRQENABLE_L3]
+        MOV     a4, #SDMACount
+        ADD     a2, a1, #DMA4_CBASE + DMA4_CCRi
+10
+        STR     a3, [a2], #DMA4_CSIZE
+        SUBS    a4, a4, #1
+        BNE     %BT10
+
+        ; 16.1.5.1 of TRM, put something reasonable in GCR
+        LDR     a3, =(1:SHL:DMA4_GCR_ARBITRATION_RATE_SHIFT) :OR: \
+                     (64:SHL:DMA4_GCR_MAX_CHANNEL_FIFO_DEPTH_SHIFT)
+        STR     a3, [a1, #DMA4_GCR]
+
+        Pull    "pc"
+
+; SDMADeviceInit
+SDMADeviceInit ROUT
+        Push    "v1-v3, lr"
+
+        ; Declare the top level controller
+        ADRL    a1, SDMADMACDevice
+        ADR     a2, SDMADMACDeviceTemplate
+        MOV     a3, #SDMADevice_DMAC_Size
+        BL      memcpy
+
+        STR     sb, [a1, #SDMADMAC_SB]  ; Fixups
+        LDR     v3, SDMA_LogBase
+        STR     v3, [a1, #HALDevice_Address]
+        MOV     v2, a1
+
+        MOV     a2, a1
+        MOV     a1, #0                  ; No flags
+        CallOS  OS_AddDevice
+
+        MOV     v1, #0
+10
+        ; Declare each of the channels
+        ADRL    a1, SDMADMABDevice
+        ADR     a2, SDMADMABDeviceTemplate
+        MOV     a3, #SDMADevice_DMA_Size
+        MLA     a1, a3, v1, a1
+        BL      memcpy
+
+        STR     sb, [a1, #SDMADMA_SB]   ; Fixups
+        STR     v2, [a1, #HALDevice_DMAController]
+        STR     v3, [a1, #SDMADMA_CtrlRegs]
+        ADD     a2, v3, #DMA4_CBASE
+        MOV     a3, #DMA4_CSIZE
+        MLA     a3, a3, v1, a2
+        STR     a3, [a1, #SDMADMA_Regs]
+        ADD     a3, v2, #SDMADMAC_ChannelPtrs
+        STR     a1, [a3, v1, LSL #2]
+        MOV     a3, #1
+      [ DoubleDMA
+        ORR     a3, a3, a3, LSL #SDMACount / 2
+      ]
+        MOV     a3, a3, LSL v1
+        STR     a3, [a1, #SDMADMA_IRQBit]
+        Push    "a1"
+
+        ADRL    a4, SDMADMABNames       ; Create channel name
+        MOV     a3, #SDMADMABDevice_DescEnd - SDMADMABDevice_Desc
+        MLA     a4, a3, v1, a4
+        STR     a4, [a1, #HALDevice_Description]
+        MOV     a1, a4
+        ADR     a2, SDMADMABDevice_Desc
+        BL      memcpy                  ; Take a strcpy
+        ADD     a1, a1, #SDMADMABDevice_DescTail - SDMADMABDevice_Desc
+        ASSERT  SDMACount < 100
+        MOV     a2, #10
+        UDIV    a4, v1, a2              ; Channel DIV 10
+        MLS     a3, a4, a2, v1          ; Channel MOD 10
+        TEQ     a4, #0
+        ADDNE   a4, a4, #'0'
+        STRNEB  a4, [a1], #1
+        ADD     a3, a3, #'0'
+        STRB    a3, [a1], #1
+
+        Pull    "a2"
+        MOV     a1, #0                  ; No flags
+        CallOS  OS_AddDevice
+        
+        ADD     v1, v1, #1
+      [ DoubleDMA
+        TEQ     v1, #SDMACount / 2
+      |
+        TEQ     v1, #SDMACount
+      ]
+        BNE     %BT10
+
+        Pull    "v1-v3, pc"
+
+SDMADMACDeviceTemplate
+        DCW     HALDeviceType_SysPeri + HALDeviceSysPeri_DMAC
+        DCW     HALDeviceID_DMAC_SDMA
+        DCD     HALDeviceBus_Sys + HALDeviceSysBus_NoC
+        DCD     &10000                  ; API version - 1.0
+        DCD     SDMADMACDevice_Desc
+        DCD     0                       ; Address of SDMA - filled later
+        %       12                      ; Reserved
+        DCD     SDMADMAC_Activate
+        DCD     SDMADMAC_Deactivate
+        DCD     SDMADMAC_Reset
+        DCD     SDMADMAC_Sleep
+        DCD     DevNoSDMA               ; Device
+        DCD     0
+        %       8
+        ; Specifics for a DMA controller
+        DCD     SDMADMAC_Features
+        DCD     SDMADMAC_Enumerate
+        DCD     SDMADMAC_Allocate
+        DCD     SDMADMAC_Deallocate
+        ASSERT  (.-SDMADMACDeviceTemplate) = HALDevice_DMAC_Size
+        DCD     SDMADMAC_TestIRQ2
+        ASSERT  (.-SDMADMACDeviceTemplate) = HALDevice_DMAC_Size_0_1
+        ; Controller's private data from here onwards
+        DCD     0                       ; Copy of HAL's SB
+        DCD     0                       ; Bitmask of allocated channels
+        %       4 * SDMACount           ; Pointers to the channel devices
+        ASSERT  (.-SDMADMACDeviceTemplate) = SDMADevice_DMAC_Size
+        ASSERT  ?SDMADMACDevice = SDMADevice_DMAC_Size
+
+SDMADMACDevice_Desc
+        DCB     "System DMA controller", 0
+        ALIGN
+
+; SDMADMAC_Activate
+; => a1 = DMA controller device
+; <= a1 = success when TRUE
+SDMADMAC_Activate ROUT
+        MOV     a1, #1                  ; SDMA_Init did everything already
+        MOV     pc, lr
+
+; SDMADMAC_Deactivate
+; => a1 = DMA controller device
+SDMADMAC_Deactivate ROUT
+        ; Fall through
+
+; SDMADMAC_Reset
+; => a1 = DMA controller device
+SDMADMAC_Reset ROUT
+        LDR     a4, [a1, #HALDevice_Address]
+
+        ; There's no soft reset bit, at least disable interrupts & channels
+        MOV     a3, #0
+        STR     a3, [a4, #DMA4_IRQENABLE_L0]
+        STR     a3, [a4, #DMA4_IRQENABLE_L1]
+        STR     a3, [a4, #DMA4_IRQENABLE_L2]
+        STR     a3, [a4, #DMA4_IRQENABLE_L3]
+        MOV     ip, #SDMACount
+        ADD     a2, a4, #DMA4_CBASE + DMA4_CCRi
+10
+        STR     a3, [a2], #DMA4_CSIZE
+        SUBS    ip, ip, #1
+        BNE     %BT10
+
+        ; Free up any allocations
+        STR     a3, [a1, #SDMADMAC_Allocated]
+
+        Push    "sb, lr"
+
+        LDR     sb, [a1, #SDMADMAC_SB]
+        MOV     a1, #DevNoSDMA
+        BL      HAL_IRQClear            ; Clear in the GIC
+
+        Pull    "sb, pc"
+
+; SDMADMAC_Sleep
+; => a1 = DMA controller device
+;    a2 = state
+; <= a1 = new state
+SDMADMAC_Sleep ROUT
+        MOV     a1, #0                  ; Will auto idle once deactivated
+        MOV     pc, lr
+
+; SDMADMAC_Features
+; => a1 = DMA controller device
+; <= a1 = flags 
+SDMADMAC_Features ROUT
+        MOV     a1, #0                  ; All reserved
+        MOV     pc, lr
+
+; SDMADMAC_Enumerate
+; => a1 = DMA controller device
+; <= a1 = pointer to an array of DMA (buffer/list) device pointers
+;    a2 = number of entries in the array
+SDMADMAC_Enumerate ROUT
+        ADD     a1, a1, #SDMADMAC_ChannelPtrs
+      [ DoubleDMA
+        MOV     a2, #SDMACount / 2      ; Declare half as they're all double buffered
+      |
+        MOV     a2, #SDMACount
+      ]
+        MOV     pc, lr
+
+; SDMADMAC_TestIRQ2
+; => a1 = DMA controller device
+; <= a1 = logical channel interrupting, or -1 if none
+SDMADMAC_TestIRQ2 ROUT
+        LDR     a2, [a1, #HALDevice_Address]
+        LDR     a3, [a2, #DMA4_IRQSTATUS_L0]
+        CLZ     a3, a3
+        RSBS    a1, a3, #31             ; Range 0 to 32 => 31 to -1
+      [ DoubleDMA
+        BICPL   a1, a1, #SDMACount / 2
+      ]
+        MOV     pc, lr
+
+; SDMADMAC_Allocate
+; => a1 = DMA controller device
+;    a2 = logical channel
+; <= a1 = pointer to a DMA (buffer/list) device, or NULL if no allocation
+SDMADMAC_Allocate ROUT
+        ADR     a4, %FT50
+10
+        LDRSH   a3, [a4], #4
+        TEQ     a2, a3
+        BEQ     %FT20
+
+        CMP     a3, #-1                 ; End of list check
+        MOVEQ   a1, #0                  ; No mapping
+        MOVEQ   pc, lr
+        BNE     %BT10
+20
+        Push    "v1, lr"
+
+        LDRH    a2, [a4, #-2]           ; Real channel
+
+        ; Be atomic while manipulating allocations
+        MRS     a4, CPSR
+        ORR     a3, a4, #I32_bit
+        MSR     CPSR_c, a3
+
+        LDR     a3, [a1, #SDMADMAC_Allocated]
+        CLZ     ip, a3
+        ASSERT  SDMACount <= 32
+      [ DoubleDMA
+        CMP     ip, #32 - (SDMACount / 2)
+      |
+        CMP     ip, #32 - SDMACount
+      ]
+        BEQ     %FT40                   ; No channels left
+
+        RSB     v1, ip, #32             ; Allocate from 0 up
+        MOV     lr, #1
+        ORR     a3, a3, lr, LSL v1
+        STR     a3, [a1, #SDMADMAC_Allocated]
+
+        MSR     CPSR_c, a4
+
+        ADD     a3, a1, #SDMADMAC_ChannelPtrs
+        LDR     a1, [a3, v1, LSL #2]    ; Get the DMA channel device
+
+        ADD     a2, a2, #1              ; CCRi is 1's based
+        LDR     a3, [a1, #SDMADMA_Regs]
+      [ DoubleDMA
+        MOV     lr, #1                  ; Repeat for set A and B
+30
+      ]
+        LDR     ip, [a3, #DMA4_CCRi]
+        BFI     ip, a2, #DMA4_CCRi_SYNCHRO_CONTROL_SHIFT, #DMA4_CCRi_SYNCHRO_CONTROL_BITS 
+        MOV     a4, a2, LSR #DMA4_CCRi_SYNCHRO_CONTROL_BITS
+        BFI     ip, a4, #DMA4_CCRi_SYNCHRO_CONTROL_UPPER_SHIFT, #DMA4_CCRi_SYNCHRO_CONTROL_UPPER_BITS
+        STR     ip, [a3, #DMA4_CCRi]    ; Put the real channel number in the hardware sync
+      [ DoubleDMA
+        MOV     ip, #SDMACount / 2
+        MLA     ip, ip, lr, v1          ; Set B for A, and A for B, to make a circle
+        ASSERT  DMA4_CLNK_CTRLi_NEXTLCH_ID_SHIFT = 0
+        ORR     ip, ip, #DMA4_CLNK_CTRLi_ENABLE_LINK
+        STR     ip, [a3, #DMA4_CLNK_CTRLi]
+
+        SUBS    lr, lr, #1
+        ADDPL   a3, a3, #DMA4_CSIZE * (SDMACount / 2)
+        BPL     %BT30
+      ]
+        Pull    "v1, pc"
+40
+        MOV     a1, #0
+        MSR     CPSR_c, a4
+        Pull    "v1, pc"
+50
+        ;       Logical channel, Table 16-5 mapping
+        DCW     DMALC_Sound0,    DMANoMCASP3Rx0
+        DCW     DMALC_Sound1,    DMANoMCASP3Tx0
+        DCW     DMALC_MMC0,      DMANoMMC1Rx
+        DCW     DMALC_MMC1,      DMANoMMC1Tx
+        DCW     DMALC_Serial0,   DMANoUART1Rx
+        DCW     DMALC_Serial1,   DMANoUART1Tx
+        DCW     -1
+        ALIGN
+        
+; SDMADMAC_Deallocate
+; => a1 = DMA controller device
+;    a2 = logical channel
+;    a3 = DMA channel device
+SDMADMAC_Deallocate ROUT
+        ; Handily, the IRQ bit is implicitly 1:SHL:channelnumber
+        LDR     a2, [a3, #SDMADMA_IRQBit]
+
+        ; Be atomic while manipulating allocations
+        MRS     a4, CPSR
+        ORR     ip, a4, #I32_bit
+        MSR     CPSR_c, ip
+
+        LDR     ip, [a1, #SDMADMAC_Allocated]
+        BIC     ip, ip, a2
+        STR     ip, [a1, #SDMADMAC_Allocated]
+
+        MSR     CPSR_c, a4
+
+        MOV     pc, lr
+
+SDMADMABDeviceTemplate
+        DCW     HALDeviceType_SysPeri + HALDeviceSysPeri_DMAB
+        DCW     HALDeviceID_DMAB_SDMA
+        DCD     HALDeviceBus_Sys + HALDeviceSysBus_NoC
+        DCD     &10000                  ; API version - 1.0
+        DCD     0                       ; Description - filled later
+        DCD     0                       ; Address - N/A
+        %       12                      ; Reserved
+        DCD     SDMADMAB_Activate
+        DCD     SDMADMAB_Deactivate
+        DCD     SDMADMAB_Reset
+        DCD     SDMADMAB_Sleep
+        DCD     DevNoSDMA :OR: 1:SHL:31 ; Device (shared)
+        DCD     SDMADMAB_TestIRQ
+        %       8
+        ; Specifics for a DMA channel
+        DCD     SDMADMAB_Features
+        DCD     0                       ; Parent DMA controller device
+        DCD     SDMADMAB_Abort
+        DCD     SDMADMAB_SetOptions
+        DCD     SDMADMAB_SetCurrentTransfer
+        DCD     SDMADMAB_SetNextTransfer
+        DCD     SDMADMAB_TransferState
+        DCD     SDMADMAB_IRQClear
+        DCD     SDMADMAB_Status
+        DCD     0                       ; SetCurrentTransfer2
+        DCD     0                       ; SetNextTransfer2
+        DCD     0                       ; TransferState2
+        ASSERT  (.-SDMADMABDeviceTemplate) = HALDevice_DMA_Size
+        ; Controller's private data from here onwards
+        DCD     0                       ; Registers for this channel
+        DCD     0                       ; Registers for the controller
+        DCD     0                       ; Copy of HAL's SB
+        DCD     0                       ; Mask bit in controller interrupt register
+        DCD     0                       ; Flags
+        ASSERT  (.-SDMADMABDeviceTemplate) = SDMADevice_DMA_Size
+        ASSERT  ?SDMADMABDevice = (SDMADevice_DMA_Size * SDMACount) 
+
+SDMADMABDevice_Desc
+        DCB     "System DMA channel "
+SDMADMABDevice_DescTail
+        DCB     "?", 0, 0
+SDMADMABDevice_DescEnd        
+        ASSERT  ?SDMADMABNames >= ((.-SDMADMABDevice_Desc) * SDMACount)
+        ALIGN
+
+; SDMADMAB_Activate
+; => a1 = DMA channel device
+; <= a1 = success when TRUE
+SDMADMAB_Activate ROUT
+        LDR     a2, [a1, #SDMADMA_CtrlRegs]
+        LDR     a3, [a1, #SDMADMA_IRQBit]
+
+        ; Be atomic while manipulating interrupt enables
+        MRS     a4, CPSR
+        ORR     ip, a4, #I32_bit
+        MSR     CPSR_c, ip
+
+        LDR     ip, [a2, #DMA4_IRQENABLE_L0]
+        ORR     ip, ip, a3              ; Unleash frame complete interrupt
+        STR     ip, [a2, #DMA4_IRQENABLE_L0]
+
+        MSR     CPSR_c, a4
+
+        MOV     a1, #1
+        MOV     pc, lr
+
+; SDMADMAB_Abort
+; => a1 = DMA channel device
+SDMADMAB_Abort ROUT
+        ; Fall through
+
+; SDMADMAB_Deactivate
+; => a1 = DMA channel device
+SDMADMAB_Deactivate ROUT
+        Push    "v1, sb, lr"
+
+        ADD     a1, a1, #SDMADMA_Regs
+        ASSERT  SDMADMA_Regs + 4 = SDMADMA_CtrlRegs
+        ASSERT  SDMADMA_CtrlRegs + 4 = SDMADMA_SB
+        ASSERT  SDMADMA_SB + 4 = SDMADMA_IRQBit
+        LDMIA   a1, {a3-a4,sb,ip}
+
+      [ DoubleDMA
+        MOV     a1, #1                  ; Repeat for set A and B
+10
+      ]
+        LDR     a2, [a3, #DMA4_CCRi]
+        BIC     a2, a2, #DMA4_CCRi_ENABLE
+        STR     a2, [a3, #DMA4_CCRi]    ; Disable that channel
+20
+        ; 16.1.4.18 of TRM says wait for RD and WR inactive too
+        LDR     a2, [a3, #DMA4_CCRi]
+        TST     a2, #DMA4_CCRi_WR_ACTIVE :OR: DMA4_CCRi_RD_ACTIVE
+        BNE     %BT20
+
+      [ DoubleDMA
+        SUBS    a1, a1, #1
+        ADDPL   a3, a3, #DMA4_CSIZE * (SDMACount / 2)
+        BPL     %BT10
+      ]
+        DMB     SY                      ; Force CPU to refetch RAM that may have just been DMA'd into
+
+        ; Be atomic while manipulating interrupt enables
+        MRS     v1, CPSR
+        ORR     a2, v1, #I32_bit
+        MSR     CPSR_c, a2
+
+        LDR     lr, [a4, #DMA4_IRQSTATUS_L0]
+        LDR     a2, [a4, #DMA4_IRQENABLE_L0]
+        BIC     a2, a2, ip              ; Stop it interrupting
+        STR     a2, [a4, #DMA4_IRQENABLE_L0]
+
+        TST     lr, ip
+        MOVNE   a1, #DevNoSDMA          ; An interrupt came in during deactivation?
+        BLNE    HAL_IRQClear
+
+        MSR     CPSR_c, v1
+
+        Pull    "v1, sb, pc"
+
+; SDMADMAB_Reset
+; => a1 = DMA channel device
+SDMADMAB_Reset ROUT
+        LDR     a3, [a1, #SDMADMA_Regs]
+        LDR     a2, [a1, #SDMADMA_CtrlRegs]
+        LDR     ip, [a1, #SDMADMA_IRQBit]
+
+        ; Be atomic while manipulating interrupt enables
+        MRS     a4, CPSR
+        ORR     a1, a4, #I32_bit
+        MSR     CPSR_c, a1
+
+        LDR     a1, [a2, #DMA4_IRQENABLE_L0]
+        BIC     a1, a1, ip
+        STR     a1, [a2, #DMA4_IRQENABLE_L0]
+
+        MSR     CPSR_c, a4
+
+      [ DoubleDMA
+        MOV     a1, #1                  ; Repeat for set A and B
+10
+      ]
+        ; The writable registers in the TRM which aren't touched by
+        ; restarting a channel are only a few, CSDPi, CENi, CFNi, CSSAi
+        ; CDSAi, CSEIi, CSFIi, CDEIi, CDFIi, CDACi, COLORi, CDPi,
+        ; CNDPi, and CCDNi can be skipped.
+        LDR     a4, [a3, #DMA4_CCRi]
+        LDR     a2, =DMA4_CCRi_SYNCHRO_CONTROL_MASK :OR: \
+                     DMA4_CCRi_SYNCHRO_CONTROL_UPPER_MASK
+        AND     a4, a4, a2
+        STR     a4, [a3, #DMA4_CCRi]
+20
+        ; 16.1.4.18 of TRM says wait for RD and WR inactive too
+        LDR     a4, [a3, #DMA4_CCRi]
+        TST     a4, #DMA4_CCRi_WR_ACTIVE :OR: DMA4_CCRi_RD_ACTIVE
+        BNE     %BT20
+
+        LDR     a4, [a3, #DMA4_CLNK_CTRLi]
+        BIC     a4, a4, #DMA4_CLNK_CTRLi_ENABLE_LINK
+        STR     a4, [a3, #DMA4_CLNK_CTRLi]
+        MOV     a4, #0
+        STR     a4, [a3, #DMA4_CCFNi]
+        STR     a4, [a3, #DMA4_CICRi]
+        MOV     a4, #-1
+        STR     a4, [a3, #DMA4_CCENi]
+        STR     a4, [a3, #DMA4_CSRi]
+      [ DoubleDMA
+        SUBS    a1, a1, #1
+        ADDPL   a3, a3, #DMA4_CSIZE * (SDMACount / 2)
+        BPL     %BT10
+      ]
+        MOV     pc, lr
+
+; SDMADMAB_Sleep
+; => a1 = DMA channel device
+;    a2 = state
+; <= a1 = new state
+SDMADMAB_Sleep ROUT
+        MOV     a1, #0                  ; Will auto idle once deactivated
+        MOV     pc, lr
+
+; SDMADMAB_TestIRQ
+; => a1 = DMA channel device
+; <= a1 = 0 if not interrupting, 1 if it is
+SDMADMAB_TestIRQ
+        LDR     a3, [a1, #SDMADMA_CtrlRegs]
+        LDR     a2, [a3, #DMA4_IRQSTATUS_L0]
+        LDR     a4, [a1, #SDMADMA_IRQBit]
+        ANDS    a1, a2, a4              ; Poll the controller channel bit
+        MOVNE   a1, #1
+        MOV     pc, lr
+
+; SDMADMAB_Features
+; => a1 = DMA channel device
+; <= a1 = flags
+SDMADMAB_Features ROUT
+      [ DoubleDMA
+        MOV     a1, #DMAFeaturesFlag_NoInitIRQ :OR: DMAFeaturesFlag_DoubleBuffered
+      |
+        MOV     a1, #DMAFeaturesFlag_NoInitIRQ
+      ]
+        MOV     pc, lr
+
+; SDMADMAB_SetOptions
+; => a1 = DMA channel device
+;    a2 = flags 0    = set for m->d clear for d->m
+;               1-5  = transfer unit size in bytes
+;               6-8  = cycle speed, arbitrary units, higher is faster
+;               9-12 = delay between transfers
+;               13   = set for no bursting
+;               14   = set to not sync clocks before starting
+;               15   = circular transfer
+;    a3 = physical address of peripheral, unused for m->m
+SDMADMAB_SetOptions ROUT
+        LDR     a4, [a1, #SDMADMA_Regs]
+
+      [ DoubleDMA
+        Push    "a2-a3, lr"             ; Repeat for set A and B
+        MOV     lr, #1
+10
+      ]
+        ; Channel control and source address
+        LDR     ip, [a4, #DMA4_CCRi]
+        LDR     a1, =DMA4_CCRi_SYNCHRO_CONTROL_MASK :OR: \
+                     DMA4_CCRi_SYNCHRO_CONTROL_UPPER_MASK
+        AND     ip, ip, a1              ; Implicit FS=0 BS=0 too
+        TST     a2, #DMASetOptionsFlag_Write
+        ORREQ   ip, ip, #DMA4_CCRi_DST_AMODE_POSTINC
+        STREQ   a3, [a4, #DMA4_CSSAi]
+        ORRNE   ip, ip, #DMA4_CCRi_SRC_AMODE_POSTINC
+        ORRNE   ip, ip, #DMA4_CCRi_PREFETCH ; It's m->d so safe to prefetch
+        STRNE   a3, [a4, #DMA4_CDSAi]
+        STR     ip, [a4, #DMA4_CCRi]
+
+        ; Channel source data parameters (always little endian)
+        AND     a3, a2, #DMASetOptionsMask_Width
+        MOV     a3, a3, LSR #DMASetOptionsShift_Width
+        CMP     a3, #2                  ; Bytes
+        MOVCC   ip, #DMA4_CSDPi_DATA_TYPE_1B
+        MOVEQ   ip, #DMA4_CSDPi_DATA_TYPE_2B
+        MOVHI   ip, #DMA4_CSDPi_DATA_TYPE_4B
+        ORR     ip, ip, #DMA4_CSDPi_DST_PACKED :OR: DMA4_CSDPi_SRC_PACKED
+        ORR     ip, ip, #DMA4_CSDPi_WRITE_MODE_WRP_EXCEPT_LAST
+        TST     a2, #DMASetOptionsFlag_NoBursts
+        ASSERT  DMA4_CSDPi_SRC_BURST_EN_SINGLE = 0
+        ASSERT  DMA4_CSDPi_DST_BURST_EN_SINGLE = 0
+        ORREQ   ip, ip, #DMA4_CSDPi_DST_BURST_EN_64B
+        ORREQ   ip, ip, #DMA4_CSDPi_SRC_BURST_EN_64B
+        TST     a2, #DMASetOptionsFlag_Write
+        BICEQ   ip, ip, #DMA4_CSDPi_SRC_PACKED ; Peripheral not packed d->m
+        BICNE   ip, ip, #DMA4_CSDPi_DST_PACKED ; Peripheral not packed m->d
+        STR     ip, [a4, #DMA4_CSDPi]
+
+        ; Channel interrupt control
+        MOV     ip, #DMA4_FRAME_IT_FLAG ; One frame, one goal, one vision
+        STR     ip, [a4, #DMA4_CICRi]
+
+      [ DoubleDMA
+        ; Link set A and set B
+        LDR     ip, [a4, #DMA4_CLNK_CTRLi]
+        ORR     ip, ip, #DMA4_CLNK_CTRLi_ENABLE_LINK
+        STR     ip, [a4, #DMA4_CLNK_CTRLi]
+
+        SUBS    lr, lr, #1
+        LDMPLIA sp, {a2-a3}
+        ADDPL   a4, a4, #DMA4_CSIZE * (SDMACount / 2)
+        BPL     %BT10
+
+        ADD     sp, sp, #8              ; Junk a2-a3
+        Pull    "pc"
+      |
+        MOV     pc, lr
+      ]
+
+; SDMADMAB_Set[Current|Next]Transfer
+; => a1 = DMA channel device
+;    a2 = address
+;    a3 = length in bytes
+;    a4 = flags 0 = set terminal count pin active
+SDMADMAB_SetCurrentTransfer ROUT
+        DMACallStats &F0, ip, a4
+        MOV     ip, #0                  ; Current
+        B       %FT10
+
+SDMADMAB_SetNextTransfer
+        DMACallStats &F4, ip, a4
+      [ DoubleDMA
+        MOV     ip, #DMA4_CCRi_ENABLE   ; Next
+      |
+        MOV     pc, lr                  ; No shadow set
+      ]
+10
+        Push    "v1, lr"
+
+        ; Decide which set to program
+        LDR     a4, [a1, #SDMADMA_Regs]
+        LDR     v1, [a4, #DMA4_CCRi + (DMA4_CSIZE * (SDMACount / 2))]
+        EOR     lr, ip, v1              ; A running, set current => prog A
+                                        ; A running, set next    => prog B
+                                        ; B running, set current => prog B
+                                        ; B running, set next    => prog A
+        ANDS    lr, lr, #DMA4_CCRi_ENABLE
+        MOVNE   lr, #1
+        ADDNE   a4, a4, #DMA4_CSIZE * (SDMACount / 2)
+        STRB    lr, [a1, #SDMADMA_LastSetWasB]
+        ASSERT  DMA4_CCRi_ENABLE < 256
+        STRB    ip, [a1, #SDMADMA_LastSetNext]
+
+        ; Recall whether it's m->d or d->m
+        TST     v1, #DMA4_CCRi_SRC_AMODE_MASK
+        STREQ   a2, [a4, #DMA4_CDSAi]
+        STRNE   a2, [a4, #DMA4_CSSAi]
+        DMB     ST                      ; Force pending CPU writes to RAM now so that m->d is consistent
+                                        ; and d->m don't get overwritten later by drained CPU writes
+
+        ; Convert length to number of elements
+        LDR     a1, [a4, #DMA4_CSDPi]
+        ASSERT  DMA4_CSDPi_DATA_TYPE_SHIFT = 0
+        AND     a1, a1, #DMA4_CSDPi_DATA_TYPE_MASK
+        ASSERT  DMA4_CSDPi_DATA_TYPE_1B = 0
+        ASSERT  DMA4_CSDPi_DATA_TYPE_2B = 1
+        ASSERT  DMA4_CSDPi_DATA_TYPE_4B = 2
+        MOV     a3, a3, LSR a1          ; Divide by element size
+        STR     a3, [a4, #DMA4_CENi]
+        MOV     a3, #0
+        STR     a3, [a4, #DMA4_CCENi]   ; To track (non) progress
+
+        ; Always 1 frame, since that's the only interrupt enabled
+        MOV     a3, #1
+        STR     a3, [a4, #DMA4_CFNi]
+
+        ; Enable if it's a SetCurrentTransfer
+        TEQ     ip, #0
+        ORREQ   v1, v1, #DMA4_CCRi_ENABLE
+        STREQ   v1, [a4, #DMA4_CCRi]
+
+        Pull    "v1, pc"
+
+; SDMADMAB_TransferState
+; => a1 = DMA channel device
+; <= a1 = address, can be an underestimate
+;    a2 = length in bytes remaining, can be an underestimate
+SDMADMAB_TransferState ROUT
+        LDR     a4, [a1, #SDMADMA_Regs]
+
+        ; Be atomic while collecting transfer stats
+        MRS     a3, CPSR
+        ORR     a1, a3, #I32_bit
+        MSR     CPSR_c, a1
+
+        LDR     ip, [a4, #DMA4_CCRi]
+      [ DoubleDMA
+        TST     ip, #DMA4_CCRi_ENABLE   ; If not enabled, must be the other set
+        ADDEQ   a4, a4, #DMA4_CSIZE * (SDMACount / 2)
+        LDREQ   ip, [a4, #DMA4_CCRi]
+      ]
+        ; Recall whether it's m->d or d->m
+        TST     ip, #DMA4_CCRi_SRC_AMODE_MASK
+        LDREQ   a2, [a4, #DMA4_CDSAi]
+        LDRNE   a2, [a4, #DMA4_CSSAi]
+        LDR     a1, [a4, #DMA4_CCENi]
+        LDR     ip, [a4, #DMA4_CENi]
+        LDR     a4, [a4, #DMA4_CSDPi]
+
+        MSR     CPSR_c, a3
+
+        DMB     SY                      ; Force CPU to refetch RAM that may have just been DMA'd into
+
+        ; Convert number of elements to length
+        ASSERT  DMA4_CSDPi_DATA_TYPE_SHIFT = 0
+        AND     a4, a4, #DMA4_CSDPi_DATA_TYPE_MASK
+        ASSERT  DMA4_CSDPi_DATA_TYPE_1B = 0
+        ASSERT  DMA4_CSDPi_DATA_TYPE_2B = 1
+        ASSERT  DMA4_CSDPi_DATA_TYPE_4B = 2
+        MOV     a3, a1, LSL a4          ; Current length
+        MOV     ip, ip, LSL a4          ; Total length
+        ADD     a1, a2, a3              ; Current address
+        SUB     a2, ip, a3              ; Length remaining
+
+        MOV     pc, lr
+
+; SDMADMAB_IRQClear
+; => a1 = DMA channel device
+SDMADMAB_IRQClear ROUT
+        DMACallStats &F8, ip, a4
+        Push    "sb, v1, lr"
+
+        ADD     a1, a1, #SDMADMA_Regs
+        ASSERT  SDMADMA_Regs + 4 = SDMADMA_CtrlRegs
+        ASSERT  SDMADMA_CtrlRegs + 4 = SDMADMA_SB
+        ASSERT  SDMADMA_SB + 4 = SDMADMA_IRQBit
+        LDMIA   a1, {a3-a4,sb,ip}
+        MOV     a1, #DevNoSDMA
+        MOV     a2, #-1
+
+        ; Be atomic while manipulating interrupt status
+        MRS     v1, CPSR
+        ORR     lr, v1, #I32_bit
+        MSR     CPSR_c, lr
+
+        STR     a2, [a3, #DMA4_CSRi]    ; Clear in the channel
+      [ DoubleDMA
+        STR     a2, [a3, #DMA4_CSRi + (DMA4_CSIZE * (SDMACount / 2))]
+      ]  
+        DSB     SY
+        STR     ip, [a4, #DMA4_IRQSTATUS_L0] ; Clear in the controller
+        DSB     SY
+        BL      HAL_IRQClear            ; Clear in the GIC
+
+        MSR     CPSR_c, v1
+
+        Pull    "sb, v1, pc"
+
+; SDMADMAB_Status
+; => a1 = DMA channel device
+; <= a1 = flags
+SDMADMAB_Status ROUT
+        DMACallStats &FC, ip, a4
+        LDR     ip, [a1, #SDMADMA_Regs]
+
+      [ DoubleDMA
+        Push    "v2-v3, lr"
+
+        LDR     a4, [a1, #SDMADMA_LastFlags]
+10
+        LDR     a2, [ip, #DMA4_CCRi]
+        LDR     a3, [ip, #DMA4_CCRi + (DMA4_CSIZE * (SDMACount / 2))]
+        LDR     v2, [ip, #DMA4_CCRi]
+        LDR     v3, [ip, #DMA4_CCRi + (DMA4_CSIZE * (SDMACount / 2))]
+        TEQ     a2, v2
+        TEQEQ   a3, v3                  ; Consistent pair?
+        BNE     %BT10
+
+        DMB     SY                      ; Force CPU to refetch RAM that may have just been DMA'd into
+
+        TST     a2, #DMA4_CCRi_ENABLE
+        TSTEQ   a3, #DMA4_CCRi_ENABLE
+        BEQ     %FT20                   ; Neither half is enabled
+
+        ; One of the channels is active, so the only thing left to work out is
+        ; if there's an unstarted programmed buffer. Look at the inactive half
+        ; to distinguish a programmed from inactive one. Note it's possible
+        ; it becomes active during evaluation, so re-read the CCR too.
+        MOV     a1, #0
+        TST     a2, #DMA4_CCRi_ENABLE   ; Inspect B if A is active, and vice versa
+        ADDNE   ip, ip, #DMA4_CSIZE * (SDMACount / 2)
+        LDR     a2, [ip, #DMA4_CCENi]   
+        LDR     a3, [ip, #DMA4_CCRi]
+        TEQ     a2, #0                  ; Disabled and zero means programmed
+        TSTEQ   a3, #DMA4_CCRi_ENABLE
+        ORRNE   a1, a1, #DMAStatusFlag_NoUnstarted
+        Pull    "v2-v3, pc"
+20
+        ; An overrun exists
+        MOV     a1, #DMAStatusFlag_Overrun :OR: DMAStatusFlag_NoUnstarted
+
+        ; See if the overrun occurred while trying to complete a SetNextTransfer call
+        ; signified by the current element number being zero in the last programmed
+        ; half. Because there's an overrun, there's no hurry to read any state
+        ; since both halves are idle.
+        ASSERT  SDMADMA_LastSetNext = SDMADMA_LastFlags + 1
+        TST     a4, #&FF00
+        Pull    "v2-v3, pc", EQ         ; Didn't use SetNextTransfer
+
+        ASSERT  SDMADMA_LastSetWasB = SDMADMA_LastFlags + 0
+        TST     a4, #&00FF              ; Last programmed set
+        LDREQ   a2, [ip, #DMA4_CCENi]
+        LDRNE   a2, [ip, #DMA4_CCENi + (DMA4_CSIZE * (SDMACount / 2))]
+        TEQ     a2, #0
+        ORREQ   a1, a1, #DMAStatusFlag_EarlyOverrun
+
+        Pull    "v2-v3, pc"
+      |
+        ; There's no shadow set of registers, so there are always no unstarted transfers,
+        ; then if the channel is not enabled it's a 'not yet been used' overrun. 
+        LDR     a2, [ip, #DMA4_CCRi]
+        TST     a2, #DMA4_CCRi_ENABLE
+        MOVNE   a1, #DMAStatusFlag_NoUnstarted
+        MOVEQ   a1, #DMAStatusFlag_NoUnstarted :OR: DMAStatusFlag_Overrun
+        DMB     SY                      ; Force CPU to refetch RAM that may have just been DMA'd into
+        MOV     pc, lr
+      ]
+
+        END

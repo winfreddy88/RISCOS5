@@ -1,0 +1,309 @@
+; Copyright 2016 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+
+GenCmd_Init    ROUT
+        Entry   "r0-r1,r7", VCHIQ_Service_Size
+        LDR     r0, GenCmdService
+        CMP     r0, #0
+        EXIT    NE
+        BL      VCHIQInit
+        FRAMSTR r0,VS
+        EXIT    VS
+        ; Create service
+        MOV     r0, #1
+        STR     r0, [sp, #VCHIQ_Service_Version]
+        STR     r0, [sp, #VCHIQ_Service_Version_Min]
+        LDR     r0, =&47434D44 ; 'GCMD'
+        STR     r0, [sp, #VCHIQ_Service_Id]
+        MOV     r0, #0
+        STR     r0, [sp, #VCHIQ_Service_Reserved]
+        STR     r0, [sp, #VCHIQ_Service_RxFifoSize]
+        STR     r0, [sp, #VCHIQ_Service_TxFifoSize]
+        ADR     r1, GenCmd_ClientCallback
+        STR     r1, [sp, #VCHIQ_Service_Callback]
+        STR     r0, [sp, #VCHIQ_Service_CallbackParam]
+        STR     r0, [sp, #VCHIQ_Service_WantUnalignedBulkRx]
+        STR     r0, [sp, #VCHIQ_Service_WantUnalignedBulkTx]
+        STR     r0, [sp, #VCHIQ_Service_WantCRC]
+        LDR     r0, VCHIQInstance
+        MOV     r1, sp
+        SWI     XVCHIQ_ServiceOpen
+        MOVVS   r7, r0
+        BVS     %FT89
+        STR     r0, GenCmdService
+        ; Release service (message functions will 'use' it again)
+        SWI     XVCHIQ_ServiceRelease
+        ; Query the GPU limits & display rotation
+        MOV     r0, #DisplayStatus_Changing
+        MOV     r1, #Service_DisplayStatus
+        LDRB    r2, GVinstance
+        CMP     r2, #255
+        SWINE   XOS_ServiceCall
+        ; For these, firwmare will return 0 if setting is absent from config.txt
+        ADR     r0, MaxFramebufferWidth
+        BL      GenCmd_GetConfigInt
+        STRNE   r0, MaxFBWidth
+        ADR     r0, MaxFramebufferHeight
+        BL      GenCmd_GetConfigInt
+        STRNE   r0, MaxFBHeight
+        ADR     r0, HDMIPixelFreqLimit
+        BL      GenCmd_GetConfigInt
+        STRNE   r0, MaxPixelClock
+        ADR     r0, HDMIPixelFreqLimitMin
+        BL      GenCmd_GetConfigInt
+        STRNE   r0, MinPixelClock
+        ADR     r0, DisplayRotateStr
+        BL      GenCmd_GetConfigInt
+        STRNE   r0, DisplayRotate
+        ; Firmware will return 1 by default, and we need to detect the 0 case
+        ADR     r0, FramebufferIgnoreAlphaStr
+        BL      GenCmd_GetConfigInt
+        STRVC   r0, FramebufferIgnoreAlpha
+      [ GPUMode
+        ADR     r0, HDMIGroup
+        BL      GenCmd_GetConfigInt
+        STRVC   r0, ConfigHDMIGroup
+      ]
+        CMP     r2, #255
+        MOV     r0, #DisplayStatus_Changed
+        SWINE   XOS_ServiceCall
+        CLRV
+        EXIT
+89
+        MOV     r0, #0
+        STR     r0, GenCmdService        
+        FRAMSTR r7,,r0
+        SETV
+        EXIT
+
+CmdTable
+        Command VCGenCmd, 255, 1, International_Help
+        =       0
+
+VCGenCmd_Help
+        =       "HGC", 0
+VCGenCmd_Syntax
+        =       "SGC", 0
+MaxFramebufferWidth
+        =       "max_framebuffer_width", 0
+MaxFramebufferHeight
+        =       "max_framebuffer_height", 0
+HDMIPixelFreqLimit
+        =       "hdmi_pixel_freq_limit", 0
+HDMIPixelFreqLimitMin
+        =       "hdmi_pixel_freq_limit_min", 0
+DisplayRotateStr
+        =       "display_rotate", 0
+FramebufferIgnoreAlphaStr
+        =       "framebuffer_ignore_alpha", 0
+ [ GPUMode
+HDMIGroup
+        =       "hdmi_group", 0
+ ]
+GetConfig
+        =       "get_config ", 0
+        ALIGN
+
+GenCmd_ClientCallback
+        ; Did we receive a message?
+        CMP     r1, #VCHI_CALLBACK_MSG_AVAILABLE
+        STREQ   r1, GenCmdResponded
+        MOV     pc, lr
+
+GenCmd_Finalise ROUT
+        Entry   "r0"
+        ; Release service
+        LDR     r0, GenCmdService
+        CMP     r0, #0
+        EXIT    EQ
+        SWI     XVCHIQ_ServiceUse
+        LDR     r0, GenCmdService
+        SWI     XVCHIQ_ServiceClose
+        MOV     r0, #0
+        STR     r0, GenCmdService
+        EXIT
+
+; in:
+; r0 -> command buffer
+; r1 = command length (incl. terminator)
+; r2 -> response buffer
+; r3 = response buffer length (incl. status word)
+; out:
+; r0 = response length (incl. status word)
+GenCmd_Send ROUT
+        Entry   "r4-r5"
+        LDR     r4, GenCmdService
+        ADR     r5, GenCmdResponded
+        BL      VCHIQSend
+        EXIT
+
+; in:
+; r0 -> config parameter name
+; out:
+; r0 = config value (iff V clear)
+; V set on error (r0 corrupt)
+; Z set if non-zero value returned
+; else Z clear (error returned or zero returned)
+; Note: The GPU *may* return 0 for config parameters that are known to the
+; firmware but have no value specified in the config (depends on item)
+GenCmd_GetConfigInt ROUT
+        Entry   "r0-r3", 64
+        MOV     r1, sp
+        ADR     r2, GetConfig
+10
+        LDRB    r3, [r2], #1
+        CMP     r3, #0
+        STRNEB  r3, [r1], #1
+        BNE     %BT10
+20
+        LDRB    r3, [r0], #1
+        CMP     r3, #0
+        STRB    r3, [r1], #1
+        BNE     %BT20
+        MOV     r0, sp
+        SUB     r1, r1, r0
+        MOV     r2, sp
+        MOV     r3, #64
+        BL      GenCmd_Send
+        BVS     %FT90
+        ; Check status
+        LDR     r0, [sp]
+        CMP     r0, #0
+        BNE     %FT90
+        ; Result should be of the form <name>=<number>
+        ; Number could be decimal or C-style hex
+        FRAMLDR r0
+        ADD     r1, sp, #4
+30
+        LDRB    r2, [r0], #1
+        LDRB    r3, [r1], #1
+        CMP     r2, #0
+        BEQ     %FT40
+        CMP     r2, r3
+        BEQ     %BT30
+        B       %FT90
+40
+        CMP     r3, #'='
+        BNE     %FT90
+        MOV     r0, #0
+        LDRB    r2, [r1]
+        LDRB    r3, [r1, #1]
+        CMP     r3, #'x'
+        CMPNE   r3, #'X'
+        CMPEQ   r2, #'0'
+        BEQ     %FT60
+        SUB     r2, r2, #'0'
+        CMP     r2, #9
+        BHI     %FT90
+        ; Decimal
+        MOV     r3, #10
+50
+        LDRB    r2, [r1], #1
+        CMP     r2, #0
+        BEQ     %FT99
+        SUB     r2, r2, #'0'
+        CMP     r2, #9
+        BHI     %FT90
+        MLA     r0, r3, r0, r2
+        B       %BT50
+60
+        ADD     r1, r1, #2
+        LDRB    r2, [r1]
+        SUB     r3, r2, #'0'
+        CMP     r3, #9
+        SUBHI   r3, r2, #'A'
+        CMPHI   r3, #5
+        SUBHI   r3, r2, #'a'
+        CMPHI   r3, #5
+        BLS     %FT70
+        ; Hex
+70
+        LDRB    r2, [r1], #1
+        CMP     r2, #0
+        BEQ     %FT99
+        SUB     r3, r2, #'0'
+        CMP     r3, #9
+        ADDLS   r0, r3, r0, LSL #4
+        BLS     %BT70
+        SUB     r3, r2, #'A'
+        CMP     r3, #5
+        SUBHI   r3, r2, #'a'
+        CMPHI   r3, #5
+        ADDLS   r0, r3, r0, LSL #4
+        ADDLS   r0, r0, #10
+        BLS     %BT70
+90
+        MSR     CPSR_f,#V_bit ; Z clear
+        EXIT
+99
+      [ Debug
+        BL      DebugHexTX4
+        FRAMLDR r1,,r0
+        BL      DebugTXS
+        BL      DebugTXStrInline
+        DCB     10,13,0
+        ALIGN        
+      ]
+        CMP     r0, #0 ; Z set/clear, V clear
+        FRAMSTR r0
+        EXIT
+
+
+VCGenCmd_BufLen * 1024
+
+; r0 -> command tail
+VCGenCmd_Code        
+        Entry   "r1-r3", VCGenCmd_BufLen
+        LDR     r12, [r12]
+        ; Try and init
+        LDR     r1, GenCmdService
+        CMP     r1, #0
+        BNE     %FT20
+        BL      GenCmd_Init
+        EXIT    VS
+20
+        ; Copy command to stack so we can ensure it's null terminated
+        ; Plus, calculate length
+        MOV     r1, #0
+30
+        LDRB    r2, [r0, r1]
+        CMP     r2, #32
+        RSBGES  lr, r1, #VCGenCmd_BufLen-4 ; Avoid buffer overflow
+        MOVLT   r2, #0
+        STRB    r2, [sp, r1]
+        ADD     r1, r1, #1
+        BGE     %BT30
+        MOV     r0, sp
+        MOV     r2, sp
+        MOV     r3, #VCGenCmd_BufLen
+        BL      GenCmd_Send
+        EXIT    VS
+        ADD     r2, r2, #4 ; Ignore status word
+        ; Response will be use LF for newline, we need LF-CR to match OS_NewLine
+40
+        LDRB    r0, [r2], #1
+        TEQ     r0, #0
+        BEQ     %FT50
+        SWI     XOS_WriteC
+        EXIT    VS
+        TEQ     r0, #10
+        SWIEQ   XOS_WriteI+13
+        B       %BT40
+50
+        ; Final newline also needed
+        SWI     XOS_NewLine
+        EXIT
+
+        END

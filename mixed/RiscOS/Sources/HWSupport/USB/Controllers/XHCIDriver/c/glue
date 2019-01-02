@@ -1,0 +1,461 @@
+/*
+ * Copyright (c) 2014, Elesar Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of Elesar Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include <stdlib.h>
+#include <string.h>
+#include "swis.h"
+
+#include "Global/OSRSI6.h"
+#include "Global/HALEntries.h"
+#include "Interface/USBDriver.h"
+#include "Interface/RTSupport.h"
+
+#include "AsmUtils/clz.h"
+#include "AsmUtils/callbacks.h"
+#include "AsmUtils/irqs.h"
+#include "SyncLib/synclib.h"
+#include "callx/callx.h"
+
+#include "machine/bus.h"
+
+#include "sys/param.h"
+#include "sys/systm.h"
+#include "sys/types.h"
+#include "sys/kmem.h"
+#include "sys/pool.h"
+
+#include "dev/usb/usb.h"
+#include "dev/usb/usbdi.h"
+#include "dev/usb/usbdivar.h"
+
+#include "glue.h"
+
+#include "USB/USBDevFS.h"
+#include "DebugLib/DebugLib.h"
+
+/*
+ * Memory pools
+ */
+typedef struct
+{
+	uint64_t   alloc;
+	void      *mem;
+	size_t     log2each;
+#define POOL_GUARD 0x4C4F4F50
+	uint32_t   guard;
+} pool_cache_private_t;
+
+pool_cache_t pool_cache_init(size_t size, u_int align, u_int align_offset, u_int flags,
+                             const char *name, struct pool_allocator *palloc, int ipl,
+                             int (*ctor)(void *, void *, int),
+                             void (*dtor)(void *, void *),
+                             void *arg)
+{
+	pool_cache_private_t *p;
+	void    *store;
+	uint32_t each;
+	_kernel_oserror *e;
+
+	/* Pretty crude emulation, check our assumptions hold water */
+	if ((align != 0) || (align_offset != 0) || (palloc != NULL) ||
+	    (ctor != NULL) || (dtor != NULL))
+	{
+		dprintf(("", "pool_cache_init asserted\n"));
+		return NULL;
+	}
+
+	/* Round size up to the next power of 2, and keep a pool
+	 * of 64 of them so allocation can be bitmask fiddling.
+	 * Although current only xfer structs are allocated from this pool,
+	 * we'll use PCI_RAMAlloc to meet the alignment requirements and any
+	 * future use that might involve DMA.
+	 */
+	each = 1u << (31 - clz(size + (size - 1)));
+	dprintf(("", "Pool items are %u each (from %u)\n", each, size));
+	e = _swix(PCI_RAMAlloc, _INR(0,2) | _OUT(0), each * 64, each, 0, &store);
+	if ((e != NULL) || (store == NULL))
+	{
+		dprintf(("", "Couldn't get a pool of %u bytes\n", each * 64));
+		return NULL;
+	}
+	p = malloc(sizeof(pool_cache_private_t));
+	p->alloc = 0;
+	p->mem = store;
+	p->log2each = 31 - clz(each);
+	p->guard = POOL_GUARD;
+
+	UNUSED(arg);
+	UNUSED(ipl);
+	UNUSED(name);
+	UNUSED(flags);
+
+	return (pool_cache_t)p;
+}
+
+void pool_cache_destroy(pool_cache_t pc)
+{
+	pool_cache_private_t *p = (pool_cache_private_t *)pc;
+
+	if (p->guard != POOL_GUARD) return;
+
+	/* Invalidate the pool, then free it */
+	p->guard = 0;
+	_swix(PCI_RAMFree, _IN(0), p->mem);
+	free(p);
+}
+
+void *pool_cache_get(pool_cache_t pc, int flags)
+{
+	pool_cache_private_t *p = (pool_cache_private_t *)pc;
+	int    state;
+	size_t i;
+	uint64_t alloc;
+
+	if (p->guard != POOL_GUARD) return NULL;
+	state = ensure_irqs_off();
+
+	/* Find a free bit */
+	alloc = p->alloc;
+	for (i = 0; i < 64; i++)
+	{
+//TODO! Track high watermark, incase 64 isn't enough?
+		if (((uint32_t)alloc & 1) == 0)
+		{
+			p->alloc |= (1uLL<<i);
+			restore_irqs(state);
+			return (void *)((i << p->log2each) + (uintptr_t)p->mem);
+		}
+		alloc = alloc >> 1;
+	}
+	restore_irqs(state);
+
+	UNUSED(flags);
+
+	return NULL;
+}
+
+void pool_cache_put(pool_cache_t pc, void *object)
+{
+	pool_cache_private_t *p = (pool_cache_private_t *)pc;
+	int    state;
+	size_t i;
+
+	if (p->guard != POOL_GUARD) return;
+	i = ((uintptr_t)object - (uintptr_t)p->mem) >> p->log2each;
+
+	state = ensure_irqs_off();
+
+	/* Return to the pool */
+	if (i < 64) p->alloc &= ~(1uLL<<i);
+
+	restore_irqs(state);
+}
+
+void *malloc_contig(int len, int alignment)
+{
+	void *p;
+	_kernel_oserror *e;
+
+	e = _swix(PCI_RAMAlloc, _INR(0,2) | _OUT(0), len, alignment, 0, &p);
+	if ((e != NULL) || (p == NULL))
+	{
+		dprintf(("", "Failed to allocate %d bytes at %d alignment -> %s\n",
+		             len, alignment, (e == NULL) ? "OK" : e->errmess));
+		return NULL;
+	}
+
+	memset(p, '\0', len);
+
+	return p;
+}
+
+void free_contig(void **mem)
+{
+	_swix(PCI_RAMFree, _IN(0), *mem);
+}
+
+void *kmem_zalloc(size_t size, km_flag_t kmflags)
+{
+	UNUSED(kmflags);
+
+	return calloc(size, 1);
+}
+
+void kmem_free(void *p, size_t size)
+{
+	UNUSED(size);
+
+	free(p);
+}
+
+/*
+ * Callouts 
+ */
+static _kernel_oserror *callout_handler(_kernel_swi_regs *r, void *pw, void *arg)
+{
+	struct callout *c = (struct callout *)arg;
+
+	/* Called by the callx library, recover the NetBSD callout details and pass on */
+	if (c->c_func != NULL) c->c_func(c->c_arg);
+	UNUSED(r);
+	UNUSED(pw);
+
+	return NULL;
+}
+
+void callout_stop(struct callout *c)
+{
+	c->c_func = NULL;
+	callx_remove_callafter(callout_handler, c);
+}
+
+void callout_reset(struct callout *c, int i, void (*f)(void *), void *v)
+{
+	if ((c->c_arg == v) && (c->c_func == f))
+	{
+		/* Reschedule existing (cancel then rebook) */
+		callout_stop(c);
+	}
+	c->c_arg = v;
+	c->c_func = f;
+
+	/* Given milliseconds, want (at least 1) centiseconds for callx */
+	if (i <= 0) i = 1;
+	callx_add_callafter((i + 9) / 10, callout_handler, c);
+}
+
+/*
+ * Emulate usb_init_task/usb_add_task for pipe timeouts
+ */
+void glue_abort_pipe(struct usb_task *task, void (*fun)(void *), void *arg)
+{
+	extern void *g_pw;
+	static const int pollword = 1;
+
+	/* Schedule the task at callback after interrupt level */
+	task->fun = fun;
+	task->arg = arg;
+	_swix(RT_Register, _INR(0,7)|_OUT(0),
+	      0, /* Flags */
+	      glue_rt_entry, *((uint32_t **)g_pw)+1, task, &pollword, NULL, NULL,
+	      "XHCIAbortPipe:50",
+	      (int *)&task->next /* Repurpose TAILQ for keeping a handle */);
+}
+
+void glue_clear_endpoint_stall(struct usb_task *task, void (*fun)(void *), void *arg)
+{
+	extern void *g_pw;
+	static const int pollword = 1;
+
+	/* Schedule the task at callback after interrupt level */
+	task->fun = fun;
+	task->arg = arg;
+	_swix(RT_Register, _INR(0,7)|_OUT(0),
+	      0, /* Flags */
+	      glue_rt_entry, *((uint32_t **)g_pw)+1, task, &pollword, NULL, NULL,
+	      "XHCIClearStall:50",
+	      (int *)&task->next /* Repurpose TAILQ for keeping a handle */);
+}
+
+int glue_rt_handler(void *arg)
+{
+	const struct usb_task *task = arg;
+
+	task->fun(task->arg);
+
+	/* Task returned, kill it */
+	_swix(RT_Deregister, _INR(0,1), 0, *(int *)&task->next);
+
+	return 0;
+}
+
+/*
+ * Semaphores
+ */
+void cv_init(kcondvar_t *cv, const char *wmesg)
+{
+	*cv = 0; /* No signal to start */
+	UNUSED(wmesg);
+}
+
+void cv_destroy(kcondvar_t *cv)
+{
+	UNUSED(cv);
+}
+
+void cv_signal(kcondvar_t *cv)
+{
+	*cv = 1; /* Signal */
+}
+
+int cv_timedwait(kcondvar_t *cv, kmutex_t *mtx, int ticks)
+{
+	kcondvar_t result;
+	bool forever = (ticks == 0);
+
+	/* There's only one signal/timedwait pair in the code, so this just
+	 * reduces to a simple semaphore.
+	 */
+	while (*cv == 0)
+	{
+		usb_delay_ms(NULL, 1);
+		ticks--;
+		if (!forever && (ticks == 0))
+		{
+			dprintf(("", "CV timed out!"));
+			break;
+		}
+	}
+
+	/* Clear the signal for next time */
+	result = *cv;
+	*cv = 0;
+
+	UNUSED(mtx);
+
+	return result ? 0 : EWOULDBLOCK;
+}
+
+/*
+ * Little helpers
+ */
+int ffs(int value)
+{
+	/* Find first set, bits are numbered 1-32 */
+	if (value) return 1 + ctz(value);
+	return 0;
+}
+
+/*
+ * USB daemon leaf functions
+ */
+void usb_delay_ms(usbd_bus_handle h, u_int d)
+{
+	static int *irqsema = NULL;
+	uint32_t    micros;
+
+	if (irqsema == NULL)
+	{
+		/* One time lookup of IRQ semaphore location */
+		_swix(OS_ReadSysInfo, _INR(0,2) | _OUT(2),
+		      6, 0, OSRSI6_IRQsema, &irqsema);
+	}
+	micros = d * 1000;
+	while (micros)
+	{
+		/* Wait 100us, do some callbacks, wait again */
+		_swix(OS_Hardware, _IN(0) | _INR(8,9), 100,
+		      OSHW_CallHAL, EntryNo_HAL_CounterDelay);
+		if (*irqsema == 0) usermode_donothing();
+		micros -= 100;
+	}
+
+	UNUSED(h);
+}
+
+const char *usbd_errstr(usbd_status s)
+{
+	UNUSED(s);
+	return "!";
+}
+
+void usb_schedsoftintr(struct usbd_bus *sc)
+{
+	_swix(USBDriver_ScheduleSoftInterrupt, _IN(0), sc);
+}
+
+usbd_status usb_insert_transfer(usbd_xfer_handle xfer)
+{
+	usbd_status status = USBD_CANCELLED; /* Should _swix() error */
+
+	_swix(USBDriver_InsertTransfer, _IN(0) | _OUT(0), xfer, &status);
+
+	return status;
+}
+
+void usb_transfer_complete(usbd_xfer_handle xfer)
+{
+	_swix(USBDriver_TransferComplete, _IN(0), xfer);
+}
+
+/*
+ * Bus space
+ */
+int bus_space_subregion(bus_space_tag_t space, bus_space_handle_t handle,
+                        bus_size_t offset, bus_size_t size, bus_space_handle_t *nhandlep)
+{
+	/* The HAL mapped in the whole register set, so this just needs to
+	 * derive a new handle (logical address) for use with read_4 and write_4.
+	 */
+	*nhandlep = (bus_space_handle_t)(offset + (uintptr_t)handle);
+	UNUSED(space);
+	UNUSED(size);
+
+	return 0;
+}
+
+void bus_write_4(bus_space_handle_t space, bus_size_t offset, uint32_t value)
+{
+	volatile uint32_t *base;
+
+	base = (volatile uint32_t *)space;
+	base[offset >> 2] = value;
+}
+
+uint32_t bus_read_4(bus_space_handle_t space, bus_size_t offset)
+{
+	volatile uint32_t *base;
+
+	base = (volatile uint32_t *)space;
+
+	return base[offset >> 2];
+}
+
+/*
+ * Virtual to physical
+ */
+int vtophys(void *v)
+{
+	struct
+	{
+		size_t page;
+		void  *logical;
+		void  *physical;
+	} block;
+	block.logical = v;
+	_swix(OS_Memory, _INR(0,2), (1<<9) + (1<<13), &block, 1);
+
+	return (int)block.physical;
+}
+
+/*
+ * Dummy function
+ */
+void aprint_normal(void *fmt, ...)
+{
+	UNUSED(fmt);
+}

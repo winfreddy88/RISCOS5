@@ -1,0 +1,619 @@
+; Copyright 2012 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+        GET     GraphicsV
+
+        GBLL    RenDebug
+RenDebug SETL   Debug :LAND: {FALSE}        
+
+        MACRO
+        GVEntry $name
+        ASSERT  . - GraphicsV_Table = GraphicsV_$name * 4
+        B       GV_$name
+        MEND
+
+        MACRO
+        RIEntry $name
+        ASSERT  . - ReadInfo_Table = GVReadInfo_$name * 4
+        B       RI_$name
+        MEND
+
+; Reason code is in R4 lower bytes. bits 31..24 = display number, default 0
+GraphicsV_Handler
+        Push    "lr"
+        LDRB    lr, GVinstance       ; may need another if more than 1 graphics module
+        EOR     lr, R4, lr, LSL #24  ; the below test will fail if this is the wrong driver
+        BIC     lr, lr, #&ff0000     ; mask out head/overlay number
+        CMP     lr, #(GraphicsV_TableEnd - GraphicsV_Table) / 4
+        ADDLO   pc, pc, lr, LSL #2
+        Pull    "pc"
+GraphicsV_Table
+        Pull    "pc"                 ;   
+        Pull    "pc"                 ; GV_VSync irq occurred                    
+        GVEntry SetMode              ; GV_SetMode                 
+        Pull    "pc"                 ; GV_SetInterlace            
+        GVEntry SetBlank             ; GV_SetBlank                
+        GVEntry UpdatePointer        ; GV_UpdatePointer           
+        GVEntry SetDMAAddress        ; GV_SetAddress              
+        GVEntry VetMode              ; GV_VetMode                 
+        GVEntry DisplayFeatures      ; GV_Features                
+        GVEntry FramestoreAddress    ; GV_FramestoreAddress
+        GVEntry WritePaletteEntry    ; GV_WritePaletteEntry       
+        GVEntry WritePaletteEntries  ; GV_WritePaletteEntries     
+        Pull    "pc"                 ; GV_ReadPaletteEntry
+        GVEntry Render               ; GV_Render                  
+        GVEntry IICOp                ; GV_IICOp                
+        Pull    "pc"                 ; GV_SelectHead
+      [ BuiltinMDF
+        GVEntry StartupMode          ; GV_StartupMode
+      |
+        Pull    "pc"                 ; GV_StartupMode
+      ]
+        GVEntry PixelFormats         ; GV_PixelFormats
+        GVEntry ReadInfo             ; GV_ReadInfo
+        GVEntry VetMode2             ; GV_VetMode2
+        GVEntry CreateOverlay
+        GVEntry DestroyOverlay
+        GVEntry SetOverlayPosition
+        GVEntry MapOverlayBuffer
+        GVEntry UnmapOverlayBuffer
+        GVEntry DiscardOverlayBuffer
+        GVEntry VetOverlay
+        GVEntry SetOverlayTransform
+        GVEntry SetOverlayZOrder
+GraphicsV_TableEnd
+
+GV_VetMode
+        Push    "r2"
+        BL      VetModeFromVIDCList
+        ASSERT  GVVetMode2_Result_Unsupported = 0
+        TST     r0, #GVVetMode2_ResultMask
+        ANDNE   r0, r0, #GVVetMode2_ExtraBytes_Invalid
+        MOVEQ   r0, #1
+        MOV     r4, #0
+        Pull    "r2,pc"
+
+GV_VetMode2
+        BL      VetModeFromVIDCList  ; Returns with r0, r2 correct
+        ; Fill in the other registers
+        MOV     r1, #32
+        MOV     r4, #0
+        Pull    "pc"
+
+GV_SetMode
+        Push    "r2"
+        BL      SetModeFromVIDCList
+        MOV     r4, #0
+        Pull    "r2,pc"
+
+GV_SetBlank
+        ; Assume state is changing and always request a message send
+        AND     r4, r0, #1
+        STRB    r4, BlankState
+        STR     lr, UpdateNeeded
+        MOV     r4, #0
+        Pull    "pc"
+
+GV_SelectHead
+;        BL      SelectHead
+        MOV     r4, #0
+        Pull    "pc"
+
+GV_UpdatePointer
+      [ HWPointer
+        LDR     lr, HWPActive
+        TEQ     lr, #0
+        BNE     HWP_Update
+      ]
+        Pull    "pc"
+
+GV_SetDMAAddress
+      [ Debug
+        Push    "r0"
+        BL      DebugHexTX4
+        MOV     r0, r1
+        BL      DebugHexTX4
+        BL      DebugTXStrInline
+        DCB     "GV_SetDMAAddress",10,13,0
+        ALIGN
+        Pull    "r0"
+      ]
+        TEQ     r0, #3
+        STREQ   r1, vdu_init
+        TEQ     r0, #0
+        BLEQ    SetVinit
+        MOV     r4, #0
+        Pull    "pc"
+
+GV_DisplayFeatures
+        MOV     r0, #GVDisplayFeature_InterlaceWithProgressiveFramestore+GVDisplayFeature_SeparateFramestore+GVDisplayFeature_VariableFramestore+GVDisplayFeature_CopyRectangleIsFast
+      [ HWPointer
+        ; Only claim hardware pointer if (a) it's available and (b) the screen
+        ; is small enough to not hit the GPU coord limit
+        LDR     r1, HWPActive
+        TEQ     r1, #0
+        ORRNE   r0, r0, #GVDisplayFeature_HardwarePointer
+        LDR     r1, DisplayWidth
+        CMP     r1, #2048
+        LDRLE   r2, DisplayHeight
+        CMPLE   r2, #2048
+        BICGT   r0, r0, #GVDisplayFeature_HardwarePointer
+      ]
+        LDRB    r1, VSyncAvailable
+        TEQ     r1, #0
+        ORREQ   r0, r0, #GVDisplayFeature_NoVsyncIRQ
+        MOV     r1, #2_101000           ; 8,32bpp supported. 16bpp is RGB565, i.e. 2_RRRRRGGGGGGBBBBB
+      [ AemulorSupport
+        ; We must claim we support the regular 32K colour mode in order for 64K
+        ; colour modes to work correctly when old versions of Aemulor are loaded
+        LDRB    lr, OldAemulor
+        TEQ     lr, #0
+        ORRNE   r1, r1, #2_010000
+      ]
+        MOV     r2, #32                 ; framestore must be 32 byte aligned?
+        MOV     r4, #0
+        Pull    "pc"
+
+GV_FramestoreAddress
+ [ Debug
+ bl DebugTXStrInline
+ DCB "GC_FSA size, base", 0
+ ALIGN
+ ]
+        LDR     r1, mbscrsz
+ [ Debug
+ mov r0, r1
+ bl DebugHexTX4
+ ]
+       LDR     r0, mbbase
+ [ Debug
+ bl DebugHexTX4
+ ]
+        MOV     r4, #0
+ [ Debug
+ bl DebugTXStrInline
+ DCB 10,13, 0
+ ALIGN
+ ]
+        Pull    "pc"
+
+GV_WritePaletteEntry ROUT
+        MOV     r4, #0
+        CMP     r0, #1
+        BGT     %FT50
+        Pull    "pc", EQ ; Border colour not supported
+        ; Standard palette entry
+        LDR     lr, mbbpp
+        CMP     lr, #8
+        Push    "r1,r3"
+        MOV     r3, #1
+        MOV     r1, sp
+        ADR     lr, %FT40
+        BNE     SetGamma
+        B       SetPalette
+40
+        Pull    "r1,r3,pc"
+
+50
+        ADR     lr, CurPalette
+        STR     r1, [lr, r2, LSL #2]
+      [ HWPointer
+        STRB    r0, HWPPalDirty
+      ]
+        Pull    "pc" 
+
+GV_WritePaletteEntries ROUT
+        MOV     r4, #0
+        CMP     r3, #0
+        CMPNE   r0, #1
+        BGT     %FT50
+        Pull    "pc", EQ ; Zero palette entries, or border colour
+        ; Standard palette entries
+        LDR     lr, mbbpp
+        CMP     lr, #8
+        ADR     lr, %FT40
+        BNE     SetGamma
+        B       SetPalette
+40
+        Pull    "pc"
+
+50
+        Push    "r0,r3"
+        ADR     lr, CurPalette
+        ADD     lr, lr, r2, LSL #2
+      [ HWPointer
+        STRB    r0, HWPPalDirty
+      ]
+60
+        LDR     r0, [r1], #4
+        STR     r0, [lr], #4
+        SUBS    r3, r3, #1
+        BNE     %BT60
+        Pull    "r0,r3,pc"
+
+GV_IICOp ROUT
+        ; => r0 = b0-15 offset to start at
+        ;         b16-23 base address of IIC device
+        ;    r1 = pointer to buffer
+        ;    r2 = number of bytes to transfer
+        ; <= r0 = 0 or error
+        ;    r1 = advanced by number of bytes transferred
+        ;    r2 = number of bytes not transferred
+        AND     r4, r0, #&FF:SHL:16
+        CMP     r4, #&A1:SHL:16         
+        MOV     r4, #0
+        MOVNE   r0, #IICStatus_NoACK
+        Pull    "pc", NE                ; Only reads of EDID please
+        Push    "r3-r8"
+        UXTH    r3, r0
+        SUB     sp, sp, #edidtagslen
+10
+        CMP     r2, #0
+        BEQ     %FT40
+        ; Try fetching a block
+        MOV     r0, sp
+        ADRL    r4, edidtagb
+        MOV     r5, #edidtagslen
+20
+        LDR     lr, [r4], #4
+        STR     lr, [r0], #4
+        SUBS    r5, r5, #4
+        BGT     %BT20
+        MOV     r0, sp
+        MOV     r4, r3, LSR #7
+        STR     r4, [r0, #edidblock-edidtagb]
+        Push    "r1,r2"
+        MOV     r1, r0
+        MOV     r2, #0
+        SWI     XBCMSupport_SendTempPropertyBuffer
+        Pull    "r1,r2"
+        MOVVS   r0, #IICStatus_Error
+        BVS     %FT90
+        ; Non-zero status generally means NoACK condition (e.g. monitor disconnected)
+        LDR     r4, [r0, #edidstatus-edidtagb]
+        TEQ     r4, #0
+        MOVNE   r0, #IICStatus_NoACK
+        BNE     %FT90
+        ; Transfer bytes from this block
+        AND     r4, r3, #127
+        ADD     r4, r4, #edidbuffer-edidtagb
+        ADD     r4, r4, r0
+30
+        LDRB    lr, [r4], #1
+        STRB    lr, [r1], #1
+        SUBS    r2, r2, #1
+        ADD     r3, r3, #1
+        TSTNE   r3, #127
+        BNE     %BT30
+        B       %BT10
+40
+        MOV     r0, #IICStatus_Completed
+90
+        ADD     sp, sp, #edidtagslen
+        Pull    "r3-r8,pc"        
+
+
+GV_Render
+        Push    "r0-r3"
+        LDRB    r0, GVRenderNotAvailable
+        TEQ     r0, #0
+        BNE     GV_Render_NotDoing
+      [ RenDebug
+        LDR     r0, [sp]
+        BL      DebugHexTX4
+        MOV     r0, r1
+        BL      DebugHexTX4
+        BL      DebugTXStrInline
+        DCB     "GV_Render",10,13,0
+        ALIGN
+      ]
+        ; Only copies & NOPs are supported
+        TEQ     r1, #GVRender_CopyRectangle
+        BEQ     GV_Render_Copy
+        TEQ     r1, #GVRender_NOP
+        BEQ     GV_Render_Complete
+
+GV_Render_NotComplete
+        LDR     r0, [sp]
+        TST     r0, #GVRender_SyncIfNotComplete
+        BLNE    GV_Render_Sync
+      [ RenDebug
+        BL      DebugTXStrInline
+        DCB     "NotComplete",10,13,0
+        ALIGN
+      ]
+GV_Render_NotDoing        
+        Pull    "r0-r3,pc"
+
+GV_Render_Complete
+        LDR     r0, [sp]
+        TST     r0, #GVRender_SyncIfComplete
+        BLNE    GV_Render_Sync
+      [ RenDebug
+        BL      DebugTXStrInline
+        DCB     "Complete",10,13,0
+        ALIGN
+      ]
+        MOV     r4, #0
+        Pull    "r0-r3,pc"
+
+                ^ 0, r2
+copy_src_left   # 4
+copy_src_bottom # 4
+copy_dst_left   # 4
+copy_dst_bottom # 4
+copy_width      # 4
+copy_height     # 4
+
+GV_Render_Copy ROUT
+        ; In: R2 parameters
+        ; Out: exit via GV_Render_Complete or GV_Render_NotComplete
+        ;      R0-R3, LR corrupt
+        BL      GV_Render_Sync ; Just in case
+        Push    "r4-r8"
+        ; Calculate src & dest addresses, and rect width
+        LDR     r0, mbbpp
+        LDR     r1, copy_width
+        LDR     r3, copy_src_left
+        LDR     r4, copy_dst_left
+        LDR     r8, DMA_Offset
+        MOV     r0, r0, LSR #3 ; bits -> bytes
+        ADD     r1, r1, #1
+        LDR     r5, mbyres
+        LDR     r6, copy_height
+        ADD     r6, r6, #1
+        SUB     r5, r5, r6
+        LDR     r6, copy_src_bottom
+        LDR     r7, copy_dst_bottom
+        SUB     r6, r5, r6
+        SUB     r7, r5, r7
+        LDR     r5, vdu_init
+        LDR     lr, mbpitch
+        ADD     r5, r5, r8
+        MLA     r6, lr, r6, r5
+        MLA     r7, lr, r7, r5
+        MUL     r1, r0, r1 ; r1 = rect width in bytes
+        MLA     r3, r0, r3, r6 ; r3 = src top-left pixel
+        MLA     r4, r0, r4, r7 ; r4 = dest top-left pixel
+      [ RenDebug
+        MOV     r0, r1
+        BL      DebugHexTX4
+        MOV     r0, r3
+        BL      DebugHexTX4
+        MOV     r0, r4
+        BL      DebugHexTX4
+        MOV     r0, r5
+        BL      DebugHexTX4
+        LDR     r0, mbpitch
+        BL      DebugHexTX4
+        BL      DebugTXStrInline
+        DCB     "rect w,src,dst,vdu,pitch",10,13,0
+        ALIGN
+        LDR     lr, mbpitch
+      ]
+        CMP     r4, r3
+        BHI     %FT10
+        ; dst rect is before src rect in memory
+        ; Copy in forwards direction, top row to bottom
+        LDR     r5, copy_height
+        ORR     r5, r1, r5, LSL #16
+        SUB     r6, lr, r1 ; stride between each row
+        MOV     r6, r6, LSL #16 ; 16 bit
+        ORR     r6, r6, r6, LSR #16 ; duplicated for src & dest
+04
+        LDR     r1, =DMA_TI_TDMODE+DMA_TI_SRC_INC+DMA_TI_DEST_INC+DMA_TI_SRC_WIDTH+DMA_TI_DEST_WIDTH
+        LDRB    r7, DMA_BurstLength
+        ORR     r1, r1, r7, LSL #DMA_TI_BURST_LENGTH_SHIFT
+        MOV     r7, #0
+        ASSERT  DMACB_TI = 0
+        ASSERT  DMACB_SOURCE_AD = 4
+        ASSERT  DMACB_DEST_AD = 8
+        ASSERT  DMACB_TXFR_LEN = 12
+        ASSERT  DMACB_STRIDE = 16
+        ASSERT  DMACB_NEXTCONBK = 20
+        LDR     r0, DMA_CB
+        STMIA   r0, {r1,r3,r4,r5,r6,r7}
+        LDR     r0, DMA_CB_phy
+        LDR     r1, DMA_Chan
+        ADD     r0, r0, r8
+        DoMemBarrier lr
+        ; Reset channel
+        MOV     lr, #DMA_CS_RESET
+        STR     lr, [r1, #DMACH_CS]
+05
+        LDR     lr, [r1, #DMACH_CS]
+        TST     lr, #DMA_CS_RESET
+        BNE     %BT05
+        ; Set list start
+        STR     r0, [r1, #DMACH_CONBLK_AD]
+        ; Go
+        LDR     r0, =DMA_CS_WAIT_FOR_OUTSTANDING_WRITES+(4<<DMA_CS_PRIORITY_SHIFT)+(7<<DMA_CS_PANIC_PRIORITY_SHIFT)+DMA_CS_ACTIVE
+        STR     r0, [r1, #DMACH_CS]
+        DoMemBarrier lr
+        Pull    "r4-r8"
+        B       GV_Render_Complete
+10
+        ADD     r0, r3, r1
+        CMP     r0, r4
+        BHI     %FT20
+        ; src rect is before dst rect in memory, but individual rows don't overlap
+        ; Copy in forwards direction, bottom row to top
+        LDR     r5, copy_height
+        MLA     r3, r5, lr, r3
+        MLA     r4, r5, lr, r4
+        ORR     r5, r1, r5, LSL #16
+        RSB     lr, lr, #0 ; Go up a row instead of down
+        SUB     r6, lr, r1 ; stride between each row
+        MOV     r6, r6, LSL #16 ; 16 bit
+        ORR     r6, r6, r6, LSR #16 ; duplicated for src & dest
+        B       %BT04
+20
+        ; src rect is before dst rect in memory, with overlapping rows
+        ; To cope with this we'd need to be able to decrement the src & dest addrs after each byte/word, which is something the DMA controller doesn't support, or maybe split up into multiple transfers
+        ; So for the moment just give up and let RISC OS do it in software
+        Pull    "r4-r8"
+        B       GV_Render_NotComplete
+
+GV_Render_Sync  ROUT
+        ; Out: All regs preserved
+        Entry   "r0"
+      [ RenDebug
+        BL      DebugTXStrInline
+        DCB     "GV_Render_Sync",10,13,0
+        ALIGN
+      ]
+        ; We may get called even if there's no DMA channel
+        LDR     r0, DMA_Chan
+        CMP     r0, #0
+        EXIT    EQ
+        DoMemBarrier lr
+10
+        LDR     lr, [r0, #DMACH_CS]
+        TST     lr, #DMA_CS_ACTIVE
+        BNE     %BT10
+        DoMemBarrier lr
+      [ RenDebug
+        BL      DebugTXStrInline
+        DCB     "done",10,13,0
+        ALIGN
+      ]
+        EXIT
+
+      [ BuiltinMDF
+GV_StartupMode
+        ADRL    r0, startupmode
+        MOV     r4, #0
+        Pull    "pc"
+      ]
+
+GV_PixelFormats
+ [ AemulorSupport
+        ; Old versions of Aemulor don't know about the new GV_PixelFormats
+        ; call, which stops their low colour mode emulation from working
+        ; because they only override the BPP flags returned by
+        ; GV_DisplayFeatures. If we detected that an old version is running,
+        ; adjust the list of returned modes to include all the low colour ones
+        LDRB    r1, OldAemulor
+        TEQ     r1, #0
+ ]
+        ADR     r0, PixelFormats
+        MOV     r1, #(PixelFormats_End-PixelFormats)/12
+ [ AemulorSupport
+        ADDNE   r1, r1, #3              ; Adjust list to include low colour modes
+ ]
+        MOV     r4, #0
+        Pull    "pc"
+
+PixelFormats
+        DCD     255,ModeFlag_FullPalette,3
+        DCD     65535,ModeFlag_64k+ModeFlag_DataFormatSub_RGB,4
+        DCD     -1,0,5
+        DCD     -1,ModeFlag_DataFormatSub_Alpha,5
+      [ ControlRGB
+        DCD     -1,ModeFlag_DataFormatSub_RGB,5
+        DCD     -1,ModeFlag_DataFormatSub_RGB+ModeFlag_DataFormatSub_Alpha,5
+      ]
+        ; Overlay-only formats
+        ; TODO: sub-formats
+        DCD     &32315659,ModeFlag_DataFormatFamily_YCbCr,7
+        DCD     &36315659,ModeFlag_DataFormatFamily_YCbCr,7
+        DCD     &3231564e,ModeFlag_DataFormatFamily_YCbCr,7
+PixelFormats_End
+ [ AemulorSupport
+        DCD     1,0,0
+        DCD     3,0,1
+        DCD     15,0,2
+ ]
+
+GV_ReadInfo ROUT
+        Push    "r0-r4"
+        CMP     r0, #(ReadInfo_TableEnd - ReadInfo_Table) / 4
+        ADDLO   pc, pc, r0, LSL #2
+        Pull    "r0-r4,pc"
+ReadInfo_Table
+        RIEntry Version
+        RIEntry ModuleName
+        RIEntry DriverName
+        RIEntry HardwareName
+        RIEntry ControlListItems
+        RIEntry MaxOverlays
+ReadInfo_TableEnd
+
+        GBLA    VersionBCD
+VersionBCD SETBCD Module_Version
+
+VersionBCDVal DCD VersionBCD<<8
+
+ControlListItems
+        DCD     ControlList_Interlaced
+        DCD     ControlList_ExtraBytes
+        DCD     ControlList_NColour
+        DCD     ControlList_ModeFlags
+        DCD     ControlList_Terminator        
+ControlListItems_End
+
+RI_Version
+        ADR     r3, VersionBCDVal
+        MOV     r4, #4
+        B       %FT10
+
+RI_ModuleName
+RI_DriverName
+        ADRL    r3, Title
+        B       %FT05
+
+RI_HardwareName
+        LDR     r3, HALDevice
+        TEQ     r3, #0
+        LDRNE   r3, [r3, #HALDevice_Description]
+05
+        MOV     r4, #0
+        TEQ     r3, #0
+06
+        LDRNEB  r0, [r3, r4]
+        ADDNE   r4, r4, #1
+        TEQNE   r0, #0
+        BNE     %BT06
+        B       %FT10
+
+RI_ControlListItems
+        ADRL    r3, ControlListItems
+        MOV     r4, #ControlListItems_End-ControlListItems
+10
+        TEQ     r4, #0
+        Pull    "r0-r4,pc", EQ
+        CMP     r4, r2
+        SUB     lr, r2, r4
+        MOVLT   r2, r4
+        STR     lr, [sp, #8]
+20
+        SUBS    r2, r2, #1
+        LDRGEB  r0, [r3], #1
+        STRGEB  r0, [r1], #1
+        BGT     %BT20
+        MOV     r4, #0
+        STR     r4, [sp, #16]
+        Pull    "r0-r4,pc"
+
+RI_MaxOverlays
+        ADR     r3, MaxOverlaysWord
+        MOV     r4, #4
+        B       %BT10
+
+MaxOverlaysWord
+        DCD     MaxOverlays
+
+        LTORG
+
+        END

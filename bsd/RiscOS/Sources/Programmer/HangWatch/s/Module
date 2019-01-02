@@ -1,0 +1,884 @@
+; 
+; Copyright (c) 2012, RISC OS Open Ltd
+; All rights reserved.
+; 
+; Redistribution and use in source and binary forms, with or without
+; modification, are permitted provided that the following conditions are met: 
+;     * Redistributions of source code must retain the above copyright
+;       notice, this list of conditions and the following disclaimer.
+;     * Redistributions in binary form must reproduce the above copyright
+;       notice, this list of conditions and the following disclaimer in the
+;       documentation and/or other materials provided with the distribution.
+;     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+;       may be used to endorse or promote products derived from this software
+;       without specific prior written permission.
+; 
+; THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+; AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+; IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+; ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+; LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+; CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+; SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+; INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+; CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+; ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+; POSSIBILITY OF SUCH DAMAGE.
+; 
+
+        AREA    |!!!ModuleHeader|, CODE, READONLY, PIC
+
+Module_BaseAddr
+        &       0
+        &       InitModule - Module_BaseAddr
+        &       KillModule - Module_BaseAddr
+        &       Service - Module_BaseAddr
+        &       ModuleTitle - Module_BaseAddr
+        &       HelpString - Module_BaseAddr
+        &       0
+        &       HangWatchSWI_Base
+        &       SWIEntry - Module_BaseAddr
+        &       SWINameTable - Module_BaseAddr
+        &       0
+        &       0
+        &       ModuleFlags - Module_BaseAddr
+
+HelpString
+        =       "HangWatch", 9, "$Module_MajorVersion ($Module_Date)"
+        [       Module_MinorVersion <> ""
+        =       " $Module_MinorVersion"
+        ]
+        =       0
+ModuleTitle
+SWINameTable
+        =       "HangWatch", 0
+        =       "Start", 0
+        =       "Stop", 0
+        =       "Tick", 0
+        =       "Dump", 0
+        =       "AddMemRegion", 0
+        =       "RemoveMemRegion", 0
+        =       0
+        ALIGN
+        
+ModuleFlags
+        &       ModuleFlag_32bit
+
+                ^ 0
+MemRegion_Next  # 4
+MemRegion_Base  # 4
+MemRegion_End   # 4
+MemRegion_Label # 0 ; Embedded string
+
+; Workspace
+; Using r10 to avoid preserving r12 over HAL calls
+
+                      ^ 0, r10
+HAL_DebugTX           # 4
+ [ ConfirmDump
+HAL_DebugRX           # 4
+ ]
+HAL_TimerDevice       # 4
+HAL_TimerGranularity  # 4
+HAL_TimerMaxPeriod    # 4
+HAL_TimerSetPeriod    # 4
+HAL_TimerIRQClear     # 4
+HAL_FIQEnable         # 4
+HAL_FIQDisable        # 4
+HAL_FIQDisableAll     # 4
+HAL_FIQClear          # 4
+HAL_IRQEnable         # 4
+HAL_IRQDisable        # 4
+HAL_IRQClear          # 4
+HAL_SB                # 4
+TimerNo               # 4
+TimerDevice           # 4
+TimerFreq             # 4
+TimerPeriod           # 4 ; Derived from above frequency
+WatchdogLimit         # 4
+WatchdogValue         # 4
+Flags                 # 4
+SVCStack              # 4
+SVCStackLimit         # 4
+IRQStack              # 4
+IRQStackLimit         # 4
+ABTStack              # 4
+ABTStackLimit         # 4
+UNDStack              # 4
+UNDStackLimit         # 4
+ProcessorVectors      # 4
+MemRegions            # 4
+                      
+WSSize                * :INDEX: @
+
+flag_UseIRQ           * &00000001
+flag_Active_IRQ       * &20000000
+flag_Active_FIQ       * &40000000
+flag_OwnFIQ           * &80000000
+
+; Macros
+
+        MACRO
+        GetHALEntry  $name,$err
+        LDR     r9, =EntryNo_$name
+        SWI     XOS_Hardware
+        BVS     $err
+        STR     r0, $name
+        MEND
+
+        MACRO
+        CallHAL $name
+        MOV     lr, pc
+        LDR     pc, $name
+        MEND
+
+        ; Corrupts r0-r3
+        MACRO
+        HALDebugS $str
+        BL      HALDebugS_code
+        DCB     "$str", 10, 0
+        ALIGN
+        MEND
+
+        MACRO
+        BankedRegs $mode, $name
+        SUB     r0, sp, #12
+        MSR     CPSR_c,#F32_bit+I32_bit+$mode
+        MRS     r4, SPSR
+        STMIA   r0, {r13,r14}
+        MSR     CPSR_c,#F32_bit+I32_bit+FIQ32_mode
+        STR     r4, [r0, #8]
+        MOV     sp, r0
+        HALDebugS "r13_$name, r14_$name, spsr_$name:"
+10
+        Pull    "r5"
+        BL      HALDebugHex        
+        MOV     r0, #10
+        CallHAL HAL_DebugTX
+        CMP     sp, r11
+        BNE     %BT10
+        MEND
+
+        MACRO
+        StackDump $mode
+        HALDebugS "$mode stack:"
+        LDR     r6, $mode.StackLimit
+        LDR     r7, $mode.Stack
+        BL      HALDebugMem
+        MEND
+
+; Module code
+
+InitModule
+        Entry   "r8-r10"
+        MOV     r0, #ModHandReason_Claim
+        LDR     r3, =WSSize
+        SWI     XOS_Module
+        EXIT    VS
+        STR     r2, [r12]
+        MOV     r10, r2
+
+        ; Zero workspace
+        MOV     r0, #0
+05
+        SUBS    r3, r3, #4
+        STR     r0, [r2], #4
+        BGT     %BT05
+
+        ; Get HAL routines
+        MOV     r8, #1
+        GetHALEntry HAL_DebugTX, %FT10
+      [ ConfirmDump
+        GetHALEntry HAL_DebugRX, %FT10
+      ]
+        GetHALEntry HAL_TimerDevice, %FT10
+        GetHALEntry HAL_TimerGranularity, %FT10
+        GetHALEntry HAL_TimerMaxPeriod, %FT10
+        GetHALEntry HAL_TimerSetPeriod, %FT10
+        GetHALEntry HAL_TimerIRQClear, %FT10
+        GetHALEntry HAL_FIQEnable, %FT10
+        GetHALEntry HAL_FIQDisable, %FT10
+        GetHALEntry HAL_FIQDisableAll, %FT10
+        GetHALEntry HAL_FIQClear, %FT10
+        GetHALEntry HAL_IRQEnable, %FT10
+        GetHALEntry HAL_IRQDisable, %FT10
+        GetHALEntry HAL_IRQClear, %FT10
+        STR     r1, HAL_SB
+
+        ; Get stacks
+        MOV     r0, #6
+        MOV     r1, #0
+
+        MOV     r2, #OSRSI6_SVCSTK
+        SWI     XOS_ReadSysInfo
+        STR     r2, SVCStack
+        MOV     r2, r2, LSR #20
+        MOV     r2, r2, LSL #20
+        STR     r2, SVCStackLimit
+
+        MOV     r2, #OSRSI6_IRQSTK
+        SWI     XOS_ReadSysInfo
+        STR     r2, IRQStack
+        MOV     r2, r2, LSR #20
+        MOV     r2, r2, LSL #20
+        STR     r2, IRQStackLimit
+
+        MOV     r2, #OSRSI6_UNDSTK
+        SWI     XOS_ReadSysInfo
+        STR     r2, UNDStack
+        MOV     r2, r2, LSR #20
+        MOV     r2, r2, LSL #20
+        STR     r2, UNDStackLimit
+
+        ; ABT isn't exposed yet, just cheat and use hardcoded values
+        LDR     r2, =&FA300000
+        STR     r2, ABTStackLimit
+        ADD     r2, r2, #8*1024
+        STR     r2, ABTStack
+        
+        MOV     r0, #0
+        SWI     XOS_PlatformFeatures
+        MOVVS   r0, #0
+        ANDS    r0, r0, #CPUFlag_HiProcVecs
+        LDRNE   r0, =&FFFF0000
+        STR     r0, ProcessorVectors
+
+      [ SeriousDump
+        ; Claim dump vector
+        MOV     r0, #SeriousErrorV
+        ADR     r1, SeriousErrorVHandler
+        MOV     r2, r10
+        SWI     XOS_Claim
+      ]
+        CLRV        
+
+        EXIT
+10
+        Push    "r0"
+        MOV     r2, r10
+        MOV     r0, #ModHandReason_Free
+        SWI     XOS_Module
+        Pull    "r0"
+        SETV
+        EXIT
+
+KillModule
+        Entry   "r10"
+        LDR     r10, [r12]
+        BL      SWI_Stop
+      [ SeriousDump
+        ; Release dump vector
+        MOV     r0, #SeriousErrorV
+        ADR     r1, SeriousErrorVHandler
+        MOV     r2, r10
+        SWI     XOS_Release
+      ]
+10
+        LDR     r0, MemRegions
+        CMP     r0, #0
+        BEQ     %FT20
+        BL      SWI_RemoveMemRegion
+        B       %BT10
+20
+        MOV     r2, r10
+        MOV     r0, #ModHandReason_Free
+        SWI     XOS_Module
+        EXIT
+
+; SWIs
+
+SWIEntry
+        LDR     r10, [r12]
+        CMP     r11, #(EndOfJumpTable-JumpTable)/4
+        ADDLO   pc, pc, r11, LSL #2
+        B       UnknownSWI
+JumpTable
+        B       SWI_Start
+        B       SWI_Stop
+        B       SWI_Tick
+        B       SWI_Dump
+        B       SWI_AddMemRegion
+        B       SWI_RemoveMemRegion
+EndOfJumpTable
+
+UnknownSWI
+        ADR     r0, ErrorBlock_ModuleBadSWI
+        SETV
+        MOV     pc, lr
+
+        MakeInternatErrorBlock  ModuleBadSWI
+
+        ; In:
+        ;  r0 = flags
+        ;       bit 0: 1 = use IRQ, 0 = use FIQ
+        ;       others: reserved
+        ;  r1 = HAL timer number
+        ;  r2 = timer frequency (Hz)
+        ;  r3 = counter limit
+        ; Out:
+        ;  r0 = watchdog counter address
+SWI_Start
+        Entry   "r0-r3,r9"
+        BL      SWI_Stop
+        ; Set up values in workspace
+        AND     r0, r0, #flag_UseIRQ
+        STR     r0, Flags
+        STR     r1, TimerNo
+        STR     r2, TimerFreq
+        STR     r3, WatchdogLimit
+        ; Examine timer
+        LDR     r9, HAL_SB
+        MOV     r0, r1
+        CallHAL HAL_TimerDevice
+        STR     r0, TimerDevice
+        LDR     r0, TimerNo
+        CallHAL HAL_TimerGranularity
+        LDR     r1, TimerFreq
+        DivRem  r2, r0, r1, r3
+        ; Ensure r2 is less than max period
+        Push    "r2"
+        LDR     r0, TimerNo
+        CallHAL HAL_TimerMaxPeriod
+        Pull    "r2"
+        LDR     r3, WatchdogLimit
+10
+        CMP     r2, r0
+        MOVHS   r2, r2, LSR #1
+        MOVHS   r3, r3, LSL #1
+        BHS     %BT10
+        ; Store updated values
+        STR     r2, TimerPeriod
+        STR     r3, WatchdogLimit
+        ; Get on IRQ/FIQ as appropriate
+        LDR     r0, Flags
+        TST     r0, #flag_UseIRQ
+        BNE     %FT50
+        MOV     r1, #Service_ClaimFIQ
+        SWI     XOS_ServiceCall
+        LDR     r0, Flags
+        ORR     r0, r0, #flag_OwnFIQ
+        STR     r0, Flags
+        BL      InstallFIQ
+        MOV     r0, #flag_Active_FIQ
+        B       %FT90
+50
+        LDR     r0, TimerDevice
+        ADR     r1, IRQHandler
+        MOV     r2, r10
+        SWI     XOS_ClaimDeviceVector
+        ; Reset watchdog
+        MOV     r0, #0
+        STR     r0, WatchdogValue
+        ; Set up timer
+        LDR     r0, TimerNo
+        LDR     r1, TimerPeriod
+        CallHAL HAL_TimerSetPeriod
+        LDR     r0, TimerDevice
+        CallHAL HAL_IRQEnable
+        MOV     r0, #flag_Active_IRQ
+90
+        ; Mark ourselves as active
+        LDR     r1, Flags
+        ORR     r0, r0, r1
+        STR     r0, Flags
+        ADR     r0, WatchdogValue
+        STR     r0, [sp]
+        CLRV
+        EXIT
+
+SWI_Stop
+        Entry   "r0-r2"
+        MRS     r0, CPSR
+        ORR     r1, r0, #I32_bit+F32_bit
+        MSR     CPSR_c, r1
+        LDR     r1, Flags
+        TST     r1, #flag_UseIRQ
+        BNE     %FT50
+        BIC     r2, r1, #flag_Active_FIQ+flag_OwnFIQ
+        TST     r1, #flag_OwnFIQ
+        STR     r2, Flags
+        MSR     CPSR_c, r0
+        EXIT    EQ
+        BL      RemoveFIQ
+        MOV     r1, #Service_ReleaseFIQ
+        SWI     XOS_ServiceCall
+        CLRV
+        EXIT
+50
+        MOV     r1, #0
+        STR     r1, Flags
+        MSR     CPSR_c, r0
+        LDR     r0, TimerDevice
+        ADR     r1, IRQHandler
+        MOV     r2, r10
+        SWI     XOS_ReleaseDeviceVector
+        CLRV
+        EXIT
+
+SWI_Tick
+        Entry   "r0"
+        MOV     r12, #0
+        STR     r12, WatchdogValue
+        SWI     XDADebug_Reset
+        CLRV
+        EXIT
+
+SWI_Dump
+        ; Entered in SVC or IRQ
+        Push    "r0-r3,lr"
+        MRS     r2, CPSR
+        ; Interrupts off from here on
+        ORR     r0, r2, #I32_bit+F32_bit
+        MSR     CPSR_c, r0
+        MOV     r1, sp
+        LDR     lr, [sp, #4*4] ; restore lr_svc/lr_irq
+        ADD     sp, sp, #5*4 ; restore SP (with stuff still on it)
+        MOV     r3, r10
+        ; Get into FIQ mode so we can call the dump handler
+        MSR     CPSR_c, #FIQ32_mode+I32_bit+F32_bit
+        ; Set SPSR to PSR on entry
+        MSR     SPSR_cxsf, r2
+        ; Set up WS ptr
+        MOV     r10, r3
+        ; Set up stack
+        LDR     r0, ProcessorVectors
+        ADD     sp, r0, #&100
+        ; Get r0-r3 back from SVC/IRQ stack
+        LDMIA   r1,{r0-r3}
+        ; Set up fake LR so it's obvious this was a call to Dump
+        MVN     lr, #0
+        ; Push r0-r7,lr onto FIQ stack
+        Push    "r0-r7,lr"
+        ; Get HAL SB from workspace
+        LDR     r9, HAL_SB
+        ; Call regular handler if we're in IRQ (-> this was an IRQ watchdog reaching its limit)
+        MRS     r2, SPSR
+        AND     r2, r2, #M32_bits
+        CMP     r2, #IRQ32_mode
+        BEQ     DumpHandler
+        ; Disable all FIQs, just in case something goes wrong
+        CallHAL HAL_FIQDisableAll
+        ; Announce ourselves
+        HALDebugS "HangWatch_Dump called"
+        ; Jump to main handler code
+        B       DumpHandler2
+
+      [ SeriousDump
+SeriousErrorVHandler
+        ; In:
+        ;  r2 = reason code
+        ;       SeriousErrorV_Collect:
+        ;         r0 -> register dump
+        ;         r1 -> untranslated error block
+        ;  r12 = workspace
+        ;  ABT32 mode
+        CMP     r2, #SeriousErrorV_Collect
+        MOVNE   pc, lr
+        ; Switch to FIQ so we can call DumpHandler2
+        MOV     r2, r12
+        MOV     r3, r13
+        MRS     r4, CPSR
+        MSR     CPSR_c, #I32_bit+F32_bit+FIQ32_mode
+        MOV     r13, r3 ; Borrow ABT stack
+        MOV     r10, r2 ; Set up workspace ptr
+        MSR     SPSR_cxsf, r4 ; Set SPSR to PSR on entry
+        ; Set up fake LR so it's obvious this was a call to Dump
+        MVN     lr, #0
+        ; Push r0-r7,lr onto FIQ stack
+        Push    "r0-r7,lr"
+        ; Get HAL SB from workspace
+        LDR     r9, HAL_SB
+        ; Disable all FIQs, just in case something goes wrong
+        CallHAL HAL_FIQDisableAll
+        ; Announce ourselves
+        HALDebugS "SeriousErrorV called"
+        ; Jump to main handler code
+        B       DumpHandler2
+      ]
+
+SWI_AddMemRegion
+        Entry   "r0-r4"
+        ; Calculate name length
+        MOV     r3, r2
+10
+        LDRB    r0, [r2], #1
+        CMP     r0, #0
+        BNE     %BT10
+        SUB     r4, r2, r3
+        ADD     r3, r4, #MemRegion_Label
+        MOV     r0, #ModHandReason_Claim
+        SWI     XOS_Module
+        STRVS   r0, [sp]
+        EXIT    VS
+        LDMIA   sp, {r11, r12, lr}
+        ; Copy over the name
+        ADD     r3, r2, #MemRegion_Label
+20
+        SUBS    r4, r4, #1
+        LDRB    r0, [lr, r4]
+        STRB    r0, [r3, r4]
+        BNE     %BT20
+        ; IRQs+FIQs off while we link it in to the list
+        ADD     r12, r11, r12
+        MRS     r0, CPSR
+        ORR     r1, r0, #I32_bit+F32_bit
+        MSR     CPSR_c, r1
+        LDR     r1, MemRegions
+        ASSERT  MemRegion_Next = 0
+        ASSERT  MemRegion_Base = 4
+        ASSERT  MemRegion_End = 8
+        STMIA   r2, {r1, r11, r12}
+        STR     r2, MemRegions
+        MSR     CPSR_c, r0
+        EXIT
+
+SWI_RemoveMemRegion
+        Entry   "r0-r4"
+        ; IRQs+FIQs off while we search the list. Yuck!
+        MRS     r3, CPSR
+        ORR     r1, r3, #I32_bit+F32_bit
+        MSR     CPSR_c, r1
+        ADR     r1, MemRegions-:INDEX:MemRegion_Next
+10
+        LDR     r2, [r1, #MemRegion_Next]
+        TEQ     r2, #0
+        LDRNE   r4, [r2, #MemRegion_Base]
+        TEQNE   r4, r0
+        MOVNE   r1, r2
+        BNE     %BT10
+        TEQ     r2, #0
+        LDRNE   r4, [r2, #MemRegion_Next]
+        STRNE   r4, [r1, #MemRegion_Next]
+        MSR     CPSR_c, r3
+        EXIT    EQ
+        MOV     r0, #ModHandReason_Free
+        SWI     XOS_Module
+        CLRV
+        EXIT
+
+; Service calls
+
+        ASSERT  Service_ReleaseFIQ < Service_ClaimFIQ
+UService
+        DCD     0
+        DCD     ServiceDispatch-Module_BaseAddr
+        DCD     Service_ReleaseFIQ
+        DCD     Service_ClaimFIQ
+        DCD     0
+        DCD     UService-Module_BaseAddr
+Service
+        MOV     r0, r0
+        TEQ     r1, #Service_ReleaseFIQ
+        TEQNE   r1, #Service_ClaimFIQ
+        MOVNE   pc, lr
+ServiceDispatch
+        Entry   "r10"
+        TEQ     r1, #Service_ReleaseFIQ
+        BEQ     ServiceReleaseFIQ
+        TEQ     r1, #Service_ClaimFIQ
+        BEQ     ServiceClaimFIQ
+        EXIT
+
+        ; Reclaim FIQ if we were previously active
+ServiceReleaseFIQ
+        LDR     r10, [r12]
+        LDR     r12, Flags
+        TST     r12, #flag_Active_FIQ
+        EXIT    EQ
+        ORR     r12, r12, #flag_OwnFIQ
+        STR     r12, Flags
+        BL      InstallFIQ
+        MOV     r1, #Service_Serviced
+        EXIT
+
+        ; Release FIQ if we're currently active
+ServiceClaimFIQ
+        LDR     r10, [r12]
+        LDR     r12, Flags
+        TST     r12, #flag_OwnFIQ
+        EXIT    EQ
+        BIC     r12, r12, #flag_OwnFIQ
+        STR     r12, Flags
+        BL      RemoveFIQ
+        MOV     r1, #Service_Serviced
+        EXIT
+
+; FIQ handling        
+
+        ; Get on the FIQ vector
+        ; Assumes we have the right to use it
+InstallFIQ
+        Entry   "r0-r3,r9"
+        ; Ensure FIQs are disabled
+        LDR     r9, HAL_SB
+        CallHAL HAL_FIQDisableAll
+        ; Copy over our FIQ code
+        LDR     lr, ProcessorVectors
+        ADD     lr, lr, #&1C
+        ADR     r0, FIQcode
+        ADR     r1, FIQcode_end
+        MOV     r2, lr
+10
+        LDR     r3, [r0], #4
+        STR     r3, [r2], #4
+        CMP     r0, r1
+        BNE     %BT10
+        MOV     r0, #1
+        MOV     r1, lr
+        SWI     XOS_SynchroniseCodeAreas
+        ; Poke in our workspace pointer & dump handler
+        ADR     r0, DumpHandler
+        STMIA   r2, {r0, r10}
+        ; Reset watchdog
+        MOV     r0, #0
+        STR     r0, WatchdogValue
+        ; Set up timer
+        LDR     r0, TimerDevice
+        CallHAL HAL_IRQDisable
+        LDR     r0, TimerNo
+        LDR     r1, TimerPeriod
+        CallHAL HAL_TimerSetPeriod
+        LDR     r0, TimerDevice
+        CallHAL HAL_FIQEnable        
+        EXIT
+
+        ; Get off the FIQ vector
+        ; Assumes we actually own it
+RemoveFIQ
+        Entry   "r0-r3,r9"
+        ; Ensure FIQs are disabled
+        LDR     r9, HAL_SB
+        CallHAL HAL_FIQDisableAll
+        ; Disable timer if possible
+        LDR     r0, TimerNo
+        MOV     r1, #0
+        CallHAL HAL_TimerSetPeriod
+        ; Reset watchdog
+        MOV     r0, #0
+        STR     r0, WatchdogValue
+        EXIT
+
+FIQcode
+        SUB     lr, lr, #4
+        ADR     sp, FIQcode+&100-&1C
+        STMFD   sp!,{r0-r7,r14}
+        LDR     r10, FIQcode_workspace
+        ; Service FIQ
+        LDR     r9, HAL_SB
+        LDR     r0, TimerNo
+        CallHAL HAL_TimerIRQClear
+        LDR     r0, TimerDevice
+        CallHAL HAL_FIQClear
+        ; Check watchdog
+        LDR     r0, WatchdogValue
+        ADD     r0, r0, #1
+        LDR     r1, WatchdogLimit
+        STR     r0, WatchdogValue
+        CMP     r0, r1
+        LDRHS   pc, FIQcode_dumphandler
+        LDMFD   sp!,{r0-r7,pc}^        
+FIQcode_end
+
+FIQcode_dumphandler * FIQcode_end
+FIQcode_workspace   * FIQcode_end + 4
+FIQcode_limit       * FIQcode_end + 8
+
+        ; We actually need slightly more space than this, due to stack usage
+        ASSERT FIQcode_limit-FIQcode <= &100-&1C
+
+; IRQ handling
+
+IRQHandler
+        ; In:
+        ;  r12 = workspace
+        ; Out:
+        ;  r0-r3,r12 corrupt
+        Entry   "r9,r10"
+        MOV     r10, r12
+        ; Service IRQ
+        LDR     r9, HAL_SB
+        LDR     r0, TimerNo
+        CallHAL HAL_TimerIRQClear
+        LDR     r0, TimerDevice
+        CallHAL HAL_IRQClear
+        ; Check watchdog
+        LDR     r0, WatchdogValue
+        ADD     r0, r0, #1
+        LDR     r1, WatchdogLimit
+        STR     r0, WatchdogValue
+        CMP     r0, r1
+        BLHS    SWI_Dump
+        EXIT
+
+; Dump handler - called when watchdog hits limit
+
+        ; In:
+        ;  r9 = HAL SB
+        ;  r10 = workspace
+        ;  sp = small stack with r0-r7, lr stacked
+        ;  FIQ mode
+DumpHandler
+        ; Firstly, disable all FIQs, just in case something goes wrong
+        CallHAL HAL_FIQDisableAll
+        HALDebugS "Watchdog limit hit"
+DumpHandler2
+      [ ConfirmDump
+        ; Sit and wait for confirmation before producing the dump - ensures there's someone there to receive it
+        MOV     r4, #-1
+01
+        HALDebugS "Enter 'ok' to output dump"
+02
+        CallHAL HAL_DebugRX
+        CMP     r0, #-1
+        BEQ     %BT02
+        BIC     r0, r0, #32
+        CMP     r0, #'O'
+        CMPNE   r0, #'K'
+        BNE     %BT01 ; Prompt if wrong letters
+        CMP     r4, #'O'
+        CMPEQ   r0, #'K'
+        MOVNE   r4, r0
+        BNE     %BT02
+      ]
+        HALDebugS "r0-r15,SPSR_fiq:"
+        ; Output r0-r7 from the stack
+        ADD     r11, sp, #8*4
+10
+        Pull    "r5"
+        BL      HALDebugHex
+        MOV     r0, #10
+        CallHAL HAL_DebugTX
+        CMP     sp, r11
+        BNE     %BT10
+        ; Grab R8-R14 from user mode
+        SUB     sp, sp, #7*4
+        MOV     r0, sp
+        STMIA   r0, {r8-r14}^
+        LDR     r4, [r0, #5*4] ; Remember r13_usr for later
+        LDR     r8, [r0, #6*4] ; and r14_usr
+        ; Grab R13, R14 from previous mode (unless user mode, in which case we've already got it)
+        MRS     r6, SPSR
+        ANDS    r7, r6, #&F
+        BEQ     %FT15
+        ORR     r7, r7, #F32_bit+I32_bit+&10
+        MSR     CPSR_c, r7
+        STR     r13, [r0, #5*4]
+        STR     r14, [r0, #6*4]
+        MSR     CPSR_c, #F32_bit+I32_bit+FIQ32_mode
+15
+        ; Output r8-r15 from the stack
+        ADD     r11, r11, #4
+20
+        Pull    "r5"
+        BL      HALDebugHex
+        MOV     r0, #10
+        CallHAL HAL_DebugTX
+        CMP     sp, r11
+        BNE     %BT20        
+        ; Output SPSR
+        MOV     r5, r6
+        BL      HALDebugHex
+        MOV     r0, #10
+        CallHAL HAL_DebugTX
+        ; Output banked registers
+        HALDebugS "r13_usr, r14_usr:"
+        MOV     r5, r4
+        BL      HALDebugHex
+        MOV     r0, #10
+        CallHAL HAL_DebugTX
+        MOV     r5, r8
+        BL      HALDebugHex
+        MOV     r0, #10
+        CallHAL HAL_DebugTX
+        BankedRegs SVC32_mode, "svc"
+        BankedRegs IRQ32_mode, "irq"
+        BankedRegs ABT32_mode, "abt"
+        BankedRegs UND32_mode, "und"
+        ; Output stacks
+        StackDump SVC
+        StackDump IRQ
+        StackDump ABT
+        StackDump UND
+        ; Output other memory regions
+        LDR     r4, MemRegions
+        B       %FT35
+30
+        ADD     r5, r4, #MemRegion_Label
+31
+        LDRB    r0, [r5], #1
+        CMP     r0, #0
+        BEQ     %FT32
+        CallHAL HAL_DebugTX
+        B       %BT31
+32
+        MOV     r0, #10
+        CallHAL HAL_DebugTX                               
+        ASSERT  MemRegion_Next = 0
+        ASSERT  MemRegion_Base = 4
+        ASSERT  MemRegion_End = 8
+        LDMIA   r4, {r4,r6,r7}
+        BL      HALDebugMem
+35
+        CMP     r4, #0
+        BNE     %BT30
+40                
+        ; Now switch to SVC mode and reset the stack
+        MOV     r0, r10
+        MSR     CPSR_c, #F32_bit+I32_bit+SVC32_mode
+        MOV     r10, r0
+        LDR     r9, HAL_SB
+        LDR     sp, SVCStack
+        ; DADebug dump
+        HALDebugS "DADebug output:"
+        SWI     XDADebug_Print
+        ; Halt
+        HALDebugS "Watchdog output complete, halting system"
+        B       .        
+
+HALDebugS_code
+10
+        LDRB    r0, [lr], #1
+        CMP     r0, #0
+        ADDEQ   lr, lr, #3
+        BICEQ   pc, lr, #3
+        Push    "lr"
+        CallHAL HAL_DebugTX
+        Pull    "lr"
+        B       %BT10
+
+        ; In: r5 = value
+        ; Out: r0-r3, r5 corrupt
+HALDebugHex
+        Entry   "r6-r7"
+        MOV     r6, #8
+        ADR     r7, HexTab
+10
+        LDRB    r0, [r7, r5, LSR #28]
+        CallHAL HAL_DebugTX
+        SUBS    r6, r6, #1
+        MOV     r5, r5, LSL #4
+        BNE     %BT10
+        EXIT
+
+        ; In: r6 = area start
+        ;     r7 = area end
+        ; Out: r0-r3, r5-r7 corrupt
+HALDebugMem
+        Entry
+10
+        MOV     r5, r6
+        BL      HALDebugHex
+        MOV     r0, #32
+        CallHAL HAL_DebugTX
+        LDR     r5, [r6], #4
+        BL      HALDebugHex
+        MOV     r0, #10
+        CallHAL HAL_DebugTX
+        CMP     r6, r7
+        BNE     %BT10
+        EXIT
+
+HexTab
+        = "0123456789abcdef"
+
+        END

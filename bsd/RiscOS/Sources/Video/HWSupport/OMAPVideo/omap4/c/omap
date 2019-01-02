@@ -1,0 +1,1226 @@
+/*
+ * Copyright (c) 2010, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include "swis.h"
+
+#include "Global/RISCOS.h"
+#include "Global/Services.h"
+#include "Global/HALEntries.h"
+#include "Global/GraphicsV.h"
+
+#include "DebugLib/DebugLib.h"
+
+#include "regs.h"
+#include "graphicsv.h"
+#include "dispc.h"
+#include "dss.h"
+#include "gvoverlay.h"
+#include "globals.h"
+#include "vars.h"
+#include "consts.h"
+#include "palette.h"
+#include "dsi.h"
+
+static const omapformat_t omapformats[PIXELFORMAT_MAX] =
+{
+	/* OMAP4430 Silicon Errata Public RevD chapter 2.4
+	 * BITMAP 1-2-4 formats not supported by the graphics pipeline
+	 */
+	[PIXELFORMAT_1_PAL]     = { 0, 0, 0, 0, 0 },
+	[PIXELFORMAT_2_PAL]     = { 0, 0, 0, 0, 0 },
+	[PIXELFORMAT_4_PAL]     = { 0, 0, 0, 0, 0 },
+	[PIXELFORMAT_8_PAL]     = { OVERLAY_ATTRIBUTES_FORMAT_BMP8, FEATURE_PALETTE, FEATURE_PALETTE+FEATURE_GAMMAHACK, (1<<OVERLAY_GFX), 0 },
+	[PIXELFORMAT_4444_TBGR] = { OVERLAY_ATTRIBUTES_FORMAT_xRGB12_4444, FEATURE_CPR, FEATURE_CPR+FEATURE_GAMMAHACK, (1<<OVERLAY_GFX)|(1<<OVERLAY_VID1)|(1<<OVERLAY_VID2)|(1<<OVERLAY_VID3), 0 },
+	[PIXELFORMAT_4444_TRGB] = { OVERLAY_ATTRIBUTES_FORMAT_xRGB12_4444, 0, FEATURE_CPR+FEATURE_GAMMAHACK, (1<<OVERLAY_GFX)|(1<<OVERLAY_VID1)|(1<<OVERLAY_VID2)|(1<<OVERLAY_VID3), 0 },
+	[PIXELFORMAT_4444_ABGR] = { OVERLAY_ATTRIBUTES_FORMAT_ARGB16_4444, FEATURE_CPR+FEATURE_ALPHA, FEATURE_CPR+FEATURE_ALPHA+FEATURE_GAMMAHACK, (1<<OVERLAY_GFX)|(1<<OVERLAY_VID1)|(1<<OVERLAY_VID2)|(1<<OVERLAY_VID3), 0 },
+	[PIXELFORMAT_4444_ARGB] = { OVERLAY_ATTRIBUTES_FORMAT_ARGB16_4444, FEATURE_ALPHA, FEATURE_CPR+FEATURE_ALPHA+FEATURE_GAMMAHACK, (1<<OVERLAY_GFX)|(1<<OVERLAY_VID1)|(1<<OVERLAY_VID2)|(1<<OVERLAY_VID3), 0 },
+	[PIXELFORMAT_1555_TBGR] = { OVERLAY_ATTRIBUTES_FORMAT_xRGB15_1555, FEATURE_CPR, FEATURE_CPR+FEATURE_GAMMAHACK, (1<<OVERLAY_GFX)|(1<<OVERLAY_VID1)|(1<<OVERLAY_VID2)|(1<<OVERLAY_VID3), 0 },
+	[PIXELFORMAT_1555_TRGB] = { OVERLAY_ATTRIBUTES_FORMAT_xRGB15_1555, 0, FEATURE_CPR+FEATURE_GAMMAHACK, (1<<OVERLAY_GFX)|(1<<OVERLAY_VID1)|(1<<OVERLAY_VID2)|(1<<OVERLAY_VID3), 0 },
+	[PIXELFORMAT_1555_ABGR] = { OVERLAY_ATTRIBUTES_FORMAT_ARGB16_1555, FEATURE_CPR+FEATURE_ALPHA, FEATURE_CPR+FEATURE_ALPHA+FEATURE_GAMMAHACK, (1<<OVERLAY_GFX)|(1<<OVERLAY_VID1)|(1<<OVERLAY_VID2)|(1<<OVERLAY_VID3), 0 },
+	[PIXELFORMAT_1555_ARGB] = { OVERLAY_ATTRIBUTES_FORMAT_ARGB16_1555, FEATURE_ALPHA, FEATURE_CPR+FEATURE_ALPHA+FEATURE_GAMMAHACK, (1<<OVERLAY_GFX)|(1<<OVERLAY_VID1)|(1<<OVERLAY_VID2)|(1<<OVERLAY_VID3), 0 },
+	[PIXELFORMAT_565_BGR]   = { OVERLAY_ATTRIBUTES_FORMAT_RGB16_565, FEATURE_CPR, FEATURE_CPR+FEATURE_GAMMAHACK, (1<<OVERLAY_GFX)|(1<<OVERLAY_VID1)|(1<<OVERLAY_VID2)|(1<<OVERLAY_VID3), 0 },
+	[PIXELFORMAT_565_RGB]   = { OVERLAY_ATTRIBUTES_FORMAT_RGB16_565, 0, FEATURE_CPR+FEATURE_GAMMAHACK, (1<<OVERLAY_GFX)|(1<<OVERLAY_VID1)|(1<<OVERLAY_VID2)|(1<<OVERLAY_VID3), 0 },
+#if 0 /* cannot be used together with EDID */
+	[PIXELFORMAT_888_BGR]   = { OVERLAY_ATTRIBUTES_FORMAT_RGB24_888, FEATURE_CPR, FEATURE_CPR+FEATURE_GAMMAHACK, (1<<OVERLAY_GFX)|(1<<OVERLAY_VID1)|(1<<OVERLAY_VID2)|(1<<OVERLAY_VID3), 0 },
+	[PIXELFORMAT_888_RGB]   = { OVERLAY_ATTRIBUTES_FORMAT_RGB24_888, 0, FEATURE_CPR+FEATURE_GAMMAHACK, (1<<OVERLAY_GFX)|(1<<OVERLAY_VID1)|(1<<OVERLAY_VID2)|(1<<OVERLAY_VID3), 0 },
+#else
+	[PIXELFORMAT_888_BGR]   = { OVERLAY_ATTRIBUTES_FORMAT_RGB24_888, FEATURE_CPR, FEATURE_CPR+FEATURE_GAMMAHACK, 0, 0 },
+	[PIXELFORMAT_888_RGB]   = { OVERLAY_ATTRIBUTES_FORMAT_RGB24_888, 0, FEATURE_CPR+FEATURE_GAMMAHACK, 0, 0 },
+#endif
+	[PIXELFORMAT_8888_TBGR] = { OVERLAY_ATTRIBUTES_FORMAT_xRGB24_8888, FEATURE_CPR, FEATURE_CPR+FEATURE_GAMMAHACK, (1<<OVERLAY_GFX)|(1<<OVERLAY_VID1)|(1<<OVERLAY_VID2)|(1<<OVERLAY_VID3), 0 },
+	[PIXELFORMAT_8888_TRGB] = { OVERLAY_ATTRIBUTES_FORMAT_xRGB24_8888, 0, FEATURE_CPR+FEATURE_GAMMAHACK, (1<<OVERLAY_GFX)|(1<<OVERLAY_VID1)|(1<<OVERLAY_VID2)|(1<<OVERLAY_VID3), 0 },
+	[PIXELFORMAT_8888_ABGR] = { OVERLAY_ATTRIBUTES_FORMAT_ARGB32_8888, FEATURE_CPR+FEATURE_ALPHA, FEATURE_CPR+FEATURE_GAMMAHACK+FEATURE_ALPHA, (1<<OVERLAY_GFX)|(1<<OVERLAY_VID1)|(1<<OVERLAY_VID2)|(1<<OVERLAY_VID3), 0 },
+	[PIXELFORMAT_8888_ARGB] = { OVERLAY_ATTRIBUTES_FORMAT_ARGB32_8888, FEATURE_ALPHA, FEATURE_CPR+FEATURE_GAMMAHACK+FEATURE_ALPHA, (1<<OVERLAY_GFX)|(1<<OVERLAY_VID1)|(1<<OVERLAY_VID2)|(1<<OVERLAY_VID3), 0 },
+	[PIXELFORMAT_UYVY_601_full ] = { OVERLAY_ATTRIBUTES_FORMAT_UYVY, 0, 0, (1<<OVERLAY_VID1)|(1<<OVERLAY_VID2)|(1<<OVERLAY_VID3), EXTRAFLAG_FULLRANGE },
+	[PIXELFORMAT_UYVY_601_video] = { OVERLAY_ATTRIBUTES_FORMAT_UYVY, 0, 0, (1<<OVERLAY_VID1)|(1<<OVERLAY_VID2)|(1<<OVERLAY_VID3), 0 },
+	[PIXELFORMAT_UYVY_709_full ] = { OVERLAY_ATTRIBUTES_FORMAT_UYVY, 0, 0, (1<<OVERLAY_VID1)|(1<<OVERLAY_VID2)|(1<<OVERLAY_VID3), EXTRAFLAG_709+EXTRAFLAG_FULLRANGE },
+	[PIXELFORMAT_UYVY_709_video] = { OVERLAY_ATTRIBUTES_FORMAT_UYVY, 0, 0, (1<<OVERLAY_VID1)|(1<<OVERLAY_VID2)|(1<<OVERLAY_VID3), EXTRAFLAG_709 },
+	[PIXELFORMAT_YUY2_601_full ] = { OVERLAY_ATTRIBUTES_FORMAT_YUV2, 0, 0, (1<<OVERLAY_VID1)|(1<<OVERLAY_VID2)|(1<<OVERLAY_VID3), EXTRAFLAG_FULLRANGE },
+	[PIXELFORMAT_YUY2_601_video] = { OVERLAY_ATTRIBUTES_FORMAT_YUV2, 0, 0, (1<<OVERLAY_VID1)|(1<<OVERLAY_VID2)|(1<<OVERLAY_VID3), 0 },
+	[PIXELFORMAT_YUY2_709_full ] = { OVERLAY_ATTRIBUTES_FORMAT_YUV2, 0, 0, (1<<OVERLAY_VID1)|(1<<OVERLAY_VID2)|(1<<OVERLAY_VID3), EXTRAFLAG_709+EXTRAFLAG_FULLRANGE },
+	[PIXELFORMAT_YUY2_709_video] = { OVERLAY_ATTRIBUTES_FORMAT_YUV2, 0, 0, (1<<OVERLAY_VID1)|(1<<OVERLAY_VID2)|(1<<OVERLAY_VID3), EXTRAFLAG_709 },
+	[PIXELFORMAT_NV12_601_full ] = { OVERLAY_ATTRIBUTES_FORMAT_NV12, 0, 0, (1<<OVERLAY_VID1)|(1<<OVERLAY_VID2)|(1<<OVERLAY_VID3), EXTRAFLAG_PLANAR+EXTRAFLAG_FULLRANGE },
+	[PIXELFORMAT_NV12_601_video] = { OVERLAY_ATTRIBUTES_FORMAT_NV12, 0, 0, (1<<OVERLAY_VID1)|(1<<OVERLAY_VID2)|(1<<OVERLAY_VID3), EXTRAFLAG_PLANAR },
+	[PIXELFORMAT_NV12_709_full ] = { OVERLAY_ATTRIBUTES_FORMAT_NV12, 0, 0, (1<<OVERLAY_VID1)|(1<<OVERLAY_VID2)|(1<<OVERLAY_VID3), EXTRAFLAG_PLANAR+EXTRAFLAG_709+EXTRAFLAG_FULLRANGE },
+	[PIXELFORMAT_NV12_709_video] = { OVERLAY_ATTRIBUTES_FORMAT_NV12, 0, 0, (1<<OVERLAY_VID1)|(1<<OVERLAY_VID2)|(1<<OVERLAY_VID3), EXTRAFLAG_PLANAR+EXTRAFLAG_709 },
+	[PIXELFORMAT_POINTER]   = { OVERLAY_ATTRIBUTES_FORMAT_ARGB32_8888, 0, 0, (1<<OVERLAY_GFX)|(1<<OVERLAY_VID1)|(1<<OVERLAY_VID2)|(1<<OVERLAY_VID3), 0 },
+};
+
+/* Transparency settings
+   Alpha blending is disabled for the layer programmed with depth 0. Other than that, alpha is always enabled (assuming Z-order is in use) */
+
+typedef enum
+{
+	TRANSPARENCY_NONE, /* No TCK, just alpha */
+	TRANSPARENCY_SOURCE, /* Layer with depth 3 has TCK applied */
+	TRANSPARENCY_DEST, /* Layer with depth 0 has TCK applied. Layer 0 appears infront of layer 1. */
+
+	TRANSPARENCY_MAX,
+} transparencycfg;
+
+static const uint32_t transparency_lut[TARGET_MAX][TRANSPARENCY_MAX] =
+{
+	{ /* TARGET_LCD2 */
+		0,
+		DISPC_CONFIG_TCKLCDENABLE | DISPC_CONFIG_TCKLCDSELECTION,
+		DISPC_CONFIG_TCKLCDENABLE,
+	},
+};
+
+/* Configuration information / hardware state softcopies */
+
+/* Default settings
+   Higher values are closest to front */
+static uint8_t overlay_zorder[OVERLAY_MAX] = {
+	[OVERLAY_GFX] = 0,
+	[OVERLAY_VID1] = 1,
+	[OVERLAY_VID2] = 2,
+	[OVERLAY_VID3] = 3,
+};
+
+static transparencycfg current_transparencycfgs[TARGET_MAX];
+
+void omap_init(void)
+{
+	features_t *features = features_write_lock();
+	for(int i=0;i<OVERLAY_MAX;i++)
+	{
+		features->requests[i].target = TARGET_NONE;
+	}
+	features_write_unlock();
+}
+
+static void flush_transparency_cfg(bool go)
+{
+	int irqs;
+	if(!begin_quick_hardware_update(&irqs))
+		return;
+	uint32_t orig_config2 = dispc->config2;
+	uint32_t config2 = orig_config2 & ~(DISPC_CONFIG_TCKLCDENABLE | DISPC_CONFIG_TCKLCDSELECTION);
+	config2 |= transparency_lut[TARGET_LCD2][current_transparencycfgs[TARGET_LCD2]];
+	uint32_t orig_config1 = dispc->config1;
+	uint32_t config1 = orig_config1 & ~(DISPC_CONFIG_TCKLCDENABLE | DISPC_CONFIG_TCKLCDSELECTION | DISPC_CONFIG_TCKTVENABLE | DISPC_CONFIG_TCKTVSELECTION | DISPC_CONFIG_LCDALPHABLENDERENABLE | DISPC_CONFIG_TVALPHABLENDERENABLE);
+
+	if (config2 != orig_config2)
+	{
+		dispc->config2 = config2;
+		if(go)
+		{
+			uint32_t control = dispc->control2;
+			config2 = config2 ^ orig_config2;
+			if ((control & DISPC_CONTROL_LCDENABLE) && (config2 & (DISPC_CONFIG_TCKLCDENABLE | DISPC_CONFIG_TCKLCDSELECTION)))
+				control |= DISPC_CONTROL_GOLCD;
+			dispc->control2 = control;
+		}
+	}
+	if(config1 != orig_config1)
+	{
+		dispc->config1 = config1;
+		if(go)
+		{
+			uint32_t control = dispc->control1;
+			config1 = config1 ^ orig_config1;
+			if ((control & DISPC_CONTROL_TVENABLE) && (config1 & (DISPC_CONFIG_TCKTVENABLE | DISPC_CONFIG_TCKTVSELECTION | DISPC_CONFIG_TVALPHABLENDERENABLE)))
+				control |= DISPC_CONTROL_GOTV;
+			dispc->control1 = control;
+		}
+	}
+	end_quick_hardware_update(irqs);
+}
+
+static void apply_features(const features_t *features)
+{
+	/* Enable/disable gamma table usage on LCD */
+	bool palette_used = false;
+	for(int i=0;i<TARGET_MAX;i++)
+	{
+		if(features->head_vals[i] & FEATURE_PALETTE)
+		{
+			palette_used = true;
+			break;
+		}
+	}
+	uint32_t config1 = dispc->config1;
+	uint32_t config2 = dispc->config2;
+	uint32_t old_config1 = config1;
+	uint32_t old_config2 = config2;
+	if(!palette_used)
+		config1 |= DISPC_CONFIG_PALETTEGAMMATABLE | DISPC_CONFIG_GAMMATABLEENABLE;
+	else
+		config1 &= ~(DISPC_CONFIG_PALETTEGAMMATABLE | DISPC_CONFIG_GAMMATABLEENABLE);
+
+	/* Enable/disable CPR for LCD */
+	if(features->head_vals[TARGET_LCD2] & FEATURE_CPR)
+	{
+		config2 |= DISPC_CONFIG_CPR;
+		/* Default CPR value for RISC OS */
+		dispc->cpr2_coef_r = 256;
+		dispc->cpr2_coef_g = 256 << DISPC_CPR_COEF_xG_SHIFT;
+		dispc->cpr2_coef_b = 256 << DISPC_CPR_COEF_xR_SHIFT;
+	}
+	else
+	{
+		config2 &= ~DISPC_CONFIG_CPR;
+	}
+
+	/* TODO need gobits here? */
+	if(config1 != old_config1)
+		dispc->config1 = config1;
+	if(config2 != old_config2)
+		dispc->config2 = config2;
+}
+
+void omap_update_features(overlayidx idx, overlaytarget target, pixelformat format)
+{
+	{
+		features_t *features = features_write_lock();
+		if ((features->requests[idx].target == target) && (features->requests[idx].format == format))
+		{
+			features_write_unlock();
+			return;
+		}
+		features->requests[idx].target = target;
+		features->requests[idx].format = format;
+
+		/* Deduce required features for all heads */
+		for(int i=0;i<TARGET_MAX;i++)
+		{
+			/* Don't unnecessarily hold onto the palette/gamma hardware */
+			features->head_vals[i] &= ~(FEATURE_PALETTE | FEATURE_GAMMAHACK);
+			/* Reset to base feature mask for the head */
+			features->head_masks[i] = headattrs[i].features_mask;
+		}
+
+		for(int i=0;i<OVERLAY_MAX;i++)
+		{
+			const featurecfg_t cfg = features->requests[i];
+			if(cfg.target != TARGET_NONE)
+			{
+				features->head_vals[cfg.target] = (features->head_vals[cfg.target] & ~omapformats[cfg.format].features_mask) | omapformats[cfg.format].features_val;
+				features->head_masks[cfg.target] |= omapformats[cfg.format].features_mask;
+			}
+		}
+
+		/* Override any requests to limit things to just the features supported by the head
+		   TODO can be removed once overlay code prevents selection of unsupported formats? */
+		for(int i=0;i<TARGET_MAX;i++)
+		{
+			features->head_vals[i] = (features->head_vals[i] & ~headattrs[i].features_mask) | headattrs[i].features_val;
+		}
+	}
+
+	const features_t *features = features_write_to_read(); /* Downgrade to read lock */
+
+	select_palette_func(&dispc->gamma_table[1], features); /* LCD2 gamma table */
+
+	apply_features(features);
+
+	features_read_unlock();
+}
+
+overlaytarget omap_pick_display(void)
+{
+	/* Only one display supported atm */
+	return TARGET_LCD2;
+}
+
+static bool omap4_vetmode_lcd2(overlaytarget target,const VIDCList3 *params,bool interlace,pixelformat format)
+{
+	(void) target;
+	(void) format;
+
+	/* Always accept if we're using fixed LCD timings */
+	if(hwconfig->lcd_configs[current_lcd].max_pixelrate == 0)
+		return true;
+
+	/* Check interlace */
+	if(interlace)
+		return false;
+	/* Check pixel rate */
+	if(params->PixelRate > hwconfig->lcd_configs[current_lcd].max_pixelrate)
+		return false;
+	/* Use a lower limit of 15MHz on the pixel rate. The limiting factor appears to be the TFP410, which according to the datasheet only supports down to 25MHz, but appears to be stable down to 15MHz. Anything lower can result in picture instability.
+	   https://www.riscosopen.org/forum/forums/3/topics/2583?page=1#posts-33233
+	*/
+	if(params->PixelRate < 15000)
+		return false;
+	/* Check screen size */
+	if((params->HorizDisplaySize-1 > REG_MAX(DISPC_SIZE_LCD_PPL))
+	|| ((params->VertiDisplaySize<<interlace)-1 > REG_MAX(DISPC_SIZE_LCD_LPP))
+	|| (params->HorizDisplaySize & 0x7)) /* Width must be multiple of 8 pixels for STALLMODE=0 */
+		return false;
+	/* Check required REGM, REGN values */
+	clock_divider_t div = calculate_dss_clock_divider(params->PixelRate*1000);
+	if((div.regm > REG_MAX(DSI_PLL_CONFIGURATION1_DSI_PLL_REGM)) || (div.regn > REG_MAX(DSI_PLL_CONFIGURATION1_DSI_PLL_REGN)))
+		return false;
+	/* Check for BMP8 erratum (in connection with pcd==1) */
+	if ((params->PixelDepth <= 3) && (div.pcd == 1))
+		return false;
+	/* Now check mode timings */
+	if((params->HorizSyncWidth > hwconfig->max_sync)
+	|| (params->HorizBackPorch+params->HorizLeftBorder > hwconfig->max_porch)
+	|| (params->HorizFrontPorch+params->HorizRightBorder > hwconfig->max_porch)
+	|| (params->VertiSyncWidth > hwconfig->max_sync)
+	|| (params->VertiBackPorch+params->VertiTopBorder > hwconfig->max_porch)
+	|| (params->VertiFrontPorch+params->VertiBottomBorder > hwconfig->max_porch))
+		return false;
+	if((params->HorizSyncWidth < 1)
+	|| (params->HorizBackPorch+params->HorizLeftBorder < 1)
+	|| (params->HorizFrontPorch+params->HorizRightBorder < 1)
+	|| (params->VertiSyncWidth < 1))
+		return false;
+	/* Check (HBP+HSW+HFP)*PCD > 8 */
+	uint32_t val = params->HorizBackPorch + params->HorizLeftBorder
+				 + params->HorizSyncWidth + params->HorizFrontPorch
+				 + params->HorizRightBorder;
+	if (val * div.pcd <= 8)
+		return false;
+
+	return true;
+}
+
+static void omap4_prepmode_lcd2(overlaytarget target,modelocked_head_t *state,pixelformat format)
+{
+	(void) target;
+	(void) state;
+	(void) format;
+	/* Defaults are all fine */
+}
+
+static void omap4_setmode_lcd2(overlaytarget target,const modelocked_head_t *state)
+{
+	(void) target;
+	/* The flow used here is similar to that shown in spruf98d fig 15-147 (p2343), except the PLL reprogramming steps use the DSI PLL */
+	int irqs;
+	if(!begin_slow_hardware_update(&irqs))
+	{
+		dprintf(("","omap4_setmode_lcd2: Banned!\n"));
+		return; /* TODO - Mark as pending */
+	}
+	dprintf(("","omap4_setmode_lcd2: rate=%d syncpol=%d\n",state->mode.pixelrate,state->mode.syncpol));
+	dprintf(("","hsw=%d hfp=%d hbp=%d width=%d\n",state->mode.hsw,state->mode.hfp,state->mode.hbp,state->mode.width));
+	dprintf(("","vsw=%d vfp=%d vbp=%d height=%d\n",state->mode.vsw,state->mode.vfp,state->mode.vbp,state->mode.height));
+
+	volatile uint32_t *dispc_config = &dispc->config2;
+	volatile uint32_t *dispc_control = &dispc->control2;
+	/* We can skip this if we aren't changing pixel rate */
+	if(state->mode.pixelrate != dsi_pll_current_pixel_rate)
+	{
+		dispc_change_pixelrate(state->mode.pixelrate,dispc_config,dispc_control);
+		/* Select DSI_ALWON_FCLK as DISPC functional clock */
+		dss->ctrl = DSS_CTRL_FCK_CLK_SWITCH_PLL2_CLK1 | DSS_CTRL_LCD2_CLK_SWITCH;
+	}
+	else
+		*dispc_control &= ~DISPC_CONTROL_GOLCD; /* Prevent any updates from occuring in the middle of our update. TODO - this isn't foolproof */
+
+	/* 24. Re-enable free-running clock, LCD
+	       (not necessary - free-running clock is SDI-only thing, and we only want to enable the LCD once we've programmed the mode timings!) */
+
+	/* Get register values */
+	dispcmode_t dm;
+	dm.control = *dispc_control;
+	dispc_getmode(&state->mode,&dm);
+	dispc->size_lcd2 = dm.size_lcd;
+	dispc->timing_h2 = dm.timing_h;
+	dispc->timing_v2 = dm.timing_v;
+	dispc->pol_freq2 = dm.pol_freq;
+
+	/* Apply features */
+	{
+		const features_t *features = features_read_lock();
+		apply_features(features);
+		features_read_unlock();
+	}
+
+	/* Update transparency settings */
+	flush_transparency_cfg(false);
+
+	/* Re-enable all the other clocks */
+	*dispc_config &= ~(DISPC_CONFIG_PIXELGATED | DISPC_CONFIG_HSYNCGATED | DISPC_CONFIG_VSYNCGATED | DISPC_CONFIG_ACBIASGATED);
+
+	/* Mark the head as active */
+	{
+		irqlocked_t *irqlocked = irqlocked_lock();
+		irqlocked->heads[TARGET_LCD2].dpms = 0;
+		irqlocked->heads[TARGET_LCD2].blanked = false;
+		irqlocked_unlock();
+	}
+
+	uint32_t mask = DISPC_IRQ_VSYNC2 | DISPC_IRQ_SYNCLOST2;
+#ifdef DEBUGLIB /* Enable these IRQs for debug builds so we can see when they occur. */
+	mask |= DISPC_IRQ_GFXBUFFERUNDERFLOW | DISPC_IRQ_OCPERROR | DISPC_IRQ_VID1BUFFERUNDERFLOW | DISPC_IRQ_VID2BUFFERUNDERFLOW;
+#endif
+	/* Now enable display */
+	*dispc_control = dm.control | DISPC_CONTROL_GOLCD | DISPC_CONTROL_LCDENABLE;
+	dispc->irqenable = mask;
+
+	/* Enable power to any external chips */
+	(hwconfig->lcd_configs[current_lcd].power)(dev,65536);
+
+	dprintf(("","omap4_setmode_lcd2: Done\n"));
+	end_slow_hardware_update(irqs);
+}
+
+static void omap4_setblank_lcd2(overlaytarget target,bool blanked,uint8_t dpms)
+{
+	(void) target;
+
+	/* If we're on a device with a fixed LCD, ignore the supplied
+	   DPMS state and just turn the LCD off entirely */
+	if(hwconfig->lcd_configs[current_lcd].lcd_timings)
+	{
+		(hwconfig->lcd_configs[current_lcd].power)(dev,(blanked?0:65536));
+		dpms = 3; /* Should be safe to gate all clocks if we've just turned off the LCD */
+	}
+
+	{
+		irqlocked_t *irqlocked = irqlocked_lock();
+		irqlocked->heads[TARGET_LCD2].blanked = blanked;
+		irqlocked->heads[TARGET_LCD2].dpms = dpms;
+		irqlocked_unlock();
+	}
+
+	int irqs;
+	if(begin_quick_hardware_update(&irqs))
+	{
+		uint32_t config = dispc->config2 & ~(DISPC_CONFIG_HSYNCGATED | DISPC_CONFIG_VSYNCGATED | DISPC_CONFIG_PIXELGATED);
+		if(blanked)
+		{
+			/* Gate pixel clock */
+			config |= DISPC_CONFIG_PIXELGATED;
+			if(dpms & 1) /* Gate HSync */
+				config |= DISPC_CONFIG_HSYNCGATED;
+			if(dpms & 2) /* Gate VSync */
+				config |= DISPC_CONFIG_VSYNCGATED;
+		}
+		dispc->config2 = config;
+		/* It looks like we might need to set the go bits for all of the updates to take effect, even though the TRM suggests otherwise */
+		dispc->control2 |= DISPC_CONTROL_GOLCD;
+		end_quick_hardware_update(irqs);
+	}
+}
+
+static void omap4_setbackground_lcd2(overlaytarget target,const irqlocked_t *irqlocked)
+{
+	(void) target;
+	const features_t *features = features_read_lock();
+	uint32_t col = irqlocked->heads[TARGET_LCD2].background >> 8;
+	if(!(features->head_vals[TARGET_LCD2] & FEATURE_CPR))
+		col = (col<<16) | (col & 0xff00) | (col>>16);
+	dispc->default_color2 = col;
+	dispc->control2 |= DISPC_CONTROL_GOLCD;
+	features_read_unlock();
+}
+
+static void omap4_settransparent_lcd2(overlaytarget target,const irqlocked_t *irqlocked)
+{
+	(void) target;
+	dispc->trans_color2 = irqlocked->heads[TARGET_LCD2].transparent;
+	dispc->control2 |= DISPC_CONTROL_GOLCD;
+}
+
+static void omap4_iicop_lcd2(overlaytarget target,_kernel_swi_regs *r)
+{
+	(void) target;
+	/* Call through to the HAL */
+	/* TODO - Implement here instead */
+	int count = r->r[2];
+	_swix(OS_Hardware,_INR(0,2)|_INR(8,9)|_OUT(0),r->r[0],r->r[1],&count,OSHW_CallHAL,EntryNo_HAL_VideoIICOp,&r->r[0]);
+	r->r[1] += count; /* Advance pointer */
+	r->r[2] -= count; /* Bytes not transferred */
+	r->r[4] = 0;
+}
+
+static const lcdtimings_t *omap4_fixedtimings_lcd2(overlaytarget target)
+{
+	(void) target;
+	return hwconfig->lcd_configs[current_lcd].lcd_timings;
+}
+
+const headattr_t headattrs[TARGET_MAX] =
+{
+	{ /* TARGET_LCD2 */
+		omap4_vetmode_lcd2,
+		omap4_prepmode_lcd2,
+		omap4_setmode_lcd2,
+		omap4_setblank_lcd2,
+		omap4_setbackground_lcd2,
+		omap4_settransparent_lcd2,
+		omap4_iicop_lcd2,
+		omap4_fixedtimings_lcd2,
+		omapformats,
+		0,
+		0,
+		HEADATTR_CLAMPTIMINGS
+	}
+};
+
+static void omap4_gfx_enable(overlayidx overlay,const lloverlaycfg_t *ll)
+{
+	(void) overlay;
+	volatile gfx_regs_t *r = &dispc->gfx;
+	uint32_t attr = r->attributes;
+	uint32_t gobits[2] = {0,0};
+	/* If we're moving it from one display to another, we need to update both - so gobits should take into account both the initial and final display */
+	if(attr & OVERLAY_ATTRIBUTES_ENABLE)
+	{
+		if(attr & OVERLAY_ATTRIBUTES_GFXCHANNELOUT)
+			gobits[0] = DISPC_CONTROL_GOTV;
+		else
+			gobits[1] = DISPC_CONTROL_GOLCD;
+	}
+	if(ll->target == TARGET_LCD2)
+		gobits[1] |= DISPC_CONTROL_GOLCD;
+	else
+		gobits[0] |= DISPC_CONTROL_GOTV;
+
+	uint32_t format = omapformats[ll->format].omapformat;
+
+	/* Program registers */
+	r->ba[0] = ll->ba[0];
+	r->ba[1] = ll->ba[1];
+	r->position = ll->position;
+	r->size = ll->size;
+	r->pixel_inc = 1;
+	r->row_inc = ll->row_inc;
+	/* use WB FIFO buffers */
+	uint32_t temp = dispc->wb.buf_size_status & OVERLAY_FIFO_SIZE_STATUS_MASK;
+	r->buf_threshold = ((temp - 1) << OVERLAY_FIFOHIGHTHRESHOLD_SHIFT)
+					 | ((temp - 8) << OVERLAY_FIFOLOWTHRESHOLD_SHIFT);
+	/* Graphics specific settings */
+	dispc->gfx_preload = temp - 1;
+	r->table_ba = gfx_palette_p;
+	r->attributes = OVERLAY_ATTRIBUTES_ENABLE
+				  | format
+				  | OVERLAY_ATTRIBUTES_GFXREPLICATIONENABLE
+				  | OVERLAY_ATTRIBUTES_GFXBURSTSIZE_8X128
+				  | OVERLAY_ATTRIBUTES_ROTATION_0
+				  | OVERLAY_ATTRIBUTES_CHANNELOUT2_LCD2
+				  | (ll->highprio ? OVERLAY_ATTRIBUTES_GFXARBITRATION : 0)
+				  | OVERLAY_ATTRIBUTES_ZORDERENABLE
+				  | (overlay_zorder[overlay]<<OVERLAY_ATTRIBUTES_ZORDER_SHIFT)
+				  | (ll->rotation?OVERLAY_ATTRIBUTES_BURSTTYPE:0); /* Assume TILER used iff we have rotation */
+
+	if (gobits[0])
+	{
+		dispc->control1 |= gobits[0];
+	}
+	if (gobits[1])
+	{
+		dispc->control2 |= gobits[1];
+	}
+}
+
+static void omap4_gfx_disable(overlayidx overlay)
+{
+	(void) overlay;
+	volatile gfx_regs_t *r = &dispc->gfx;
+	uint32_t attr = r->attributes;
+	if(attr & OVERLAY_ATTRIBUTES_ENABLE)
+	{
+		attr &= OVERLAY_ATTRIBUTES_GFXCHANNELOUT | OVERLAY_ATTRIBUTES_CHANNELOUT2;
+		r->attributes = attr;
+		if(attr & OVERLAY_ATTRIBUTES_GFXCHANNELOUT)
+			dispc->control1 |= DISPC_CONTROL_GOTV;
+		else
+			dispc->control2 |= DISPC_CONTROL_GOLCD;
+	}
+}
+
+/* Colour convolution + extra flags for all four YUV colour spaces
+   Transcribed from OMAP3 TRM */
+#define COLOURCONV(RY,RCr,RCb,GY,GCr,GCb,BY,BCr,BCb,flag) { \
+  (RY & 0x7ff) + ((RCr & 0x7ff) << 16), \
+  (RCb & 0x7ff) + ((GY & 0x7ff) << 16), \
+  (GCr & 0x7ff) + ((GCb & 0x7ff) << 16), \
+  (BY & 0x7ff) + ((BCr & 0x7ff) << 16), \
+  BCb & 0x7ff, \
+  OVERLAY_ATTRIBUTES_VIDCOLORCONVENABLE + (flag * OVERLAY_ATTRIBUTES_VIDFULLRANGE), \
+}
+
+static const uint32_t colour_conv[4][6] =
+{
+	COLOURCONV(298,409,0,298,-208,-100,298,0,517,0), /* 601 video */
+	COLOURCONV(256,351,0,256,-179,-86,256,0,443,1), /* 601 full */
+	COLOURCONV(298,459,0,298,-137,-55,298,0,541,0), /* 709 video */
+	COLOURCONV(256,394,0,256,-118,-47,256,0,465,1), /* 709 full */
+};
+
+static void omap4_vid_enable(overlayidx overlay,const lloverlaycfg_t *ll)
+{
+	volatile vid_regs_t *r = (overlay==OVERLAY_VID1?&dispc->vid1:&dispc->vid2);
+	volatile vid_regs2_t *r2 = (overlay==OVERLAY_VID1?&dispc->vid1_2:&dispc->vid2_2);
+	uint32_t attr = r->attributes;
+	uint32_t gobits[2] = {0,0};
+	/* If we're moving it from one display to another, we need to update both - so gobits should take into account both the initial and final display */
+	if(attr & OVERLAY_ATTRIBUTES_ENABLE)
+	{
+		if(attr & OVERLAY_ATTRIBUTES_VIDCHANNELOUT)
+			gobits[0] = DISPC_CONTROL_GOTV;
+		else
+			gobits[1] = DISPC_CONTROL_GOLCD;
+	}
+	if(ll->target == TARGET_LCD2)
+		gobits[1] |= DISPC_CONTROL_GOLCD;
+	else
+		gobits[0] |= DISPC_CONTROL_GOTV;
+
+	uint32_t format = omapformats[ll->format].omapformat;
+
+	/* TODO: Avoid doing this every time */
+	uint32_t fir = ll->fir;
+	if ((fir != 0x04000400) || (format == OVERLAY_ATTRIBUTES_FORMAT_NV12))
+	{
+		dispc_program_vid_scale_coefficients(r->fir_coef,dispc->vid_fir_coef_v[overlay-OVERLAY_VID1],(fir & VID_OVERLAY_FIR_HINC_MASK) < (1024<<VID_OVERLAY_FIR_HINC_SHIFT),(fir & VID_OVERLAY_FIR_VINC_MASK) < (1024<<VID_OVERLAY_FIR_VINC_SHIFT),ll->v5tap);
+		if (format == OVERLAY_ATTRIBUTES_FORMAT_NV12)
+		{
+			/* 2x H & V upscale
+			   TODO: Fixup other values */
+			fir = (fir>>1) & ~0x8000;
+			dispc_program_vid_scale_coefficients(r2->fir_coef,r2->fir_coef_v,(fir & VID_OVERLAY_FIR_HINC_MASK) < (1024<<VID_OVERLAY_FIR_HINC_SHIFT),(fir & VID_OVERLAY_FIR_VINC_MASK) < (1024<<VID_OVERLAY_FIR_VINC_SHIFT),ll->v5tap);
+			r2->fir = fir;
+			r2->accu[0] = ll->accui[0];
+			r2->accu[1] = ll->accui[1];
+		} 
+	}
+
+	r->ba[0] = ll->ba[0];
+	r->ba[1] = ll->ba[1];
+	r->position = ll->position;
+	r->size = ll->size;
+	uint32_t row_inc = ll->row_inc;
+	r->pixel_inc = 1;
+	r->fir = ll->fir;
+	r->picture_size = ll->pic_size;
+	r->accui[0] = ll->accui[0];
+	r->accui[1] = ll->accui[1];
+	uint32_t temp = REG_EXTRACT(r->buf_size_status,OVERLAY_FIFO_SIZE_STATUS);
+	r->buf_threshold = ((temp - 1) << OVERLAY_FIFOHIGHTHRESHOLD_SHIFT)
+					 | ((temp - 8) << OVERLAY_FIFOLOWTHRESHOLD_SHIFT);
+	/* Video specific settings */
+	dispc->vid_preload[overlay-OVERLAY_VID1] = temp - 1;
+	uint32_t newattr = OVERLAY_ATTRIBUTES_ENABLE
+	                 | format
+	                 | OVERLAY_ATTRIBUTES_VIDREPLICATIONENABLE
+	                 | OVERLAY_ATTRIBUTES_ROTATION_0
+	                 | OVERLAY_ATTRIBUTES_VIDRESIZEENABLE_NONE
+	                 | OVERLAY_ATTRIBUTES_VIDBURSTSIZE_8X128
+	                 | OVERLAY_ATTRIBUTES_CHANNELOUT2_LCD2
+	                 | (ll->highprio ? OVERLAY_ATTRIBUTES_VIDARBITRATION : 0)
+	                 | OVERLAY_ATTRIBUTES_ZORDERENABLE
+	                 | (overlay_zorder[overlay]<<OVERLAY_ATTRIBUTES_ZORDER_SHIFT)
+	                 | ((fir & VID_OVERLAY_FIR_HINC_MASK) != (1024<<VID_OVERLAY_FIR_HINC_SHIFT)?OVERLAY_ATTRIBUTES_VIDRESIZEENABLE_H:0)
+	                 | ((fir & VID_OVERLAY_FIR_VINC_MASK) != (1024<<VID_OVERLAY_FIR_VINC_SHIFT)?OVERLAY_ATTRIBUTES_VIDRESIZEENABLE_V:0)
+	                 | (ll->v5tap ? OVERLAY_ATTRIBUTES_VIDVERTICALTAPS : 0)
+	                 | (ll->rotation?OVERLAY_ATTRIBUTES_BURSTTYPE:0); /* Assume TILER used iff we have rotation */
+	uint32_t newattr2 = 0;
+	if ((format == OVERLAY_ATTRIBUTES_FORMAT_YUV2) || (format == OVERLAY_ATTRIBUTES_FORMAT_UYVY) || (format == OVERLAY_ATTRIBUTES_FORMAT_NV12))
+	{
+		const uint32_t *settings = colour_conv[omapformats[ll->format].extra_flags & (EXTRAFLAG_FULLRANGE|EXTRAFLAG_709)];
+		uint8_t features = features_read_lock()->head_vals[ll->target];
+		features_read_unlock();
+		if (features & FEATURE_CPR)
+		{
+			/* Red/blue swap the convolution matrix, to counter the CPR */
+			r->conv_coef[0] = settings[3];
+			r->conv_coef[1] = settings[4] | (settings[1] & 0xffff0000);
+			r->conv_coef[2] = settings[2];
+			r->conv_coef[3] = settings[0];
+			r->conv_coef[4] = settings[1] & 0xffff;
+		}
+		else
+		{
+			r->conv_coef[0] = settings[0];
+			r->conv_coef[1] = settings[1];
+			r->conv_coef[2] = settings[2];
+			r->conv_coef[3] = settings[3];
+			r->conv_coef[4] = settings[4];
+		}
+		newattr |= settings[5];
+		switch(ll->rotation)
+		{
+		case 1:
+			newattr |= OVERLAY_ATTRIBUTES_ROTATION_90;
+			break;
+		case 2:
+			newattr |= OVERLAY_ATTRIBUTES_ROTATION_180;
+			break;
+		case 3:
+			newattr |= OVERLAY_ATTRIBUTES_ROTATION_270;
+			break;
+		}
+		if (ll->rotation)
+		{
+			/* Chroma resampling required for rotated YUV 4:2:2 (which also requires the scalers to be enabled) */
+//			newattr |= OVERLAY_ATTRIBUTES_VIDRESIZEENABLE_BOTH; // TODO should program FIR?
+			newattr2 |= OVERLAY_ATTRIBUTES2_YUVCHROMARESAMPLING;
+		}
+		if (format == OVERLAY_ATTRIBUTES_FORMAT_NV12)
+		{
+			dispc->ba_uv[overlay-OVERLAY_VID1][0] = ll->ba_uv[0];
+			dispc->ba_uv[overlay-OVERLAY_VID1][1] = ll->ba_uv[1];
+//			newattr |= OVERLAY_ATTRIBUTES_VIDDOUBLESTRIDE;
+			newattr2 |= OVERLAY_ATTRIBUTES2_YUVCHROMARESAMPLING;
+		}
+	}
+	r->row_inc = row_inc;
+	r->attributes = newattr;
+	dispc->attributes2[overlay-OVERLAY_VID1] = newattr2;
+	if (gobits[0])
+	{
+		dispc->control1 |= gobits[0];
+	}
+	if (gobits[1])
+	{
+		dispc->control2 |= gobits[1];
+	}
+}
+
+static void omap4_vid_disable(overlayidx overlay)
+{
+	volatile vid_regs_t *r = (overlay==OVERLAY_VID1?&dispc->vid1:&dispc->vid2);
+	uint32_t attr = r->attributes;
+	if(attr & OVERLAY_ATTRIBUTES_ENABLE)
+	{
+		attr &= OVERLAY_ATTRIBUTES_VIDCHANNELOUT | OVERLAY_ATTRIBUTES_CHANNELOUT2;
+		r->attributes = attr;
+		if(attr & OVERLAY_ATTRIBUTES_VIDCHANNELOUT)
+			dispc->control1 |= DISPC_CONTROL_GOTV;
+		else
+			dispc->control2 |= DISPC_CONTROL_GOLCD;
+	}
+}
+
+static void omap4_vid3_enable(overlayidx overlay,const lloverlaycfg_t *ll)
+{
+	volatile vid3_regs_t *r = &dispc->vid3;
+	volatile vid_regs2_t *r2 = &dispc->vid3_2;
+	uint32_t attr = r->attributes;
+	uint32_t gobits[2] = {0,0};
+	/* If we're moving it from one display to another, we need to update both - so gobits should take into account both the initial and final display */
+	if(attr & OVERLAY_ATTRIBUTES_ENABLE)
+	{
+		if(attr & OVERLAY_ATTRIBUTES_VIDCHANNELOUT)
+			gobits[0] = DISPC_CONTROL_GOTV;
+		else
+			gobits[1] = DISPC_CONTROL_GOLCD;
+	}
+	if(ll->target == TARGET_LCD2)
+		gobits[1] |= DISPC_CONTROL_GOLCD;
+	else
+		gobits[0] |= DISPC_CONTROL_GOTV;
+
+	uint32_t format = omapformats[ll->format].omapformat;
+
+	/* TODO: Avoid doing this every time */
+	uint32_t fir = ll->fir;
+	if ((fir != 0x04000400) || (format == OVERLAY_ATTRIBUTES_FORMAT_NV12))
+	{
+		dispc_program_vid_scale_coefficients(r->fir_coef,r->fir_coef_v,(fir & VID_OVERLAY_FIR_HINC_MASK) < (1024<<VID_OVERLAY_FIR_HINC_SHIFT),(fir & VID_OVERLAY_FIR_VINC_MASK) < (1024<<VID_OVERLAY_FIR_VINC_SHIFT),ll->v5tap); 
+		if (format == OVERLAY_ATTRIBUTES_FORMAT_NV12)
+		{
+			/* 2x H & V upscale
+			   TODO: Fixup other values */
+			fir = (fir>>1) & ~0x8000;
+			dispc_program_vid_scale_coefficients(r2->fir_coef,r2->fir_coef_v,(fir & VID_OVERLAY_FIR_HINC_MASK) < (1024<<VID_OVERLAY_FIR_HINC_SHIFT),(fir & VID_OVERLAY_FIR_VINC_MASK) < (1024<<VID_OVERLAY_FIR_VINC_SHIFT),ll->v5tap);
+			r2->fir = fir;
+			r2->accu[0] = ll->accui[0];
+			r2->accu[1] = ll->accui[1];
+		} 
+	}
+
+	r->ba[0] = ll->ba[0];
+	r->ba[1] = ll->ba[1];
+	r->position = ll->position;
+	r->size = ll->size;
+	uint32_t row_inc = ll->row_inc;
+	r->pixel_inc = 1;
+	r->fir = ll->fir;
+	r->picture_size = ll->pic_size;
+	r->accui[0] = ll->accui[0];
+	r->accui[1] = ll->accui[1];
+	uint32_t temp = REG_EXTRACT(r->buf_size_status,OVERLAY_FIFO_SIZE_STATUS);
+	r->buf_threshold = ((temp - 1) << OVERLAY_FIFOHIGHTHRESHOLD_SHIFT)
+					 | ((temp - 8) << OVERLAY_FIFOLOWTHRESHOLD_SHIFT);
+	/* Video specific settings */
+	dispc->vid_preload[overlay-OVERLAY_VID1] = temp - 1;
+	uint32_t newattr = OVERLAY_ATTRIBUTES_ENABLE
+	                 | format
+	                 | OVERLAY_ATTRIBUTES_VIDREPLICATIONENABLE
+	                 | OVERLAY_ATTRIBUTES_ROTATION_0
+	                 | OVERLAY_ATTRIBUTES_VIDRESIZEENABLE_NONE
+	                 | OVERLAY_ATTRIBUTES_VIDBURSTSIZE_8X128
+	                 | OVERLAY_ATTRIBUTES_CHANNELOUT2_LCD2
+	                 | (ll->highprio ? OVERLAY_ATTRIBUTES_VIDARBITRATION : 0)
+	                 | OVERLAY_ATTRIBUTES_ZORDERENABLE
+	                 | (overlay_zorder[overlay]<<OVERLAY_ATTRIBUTES_ZORDER_SHIFT)
+	                 | ((fir & VID_OVERLAY_FIR_HINC_MASK) != (1024<<VID_OVERLAY_FIR_HINC_SHIFT)?OVERLAY_ATTRIBUTES_VIDRESIZEENABLE_H:0)
+	                 | ((fir & VID_OVERLAY_FIR_VINC_MASK) != (1024<<VID_OVERLAY_FIR_VINC_SHIFT)?OVERLAY_ATTRIBUTES_VIDRESIZEENABLE_V:0)
+	                 | (ll->v5tap ? OVERLAY_ATTRIBUTES_VIDVERTICALTAPS : 0)
+	                 | (ll->rotation?OVERLAY_ATTRIBUTES_BURSTTYPE:0); /* Assume TILER used iff we have rotation */
+	uint32_t newattr2 = 0;
+	if ((format == OVERLAY_ATTRIBUTES_FORMAT_YUV2) || (format == OVERLAY_ATTRIBUTES_FORMAT_UYVY) || (format == OVERLAY_ATTRIBUTES_FORMAT_NV12))
+	{
+		const uint32_t *settings = colour_conv[omapformats[ll->format].extra_flags & (EXTRAFLAG_FULLRANGE|EXTRAFLAG_709)];
+		uint8_t features = features_read_lock()->head_vals[ll->target];
+		features_read_unlock();
+		if (features & FEATURE_CPR)
+		{
+			/* Red/blue swap the convolution matrix, to counter the CPR */
+			r->conv_coef[0] = settings[3];
+			r->conv_coef[1] = settings[4] | (settings[1] & 0xffff0000);
+			r->conv_coef[2] = settings[2];
+			r->conv_coef[3] = settings[0];
+			r->conv_coef[4] = settings[1] & 0xffff;
+		}
+		else
+		{
+			r->conv_coef[0] = settings[0];
+			r->conv_coef[1] = settings[1];
+			r->conv_coef[2] = settings[2];
+			r->conv_coef[3] = settings[3];
+			r->conv_coef[4] = settings[4];
+		}
+		newattr |= settings[5];
+		switch(ll->rotation)
+		{
+		case 1:
+			newattr |= OVERLAY_ATTRIBUTES_ROTATION_90;
+			break;
+		case 2:
+			newattr |= OVERLAY_ATTRIBUTES_ROTATION_180;
+			break;
+		case 3:
+			newattr |= OVERLAY_ATTRIBUTES_ROTATION_270;
+			break;
+		}
+		if (ll->rotation)
+		{
+			/* Chroma resampling required for rotated YUV 4:2:2 (which also requires the scalers to be enabled) */
+//			newattr |= OVERLAY_ATTRIBUTES_VIDRESIZEENABLE_BOTH; // TODO should program FIR+coef?
+			newattr2 |= OVERLAY_ATTRIBUTES2_YUVCHROMARESAMPLING;
+		}
+		if (format == OVERLAY_ATTRIBUTES_FORMAT_NV12)
+		{
+			dispc->ba_uv[overlay-OVERLAY_VID1][0] = ll->ba_uv[0];
+			dispc->ba_uv[overlay-OVERLAY_VID1][1] = ll->ba_uv[1];
+//			newattr |= OVERLAY_ATTRIBUTES_VIDDOUBLESTRIDE;
+			newattr2 |= OVERLAY_ATTRIBUTES2_YUVCHROMARESAMPLING;
+		}
+	}
+	r->row_inc = row_inc;
+	r->attributes = newattr;
+	dispc->attributes2[2] = newattr2;
+	if (gobits[0])
+	{
+		dispc->control1 |= gobits[0];
+	}
+	if (gobits[1])
+	{
+		dispc->control2 |= gobits[1];
+	}
+}
+
+static void omap4_vid3_disable(overlayidx overlay)
+{
+	(void) overlay;
+	volatile vid3_regs_t *r = &dispc->vid3;
+	uint32_t attr = r->attributes;
+	if(attr & OVERLAY_ATTRIBUTES_ENABLE)
+	{
+		attr &= OVERLAY_ATTRIBUTES_VIDCHANNELOUT | OVERLAY_ATTRIBUTES_CHANNELOUT2;
+		r->attributes = attr;
+		if(attr & OVERLAY_ATTRIBUTES_VIDCHANNELOUT)
+			dispc->control1 |= DISPC_CONTROL_GOTV;
+		else
+			dispc->control2 |= DISPC_CONTROL_GOLCD;
+	}
+}
+
+const overlayattr_t overlayattrs[OVERLAY_MAX] =
+{
+	{ /* OVERLAY_GFX */
+		omap4_gfx_enable,
+		omap4_gfx_disable,
+	},
+	{ /* OVERLAY_VID1 */
+		omap4_vid_enable,
+		omap4_vid_disable,
+	},
+	{ /* OVERLAY_VID2 */
+		omap4_vid_enable,
+		omap4_vid_disable,
+	},
+	{ /* OVERLAY_VID3 */
+		omap4_vid3_enable,
+		omap4_vid3_disable,
+	}
+};
+
+void omap_pick_overlays(overlaytarget head, pixelformat format, modelocked_t *modelocked)
+{
+	/* If the desktop is using an alpha format, disable TCK and place the desktop at depth 2, infront of the overlays at depths 0 & 1
+	   Otherwise, force the desktop to the back and treat all overlays as Basic. */
+	modelocked->overlay_desktop = OVERLAY_GFX;
+	modelocked->overlay_pointer = OVERLAY_VID2;
+	switch(format)
+	{
+	case PIXELFORMAT_4444_ABGR:
+	case PIXELFORMAT_4444_ARGB:
+	case PIXELFORMAT_1555_ABGR:
+	case PIXELFORMAT_1555_ARGB:
+	case PIXELFORMAT_8888_ABGR:
+	case PIXELFORMAT_8888_ARGB:
+		/* Place the desktop near the front and use alpha blending for controlling the visibility of the GraphicsV overlays */
+		current_transparencycfgs[head] = TRANSPARENCY_NONE;
+		/* Ensure the Z-orders remain valid
+		   (assume VID2 pointer, GFX desktop) */
+		overlay_zorder[OVERLAY_VID2] = 3;
+		overlay_zorder[OVERLAY_GFX] = 2;
+		overlay_zorder[OVERLAY_VID3] = 1;
+		overlay_zorder[OVERLAY_VID1] = 0;
+		current_gvoverlay_mode = GVOverlayType_ZOrder;
+		break;
+	default:
+		/* Place the desktop at the back and treat all overlays as Basic
+		   TODO: Could use TRANSPARENCY_SOURCE to allow one of the overlays behind the desktop, but that's a bit tricky to manage
+		   Or, whenever a GraphicsV overlay is enabled bring the desktop to the front and use TRANSPARENCY_DEST (and use a software mouse pointer) */
+		current_transparencycfgs[head] = TRANSPARENCY_NONE;
+		overlay_zorder[OVERLAY_VID2] = 3;
+		overlay_zorder[OVERLAY_VID3] = 2;
+		overlay_zorder[OVERLAY_VID1] = 1;
+		overlay_zorder[OVERLAY_GFX] = 0;
+		current_gvoverlay_mode = GVOverlayType_Basic;
+		break;
+	}
+	flush_transparency_cfg(true);
+}
+
+int omap_scalable_overlays(const modelocked_t *modelocked, overlaytarget target, pixelformat format)
+{
+	(void) modelocked;
+	(void) target;
+	(void) format;
+	/* Only video overlays support scaling */
+	return (1<<OVERLAY_VID1) | (1<<OVERLAY_VID2) | (1<<OVERLAY_VID3);
+}
+
+void omap_set_zorder(const overlayidx *order,int count,const modelocked_t *modelocked)
+{
+	int seen = 0;
+	bool modified = false;
+	int z = 3;
+	for(int i=0;i<count;i++)
+	{
+		overlayidx overlay = *order++;
+		seen |= 1<<overlay;
+		if (overlay_zorder[overlay] != z)
+		{
+			overlay_zorder[overlay] = z;
+			modified = true;
+		}
+		z--;
+	}
+	if (!modified || (current_gvoverlay_mode == GVOverlayType_Basic))
+	{
+		return;
+	}
+	/* Avoid collisions by setting the other overlays to the remaining values */
+	for(int i=0;i<OVERLAY_MAX;i++)
+	{
+		if (!(seen & (1<<i)))
+		{
+			overlay_zorder[i] = z--;
+		}
+	}
+	/* Now update any active overlays */
+	{
+		const irqlocked_t *irqlocked = irqlocked_lock();
+		for(int i=0;i<OVERLAY_MAX;i++)
+			dispc_update_overlay((overlayidx)i,modelocked,irqlocked);
+		irqlocked_unlock();
+	}
+}
+
+static const uint8_t fir_pcd_min[2][5] =
+{
+	{ 1, 1, 2, 3, 4 },
+	{ 2, 2, 2, 3, 4 },
+};
+
+/* Check if the given FIR values are acceptable for the current mode */
+bool omap_check_fir(int fir_x,int fir_y,int buf_h,int scaled_w,int scaled_h,pixelformat format,const modelocked_t *modelocked, overlaytarget target,bool *v5tap)
+{
+	(void) buf_h;
+	(void) scaled_w;
+	(void) scaled_h;
+	(void) modelocked;
+	/* ASSUMPTION: All clocks are derived from the same source
+	   Currently true (PLL2_CLK1, aka DSI2 PLL)
+	   This means we can just look at the ratios of the clock dividers rather than calculate the actual clock rates */
+	uint32_t lcd_clk_divisor = REG_EXTRACT(dispc->divisor2,DISPC_DIVISOR_LCD)*REG_EXTRACT(dispc->divisor2,DISPC_DIVISOR_PCD);
+	uint32_t core_clk_divisor = REG_EXTRACT(dispc->divisor,DISPC_DIVISOR_LCD);
+	uint32_t ratio = lcd_clk_divisor / core_clk_divisor;
+	/* Work out coordinates in the table */
+	int col;
+	int row = (dispc->pol_freq2 & DISPC_POL_FREQ_IPC) ? 1 : 0;
+	dprintf(("","omap_check_fir: fir_x %d fir_y %d buf_h %d scaled_w %d scaled_h %d format %s\n",fir_x,fir_y,buf_h,scaled_w,scaled_h,pixelformatnames[format]));
+	if ((fir_x > 4096) || (fir_y > 4096) || (fir_x < 128) || (fir_y < 128))
+		return false; /* Beyond 8x upscale / 4x downscale limits */
+
+	if (fir_x == 1024)
+		col = 0;
+	else if (fir_x < 1024) /* upscale */
+		col = 1;
+	else if (fir_x <= 2048) /* 1:1 - 1:2 */
+		col = 2;
+	else if (fir_x <= 3072) /* 1:2 - 1:3 */
+		col = 3;
+	else /* 1:3 - 1:4 */
+		col = 4;
+
+	int ratiomin = fir_pcd_min[row][col];
+	dprintf(("","row %d col %d ratio %d min %d\n",row,col,ratio,ratiomin));
+	if (ratio < ratiomin)
+	{
+		return false;
+	}
+
+	/* Use 5-tap vertical filter if necessary */
+	if (v5tap)
+	{
+		*v5tap = (fir_y > 2048);
+	}
+
+	return true;
+}
+
+#ifdef DEBUGLIB
+
+void omap_dump_videoregs(void)
+{
+	DUMPREG(dss,sysstatus);
+	DUMPREG(dss,ctrl);
+	DUMPREG(dss,status);
+
+	DUMPREG(dispc,sysconfig);
+	DUMPREG(dispc,sysstatus);
+	DUMPREG(dispc,irqstatus);
+	DUMPREG(dispc,irqenable);
+	DUMPREG(dispc,control1);
+	DUMPREG(dispc,config1);
+	DUMPREG(dispc,default_color[1]);
+	DUMPREG(dispc,trans_color[1]);
+	DUMPREG(dispc,control2);
+	DUMPREG(dispc,config2);
+	DUMPREG(dispc,default_color2);
+	DUMPREG(dispc,trans_color2);
+	DUMPREG(dispc,line_status);
+	DUMPREG(dispc,line_number);
+	DUMPREG(dispc,timing_h2);
+	DUMPREG(dispc,timing_v2);
+	DUMPREG(dispc,pol_freq2);
+	DUMPREG(dispc,divisor2);
+	DUMPREG(dispc,global_alpha);
+	DUMPREG(dispc,size_tv);
+	DUMPREG(dispc,size_lcd2);
+
+	DUMPREG(dispc,gfx.ba[0]);
+	DUMPREG(dispc,gfx.ba[1]);
+	DUMPREG(dispc,gfx.position);
+	DUMPREG(dispc,gfx.size);
+	DUMPREG(dispc,gfx.attributes);
+	DUMPREG(dispc,gfx.buf_threshold);
+	DUMPREG(dispc,gfx.buf_size_status);
+	DUMPREG(dispc,gfx.row_inc);
+	DUMPREG(dispc,gfx.pixel_inc);
+	DUMPREG(dispc,gfx.window_skip);
+	DUMPREG(dispc,gfx.table_ba);
+
+	DUMPREG(dispc,vid1.ba[0]);
+	DUMPREG(dispc,vid1.ba[1]);
+	DUMPREG(dispc,ba_uv[0][0]);
+	DUMPREG(dispc,ba_uv[0][1]);
+	DUMPREG(dispc,vid1.position);
+	DUMPREG(dispc,vid1.size);
+	DUMPREG(dispc,vid1.attributes);
+	DUMPREG(dispc,attributes2[0]);
+	DUMPREG(dispc,vid1.buf_threshold);
+	DUMPREG(dispc,vid1.buf_size_status);
+	DUMPREG(dispc,vid1.row_inc);
+	DUMPREG(dispc,vid1.pixel_inc);
+	DUMPREG(dispc,vid1.fir);
+	DUMPREG(dispc,vid1.picture_size);
+	DUMPREG(dispc,vid1.accui[0]);
+	DUMPREG(dispc,vid1.accui[1]);
+	DUMPREG(dispc,vid1.fir_coef[0].h);
+	DUMPREG(dispc,vid1.fir_coef[0].hv);
+	DUMPREG(dispc,vid1.fir_coef[1].h);
+	DUMPREG(dispc,vid1.fir_coef[1].hv);
+	DUMPREG(dispc,vid1.fir_coef[2].h);
+	DUMPREG(dispc,vid1.fir_coef[2].hv);
+	DUMPREG(dispc,vid1.fir_coef[3].h);
+	DUMPREG(dispc,vid1.fir_coef[3].hv);
+	DUMPREG(dispc,vid1.fir_coef[4].h);
+	DUMPREG(dispc,vid1.fir_coef[4].hv);
+	DUMPREG(dispc,vid1.fir_coef[5].h);
+	DUMPREG(dispc,vid1.fir_coef[5].hv);
+	DUMPREG(dispc,vid1.fir_coef[6].h);
+	DUMPREG(dispc,vid1.fir_coef[6].hv);
+	DUMPREG(dispc,vid1.fir_coef[7].h);
+	DUMPREG(dispc,vid1.fir_coef[7].hv);
+	DUMPREG(dispc,vid1.conv_coef[0]);
+	DUMPREG(dispc,vid1.conv_coef[1]);
+	DUMPREG(dispc,vid1.conv_coef[2]);
+	DUMPREG(dispc,vid1.conv_coef[3]);
+	DUMPREG(dispc,vid1.conv_coef[4]);
+
+	DUMPREG(dispc,vid2.ba[0]);
+	DUMPREG(dispc,vid2.ba[1]);
+	DUMPREG(dispc,ba_uv[1][0]);
+	DUMPREG(dispc,ba_uv[1][1]);
+	DUMPREG(dispc,vid2.position);
+	DUMPREG(dispc,vid2.size);
+	DUMPREG(dispc,vid2.attributes);
+	DUMPREG(dispc,attributes2[1]);
+	DUMPREG(dispc,vid2.buf_threshold);
+	DUMPREG(dispc,vid2.buf_size_status);
+	DUMPREG(dispc,vid2.row_inc);
+	DUMPREG(dispc,vid2.pixel_inc);
+	DUMPREG(dispc,vid2.fir);
+	DUMPREG(dispc,vid2.picture_size);
+	DUMPREG(dispc,vid2.accui[0]);
+	DUMPREG(dispc,vid2.accui[1]);
+	DUMPREG(dispc,vid2.fir_coef[0].h);
+	DUMPREG(dispc,vid2.fir_coef[0].hv);
+	DUMPREG(dispc,vid2.fir_coef[1].h);
+	DUMPREG(dispc,vid2.fir_coef[1].hv);
+	DUMPREG(dispc,vid2.fir_coef[2].h);
+	DUMPREG(dispc,vid2.fir_coef[2].hv);
+	DUMPREG(dispc,vid2.fir_coef[3].h);
+	DUMPREG(dispc,vid2.fir_coef[3].hv);
+	DUMPREG(dispc,vid2.fir_coef[4].h);
+	DUMPREG(dispc,vid2.fir_coef[4].hv);
+	DUMPREG(dispc,vid2.fir_coef[5].h);
+	DUMPREG(dispc,vid2.fir_coef[5].hv);
+	DUMPREG(dispc,vid2.fir_coef[6].h);
+	DUMPREG(dispc,vid2.fir_coef[6].hv);
+	DUMPREG(dispc,vid2.fir_coef[7].h);
+	DUMPREG(dispc,vid2.fir_coef[7].hv);
+	DUMPREG(dispc,vid2.conv_coef[0]);
+	DUMPREG(dispc,vid2.conv_coef[1]);
+	DUMPREG(dispc,vid2.conv_coef[2]);
+	DUMPREG(dispc,vid2.conv_coef[3]);
+	DUMPREG(dispc,vid2.conv_coef[4]);
+
+	DUMPREG(dispc,vid3.ba[0]);
+	DUMPREG(dispc,vid3.ba[1]);
+	DUMPREG(dispc,ba_uv[2][0]);
+	DUMPREG(dispc,ba_uv[2][1]);
+	DUMPREG(dispc,vid3.position);
+	DUMPREG(dispc,vid3.size);
+	DUMPREG(dispc,vid3.attributes);
+	DUMPREG(dispc,attributes2[2]);
+	DUMPREG(dispc,vid3.buf_threshold);
+	DUMPREG(dispc,vid3.buf_size_status);
+	DUMPREG(dispc,vid3.row_inc);
+	DUMPREG(dispc,vid3.pixel_inc);
+	DUMPREG(dispc,vid3.fir);
+	DUMPREG(dispc,vid3.picture_size);
+	DUMPREG(dispc,vid3.accui[0]);
+	DUMPREG(dispc,vid3.accui[1]);
+	DUMPREG(dispc,vid3.fir_coef[0].h);
+	DUMPREG(dispc,vid3.fir_coef[0].hv);
+	DUMPREG(dispc,vid3.fir_coef[1].h);
+	DUMPREG(dispc,vid3.fir_coef[1].hv);
+	DUMPREG(dispc,vid3.fir_coef[2].h);
+	DUMPREG(dispc,vid3.fir_coef[2].hv);
+	DUMPREG(dispc,vid3.fir_coef[3].h);
+	DUMPREG(dispc,vid3.fir_coef[3].hv);
+	DUMPREG(dispc,vid3.fir_coef[4].h);
+	DUMPREG(dispc,vid3.fir_coef[4].hv);
+	DUMPREG(dispc,vid3.fir_coef[5].h);
+	DUMPREG(dispc,vid3.fir_coef[5].hv);
+	DUMPREG(dispc,vid3.fir_coef[6].h);
+	DUMPREG(dispc,vid3.fir_coef[6].hv);
+	DUMPREG(dispc,vid3.fir_coef[7].h);
+	DUMPREG(dispc,vid3.fir_coef[7].hv);
+	DUMPREG(dispc,vid3.conv_coef[0]);
+	DUMPREG(dispc,vid3.conv_coef[1]);
+	DUMPREG(dispc,vid3.conv_coef[2]);
+	DUMPREG(dispc,vid3.conv_coef[3]);
+	DUMPREG(dispc,vid3.conv_coef[4]);
+
+	DUMPREG(dispc,data2_cycle[0]);
+	DUMPREG(dispc,data2_cycle[1]);
+	DUMPREG(dispc,data2_cycle[2]);
+	DUMPREG(dispc,cpr2_coef_r);
+	DUMPREG(dispc,cpr2_coef_g);
+	DUMPREG(dispc,cpr2_coef_b);
+	DUMPREG(dispc,gfx_preload);
+	DUMPREG(dispc,vid_preload[0]);
+	DUMPREG(dispc,vid_preload[1]);
+
+	DUMPREG(dsi,ctrl);
+	DUMPREG(dsi,clk_ctrl);
+
+	DUMPREG(dsi_pll,control);
+	DUMPREG(dsi_pll,status);
+	DUMPREG(dsi_pll,go);
+	DUMPREG(dsi_pll,configuration1);
+	DUMPREG(dsi_pll,configuration2);
+	DUMPREG(dsi_pll,configuration3);
+
+	printf("Ban state: %08x\n",ban_hardware_update);
+}
+
+void omap_dump_tvregs(void)
+{
+	/* TV-out currently not supported */
+}
+
+#endif

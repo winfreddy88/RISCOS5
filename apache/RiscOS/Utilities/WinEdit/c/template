@@ -1,0 +1,4225 @@
+/* Copyright 2003 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*-*-C-*-
+ *
+ * Template manipulation and load/save
+ */
+
+
+/*
+ * XXXX always set owner == NULL on deleted ones - ensure check for deleted
+ * icons checks this, and not IF_DELETED.
+ */
+
+#include "resed.h"
+
+static error * start_rename (ResourcePtr res, ItemInfoPtr item, int iconnum, PointPtr position);
+static void template_renumber (ResourcePtr res, RectPtr bbox);
+static void make_selection_pendingsnap (ResourcePtr res);
+static void snap_pending (ResourcePtr res, RectPtr bbox);
+static error * test_mode (ResourcePtr res);
+static error * normal_mode (ResourcePtr res);
+
+
+static IconRec resizeproto;
+static int resizewidth, resizeheight;
+
+static MenuPtr tempmenu = NULL, windowmenu = NULL, selmenu = NULL;
+static MenuPtr alignmenu = NULL;
+
+static int key_winprops, key_cols, key_extent, key_close, key_grid;
+static int key_delete, key_sort;
+static int key_selectall, key_clearsel, key_props, key_test;
+
+static ItemInfoPtr menuitem;    /* The item that the last MENU hit was on */
+
+static void plot_rubber_selected (ResourcePtr, int, Bool, PointPtr);
+
+#define WINDOWMENU_PROPS 0
+#define WINDOWMENU_COLOURS 1
+#define WINDOWMENU_EXTENT 2
+#define WINDOWMENU_GRID 3
+#define WINDOWMENU_RENUM 4
+#define WINDOWMENU_CLOSE 5
+
+#define SELMENU_DELETE 0
+#define SELMENU_ALIGN 1
+#define SELMENU_SORT 2
+#define SELMENU_PROPS 3
+
+#define TEMPMENU_WINDOW 0
+#define TEMPMENU_SELECTION 1
+#define TEMPMENU_SELECTALL 2
+#define TEMPMENU_CLEARSELECTION 3
+#define TEMPMENU_TEST 4
+
+
+
+#define DELETED_FLAGS (IF_TEXT | IF_BORDER | IF_HCENT | IF_VCENT | IF_DELETED)
+#define VALID_TYPE(t) ((t) >= 0 && (t) < NUMBER(numicons))
+
+
+/*
+ * Debug stuff
+ */
+
+#if DEBUG
+
+static void dump_template (ResourcePtr res, char *label)
+{
+    int i;
+    dprintf("%s template has %d icons, max %d\n" _ label _ res->numicons _ res->maxicons);
+    for (i = 0; i < res->numicons; i++)
+    {
+        ItemInfoPtr info = res->icons[i].owner;
+        if (info)
+            dprintf("  Icon %d is part of item *%s* _ type %d\n" _ i _ info->name _ info->type);
+        else
+            dprintf("  Icon %d not part of an item\n");
+    }
+}
+
+#endif
+
+
+/*
+ * Called while the Templates file is open.
+ * The prototype "resource" window in fact only contains
+ * icon definitions - we never actually create a
+ * resource window from it.  Currently only
+ * icon 0 is used - this is the "resize handle".
+ */
+
+error * template_load_prototypes ()
+{
+    WindowPtr resprotowin;
+
+    ER ( wimp_load_template("ResProto", &resprotowin) );
+
+    /* Resource window: first (only) icon is prototype for resize handles */
+    if (resprotowin->numicons != 1)
+        return error_lookup("ResProtos");
+
+    resizeproto = resprotowin->icons[0];
+
+    /* Arrange for the centre of the icon to be at 0,0 */
+
+    resizewidth = resizeproto.bbox.maxx - resizeproto.bbox.minx;
+    resizeheight = resizeproto.bbox.maxy - resizeproto.bbox.miny;
+
+    resizeproto.bbox.minx = -(resizewidth / 2);
+    resizeproto.bbox.miny = -(resizeheight / 2);
+    resizeproto.bbox.maxx = resizeproto.bbox.minx + resizewidth;
+    resizeproto.bbox.maxy = resizeproto.bbox.miny + resizeheight;
+
+    free ((char *) resprotowin);
+
+    /* Use this opportunity to create menus */
+
+    ER ( menu_create (6, message_lookup (&msgs, "TWM_Name"),
+                      &windowmenu) );
+    ER ( menu_entry (windowmenu, WINDOWMENU_PROPS, message_lookup (&msgs, "TWM_Prop"),
+                     0, 0, -1, -1, NULL) );
+    ER ( menu_entry (windowmenu, WINDOWMENU_COLOURS, message_lookup (&msgs, "TWM_Cols"),
+                     0, 0, -1, -1, NULL) );
+    ER ( menu_entry (windowmenu, WINDOWMENU_EXTENT, message_lookup (&msgs, "TWM_Extn"),
+                     0, 0, -1, -1, NULL) );
+    ER ( menu_entry (windowmenu, WINDOWMENU_GRID, message_lookup (&msgs, "TWM_Grid"),
+                     0, 0, -1, -1, NULL) );
+    ER ( menu_entry (windowmenu, WINDOWMENU_RENUM, message_lookup (&msgs, "TWM_Rnum"),
+                     0, 0, -1, -1, NULL) );
+    ER ( menu_entry (windowmenu, WINDOWMENU_CLOSE, message_lookup (&msgs, "TWM_Clse"),
+                     0, 0, -1, -1, NULL) );
+
+    ER ( menu_create (7, message_lookup (&msgs, "TSAM_Name"),
+                      &alignmenu) );
+    ER ( menu_entry (alignmenu, ALIGNMENU_LEFT, message_lookup (&msgs, "TSAM_Left"),
+                     0, 0, -1, -1, NULL) );
+    ER ( menu_entry (alignmenu, ALIGNMENU_RIGHT, message_lookup (&msgs, "TSAM_Right"),
+                     0, 0, -1, -1, NULL) );
+    ER ( menu_entry (alignmenu, ALIGNMENU_HCENT, message_lookup (&msgs, "TSAM_HCent"),
+                     0, MF_DOTTED, -1, -1, NULL) );
+    ER ( menu_entry (alignmenu, ALIGNMENU_TOP, message_lookup (&msgs, "TSAM_Top"),
+                     0, 0, -1, -1, NULL) );
+    ER ( menu_entry (alignmenu, ALIGNMENU_BOTTOM, message_lookup (&msgs, "TSAM_Bot"),
+                     0, 0, -1, -1, NULL) );
+    ER ( menu_entry (alignmenu, ALIGNMENU_VCENT, message_lookup (&msgs, "TSAM_VCent"),
+                     0, 0, -1, -1, NULL) );
+    ER ( menu_entry (alignmenu, ALIGNMENU_BASELINE, message_lookup (&msgs, "TSAM_Base"),
+                     0, 0, -1, -1, NULL) );
+
+    ER ( menu_create (4, message_lookup (&msgs, "TSM_Name"),
+                      &selmenu) );
+    ER ( menu_entry (selmenu, SELMENU_DELETE, message_lookup (&msgs, "TSM_Dele"),
+                     0, 0, -1, -1, NULL) );
+    ER ( menu_entry (selmenu, SELMENU_ALIGN, message_lookup (&msgs, "TSM_Algn"),
+                     0, 0, -1, -1, (void *) alignmenu) );
+    ER ( menu_entry (selmenu, SELMENU_SORT, message_lookup (&msgs, "TSM_Sort"),
+                     0, MF_DOTTED, -1, -1, NULL) );
+    ER ( menu_entry (selmenu, SELMENU_PROPS, message_lookup (&msgs, "TSM_Prop"),
+                     0, 0, -1, -1, NULL) );
+
+    ER ( menu_create (5 , message_lookup (&msgs, "TM_Name"),
+                      &tempmenu) );
+    ER ( menu_entry (tempmenu, TEMPMENU_WINDOW, message_lookup (&msgs, "TM_Wind"),
+                     0, 0, -1, -1, (void *) windowmenu) );
+    ER ( menu_entry (tempmenu, TEMPMENU_SELECTION, message_lookup (&msgs, "TM_Seln"),
+                     0, MF_DOTTED, -1, -1, (void *) selmenu) );
+    ER ( menu_entry (tempmenu, TEMPMENU_SELECTALL, message_lookup (&msgs, "TM_SAll"),
+                     0, 0, -1, -1, NULL) );
+    ER ( menu_entry (tempmenu, TEMPMENU_CLEARSELECTION, message_lookup (&msgs, "TM_CSel"),
+                     0, MF_DOTTED, -1, -1, NULL) );
+    ER ( menu_entry (tempmenu, TEMPMENU_TEST, message_lookup (&msgs, "TM_Test"),
+                     0, 0, -1, -1, NULL) );
+
+    key_winprops = atoi (message_lookup (&msgs, "KeyTWM_Prop"));
+    key_cols =  atoi (message_lookup (&msgs, "KeyTWM_Cols"));
+    key_extent = atoi (message_lookup (&msgs, "KeyTWM_Extn"));
+    key_grid = atoi (message_lookup (&msgs, "KeyTWM_Grid"));
+    key_close = atoi (message_lookup (&msgs, "KeyTWM_Clse"));
+    key_delete = atoi (message_lookup (&msgs, "KeyTSM_Dele"));
+    key_sort = atoi (message_lookup (&msgs, "KeyTSM_Sort"));
+    key_selectall = atoi (message_lookup (&msgs, "KeyTM_SAll"));
+    key_clearsel = atoi (message_lookup (&msgs, "KeyTM_CSel"));
+    key_props = atoi (message_lookup (&msgs, "KeyTSM_Prop"));
+    key_test = atoi (message_lookup (&msgs, "KeyTM_Test"));
+
+    /* Set up the palette.  The file is expected to contain one resource. */
+
+    block
+    {
+        DocumentPtr palettedoc;
+        ER ( document_create (&palettedoc, NULL) );
+        ER ( template_load_file ("<" APPDIR ">.Palette", palettedoc, NULL, FALSE) );
+        palette = palettedoc->resources;
+        if (palette == NULL)
+            return error_lookup ("NoPal");
+    }
+
+    return NULL;
+}
+
+
+/*
+ * Validation string bashing
+ *
+ * The validation string format is Nname/type/icon/icon... terminated by semicolon
+ * or end of line.  Only master icons have such an entry; the icon numbers of the slave
+ * ones are simply grabbed from it (-1 means corresponding icon not present).
+ */
+
+
+/*
+ * Take a validation string and return a pointer to the start of the given
+ * entry, if any.  NULL if none.
+ */
+
+char * template_validation_command_start (char *valid, char command)
+{
+    Bool outside = TRUE;
+    if (valid == NULL) return NULL;
+
+    if (islower(command)) command = toupper(command);
+
+    for (; *valid; valid++)
+    {
+        if (outside)
+        {
+            char q = *valid;
+            if (islower(q)) q = toupper(q);
+            if (q == command)
+                return valid;
+            else if (isspace(q))
+                continue;
+            else
+                outside = FALSE;
+        }
+        else
+        {
+            if (*valid == '\\' && *(valid+1) != 0)
+            {
+                valid++;
+                continue;
+            }
+            else if (*valid == ';')
+                outside = TRUE;
+        }
+    }
+    return NULL;
+}
+
+
+/*
+ * Locate the end of the validation command pointed to by 'start'.  Actually returns the
+ * location of the 0 or semicolon.
+ */
+
+char *template_validation_command_end (char *start)
+{
+    if (!start) return NULL;
+    for (; *start > 31 && *start != ';'; start++)
+    {
+        if (*start == '\\' && *(start + 1) > 31)
+        {
+            start++;
+            continue;
+        }
+    }
+    return start;
+}
+
+
+/*
+ * Replace the given validation field with new contents.  NULL means
+ * delete field.  Return old value of field in 'old' if this is not NULL.
+ */
+
+void template_edit_validation (char *vstring, char *command, char *new, char *old)
+{
+    char valid[VALID_BUFFER_LEN], *start, *end, *s, *d;
+
+dprintf("template_edit_validation(%s): *%s* to " _ command _ vstring ? vstring : "NULL");
+
+    if (old)
+        *old = 0;
+
+    strcpy (valid, vstring);
+
+    start = template_validation_command_start (valid, *command);
+    if (start == NULL)
+    {
+        if (new)
+        {
+            if (*vstring)
+                strcat (vstring, ";");
+            strcat (vstring, command);
+            strcat (vstring, new);
+        }
+dprintf("1 *%s* (*%s*)" _ vstring ? vstring : "NULL" _ old ? old : "XXX");
+        return;
+    }
+
+    end = template_validation_command_end (start);
+
+    for (s = valid, d = vstring; s < start; *d++ = *s++);
+
+    if (new)
+    {
+        *d++ = *command;
+        while (*new)
+            *d++ = *new++;
+    }
+
+    if (old)
+    {
+        start++;
+        while (start < end)
+            *old++ = *start++;
+        *old = 0;
+    }
+
+    if (*end)                   /* skip ; */
+        end++;
+    while ((*d++ = *end++) != 0)
+        ;
+
+    if (d > vstring + 1 && *(d-2) == ';')
+        *(d-2) = 0;
+dprintf("2 *%s* (*%s*)" _ vstring ? vstring : "NULL" _ old ? old : "XXX");
+
+
+}
+
+
+
+
+
+/*
+ * If the icon has a validation string, then return ptr to it.
+ * If not, return NULL.
+ */
+
+char * template_get_validation (IconPtr icon)
+{
+    if ((icon->flags & (IF_TEXT | IF_INDIR)) == (IF_TEXT | IF_INDIR))
+        if (icon->data[1] != -1)
+            return (char *)(icon->data[1]);
+    return NULL;
+}
+
+
+/*
+ * Read validation string of icon into a buffer, which is
+ * assumed to be big enough.
+ */
+
+void template_read_validation (IconPtr icon, char *buf)
+{
+    char *v = template_get_validation (icon);
+    if (v)
+        strcpy (buf, v);
+    else
+        *buf = 0;
+}
+
+
+/*
+ * Set icon's validation string to the contents of the buffer.
+ * If the string is greater in length than the existing one, then
+ * free & reallocate.  This approach means there is wasted space
+ * at the end of a validation string that gets shortened, but
+ * it has the merit of being simple.  When the string gets written
+ * to file it will be the correct length, of course.
+ *
+ * Pass "" to get the old string freed and replaced with -1.
+ */
+
+void template_write_validation (IconPtr icon, char *buf)
+{
+    if ((icon->flags & (IF_TEXT | IF_INDIR)) == (IF_TEXT | IF_INDIR))
+    {
+        char *new = NULL;
+        if (buf == NULL)
+            buf = "";
+        if (icon->data[1] == -1)
+        {
+            if (*buf)
+                new = strsave(buf);
+        }
+        else
+        {
+            char *old = (char *) icon->data[1];
+            if (*buf == 0)
+                free (old);
+            else
+            {
+                if (strlen(old) < strlen(buf))
+                {
+                    free (old);
+                    new = strsave(buf);
+                }
+                else
+                    new = strcpy (old, buf);
+            }
+        }
+        icon->data[1] = new ? (int) new : -1;
+    }
+}
+
+
+
+/*
+ * Read name icon name (only) into given buffer, which should be big enough.
+ * This is only used for internal purposes (ie, interrogating our own
+ * windows).  Return TRUE for success, else FALSE if no name.
+ * Assumes that the name entry will be the first thing in the validation
+ * string.
+ */
+
+Bool template_read_icon_name (IconPtr icon, char *buf)
+{
+    char *valid = template_get_validation (icon), *end;
+
+    if (valid == NULL)
+        return FALSE;
+    if (*valid != 'n' && *valid != 'N')
+        return FALSE;
+    if (*(valid + 1) == '/')
+        return FALSE;
+
+    end = template_validation_command_end (valid);
+    block
+    {
+        char endc = *end;
+        *end = 0;
+        sscanf(valid, "N%*d/%[^/]", buf);
+        *end = endc;
+    }
+
+    if (*buf)
+        return TRUE;
+    return FALSE;
+}
+
+
+/*
+ * Write the text of an indirected text, sprite or both icon, reallocating the
+ * string if needed.  If malloc fails just leave the old contents
+ * in place.  Pass buflen == -1 if you want exact fit.  Otherwise
+ * pass desired buffer length, which will be increased to strlen(buf)+1
+ * if it is too small.
+ *
+ * Pass buf == NULL to just free the old string.
+ */
+
+void template_write_text (IconPtr icon, char *buf, int buflen)
+{
+    if ((icon->flags & (IF_TEXT | IF_INDIR)) == (IF_TEXT | IF_INDIR) ||
+        (icon->flags & (IF_SPRITE | IF_INDIR)) == (IF_SPRITE | IF_INDIR))
+    {
+        if (buf == NULL)
+        {
+            free ((char *) icon->data[0]);
+            icon->data[0] = icon->data[2] = 0;
+        }
+        else
+        {
+            int len = strlen(buf) + 1;
+            if (len > buflen)
+                buflen = len;
+            if (buflen > icon->data[2])
+            {
+                char *new = malloc(buflen);
+                if (!new)
+                    return;
+                free ((char *) icon->data[0]);
+                icon->data[0] = (int) new;
+            }
+            strcpy ((char *) icon->data[0], buf);
+            icon->data[2] = buflen;
+        }
+    }
+}
+
+/*
+ * Assign an item to a master icon, determine the other icons in the item
+ * and make them all reference the item.  If 'offset' is non-zero then
+ * add this offset to all icon numbers (including master) before putting them in the
+ * ItemInfoRec.
+ */
+
+static error * assign_item (ResourcePtr res, IconInfoPtr icons, char *name,
+                            ItemType type, int master, int offset, Bool pendingsnap)
+{
+    ItemInfoPtr item;
+    int i;
+
+    if (icons[master].owner == NULL)
+    {
+        icons[master].owner = (ItemInfoPtr) calloc (1, sizeof(ItemInfoRec));
+        if (icons[master].owner == NULL)
+            return error_lookup("NoMem");
+    }
+    item = icons[master].owner;
+    item->u.master = master + offset;
+    item->pendingsnap = pendingsnap;
+    if (pendingsnap)
+        res->numpendingsnap++;
+
+    sscanf(name, "%*d/%[^/]/%d/%d/%d/%d",       /* It doesn't matter if */
+           item->name,                          /* the name string has */
+           &item->u.rawicons[1],                /* fewer icons; just have */
+           &item->u.rawicons[2],                /* to ensure that the number of */
+           &item->u.rawicons[3],                /* %d's here equals the number */
+           &item->u.rawicons[4]);               /* of slave icons in the biggest item */
+
+    for (i = 1; i < numicons[type]; i++)
+        if (item->u.rawicons[i] != -1)
+        {
+            char *valid;
+            /* Ensure that the master pointer entry (if any) is removed */
+            if ((valid = template_get_validation(&icons[item->u.rawicons[i]].icon)) != NULL)
+                template_edit_validation (valid, "N", NULL, NULL);
+            icons[item->u.rawicons[i]].owner = item;
+            item->u.rawicons[i] += offset;
+        }
+
+    item->type = type;
+
+#if DEBUG
+    dprintf("Assigned item *%s* type %d to icons" _ item->name _ type);
+    for (i = 0; i < numicons[type]; i++)
+        dprintf(" %d" _ item->u.rawicons[i]);
+    dprintf("\n");
+#endif
+
+    return NULL;
+}
+
+
+/*
+ * Place the full name of 'item' into the string supplied.  If
+ * the item is a simple item with no name, then don't write
+ * anything.
+ *
+ * If 'adjust' is TRUE, then use the 'mapping' field of the
+ * icons to get the final icon numbers rather than using the
+ * current numbers.
+ */
+
+static void item_name (ItemInfoPtr item, IconInfoPtr icons, char *buf, Bool remap, Bool master)
+{
+    int i;
+    if (item->type == SimpleIcon && *(item->name) == 0)
+        return;
+    else
+    {
+        if (master)
+        {
+            sprintf(buf, "N%d/%s", item->type, item->name);
+            for (i = 1; i < numicons[item->type]; i++)
+            {
+                char part[20];
+                int number = item->u.rawicons[i];
+                if (remap && number != -1) number = icons[number].mapping;
+                sprintf(part, "/%d", number);
+                strcat(buf, part);
+            }
+        }
+        else
+        {
+            int number = item->u.master;
+            if (number == -1)
+                return;         /* shouldn't happen */
+            if (remap) number = icons[number].mapping;
+            sprintf(buf, "N/%d", number);
+        }
+    }
+}
+
+
+/*
+ * Scan the supplied icon array and build item information for the
+ * icons within.  Name commands are removed from validation strings
+ * at this point, and an instance of ItemRec allocated.  Note that
+ * a multi-icon item will have more than one icon pointing to the
+ * same ItemRec, so we need to take care to free it once only.
+ *
+ * Having finished looking for named items, we can assign anonymous
+ * items of the "raw WIMP icon" type for the remaining ones.
+ * Icons that have 'IF_DELETED' set are left with owner == NULL.
+ *
+ * If 'offset' is non-zero, then add this number to all icon numbers found
+ * in validation strings.
+ *
+ */
+
+static error * build_items (ResourcePtr res, IconInfoPtr icons, int nicons, int offset, Bool pendingsnap)
+{
+    int i;
+    ItemType type;
+    char namebuff[80];
+    for (i = 0; i < nicons; i++)
+    {
+        char *valid;
+        if (icons[i].owner)
+            continue;                   /* already done */
+        if (icons[i].icon.flags & IF_DELETED)
+            continue;                   /* deleted */
+        if ((valid = template_get_validation(&icons[i].icon)) == NULL)
+            continue;                   /* no validation */
+        template_edit_validation (valid, "N", NULL, namebuff);
+        if (*namebuff == 0)
+            continue;
+        if (*namebuff == '/')
+            continue;
+        if (sscanf (namebuff, "%d", &type) != 1)
+            continue;
+        if (VALID_TYPE(type))
+        {
+            ER ( assign_item (res, icons, namebuff, type, i, offset, pendingsnap) );
+        }
+    }
+
+    /* Get the ones that are still unassigned */
+    for (i = 0; i < nicons; i++)
+    {
+        if (icons[i].icon.flags & IF_DELETED)
+            continue;
+        if (icons[i].owner)
+            continue;
+        ER ( assign_item (res, icons, "N0/", SimpleIcon, i, offset, pendingsnap) );
+    }
+
+    return NULL;
+}
+
+
+/*
+ * Make sure there's enough space for this many icons
+ */
+
+static error * ensure_icon_space (ResourcePtr res, int numicons)
+{
+    if (res->maxicons >= numicons)
+        return NULL;
+
+    while (res->maxicons < numicons)
+        res->maxicons += ICON_ARRAY_DELTA;
+
+    res->icons = (IconInfoPtr) realloc (res->icons, res->maxicons * sizeof (IconInfoRec));
+    if (!res->icons)
+    {
+        res->maxicons = 0;
+        return error_lookup("NoMem");
+    }
+
+    return NULL;
+}
+
+
+/*
+ * Convert a control-terminated string
+ * into a 0-terminated one, in place.
+ */
+
+char *template_control_to_null (char *str)
+{
+    int i;
+    for (i = 0; str[i] >= 32; i++)
+        ;
+    str[i] = 0;
+    return str;
+}
+
+
+/*
+ * Check that window flags have sensible values, and rectify as needed.
+ * Also allocate room for indirected title data.  'buf' is a pointer
+ * to the start of the window block in the input.
+ */
+
+static error * sanitise_window_flags (ResourcePtr res, char *buf)
+{
+    char *name = NULL, *valid = NULL;
+
+    /* Force title flags to normal values (no a-a fonts) */
+    res->window.titleflags &= ~IF_FONT;
+
+    /* If WF_TITLE is off, then IF_INDIR should be off and
+     * the titledata are undefined.  If WF_TITLE is on, insist
+     * on indirected, text only.
+     */
+
+    if (res->window.flags & WF_TITLE)
+    {
+        switch (res->window.titleflags & IF_IST)
+        {
+        case IF_TEXT | IF_INDIR:
+        case IF_TEXT | IF_INDIR | IF_SPRITE:
+            if ((name = malloc (res->window.titledata[2])) == NULL)
+                goto fail;
+            strcpy(name, template_control_to_null(buf + res->window.titledata[0]));
+            if (res->window.titledata[1] != -1)
+                if ((valid = strsave(template_control_to_null(buf + res->window.titledata[1]))) == NULL)
+                    goto fail;
+            break;
+
+        case IF_TEXT:
+            /* Just convert it quietly to indirected text */
+            if ((name = strsave(template_control_to_null((char *) res->window.titledata))) == NULL)
+                goto fail;
+            res->window.titledata[1] = -1;
+            res->window.titledata[2] = strlen(name) + 1;
+            break;
+
+        default:
+            /* Invent a nice title using the resource name */
+            if ((name = strsave(res->name)) == NULL)
+                goto fail;
+            res->window.titledata[1] = -1;
+            res->window.titledata[2] = strlen(name) + 1;
+            break;
+        }
+
+        res->window.titledata[0] = (int) name;
+        if (valid)
+            res->window.titledata[1] = (int) valid;
+
+        res->window.titleflags &= ~ IF_IST;
+        res->window.titleflags |= IF_INDIR | IF_TEXT;
+    }
+    else
+    {
+        res->window.titleflags &= ~IF_IST;
+        res->window.titledata[0] = (int) NULL;
+        res->window.titledata[1] = -1;
+        res->window.titledata[2] = 0;
+    }
+
+    return NULL;
+
+ fail:
+    free(name);
+    free(valid);
+    return error_lookup("NoMem");
+}
+
+
+/*
+ * Check that icon flags have sensible values.
+ *
+ * All addresses in the input icon are really offsets inside buf.  This
+ * fixes them up by allocating real space for them, and also
+ * checks the flag bits, etc.
+ *
+ * The parameter "fonts" might not be word aligned, so we copy the font
+ * rec somewhere that is before using it.
+ */
+
+static error * sanitise_icon_flags (IconInfoPtr icon, char *buf, int buflen, char *fonts)
+{
+    char *txt = NULL, *sprt = NULL, *valid = NULL;
+    error *err;
+    FontRec thefont;
+
+    if (icon->icon.flags & IF_DELETED)
+        return NULL;
+
+    if (icon->icon.flags & IF_FONT)
+    {
+        unsigned int handle;
+
+        dprintf("FONT ");
+        if (!fonts)
+            return error_lookup("NoFonts");
+
+        /* According to the PRM, template font handles start at 1 */
+        memcpy (&thefont,
+                fonts + sizeof(FontRec) * (IF_GET_FIELD(FONT, icon->icon.flags) - 1),
+                sizeof(FontRec));
+
+dprintf("%d %s at %d by %d ->" _ IF_GET_FIELD(FONT, icon->icon.flags) - 1 _ thefont.name _ thefont.xsize _ thefont.ysize);
+        err = _swix(Font_FindFont, _INR(1,5) | _OUT(0),
+                    thefont.name, thefont.xsize, thefont.ysize, 0, 0,
+                    &handle);
+dprintf("%d  " _ handle);
+        if (!err)
+        {
+            IF_SET_FIELD(FONT, icon->icon.flags, handle);
+        }
+        else
+        {
+            _swix(Wimp_ReportError, _INR(0,2),
+                  err, BIT(4), message_lookup(&msgs, "TaskName"));
+            icon->icon.flags &= ~IF_FONT;
+            IF_SET_FIELD(FG, icon->icon.flags, 7);
+            IF_SET_FIELD(BG, icon->icon.flags, 0);
+        }
+    }
+
+    /* Fix up indir. buffer & validation string */
+
+    switch (icon->icon.flags & IF_IST)
+    {
+    case IF_INDIR | IF_TEXT:
+    case IF_INDIR | IF_TEXT | IF_SPRITE:
+        txt = malloc(icon->icon.data[2]);
+        if (!txt) goto fail;
+        strcpy (txt, template_control_to_null (buf +  icon->icon.data[0]));
+        icon->icon.data[0] = (int) txt;
+
+        if (icon->icon.data[1] != -1)
+        {
+            valid = strsave (template_control_to_null (buf + icon->icon.data[1]));
+            if (!valid) goto fail;
+            icon->icon.data[1] = (int) valid;
+        }
+
+        break;
+
+    case IF_INDIR | IF_SPRITE:
+        /*
+         * It's silly for a Template file to contain a sprite ptr
+         * - insist on a name.  Similarly insist on the Wimp
+         * sprite pool.
+         */
+        /* XXX PRM says +1, experiment with FormEd suggests -1 */
+        if (icon->icon.data[1] != -1 && icon->icon.data[1] != 1)
+        {
+            icon->icon.data[1] = -1;
+        }
+        if (icon->icon.data[2] == 0)
+        {
+            err = error_lookup("SpritePtr");
+            goto fail2;
+        }
+
+        sprt = malloc (icon->icon.data[2]);
+        if (!sprt) goto fail;
+        strcpy (sprt, template_control_to_null (buf + icon->icon.data[0]));
+        icon->icon.data[0] = (int) sprt;
+
+        break;
+    }
+    return NULL;
+ fail:
+    err = error_lookup("NoMem");
+ fail2:
+    free(txt); free(sprt); free(valid);
+    if (icon->icon.flags & IF_FONT)
+        _swix(Font_LoseFont, _IN(0),
+              IF_GET_FIELD(FONT, icon->icon.flags));
+    return err;
+}
+
+
+/*
+ * Merge the first resource in the given block of memory into the
+ * given resource.  Currently this ignores name clashes -
+ * it might be a good idea to add code to disambiguate names
+ * automatically.
+ *
+ * Placement: for now, just put the resources at their natural positions.
+ * later want to make it mouse-relative.  XXX.
+ *
+ * Return the area that needs redrawing in bbox.
+ *
+ * If 'nudge' is set (meaning this is the result of a claimed dragdrop), and if claimbbox
+ * suggests that the src data is 'true size', then offset all
+ * the icons.  The amount to offset by is such that the final
+ * bounding box lies on the dragdrop rubber box.
+ *
+ */
+
+static PointRec claimposition;                           /* screen coords */
+static RectRec  claimbbox;                               /* Message_Dragging internal coords */
+
+error * template_merge (char *buf, int size, ResourcePtr res, RectPtr bbox, Bool nudge)
+{
+    char *fonts = NULL;
+    int i, *ind = ((int *) buf) + 4; /* first index entry */
+    error *err = NULL;
+    ResourceRec new;
+    int offset = res->numicons;
+    PointRec nudgeby;
+
+    bbox->minx = bbox->miny = 1000000;
+    bbox->maxx = bbox->maxy = -1000000;
+
+    if (nudge)
+    {
+        nudgeby.x = claimbbox.minx / 400 + claimposition.x;
+        nudgeby.y = claimbbox.maxy / 400 + claimposition.y;
+        wimp_convert_point (ScreenToWork, &res->window, &nudgeby, &nudgeby);
+    }
+    else
+        nudgeby.x = nudgeby.y = 0;
+
+    dprintf("MERGE: OFFSETTING ICONS BY %d,%d\n" _ nudgeby.x _ nudgeby.y);
+
+#if DEBUG
+    dump_template(res, "BEFORE");
+#endif
+
+    /* Locate font table, if any.  This might not be word-aligned. */
+    i = *((int *) buf);
+    if (i != -1)
+        fonts = buf + i;
+
+    /* We only want the first resource in the block */
+
+    if (ind[0] == 0)
+    {
+        dprintf("No resource in block\n");
+        return NULL;    /* end of index; so no resource in block */
+    }
+    if (ind[2] != 1)
+    {
+        dprintf("Not a window resource\n");
+        return NULL;    /* not a Window resource; ignore */
+    }
+
+    template_control_to_null ((char *)(ind + 3));
+
+    dprintf("  MERGE RESNAME %s\n" _ (char *)(ind + 3));
+
+    /* Copy window data across to temporary space, as it may not be aligned */
+    memcpy((char *) &new.window.visarea, buf + ind[0], 88);
+
+    /* Make room for the icons at the end of res */
+    EG ( fail, ensure_icon_space (res, res->numicons + new.window.numicons) );
+
+    /*
+     * Copy the icon definitions across, assigning new numbers.
+     * Note: the validation string icon numbers are out by 'offset';
+     * we fix them up at the build_items step below.
+     */
+
+    for (i = 0; i < new.window.numicons; i++)
+    {
+        IconInfoPtr ic = &res->icons[i + offset];
+        ic->owner = NULL;
+        memcpy (&ic->icon, (buf + ind[0] + 88 + i * 32), sizeof(IconRec));
+        ic->icon.bbox.minx += nudgeby.x;
+        ic->icon.bbox.maxx += nudgeby.x;
+        ic->icon.bbox.miny += nudgeby.y;
+        ic->icon.bbox.maxy += nudgeby.y;
+        EG ( fail, sanitise_icon_flags (ic, buf + ind[0], size, fonts) );
+        wimp_merge_bboxes (bbox, bbox, &ic->icon.bbox);
+    }
+
+    /*
+     * Perform the 'build items' step in the trailing subsequence of the
+     * icons array, fixing up the icon numbers as we go.
+     */
+
+    ER ( build_items (res, res->icons + offset, new.window.numicons, offset, TRUE) );
+
+    /*
+     * Now sort the whole icon array
+     */
+
+    res->numicons += new.window.numicons;
+
+    /* Snap the items if needed */
+    snap_pending (res, bbox);
+
+#if DEBUG
+    dump_template(res, "Before renumber");
+#endif
+
+    template_renumber (res, bbox);
+
+#if DEBUG
+    dump_template(res, "AFTER");
+#endif
+
+ fail:
+    return err;
+}
+
+
+/*
+ * Append the resources in the given block of memory to the
+ * document "doc".  Name clashes are disambiguated by adding
+ * numeric suffixes.
+ *
+ * If an error occurs, give up processing the file.  Leave any
+ * fully-loaded templates in "doc", but delete partial ones, ensuring
+ * the data structures are still consistent.
+ */
+
+error * template_load (char *buf, int size, DocumentPtr doc)
+{
+    char *fonts = NULL;
+    int i, count = 0;
+    ResourcePtr new = NULL;
+    error *err = NULL;
+    int numdis = 0;
+    char name[RESOURCENAMELEN];
+
+    /* Locate font table, if any.  This might not be word-aligned. */
+    i = *((int *) buf);
+    if (i != -1)
+        fonts = buf + i;
+
+    /* Loop over the index.  This is word-aligned, but the offsets in it might not be */
+    for (; ; count++)
+    {
+        int *ind = ((int *) buf) + 4 + 6 * count;
+        if (ind[0] == 0)
+            break;                      /* end of index */
+        if (ind[2] != 1)
+            continue;                   /* not a window resource */
+
+        template_control_to_null ((char *)(ind + 3));
+        sprintf (name, "%.*s", RESOURCENAMELEN - 1, (char *)(ind + 3));
+        dprintf("  RESNAME %s\n" _ name);
+        if (document_disambiguate_name (doc, name))
+        {
+            numdis++;
+            dprintf (" DISAMBIGUATED TO %s\n" _ name);
+        }
+
+        /* Below increments doc->numresources & links it in, also fixes */
+        /* up the dirviewer */
+
+        EG ( fail, document_add_resource (doc, name, &new) );
+
+        /* Copy window data across */
+        memcpy((char *) &new->window.visarea, buf + ind[0], 88);
+        EG ( failnew, sanitise_window_flags (new, buf + ind[0]) );
+        new->window.handle = -1;              /* not created yet */
+        new->numicons = 0;
+
+        /* Make room for the icons */
+        EG ( failnew, ensure_icon_space (new, new->window.numicons) );
+
+        /* Copy the icon definitions across */
+
+        for (i = 0; i < new->window.numicons; i++)
+        {
+            new->icons[i].owner = NULL;
+            memcpy (&new->icons[i].icon, (buf + ind[0] + 88 + i * 32), sizeof(IconRec));
+            EG ( failnew, sanitise_icon_flags (&new->icons[i], buf + ind[0], size, fonts) );
+            new->numicons++;
+        }
+        new->window.numicons = 0;
+        ER ( build_items (new, new->icons, new->numicons, 0, FALSE) );
+    }
+
+    /* Warn user if any resource names were disambiguated */
+
+    if (numdis != 0)
+        error_box (error_lookup (numdis == 1 ? "DisOne" : "DisSome", numdis));
+
+    return NULL;
+
+ failnew:
+    document_delete_resource (new);
+ fail:
+    return err;
+}
+
+
+/*
+ * Append the resources in "filename" to the document "doc" or the
+ * resource "res" according to which is non-NULL.  In the resource case,
+ * force a redraw of the invalid area, if any.
+ *
+ * If nudge is TRUE, then offset the icons according to the mouse position
+ * stored in claimposition.
+ */
+
+error * template_load_file (char *filename, DocumentPtr doc, ResourcePtr res, Bool nudge)
+{
+    FILE *file = fopen(filename, "r");
+    char *buf = NULL;
+    int size;
+    error *err = NULL;
+
+    if (res && res->testing)
+        normal_mode (res);
+
+    if (!file) return error_lookup("CantRead", filename);
+    fseek(file, 0, SEEK_END);
+    size = (int) ftell(file);
+
+    buf = calloc(size, sizeof(char));
+    if (!buf)
+    {
+        err = error_lookup("NoMem");
+        goto fail;
+    }
+
+    fseek(file, 0, SEEK_SET);
+    fread (buf, sizeof(*buf), size, file);
+
+    if (doc)
+        err = template_load (buf, size, doc);
+    else if (res)
+    {
+        RectRec bbox;
+        err = template_merge (buf, size, res, &bbox, nudge);
+        if (bbox.minx <= bbox.maxx && res->window.handle != -1)
+        {
+            EG (fail, wimp_invalidate (&res->window, &bbox) );
+        }
+    }
+
+ fail:
+    if (buf) free(buf);
+    if (file) fclose(file);
+    return err;
+}
+
+
+/*
+ * Frees up store etc associated with a particular icon, and then marks it
+ * as deleted.
+ */
+
+error * template_free_icon (IconInfoPtr icon, int num)
+{
+    if (icon->owner == NULL)   /* was if (icon->icon.flags & IF_DELETED) */
+        return NULL;
+
+    switch (icon->icon.flags & IF_IST)
+    {
+    case IF_INDIR | IF_TEXT:
+    case IF_INDIR | IF_SPRITE | IF_TEXT:
+        free ((char *) icon->icon.data[0]);
+        if (icon->icon.data[1] != -1)
+            free ((char *) icon->icon.data[1]);
+        break;
+    case IF_INDIR | IF_SPRITE:
+        free ((char *) icon->icon.data[0]);
+        break;
+    }
+
+    if (icon->icon.flags & IF_FONT)
+        _swix(Font_LoseFont, _IN(0),
+              IF_GET_FIELD(FONT, icon->icon.flags));
+
+    icon->icon.flags = DELETED_FLAGS;
+    *((char *) &icon->icon) = 13;
+
+    if (icon->owner->u.master == num)   /* was if (icon->owner && icon->owner->u.master == num) */
+        free(icon->owner);
+    icon->owner = NULL;
+    return NULL;
+}
+
+
+/*
+ * Delete the selected items in res.
+ */
+
+error * template_delete_selection (ResourcePtr res)
+{
+    ItemInfoPtr propsitem = props_current (NULL);
+    RectRec damage;
+    int i;
+    Bool any = FALSE;
+
+    if (res == palette)
+        return NULL;
+
+    damage.minx = damage.miny = 1000000;
+    damage.maxx = damage.maxy = -1000000;
+
+    for (i = 0; i < res->numicons; i++)
+    {
+        RectRec bbox;
+        IconInfoPtr icon = res->icons + i;
+        if (icon->owner == NULL || icon->icon.flags & IF_DELETED || !icon->owner->selected)
+            continue;
+        if (icon->owner->u.master == i)
+        {
+            if (icon->owner == propsitem)
+                props_select (NULL, NULL);
+            template_item_bbox (res, icon->owner, &bbox);
+            template_adjust_item_bbox (AddHighlight, &bbox, &bbox);
+            wimp_merge_bboxes (&damage, &damage, &bbox);
+            any = TRUE;
+        }
+
+        template_free_icon (icon, i);
+    }
+
+    res->numselected = 0;
+    selection_giveup (res->window.handle);
+
+    if (any)
+    {
+        document_modified (res->owner, TRUE);
+        wimp_invalidate (&res->window, &damage);
+    }
+    return NULL;
+}
+
+
+/*
+ * Close a template window and delete it.  Does not free any storage.
+ * If the window is in test mode, then exit test mode first.
+ */
+
+error * template_close_window (ResourcePtr res)
+{
+    ResourcePtr propsres;
+
+    if (res->testing)
+    {
+        ER ( normal_mode (res) );
+    }
+
+    if (selection_current(NULL) == res->window.handle)
+        template_lose_selection (res);
+
+    ER ( selection_giveup (res->window.handle) );
+    ER ( registry_deregister_window (res->window.handle) );
+    ER ( _swix(Wimp_DeleteWindow, _IN(1),
+               &res->window) );
+    if (props_current (&propsres) && propsres == res)
+        props_select (NULL, NULL);
+    res->window.handle = -1;
+    return NULL;
+}
+
+
+/*
+ * Free up a TemplateRec and all associated store.  Closes and deletes window if it is open.
+ * Assumes that the document viewer has already been fixed up or is being deleted.
+ */
+
+error * template_free (ResourcePtr res)
+{
+    int i;
+    if (res->type != Window) return NULL;
+
+    if (res->window.handle > 0)
+        template_close_window (res);
+
+    /* Free title data; it is expected to be indir text, system font */
+    free ((char *) res->window.titledata[0]);
+    if (res->window.titledata[1] != -1)
+        free((char *) res->window.titledata[1]);
+
+    /* Free stuff to do with each icon */
+    for (i = 0; i < res->numicons; i++)
+        template_free_icon(&res->icons[i], i);
+
+    /* Free the icon vector */
+    free ((char *) res->icons);
+
+    /* Free the TemplateRec itself */
+    free ((char *) res);
+
+    return NULL;
+}
+
+
+/*
+ * Respond to open_window_request on a template window.
+ * Note: the 'win' parameter is only a partial window structure
+ * (just the fields returned with Open_Window_Request).
+ */
+
+error * template_open_window (WindowPtr win, ResourcePtr res)
+{
+    document_modified (res->owner, TRUE);
+    res->window.visarea = win->visarea;
+    res->window.scrolloffset = win->scrolloffset;
+    res->window.behind = win->behind;
+    return _swix(Wimp_OpenWindow, _IN(1),
+                 &res->window);
+}
+
+
+/*
+ * Given an item's bounding box, return where its handles are
+ * in the arrays given.  All in work coords.
+ */
+
+static void item_handles (RectPtr bbox, int *x, int *y)
+{
+    x[0] = bbox->minx + scalex - resizewidth;
+    x[1] = bbox->minx + (bbox->maxx - bbox->minx - resizewidth) / 2;
+    x[2] = bbox->maxx - scalex;
+    y[0] = bbox->miny + scaley - resizeheight;
+    y[1] = bbox->miny + (bbox->maxy - bbox->miny - resizeheight) / 2;
+    y[2] = bbox->maxy - scaley;
+}
+
+
+/*
+ * Adjust size of a bounding box to add/remove space for the
+ * resize handles.
+ */
+
+void template_adjust_item_bbox (AdjustType way, RectPtr src, RectPtr dst)
+{
+    dst->minx = src->minx - way * resizewidth;
+    dst->miny = src->miny - way * resizeheight;
+    dst->maxx = src->maxx + way * resizewidth;
+    dst->maxy = src->maxy + way * resizeheight;
+}
+
+
+/*
+ * Given the bbox of an item, plot the "highlight" rectangle around it.
+ * The bbox is in work-area coordinates for the template window; note
+ * that it is half-open.  Also plot the resize handle.
+ */
+
+static error * plot_highlight (ResourcePtr res, RectPtr work)
+{
+    IconRec handle = resizeproto;
+    RectRec bbox;
+    int x[3], y[3], xx, yy;
+
+    if (IF_GET_FIELD (BG, handle.flags) == res->window.colours.workBG)
+        IF_SET_FIELD (BG, handle.flags, res->window.colours.workBG ^ 0xF);
+
+    wimp_convert_rect (WorkToScreen, &res->window, work, &bbox);
+    bbox.maxx -= scalex;
+    bbox.maxy -= scaley;
+
+    _swix(Wimp_SetColour, _IN(0),
+          IF_GET_FIELD(BG, handle.flags));
+    _swix(OS_Plot, _INR(0,2),
+          4, bbox.minx, bbox.miny);
+    _swix(OS_Plot, _INR(0,2),
+          5, bbox.maxx, bbox.miny);
+    _swix(OS_Plot, _INR(0,2),
+          5, bbox.maxx, bbox.maxy);
+    _swix(OS_Plot, _INR(0,2),
+          5, bbox.minx, bbox.maxy);
+    _swix(OS_Plot, _INR(0,2),
+          5, bbox.minx, bbox.miny);
+
+    item_handles (work, x, y);
+    for (yy = 0; yy < 3; yy++)
+        for (xx = 0; xx < 3; xx++)
+            if (!(xx == 1 && yy == 1))
+            {
+                handle.bbox.minx = x[xx];
+                handle.bbox.maxx = x[xx] + resizewidth;
+                handle.bbox.miny = y[yy];
+                handle.bbox.maxy = y[yy] + resizeheight;
+                ER ( _swix(Wimp_PlotIcon, _IN(1),
+                           &handle) );
+            }
+
+    return NULL;
+}
+
+
+/*
+ * Determine the bounding box of an item's icons, not adjusted for
+ * highlight box size.
+ */
+
+void template_item_bbox (ResourcePtr res, ItemInfoPtr item, RectPtr bbox)
+{
+    int i, n = numicons[item->type];
+    *bbox = res->icons[item->u.master].icon.bbox;
+    for (i = 1; i < n; i++)
+    {
+        int ind = item->u.rawicons[i];
+        if (ind != -1)
+            wimp_merge_bboxes (bbox, bbox, &res->icons[ind].icon.bbox);
+    }
+}
+
+
+/*
+ * Redraw Part of a Template window according to the redraw
+ * event supplied.  First put the relevent icons on, then draw
+ * the "selected" boxes for any selected ones.  Finally draw the grid
+ * and the rubber resize/constrained move boxes and lassoo box
+ * if non NULL.
+ */
+
+static error * _template_redraw_window (WindowRedrawPtr redraw, ResourcePtr res,
+                                        int handlenum, Bool resize, PointPtr offset,
+                                        RectPtr lassoo)
+{
+    int more;
+
+    ER ( _swix(Wimp_RedrawWindow, _IN(1) | _OUT(0),
+               redraw,
+               &more) );
+    while (more)
+    {
+        RectRec work;
+        int i;
+
+        if (res->testing == FALSE)
+        {
+
+            /* Determine work-area relative bbox of invalid area */
+            wimp_convert_rect(ScreenToWork, (WindowPtr) redraw, &redraw->graphwin, &work);
+
+            /* Draw the icons themselves */
+            for (i = 0; i < res->numicons; i++)
+            {
+                IconInfoPtr icon = res->icons + i;
+                if (icon->icon.flags & IF_DELETED)
+                    continue;
+                if (wimp_rects_intersect(&icon->icon.bbox, &work))
+                {
+                    ER (_swix(Wimp_PlotIcon, _IN(1),
+                              &icon->icon) );
+                }
+            }
+
+            /* Then draw any highlight boxes */
+            for (i = 0; i < res->numicons; i++)
+            {
+                IconInfoPtr icon = res->icons + i;
+                if (icon->owner && icon->owner->selected &&
+                    icon->owner->u.master == i && VALID_TYPE(icon->owner->type))
+                {
+                    RectRec bbox, temp;
+                    template_item_bbox (res, icon->owner, &bbox);
+                    template_adjust_item_bbox (AddHighlight, &bbox, &temp);
+                    if (wimp_rects_intersect (&temp, &work))
+                    {
+                        ER ( plot_highlight (res, &bbox) );;
+                    }
+                }
+            }
+
+            /* Finally draw the grid if it is switched on */
+            grid_draw (res, &work);
+
+            /* And the rubber boxes if required */
+            if (offset)
+                plot_rubber_selected (res, handlenum, resize, offset);
+
+            if (lassoo)
+                wimp_plot_eor_box (&res->window, lassoo);
+        }
+
+        ER ( _swix(Wimp_GetRectangle, _IN(1) | _OUT(0),
+                   redraw,
+                   &more) );
+    }
+    return NULL;
+}
+
+
+error * template_redraw_window (WindowRedrawPtr redraw, ResourcePtr res)
+{
+    return _template_redraw_window (redraw, res, -1, FALSE, NULL, NULL);
+}
+
+
+/*
+ * Get the total bounding box of all selected items in the
+ * given resource.
+ */
+
+static void get_selection_bbox (ResourcePtr res, RectPtr bbox)
+{
+    int i;
+    bbox->minx = bbox->miny = 1000000;
+    bbox->maxx = bbox->maxy = -1000000;
+
+    if (selection_current(NULL) != res->window.handle)
+        return;
+
+    for (i = 0; i < res->numicons; i++)
+    {
+        IconInfoPtr icon = res->icons + i;
+        if (icon->owner && icon->owner->selected &&
+            icon->owner->u.master == i && VALID_TYPE(icon->owner->type))
+        {
+            RectRec temp;
+            template_item_bbox (res, icon->owner, &temp);
+            template_adjust_item_bbox (AddHighlight, &temp, &temp);
+            wimp_merge_bboxes (bbox, bbox, &temp);
+        }
+    }
+}
+
+#if 0
+/*
+ * Get the total bounding box of all pending snap items in the
+ * given resource.  Do not include space for highlight box.
+ */
+
+static void get_pendingsnap_bbox (ResourcePtr res, RectPtr bbox)
+{
+    int i;
+    bbox->minx = bbox->miny = 1000000;
+    bbox->maxx = bbox->maxy = -1000000;
+
+    for (i = 0; i < res->numicons; i++)
+    {
+        IconInfoPtr icon = res->icons + i;
+        if (icon->owner && icon->owner->pendingsnap &&
+            icon->owner->u.master == i && VALID_TYPE(icon->owner->type))
+        {
+            RectRec temp;
+            template_item_bbox (res, icon->owner, &temp);
+            wimp_merge_bboxes (bbox, bbox, &temp);
+        }
+    }
+}
+#endif
+
+/*
+ * Determine which item is inside a given point.  If more than one,
+ * icon stacking order will determine which is returned.
+ * If none found, return NULL.  Returns the item.  Also returns in
+ * 'iconnum' the icon number if the pointer was within one, -1 otherwise.
+ */
+
+static ItemInfoPtr which_item (ResourcePtr res, PointPtr position, int *iconnum)
+{
+    int i;
+
+    if (iconnum) *iconnum = -1;
+
+    for (i = res->numicons - 1; i >= 0; i--)
+    {
+        IconInfoPtr icon = res->icons + i;
+        if (icon->owner == NULL)
+            continue;
+        if (wimp_point_inside(&icon->icon.bbox, position))
+        {
+            if (iconnum) *iconnum = i;
+            return icon->owner;
+        }
+    }
+
+    /* Catch the gaps between icons of a composite item - give them
+     * the stacking order of the master icon
+     */
+
+    for (i = res->numicons - 1; i >= 0; i--)
+    {
+        IconInfoPtr icon = res->icons + i;
+        RectRec bbox;
+        if (icon->owner == NULL || icon->owner->u.master != i)
+            continue;
+        template_item_bbox (res, icon->owner, &bbox);
+        if (wimp_point_inside(&bbox, position))
+            return icon->owner;
+    }
+
+    return NULL;
+}
+
+
+/*
+ * Determine which item's resize handle is at a given place.
+ * Item stacking order will determine which is returned.
+ * If none found, return NULL.  Returns the item and the
+ * index (0-8 but not 4) of the resize handle.
+ */
+
+static ItemInfoPtr which_resize_handle (ResourcePtr res, PointPtr position, int *which)
+{
+    RectRec bbox;
+    int x[3], y[3], i, xx, yy;
+
+    for (i = res->numicons - 1; i >= 0; i--)
+    {
+        IconInfoPtr icon = res->icons + i;
+        if (icon->owner == NULL || icon->owner->u.master != i)
+            continue;
+        if (icon->owner->selected)
+        {
+            template_item_bbox (res, icon->owner, &bbox);
+            item_handles (&bbox, x, y);
+
+            for (yy = 0; yy < 3; yy++)
+                if (position->y >= y[yy] && position->y < y[yy] + resizeheight)
+                    break;
+
+            if (yy != 3)
+            {
+                for (xx = 0; xx < 3; xx++)
+                    if (position->x >= x[xx] && position->x < x[xx] + resizewidth)
+                        break;
+                if (xx != 3 && !(yy == 1 && xx == 1))
+                {
+                    *which = 3 * yy + xx;
+                    return icon->owner;
+                }
+            }
+        }
+    }
+
+    return NULL;
+}
+
+
+/*
+ * Select or deselect an item according to the
+ * value passed in.  Redraws screen and keeps
+ * numselected up to date.
+ */
+
+static error * select_item (ResourcePtr res, ItemInfoPtr item, Bool newstate)
+{
+    RectRec bbox;
+
+    if (item->selected == newstate)
+        return NULL;
+    res->numselected += newstate ? 1 : -1;
+    item->selected = newstate;
+
+    if (res->numselected)
+        selection_claim (res->window.handle);
+    else
+        selection_giveup (res->window.handle);
+
+    template_item_bbox (res, item, &bbox);
+    template_adjust_item_bbox (AddHighlight, &bbox, &bbox);
+    return wimp_invalidate (&res->window, &bbox);
+}
+
+
+
+/*
+ * Select any items in the window that intersect the given
+ * bounding box.  If the 'toggle' parameter is TRUE, then
+ * toggle state rather than setting.  If 'toggle' FALSE, then
+ * items not in the bbox are cleared.  Forces redraw of the
+ * appropriate parts of the screen.
+ *
+ * If 'fully', then only select items *entirely* within the bbox.
+ */
+
+static error * select_bounded_items (ResourcePtr res, RectPtr inside, Bool toggle, Bool fully)
+{
+    Bool anyinvalid = FALSE;
+    RectRec invalid;
+    int i;
+    invalid.minx = invalid.miny = 1000000;
+    invalid.maxx = invalid.maxy = -1000000;
+
+    for (i = 0; i < res->numicons; i++)
+    {
+        Bool changed = FALSE;
+        IconInfoPtr icon = res->icons + i;
+        RectRec bbox;
+        if (icon->owner == NULL || icon->owner->u.master != i)
+            continue;
+        template_item_bbox (res, icon->owner, &bbox);
+/*      template_adjust_item_bbox (AddHighlight, &bbox, &bbox);*/
+
+        if (fully && wimp_rect_contained (&bbox, inside) ||
+            !fully && wimp_rects_intersect (&bbox, inside))
+        {
+            if (icon->owner->selected)
+            {
+                if (toggle)
+                {
+                    /* Toggle off */
+                    icon->owner->selected = FALSE;
+                    res->numselected--;
+                    changed = TRUE;
+                }
+            }
+            else
+            {
+                /* Switch on */
+                icon->owner->selected = TRUE;
+                res->numselected++;
+                changed = TRUE;
+            }
+        }
+        else
+        {
+            if (icon->owner->selected && !toggle)
+            {
+                /* clear selection */
+                icon->owner->selected = FALSE;
+                res->numselected--;
+                changed = TRUE;
+            }
+        }
+
+        if (changed)
+        {
+            template_adjust_item_bbox (AddHighlight, &bbox, &bbox);
+            wimp_merge_bboxes (&invalid, &invalid, &bbox);
+            anyinvalid = TRUE;
+        }
+    }
+
+    if (res->numselected)
+        selection_claim (res->window.handle);
+    else
+        selection_giveup (res->window.handle);
+
+    if (anyinvalid)
+        ER ( wimp_invalidate (&res->window, &invalid) );
+    return NULL;
+}
+
+
+/*
+ * Deselect all items in the window.
+ */
+
+error * template_lose_selection (ResourcePtr res)
+{
+    RectRec outside;
+    if (selection_current(NULL) != res->window.handle)
+        return NULL;
+    /* Somewhere outside valid coordinates */
+    outside.minx = outside.maxx = res->window.workarea.minx - 1000;
+    outside.miny = outside.maxy = res->window.workarea.miny - 1000;
+    ER ( select_bounded_items (res, &outside, FALSE, FALSE) );
+    return NULL;
+}
+
+
+
+static void settype (char *filename, int filetype)
+{
+    char buf[256];
+    sprintf (buf, "%%settype %s %x", filename, filetype);
+    system (buf);
+}
+
+
+/*
+ * Take an item's bounding box, and calculate what the new bounding box would
+ * be if the given handle was moved by the given offset.
+ */
+
+static void calculate_new_bbox (ResourcePtr res, ItemInfoPtr item, int handlenum,
+                                Bool resize, PointPtr offset, RectPtr bbox)
+{
+    int xx = handlenum % 3, yy = handlenum / 3;
+    PointRec p;
+
+    if (xx == 0)
+    {
+        bbox->minx += offset->x;
+        if (resize)
+        {
+            if (res->grid.lock)
+            {
+                p.x = bbox->maxx - bbox->minx;
+                grid_snap_point(res, &p, &p);
+                bbox->minx = bbox->maxx - p.x;
+            }
+        }
+        else
+            bbox->maxx += offset->x;
+    }
+    else if (xx == 2)
+    {
+        bbox->maxx += offset->x;
+        if (resize)
+        {
+            if (res->grid.lock)
+            {
+                p.x = bbox->maxx - bbox->minx;
+                grid_snap_point(res, &p, &p);
+                bbox->maxx = bbox->minx + p.x;
+            }
+        }
+        else
+            bbox->minx += offset->x;
+    }
+
+    if (yy == 0)
+    {
+        bbox->miny += offset->y;
+        if (resize)
+        {
+            if (res->grid.lock)
+            {
+                p.y = bbox->maxy - bbox->miny;
+                grid_snap_point(res, &p, &p);
+                bbox->miny = bbox->maxy - p.y;
+            }
+        }
+        else
+            bbox->maxy += offset->y;
+    }
+    else if (yy == 2)
+    {
+        bbox->maxy += offset->y;
+        if (resize)
+        {
+            if (res->grid.lock)
+            {
+                p.y = bbox->maxy - bbox->miny;
+                grid_snap_point(res, &p, &p);
+                bbox->maxy = bbox->miny + p.y;
+            }
+        }
+        else
+            bbox->miny += offset->y;
+    }
+}
+
+
+/*
+ * Plot the rubber boxes for the selected items in the template, using the
+ * offset and handle info supplied.  Should only
+ * be called in a Wimp_RedrawWindow or Wimp_UpdateWindow loop
+ */
+
+static void plot_rubber_selected (ResourcePtr res, int handlenum, Bool resize, PointPtr offset)
+{
+    int i;
+    RectRec bbox;
+    ItemInfoPtr item;
+    for (i = 0; i < res->numicons; i++)
+    {
+        item = res->icons[i].owner;
+        if (item && item->selected && item->u.master == i)
+        {
+            template_item_bbox (res, item, &bbox);
+            calculate_new_bbox (res, item, handlenum, resize, offset, &bbox);
+            wimp_plot_eor_box (&res->window, &bbox);
+        }
+    }
+}
+
+
+/*
+ * Plot rubber resize boxes for all selected items.  This may
+ * be called outside a redraw loop because it uses
+ * Wimp_UpdateWindow.
+ */
+
+static void update_rubber_selected (ResourcePtr res, int handlenum, Bool resize, PointPtr offset)
+{
+    WindowRedrawRec temp;
+    int more;
+
+    temp.handle = res->window.handle;
+    wimp_convert_rect (ScreenToWork, &res->window, &res->window.visarea, &temp.visarea);
+    _swix(Wimp_UpdateWindow, _IN(1) | _OUT(0),
+          &temp,
+          &more);
+
+    while (more)
+    {
+        plot_rubber_selected (res, handlenum, resize, offset);
+        _swix(Wimp_GetRectangle, _IN(1) | _OUT(0),
+              &temp,
+              &more);
+    }
+}
+
+
+/*
+ * Closure for the drag and lassoo interactors
+ */
+
+typedef struct
+{
+    ResourcePtr res;
+    PointRec offset, position;
+    RectRec workbox;
+    unsigned int buttons, modifiers;
+    ItemInfoPtr item;
+    int handlenum;              /* 0 through 8 but not 4 */
+} DragClosureRec, *DragClosurePtr;
+
+
+/*
+ * Interactor for the lassoo operation
+ */
+
+static error * lassoo_interactor (unsigned int event, int *buf, void *closure, Bool *consumed)
+{
+    DragClosurePtr drag = (DragClosurePtr) closure;
+    static Bool donepointer = FALSE;
+    Bool removeptr;
+
+    if (buf == NULL)            /* we are being asked to cancel */
+    {
+        if (donepointer)
+        {
+            (void) _swix(Wimp_SetPointerShape, _INR(0,1),
+                         1, -1);
+            donepointer = FALSE;
+        }
+        wimp_update_eor_box (&drag->res->window, &drag->workbox);
+        (void) dragdrop_scroll (NULL, NULL, NULL);
+        return _swix(Wimp_DragBox, _IN(1),
+                     0);
+    }
+
+    switch (event)
+    {
+    case EV_NULL_REASON_CODE:
+        {
+            PointerInfoRec pointer;
+            PointRec work;
+
+            ER ( _swix(Wimp_GetPointerInfo, _IN(1),
+                       &pointer) );
+
+            wimp_convert_point (ScreenToWork, &drag->res->window, &pointer.position, &work);
+
+            if (work.x != drag->workbox.maxx || work.y != drag->workbox.miny)
+            {
+                wimp_update_eor_box (&drag->res->window, &drag->workbox);
+                drag->workbox.maxx = work.x;
+                drag->workbox.miny = work.y;
+                wimp_update_eor_box (&drag->res->window, &drag->workbox);
+            }
+
+            /* See if scrolling would be in order.  If it does scroll, then
+             * the next thing received will be an Open Request.  We will issue
+             * an Open Window, which will cause the window to scroll.  We will
+             * then receive a redraw request for the area that got uncovered
+             * as a result of the scroll.  This we field below, asking the
+             * redraw code to draw any portions of rubber box that need
+             * filling in.  The result should (!) be that the rubber box will be
+             * fully intact at the end of all this, with no "bits" left behind...
+             */
+
+            if (dragdrop_scroll (&drag->res->window, &pointer.position, &removeptr))
+            {
+                if (donepointer == FALSE)
+                {
+                    ER ( _swix(Wimp_SpriteOp, _IN(0) | _INR(2,7),
+                               36, "ptr_scroll", 2, 12, 12, 0, 0) );
+                    donepointer = TRUE;
+                }
+            }
+            if (donepointer && removeptr)
+            {
+                (void) _swix(Wimp_SetPointerShape, _INR(0,1),
+                             1, -1);
+                donepointer = FALSE;
+            }
+        }
+        break;
+
+    case EV_REDRAW_WINDOW_REQUEST:
+        block
+        {
+            WindowRedrawPtr redraw = (WindowRedrawPtr) buf;
+
+            if (redraw->handle == drag->res->window.handle)
+            {
+                *consumed = TRUE;
+                return _template_redraw_window (redraw, drag->res,
+                                                drag->handlenum, TRUE, &drag->offset,
+                                                &drag->workbox);
+            }
+        }
+        break;
+
+    case EV_USER_DRAG_BOX:
+        {
+            interactor_cancel();
+            *consumed = TRUE;
+            wimp_regularise_rect (&drag->workbox);
+            return select_bounded_items (drag->res, &drag->workbox, drag->buttons == MB_DRAG(MB_ADJUST),
+                                         drag->modifiers == MODIFIER_CTRL);
+        }
+        break;
+    }
+    return NULL;
+}
+
+
+/*
+ * Interactor for the resize operation.
+ *
+ * Grid-snap for resize works by snapping each item being resized to a
+ * multiple of the grid spacing high/wide.  Note that the *size* of
+ * the item is snapped, not the coordinates.  This is done by calculate_new_bbox,
+ * so that the rubber-band interaction follows the same pattern.
+ */
+
+static error * resize_interactor (unsigned int event, int *buf, void *closure, Bool *consumed)
+{
+    DragClosurePtr drag = (DragClosurePtr) closure;
+    static Bool donepointer = FALSE;
+    Bool removeptr;
+
+    if (buf == NULL)            /* we are being asked to cancel */
+    {
+        if (donepointer)
+        {
+            (void) _swix(Wimp_SetPointerShape, _INR(0,1),
+                         1, -1);
+            donepointer = FALSE;
+        }
+        update_rubber_selected (drag->res, drag->handlenum, TRUE, &drag->offset);
+        (void) dragdrop_scroll (NULL, NULL, NULL);
+        return _swix(Wimp_DragBox, _IN(1),
+                     0);
+    }
+
+    switch (event)
+    {
+    case EV_NULL_REASON_CODE:
+        block
+        {
+            PointerInfoRec pointer;
+            PointRec work;
+
+            ER ( _swix(Wimp_GetPointerInfo, _IN(1),
+                       &pointer) );
+
+            wimp_convert_point (ScreenToWork, &drag->res->window, &pointer.position, &work);
+            work.x -= drag->position.x;
+            work.y -= drag->position.y;
+
+            if (work.x != drag->offset.x || work.y != drag->offset.y)
+            {
+                update_rubber_selected (drag->res, drag->handlenum, TRUE, &drag->offset);
+                drag->offset = work;
+                update_rubber_selected (drag->res, drag->handlenum, TRUE, &drag->offset);
+            }
+
+            /* See if scrolling would be in order.  If it does scroll, then
+             * the next thing received will be an Open Request.  We will issue
+             * an Open Window, which will cause the window to scroll.  We will
+             * then receive a redraw request for the area that got uncovered
+             * as a result of the scroll.  This we field below, asking the
+             * redraw code to draw any portions of rubber box that need
+             * filling in.  The result should (!) be that the rubber box will be
+             * fully intact at the end of all this, with no "bits" left behind...
+             */
+
+            if (dragdrop_scroll (&drag->res->window, &pointer.position, &removeptr))
+            {
+                if (donepointer == FALSE)
+                {
+                    ER ( _swix(Wimp_SpriteOp, _IN(0) | _INR(2,7),
+                               36, "ptr_scroll", 2, 12, 12, 0, 0) );
+                    donepointer = TRUE;
+                }
+            }
+            if (donepointer && removeptr)
+            {
+                (void) _swix(Wimp_SetPointerShape, _INR(0,1),
+                             1, -1);
+                donepointer = FALSE;
+            }
+        }
+        break;
+
+    case EV_REDRAW_WINDOW_REQUEST:
+        block
+        {
+            WindowRedrawPtr redraw = (WindowRedrawPtr) buf;
+
+            if (redraw->handle == drag->res->window.handle)
+            {
+                *consumed = TRUE;
+                return _template_redraw_window (redraw, drag->res,
+                                                drag->handlenum, TRUE, &drag->offset,
+                                                NULL);
+            }
+        }
+        break;
+
+    case EV_USER_DRAG_BOX:
+        block
+        {
+            int i;
+
+            interactor_cancel();        /* rubs out the box */
+            *consumed = TRUE;
+
+            for (i = 0; i < drag->res->numicons; i++)
+            {
+                ItemInfoPtr item = drag->res->icons[i].owner;
+                if (item && item->selected && item->u.master == i)
+                {
+                    RectRec bbox;
+                    template_item_bbox (drag->res, item, &bbox);
+                    calculate_new_bbox (drag->res, item, drag->handlenum, TRUE, &drag->offset, &bbox);
+
+                    wimp_regularise_rect (&bbox);
+                    resize_item (drag->res, item, &bbox);
+                    if (props_current (NULL) == item)
+                        props_select (drag->res, item);
+                }
+            }
+
+            document_modified (drag->res->owner, TRUE);
+            dprintf("Resize finished\n");
+            return NULL;
+        }
+        break;
+    }
+    return NULL;
+}
+
+
+/*
+ * Interactor for the constrained move operation.
+ * The grid-snap system works similarly to that of the resize operation,
+ * but the snap is not done as you drag (only at the end).  The
+ * dragged item is snapped, and the other selected items are moved
+ * the same amount.
+ */
+
+static error * constrained_move_interactor (unsigned int event, int *buf, void *closure, Bool *consumed)
+{
+    DragClosurePtr drag = (DragClosurePtr) closure;
+    static Bool donepointer = FALSE;
+    Bool removeptr;
+    RectRec damage;
+    damage.minx = damage.miny = 1000000;
+    damage.maxx = damage.maxy = -1000000;
+
+    if (buf == NULL)            /* we are being asked to cancel */
+    {
+        if (donepointer)
+        {
+            (void) _swix(Wimp_SetPointerShape, _INR(0,1),
+                         1, -1);
+            donepointer = FALSE;
+        }
+        update_rubber_selected (drag->res, drag->handlenum, FALSE, &drag->offset);
+        (void) dragdrop_scroll (NULL, NULL, NULL);
+        return _swix(Wimp_DragBox, _IN(1),
+                     0);
+    }
+
+    switch (event)
+    {
+    case EV_NULL_REASON_CODE:
+        block
+        {
+            PointerInfoRec pointer;
+            PointRec work;
+
+            ER ( _swix(Wimp_GetPointerInfo, _IN(1),
+                       &pointer) );
+
+            wimp_convert_point (ScreenToWork, &drag->res->window, &pointer.position, &work);
+            work.x -= drag->position.x;
+            work.y -= drag->position.y;
+
+            if (work.x != drag->offset.x || work.y != drag->offset.y)
+            {
+                update_rubber_selected (drag->res, drag->handlenum, FALSE, &drag->offset);
+                drag->offset = work;
+                update_rubber_selected (drag->res, drag->handlenum, FALSE, &drag->offset);
+            }
+
+            /* See if scrolling would be in order.  If it does scroll, then
+             * the next thing received will be an Open Request.  We will issue
+             * an Open Window, which will cause the window to scroll.  We will
+             * then receive a redraw request for the area that got uncovered
+             * as a result of the scroll.  This we field below, asking the
+             * redraw code to draw any portions of rubber box that need
+             * filling in.  The result should (!) be that the rubber box will be
+             * fully intact at the end of all this, with no "bits" left behind...
+             */
+
+            if (dragdrop_scroll (&drag->res->window, &pointer.position, &removeptr))
+            {
+                if (donepointer == FALSE)
+                {
+                    ER ( _swix(Wimp_SpriteOp, _IN(0) | _INR(2,7),
+                               36, "ptr_scroll", 2, 12, 12, 0, 0) );
+                    donepointer = TRUE;
+                }
+            }
+            if (donepointer && removeptr)
+            {
+                (void) _swix(Wimp_SetPointerShape, _INR(0,1),
+                             1, -1);
+                donepointer = FALSE;
+            }
+        }
+        break;
+
+    case EV_REDRAW_WINDOW_REQUEST:
+        block
+        {
+            WindowRedrawPtr redraw = (WindowRedrawPtr) buf;
+
+            if (redraw->handle == drag->res->window.handle)
+            {
+                *consumed = TRUE;
+                return _template_redraw_window (redraw, drag->res,
+                                                drag->handlenum, FALSE, &drag->offset,
+                                                NULL);
+            }
+        }
+        break;
+
+    case EV_USER_DRAG_BOX:
+        block
+        {
+            RectRec bbox, oldbbox;
+            PointRec delta;
+            int i;
+            ItemInfoPtr item;
+
+            interactor_cancel();        /* rubs out the box */
+            *consumed = TRUE;
+
+            template_item_bbox (drag->res, drag->item, &oldbbox);
+            bbox = oldbbox;
+            calculate_new_bbox (drag->res, drag->item, drag->handlenum, FALSE, &drag->offset, &bbox);
+            wimp_regularise_rect (&bbox);
+
+            if (drag->res->grid.lock)
+            {
+                PointRec pt;
+                int xx = drag->handlenum % 3, yy = drag->handlenum / 3;
+                int width = bbox.maxx - bbox.minx, height = bbox.maxy - bbox.miny;
+
+                if (xx == 0)
+                {
+                    pt.x = bbox.minx;
+                    grid_snap_point (drag->res, &pt, &pt);
+                    bbox.minx = pt.x;
+                    bbox.maxx = bbox.minx + width;
+                }
+                else if (xx == 2)
+                {
+                    pt.x = bbox.maxx;
+                    grid_snap_point (drag->res, &pt, &pt);
+                    bbox.maxx = pt.x + scalex;
+                    bbox.minx = bbox.maxx - width;
+                }
+
+                if (yy == 0)
+                {
+                    pt.y = bbox.miny;
+                    grid_snap_point (drag->res, &pt, &pt);
+                    bbox.miny = pt.y;
+                    bbox.maxy = bbox.miny + height;
+                }
+                else if (yy == 2)
+                {
+                    pt.y = bbox.maxy;
+                    grid_snap_point (drag->res, &pt, &pt);
+                    bbox.maxy = pt.y + scaley;
+                    bbox.miny = bbox.maxy - height;
+                }
+            }
+
+            /* Determine delta */
+            delta.x = bbox.minx - oldbbox.minx;
+            delta.y = bbox.miny - oldbbox.miny;
+
+            for (i = 0; i < drag->res->numicons; i++)
+            {
+                RectRec newbbox;
+                item = drag->res->icons[i].owner;
+                if (item && item->selected && item->u.master == i)
+                {
+                    template_item_bbox (drag->res, item, &newbbox);
+                    (void) wimp_merge_bboxes (&damage, &damage, &newbbox);
+                    grid_move_item (drag->res, item, delta.x, delta.y);
+                    template_item_bbox (drag->res, item, &newbbox);
+                    (void) wimp_merge_bboxes (&damage, &damage, &newbbox);
+
+                    if (props_current (NULL) == item)
+                        props_select (drag->res, item);
+                }
+            }
+
+            template_adjust_item_bbox (AddHighlight, &damage, &damage);
+            wimp_invalidate (&drag->res->window, &damage);
+            document_modified (drag->res->owner, TRUE);
+            dprintf("Constrained move finished\n");
+        }
+        break;
+    }
+    return NULL;
+}
+
+
+/*
+ * Message_Dragging handler for Template windows.
+ *
+ * Experimental: refuse to claim drags that have 'not true size'
+ * asserted.
+ */
+
+error * template_claim_drag (ResourcePtr res,            /* the resource in this window */
+                             int windowhandle,           /* window handle of receiver/claimant */
+                             MessageDraggingPtr msg,     /* may contain different window handle */
+                             int *claimref)              /* update with new myref, else 0 */
+{
+    int reply[64];
+    MessageDragClaimPtr claim = (MessageDragClaimPtr) reply;
+    static Bool donepointer = FALSE;
+    Bool removeptr;
+
+    *claimref = 0;
+
+    if (msg == NULL)
+    {                    /* Drag-n-drop aborted */
+        donepointer = FALSE;
+        (void) dragdrop_scroll (NULL, NULL, NULL);
+        return NULL;
+    }
+
+dprintf ("        MESSAGE_DRAGGING Offered to RESOURCE win %d (for %d)\n" _ windowhandle _ msg->windowhandle);
+
+    if (windowhandle != msg->windowhandle)
+    {
+        donepointer = FALSE;
+        (void) dragdrop_scroll (NULL, NULL, NULL);
+        return NULL;
+    }
+
+#if 0
+    if (msg->bbox.minx > msg->bbox.maxx)
+    {
+        donepointer = FALSE;
+        (void) dragdrop_scroll (NULL, NULL, NULL);
+        return NULL;
+    }
+#endif
+
+    if (dragdrop_scroll (&res->window, &msg->position, &removeptr))
+    {
+        if (donepointer == FALSE)
+        {
+            ER ( _swix(Wimp_SpriteOp, _IN(0) | _INR(2,7),
+                       36, "ptr_scroll", 2, 12, 12, 0, 0) );
+            donepointer = TRUE;
+        }
+    }
+    if (donepointer && removeptr)
+        donepointer = FALSE;
+
+    /* Store the bounding box and position for use by the final callback code */
+
+    claimbbox = msg->bbox;
+    claimposition = msg->position;
+
+    claim->header.yourref = msg->header.myref;           /* Reply */
+    claim->header.messageid = MESSAGE_DRAG_CLAIM;
+/*    claim->flags = 0;*/
+    claim->flags = donepointer ? BIT(0) : 0;
+    claim->filetypes[0] = FileType_Template;
+    claim->filetypes[1] = -1;
+    claim->header.size = sizeof (MessageDragClaimRec) + sizeof(int);
+                                                         /* needs increasing if length of filetypes list grows*/
+
+    ER ( _swix(Wimp_SendMessage, _INR(0,2),
+               EV_USER_MESSAGE, claim, msg->header.taskhandle) );
+    *claimref = claim->header.myref;
+dprintf("         Replying with MESSAGE_DRAG_CLAIM ref == %d\n" _ *claimref);
+    return NULL;
+}
+
+
+
+/*
+ * Closure record for the Data_Save interactor.
+ */
+
+typedef struct
+{
+    ResourcePtr res;                                     /* src res */
+    Bool move;                                           /* TRUE => delete src */
+    PointRec offset;                                     /* subtract from all coords */
+} DataSaveClosureRec, *DataSaveClosurePtr;
+
+
+/*
+ * Interactor for datasaving a selection from a template.
+ */
+
+static error * datasave_interactor (unsigned int event, int *buf, void *closure, Bool *consumed)
+{
+    DataSaveClosurePtr cls = (DataSaveClosurePtr) closure;
+    MessageDataSavePtr save = (MessageDataSavePtr) buf;
+    MessageDataLoadPtr load = (MessageDataLoadPtr) buf;
+
+    if (buf == NULL) return NULL;                        /* cancel */
+
+    switch (event)
+    {
+    case EV_USER_MESSAGE:
+    case EV_USER_MESSAGE_RECORDED:
+        if (save->header.messageid == MESSAGE_DATA_SAVE_ACK)
+        {
+            dprintf("Data Save Ack\n");
+            *consumed = TRUE;
+
+#if 0
+            ER ( template_save_file (NULL, cls->res, save->leafname, TRUE, &cls->offset) );
+#else
+            block
+            {
+                int size = template_file_size (NULL, cls->res, TRUE);
+                char *buf = malloc(size);
+                if (buf)
+                {
+                    FILE *f = fopen(save->leafname, "w");
+                    if (f)
+                    {
+                        ED ( template_save_to_memory (NULL, cls->res, buf, TRUE, &cls->offset) );
+                        fwrite ((void *) buf, 1, size, f);
+                        fclose(f);
+                        settype(save->leafname, FileType_Template);
+                        free(buf);
+                    }
+                    else
+                    {
+                        free (buf);
+                        return error_lookup("CantWrite", save->leafname);
+                    }
+                }
+                else
+                    return error_lookup("NoMem");
+            }
+#endif
+
+            load->header.yourref = save->header.myref;
+            load->header.messageid = MESSAGE_DATA_LOAD;
+            return _swix(Wimp_SendMessage, _INR(0,2), 
+                         EV_USER_MESSAGE_RECORDED, load, save->header.taskhandle);
+        }
+        else if (load->header.messageid == MESSAGE_DATA_LOAD_ACK)
+        {
+            *consumed = TRUE;
+            interactor_cancel();
+            if (cls->move)
+                return template_delete_selection (cls->res);
+        }
+        break;
+    case EV_USER_MESSAGE_ACKNOWLEDGE:
+        if (save->header.messageid == MESSAGE_DATA_SAVE ||
+            load->header.messageid == MESSAGE_DATA_LOAD)
+        {
+            dprintf("Message bounced: %d; datasave cancelled\n" _ save->header.messageid);
+            *consumed = TRUE;                            /* error message here? */
+            interactor_cancel();
+        }
+    }
+    return NULL;
+}
+
+
+/*
+ * Finalise a drag operation from the Template window.
+ * If the target window is the same as the src then do
+ * a simple move.  Otherwise package the selection up
+ * as a Template file and do a DataSave.
+ */
+
+static error * drag_callback (void *cp, DragDropCallbackPtr dd)
+{
+    DragClosurePtr cls = (DragClosurePtr) cp;
+    ResourcePtr res = cls->res;                 /* src resource */
+
+    if (dd->claimant == taskhandle &&
+        dd->mouse.windowhandle == res->window.handle &&
+        !(dd->dragflags & BIT(3)))                       /* reverse sense of SHIFT in this case */
+    {
+        RectRec bbox;
+        PointRec delta;
+        int i;
+
+        dragdrop_cancel();
+
+        if (res == palette)
+            return NULL;        /* disallow rearranging the palette! */
+
+        /* Invalidate old bbox */
+        get_selection_bbox (res, &bbox);
+        wimp_invalidate (&res->window, &bbox);
+        template_adjust_item_bbox (RemoveHighlight, &bbox, &bbox);
+
+        /* Determine delta */
+        delta.x = claimbbox.minx / 400 + claimposition.x;
+        delta.y = claimbbox.miny / 400 + claimposition.y;
+dprintf("delta is first %d %d\n" _ delta.x _ delta.y);
+        wimp_convert_point (ScreenToWork, &res->window, &delta, &delta);
+dprintf("delta and then %d %d\n" _ delta.x _ delta.y);
+        delta.x -= bbox.minx;
+        delta.y -= bbox.miny;
+dprintf("delta and finally %d %d\n" _ delta.x _ delta.y);
+
+        /* Move selected items by delta */
+        for (i = 0; i < res->numicons; i++)
+        {
+            IconInfoPtr icon = res->icons + i;
+            if (icon->owner == NULL || icon->icon.flags & IF_DELETED)
+                continue;
+            if (icon->owner->selected)
+            {
+                icon->icon.bbox.minx += delta.x;
+                icon->icon.bbox.miny += delta.y;
+                icon->icon.bbox.maxx += delta.x;
+                icon->icon.bbox.maxy += delta.y;
+            }
+        }
+
+        /* Invalidate new bbox */
+        get_selection_bbox (res, &bbox);
+
+        make_selection_pendingsnap (res);
+        snap_pending (res, &bbox);
+        wimp_invalidate (&res->window, &bbox);
+    }
+    else
+    {
+        /* DataSave the selection in "res" to the given window as an anonymous document */
+
+        static DataSaveClosureRec closure;
+        MessageDataSaveRec msg;
+
+        if (dd->claimant != -1)                          /* find an agreeable filetype */
+            msg.filetype = document_negotiate_filetype (dd->filetypes, dd->claimantstypes);
+        else
+            msg.filetype = dd->filetypes[0];
+
+        msg.header.size = sizeof(MessageDataSaveRec);
+        msg.header.yourref = (dd->claimant != -1 ? dd->claimantsref : 0);
+        msg.header.messageid = MESSAGE_DATA_SAVE;
+        msg.windowhandle = dd->mouse.windowhandle;
+        msg.iconhandle = dd->mouse.iconhandle;
+        msg.position = dd->mouse.position;
+        msg.estsize = template_file_size (NULL, res, TRUE);
+        strcpy(msg.leafname, message_lookup(&msgs, "Selection"));
+
+        ER ( _swix(Wimp_SendMessage, _INR(0,3),
+                   EV_USER_MESSAGE_RECORDED, &msg, dd->mouse.windowhandle, dd->mouse.iconhandle) );
+
+        closure.res = res;
+
+        if (dd->dragflags & BIT(3))
+            closure.move = TRUE;
+        else if (dd->claimant != -1 && (dd->claimantsflags & BIT(3)))
+            closure.move = TRUE;
+        else
+            closure.move = FALSE;
+
+        if (dd->claimant == taskhandle &&
+            dd->mouse.windowhandle == res->window.handle)
+            closure.move = !closure.move;       /* reverse sense of SHIFT in same window */
+
+        if (dd->claimant != -1)
+        {
+            closure.offset = cls->offset;
+            dprintf("OFFSET ON SAVE IS %d,%d\n" _ closure.offset.x _ closure.offset.y);
+        }
+        else
+        {
+            dprintf("NO SAVE OFFSET\n");
+            closure.offset.x = closure.offset.y = 0;
+        }
+
+        interactor_install (datasave_interactor, (void *) &closure);
+    }
+
+    return NULL;
+}
+
+
+/*
+ * Commence a drag operation on the template window.  The coords in
+ * 'mouse' are screen-relative.
+ */
+
+
+static int filetypes [] = {FileType_Template, -1};
+
+static error * start_drag (ResourcePtr res, ItemInfoPtr item, MouseClickPtr mouse, unsigned int modifiers)
+{
+    static DragClosureRec closure;
+    if (item)
+    {
+        RectRec bbox;
+
+        /* Determine the offset to subtract from icons by on saving, such that the
+         * top-left corner of the bounding box is at 0,0
+         */
+
+        get_selection_bbox (res, &bbox);
+        template_adjust_item_bbox (RemoveHighlight, &bbox, &bbox);
+
+        closure.offset.x = bbox.minx;
+        closure.offset.y = bbox.maxy;
+        closure.res = res;
+
+        dprintf("OFFSET AT START_DRAG is %d,%d\n" _ closure.offset.x _ closure.offset.y);
+
+        wimp_convert_rect (WorkToScreen, &res->window, &bbox, &bbox);
+
+        ER ( dragdrop_start (&bbox, TRUE,                /* bbox is data's real size */
+                             BIT(1) | ((modifiers == MODIFIER_SHIFT) ? BIT(3) : 0),
+                             filetypes,
+                             drag_callback,
+                             (void *) &closure) );
+    }
+    else
+    {
+        /* Lassoo icons */
+        DragBoxRec drag;
+        PointRec work;
+
+        interactor_cancel();
+        wimp_convert_point (ScreenToWork, &res->window, &mouse->position, &work);
+        closure.res = res;
+        closure.buttons = mouse->buttons;
+        closure.modifiers = modifiers;
+        closure.workbox.minx = work.x;
+        closure.workbox.miny = work.y;
+        closure.workbox.maxx = work.x + scalex;
+        closure.workbox.maxy = work.y + scaley;
+
+        wimp_update_eor_box (&res->window, &closure.workbox);
+
+        drag.windowhandle = res->window.handle;
+        drag.type = 7;
+        drag.constrain = res->window.visarea;
+
+        ER ( _swix(Wimp_DragBox, _IN(1),
+                   &drag) );
+
+        interactor_install (lassoo_interactor, (void *) &closure);
+        interactor_enable_events (BIT(EV_NULL_REASON_CODE));
+        interactor_set_timeout (2);
+    }
+    return NULL;
+}
+
+
+
+/*
+ * Start resizing an item.  Start a drag of the appropriate type
+ * and set an interactor to catch the end-of-drag.  The mouse position
+ * is expected to be within the resize handle for the item.
+ */
+
+static error * start_resize (ResourcePtr res, ItemInfoPtr item, int handlenum, MouseClickPtr mouse, unsigned int modifiers)
+{
+    static DragClosureRec closure;
+    DragBoxRec drag;
+
+    interactor_cancel();
+
+    /* Original position, work area coords */
+    wimp_convert_point (ScreenToWork, &res->window, &mouse->position, &closure.position);
+
+    closure.offset.x = closure.offset.y = 0;    /* Amount moved */
+    closure.res = res;
+    closure.buttons = mouse->buttons;
+    closure.modifiers = modifiers;
+    closure.item = item;
+    closure.handlenum = handlenum;
+
+    update_rubber_selected (res, handlenum, TRUE, &closure.offset);
+
+    drag.windowhandle = res->window.handle;
+    drag.type = 7;
+    drag.constrain = res->window.visarea;
+
+    ER ( _swix(Wimp_DragBox, _IN(1),
+               &drag) );
+
+    interactor_install (resize_interactor, (void *) &closure);
+    interactor_enable_events (BIT(EV_NULL_REASON_CODE));
+    interactor_set_timeout (2);
+    return NULL;
+}
+
+
+/*
+ * Start a constrained drag of an item.  Start a drag of the appropriate type
+ * and set an interactor to catch the end-of-drag.  The mouse position
+ * is expected to be within a resize handle of the item.
+ */
+
+static error * start_constrained_move (ResourcePtr res, ItemInfoPtr item, int handlenum,
+                                       MouseClickPtr mouse, unsigned int modifiers)
+{
+    static DragClosureRec closure;
+    DragBoxRec drag;
+
+    interactor_cancel();
+
+    /* Original position, work area coords */
+    wimp_convert_point (ScreenToWork, &res->window, &mouse->position, &closure.position);
+
+    closure.offset.x = closure.offset.y = 0;    /* Amount moved */
+    closure.res = res;
+    closure.buttons = mouse->buttons;
+    closure.modifiers = modifiers;
+    closure.item = item;
+    closure.handlenum = handlenum;
+
+    update_rubber_selected (res, handlenum, FALSE, &closure.offset);
+
+    drag.windowhandle = res->window.handle;
+    drag.type = 7;
+    drag.constrain = res->window.visarea;
+
+    ER ( _swix(Wimp_DragBox, _IN(1),
+               &drag) );
+
+    interactor_install (constrained_move_interactor, (void *) &closure);
+    interactor_enable_events (BIT(EV_NULL_REASON_CODE));
+    interactor_set_timeout (2);
+    return NULL;
+}
+
+
+/* Return the selected item in res, NULL if none.  If more
+ * than one selected item, return the first.
+ */
+
+static ItemInfoPtr selected_item (ResourcePtr res)
+{
+    int i;
+    if (res->numselected > 0)
+        for (i = 0; i < res->numicons; i++)
+        {
+            IconInfoPtr icon = res->icons + i;
+            if (icon->owner && icon->owner->selected)
+                return icon->owner;
+        }
+    return NULL;
+}
+
+
+/*
+ * Shade/unshade menu ready for display or (if workposition is NULL) redisplay.
+ * Also makes a temporary selection if necessary.
+ */
+
+static error * prepare_menu (ResourcePtr res, PointPtr workposition)
+{
+    if (res->testing)
+    {
+        menu_shade_menu (selmenu, TRUE);
+        menu_shade_menu (windowmenu, TRUE);
+        menu_shade (tempmenu, TEMPMENU_SELECTALL, TRUE);
+        menu_shade (tempmenu, TEMPMENU_CLEARSELECTION, TRUE);
+        menu_alter_entry (tempmenu, TEMPMENU_TEST, MF_TICKED, MF_TICKED, -1, -1);
+    }
+    else
+    {
+        /* Record the item over which the menu hit occurred, if any.  This
+         * is so that we know what to align to for the Align menu.
+         * menuitem is a static variable.
+         */
+        if (workposition)
+            menuitem = which_item (res, workposition, NULL);
+        menu_alter_entry (tempmenu, TEMPMENU_TEST, MF_TICKED, 0, -1, -1);
+        menu_shade_menu (windowmenu, FALSE);
+        menu_shade (tempmenu, TEMPMENU_SELECTALL, FALSE);
+
+        if (selection_current(NULL) == res->window.handle)
+        {
+            /* The selection we have is fine */
+            menu_shade_menu (selmenu, FALSE);
+            menu_shade (selmenu, SELMENU_ALIGN, menuitem == NULL);
+            menu_shade (selmenu, SELMENU_PROPS, res->numselected != 1);
+            menu_shade (tempmenu, TEMPMENU_CLEARSELECTION, FALSE);
+        }
+        else if (selection_current(NULL) != -1)
+        {
+            /* Another window has selection */
+            menu_shade_menu (selmenu, TRUE);
+            menu_shade (tempmenu, TEMPMENU_CLEARSELECTION, TRUE);
+        }
+        else if (workposition && menuitem != NULL)
+        {
+            ER ( select_item (res, menuitem, TRUE) );
+            selection_set_temporary (TRUE);
+            menu_shade_menu (selmenu, FALSE);
+            menu_shade (selmenu, SELMENU_ALIGN, menuitem == NULL);
+            menu_shade (selmenu, SELMENU_PROPS, res->numselected != 1);
+            menu_shade (tempmenu, TEMPMENU_CLEARSELECTION, FALSE);
+        }
+        else
+        {
+            menu_shade_menu (selmenu, TRUE);
+            menu_shade (tempmenu, TEMPMENU_CLEARSELECTION, TRUE);
+        }
+    }
+    return NULL;
+}
+
+
+/*
+ * Callback for the template menu.
+ */
+
+static error * tempmenu_cb (MenuPtr menu, int *buf, void *closure, Bool adjust)
+{
+    ResourcePtr res = (ResourcePtr) closure;
+    Bool temp;
+    if (buf)
+    {
+        if (buf[0] == TEMPMENU_WINDOW)
+        {
+            switch (buf[1])
+            {
+            case WINDOWMENU_PROPS:
+                ER ( winflags_show_window () );
+                break;
+            case WINDOWMENU_COLOURS:
+                ER ( colours_show_window () );
+                break;
+            case WINDOWMENU_EXTENT:
+                ER ( extent_show_window () );
+                break;
+            case WINDOWMENU_GRID:
+                ER ( grid_show_window () );
+                break;
+            case WINDOWMENU_RENUM:
+                block
+                {
+                    ResourcePtr propsres;
+                    ItemInfoPtr propsitem;
+                    RectRec damage;
+                    template_renumber (res, &damage);
+                    propsitem = props_current (&propsres);
+                    if (res == propsres)
+                        props_select (propsres, propsitem);
+                    ER ( wimp_invalidate (&res->window, &damage) );
+                }
+                break;
+            case WINDOWMENU_CLOSE:
+                ER ( template_close_window (res) );
+                interactor_cancel ();   /* can't open menu again! */
+                break;
+            }
+        }
+        else if (buf[0] == TEMPMENU_SELECTION && buf[1] == SELMENU_DELETE)
+            ER ( template_delete_selection (res) )
+        else if (buf[0] == TEMPMENU_SELECTION && buf[1] == SELMENU_SORT)
+            ER ( sort_selected_icons (res) )
+        else if (buf[0] == TEMPMENU_SELECTION && buf[1] == SELMENU_ALIGN)
+            ER ( align_selection (res, menuitem, buf[2]) )
+        else if (buf[0] == TEMPMENU_SELECTION && buf[1] == SELMENU_PROPS)
+        {
+            ER ( props_select (res, selected_item (res)) );
+            ER ( props_show_window () );
+        }
+        else if (buf[0] == TEMPMENU_SELECTALL)
+            ER ( select_bounded_items (res, &res->window.workarea, FALSE, FALSE) )
+        else if (buf[0] == TEMPMENU_CLEARSELECTION)
+            ER ( template_lose_selection (res) )
+        else if (buf[0] == TEMPMENU_TEST)
+        {
+            if (res->testing)
+            {
+                ER ( normal_mode (res) );
+            }
+            else
+            {
+                ER ( test_mode (res) );
+            }
+        }
+
+        if (adjust)
+        {
+            ER ( prepare_menu (res, NULL) );
+        }
+    }
+    else
+        if (!adjust && selection_current(&temp) == res->window.handle && temp)
+            selection_lose();
+
+    return NULL;
+}
+
+
+/*
+ * Post the template menu
+ */
+
+static error * post_tempmenu (PointPtr workposition, PointPtr screenposition, ResourcePtr res)
+{
+    ER ( prepare_menu (res, workposition) );
+    return menu_post (tempmenu, screenposition, FALSE, tempmenu_cb, (void *) res);
+}
+
+
+
+
+
+
+/*
+ * Respond to Mouse_Click events on a Template window.
+ */
+
+error * template_mouse_click (MouseClickPtr mouse, unsigned int modifiers, ResourcePtr res)
+{
+    ItemInfoPtr item = NULL;
+    int iconnum;
+    PointRec position;
+    int handlenum;
+
+    position.x = mouse->position.x - (res->window.visarea.minx - res->window.scrolloffset.x);
+    position.y = mouse->position.y - (res->window.visarea.maxy - res->window.scrolloffset.y);
+
+    if (res->testing && mouse->buttons != MB_MENU)
+        return NULL;
+
+    /* All clicks gain the caret */
+    ER ( _swix(Wimp_SetCaretPosition, _INR(0,5),
+               res->window.handle, -1, 0, 0, BIT(25), 0) );
+
+    if (res != palette)
+    {
+        /* All clicks update the Winflags and Grid windows, but don't open them */
+        winflags_select (res);
+        colours_select (res);
+        grid_select (res);
+        extent_select (res);
+    }
+
+    switch (mouse->buttons)
+    {
+    case MB_DOUBLE(MB_SELECT):
+        if (res != palette)
+        {
+            item = which_item (res, &position, &iconnum);
+            if (item)
+            {
+                ER ( props_select (res, item) );
+                ER ( props_show_window () );
+            }
+        }
+        break;
+
+    case MB_SINGLECLICK(MB_SELECT):
+        item = which_resize_handle (res, &position, &handlenum);
+        if (res != palette && item)
+        {
+            dprintf("RESIZE CLICK SEEN ACTIVATED\n");
+            /* Seen a click inside a resize handle for a
+             * selected item.  Don't do anything for
+             * now.
+             */
+            return NULL;
+        }
+
+        item = which_item (res, &position, &iconnum);
+
+        if (res != palette && (modifiers == (MODIFIER_CTRL | MODIFIER_SHIFT)))
+        {
+            /* Interactively alter the text of this icon, if possible */
+            if (iconnum != -1)
+            {
+                ER ( start_rename (res, item, iconnum, &position) );
+            }
+        }
+        else
+        {
+            if (item == NULL)
+            {
+                ER ( selection_lose() );
+/*
+                ER ( template_lose_selection(res) );
+*/
+            }
+            else
+            {
+                if (!item->selected)
+                {
+                    template_lose_selection(res);
+                    ER ( select_item (res, item, TRUE) );
+                }
+/*
+                if (res != palette)
+                {
+                    ER ( props_select (res, item) );
+                }
+*/
+            }
+        }
+        break;
+
+    case MB_SINGLECLICK(MB_ADJUST):
+            item = which_resize_handle (res, &position, &handlenum);
+            if (!item)
+            {
+                item = which_item (res, &position, &iconnum);
+                if (item)
+                {
+                    ER ( select_item (res, item, !item->selected) );
+/*
+                    if (res != palette)
+                    {
+                        ER ( props_select (res, item) );
+                    }
+*/
+                }
+            }
+        break;
+
+    case MB_MENU:
+        if (res != palette)
+        {
+            ER ( post_tempmenu (&position, &mouse->position, res) );
+        }
+        break;
+
+    case MB_DRAG(MB_SELECT):
+        item = which_resize_handle (res, &position, &handlenum);
+        if (res != palette && item)
+        {
+            dprintf("RESIZE DRAG ACTIVATED\n");
+            ER ( start_resize(res, item, handlenum, mouse, modifiers) );
+        }
+        else
+        {
+            dprintf("NORMAL DRAG ACTIVATED\n");
+            if (modifiers != MODIFIER_CTRL)
+                item = which_item (res, &position, &iconnum);
+            else
+                item = NULL;
+            ER ( start_drag(res, item, mouse, modifiers) );
+        }
+        break;
+
+    case MB_DRAG(MB_ADJUST):
+        item = which_resize_handle (res, &position, &handlenum);
+        if (res != palette && item)
+        {
+            dprintf("CONSTRAINED MOVE DRAG ACTIVATED\n");
+            ER ( start_constrained_move(res, item, handlenum, mouse, modifiers) );
+        }
+        else
+        {
+            dprintf("NORMAL ADJUST DRAG ACTIVATED\n");
+            if (modifiers != MODIFIER_CTRL)
+                item = which_item (res, &position, &iconnum);
+            else
+                item = NULL;
+            ER ( start_drag(res, item, mouse, modifiers) );
+        }
+        break;
+    }
+    return NULL;
+}
+
+
+/*
+ * Font handle remapping
+ */
+
+static int internal_handle (int *arr, int *used, int handle)
+{
+    int i;
+    for (i = 0; i < *used; i++)
+        if (arr[i] == handle) return i;
+    arr[(*used)++] = handle;            /* should check overflow */
+    return *used - 1;
+}
+
+
+/*
+ * Write indirected text to the memory, updating 'buf'.
+ * Use 13-termination rather than 0.  Pad to 'length' chars.
+ */
+
+static char * save_indir (char **buf, char *text, int length)
+{
+    char *old = *buf;
+    char *new = old;
+
+    for (; *text >= 32; text++)
+    {
+        *new++ = *text;
+        length--;
+    }
+    *new++ = 13;
+
+#if 0
+    while (length-- > 1)
+        *new++ = 0;
+#endif
+
+    *buf = new;
+    return old;
+}
+
+
+/*
+ * Calculate length of template file needed to store the document/selection.
+ *
+ * If doc, save some/all of the templates in it according to 'selection'.
+ * If !doc && res, save the single template referenced by res.
+ */
+
+int template_file_size (DocumentPtr doc, ResourcePtr res, Bool selection)
+{
+    int i;
+    Bool again = TRUE;
+    int handles[256], used = 0;
+
+    int size = 16;              /* header */
+
+    if (doc)
+        res = doc->resources;
+
+    /* Index */
+    size += 4 * 6 * (doc ? (selection ? doc->numselected : doc->numresources) : 1);
+
+    /* Index termination */
+    size += 4;
+
+    /* Loop over all templates */
+
+    for (; again && res; res = res->next)
+    {
+        if (doc)
+        {
+            if (selection && !res->selected)
+                continue;
+        }
+        else
+        {
+            again = FALSE;
+        }
+
+        /* Window block */
+        size += 88;
+
+        /* Title data; always indirected text */
+        size += strlen((char *) res->window.titledata[0]) + 1; /* was size += res->window.titledata[2]; */
+        if (res->window.titledata[1] != -1)
+            size += strlen ((char *) res->window.titledata[1]) + 1;
+
+        /* If doc, count all icons, including deleted ones (to keep numbering correct) */
+        /* If !doc, count only selected ones */
+
+        for (i = 0; i < res->numicons; i++)
+        {
+            IconInfoRec icon = res->icons[i];
+
+            if (!doc && (!icon.owner || !icon.owner->selected))
+                continue;
+
+            /* Icon block */
+            size += 32;
+
+            if (icon.owner && !(icon.icon.flags & IF_DELETED))
+            {
+                char valid[256];
+
+                switch (icon.icon.flags & IF_IST)
+                {
+                case IF_INDIR | IF_TEXT:
+                case IF_INDIR | IF_TEXT | IF_SPRITE:
+                    /* See if this is the master icon, and add name if so */
+                    valid[0] = 0;
+                    if (icon.owner)
+                        item_name (icon.owner, res->icons, valid, doc == NULL, icon.owner->u.master == i);
+                    if (icon.icon.data[1] != -1 && strlen((char *) icon.icon.data[1]) != 0)
+                    {
+                        if (valid[0])
+                            strcat(valid, ";");
+                        strcat(valid, (char *) icon.icon.data[1]);
+                    }
+
+                    size += strlen ((char *)icon.icon.data[0]) + 1; /* was size += icon.icon.data[2]; */
+                    if (valid[0])
+                        size += strlen (valid) + 1;
+                    break;
+
+                case IF_INDIR | IF_SPRITE:
+                    size += strlen ((char *)icon.icon.data[0]) + 1; /* was size += icon.icon.data[2]; */
+                    break;
+                }
+
+                /* Deal with font handle */
+                if (icon.icon.flags & IF_FONT)
+                    (void) internal_handle (handles, &used, IF_GET_FIELD(FONT, icon.icon.flags));
+            }
+        }                       /* for all icons */
+    }                           /* for all templates */
+
+    /* Finally count the font data if needed.  Each is known to be
+     * exactly 48 bytes
+     */
+
+    size += used * 48;
+
+    return size;
+}
+
+
+
+/*
+ * Save a document, or just the selected templates, into a given file.
+ * The caller is responsible for updating the stored filename,
+ * resetting the modified flag when appropriate, etc.
+ *
+ * If doc, save some/all of the templates in it according to 'selection'.
+ * If !doc && res, save the single template referenced by res.
+ *
+ * 'offset', which may be NULL, is a point to be subtracted from all the icon bounding boxes.
+ */
+
+
+error * template_save_file (DocumentPtr doc, ResourcePtr res, char *filename, Bool selection, PointPtr offset)
+{
+    int size = template_file_size (doc, res, selection);
+    char *buf = NULL;
+    error *err = NULL;
+    FILE *f = fopen(filename, "w");
+
+    if (!f)
+        err = error_lookup ("CantWrite", filename);
+    else
+    {
+        buf = malloc(size);
+        if (!buf)
+            err = error_lookup("NoMem");
+        else
+        {
+            err = template_save_to_memory (doc, res, buf, selection, offset);
+            if (!err)
+                if (fwrite ((void *) buf, 1, size, f) < size)
+                    err = error_lookup ("CantWrite", filename);
+        }
+    }
+
+    if (f) fclose(f);
+    free(buf);
+    if (!err)
+        settype(filename, FileType_Template);
+    return err;
+}
+
+
+/*
+ * Save a document, or just the selected templates, into a block of memory
+ * which should be big enough (as calculated by template_file_size.
+ *
+ * If doc, save some/all of the templates in it according to 'selection'.
+ * If !doc && res, save the selected icons of the single template referenced by res;
+ *    in this case the 'selection' parameter is implicitly TRUE.
+ *
+ * 'offset', which may be NULL, is a point to be subtracted from all the icon bounding boxes.
+ */
+
+
+error * template_save_to_memory (DocumentPtr doc, ResourcePtr res, char *buffer, Bool selection, PointPtr offset)
+{
+    int handles[256], used = 0;
+    int numdone = 0;
+    int i;
+    Bool again = TRUE;
+    int *header = (int *) buffer;
+    char *bufp;
+
+    if (doc)
+        res = doc->resources;
+
+    /* Put down header */
+    header[0] = -1;
+    header[1] = header[2] = header[3] = 0;
+
+    /* Skip index for now; it starts at header[4] */
+
+    bufp = buffer + 16 + 24 * (doc ? (selection ? doc->numselected : doc->numresources) : 1);
+    bufp += 4;                  /* space for index terminator */
+
+    /* Loop over all templates */
+
+    for (; again && res; res = res->next)
+    {
+        char *start = bufp, *indir;
+        WindowRec temp = res->window;
+
+        if (doc)
+        {
+            if (selection && !res->selected)
+                continue;
+            temp.numicons = res->numicons;
+        }
+        else
+        {
+            again = FALSE;
+            temp.numicons = 0;
+            for (i = 0; i < res->numicons; i++)
+                if (res->icons[i].owner && res->icons[i].owner->selected)
+                    res->icons[i].mapping = temp.numicons++;
+        }
+
+        indir = start + 88 + temp.numicons * 32;
+        bufp = start + 88;
+
+        /* Write title data; always indirected text */
+
+        temp.titledata[0] = save_indir (&indir, (char *)temp.titledata[0], temp.titledata[2]) - start;
+        if (temp.titledata[1] != -1)
+        {
+            temp.titledata[1] = save_indir (&indir, (char *) temp.titledata[1], 0) - start;
+        }
+
+        /* Normalise the window work area to if we are saving a selection;
+         * this is so that dragging items from a resource window into a document
+         * window are not off the work area
+         */
+
+        if (!doc && res)
+        {
+            int w = temp.workarea.maxx - temp.workarea.minx;
+            int h = temp.workarea.maxy - temp.workarea.miny;
+            temp.workarea.minx = 0;
+            temp.workarea.maxy = 0;
+            temp.workarea.maxx = temp.workarea.minx + w;
+            temp.workarea.miny = temp.workarea.maxy - h;
+        }
+
+        /* Write the main window block */
+        memcpy ((void *) start, (void *) &temp.visarea, 88);
+
+
+        /* If doc, write all icons, including deleted ones (to keep numbering correct) */
+        /* If !doc, write only selected ones using the mapping information gleaned above */
+
+        for (i = 0; i < res->numicons; i++)
+        {
+            IconInfoRec icon = res->icons[i];
+
+            if (!doc && (!icon.owner || !icon.owner->selected))
+                continue;
+
+            if (icon.owner && !(icon.icon.flags & IF_DELETED))
+            {
+                char valid[256];
+
+                switch (icon.icon.flags & IF_IST)
+                {
+                case IF_INDIR | IF_TEXT:
+                case IF_INDIR | IF_TEXT | IF_SPRITE:
+                    /* See if this is the master icon, and add name if so */
+                    valid[0] = 0;
+                    if (icon.owner)
+                        item_name (icon.owner, res->icons, valid, doc == NULL, icon.owner->u.master == i);
+
+                    if (icon.icon.data[1] != -1 && strlen((char *) icon.icon.data[1]) != 0)
+                    {
+                        if (valid[0])
+                            strcat(valid, ";");
+                        strcat(valid, (char *) icon.icon.data[1]);
+                    }
+
+
+                    icon.icon.data[0] = save_indir (&indir, (char *) icon.icon.data[0], icon.icon.data[2]) - start;
+
+                    if (valid[0])
+                    {
+                        icon.icon.data[1] = save_indir (&indir, valid, 0) - start;
+                    }
+
+                    break;
+
+                case IF_INDIR | IF_SPRITE:
+                    icon.icon.data[0] = save_indir (&indir, (char *) icon.icon.data[0], icon.icon.data[2]) - start;
+
+                    break;
+                }
+
+                /* Deal with font handle */
+
+                if (icon.icon.flags & IF_FONT)
+                {
+                    int handle = IF_GET_FIELD(FONT, icon.icon.flags);
+                    /* Internal font handles start at 1 */
+                    handle = 1 + internal_handle (handles, &used, handle);
+                    IF_SET_FIELD(FONT, icon.icon.flags, handle);
+                }
+            }
+            else
+            {
+                /* Deleted; set to sensible flag values */
+                icon.icon.flags = DELETED_FLAGS;
+                *((char *) &icon.icon.data) = 13;
+            }
+
+
+            /* Move icon bbox by the required offset */
+            if (offset)
+            {
+                icon.icon.bbox.minx -= offset->x;
+                icon.icon.bbox.maxx -= offset->x;
+                icon.icon.bbox.miny -= offset->y;
+                icon.icon.bbox.maxy -= offset->y;
+            }
+
+            /* Now write the icon definition out */
+            memcpy ((void *) bufp, (void *) &icon.icon, 32);
+            bufp += 32;
+        }                             /* for all icons */
+
+        /* Go back and fill in the index entry for this template */
+        block
+        {
+            int *ip = header + 4 + 6 * numdone;
+            char *name = (char *) (ip + 3);
+            *ip++ = start - buffer;
+            *ip++ = indir - start;
+            *ip++ = 1;
+            if (doc)
+                strncpy(name, res->name, RESOURCENAMELEN);
+            else
+                strncpy(name, message_lookup (&msgs, "Selection"), RESOURCENAMELEN);
+            name[RESOURCENAMELEN - 1] = 0;
+            *(strchr(name, 0)) = 13;
+        }
+
+        /* Move past end of this template (including any indir data) */
+        bufp = indir;
+
+        numdone++;
+    }                                 /* for all templates */
+
+    header[4 + 6 * numdone] = 0;      /* index termination */
+
+    /*
+     * Finally put in the font data & index if needed.
+     * Must be careful because this may not be word
+     * aligned.
+     */
+
+    if (used)
+    {
+        header[0] = bufp - buffer;
+        for (i = 0; i < used; i++)
+        {
+            int xs, ys;
+            char name[256];
+            ER ( _swix(Font_ReadDefn, _INR(0,1) | _OUTR(2,3),
+                       handles[i], name,
+                       &xs, &ys) );
+            name[39] = 0;
+            *(strchr(name, 0)) = 13;
+            memcpy ((void *) bufp, (void *) &xs, 4);
+            memcpy ((void *) (bufp + 4), (void *) &ys, 4);
+            memcpy ((void *) (bufp + 8), (void *) name, 40);
+            bufp += 48;
+        }
+    }
+
+    return NULL;
+}
+
+
+
+/*
+ * Tell an item that one of it's icon numbers has changed.  Used
+ * by the renumbering code.
+ */
+
+static void icon_number_changed (ItemInfoPtr item, int oldnum, int newnum)
+{
+    int i, n;
+    if (!item) return;
+    n = numicons[item->type];
+    for (i = 0; i < n; i++)
+        if (item->u.rawicons[i] == oldnum)
+        {
+            item->u.rawicons[i] = newnum;
+            return;
+        }
+}
+
+
+/*
+ * Called in response to user attempting to renumber an icon
+ * manually.  Old assumed valid; new checked for validity.
+ * Invalidate any damaged bits of other items so that they get
+ * repainted; don't invalidate our item's screen space since
+ * the props code (apply) does this.
+ */
+
+error * template_renumber_icon (ResourcePtr res, ItemInfoPtr item, int old, int new)
+{
+    ItemInfoPtr owner = NULL;
+    IconInfoRec temp;
+    if (new == old)
+        return NULL;
+    if (new < 0 || new >= res->numicons)
+        return error_lookup ("BadIcon", new, 0, res->numicons - 1);
+
+    owner = res->icons[new].owner;     /* may be == item or NULL */
+
+    temp = res->icons[old];
+    res->icons[old] = res->icons[new];
+    res->icons[new] = temp;
+
+    if (item == owner)
+    {
+        icon_number_changed (item, new, -99);
+        icon_number_changed (item, old, new);
+        icon_number_changed (item, -99, old);
+    }
+    else
+    {
+        icon_number_changed (item, old, new);
+        if (owner)
+        {
+            RectRec bbox;
+            icon_number_changed (owner, new, old);
+            template_item_bbox (res, owner, &bbox);
+            wimp_invalidate (&res->window, &bbox);
+        }
+    }
+
+    return NULL;
+}
+
+
+/*
+ * Renumber one item, returning the new value of 'where'.  Merge the bbox of all
+ * moved icons into the 'bbox' parameter, since they may have changed in their
+ * stacking order.
+ */
+
+static void renumber_item (ResourcePtr res, ItemInfoPtr item, int *where, RectPtr bbox)
+{
+    ItemType type = item->type;
+    int n = numicons[type];
+    int i, *numbers = item->u.rawicons;
+
+    for (i = 0; i < n; i++)
+    {
+        /* Swap icon[numbers[i]] with icon[*where] */
+        int from = numbers[i];
+        int to = *where;
+
+        if (from == -1)
+            continue;
+
+        if (from != to)
+        {
+            IconInfoRec t = res->icons[from];
+            res->icons[from] = res->icons[to];
+            res->icons[to] = t;
+
+            /* Incorporate both icon bboxes into the redraw area
+             */
+
+            wimp_merge_bboxes (bbox, bbox, &res->icons[from].icon.bbox);
+            wimp_merge_bboxes (bbox, bbox, &res->icons[to].icon.bbox);
+
+            /* Tell "victim" item that it has a new icon number; the one
+             * that was at 'to' is now at 'from'.
+             */
+            icon_number_changed (res->icons[from].owner, to, from);
+
+            /* Tell this item that it has a new icon number; the one
+             * that was as 'from' is now at 'to'.
+             */
+            numbers[i] = to;
+        }
+        (*where)++;
+    }
+}
+
+
+/*
+ * Renumbering icons and items.  We do two passes, first putting
+ * the 'stay at bottom' items at the bottom, and then putting
+ * all the other ones after that.  Each item ends up with
+ * contiguous icon numbers, and the order should be similar to
+ * the partial ordering in the input array.
+ *
+ * Returns the bounding box of the area that needs to be redrawn
+ * in 'bbox'.
+ *
+ * Any deleted icons that are trapped in the icon array get moved to
+ * the end where they can be re-used.  Hence the value of
+ * res->numicons may be lower after calling this routine, but
+ * that of res->maxicons will be the same as before.
+ */
+
+
+static void template_renumber (ResourcePtr res, RectPtr bbox)
+{
+    int i;
+    int where = 0;              /* next index to swap with */
+
+    for (i = 0; i < res->numicons; i++)
+    {
+        ItemInfoPtr item = res->icons[i].owner;
+        if (item == NULL || !bottom[item->type])
+            continue;
+
+        /* Move item down to 'where' */
+        renumber_item (res, item, &where, bbox);
+        i = where;
+    }
+
+    for (i = 0; i < res->numicons; i++)
+    {
+        ItemInfoPtr item = res->icons[i].owner;
+        if (item == NULL || bottom[item->type])
+            continue;
+
+        /* Move item down to 'where' */
+        renumber_item (res, item, &where, bbox);
+        i = where;
+    }
+
+    /* Get rid of deleted ones at end */
+    while (res->numicons > 0 && res->icons[res->numicons - 1].owner == NULL)
+        res->numicons--;
+
+/*    res->numicons = where;*/
+}
+
+
+
+/*
+ * Click-to-edit
+ */
+
+typedef struct
+{
+    ResourcePtr res;                            /* resource being edited */
+    int icon;                                   /* icon number that we created for editing in */
+    int iconnum;                                /* the number of the icon we're editing */
+    char newname[TYPEINNAMELEN];
+    CaretPositionRec caret;
+    Bool resetcaret;
+} RenameClosureRec, *RenameClosurePtr;
+
+
+/*
+ * RETURN finishes a rename operation.  Many other events cause cancellation.  The
+ * losing caret stuff is surprisingly difficult to get right.
+ */
+
+static error * rename_interactor (unsigned int event, int *buf, void *closure, Bool *consumed)
+{
+    RenameClosurePtr rename = (RenameClosurePtr) closure;
+    IconInfoPtr iconp = rename->res->icons + rename->iconnum;
+    CaretPositionPtr caret = (CaretPositionPtr) buf;
+    MouseClickPtr mouse = (MouseClickPtr) buf;
+    KeyPressPtr key = (KeyPressPtr) buf;
+    PointRec p;
+
+    if (buf == NULL)            /* we are being asked to cancel */
+    {
+        int iblock[2];
+        iblock[0] = rename->res->window.handle;
+        iblock[1] = rename->icon;
+        ER ( _swix(Wimp_DeleteIcon, _IN(1),
+                   &iblock) );
+        ER ( wimp_invalidate (&rename->res->window, &iconp->icon.bbox) );
+
+        if (rename->resetcaret)
+            return _swix(Wimp_SetCaretPosition, _INR(0,5),
+                         rename->caret.windowhandle, rename->caret.iconhandle, rename->caret.position.x, rename->caret.position.y, rename->caret.height, rename->caret.index);
+    }
+
+    switch (event)
+    {
+    case EV_NULL_REASON_CODE:           case EV_REDRAW_WINDOW_REQUEST:
+    case EV_POINTER_ENTERING_WINDOW:    case EV_POINTER_LEAVING_WINDOW:
+    case EV_GAIN_CARET:                 case EV_USER_MESSAGE:
+    case EV_USER_MESSAGE_RECORDED:      case EV_USER_MESSAGE_ACKNOWLEDGE:
+        break;
+
+    case EV_LOSE_CARET:
+        if (caret->windowhandle == rename->res->window.handle &&
+            wimp_point_inside(&iconp->icon.bbox, &caret->position))
+        {
+            rename->resetcaret = FALSE;
+            interactor_cancel();
+        }
+        break;
+
+    case EV_MOUSE_CLICK:
+        p.x = mouse->position.x - (rename->res->window.visarea.minx - rename->res->window.scrolloffset.x);
+        p.y = mouse->position.y - (rename->res->window.visarea.maxy - rename->res->window.scrolloffset.y);
+        if (mouse->windowhandle == rename->res->window.handle &&
+            wimp_point_inside(&iconp->icon.bbox, &p))
+            *consumed = TRUE;
+        else
+            interactor_cancel();
+        break;
+
+    case EV_KEY_PRESSED:
+        if (key->caret.windowhandle == rename->res->window.handle &&
+            key->code == 13)
+        {
+            /* Text changed */
+            if (iconp->icon.flags & IF_INDIR)
+            {
+                int newlen = strlen(rename->newname) + 1;
+                if (newlen > iconp->icon.data[2])
+                {
+                    char *new = malloc(newlen);
+                    if (!new)
+                    {
+                        interactor_cancel();
+                        *consumed = TRUE;
+                        return error_lookup("NoMem");
+                    }
+                    free ((char *) iconp->icon.data[0]);
+                    iconp->icon.data[0] = (int) new;
+                    iconp->icon.data[2] = newlen;
+                }
+                strcpy((char *) iconp->icon.data[0], rename->newname);
+            }
+            else
+            {
+                char *s;
+                sprintf ((char *) iconp->icon.data, "%.*s", 11, rename->newname);
+                s = strchr ((char *) iconp->icon.data, 0);
+                if (s)
+                    *s = 13;
+            }
+
+            /* Call resize code in case it wants to alter layout (eg group box) */
+            if (iconp->owner)
+            {
+                RectRec bbox;
+                template_item_bbox (rename->res, iconp->owner, &bbox);
+                resize_item (rename->res, iconp->owner, &bbox);
+                template_adjust_item_bbox (AddHighlight, &bbox, &bbox);
+                wimp_invalidate (&rename->res->window, &bbox);
+            }
+
+            interactor_cancel();
+            *consumed = TRUE;
+            document_modified (rename->res->owner, TRUE);
+            if (props_current (NULL) == iconp->owner)
+                props_select (rename->res, iconp->owner);
+        }
+        break;
+
+    default:
+        interactor_cancel();
+        break;
+    }
+    return NULL;
+}
+
+
+/*
+ * Ought to deal with non-indirected text... perhaps allow
+ * non-indir, text icons, and convert to indir if the final
+ * string is too long.
+ *
+ * Need to ensure the caret colour is red.
+ *
+ * Need to resize the icon, at least when the user finished typing.
+ * Behaviour probably depends on the item type; for example,
+ * a group box will have a particular way of doing it so that the
+ * label is still in the "right" place.
+ */
+
+static error * start_rename (ResourcePtr res, ItemInfoPtr item, int iconnum, PointPtr position)
+{
+    static RenameClosureRec closure;
+    CreateIconRec create;
+    IconInfoPtr iconp = res->icons + iconnum;
+    int i;
+
+dprintf("In rename\n");
+
+    interactor_cancel();
+
+    /* Check that we're allowed to edit this one */
+    for (i = 0; i < numicons[item->type]; i++)
+        if (item->u.rawicons[i] == iconnum)
+            break;
+
+dprintf("Item %x, icon %d = sub %d\n" _ (int) item _ iconnum _ i);
+
+dprintf("Type %d; editable is 0x%x and bit is 0x%x\n" _ item->type _ editable[item->type] _ BIT(i));
+    if (!(editable[item->type] & BIT(i)))
+        return NULL;                            /* quietly refuse */
+
+    switch (iconp->icon.flags & (IF_INDIR | IF_TEXT))
+    {
+    case IF_INDIR | IF_TEXT:
+        sprintf(closure.newname, "%.*s", TYPEINNAMELEN - 1, (char *) iconp->icon.data[0]);
+        break;
+    case IF_TEXT:
+        sprintf(closure.newname, "%.*s", 11, (char *) &iconp->icon.data);
+        template_control_to_null (closure.newname);
+        break;
+    default:
+        return NULL;
+    }
+
+dprintf("Text initially *%s*\n" _ closure.newname);
+
+    create.windowhandle = res->window.handle;
+    create.icon = iconp->icon;
+    /* Force flags values to something appropriate for text entry */
+    IF_SET_FIELD (TYPE, create.icon.flags, 15);
+    create.icon.flags |= IF_INDIR;
+    create.icon.data[0] = (int) closure.newname;
+    create.icon.data[1] = -1;
+    create.icon.data[2] = iconp->icon.flags & IF_INDIR ? TYPEINNAMELEN - 1 : 12;
+
+dprintf("Creating icon\n");
+
+    ER ( _swix(Wimp_CreateIcon, _IN(1) | _OUT(0),
+               &create,
+               &closure.icon) );
+    closure.res = res;
+    closure.iconnum = iconnum;
+    closure.resetcaret = TRUE;
+
+dprintf("Created icon\n");
+
+    ER ( wimp_invalidate (&res->window, &iconp->icon.bbox) );
+
+    interactor_install (rename_interactor, (void *) &closure);
+
+    ER ( _swix(Wimp_GetCaretPosition, _IN(1),
+               &closure.caret) );
+    ER ( _swix(Wimp_SetCaretPosition, _INR(0,5),
+               res->window.handle, closure.icon, position->x, position->y, -1, -1) );
+
+    return  NULL;
+}
+
+
+/*
+ * Snap an item to the grid.  The point to be snapped is
+ * determined by a call to grid_snap_offset, then all the
+ * icons in the item are moved by the amount the the bounding box moved.
+ */
+
+static void snap_item (ResourcePtr res, ItemInfoPtr item, RectPtr bboxp)
+{
+    RectRec bbox, newbbox;
+    PointRec snap, newsnap, delta;
+    int x, y;
+
+    if (res->grid.lock == FALSE)
+        return;
+
+    template_item_bbox (res, item, &bbox);
+    grid_snap_offset (res, item, &bbox, &x, &y);
+
+    snap.x = bbox.minx + x;
+    snap.y = bbox.miny + y;
+    grid_snap_point (res, &snap, &newsnap);
+    delta.x = newsnap.x - snap.x;
+    delta.y = newsnap.y - snap.y;
+    if (delta.x == 0 && delta.y == 0)
+        return;
+
+    grid_move_item (res, item, delta.x, delta.y);
+
+    template_item_bbox (res, item, &newbbox);
+    template_adjust_item_bbox (AddHighlight, &bbox, &bbox);
+    template_adjust_item_bbox (AddHighlight, &newbbox, &newbbox);
+
+    (void) wimp_merge_bboxes (bboxp, bboxp, &bbox);
+    (void) wimp_merge_bboxes (bboxp, bboxp, &newbbox);
+}
+
+
+/*
+ * Make the selection "pending snap"
+ */
+
+static void make_selection_pendingsnap (ResourcePtr res)
+{
+    int i;
+    res->numpendingsnap = 0;
+    for (i = 0; i < res->numicons; i++)
+    {
+        IconInfoPtr icon = res->icons + i;
+        ItemInfoPtr item = icon->owner;
+        if (item && item->u.master == i)
+        {
+            item->pendingsnap = item->selected;
+            if (item->pendingsnap)
+                res->numpendingsnap++;
+        }
+    }
+}
+
+
+/*
+ * Snap the pending-snap items to the grid.  The exact behaviour depends on
+ * the number of pending items.  If there is only one, its snap
+ * point is used.  Otherwise, the bottom-leftmost item is chosen,
+ * and the alignment point of that is used - all the other items
+ * are moved by the same amount.
+ *
+ * damage gets updated to include the damaged area.
+ */
+
+static void snap_pending (ResourcePtr res, RectPtr damage)
+{
+    int i;
+
+    if (res->numpendingsnap == 1)
+    {
+        for (i = 0; i < res->numicons; i++)
+        {
+            IconInfoPtr icon = res->icons + i;
+            ItemInfoPtr item = icon->owner;
+            if (item && item->u.master == i && item->pendingsnap)
+            {
+                if (res->grid.lock)
+                    snap_item (res, item, damage);
+                item->pendingsnap = FALSE;
+                break;
+            }
+        }
+    }
+    else if (res->numpendingsnap != 0)
+    {
+        RectRec bbox1, bbox2;
+        PointRec botleft;
+        ItemInfoPtr blitem = NULL;
+
+        botleft.x = 10000000;
+        botleft.y = 10000000;
+
+        for (i = 0; i < res->numicons; i++)
+        {
+            IconInfoPtr icon = res->icons + i;
+            if (icon->owner && icon->owner->pendingsnap &&
+                icon->owner->u.master == i && VALID_TYPE(icon->owner->type))
+            {
+                RectRec temp;
+                template_item_bbox (res, icon->owner, &temp);
+                if (temp.miny < botleft.y ||
+                    temp.miny == botleft.y && temp.minx < botleft.x)
+                {
+                    botleft.x = temp.minx;
+                    botleft.y = temp.miny;
+                    blitem = icon->owner;
+                }
+            }
+        }
+
+        template_item_bbox (res, blitem, &bbox1);
+        snap_item (res, blitem, damage);
+        blitem->pendingsnap = FALSE;
+        template_item_bbox (res, blitem, &bbox2);
+
+        for (i = 0; i < res->numicons; i++)
+        {
+            IconInfoPtr icon = res->icons + i;
+            ItemInfoPtr item = icon->owner;
+            if (item && item != blitem && item->u.master == i &&
+                VALID_TYPE(icon->owner->type) && item->pendingsnap)
+            {
+                if (res->grid.lock)
+                {
+                    RectRec bbox;
+                    template_item_bbox (res, item, &bbox);
+                    template_adjust_item_bbox (AddHighlight, &bbox, &bbox);
+                    wimp_merge_bboxes (damage, damage, &bbox);
+                    grid_move_item (res, item, bbox2.minx - bbox1.minx, bbox2.miny - bbox1.miny);
+                    template_item_bbox (res, item, &bbox);
+                    template_adjust_item_bbox (AddHighlight, &bbox, &bbox);
+                    wimp_merge_bboxes (damage, damage, &bbox);
+                }
+                item->pendingsnap = FALSE;
+            }
+        }
+    }
+
+    res->numpendingsnap = 0;
+}
+
+
+
+/*
+ * Determine bbox in OS units needed to accomodate the text in an icon.
+ * Only call if you are sure the icon is indir text.
+ */
+
+void template_icon_size (IconPtr icon, int *w, int *h)
+{
+    char *s = (char *) icon->data[0];
+    int handle = 0;
+
+    if (icon->flags & IF_FONT)
+        handle = IF_GET_FIELD(FONT, icon->flags);
+    else if (_swix(Wimp_ReadSysInfo, _IN(0) | _OUT(0),
+                   8,
+                   &handle))
+        handle = 0;
+
+    if (handle)
+    {
+        int x0, y0, x1, y1;
+        _swix(Font_StringBBox, _IN(1) | _OUTR(1,4),
+              s,
+              &x0, &y0, &x1, &y1);
+        *w = (x1 - x0) / 400;
+        *h = (y1 - y0) / 400;
+    }
+    else
+    {
+        *w = strlen(s) * 16;
+        *h = 32;
+    }
+
+    /* Round up to pixels; scalex and scaley are powers of two */
+    *w = (*w + (scalex - 1)) & ~(scalex - 1);
+    *h = (*h + (scaley - 1)) & ~(scaley - 1);
+}
+
+
+/*
+ * Keyboard shortcuts.
+ */
+
+error * template_key_pressed (ResourcePtr res, KeyPressPtr key, Bool *consumed)
+{
+    if (res == palette)
+        return NULL;
+
+    *consumed = TRUE;
+
+    if (res->testing)
+    {
+        if (key->code == key_test)
+            return normal_mode (res);
+        else
+        {
+            *consumed = FALSE;
+            return NULL;
+        }
+    }
+
+    if (key->code == key_winprops)
+        return winflags_select (res), winflags_show_window ();
+    else if (key->code == key_cols)
+        return colours_select (res), colours_show_window ();
+    else if (key->code == key_extent)
+        return extent_select (res), extent_show_window ();
+    else if (key->code == key_grid)
+        return grid_select (res), grid_show_window ();
+    else if (key->code == key_close)
+        return template_close_window (res);
+    else if (key->code == key_delete)
+        return template_delete_selection (res);
+    else if (key->code == key_sort)
+        return sort_selected_icons (res);
+    else if (key->code == key_selectall)
+        return select_bounded_items (res, &res->window.workarea, FALSE, FALSE);
+    else if (key->code == key_clearsel)
+        return template_lose_selection (res);
+    else if (key->code == key_props)
+    {
+        ER ( props_select (res, selected_item (res)) );
+        return props_show_window ();
+    }
+    else if (key->code == key_test)
+        return test_mode (res);
+
+    *consumed = FALSE;
+
+    /* Pass unknown ones to document handler so that ^F3 works */
+    return document_key_pressed (res->owner, key, consumed);
+}
+
+
+
+/*
+ * Enter "test mode".  Create icons and stuff
+ */
+
+static error * test_mode (ResourcePtr res)
+{
+    CreateIconRec create;
+    int i;
+
+    if (res->testing)
+        return NULL;
+
+    create.windowhandle = res->window.handle;
+
+    for (i = 0; i < res->numicons; i++)
+    {
+        if (res->icons[i].owner == NULL)
+            create.icon = resizeproto; /* any known-valid one */
+        else
+            create.icon = res->icons[i].icon;
+        ER ( _swix(Wimp_CreateIcon, _IN(1),
+                   &create) );
+    }
+
+    for (i = 0; i < res->numicons; i++)
+    {
+        if (res->icons[i].owner == NULL)
+        {
+            int iblock[2];
+            iblock[0] = res->window.handle;
+            iblock[1] = i;
+            ER ( _swix(Wimp_DeleteIcon, _IN(1),
+                       &iblock) );
+        }
+    }
+
+    res->testing = TRUE;
+    return wimp_invalidate (&res->window, &res->window.workarea);
+}
+
+
+static error * normal_mode (ResourcePtr res)
+{
+    int i, iblock[2];
+    IconStateRec state;
+    ResourcePtr propsres;
+    ItemInfoPtr propsitem;
+
+    if (res->testing)
+        res->testing = FALSE;
+    else
+        return NULL;
+
+    state.windowhandle = res->window.handle;
+
+    for (i = 0; i < res->numicons; i++)
+    {
+        if (res->icons[i].owner != NULL)
+        {
+            state.iconhandle = i;
+            ER ( _swix(Wimp_GetIconState, _IN(1),
+                       &state) );
+            res->icons[i].icon = state.icon;
+            iblock[0] = res->window.handle;
+            iblock[1] = i;
+            ER ( _swix(Wimp_DeleteIcon, _IN(1),
+                       &iblock) );
+        }
+    }
+
+    if ((propsitem = props_current (&propsres)) != NULL && propsres == res)
+    {
+        props_select (propsres, propsitem);
+    }
+
+    /* Prevent caret loss */
+    ER ( _swix(Wimp_SetCaretPosition, _INR(0,5),
+               res->window.handle, -1, 0, 0, BIT(25), 0) );
+    document_modified (res->owner, TRUE);
+    return wimp_invalidate (&res->window, &res->window.workarea);
+}
+
+
+/*
+ * Handling the font re-finding that has to happen on mode change.  This happens
+ * to all templates loaded, not just ones that are open on the screen.  Also
+ * happens for the palette.
+ */
+
+error * template_refind_fonts ()
+{
+    RegistryType type;
+    DocumentPtr doc;
+    char name[256];
+    int xs, ys, handle;
+    int i = 0;
+
+    while ((i = registry_enumerate_windows (i, &type, NULL, (void *)&doc)) != 0)
+    {
+        if (type == Document)
+        {
+            ResourcePtr res = doc->resources;
+            for (; res; res = res->next)
+            {
+                int j;
+                SetIconStateRec set;
+                set.windowhandle = res->window.handle;
+                for (j = 0; j < res->numicons; j++)
+                {
+                    IconInfoPtr icon = &res->icons[j];
+                    if (icon->owner && (icon->icon.flags & IF_FONT))
+                    {
+                        ER ( _swix(Font_ReadDefn, _INR(0,1) | _OUTR(2,3),
+                                   IF_GET_FIELD(FONT, icon->icon.flags), name,
+                                   &xs, &ys) );
+                        ER ( _swix(Font_LoseFont, _IN(0),
+                                   IF_GET_FIELD(FONT, icon->icon.flags)) );
+                        ER ( _swix(Font_FindFont, _INR(1,5) | _OUT(0),
+                                   name, xs, ys, 0, 0,
+                                   &handle) );
+                        IF_SET_FIELD(FONT, icon->icon.flags, handle);
+                        if (res->window.handle > 0 && res->testing)
+                        {
+                            set.iconhandle = j;
+                            set.clear = IF_FIELD(FONT, 0xFF);
+                            set.eor = IF_FIELD(FONT, handle);
+                            ER ( _swix(Wimp_SetIconState, _IN(1),
+                                       &set) );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return NULL;
+}

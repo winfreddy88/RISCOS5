@@ -1,0 +1,233 @@
+/*
+ * Copyright (c) 2012, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include "swis.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stddef.h>
+
+#include "Global/RISCOS.h"
+#include "Global/Services.h"
+#include "Global/HALEntries.h"
+
+#include "DebugLib/DebugLib.h"
+
+#include "globals.h"
+#include "VCHIQHdr.h"
+#include "errors.h"
+
+#include "vc04_services/interface/vchiq_arm/vchiq_core.h"
+
+void *our_private_word;
+
+MessagesFD messages;
+
+vchiq_device_t *vchiq_dev = NULL;
+
+static VCHIQ_STATE_T vchiq_state;
+
+#define TOTAL_SLOTS (VCHIQ_SLOT_ZERO_SLOTS + 2*32)
+
+#ifdef STANDALONE
+extern void* Resources(void);
+#endif
+
+_kernel_oserror* module_init (const char *cmd_tail, int podule_base, void *pw)
+{
+	(void) cmd_tail;
+	(void) podule_base;
+	(void) pw;
+	_kernel_oserror* e = NULL;
+	void *slot_mem;
+	uint32_t slot_mem_phys;
+	int slot_mem_size;
+	VCHIQ_SLOT_ZERO_T *vchiq_slot_zero;
+	int pos=0;
+    
+	/* set up debugging */
+	debug_initialise(Module_Title, "", "");
+	debug_set_device(DADEBUG_OUTPUT);
+	debug_set_unbuffered_files(TRUE);
+    
+	our_private_word = pw;
+
+	/* Set up messages */
+#ifdef STANDALONE
+	e = _swix(ResourceFS_RegisterFiles,_IN(0),Resources());
+	if(e)
+		goto error;
+#endif
+
+	e = _swix(MessageTrans_OpenFile,_INR(0,2),&messages,"Resources:$.Resources.VCHIQ.Messages",0);
+	if(e)
+		goto error1;
+    
+	/* Hunt for the HAL device */
+	do {
+		e = _swix(OS_Hardware, _INR(0,1) | _IN(8) | _OUTR(1,2), HALDeviceType_Comms + HALDeviceComms_InterProc,pos,4,&pos,&vchiq_dev);
+		if(e)
+			goto error2;
+		if(pos == -1)
+		{
+			e = geterror(Error_NoDev);
+			goto error2;
+		}
+	} while(vchiq_dev->dev.id != HALDeviceID_InterProc_VCHIQ);
+
+	dprintf(("","Activate HAL device @ %08x\n",vchiq_dev));
+    
+	/* Call the Activate entry to make sure everything's OK */
+	if(!(vchiq_dev->dev.Activate)(&vchiq_dev->dev))
+	{
+		e = geterror(Error_BadDev);
+		goto error2;
+	}
+
+	dprintf(("","Initialise VCHIQ\n"));
+
+	/* Initialise VCHIQ driver */
+	slot_mem_size = TOTAL_SLOTS*VCHIQ_SLOT_SIZE;
+	e = _swix(PCI_RAMAlloc,_INR(0,2)|_OUTR(0,1),slot_mem_size,VCHIQ_SLOT_SIZE,0,&slot_mem,&slot_mem_phys);
+	if(e)
+		goto error3;
+
+	dprintf(("","slot_mem_size = %08x\nslot_mem = %08x\nslot_mem_phys = %08x\n",slot_mem_size,slot_mem,slot_mem_phys));
+
+	vchiq_slot_zero = vchiq_init_slots(slot_mem,slot_mem_size);
+	if(!vchiq_slot_zero)
+	{
+		e = geterror(Error_InitSlots);
+		goto error4;
+	}
+
+	dprintf(("","Init state\n"));
+
+	if(vchiq_init_state(&vchiq_state, vchiq_slot_zero, 0) != VCHIQ_SUCCESS)
+	{
+		e = geterror(Error_InitState);
+		goto error4;
+	}
+
+	dprintf(("","Claim IRQ\n"));
+
+	/* Claim IRQ */
+	e = _swix(OS_ClaimDeviceVector, _INR(0,4), vchiq_dev->dev.devicenumber, doorbell_irq_entry, pw, 0, 0);
+	if(e)
+		goto error4;
+
+	/* Enable IRQ */
+	_swix(OS_Hardware, _IN(0) | _INR(8,9), vchiq_dev->dev.devicenumber&~(1u<<31), 0, EntryNo_HAL_IRQEnable);
+
+	dprintf(("","Init VC\n"));
+
+	/* Initialise the VideoCore side of things */
+	(vchiq_dev->init_vc)(vchiq_dev,slot_mem_phys);
+
+	dprintf(("","module initialised\n"));
+    
+	return NULL;
+
+error4:
+	_swix(PCI_RAMFree,_IN(0),slot_mem);
+error3:
+	/* Deactivate */
+	(vchiq_dev->dev.Deactivate)(&vchiq_dev->dev);
+	vchiq_dev = 0;
+error2:
+	_swix(MessageTrans_CloseFile, _IN(0), &messages);
+error1:
+#ifdef STANDALONE
+	_swix(ResourceFS_DeregisterFiles,_IN(0),Resources());
+error:
+#endif
+	dprintf(("","Failed initialisation: %s\n", e->errmess));
+	return e;
+}
+
+_kernel_oserror *module_final(int fatal, int podule, void *pw)
+{
+	(void) fatal;
+	(void) podule;
+	(void) pw;
+#if 0
+	/* The linux sources don't appear to provide any termination code for the driver! For now just don't allow us to be killed */
+	return geterror(Error_NoKill);
+#else
+	/* Close messages */
+	_swix(MessageTrans_CloseFile,_IN(0),&messages);
+
+#ifdef STANDALONE
+	_swix(ResourceFS_DeregisterFiles,_IN(0),Resources());
+#endif
+
+	return NULL;
+#endif
+}
+
+/* IRQ handling */
+
+void remote_event_signal(REMOTE_EVENT_T *event)
+{
+	wmb();
+	event->fired = 1;
+	dsb(sy);
+	if(event->armed)
+	{
+		dprintf(("","remote_event_signal\n"));
+		(vchiq_dev->vc_doorbell)(vchiq_dev);
+	}
+}
+
+int doorbell_irq_handler(_kernel_swi_regs *r, void *pw)
+{
+	(void) r;
+	(void) pw;
+	/* Read (and clear) the doorbell */
+	uint32_t status = (vchiq_dev->arm_doorbell)(vchiq_dev);
+
+	dprintf(("","doorbell %08x\n",status));
+
+	/* Clear in interrupt controller */
+	_swix(OS_Hardware, _IN(0) | _INR(8,9), vchiq_dev->dev.devicenumber&~(1u<<31), 0, EntryNo_HAL_IRQClear);
+
+	if(status & 0x4)
+	{
+		remote_event_pollall(&vchiq_state);
+	}
+
+	return 1;
+}
+
+/* kern_lib helper */
+
+extern VCHIQ_STATE_T *vchiq_get_state(void);
+
+VCHIQ_STATE_T *vchiq_get_state(void)
+{
+	return &vchiq_state;
+}

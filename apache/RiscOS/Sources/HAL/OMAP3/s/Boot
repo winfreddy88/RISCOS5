@@ -1,0 +1,1274 @@
+; Copyright 2009 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:Machine.<Machine>
+        GET     Hdr:HALSize.<HALSize>
+
+        GET     Hdr:MEMM.VMSAv6
+
+        GET     Hdr:Proc
+        GET     Hdr:OSEntries
+        GET     Hdr:HALEntries
+
+        GET     hdr.omap3530
+        GET     hdr.StaticWS
+        GET     hdr.SDRC
+        GET     hdr.Interrupts
+        GET     hdr.Timers
+        GET     hdr.GPIO
+        GET     hdr.UART
+        GET     hdr.PRCM
+        GET     hdr.GPMC
+
+; This version assumes a RISC OS image starting OSROM_HALSize bytes after us.
+
+; FIQ-based debugger - prints out the PC when the beagleboard/touchbook USER button is pressed
+; The code installs itself when HAL_InitDevices is called with R0=123. e.g. SYS "OS_Hardware",123,,,,,,,,0,100
+                GBLL FIQDebug
+FIQDebug        SETL {FALSE}
+
+                GBLL MoreDebug
+MoreDebug       SETL Debug :LAND: {FALSE}                
+
+        AREA    |Asm$$Code|, CODE, READONLY, PIC
+
+        EXPORT  rom_checkedout_ok
+
+        IMPORT  HAL_Base
+        IMPORT  SDMA_Had_POR
+        IMPORT  RTC_Init
+        IMPORT  TPSRead
+        IMPORT  TPSWrite
+        IMPORT  IIC_DoOp_Poll
+        IMPORT  CPUClk_PreInit
+        IMPORT  CPUClk_Init
+        IMPORT  CPUClk_PreReset
+        IMPORT  PBias1Write
+
+; v8 is used as pointer to RISC OS entry table throughout pre-MMU stage.
+        MACRO
+        CallOSM $entry, $reg
+        LDR     ip, [v8, #$entry*4]
+        MOV     lr, pc
+        ADD     pc, v8, ip
+        MEND
+
+rom_checkedout_ok
+        ; On entry, v8 -> OS entry table, sb -> board config
+        ; Register the attached RAM
+        LDR     v1, =SDRC_Regs
+        MOV     a1, #0
+        MOV     sp, #0
+        ; Check CS0
+        LDR     a3, [v1, #SDRC_MCFG_0]
+        LDR     a2, =&3FF00<<13
+        ANDS    a3, a2, a3, LSL #13 ; Get CS0 RAM size
+        BEQ     no_cs0
+        LDR     a2, =CS0_SDRAM
+        ADD     a3, a3, a2
+        LDR     a4, =&FFFFFFFF
+        ADD     sp, a2, #4096 ; HAL spec says that (for software reset compliance only?) stack should be 4K into first block
+        STR     a1, [sp, #-4]!
+        MOV     a1, #0
+        CallOSM OS_AddRAM
+no_cs0
+        ; Check CS1
+        LDR     a3, [v1, #SDRC_MCFG_1]
+        LDR     a2, =&3FF00<<13
+        ANDS    a3, a2, a3, LSL #13
+        BEQ     no_cs1
+        LDR     a2, =CS0_SDRAM
+        LDR     a4, [v1, #SDRC_CS_CFG]
+        AND     v2, a4, #7 ; Offset in 128MB units
+        ADD     a2, a2, v2, LSL #20+7
+        AND     v2, a4, #&300 ; Offset in 32MB units
+        ADD     a2, a2, v2, LSL #20+5-8
+        ADD     a3, a3, a2
+        LDR     a4, =&FFFFFFFF
+        CMP     sp, #0
+        ADDEQ   sp, a2, #4096 ; If no CS0 set up stack in CS1
+        STR     a1, [sp, #-4]!
+        MOV     a1, #0
+        CallOSM OS_AddRAM
+no_cs1
+        DebugChar v1,v2,71
+        MOV     v1, a1
+        BL      SDMA_Had_POR
+        CMP     a1, #0
+        MOVNE   a1, #OSStartFlag_RAMCleared :OR: OSStartFlag_POR
+        MOVEQ   a1, #OSStartFlag_RAMCleared
+        ADRL    a2, HAL_Base + OSROM_HALSize       ; a2 -> RISC OS image
+        ADR     a3, HALdescriptor
+        MOV     a4, v1
+        CallOSM OS_Start
+
+
+HALdescriptor   DATA
+        DCD     HALFlag_NCNBWorkspace
+        DCD     HAL_Base - HALdescriptor
+        DCD     OSROM_HALSize
+        DCD     HAL_EntryTable - HALdescriptor
+        DCD     HAL_Entries
+        DCD     HAL_WsSize
+
+
+        MACRO
+        HALEntry $name
+        ASSERT  (. - HAL_EntryTable) / 4 = EntryNo_$name
+        DCD     $name - HAL_EntryTable
+        MEND
+
+        MACRO
+        NullEntry
+        DCD     HAL_Null - HAL_EntryTable
+        MEND
+
+        IMPORT   Video_Init
+        IMPORT   Interrupt_Init
+        IMPORT   Timer_Init
+        IMPORT   PRCM_SetClocks
+        IMPORT   USB_Init
+        IMPORT   I2C_Init
+        IMPORT   SDMA_Init
+        IMPORT   VideoDevice_Init
+        IMPORT   Audio_Init
+        IMPORT   PandoraAudio_Init
+        IMPORT   GPMC_Init
+        IMPORT   NIC_Init
+        IMPORT   NIC_GPMC_Config_IGEP
+        IMPORT   NIC_GPMC_Config_DevKit
+        IMPORT   NIC_SMSC
+        IMPORT   NIC_DM9000
+        IMPORT   GPIO_Init
+        IMPORT   GPIOx_SetAsOutput
+        IMPORT   GPIO_InitDevices
+        IMPORT   SDIO_InitDevices
+        IMPORT   NVMemory_Init
+        IMPORT   NVMemory_InitDevice
+        IMPORT   TPS_Init
+        IMPORT   PandoraKB_Init
+        IMPORT   Enable_main_battery_charging
+        IMPORT   BMU_InitDevice
+        IMPORT   BMUParams_TPS65950_TouchBook
+        IMPORT   BMUParams_BQ27200_TouchBook
+        IMPORT   BMUParams_BQ27500_Pandora
+        IMPORT   Video_SetPandoraGamma
+        IMPORT   BoardConfigNames
+
+        EXPORT   Board_Init_BeagleBoard
+        EXPORT   Board_Init_DevKit8000
+        EXPORT   Board_Init_IGEPv2
+        EXPORT   Board_Init_Pandora
+        EXPORT   Board_Init_TouchBook
+        EXPORT   Board_Init_OMAP35xEVM
+ 
+        EXPORT   Board_InitDevices_BeagleBoard
+        EXPORT   Board_InitDevices_DevKit8000
+        EXPORT   Board_InitDevices_IGEPv2
+        EXPORT   Board_InitDevices_Pandora
+        EXPORT   Board_InitDevices_TouchBook
+        EXPORT   Board_InitDevices_OMAP35xEVM
+
+        EXPORT   Board_PowerOff_BeagleBoard
+        EXPORT   Board_PowerOff_DevKit8000
+        EXPORT   Board_PowerOff_IGEPv2
+        EXPORT   Board_PowerOff_Pandora
+        EXPORT   Board_PowerOff_TouchBook
+        EXPORT   Board_PowerOff_OMAP35xEVM
+
+        IMPORT   HAL_IRQEnable
+        IMPORT   HAL_IRQDisable
+        IMPORT   HAL_IRQClear
+        IMPORT   HAL_IRQSource
+        IMPORT   HAL_IRQStatus
+        IMPORT   HAL_FIQEnable
+        IMPORT   HAL_FIQDisable
+        IMPORT   HAL_FIQDisableAll
+        IMPORT   HAL_FIQClear
+        IMPORT   HAL_FIQSource
+        IMPORT   HAL_FIQStatus
+        IMPORT   HAL_IRQMax
+
+        IMPORT   HAL_Timers
+        IMPORT   HAL_TimerDevice
+        IMPORT   HAL_TimerGranularity
+        IMPORT   HAL_TimerMaxPeriod
+        IMPORT   HAL_TimerSetPeriod
+        IMPORT   HAL_TimerPeriod
+        IMPORT   HAL_TimerReadCountdown
+        IMPORT   HAL_TimerIRQClear
+
+        IMPORT   HAL_CounterRate
+        IMPORT   HAL_CounterPeriod
+        IMPORT   HAL_CounterRead
+        IMPORT   HAL_CounterDelay
+
+        IMPORT   HAL_IICBuses
+        IMPORT   HAL_IICType
+        IMPORT   HAL_IICDevice
+        IMPORT   HAL_IICTransfer
+        IMPORT   HAL_IICMonitorTransfer
+
+        IMPORT   HAL_NVMemoryType
+        IMPORT   HAL_NVMemorySize
+        IMPORT   HAL_NVMemoryPageSize
+        IMPORT   HAL_NVMemoryProtectedSize
+        IMPORT   HAL_NVMemoryProtection
+        IMPORT   HAL_NVMemoryRead
+        IMPORT   HAL_NVMemoryWrite
+
+        IMPORT   HAL_VideoIICOp ; Implemented in s.I2C
+
+        IMPORT   HAL_UARTPorts
+        IMPORT   HAL_UARTStartUp
+        IMPORT   HAL_UARTShutdown
+        IMPORT   HAL_UARTFeatures
+        IMPORT   HAL_UARTReceiveByte
+        IMPORT   HAL_UARTTransmitByte
+        IMPORT   HAL_UARTLineStatus
+        IMPORT   HAL_UARTInterruptEnable
+        IMPORT   HAL_UARTRate
+        IMPORT   HAL_UARTFormat
+        IMPORT   HAL_UARTFIFOSize
+        IMPORT   HAL_UARTFIFOClear
+        IMPORT   HAL_UARTFIFOEnable
+        IMPORT   HAL_UARTFIFOThreshold
+        IMPORT   HAL_UARTInterruptID
+        IMPORT   HAL_UARTBreak
+        IMPORT   HAL_UARTModemControl
+        IMPORT   HAL_UARTModemStatus
+        IMPORT   HAL_UARTDevice
+        IMPORT   HAL_UARTDefault
+
+        IMPORT   HAL_DebugRX
+        IMPORT   HAL_DebugTX
+
+        IMPORT   HAL_KbdScanDependencies
+
+        IMPORT   HAL_USBControllerInfo
+
+HAL_EntryTable  DATA
+        HALEntry HAL_Init
+
+        HALEntry HAL_IRQEnable
+        HALEntry HAL_IRQDisable
+        HALEntry HAL_IRQClear
+        HALEntry HAL_IRQSource
+        HALEntry HAL_IRQStatus
+        HALEntry HAL_FIQEnable
+        HALEntry HAL_FIQDisable
+        HALEntry HAL_FIQDisableAll
+        HALEntry HAL_FIQClear
+        HALEntry HAL_FIQSource
+        HALEntry HAL_FIQStatus
+
+        HALEntry HAL_Timers
+        HALEntry HAL_TimerDevice
+        HALEntry HAL_TimerGranularity
+        HALEntry HAL_TimerMaxPeriod
+        HALEntry HAL_TimerSetPeriod
+        HALEntry HAL_TimerPeriod
+        HALEntry HAL_TimerReadCountdown
+
+        HALEntry HAL_CounterRate
+        HALEntry HAL_CounterPeriod
+        HALEntry HAL_CounterRead
+        HALEntry HAL_CounterDelay
+
+        HALEntry HAL_NVMemoryType
+        HALEntry HAL_NVMemorySize
+        HALEntry HAL_NVMemoryPageSize
+        HALEntry HAL_NVMemoryProtectedSize
+        HALEntry HAL_NVMemoryProtection
+        NullEntry ; HAL_NVMemoryIICAddress
+        HALEntry HAL_NVMemoryRead 
+        HALEntry HAL_NVMemoryWrite
+
+        HALEntry HAL_IICBuses
+        HALEntry HAL_IICType
+        NullEntry ; HAL_IICSetLines   
+        NullEntry ; HAL_IICReadLines  
+        HALEntry HAL_IICDevice
+        HALEntry HAL_IICTransfer
+        HALEntry HAL_IICMonitorTransfer
+
+        NullEntry ; HALEntry HAL_VideoFlybackDevice
+        NullEntry ; HALEntry HAL_VideoSetMode
+        NullEntry ; HALEntry HAL_VideoWritePaletteEntry
+        NullEntry ; HALEntry HAL_VideoWritePaletteEntries
+        NullEntry ; HALEntry HAL_VideoReadPaletteEntry
+        NullEntry ; HALEntry HAL_VideoSetInterlace
+        NullEntry ; HALEntry HAL_VideoSetBlank
+        NullEntry ; HALEntry HAL_VideoSetPowerSave
+        NullEntry ; HALEntry HAL_VideoUpdatePointer
+        NullEntry ; HALEntry HAL_VideoSetDAG
+        NullEntry ; HALEntry HAL_VideoVetMode
+        NullEntry ; HALEntry HAL_VideoPixelFormats
+        NullEntry ; HALEntry HAL_VideoFeatures
+        NullEntry ; HALEntry HAL_VideoBufferAlignment
+        NullEntry ; HALEntry HAL_VideoOutputFormat
+
+        NullEntry ; HALEntry HAL_MatrixColumns
+        NullEntry ; HALEntry HAL_MatrixScan
+
+        NullEntry ; HALEntry HAL_TouchscreenType
+        NullEntry ; HALEntry HAL_TouchscreenRead
+        NullEntry ; HALEntry HAL_TouchscreenMode
+        NullEntry ; HALEntry HAL_TouchscreenMeasure
+
+        HALEntry HAL_MachineID
+
+        HALEntry HAL_ControllerAddress
+        HALEntry HAL_HardwareInfo
+        HALEntry HAL_SuperIOInfo
+        HALEntry HAL_PlatformInfo
+        NullEntry ; HALEntry HAL_CleanerSpace
+
+        HALEntry HAL_UARTPorts
+        HALEntry HAL_UARTStartUp
+        HALEntry HAL_UARTShutdown
+        HALEntry HAL_UARTFeatures
+        HALEntry HAL_UARTReceiveByte
+        HALEntry HAL_UARTTransmitByte
+        HALEntry HAL_UARTLineStatus
+        HALEntry HAL_UARTInterruptEnable
+        HALEntry HAL_UARTRate
+        HALEntry HAL_UARTFormat
+        HALEntry HAL_UARTFIFOSize
+        HALEntry HAL_UARTFIFOClear
+        HALEntry HAL_UARTFIFOEnable
+        HALEntry HAL_UARTFIFOThreshold
+        HALEntry HAL_UARTInterruptID
+        HALEntry HAL_UARTBreak
+        HALEntry HAL_UARTModemControl
+        HALEntry HAL_UARTModemStatus
+        HALEntry HAL_UARTDevice
+        HALEntry HAL_UARTDefault
+
+        HALEntry HAL_DebugRX
+        HALEntry HAL_DebugTX
+
+        NullEntry ; HAL_PCIFeatures
+        NullEntry ; HAL_PCIReadConfigByte
+        NullEntry ; HAL_PCIReadConfigHalfword
+        NullEntry ; HAL_PCIReadConfigWord
+        NullEntry ; HAL_PCIWriteConfigByte
+        NullEntry ; HAL_PCIWriteConfigHalfword
+        NullEntry ; HAL_PCIWriteConfigWord
+        NullEntry ; HAL_PCISpecialCycle
+        NullEntry ; HAL_PCISlotTable
+        NullEntry ; HAL_PCIAddresses
+
+        HALEntry HAL_PlatformName
+        NullEntry
+        NullEntry
+
+        HALEntry HAL_InitDevices
+
+        HALEntry HAL_KbdScanDependencies
+        NullEntry
+        NullEntry
+        NullEntry
+
+        HALEntry HAL_PhysInfo
+
+        HALEntry HAL_Reset
+
+        HALEntry HAL_IRQMax
+
+        HALEntry HAL_USBControllerInfo
+        NullEntry ; HAL_USBPortPower
+        NullEntry ; HAL_USBPortIRQStatus
+        NullEntry ; HAL_USBPortIRQClear
+        NullEntry ; HAL_USBPortDevice
+
+        HALEntry HAL_TimerIRQClear
+        NullEntry ; HAL_TimerIRQStatus
+
+        HALEntry HAL_ExtMachineID
+
+        NullEntry ; HAL_VideoFramestoreAddress
+        NullEntry ; HAL_VideoRender
+        NullEntry ; HAL_VideoStartupMode
+        NullEntry ; HAL_VideoPixelFormatList
+        HALEntry HAL_VideoIICOp
+
+HAL_Entries     * (.-HAL_EntryTable)/4
+
+
+;--------------------------------------------------------------------------------------
+
+
+HAL_Init
+        Entry   "v1-v3"
+
+        STR     a2, NCNBWorkspace
+        STR     a2, NCNBAllocNext
+        
+        BL      SetUpOSEntries
+
+        ; Cortex-A8 implementation defined L2 cache enable.
+        ; At this point (after a reset) C=1 L2EN=0 so we only need to
+        ; set L2EN according to section 8.3 of the r2p1 TRM, leaving
+        ; the L2 Cache Auxiliary Control Register at its default value
+        MRC     p15, 0, a1, c1, c0, 1
+        ORR     a1, a1, #2      ; ACTLR.L2EN
+        MCR     p15, 0, a1, c1, c0, 1        
+
+        ; Map in the main IO ranges (L3, L4) and then store the offsets to the components we're interested in
+        MOV     a1, #0
+        LDR     a2, =L3_Control
+        MOV     a3, #L3_Size
+        CallOS  OS_MapInIO
+        STR     a1, L3_Log
+        
+        MOV     a1, #0
+        LDR     a2, =L4_Core
+        MOV     a3, #L4_Core_Size
+        CallOS  OS_MapInIO
+        STR     a1, L4_Core_Log
+
+        ; Clockman
+        ADD     a3, a1, #L4_ClockMan-L4_Core
+        STR     a3, L4_ClockMan_Log
+
+        ; Display
+        ADD     a3, a1, #L4_Display-L4_Core
+        STR     a3, L4_Display_Log
+
+        ; USB
+        ADD     a3, a1, #L4_USBTLL-L4_Core
+        STR     a3, L4_USBTLL_Log
+        ADD     a3, a1, #L4_USB_Host-L4_Core
+        STR     a3, L4_USB_Host_Log
+        ADD     a3, a1, #L4_USB_OTG-L4_Core
+        STR     a3, L4_USB_OTG_Log
+
+        ; DMA
+        ADD     a3, a1, #L4_sDMA-L4_Core
+        STR     a3, L4_sDMA_Log
+
+        MOV     a1, #0
+        LDR     a2, =L4_Wakeup
+        MOV     a3, #L4_Wakeup_Size
+        CallOS  OS_MapInIO
+        STR     a1, L4_Wakeup_Log
+        
+        ; L4_PowerMan, L4_32KTIMER, L4_GPIO1
+        ADD     a3, a1, #L4_PowerMan-L4_Wakeup
+        STR     a3, L4_PowerMan_Log
+        ADD     a3, a1, #L4_32KTIMER-L4_Wakeup
+        STR     a3, L4_32KTIMER_Log
+        ADD     a3, a1, #L4_GPIO1-L4_Wakeup
+        STR     a3, L4_GPIO1_Log
+
+        MOV     a1, #0
+        LDR     a2, =L4_Per
+        MOV     a3, #L4_Per_Size
+        CallOS  OS_MapInIO
+        STR     a1, L4_Per_Log
+
+        ; Timers
+        ADD     a2, a1, #TIMER_BASE-L4_Per
+        STR     a2, Timers_Log
+
+        ; GPIO2-6
+        ADD     a2, a1, #L4_GPIO2-L4_Per
+        STR     a2, L4_GPIO2_Log
+        ADD     a2, a1, #L4_GPIO3-L4_Per
+        STR     a2, L4_GPIO3_Log
+        ADD     a2, a1, #L4_GPIO4-L4_Per
+        STR     a2, L4_GPIO4_Log
+        ADD     a2, a1, #L4_GPIO5-L4_Per
+        STR     a2, L4_GPIO5_Log
+        ADD     a2, a1, #L4_GPIO6-L4_Per
+        STR     a2, L4_GPIO6_Log
+
+        ; Interrupt controller
+        MOV     a1, #0
+        LDR     a2, =MPU_INTC
+        MOV     a3, #MPU_INTC_SIZE
+        CallOS  OS_MapInIO
+        STR     a1, MPU_INTC_Log
+
+        ; GPMC
+        MOV     a1, #0
+        LDR     a2, =GPMC_Regs
+        MOV     a3, #4096 ; only a small register file
+        CallOS  OS_MapInIO
+        STR     a1, GPMC_Regs_Log
+
+        ; Recover board config from SRAM
+        MOV     a1, #0
+        LDR     a2, =IntSRAM_Base
+        MOV     a3, #IntSRAM_Size
+        CallOS  OS_MapInIO
+        STR     a1, IntSRAM_Log
+        MOV     a2, #BoardConfig_Size
+10      SUBS    a2, a2, #4
+        LDR     a3, [a1, a2]
+        STR     a3, [sb, a2]
+        BGT     %BT10
+        ; Now do phys -> log conversion on all the addresses contained within
+        ; RISC OS doesn't currently provide a phys->log conversion function, so we do it manually based around the regions that were mapped in above
+        ASSERT  BoardConfig_DebugUART = 0
+        ASSERT  BoardConfig_DebugUART+4 = BoardConfig_HALUART
+        MOV     a1, #BoardConfig_HALUART+?BoardConfig_HALUART-4
+10      BL      phys2log
+        SUBS    a1, a1, #4
+        BGE     %BT10
+        MOV     a1, #BoardConfig_HALI2C
+        BL      phys2log
+        STR     a2, I2C1Block+I2C_HW
+        MOV     a1, #BoardConfig_HALI2C+4
+        BL      phys2log
+        STR     a2, I2C2Block+I2C_HW
+        MOV     a1, #BoardConfig_HALI2C+8
+        BL      phys2log
+        STR     a2, I2C3Block+I2C_HW
+
+ [ Debug
+        DebugTX "HAL_Init"
+        DebugTime a1, "@ "
+ ]
+
+        BL      PRCM_SetClocks ; Calls Timer_init & starts GPTIMER2
+
+        BL      I2C_Init ; Uses GPTIMER2
+
+        BL      TPS_Init ; Program reset script(s), must be before CPUClk_PreInit
+
+        BL      GPIO_Init ; Make sure all GPIO IRQs are disabled before we potentially start enabling them
+
+        ; Board-specific initialisation
+        MOV     lr, pc
+        LDR     pc, [sb, #BoardConfig_Init]
+        ; DevKit & IGEP don't need any special initialisation
+Board_Init_DevKit8000
+Board_Init_IGEPv2
+
+        BL      CPUClk_PreInit ; Go fast!
+
+ [ MoreDebug
+        DebugTX "Video_Init"
+ ] 
+        BL      Video_Init ; Uses GPTIMER2
+
+ [ MoreDebug
+        DebugTX "USB_Init"
+ ] 
+        BL      USB_Init ; Uses GPTIMER2
+
+ [ MoreDebug
+        DebugTX "NVMemory_Init"
+ ] 
+        BL      NVMemory_Init
+
+ [ MoreDebug
+        DebugTX "Timer_Init"
+ ]
+        BL      Timer_Init ; Re-inits timers
+
+ [ MoreDebug
+        DebugTX "Interrupt_Init"
+ ]
+        BL      Interrupt_Init
+
+ [ MoreDebug
+        DebugTX "GPMC_Init"
+ ]
+        BL      GPMC_Init
+
+        LDRB    v1, [sb, #BoardConfig_NumUART]
+10      SUBS    v1, v1, #1
+ [ Debug
+        BLT     %FT20
+        ; Don't reset the debug UART
+        LDR     a3, [sb, #BoardConfig_DebugUART]
+        ADD     a2, sb, v1, LSL #2
+        LDR     a2, [a2, #BoardConfig_HALUART]
+        CMP     a3, a2
+        BEQ     %BT10
+        MOV     a1, v1
+        ADR     lr, %BT10
+        B       HAL_UARTStartUp
+ |
+        MOVGE   a1, v1
+        ADRGE   lr, %BT10
+        BGE     HAL_UARTStartUp
+ ]
+20
+        ; Mark HAL as initialised
+        STR     pc, HALInitialised ; Any nonzero value will do
+
+        DebugTime a1, "HAL initialised @ "
+
+        EXIT
+
+Board_Init_BeagleBoard ROUT
+        Entry
+        ; Read/report beagleboard revision GPIOs (GPIOs 171-173)
+        ; First we need to set up the right pin mux settings, as old
+        ; x-loader/u-boot versions might not do them all for us
+        LDR     a1, L4_Core_Log
+        ADD     a1, a1, #&2100
+        ADD     a1, a1, #&00C8 ; CONTROL_PADCONF_MCBSPI1_CLK
+        LDR     a2, =&011C011C ; GPIO171 & 172 input with pull-up enabled
+        STR     a2, [a1], #4 ; configure, and point to CONTROL_PADCONF_MCBSPI1_SOMI
+        LDR     a2, [a1]
+        MOV     a2, a2, LSR #16
+        MOV     a2, a2, LSL #16
+        ORR     a2, a2, #&11C ; GPIO173 as above
+        STR     a2, [a1]
+        ; Now configure the GPIO controller
+        LDR     v1, L4_GPIO_Table+4*(171>>5)
+        MOV     v2, #7 :SHL: (171 :AND: 31)
+        GPIO_SetAsInput v1, v2, a1
+        ; Wait a bit for input to settle?
+        MOV     a1, #512
+        BL      HAL_CounterDelay
+        GPIO_GetInput v1, v1, v2
+        MOV     v1, v1, LSR #(171 :AND: 31)
+ [ Debug
+        DebugReg v1, "BB revision GPIOs="
+ ]
+        ; Classic beagle needs TPS LED A turning off for EHCI
+        ; Beagle xM A/B needs TPS GPIO 1 off and TPS LED A on for DVI & EHCI
+        ; Beagle xM C+ needs TPS GPIO 1 off and TPS LED A off for DVI & EHCI
+        ; check OMAP type to work out if it's an -xM
+        LDR     a2, L4_Wakeup_Log
+        ADD     a2, a2, #(L4_CONTROL_IDCODE-L4_Wakeup) :AND: &FF00
+        LDR     a2, [a2, #(L4_CONTROL_IDCODE-L4_Wakeup) :AND: &00FF]
+        LDR     a1, =HAWKEYE_AMDM37x
+        MOV     a2, a2, LSL #4
+        CMP     a1, a2, LSR #16
+        MOV     a2, #0
+        BNE     %FT10 ; Classic beagle
+        ; XM
+        MOV     a1, #GPIO_PIN_MAX+1
+        BL      GPIOx_SetAsOutput
+        ; XM rev A3 also uses TPS GPIO2, and can use it for turning DVI on/off (unlike the TPS GPIO1 that had to be off all the time?)
+        ; Previously this was allegedly used for providing power to the camera interface, and defaulted to on in Linux
+        MOV     a1, #GPIO_PIN_MAX+2
+        STRB    a1, [sb, #BoardConfig_VideoGPIO]
+        MOV     a2, #1
+        BL      GPIOx_SetAsOutput
+        ; Check whether this is a rev A/B xM. If it isn't we'll assume it's
+        ; rev C+, like the new x-loader/u-boot/linux versions do
+        CMP     v1, #BeagleBoard_xMA
+        CMPNE   v1, #BeagleBoard_xMB
+        MOVEQ   a2, #1 ; xM A/B
+        MOVNE   a2, #0 ; xM C+
+        ; .. fall through to non-XM bit
+10
+        MOV     a1, #GPIO_PIN_MAX+TPS_GPIO_PIN_MAX
+        BL      GPIOx_SetAsOutput
+        EXIT
+        
+Board_Init_OMAP35xEVM ROUT
+        Entry
+        ; EVM needs GPIO 22 on & GPIO 61 off for EHCI
+        ; It looks like u-boot sets things up assuming an ETK module is in use.
+        ; But we want to use USB, so we need to tweak a few pin mux settings.
+        LDR     a1, L4_Core_Log
+        ADD     a1, a1, #&2000
+        LDR     a2, [a1, #&5E8] ; GPIO 20, GPIO 21
+        MOV     a2, a2, LSL #16
+        MOV     a2, a2, LSR #16
+        ORR     a2, a2, #&011C0000 ; GPIO 21 input/bidirectional with pull-up enabled
+        STR     a2, [a1, #&5E8]
+        LDR     a2, [a1, #&5EC]
+        MOV     a2, a2, LSR #16
+        MOV     a2, a2, LSL #16
+        ORR     a2, a2, #&011C ; Ditto for GPIO 22
+        STR     a2, [a1, #&5EC]
+        LDR     a2, [a1, #&0C8]
+        MOV     a2, a2, LSR #16
+        MOV     a2, a2, LSL #16
+        ORR     a2, a2, #&011C ; Ditto for GPIO 61
+        STR     a2, [a1, #&0C8]
+        ; Now set the GPIOs
+        MOV     a1, #22
+        MOV     a2, #1
+        BL      GPIOx_SetAsOutput ; Enables VBUS
+        MOV     a1, #61
+        MOV     a2, #0
+        BL      GPIOx_SetAsOutput ; Enables the port
+        ; We also need to make sure VAUX2 is enabled in order to supply power
+        ; to the phy
+        SUB     sp, sp, #4
+        MOV     a2, sp
+        MOV     a3, #1
+        ADRL    v1, IIC_DoOp_Poll
+        ; Configure for 2.8V
+        MOV     a1, #&4b*2
+        MOV     ip, #9
+        MOV     a4, #&79 ; VAUX2_DEDICATED
+        STRB    ip, [a2]
+        BL      TPSWrite
+        ; Ensure enabled, by associating it with all processor groups
+        MOV     a1, #&4b*2
+        MOV     ip, #&e0
+        MOV     a4, #&76 ; VAUX2_DEV_GRP
+        STRB    ip, [a2]
+        BL      TPSWrite
+        ADD     sp, sp, #4
+        EXIT
+
+Board_Init_TouchBook ROUT
+        Entry
+        ; TouchBook battery charging
+        LDR     a1, =&3ff ; Max charging current (1704mA)
+        BL      Enable_main_battery_charging
+        ; Touchbook needs TPS LED A turning off for EHCI
+        MOV     a1, #GPIO_PIN_MAX+TPS_GPIO_PIN_MAX
+        MOV     a2, #0
+        BL      GPIOx_SetAsOutput
+        EXIT
+
+Board_Init_Pandora ROUT
+        Entry
+        ; Increase battery charging current
+        LDR     a1, =&35c ; 1158mA
+        BL      Enable_main_battery_charging
+        ; Disable PBIAS1 while we update the power supplies
+        MOV     a1, #0
+        BL      PBias1Write
+        ; Enable some extra power supplies
+        MOV     a3, #1
+        ADRL    v1, IIC_DoOp_Poll
+        ADR     a2, pandora_init_data
+10
+        LDRB    a4, [a2], #1
+        CMP     a4, #0
+        BEQ     %FT50
+        MOV     a1, #&4b*2
+        BL      TPSWrite
+        ADD     a2, a2, #1
+        B       %BT10
+50
+        ; Wait for VSIM to stabilise
+        MOV     a1, #35000 ; as per s.SDIO BUS_POWER_RAMP
+        BL      HAL_CounterDelay
+        ; Re-enable PBIAS1
+        ; Despite 2.8V being closer to 3.0V than 1.8V, the hardware seems to think it's 1.8V, so program it for that
+        MOV     a1, #1 :SHL: 9 ; Just PWRDNZ1 that needs setting
+        BL      PBias1Write
+        EXIT
+
+pandora_init_data
+        ; VAUX4 set to 2.85V (touchscreen, nubs)
+        DCB     &81 ; VAUX4_DEDICATED
+        DCB     &0a ; 2.85V
+        DCB     &7E ; VAUX4_DEV_GRP
+        DCB     &20 ; associate with P1
+        ; VSIM set to 2.8V (audio DAC)
+        DCB     &95 ; VSIM_DEDICATED
+        DCB     &04 ; 2.8V
+        DCB     &92 ; VSIM_DEV_GRP
+        DCB     &20 ; associate with P1
+        ; VAUX2 set to 1.8V (EHCI PHY power)
+        DCB     &79 ; VAUX2_DEDICATED
+        DCB     &05 ; 1.8V
+        DCB     &76 ; VAUX2_DEV_GRP
+        DCB     &20 ; associate with P1
+        ; End
+        DCB       0
+        ALIGN
+
+; Dodgy phys->log conversion using the mapped in IO ranges
+; In/out: a1 = offset into sb of address to get/put
+; Out: a2 = log addr
+; Corrupts a3
+phys2log
+        LDR     a3, [sb, a1]
+        CMP     a3, #0 ; Null pointers are valid; ignore them
+        MOVEQ   a2, #0
+        MOVEQ   pc, lr
+        SUB     a2, a3, #L3_Control
+        CMP     a2, #L3_Size
+        LDRLO   a3, L3_Log
+        BLO     %FT10
+        SUB     a2, a3, #L4_Per
+        CMP     a2, #L4_Per_Size
+        LDRLO   a3, L4_Per_Log
+        BLO     %FT10
+        SUB     a2, a3, #L4_Core
+        CMP     a2, #L4_Core_Size
+        LDRLO   a3, L4_Core_Log
+        SUBHI   a2, a2, #L4_Wakeup-L4_Core
+        LDRHI   a3, L4_Wakeup_Log
+10
+        ADD     a2, a2, a3
+        STR     a2, [sb, a1]
+        MOV     pc, lr
+
+; Initialise and relocate the entry table.
+SetUpOSEntries  ROUT
+        STR     a1, OSheader
+        LDR     a2, [a1, #OSHdr_NumEntries]
+        CMP     a2, #HighestOSEntry+1
+        MOVHI   a2, #HighestOSEntry+1
+
+        ADR     a3, OSentries
+        LDR     a4, [a1, #OSHdr_Entries]
+        ADD     a4, a4, a1
+
+05      SUBS    a2, a2, #1
+        LDR     ip, [a4, a2, LSL #2]
+        ADD     ip, ip, a4
+        STR     ip, [a3, a2, LSL #2]
+        BNE     %BT05
+        ; Fall through
+
+HAL_Null
+        MOV     pc, lr
+
+HAL_InitDevices
+ [ DebugTiming
+        CMP     a1, #124
+        BNE     %FT10
+        Push    "lr"
+        DebugTime a1, "@ "
+        Pull    "pc"
+10
+ ]
+ [ FIQDebug
+        CMP     a1, #123
+        BNE     %FT10
+        LDR     a1, =&E51FF004
+        ADR     a2, FIQRoutine
+        MOV     a4, #&1C
+        STMIA   a4,{a1-a2,sb}
+        ; Sync cache
+        MOV     a1, #0
+        MCR     p15, 0, a1, c7, c11, 1 ; Clean DCache by VA to PoU
+        DSB     SY ; wait for clean to complete
+        MCR     p15, 0, a1, c7, c5, 1 ; invalidate ICache entry (to PoC)
+        MCR     p15, 0, a1, c7, c5, 6 ; invalidate entire BTC
+        DSB     SY ; wait for cache invalidation to complete
+        ISB     SY ; wait for BTC invalidation to complete?
+        ; Now reconfigure the USER button (GPIO 4/7) to fire an FIQ
+        LDR     a2, L4_Wakeup_Log
+        ADD     a2, a2, #(L4_CONTROL_IDCODE-L4_Wakeup) :AND: &FF00
+        LDR     a2, [a2, #(L4_CONTROL_IDCODE-L4_Wakeup) :AND: &00FF]
+        LDR     a1, =HAWKEYE_AMDM37x
+        MOV     a2, a2, LSL #4
+        CMP     a1, a2, LSR #16
+        MOVEQ   a3, #1:SHL:4 ; It's an AM/DM37x, so assume BBxM
+        MOVNE   a3, #1:SHL:7 ; Else assume user button on GPIO 7        
+        LDR     a1, L4_GPIO1_Log
+        LDR     a2, [a1, #GPIO_OE]
+        ORR     a2, a2, a3 ; Configure as input
+        STR     a2, [a1, #GPIO_OE]
+        MOV     a2, #0
+        STR     a2, [a1, #GPIO_LEVELDETECT0]
+        STR     a2, [a1, #GPIO_LEVELDETECT1]
+        STR     a2, [a1, #GPIO_FALLINGDETECT]
+        STR     a3, [a1, #GPIO_RISINGDETECT] ; Enable IRQ on rising edge
+        STR     a3, [a1, #GPIO_IRQENABLE1] ; Set MPU as interrupt target
+        MOV     a1, #29 ; GPIO1 IRQ
+        B       HAL_FIQEnable ; tail-optimised, repeating the HAL device init would be a bad thing!
+10
+ ]
+        Entry   "v1-v3"
+        DebugTime a1, "HAL_InitDevices @ "
+        ; Common HAL devices
+        BL      CPUClk_Init
+        BL      NVMemory_InitDevice
+        BL      RTC_Init
+        BL      SDMA_Init
+        BL      VideoDevice_Init
+        ; Board-specific HAL devices
+        LDR     pc, [sb, #BoardConfig_InitDevices]
+        ; EVM doesn't have any extra devices
+Board_InitDevices_OMAP35xEVM
+        BL      Audio_Init
+        EXIT
+
+Board_InitDevices_TouchBook
+        BL      Audio_Init
+        ; BMU devices
+        ADRL    a1, BMUWS1
+        ADRL    a2, BMUParams_TPS65950_TouchBook
+        BL      BMU_InitDevice
+        ADRL    a1, BMUWS2
+        ADRL    a2, BMUParams_BQ27200_TouchBook
+        BL      BMU_InitDevice
+        MOV     a1, #BoardType_OMAP3_TouchBook
+        MOV     a2, #BoardRevision_TouchBook_Unknown ; no boards variants for TouchBook (yet?)
+        BL      SDIO_InitDevices
+        EXIT
+
+Board_InitDevices_Pandora
+        BL      PandoraAudio_Init
+        MOV     a1, #BoardType_OMAP3_Pandora
+        MOV     a2, #BoardRevision_Pandora_Unknown ; no boards variants for Pandora (yet?)
+        BL      SDIO_InitDevices
+        ; Register the keyboard device
+        BL      PandoraKB_Init
+        ; BMU device
+        ADRL    a1, BMUWS1
+        ADRL    a2, BMUParams_BQ27500_Pandora
+        BL      BMU_InitDevice
+        ; LCD gamma (done here for simplicity)
+        BL      Video_SetPandoraGamma
+        EXIT
+
+Board_InitDevices_IGEPv2
+        BL      Audio_Init
+        ; SMSC NIC on GPMC CS 5, GPIO IRQ 176
+        MOV     a1, #5
+        ADRL    a2, NIC_GPMC_Config_IGEP
+        MOV     a3, #176
+        ADRL    a4, NIC_SMSC
+        MOV     v1, #256 ; 256 bytes is all we need... although OS_MapInIO will only map in a minimum of 1MB!
+        BL      NIC_Init
+        ; Determine board revision for GPIO device
+        ; First set up pin mux settings
+        LDR     a1, L4_Core_Log
+        ADD     a1, a1, #&2500
+        ADD     a1, a1, #&00F8 ; CONTROL_PADCONF_ETK_D14
+        LDR     a2, [a1]
+        MOV     a2, a2, LSR #16
+        MOV     a2, a2, LSL #16
+        ORR     a2, a2, #&0104 ; GPIO28: Input, pull-down (disabled), M4
+        STR     a2, [a1]
+        ; Now probe GPIO
+        GPIO_PrepareC v1,v2,28
+        GPIO_SetAsInput v1,v2,v3
+        ; Wait a bit for input to settle?
+        MOV     a1, #512
+        BL      HAL_CounterDelay
+        GPIO_GetInput v3,v1,v2
+        CMP     v3, #0
+        MOVNE   a2, #BoardRevision_IGEPv2_BC
+        MOVEQ   a2, #BoardRevision_IGEPv2_C
+        MOV     a1, #BoardType_OMAP3_IGEPv2
+        ; Now init the device
+        Push    "a1-a2"
+        BL      GPIO_InitDevices
+        ; SD needs the same parameters to configure the devices correctly
+        Pull    "a1-a2"
+        BL      SDIO_InitDevices
+        EXIT
+
+Board_InitDevices_DevKit8000
+        BL      Audio_Init
+        ; DM9000 on GPMC 6, GPIO IRQ 25
+        MOV     a1, #6
+        ADRL    a2, NIC_GPMC_Config_DevKit
+        MOV     a3, #25
+        ADRL    a4, NIC_DM9000
+        MOV     v1, #2048 ; The DM9000 doesn't have a proper address bus. Instead, the DevKit connects GPMC address pin 10 to the DM9000's CMD pin, which is used to select between the INDEX and DATA registers. So we'll map in 2K of memory (which happens to be the max the GPMC supports in non-muxed address/data mode)
+        BL      NIC_Init
+        ; Init GPIO HAL device
+        MOV     a1, #BoardType_OMAP3_DevKit8000
+        MOV     a2, #BoardRevision_DevKit8000_Unknown
+        Push    "a1-a2"
+        BL      GPIO_InitDevices
+        ; SD needs the same parameters to configure the device correctly
+        Pull    "a1-a2"
+        BL      SDIO_InitDevices
+        EXIT
+
+Board_InitDevices_BeagleBoard
+        BL      Audio_Init
+        ; Determine board revision for GPIO device
+        ; HAL_Init will have set everything up already, so we can just read the pins
+        LDR     v1, L4_GPIO_Table+4*(171>>5)
+        MOV     v2, #7 :SHL: (171 :AND: 31)
+        GPIO_GetInput v1, v1, v2
+        MOV     v1, v1, LSR #(171 :AND: 31)
+        ADR     a3, BBGPIORevTable
+10
+        LDMIA   a3!,{a1-a2}
+        CMP     a1, #-1
+        EXIT    EQ
+        CMP     a1, v1
+        BNE     %BT10
+        MOV     a1, #BoardType_OMAP3_BeagleBoard
+        Push    "a1-a2"
+        BL      GPIO_InitDevices
+        ; SD needs the same parameters to configure the device correctly
+        Pull    "a1-a2"
+        BL      SDIO_InitDevices
+        DebugTime a1, "Done @ "
+        EXIT
+
+BBGPIORevTable
+        DCD     BeagleBoard_AB, BoardRevision_BeagleBoard_AB
+        DCD     BeagleBoard_C123, BoardRevision_BeagleBoard_C123
+        DCD     BeagleBoard_C4, BoardRevision_BeagleBoard_C4
+        DCD     BeagleBoard_xMA, BoardRevision_BeagleBoard_xMA
+        DCD     BeagleBoard_xMB, BoardRevision_BeagleBoard_xMB
+        DCD     BeagleBoard_xMC, BoardRevision_BeagleBoard_xMC
+        DCD     -1        
+
+HAL_ControllerAddress
+        MOV     a1, #0
+        MOV     pc, lr
+
+HAL_HardwareInfo
+        LDR     ip, =&FFFFFF00
+        STR     ip, [a1]
+        MOV     ip, #0
+        STR     ip, [a2]
+        STR     ip, [a3]
+        MOV     pc, lr
+
+HAL_PlatformInfo
+        ; Is soft-off supported?
+        LDR     ip, [sb, #BoardConfig_PowerOff]
+        ADR     a1, Board_PowerOff_None
+        CMP     a1, ip
+        MOVEQ   ip, #2_10000                    ; no podules,no PCI cards,no multi CPU,no soft off,and soft ROM
+        MOVNE   ip, #2_11000
+        STR     ip, [a2]
+        MOV     ip, #2_11111                    ; mask of valid bits
+        STR     ip, [a3]
+        MOV     pc, lr
+
+HAL_SuperIOInfo
+        MOV     ip, #0
+        STR     ip, [a1]
+        STR     ip, [a2]
+        MOV     pc, lr
+
+HAL_MachineID
+        MOV     a1, #0
+        MOV     a2, #0
+        MOV     pc, lr
+
+HAL_ExtMachineID
+        MOVS    ip, a1
+        MOV     a1, #16
+        MOVEQ   pc, lr
+        LDR     a2, L4_Wakeup_Log
+        ADD     a2, a2, #(L4_DIE_ID-L4_Wakeup) :AND: &FF00
+        ADD     a2, a2, #(L4_DIE_ID-L4_Wakeup) :AND: &00FF
+        LDMIA   a2!, {a3-a4}
+        STMIA   ip!, {a3-a4}
+        LDMIA   a2, {a3-a4}
+        STMIA   ip, {a3-a4}
+        MOV     pc, lr
+
+; Shifts to determine number of bytes/words to allocate in table.
+NibbleShift     *       12 ; 1<<12 = 4K ARM page size
+ByteShift       *       NibbleShift + 1
+WordShift       *       ByteShift + 2
+
+; Bit patterns for different types of memory.
+NotPresent      *       &00000000
+DRAM_Pattern    *       &11111111
+VRAM_Pattern    *       &22222222
+ROM_Pattern     *       &33333333
+IO_Pattern      *       &44444444
+NotAvailable    *       &88888888
+
+        IMPORT  memset
+
+HAL_PhysInfo
+        TEQ     a1, #PhysInfo_GetTableSize
+        MOVEQ   a1, #1:SHL:(32-ByteShift)
+        STREQ   a1, [a2]
+        MVNEQ   a1, #0             ; Supported
+        MOVEQ   pc, lr
+
+        TEQ     a1, #PhysInfo_HardROM
+        MOVEQ   a1, #0             ; No hard ROM, since the NAND flash isn't supported yet
+        MOVEQ   a2, #0
+        STMEQIA a3, {a1-a2}
+        MVNEQ   a1, #0             ; Supported
+        MOVEQ   pc, lr
+
+        TEQ     a1, #PhysInfo_WriteTable
+        MOVNE   a1, #0
+        MOVNE   pc, lr
+
+        ; Do the PhysInfo_WriteTable table output 
+        Push    "v1-v2,lr"
+        MOV     a1, #&80000000     ; Up to 1GB physical RAM from &80000000
+        LDR     lr, =&C0000000-1
+        STMIA   a3, {a1,lr}
+        MOV     v1, a2
+
+        ADR     v2, HAL_PhysTable
+10      LDMIA   v2, {a1, a2, lr}
+        SUB     a3, lr, a1
+        ADD     a1, v1, a1, LSR #ByteShift
+        MOV     a3, a3, LSR #ByteShift
+        BL      memset
+        LDR     a1, [v2, #8]!
+        TEQ     a1, #0
+        BNE     %BT10
+
+        MVN     a1, #0             ; Supported
+        Pull    "v1,v2,pc"
+
+; HAL_PhysInfo uses memset to fill the table, so all regions
+; must be byte-aligned (ie double-page-aligned addresses).
+HAL_PhysTable
+        DCD     &00000000, NotPresent  :OR: NotAvailable ; GPMC
+        DCD     &40000000, IO_Pattern  :OR: NotAvailable ; All I/O registers
+        DCD     &80000000, NotPresent  :OR: NotAvailable ; SDRC-SMS/SDRAM
+        DCD     &C0000000, NotPresent  :OR: NotAvailable ; Nothing
+        DCD     0
+
+HAL_Reset       ROUT
+        Push    "a1"
+        ; Place EHCI PHY in reset
+        ; This may help unreliable USB on the Pandora following a reset?
+        LDRB    a1, [sb, #BoardConfig_USBGPIO]
+        MOV     a2, #0
+        CMP     a1, #255
+        BLNE    GPIOx_SetAsOutput
+        ; Reset clock speed to default
+        BL      CPUClk_PreReset
+        Pull    "a1"
+        ; Reset or power off?
+        CMP     a1, #0
+        LDREQ   pc, [sb, #BoardConfig_PowerOff]
+Board_PowerOff_None ; Marker used by HAL_PlatformInfo, must be with other unimplemented entries
+Board_PowerOff_BeagleBoard
+Board_PowerOff_DevKit8000
+Board_PowerOff_IGEPv2
+Board_PowerOff_OMAP35xEVM       
+        ; Reset, or power off not supported
+        ; For a reset, we just poke PRM_RSTCTRL.RST_DPLL3
+        LDR     a3, L4_PowerMan_Log
+        ADD     a3, a3, #Global_Reg_PRM
+        MOV     a2, #4
+        STR     a2, [a3, #PRM_RSTCTRL]
+        DebugTX "HAL_Reset failed!"
+        B       . ; Just in case
+
+Board_PowerOff_TouchBook
+        ; TouchBook can power off by setting GPIO168 to 0
+        MOV     a1, #168
+        MOV     a2, #0
+        BL      GPIOx_SetAsOutput
+        ; It seems like there's a short delay before the system shuts down; if we try doing a soft reset during that time then we'll hang with the power still on
+        ; So just loop here, with a warning message for if something's gone wrong
+        DebugTX "TouchBook power off failed!"
+        B       .
+
+Board_PowerOff_Pandora
+        ; Pandora can power off by setting the SW_EVENTS_DEVOFF bit of the TWL P1_SW_EVENTS register
+        MOV     a1, #&4b*2
+        SUB     sp, sp, #4
+        MOV     a2, sp
+        MOV     a3, #1
+        MOV     a4, #&46 ; P1_SW_EVENTS
+        LDR     v1, OSentries+4*OS_IICOpV
+        BL      TPSRead
+        CMP     a1, #0
+        BNE     Board_PowerOff_None ; Just give up and reset if things go wrong
+        LDRB    a1, [a2]
+        ORR     a1, a1, #1
+        STRB    a1, [a2]
+        MOV     a1, #&4b*2
+        BL      TPSWrite
+        CMP     a1, #0
+        BNE     Board_PowerOff_None
+        B       .
+
+HAL_PlatformName
+        LDR     a2, L4_Wakeup_Log
+        ADD     a2, a2, #(L4_CONTROL_IDCODE-L4_Wakeup) :AND: &FF00
+        LDR     a2, [a2, #(L4_CONTROL_IDCODE-L4_Wakeup) :AND: &00FF]
+        LDR     a1, =HAWKEYE_AMDM37x
+        MOV     a2, a2, LSL #4
+        CMP     a1, a2, LSR #16
+        LDRNEB  a2, [sb, #BoardConfig_NameOMAP3]
+        LDREQB  a2, [sb, #BoardConfig_NameDM37x]
+        ADRL    a1, BoardConfigNames
+        ADD     a1, a1, a2
+        MOV     pc, lr
+
+        LTORG
+
+        EXPORT  vtophys
+vtophys
+        CallOS  OS_LogToPhys, tailcall
+
+        EXPORT  mapinio
+mapinio
+        CallOS  OS_MapInIO, tailcall
+
+ [ FIQDebug
+FIQRoutine
+        ; Dump PC value to the serial port
+        MOV     r8, #&24
+        LDR     sb, [r8]
+        LDR     r8, [sb, #BoardConfig_DebugUART]
+        ADR     r9, hextab
+        MOV     r10, #8
+        MOV     r11, lr ; Preserve return address
+10
+        LDRB    r12, [r8, #UART_LSR]
+        TST     r12, #THRE
+        BEQ     %BT10
+        LDRB    r12, [r9, r11, LSR #28]
+        STRB    r12, [r8, #UART_THR]
+        MOV     r11, r11, LSL #4
+        SUBS    r10, r10, #1
+        BNE     %BT10
+10
+        LDRB    r12, [r8, #UART_LSR]
+        TST     r12, #THRE
+        BEQ     %BT10
+        MOV     r12, #13
+        STRB    r12, [r8, #UART_THR]  
+10
+        LDRB    r12, [r8, #UART_LSR]
+        TST     r12, #THRE
+        BEQ     %BT10
+        MOV     r12, #10
+        STRB    r12, [r8, #UART_THR]
+        ; Clear interrupt
+        MOV     r8, #&24
+        LDR     sb, [r8]
+        LDR     r8, L4_GPIO1_Log
+        LDR     r10, [r8, #GPIO_IRQSTATUS1]
+        STR     r10, [r8, #GPIO_IRQSTATUS1]
+        LDR     r8, MPU_INTC_Log
+        MOV     r10, #2
+        STR     r10, [r8, #INTCPS_CONTROL]
+        ; Data synchronisation barrier to make sure INTC gets the message
+        DSB     SY
+   [ {FALSE} ; Code to call DebugCallstack on any button press
+        ; Switch back to original mode
+        MRS     r8, CPSR
+        MRS     r9, SPSR
+        BIC     r8, r8, #&1F
+        AND     r9, r9, #&1F
+        ORR     r8, r8, r9
+        MSR     CPSR_c, r8
+        ; Dump the callstack & other regs
+        Push    "sb" ; preserve original sb so it can be dumped
+        MOV     sb, #&24
+        LDR     sb, [sb]
+        B       DebugCallstack
+   ]
+        ; Now return
+        SUBS    pc, lr, #4
+
+hextab  DCB "0123456789abcdef"
+ ]
+        END

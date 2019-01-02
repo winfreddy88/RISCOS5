@@ -1,0 +1,413 @@
+; Copyright 2002 Tematic Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+; Intel 80321 RAM configuration
+;
+; We require 1 or 2 banks of 32 or 64-bit DDR SDRAM.
+; We assume only one module.
+; We don't use ECC - any extra RAM (eg in 36 or 72-bit) is ignored.
+; We know the RAM is clocked at 100MHz, and choose use CAS latency 2 (PC1600 RAM).
+; We assume 4 leaves.
+; We don't support < ×8 devices, as we can only drive 1 DQS/DM pair per byte lane.
+
+initialise_ram
+        MOV     v7, lr
+
+; Do we have DDR?
+        MOV     a1, #RAMSPD_MemoryType
+        BL      ReadSPD
+        TEQ     a1, #RAMSPD_MemType_DDR
+        BNE     GiveUp
+
+; Is it at least 32-bit?
+        MOV     a1, #RAMSPD_WidthL
+        BL      ReadSPD
+        MOV     v1, a1
+        MOV     a1, #RAMSPD_WidthH
+        BL      ReadSPD
+        ADD     v6, v1, a1, LSL #8
+        CMP     v6, #32
+        BLO     GiveUp
+
+; Check number of banks
+        MOV     a1, #RAMSPD_Banks
+        BL      ReadSPD
+        MOV     v1, a1
+
+        MOV     a1, #RAMSPD_Rows
+        BL      ReadSPD
+        MOV     v2, a1
+
+        MOV     a1, #RAMSPD_Cols
+        BL      ReadSPD
+        MOV     v3, a1
+
+        MOV     a1, #RAMSPD_ModuleAttr
+        BL      ReadSPD
+        MOV     v4, a1
+
+; Set up all the basics first
+        LDR     v5, =PMMR
+        MOV     lr, #0                  ; Disable refresh
+        STR     lr, [v5, #MCU_RFR]
+
+        TST     v4, #RAMSPD_ModAttr_RegAC
+        MOVNE   lr, #2_010              ; 64-bit, registered
+        MOVEQ   lr, #2_000              ; 64-bit, unbuffered
+        CMP     v6, #64
+        ORRLO   lr, lr, #2_001          ; 32-bit
+        MOVLO   v6, #4
+        MOVHS   v6, #5
+        STR     lr, [v5, #MCU_SDCR]
+
+        ; Drive strength values from design guide
+        TST     v4, #RAMSPD_ModAttr_RegAC
+        MOV     lr, #&0D
+        STR     lr, [v5, #MCU_DBUDSR]
+        STR     lr, [v5, #MCU_DBDDSR]
+        MOV     lr, #&22
+        STR     lr, [v5, #MCU_CUDSR]
+        MOV     lr, #&20
+        STR     lr, [v5, #MCU_CDDSR]
+        MOV     lr, #&30
+        STR     lr, [v5, #MCU_CEUDSR]
+        STR     lr, [v5, #MCU_CEDDSR]
+        MOVEQ   lr, #&18
+        MOVNE   lr, #&0D
+        STR     lr, [v5, #MCU_CSUDSR]
+        STR     lr, [v5, #MCU_CSDDSR]
+        MOV     lr, #&0D
+        STR     lr, [v5, #MCU_REUDSR]
+        STR     lr, [v5, #MCU_REDDSR]
+        MOVEQ   lr, #&18
+        STR     lr, [v5, #MCU_ABUDSR]
+        STR     lr, [v5, #MCU_ABDDSR]
+
+        MOV     lr, #2_0000             ; Disable ECC
+        STR     lr, [v5, #MCU_ECCR]
+
+        MOV     lr, #Boot_RAM_Base      ; Base address
+        STR     lr, [v5, #MCU_SDBR]
+
+        MOV     v4, lr, LSR #25
+        AND     v4, v4, #&1F            ; Starting value for SBR registers (32M units)
+        STR     v4, [v5, #MCU_SBR0]
+        STR     v4, [v5, #MCU_SBR1]
+
+; It's not clear whether or how ×9 or ×32 devices might work, so we won't try to
+; exclude them, despite only nominally supporting ×8 or ×16. However, ×4 devices
+; definitely don't work. Therefore we skip any banks with devices narrower
+; than ×8.
+        MOV     a1, #RAMSPD_PrimaryWidth
+        BL      ReadSPD
+        AND     lr, a1, #&7F            ; lr = device width (eg 4, 8, 9, 16, 17)
+; If bank 1 devices >= 8-bit, proceed as normal
+        CMP     lr, #8
+        BHS     DoBank1
+; If bank 2 devices twice the width & bank 1 is >= 4-bit, can do bank 2 only
+        CMP     a1, #&84
+        BHS     DoneBank1
+GiveUp  B       GiveUp
+
+        MACRO
+        ValidateRowColCombination $label
+        CMP     a1, #13                 ; 80321 supports MA0-MA12
+        MOVHI   a1, #13                 ; (mapped to A12-A23,A25 or A12-A24)
+        CMP     a2, #11                 ; 80321 supports MA0-MA9,MA11
+        MOVHI   a2, #11                 ; (mapped to A3-A11,A24,A26)
+
+        CMP     a1, #12                 ; must have at least 12 rows so A12-A23 all mapped
+        CMPHS   a2, #9                  ; must have at least 9 columns so A3-A11 all mapped
+        BLO     $label
+
+        ; now a1 = 12 or 13, a2 = 9, 10 or 11
+        ; all combinations are valid except 12,11 which leaves A25 stranded
+        ; (we could handle the holes, I suppose, but it's not a standard layout)
+        ;
+        ;              Rows
+        ;            12    13
+        ;        9   64M   128M*     *: needs alternate row/col mapping
+        ; Cols  10   128M  256M      memory sizes halved if 32-bit
+        ;       11    -    512M
+
+        TEQ     a1, #12
+        TEQEQ   a2, #11
+        MOVEQ   a2, #10
+
+; Memory available is 2^(rows+cols+(4 or 5))
+; (+2 for 4 leaves, +2 or 3 for 4 or 8 bytes per address)
+        MOV     lr, #1
+        ADD     a3, a1, a2              ; Total address lines
+        ADD     a3, a3, v6              ; plus 4 or 5
+        MOV     a3, lr, LSL a3          ; = bank actual size (between 32M and 512M)
+
+        ADD     v4, v4, a3, LSR #25
+
+        MOV     lr, v4
+        TEQ     a1, #13
+        TEQEQ   a2, #9
+        ORREQ   lr, lr, #1:SHL:31       ; use alternate row/col mapping if necessary
+
+        MEND
+
+DoBank1
+; Process bank 1.
+        AND     a1, v2, #&F             ; Bank 1 rows
+        AND     a2, v3, #&F             ; Bank 1 cols
+
+        ValidateRowColCombination DoneBank1
+
+        STR     lr, [v5, #MCU_SBR0]
+        STR     v4, [v5, #MCU_SBR1]
+
+DoneBank1
+        CMP     v1, #2
+        BLO     DoneBanks
+
+; Process bank 2.
+        MOVS    a1, v2, LSR #4
+        ANDEQ   a1, v2, #&F
+        MOVS    a2, v3, LSR #4
+        ANDEQ   a2, v3, #&F
+
+        ValidateRowColCombination DoneBanks
+
+        STR     lr, [v5, #MCU_SBR1]
+
+        MACRO
+        CLKDelay $clk
+        LDR     a1, =($clk * (CPUCLK/1000)) / (RAMCLK/1000)
+        SUBS    a1, a1, #6      ; 1 cycle
+        SUBHS   pc, pc, #12     ; 5 cycles
+        MEND
+
+
+; Now we start the RAM initialisation sequence.
+
+tMRD    *       2       ; delay times in units of tCLK (100MHz)
+tRP     *       2
+tRFC    *       8
+
+DoneBanks
+        MOV     lr, #SDIR_NOP
+        STR     lr, [v5, #MCU_SDIR]
+
+        CLKDelay tRFC                   ; why not?
+
+        MOV     lr, #SDIR_PrechargeAll
+        STR     lr, [v5, #MCU_SDIR]
+
+        CLKDelay tRP                    ; for Samsung
+
+        MOV     lr, #SDIR_EMRS_EnableDLL
+        STR     lr, [v5, #MCU_SDIR]
+
+        CLKDelay tMRD
+
+        MOV     lr, #SDIR_MRS_ResetDLL_CAS2
+        STR     lr, [v5, #MCU_SDIR]
+
+        CLKDelay tMRD
+
+        MOV     lr, #SDIR_PrechargeAll
+        STR     lr, [v5, #MCU_SDIR]
+
+        CLKDelay tRP
+
+        MOV     lr, #SDIR_AutoRefresh
+        STR     lr, [v5, #MCU_SDIR]
+
+        CLKDelay tRFC
+
+        MOV     lr, #SDIR_AutoRefresh
+        STR     lr, [v5, #MCU_SDIR]
+
+        CLKDelay tRFC
+
+        MOV     lr, #SDIR_MRS_CAS2
+        STR     lr, [v5, #MCU_SDIR]
+
+        MOV     a1, #RAMSPD_Refresh
+        BL      ReadSPD
+        AND     a1, a1, #&7F
+        ADR     lr, RefreshTable
+        CMP     a1, #6
+        MOVHS   a1, #RAMSPD_Refresh_8us
+        LDR     lr, [lr, a1, LSL #2]
+        STR     lr, [v5, #MCU_RFR]
+
+        MOV     lr, #SDIR_Operational
+        STR     lr, [v5, #MCU_SDIR]
+
+        MOV     pc, v7
+
+RefreshTable
+        DCD     &0C00
+        DCD     &0300
+        DCD     &0600
+        DCD     &1800
+        DCD     &3000
+        DCD     &6000
+
+; Power up
+; Wait 200µs
+; <Disable refresh>
+; Issue NOP
+; Make CKE high
+; Issue PRECHARGE ALL
+; Issue MODE REGISTER SET for extended mode register to enable DLL
+; Issue MODE REGISTER SET for mode register to reset the DLL and set parameters
+; Wait 200 cycles before any read
+; Issue PRECHARGE ALL
+; Issue two AUTO refresh cycles
+; Issue MODE REGISTER SET for mode register to set parameters without DLL reset
+
+
+get_end_of_ram
+        LDR     ip, =PMMR
+        LDR     a1, [ip, #MCU_SBR1]             ; read end direct from control register
+        LDR     a2, [ip, #MCU_SDBR]             ; and start
+        AND     a1, a1, #&3F
+        AND     a2, a2, #&C0000000
+        ADD     a1, a2, a1, LSL #25
+        SUB     a3, a1, #1
+        CMP     a3, #&FFF00000
+        MOVHS   a1, #&FFF00000-1
+        ADDHS   a1, a1, #1
+        MOV     pc, lr
+
+; Bus 1 access for the RAM Serial Presence Detect devices
+
+ReadSPD
+        ; Enable the IIC clock
+        MOV     ip, #ICR_Enable+ICR_SCLEnable
+        STR     ip, [a4, #IIC_ICR1]
+        MVN     ip, #ISR_AllInts
+        STR     ip, [a4, #IIC_ISR1]
+
+        ; Transmit SPD IIC address
+        MOV     a2, #SPD_Address
+        STR     a2, [a4, #IIC_IDBR1]
+        LDR     a2, [a4, #IIC_ICR1]
+        ORR     a2, a2, #ICR_Transfer+ICR_Start
+        STR     a2, [a4, #IIC_ICR1]
+10      LDR     a3, [a4, #IIC_ISR1]
+        TST     a3, #ISR_TransmitEmpty
+        BEQ     %BT10
+        STR     a3, [a4, #IIC_ISR1]
+
+        ; Transmit SPD location
+        STR     a1, [a4, #IIC_IDBR1]
+        LDR     a2, [a4, #IIC_ICR1]
+        ORR     a2, a2, #ICR_Transfer
+        BIC     a2, a2, #ICR_Start
+        STR     a2, [a4, #IIC_ICR1]
+20      LDR     a3, [a4, #IIC_ISR1]
+        TST     a3, #ISR_TransmitEmpty
+        BEQ     %BT20
+        STR     a3, [a4, #IIC_ISR1]
+
+        ; Repeated start
+        MOV     a2, #SPD_Address+1
+        STR     a2, [a4, #IIC_IDBR1]
+        LDR     a2, [a4, #IIC_ICR1]
+        ORR     a2, a2, #ICR_Transfer+ICR_Start
+        STR     a2, [a4, #IIC_ICR1]
+30      LDR     a3, [a4, #IIC_ISR1]
+        TST     a3, #ISR_TransmitEmpty
+        BEQ     %BT30
+        STR     a3, [a4, #IIC_ISR1]
+
+        ; Read data byte
+        LDR     a2, [a4, #IIC_ICR1]
+        BIC     a2, a2, #ICR_Start
+        ORR     a2, a2, #ICR_Transfer+ICR_Nack+ICR_Stop
+        STR     a2, [a4, #IIC_ICR1]
+40      LDR     a3, [a4, #IIC_ISR1]
+        TST     a3, #ISR_ReceiveFull
+        BEQ     %BT40
+        STR     a3, [a4, #IIC_ISR1]
+
+        LDRB    a1, [a4, #IIC_IDBR1]
+
+        ; Wait until unit not busy (ie finished transmitting STOP)
+50      LDR     a3, [a4, #IIC_ISR1]
+        TST     a3, #ISR_UnitBusy
+        BNE     %BT50
+
+        ; Disable the clock (but leave IIC enabled)
+        MOV     a2, #ICR_Enable
+        STR     a2, [a4, #IIC_ICR1]
+
+        MOV     pc, lr
+
+; Clear the entire RAM using the application accelerator. We place AA descriptors
+; in the first 2K of memory (max 1GB = 64 descriptors = 2K), use them to clear the
+; whole RAM, and then clear that 2K in software.
+clear_ram
+        MOV     v7, lr
+        BL      get_end_of_ram
+        MOV     v6, a1                          ; v6 = end of RAM
+clear_ram_softload ; Alternate entry, v7 = return address, v6 = end of clear area
+
+        MOV     v3, #16*1024*1024
+        SUB     v3, v3, #8                      ; v5 = max length per descriptor
+
+        LDR     a4, =PMMR
+
+        MOV     a1, #0
+        STR     a1, [a4, #AAU_ACR]
+        LDR     a2, =Boot_RAM_Base
+        ADD     v5, a2, #2048                   ; v5 = current address
+
+10      SUB     v4, v6, v5                      ; v4 = length of this section
+        CMP     v4, v3
+        MOVHS   v4, v3
+        STR     a1, [a2, #AAUDesc_SAR1]
+        STR     v5, [a2, #AAUDesc_DAR]
+        STR     v4, [a2, #AAUDesc_BC]
+        LDR     a3, =ADCR_WriteEnable+(ADCR_FillCmd:SHL:ADCR_1)
+        STR     a3, [a2, #AAUDesc_DC]
+        ADD     v5, v5, v4
+        CMP     v5, v6
+        ADDLO   a3, a2, #32
+        ASSERT  AAUDesc_NDA=0
+        STRLO   a3, [a2], #32
+        BLO     %BT10
+
+        STR     a1, [a2, #AAUDesc_NDA]
+        LDR     a2, =Boot_RAM_Base
+        STR     a2, [a4, #AAU_ANDAR]
+        MOV     a1, #ACR_Enable
+        STR     a1, [a4, #AAU_ACR]
+
+        ; Not using interrupts, and we don't have anything better to do
+        ; while it's running. Put a millisecond delay in so we're not
+        ; constantly accessing the bus.
+wait_for_aau
+        Delay   1024
+        LDR     a1, [a4, #AAU_ASR]
+        TST     a1, #ASR_Active
+        BNE     wait_for_aau
+
+        ; Go back and do the first 2K we used for the descriptors
+        LDR     a4, =Boot_RAM_Base
+        MOV     a2, #0
+        MOV     a3, #2048
+20      STR     a2, [a4], #4
+        SUBS    a3, a3, #4
+        BNE     %BT20
+        MOV     pc, v7
+
+        END

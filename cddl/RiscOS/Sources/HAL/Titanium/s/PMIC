@@ -1,0 +1,158 @@
+;
+; CDDL HEADER START
+;
+; The contents of this file are subject to the terms of the
+; Common Development and Distribution License (the "Licence").
+; You may not use this file except in compliance with the Licence.
+;
+; You can obtain a copy of the licence at
+; cddl/RiscOS/Sources/HAL/Titanium/LICENCE.
+; See the Licence for the specific language governing permissions
+; and limitations under the Licence.
+;
+; When distributing Covered Code, include this CDDL HEADER in each
+; file and include the Licence file. If applicable, add the
+; following below this CDDL HEADER, with the fields enclosed by
+; brackets "[]" replaced with your own identifying information:
+; Portions Copyright [yyyy] [name of copyright owner]
+;
+; CDDL HEADER END
+;
+;
+; Copyright 2014 Elesar Ltd.  All rights reserved.
+; Use is subject to license terms.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:OSEntries
+
+        GET     hdr.RegMap
+        GET     hdr.RegPMIC
+        GET     hdr.StaticWS
+                
+        AREA    |PMIC$$Code|, CODE, READONLY, PIC
+
+        EXPORT  PMICInit
+        EXPORT  PMICPowerOff
+        EXPORT  PMICReadByte
+        EXPORT  PMICWriteByte
+        EXPORT  PMICmVToSMPSVSel
+        IMPORT  HAL_CounterDelay
+
+; SMPS parameters in millivolts (range = 0)
+SMPSMin         * 700
+SMPSMax         * 1650
+SMPSOffset      * 440
+SMPSStepSize    * 10
+
+; Address pages to IIC bases
+PMICPageAddr
+        DCB     &24, &B0, &B2, &B4, &B6
+        ALIGN
+
+; PMICInit
+PMICInit ROUT
+        ; Actively drive the soft off line low
+        LDR     a1, GPIO_LogBase + (7 * 4)
+        MOV     a3, #1:SHL:7            ; GPIO7.7 on SPI1_SCLK
+        STR     a3, [a1, #GPIO_CLEARDATAOUT]
+        LDR     a2, [a1, #GPIO_OE]
+        BIC     a2, a2, a3
+        STR     a2, [a1, #GPIO_OE]
+
+        MOV     pc, lr
+
+; PMICPowerOff
+PMICPowerOff ROUT
+        ; Raise the line to start the ATX turn off
+        LDR     a1, GPIO_LogBase + (7 * 4)
+        MOV     a3, #1:SHL:7            ; GPIO7.7 on SPI1_SCLK
+        STR     a3, [a1, #GPIO_SETDATAOUT]
+
+        ; Wait for the debounce time +2%
+        LDR     a1, =20400
+        BL      HAL_CounterDelay
+
+        ; Tell the PMIC to do a shutdown
+        LDR     a1, =PRIMARY_SECONDARY_PAD2
+        BL      PMICReadByte
+        BIC     a2, a1, #PRIMARY_SECONDARY_PAD2_POWERHOLD
+        LDR     a1, =PRIMARY_SECONDARY_PAD2
+        BL      PMICWriteByte
+        B       .                       ; Should be off now
+
+; PMICReadByte
+; => a1 = combined address &PRR where P=page R=reg
+; <= a1 = byte read
+PMICReadByte ROUT
+        Push    "lr"
+        SUB     sp, sp, #12+12+4
+
+        STRB    a1, [sp, #12+12+0]
+
+        ADR     a3, PMICPageAddr
+        LDRB    a1, [a3, a1, LSR #8]    ; AddrFlags (write)
+        ADD     a2, sp, #12+12+0        ; Data
+        MOV     a3, #1                  ; Length
+        STMIA   sp, {a1-a3}
+
+        ORR     a1, a1, #1              ; AddrFlags (read)
+        ADD     a2, sp, #12+12+1        ; Data
+                                        ; Length
+        ADD     a4, sp, #12
+        STMIA   a4, {a1-a3}
+
+        MOV     a1, sp
+        MOV     a2, #2                  ; 2 transfers on bus 0
+        CallOS  OS_IICOpV
+        LDRB    a1, [sp, #12+12+1]
+
+        ADD     sp, sp, #12+12+4
+        Pull    "pc"
+
+; PMICWriteByte
+; => a1 = combined address &PRR where P=page R=reg
+;    a2 = byte to write
+PMICWriteByte ROUT
+        Push    "lr"
+        SUB     sp, sp, #12+4
+
+        STRB    a1, [sp, #12+0]
+        STRB    a2, [sp, #12+1]
+
+        ADR     a3, PMICPageAddr
+        LDRB    a1, [a3, a1, LSR #8]    ; AddrFlags (read)
+        ADD     a2, sp, #3*4            ; Data
+        MOV     a3, #2                  ; Length
+        STMIA   sp, {a1-a3}
+
+        MOV     a1, sp
+        MOV     a2, #1                  ; 1 transfer on bus 0
+        CallOS  OS_IICOpV
+
+        ADD     sp, sp, #12+4
+        Pull    "pc"
+
+; PMICmVToSMPSVSel
+; => a1 = target millivolts
+; <= a1 = VSel register value (range = 0), or -1 if unattainable
+PMICmVToSMPSVSel ROUT
+        TEQ     a1, #0
+        MOVEQ   pc, lr                  ; Turn off
+
+        LDR     a2, =SMPSMin
+        CMP     a1, a2
+        LDRCS   a2, =SMPSMax + 1
+        CMPCS   a2, a1
+        MOVCC   a1, #-1
+        MOVCC   pc, lr
+
+        SUB     a1, a1, #SMPSOffset
+        ADD     a1, a1, #SMPSStepSize - 1
+        MOV     a2, #SMPSStepSize
+        UDIV    a1, a1, a2
+        MOV     pc, lr
+        
+        END

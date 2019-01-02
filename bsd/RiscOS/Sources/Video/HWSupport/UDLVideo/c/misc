@@ -1,0 +1,302 @@
+/*
+ * Copyright (c) 2014, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <ctype.h>
+#include "kernel.h"
+#include "swis.h"
+
+#include "Global/Services.h"
+#include "Global/FSNumbers.h"
+#include "Interface/HighFSI.h"
+
+#include "udl_riscos.h"
+
+#include <dev/usb/usb.h>
+#include <dev/usb/usbdi.h>
+
+#include "udl.h"
+#include "netbsd.h"
+#include "devcaps.h"
+
+uint8_t *huffman_decomp = NULL;
+uint32_t *huffman_16_patterns = NULL;
+uint8_t *huffman_16_bits = NULL;
+huffman_8_t *huffman_8 = NULL;
+
+const char *chip_names[] =
+{
+	"DL115",
+	"DL120",
+	"DL125",
+	"DL160",
+	"DL165",
+	"DL190",
+	"DL195",
+	"DLUNK",
+	"DLUNSUPPORTED",
+};
+
+int chip_matchname(const char *name)
+{
+	for(int i=0;i<DLUNK;i++)
+	{
+		/* Case-insensitive comparison */
+		int j=0;
+		while(chip_names[i][j] && name[j])
+		{
+			if(chip_names[i][j] != toupper(name[j]))
+				break;
+			j++;
+		}
+		if(chip_names[i][j] == name[j])
+			return i;
+	}
+	return DLUNK;
+}
+
+static void eor_32(uint32_t *patterns)
+{
+	uint32_t prev[32];
+	memset(prev,0,sizeof(uint32_t)*32);
+	for(int i=0;i<UDL_HUFFMAN_RECORDS;i++)
+	{
+		uint32_t t = patterns[i];
+		patterns[i] = t ^ prev[i & 31];
+		prev[i & 31] = patterns[i];
+	}
+}
+
+static void eor_prev(uint32_t *patterns)
+{
+	uint32_t prev = 0;
+	for(int i=0;i<UDL_HUFFMAN_RECORDS;i++)
+	{
+		uint32_t t = patterns[i];
+		patterns[i] = t ^ prev;
+		prev = patterns[i];
+	}
+}
+
+static bool load_squashed_file(void *dest,size_t destsize,const char *filename)
+{
+	/* Get a direct pointer to the file in ResourceFS to avoid a temporary allocation */
+	int fh,fhh,info;
+	_kernel_oserror *e;
+	_swi(OS_Find,_INR(0,1)|_OUT(0),OSFind_OpenIn,filename,&fh);
+
+	e = _swix(OS_FSControl,_INR(0,1)|_OUTR(1,2),FSControl_ReadFSHandle,fh,&fhh,&info);
+	if(fh)
+	{
+		_swix(OS_Find,_INR(0,1),0,fh);
+	}
+	if(e)
+	{
+		dprintf(("","load_squashed_file(%s) failed: error %08x %s\n",filename,e->errnum,e->errmess));
+		return false;
+	}
+	if((info & 0xff) != fsnumber_resourcefs)
+	{
+		/* Give up if not in ResourceFS */
+		dprintf(("","load_squashed_file(%s) failed: Not in ResourceFS!\n",filename));
+		return false;
+	}
+	size_t srcsize = ((size_t *)fhh)[-1]-4;
+	if(*((uint32_t *)fhh) == 0x48535153)
+	{
+		/* Squash header found, try and decompress the data */
+		if(((uint32_t *)fhh)[1] != destsize)
+		{
+			dprintf(("","load_squashed_file(%s) failed: Wrong data size\n",filename));
+			return false;
+		}
+		fhh += 20;
+		srcsize -= 20;
+		size_t tempsize;
+		e = _swix(Squash_Decompress,_INR(0,1)|_OUT(0),8,-1,&tempsize);
+		if(e)
+		{
+			dprintf(("","load_squashed_file(%s) failed: Squash_Decompress failed: error %08x %s\n",filename,e->errnum,e->errmess));
+			return false;
+		}
+		void *temp = malloc(tempsize);
+		if(!temp)
+		{
+			dprintf(("","load_squashed_file(%s) failed: Failed to get temp squash buffer\n",filename));
+			return false;
+		}
+		int status;
+		e = _swix(Squash_Decompress,_INR(0,5)|_OUT(0),4,temp,fhh,srcsize,dest,destsize,&status);
+		free(temp);
+		if(e)
+		{
+			dprintf(("","load_squashed_file(%s) failed: Squash_Decompress failed: error %08x %s\n",filename,e->errnum,e->errmess));
+			return false;
+		}
+		if(status)
+		{
+			dprintf(("","load_squashed_file(%s) failed: Squash_Decompress failed: status %d\n",filename,status));
+			return false;
+		}
+	}
+	else if(srcsize == destsize)
+	{
+		/* Looks like it's uncompressed. Copy straight over. */
+		memcpy(dest,(void *) fhh,destsize);
+	}
+	else
+	{
+		dprintf(("","load_squashed_file(%s) failed: Unknown file content\n",filename));
+		return false;
+	}
+	return true;
+}
+
+void huffman_init(void)
+{
+	if(huffman_decomp)
+		return;
+
+	/* Allocate buffers */
+	huffman_decomp = (uint8_t *) malloc(HUFFMAN_DECOMP_SIZE);
+	huffman_16_patterns = (uint32_t *) malloc(sizeof(uint32_t)*UDL_HUFFMAN_RECORDS);
+	huffman_16_bits = (uint8_t *) malloc(sizeof(uint8_t)*UDL_HUFFMAN_RECORDS);
+	huffman_8 = (huffman_8_t *) malloc(sizeof(huffman_8_t)*256);
+
+	if(!huffman_decomp || !huffman_16_patterns || !huffman_16_bits || !huffman_8)
+	{
+		huffman_shutdown();
+		dprintf(("","Failed to allocate memory for huffman tables\n"));
+		return;
+	}
+
+	/* Load the decompression table */
+	if(!load_squashed_file(huffman_decomp,HUFFMAN_DECOMP_SIZE,"Resources:$.Resources.UDLVideo.decomp"))
+	{
+		huffman_shutdown();
+		return;
+	}
+
+	/* Load the 16 bit huffman compression table */
+	if(!load_squashed_file(huffman_16_patterns,sizeof(uint32_t)*UDL_HUFFMAN_RECORDS,"Resources:$.Resources.UDLVideo.huff16"))
+	{
+		huffman_shutdown();
+		return;
+	}
+
+	/* Unpack the data. First undo the EORing that helped with the compression. */
+	eor_prev(huffman_16_patterns);
+	eor_32(huffman_16_patterns);
+	/* Now deduce the bit length of each pattern */
+	for(int i=0;i<UDL_HUFFMAN_RECORDS;i++)
+	{
+		int count = 31;
+		uint32_t pattern = huffman_16_patterns[i];
+		while(!(pattern & (1<<count)))
+			count--;
+		/* The marker bit gets masked out, so we don't have to worry about masking it out when inserting the pattern into the output buffers */
+		huffman_16_patterns[i] = pattern & ~(1<<count);
+		huffman_16_bits[i] = count;
+	}
+
+	/* Finally, generate the 8 bit huffman table
+	   This table is so simple that there's no point storing it as a data file
+	   Most values are just encoded as two 1's followed by the 8 bit value
+	*/
+	for(int i=0;i<256;i++)
+	{
+		huffman_8[i].pattern = (i<<2) | 3;
+		huffman_8[i].bits = 10;
+	}
+	/* These are the only values that get any compression! */
+	huffman_8[0].pattern = 0;
+	huffman_8[0].bits = 1;
+	huffman_8[0x29].pattern = 0x01;
+	huffman_8[0x29].bits = 4;
+	huffman_8[0x12].pattern = 0x09;
+	huffman_8[0x12].bits = 6;
+	huffman_8[0x32].pattern = 0x29;
+	huffman_8[0x32].bits = 6;
+	huffman_8[0xce].pattern = 0x19;
+	huffman_8[0xce].bits = 6;
+	huffman_8[0xae].pattern = 0x39;
+	huffman_8[0xae].bits = 6;
+	huffman_8[0xb7].pattern = 0x05;
+	huffman_8[0xb7].bits = 4;
+	huffman_8[0xd7].pattern = 0x0d;
+	huffman_8[0xd7].bits = 5;
+	huffman_8[0x09].pattern = 0x1d;
+	huffman_8[0x09].bits = 5;
+	dprintf(("","huffman tables initialised\n"));
+}
+
+void huffman_shutdown(void)
+{
+	if(huffman_decomp)
+	{
+		free(huffman_decomp);
+		huffman_decomp = NULL;
+	}
+	if(huffman_16_patterns)
+	{
+		free(huffman_16_patterns);
+		huffman_16_patterns = NULL;
+	}
+	if(huffman_16_bits)
+	{
+		free(huffman_16_bits);
+		huffman_16_bits = NULL;
+	}
+	if(huffman_8)
+	{
+		free(huffman_8);
+		huffman_8 = NULL;
+	}
+}
+
+size_t buffer_nextfreeblock(uint32_t bufh,void **ptr)
+{
+	uint8_t *start,*end;
+	size_t insert,freespace;
+	if(_swix(Buffer_GetInfo,_IN(0)|_OUTR(1,3)|_OUT(5),bufh,&start,&end,&insert,&freespace))
+	{
+		return 0;
+	}
+	static bool first=true;
+	if(first || (freespace < 4*1024))
+	{
+		dprintf(("","free space: %d/%d\n",freespace,end-start));
+	}
+	first = false;
+	start += insert;
+	*ptr = start;
+	if(end-start >= freespace)
+		return freespace;
+	return end-start;
+}

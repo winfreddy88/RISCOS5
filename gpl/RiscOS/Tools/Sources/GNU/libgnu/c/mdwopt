@@ -1,0 +1,786 @@
+/* -*-c-*-
+ *
+ * $Id: mdwopt,v 1.1.1.1 2003/11/18 15:09:02 bavison Exp $
+ *
+ * Options parsing, similar to GNU @getopt_long@
+ *
+ * (c) 1996 Mark Wooding
+ */
+
+/*----- Licensing notice --------------------------------------------------*
+ *
+ * This file is part of many programs.
+ *
+ * `mdwopt' is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * `mdwopt' is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with `mdwopt'; if not, write to the Free Software Foundation,
+ * Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
+ */
+
+/*----- Revision history --------------------------------------------------*
+ *
+ * $Log: mdwopt,v $
+ * Revision 1.1.1.1  2003/11/18 15:09:02  bavison
+ * Initial import of libgnu, a library used by Darren Salt's ports of GNU diff,
+ * grep and sed.
+ *
+ * Revision 1.1.1.1  1998/06/17 23:44:42  mdw
+ * Initial version of mLib
+ *
+ * Revision 1.7  1997/09/11 09:19:11  mdw
+ * (mo__nextWord): Arrrgh.  Don't free the environment variable buffer!
+ * People are still using it!
+ *
+ * Revision 1.6  1997/09/11 09:05:54  mdw
+ * (mo__nextWord): Fix bug which returns too many words from environment
+ * variables.
+ *
+ * Revision 1.5  1997/08/09 20:27:59  mdw
+ * Fix spelling of `Licensing'.
+ *
+ * Revision 1.4  1997/07/29 21:11:35  mdw
+ * Reformatted.  Fixed buffer overflow when dealing with environment
+ * variables.  Included NT in list of daft operating systems with `\' as a
+ * path separator.  Fixed address of the FSF.
+ *
+ * Revision 1.3  1997/02/26 00:41:10  mdw
+ * Added GPL notice to the top.  Slight formatting changes.
+ *
+ * Revision 1.2  1996/10/28 13:12:13  mdw
+ * Fixed calls to ctype.h routines.  Arguments are cast to unsigned char
+ * to avoid invoking undefined behaviour caused by signedness of chars.
+ *
+ * Revision 1.1  1996/09/24 18:01:28  mdw
+ * Initial revision
+ *
+ */
+
+/*----- External dependencies ---------------------------------------------*/
+
+#include <ctype.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "mdwopt.h"
+
+/*----- Configuration things ----------------------------------------------*/
+
+#if defined(__riscos)
+#  define PATHSEP '.'
+#elif defined(__OS2__) || defined(__MSDOS__) || defined(__WINNT__)
+#  define PATHSEP '\\'
+#else /* Assume a sane filing system */
+#  define PATHSEP '/'
+#endif
+
+/*----- Global variables --------------------------------------------------*/
+
+mdwopt_data mdwopt_global = {0, 0, 0, 1, 0, 0, 0, 0, 0};
+
+enum {
+  ord__permute = 0,			/* Permute the options (default) */
+  ord__return = 1,			/* Return non-option things */
+  ord__posix = 2,			/* Do POSIX-type hacking */
+  ord__negate = 4			/* Magic negate-next-thing flag */
+};
+
+/*----- Main code ---------------------------------------------------------*/
+
+/* --- @mo__nextWord@ --- *
+ *
+ * Arguments:   @int argc@ = number of command line options
+ *              @char *argv[]@ = pointer to command line options
+ *              @mdwopt_data *data@ = pointer to persistent state
+ *
+ * Returns:     Pointer to the next word to handle, or 0
+ *
+ * Use:         Extracts the next word from the command line or environment
+ *              variable.
+ */
+
+static char *mo__nextWord(int argc, char *const *argv, mdwopt_data *data)
+{
+  if (data->ind == -1) {
+    char *p = data->env;
+    char *q;
+    while (isspace((unsigned char)*p))
+      p++;
+    q = p;
+    while (*p && !isspace((unsigned char)*p))
+      p++;
+    data->env = p;
+    if (*p)
+      *p++ = 0;
+    if (p != q)
+      return (q);
+    data->env = 0;
+    data->ind = 1;
+  }
+
+  if (data->next == argc)
+    return (0);
+  return (argv[data->next++]);
+}
+
+/* --- @mo__permute@ --- *
+ *
+ * Arguments:   @char *argv[]@ = pointer to command line arguments
+ *              @mdwopt_data *data@ = pointer to persistent data
+ *
+ * Returns:     --
+ *
+ * Use:         Moves a command line option into the right place.
+ */
+
+static void mo__permute(char *const *argv, mdwopt_data *data)
+{
+  char **v = (char **)argv;
+  if (data->ind != -1) {
+    int i = data->next - 1;
+    char *p = v[i];
+    while (i > data->ind) {
+      v[i] = v[i - 1];
+      i--;
+    }
+    v[i] = p;
+    data->ind++;
+  }
+}
+
+/* --- @mo__findOpt@ --- *
+ *
+ * Arguments:   @int o@ = which option to search for
+ *              @const char *shortopt@ = short options string to search
+ *              @mdwopt_data *data@ = pointer to persistant state
+ *
+ * Returns:     Pointer to rest of short options string (including magic
+ *              characters)
+ *
+ * Use:         Looks up a short option in the given string.
+ */
+
+static const char *mo__findOpt(int o, const char *shortopt,
+			       mdwopt_data *data)
+{
+  const char *p = shortopt;		/* Point to short opts table */
+  for (;;) {
+    if (!*p)				/* No more options left */
+      return (0);
+
+    if (o != *p || (p[1] != '+' && data->order & ord__negate)) {
+      p++;				/* Skip this option entry */
+      while (*p == '+')			/* Jump a `%|+|%' sign */
+	p++;
+      while (*p == ':')			/* And jump any `%|:|%' characters */
+	p++;				/* Just in case there are any */
+    }
+    else
+      return (p + 1);
+  }
+}
+
+/* --- @mdwopt@ --- *
+ *
+ * Arguments:   @int argc@ = number of command line arguments
+ *              @char * const *argv@ = pointer to command line arguments
+ *              @const char *shortopt@ = pointer to short options information
+ *              @const struct option *longopts@ = pointer to long opts info
+ *              @int *longind@ = where to store matched longopt
+ *              @mdwopt_data *data@ = persistent state for the parser
+ *              @int flags@ = various useful flags
+ *
+ * Returns:     Value of option found next, or an error character, or
+ *              @EOF@ for the last thing.
+ *
+ * Use:         Reads options.  The routine should be more-or-less compatible
+ *              with standard getopts, although it provides many more
+ *              features even than the standard GNU implementation.
+ *
+ *              The precise manner of options parsing is determined by
+ *              various flag settings, which are described below.  By setting
+ *              flag values appropriately, you can achieve behaviour very
+ *              similar to most other getopt routines.
+ *
+ *
+ *          How options parsing appears to users
+ *
+ *              A command line consists of a number of `words' (which may
+ *              contain spaces, according to various shell quoting
+ *              conventions).  A word may be an option, an argument to an
+ *              option, or a non-option.  An option begins with a special
+ *              character, usually `%|-|%', although `%|+|%' is also used
+ *              sometimes.  As special exceptions, the word containing only a
+ *              `%|-|%' is considered to be a non-option, since it usually
+ *              represents standard input or output as a filename, and the
+ *              word containing a double-dash `%|--|%' is used to mark all
+ *              following words as being non-options regardless of their
+ *              initial character.
+ *
+ *              Traditionally, all words after the first non-option have been
+ *              considered to be non-options automatically, so that options
+ *              must be specified before filenames.  However, this
+ *              implementation can extract all the options from the command
+ *              line regardless of their position.  This can usually be
+ *              disabled by setting one of the environment variables
+ *              `%|POSIXLY_CORRECT|%' or `%|_POSIX_OPTION_ORDER|%'.
+ *
+ *              There are two different styles of options: `short' and
+ *              `long'.
+ *
+ *              Short options are the sort which Unix has known for ages: an
+ *              option is a single letter, preceded by a `%|-|%'.  Short
+ *              options can be joined together to save space (and possibly to
+ *              make silly words): e.g., instead of giving options
+ *              `%|-x -y|%', a user could write `%|-xy|%'.  Some short
+ *              options can have arguments, which appear after the option
+ *              letter, either immediately following, or in the next `word'
+ *              (so an option with an argument could be written as
+ *              `%|-o foo|%' or as `%|-ofoo|%').  Note that options with
+ *              optional arguments must be written in the second style.
+ *
+ *              When a short option controls a flag setting, it is sometimes
+ *              possible to explicitly turn the flag off, as well as turning
+ *              it on, (usually to override default options).  This is
+ *              usually done by using a `%|+|%' instead of a `%|-|%' to
+ *              introduce the option.
+ *
+ *              Long options, as popularised by the GNU utilities, are given
+ *              long-ish memorable names, preceded by a double-dash `%|--|%'.
+ *              Since their names are more than a single character, long
+ *              options can't be combined in the same way as short options.
+ *              Arguments to long options may be given either in the same
+ *              `word', separated from the option name by an equals sign, or
+ *              in the following `word'.
+ *
+ *              Long option names can be abbreviated if necessary, as long
+ *              as the abbreviation is unique.  This means that options can
+ *              have sensible and memorable names but still not require much
+ *              typing from an experienced user.
+ *
+ *              Like short options, long options can control flag settings.
+ *              The options to manipulate these settings come in pairs: an
+ *              option of the form `%|--set-flag|%' might set the flag, while
+ *              an option of the form `%|--no-set-flag|%' might clear it.
+ *
+ *              It is usual for applications to provide both short and long
+ *              options with identical behaviour.  Some applications with
+ *              lots of options may only provide long options (although they
+ *              will often be only two or three characters long).  In this
+ *              case, long options can be preceded with a single `%|-|%'
+ *              character, and negated by a `%|+|%' character.
+ *
+ *              Finally, some (older) programs accept arguments of the form
+ *              `%%@.{"-"<number>}%%', to set some numerical parameter,
+ *              typically a line count of some kind.
+ *
+ *
+ *          How programs parse options
+ *
+ *              An application parses its options by calling mdwopt
+ *              repeatedly.  Each time it is called, mdwopt returns a value
+ *              describing the option just read, and stores information about
+ *              the option in a data block.  The value %$-1$% is returned
+ *              when there are no more options to be read.  The `%|?|%'
+ *              character is returned when an error is encountered.
+ *
+ *              Before starting to parse options, the value @data->ind@ must
+ *              be set to 0 or 1. The value of @data->err@ can also be set,
+ *              to choose whether errors are reported by mdwopt.
+ *
+ *              The program's `@argc@' and `@argv@' arguments are passed to
+ *              the options parser, so that it can read the command line.  A
+ *              flags word is also passed, allowing the program fine control
+ *              over parsing.  The flags are described above.
+ *
+ *              Short options are described by a string, which once upon a
+ *              time just contained the permitted option characters.  Now the
+ *              options string begins with a collection of flag characters,
+ *              and various flag characters can be put after options
+ *              characters to change their properties.
+ *
+ *              If the first character of the short options string is
+ *              `%|+|%', `%|-|%' or `%|!|%', the order in which options are
+ *              read is modified, as follows:
+ *
+ *              `%|+|%' forces the POSIX order to be used. As soon as a non-
+ *                      option is found, mdwopt returns %$-1$%.
+ *
+ *              `%|-|%' makes mdwopt treat non-options as being `special'
+ *                      sorts of option. When a non-option word is found, the
+ *                      value 0 is returned, and the actual text of the word
+ *                      is stored as being the option's argument.
+ *
+ *              `%|!|%' forces the default order to be used.  The entire
+ *                      command line is scanned for options, which are
+ *                      returned in order.  However, during this process,
+ *                      the options are moved in the @argv@ array, so that
+ *                      they appear before the non- options.
+ *
+ *              A `%|:|%' character may be placed after the ordering flag (or
+ *              at the very beginning if no ordering flag is given) which
+ *              indicates that the character `%|:|%', rather than `%|?|%',
+ *              should be returned if a missing argument error is detected.
+ *
+ *              Each option in the string can be followed by a `%|+|%' sign,
+ *              indicating that it can be negated, a `%|:|%' sign indicating
+ *              that it requires an argument, or a `%|::|%' string,
+ *              indicating an optional argument.  Both `%|+|%' and `%|:|%' or
+ *              `%|::|%' may be given, although the `%|+|%' must come first.
+ *
+ *              If an option is found, the option character is returned to
+ *              the caller.  A pointer to an argument is stored in
+ *              @data->arg@, or @NULL@ is stored if there was no argument.
+ *              If a negated option was found, the option character is
+ *              returned ORred with @gFlag_negated@ (bit 8 set).
+ *
+ *              Long options are described in a table.  Each entry in the
+ *              table is of type @struct option@, and the table is terminated
+ *              by an entry whose @name@ field is null.  Each option has
+ *              a flags word which, due to historical reasons, is called
+ *              @has_arg@.  This describes various properties of the option,
+ *              such as what sort of argument it takes, and whether it can
+ *              be negated.
+ *
+ *              When mdwopt finds a long option, it looks the name up in the
+ *              table. The index of the matching entry is stored in the
+ *              @longind@ variable, passed to mdwopt (unless @longind@ is 0):
+ *              a value of %$-1$% indicates that no long option was
+ *              found. The behaviour is then dependent on the values in the
+ *              table entry.  If @flag@ is nonzero, it points to an integer
+ *              to be modified by mdwopt.  Usually the value in the @val@
+ *              field is simply stored in the @flag@ variable. If the flag
+ *              @gFlag_switch@ is set, however, the value is combined with
+ *              the existing value of the flags using a bitwise OR.  If
+ *              @gFlag_negate@ is set, then the flag bit will be cleared if a
+ *              matching negated long option is found.  The value 0 is
+ *              returned.
+ *
+ *              If @flag@ is zero, the value in @val@ is returned by mdwopt,
+ *              possibly with bit 8 set if the option was negated.
+ *
+ *              Arguments for long options are stored in @data->arg@, as
+ *              before.
+ *
+ *              Numeric options, if enabled, cause the value `%|#|%' to be
+ *              returned, and the numeric value to be stored in @data->opt@.
+ *
+ *              If the flag @gFlag_envVar@ is set on entry, options will be
+ *              extracted from an environment variable whose name is built by
+ *              capitalising all the letters of the program's name.  (This
+ *              allows a user to have different default settings for a
+ *              program, by calling it through different symbolic links.)  */
+
+int mdwopt(int argc, char *const *argv,
+	   const char *shortopt,
+	   const struct option *longopts, int *longind,
+	   mdwopt_data *data, int flags)
+{
+  /* --- Local variables --- */
+
+  char *p, *q, *r;			/* Some useful things to have */
+  char *prefix;				/* Prefix from this option */
+  int i;				/* Always useful */
+  char noarg = '?';			/* Standard missing-arg char */
+
+  /* --- Sort out our data --- */
+
+  if (!data)				/* If default data requested */
+    data = &mdwopt_global;		/* Then use the global stuff */
+
+  /* --- See if this is the first time --- */
+
+  if (data->ind == 0 || (data->ind == 1 && ~flags & gFlag_noProgName)) {
+
+    /* --- Sort out default returning order --- */
+
+    if (getenv("_POSIX_OPTION_ORDER") || /* Examine environment for opts */
+	getenv("POSIXLY_CORRECT"))	/* To see if we disable features */
+      data->order = ord__posix;		/* If set, use POSIX ordering */
+    else
+      data->order = ord__permute;	/* Otherwise mangle the options */
+
+    /* --- Now see what the caller actually wants --- */
+
+    switch (shortopt[0]) {		/* Look at the first character */
+      case '-':				/* `%|-|%' turns on in-orderness */
+	data->order = ord__return;
+	break;
+      case '+':				/* `%|+|%' turns on POSIXness */
+	data->order = ord__posix;
+	break;
+      case '!':				/* `%|!|%' ignores POSIXness */
+	data->order = ord__permute;
+	break;
+    }
+
+    /* --- Now decide on the program's name --- */
+
+    if (~flags & gFlag_noProgName) {
+      p = q = (char *)argv[0];
+      while (*p) {
+	if (*p++ == PATHSEP)
+	  q = p;
+      }
+      data->prog = q;
+
+      data->ind = data->next = 1;
+      data->list = 0;
+
+      /* --- See about environment variables --- *
+       *
+       * Be careful.  The program may be setuid, and an attacker might have
+       * given us a long name in @argv[0]@.  If the name is very long, don't
+       * support this option.
+       */
+
+      if (flags & gFlag_envVar && strlen(data->prog) < 48) {
+
+	char buf[64];
+
+	/* --- For RISC OS, support a different format --- *
+	 *
+	 * Acorn's RISC OS tends to put settings in variables named
+	 * `App$Options' rather than `APP'.  Under RISC OS, I'll support
+	 * both methods, just to avoid confuddlement.
+	 */
+
+#ifdef __riscos
+	sprintf(buf, "%s$Options", data->prog);
+	p = getenv(buf);
+	if (!p) {
+#endif
+
+	  p = buf;			/* Point to a buffer */
+	  q = data->prog;		/* Point to program name */
+	  while (*q)			/* While characters left here */
+	    *p++ = toupper(*q++);	/* Copy and uppercase */
+	  *p++ = 0;			/* Terminate my copy of this */
+	  p = getenv(buf);		/* Get the value of the variable */
+
+#ifdef __riscos
+	}
+#endif
+
+	/* --- Copy the options string into a buffer --- */
+
+	if (p) {			/* If it is defined */
+	  q = malloc(strlen(p) + 1);	/* Allocate space for a copy */
+	  if (!q) {			/* If that failed */
+	    fprintf(stderr,		/* Report a nice error */
+		    "%s: Not enough memory to read settings in "
+		    "environment variable\n",
+		    data->prog);
+	  } else {			/* Otherwise */
+	    strcpy(q, p);		/* Copy the text over */
+	    data->ind = -1;		/* Mark that we're parsing envvar */
+	    data->env = data->estart = q; /* And store the pointer away */
+	  }
+	}
+
+      }
+    }
+    else
+      data->ind = data->next = 0;
+  }
+
+  /* --- Do some initial bodgery --- *
+   *
+   * The @shortopt@ string can have some interesting characters at the
+   * beginning.  We'll skip past them.
+   */
+
+  switch (shortopt[0]) {
+    case '+':
+    case '-':
+    case '!':
+      shortopt++;
+      break;
+  }
+
+  if (shortopt[0] == ':') {
+    noarg = shortopt[0];
+    shortopt++;
+  }
+
+  if (longind)				/* Allow longind to be null */
+    *longind = -1;			/* Clear this to avoid confusion */
+  data->opt = -1;			/* And this too */
+  data->arg = 0;			/* No option set up here */
+
+  /* --- Now go off and search for an option --- */
+
+  if (!data->list || !*data->list) {
+    data->order &= 3;			/* Clear negation flag */
+
+    /* --- Now we need to find the next option --- *
+     *
+     * Exactly how we do this depends on the settings of the order variable.
+     * We identify options as being things starting with `%|-|%', and which
+     * aren't equal to `%|-|%' or `%|--|%'.  We'll look for options until:
+     *
+     *   * We find something which isn't an option AND @order == ord__posix@
+     *   * We find a `%|--|%'
+     *   * We reach the end of the list
+     *
+     * There are some added little wrinkles, which we'll meet as we go.
+     */
+
+    for (;;) {				/* Keep looping for a while */
+      p = mo__nextWord(argc, argv, data); /* Get the next word out */
+      if (!p)				/* If there's no next word */
+	return (EOF);			/* There's no more now */
+
+      /* --- See if we've found an option --- */
+
+      if ((p[0] == '-' || (p[0] == '+' && flags & gFlag_negation)) &&
+	  p[1] != 0) {
+	if (strcmp(p, "--") == 0) {	/* If this is the magic marker */
+	  mo__permute(argv, data);	/* Stow the magic marker item */
+	  return (EOF);			/* There's nothing else to do */
+	}
+	break;				/* We've found something! */
+      }
+
+      /* --- Figure out how to proceed --- */
+
+      switch (data->order & 3) {
+	case ord__posix:		/* POSIX option order */
+	  return (EOF);			/* This is easy */
+	  break;
+	case ord__permute:		/* Permute the option order */
+	  break;
+	case ord__return:		/* Return each argument */
+	  mo__permute(argv, data);	/* Insert word in same place */
+	  data->arg = p;		/* Point to the argument */
+	  return (0);			/* Return the value */
+      }
+    }
+
+    /* --- We found an option --- */
+
+    mo__permute(argv, data);		/* Do any permuting necessary */
+
+    /* --- Check for a numeric option --- *
+     *
+     * We only check the first character (or the second if the first is a
+     * sign).  This ought to be enough.
+     */
+
+    if (flags & gFlag_numbers && (p[0] == '-' || flags & gFlag_negNumber)) {
+      if (((p[1] == '+' || p[1] == '-') && isdigit((unsigned char)p[2])) ||
+	  isdigit((unsigned char)p[1])) {
+	data->opt = strtol(p + 1, &data->arg, 10);
+	while (isspace((unsigned char)data->arg[0]))
+	  data->arg++;
+	if (!data->arg[0])
+	  data->arg = 0;
+	return (p[0] == '-' ? '#' : '#' | gFlag_negated);
+      }
+    }
+
+    /* --- Check for a long option --- */
+
+    if (p[0] == '+')
+      data->order |= ord__negate;
+
+    if (((p[0] == '-' && p[1] == '-') ||
+	 (flags & gFlag_noShorts && !mo__findOpt(p[1], shortopt, data))) &&
+	(~flags & gFlag_noLongs))	/* Is this a long option? */
+    {
+      int match = -1;			/* Count matches as we go */
+
+      if (p[0] == '+') {		/* If it's negated */
+	data->order |= ord__negate;	/* Set the negate flag */
+	p++;				/* Point to the main text */
+	prefix = "+";			/* Set the prefix string up */
+      } else if (p[1] == '-') {		/* If this is a `%|--|%' option */
+	if ((flags & gFlag_negation) && strncmp(p + 2, "no-", 3) == 0) {
+	  p += 5;			/* Point to main text */
+	  prefix = "--no-";		/* And set the prefix */
+	  data->order |= ord__negate;	/* Set the negatedness flag */
+	} else {
+	  p += 2;			/* Point to the main text */
+	  prefix = "--";		/* Remember the prefix string */
+	}
+      } else {
+	if ((flags & gFlag_negation) && strncmp(p + 1, "no-", 3) == 0) {
+	  p += 4;			/* Find the text */
+	  prefix = "-no-";		/* Set the prefix */
+	  data->order |= ord__negate;	/* Set negatedness flag */
+	} else {
+	  p++;				/* Otherwise find the text */
+	  prefix = "-";			/* And remember the prefix */
+	}
+      }
+
+      for (i = 0; longopts[i].name; i++) { /* Loop through the options */
+	if ((data->order & ord__negate) &&
+	    (~longopts[i].has_arg & gFlag_negate))
+	  continue;			/* If neg and opt doesn't allow */
+
+	r = (char *) longopts[i].name;	/* Point to the name string */
+	q = p;				/* Point to the string start */
+	for (;;) {			/* Do a loop here */
+	  if (*q == 0 || *q == '=') {	/* End of the option string? */
+	    if (*r == 0) {		/* If end of other string */
+	      match = i;		/* This is the match */
+	      goto botched;		/* And exit the loop now */
+	    }
+	    if (match == -1) {		/* If no match currently */
+	      match = i;		/* Then this is it, here */
+	      break;			/* Stop looking now */
+	    } else {
+	      match = -1;		/* Else it's ambiguous */
+	      goto botched;		/* So give up right now */
+	    }
+	  }
+	  else if (*q != *r)		/* Otherwise if mismatch */
+	    break;			/* Abort this loop */
+	  q++, r++;			/* Increment the counters */
+	}
+      }
+
+    botched:
+      if (match == -1) {		/* If we couldn't find a match */
+	if (data->err) {
+	  fprintf(stderr, "%s: unrecognised option `%s%s'\n",
+		  data->prog,
+		  prefix, p);
+	}
+	return ('?');
+      }
+
+      if (longind)			/* Allow longind to be null */
+	*longind = match;		/* Store the match away */
+
+      /* --- Handle argument behaviour --- */
+
+      while (*p != 0 && *p != '=')	/* Find the argument string */
+	p++;
+      p = (*p ? p + 1 : 0);		/* Sort out argument presence */
+      q = (char *) longopts[match].name; /* Remember the name here */
+
+      switch (longopts[match].has_arg & 3) {
+	case no_argument:
+	  if (p) {
+	    if (data->err) {
+	      fprintf(stderr,
+		      "%s: option `%s%s' does not accept arguments\n",
+		      data->prog,
+		      prefix, q);
+	    }
+	    return ('?');
+	  }
+	  break;
+
+	case required_argument:
+	  if (!p) {			/* If no argument given */
+	    p = mo__nextWord(argc, argv, data);
+
+	    if (!p) {			/* If no more arguments */
+	      if (data->err) {
+		fprintf(stderr, "%s: option `%s%s' requires an argument\n",
+			data->prog,
+			prefix, q);
+	      }
+	      return (noarg);
+	    }
+
+	    mo__permute(argv, data);
+	  }
+	  break;
+
+	case optional_argument:
+	  /* Who cares? */
+	  break;
+      }
+      data->arg = p;
+
+      /* --- Do correct things now we have a match --- */
+
+      if (longopts[match].flag) {	/* If he has a @flag@ argument */
+	if (longopts[match].has_arg & gFlag_switch) {
+	  if (data->order & ord__negate)
+	    *longopts[match].flag &= ~longopts[match].val;
+	  else
+	    *longopts[match].flag |= longopts[match].val;
+	} else {
+	  if (data->order & ord__negate)
+	    *longopts[match].flag = 0;
+	  else
+	    *longopts[match].flag = longopts[match].val;
+	}
+	return (0);			/* And return something */
+      } else {
+	if (data->order & ord__negate)
+	  return (longopts[match].val | gFlag_negated);
+	else
+	  return (longopts[match].val);
+      }
+    }
+
+    /* --- Do short options things --- */
+
+    else {
+      if (p[0] == '+')			/* If starts with a `%|+|%' */
+	data->order |= ord__negate;
+      data->list = p + 1;		/* Omit leading `%|-|%'/`%|+|%' */
+    }
+  }
+
+  /* --- Now process the short options --- */
+
+  i = *data->list++;			/* Get the next option letter */
+  data->opt = i;			/* Store this away nicely */
+
+  p = (char *) mo__findOpt(i, shortopt, data);
+  if (!p) {				/* No more options left */
+    if (data->err) {
+      fprintf(stderr, "%s: unknown option `%c%c'\n",
+	      data->prog,
+	      data->order & ord__negate ? '+' : '-',
+	      i);
+    }
+    return ('?');
+  }
+
+  data->opt = i;			/* Store this for the caller */
+
+  /* --- Sort out an argument, if we expect one --- */
+
+  if (p[0] == ':') {			/* If we expect an option */
+    q = (data->list[0] ? data->list : 0); /* If argument expected, use it */
+    data->list = 0;			/* Kill the remaining options */
+    if (p[1] != ':' && !q) {		/* If no arg, and not optional */
+
+      /* --- Same code as before --- */
+
+      q = mo__nextWord(argc, argv, data); /* Read the next word */
+      if (!q) {				/* If no more arguments */
+	if (data->err) {
+	  fprintf(stderr, "%s: option `%c%c' requires an argument\n",
+		  data->prog,
+		  data->order & ord__negate ? '+' : '-',
+		  i);
+	}
+	return (noarg);
+      }
+      mo__permute(argv, data);
+    }
+
+    data->arg = q;
+  }
+  return ((data->order & ord__negate) ? i | gFlag_negated : i);
+}
+
+/*----- That's all, folks -------------------------------------------------*/

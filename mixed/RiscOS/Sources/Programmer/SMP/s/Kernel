@@ -1,0 +1,639 @@
+; 
+; Copyright (c) 2017, RISC OS Open Ltd
+; All rights reserved.
+; 
+; Redistribution and use in source and binary forms, with or without
+; modification, are permitted provided that the following conditions are met: 
+;     * Redistributions of source code must retain the above copyright
+;       notice, this list of conditions and the following disclaimer.
+;     * Redistributions in binary form must reproduce the above copyright
+;       notice, this list of conditions and the following disclaimer in the
+;       documentation and/or other materials provided with the distribution.
+;     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+;       may be used to endorse or promote products derived from this software
+;       without specific prior written permission.
+; 
+; THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+; AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+; IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+; ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+; LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+; CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+; SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+; INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+; CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+; ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+; POSSIBILITY OF SUCH DAMAGE.
+; 
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr.Copro15ops
+        GET     Hdr:MEMM.VMSAv6
+        GET     Hdr:HALDevice
+        GET     Hdr:UpCall
+        GET     Hdr:Proc
+        GET     Hdr:Portable
+        GET     Hdr:FSNumbers
+        GET     Hdr:NewErrors
+        GET     Hdr.Defs
+
+        AREA    Kernel, CODE, READONLY, PIC
+
+        EXPORT  Kernel_ASM_Entry
+        EXPORT  Kernel_ASM_ResetVec
+        EXPORT  Kernel_ASM_UndVec
+        EXPORT  Kernel_ASM_SWIVec
+        EXPORT  Kernel_ASM_PrefetchAbortVec
+        EXPORT  Kernel_ASM_DataAbortVec
+        EXPORT  Kernel_ASM_AddrExVec
+        EXPORT  Kernel_ASM_IRQVec
+        EXPORT  Kernel_ASM_FIQVec
+        EXPORT  Kernel_ASM_Reschedule
+        EXPORT  Kernel_ASM_SwitchThread
+        EXPORT  Kernel_ASM_RequestReschedule
+        EXPORT  Kernel_ASM_InitThread
+        EXPORT  Kernel_ASM_TerminateThread
+        EXPORT  Kernel_ASM_MOSSWI0
+        EXPORT  Kernel_ASM_MOSSWI1
+        EXPORT  Kernel_ASM_Fatal
+        EXPORT  riscos_irq1v
+        EXPORT  riscos_claimdevicevector
+        EXPORT  riscos_releasedevicevector
+
+        IMPORT  Kernel_C_Entry
+        IMPORT  Kernel_C_UndVec
+        IMPORT  Kernel_C_SWIVec
+        IMPORT  Kernel_C_PrefetchAbortVec
+        IMPORT  Kernel_C_DataAbortVec
+        IMPORT  Kernel_C_IRQVec
+        IMPORT  Kernel_C_Reschedule
+        IMPORT  thread_init_thread
+        IMPORT  irq_claim_swi
+        IMPORT  irq_release_swi
+        IMPORT  BranchToSWIExit
+
+        ; Macro to construct and restore ARM context dumps from the stack
+        ; These macros read/write to below SP, so it's assumed that we won't get
+        ; re-entered during execution (but this assumption should be OK since
+        ; the ARM can't really recover from such a recursive abort anyway, e.g.
+        ; SPSR will be corrupted)
+        ; In reality a recursive abort will only happen if we ourselves trigger
+        ; an abort or a FIQ handler triggers an abort.
+        MACRO
+        CreateARMCtx $mode
+        ; Out: r0 -> ARM context (pushed on stack)
+        ;      r1 = SPSR
+        ;      r2-r3, lr corrupted
+        ASSERT  ARMCtx_Regs + 16*4 = ARMCtx_Size
+        ; Store R0-R7 and R15
+        STR     lr, [sp, #ARMCtx_Regs+15*4-ARMCtx_Size]
+        SUB     lr, sp, #ARMCtx_Size-ARMCtx_Regs ; lr -> ARMCtx_Regs
+        STMIA   lr, {r0-r7}
+        ; Store SPSR
+        SUB     r0, sp, #ARMCtx_Size-(ARMCtx_Regs+8*4) ; sp -> R8-R14
+        MRS     r1, SPSR
+        STR     r1, [r0, #ARMCtx_PSR-(ARMCtx_Regs+8*4)]
+        ; Recover R8-R14 from original mode
+        ANDS    r2, r1, #&F         ; Get the exception mode
+        MRS     r3, CPSR
+        ASSERT  (USR32_mode :AND: &F) = 0
+        ORREQ   r2, r2, #SYS32_mode ; Use SYS mode instead of USR
+        BFI     r3, r2, #0, #4
+        MSR     CPSR_c, r3          ; Select original mode (or equiv.)
+        STMIA   r0, {r8-r14}        ; Store banked regs
+        CPS     #$mode              ; Back to exception handler mode
+        SUB     r0, r0, #ARMCtx_Regs+8*4 ; r0 -> start of dump
+        SUB     sp, sp, #ARMCtx_Size ; Reserve the space for the dump. This comes last so that the stored SP is correct for cases where the abort came from the current CPU mode.
+        MEND
+
+        MACRO
+        RestoreARMCtx $ctx, $mode
+        ; In: $ctx -> context to restore (must be located on a stack for this mode)
+        CLREX                       ; Will be redundant in some situations, but do it now for safety anyway
+        ADD     r7, $ctx, #ARMCtx_Regs
+        LDMIA   r7!, {r0-r6}        ; Restore as many unbanked regs as possible
+        LDR     r8, [r7, #ARMCtx_PSR-(ARMCtx_Regs+7*4)] ; r8 = SPSR to use
+        CPSID   i                   ; Disable IRQs for remainder (re-entrancy danger zone)
+        ANDS    r9, r8, #&F         ; Get target mode
+        MSR     SPSR_cxsf, r8       ; Restore SPSR
+        MRS     r10, CPSR
+        ASSERT  (USR32_mode :AND: &F) = 0
+        ORREQ   r9, r9, #SYS32_mode ; Use SYS mode instead of USR
+        BFI     r10, r9, #0, #4
+        ADD     sp, r7, #ARMCtx_Size-(ARMCtx_Regs+7*4) ; Junk context from stack
+        MSR     CPSR_c, r10         ; Select target mode (or equiv.)
+        LDMIA   r7, {r7-r14}        ; Restore R7-R14 (may do redundant restore of R13 if dest mode == handler mode)
+        CPS     #$mode              ; Back to handler mode
+        ASSERT  ARMCtx_Regs+16*4=ARMCtx_Size
+        LDMDB   sp, {pc}^           ; Return from exception
+        MEND
+
+        MACRO
+        SetupCEnvironment $corews
+        ASSERT  $corews < sl
+        ; Save current relocation offsets on the stack
+        MOV     sl, sp, LSR #20
+        MOV     sl, sl, LSL #20
+        LDMIA   sl, {fp, ip}
+        Push    "fp, ip"
+        ; Set up new relocation offsets
+      [ CWS_RelocOffsets <> 0
+        ADD     ip, $corews, #CWS_RelocOffsets
+        LDMIA   ip, {fp, ip}
+      |
+        LDMIA   $corews, {fp, ip}
+      ]
+        STMIA   sl, {fp, ip}
+        ; Set up APCS registers
+        MOV     fp, #0
+        ADD     sl, sl, #540
+        MEND
+
+        MACRO
+        RestoreCEnvironment $corews
+        ; Restore original relocation offsets
+        Pull    "fp, ip"
+        SUB     sl, sl, #540
+        STMIA   sl, {fp, ip}
+        MEND
+
+Kernel_ASM_Entry
+        GetCoreWS r1
+        ; Set up processor vectors
+        LDR     r2, [r1, #CWS_ProcVecs]
+        MCR     p15, 0, r2, c12, c0, 0
+        ISB
+        ; Set up stacks
+        CPS     #UND32_mode
+        LDR     sp, [r1, #CWS_UNDStack]
+        CPS     #ABT32_mode
+        LDR     sp, [r1, #CWS_ABTStack]
+        CPS     #IRQ32_mode
+        LDR     sp, [r1, #CWS_IRQStack]
+        CPS     #SVC32_mode
+        LDR     sp, [r1, #CWS_SVCStack]
+        ; Set up context for the idle thread
+        MOV      r0, #SVC32_mode+A32_bit ; idle thread runs in SVC32, I+F enabled
+        MSR      SPSR_cxsf, r0
+        ADR      lr, Sleep_Entry
+        ; Enter kernel
+        CreateARMCtx SVC32_mode
+        GetCoreWS r1
+        SetupCEnvironment r1
+        BL      Kernel_C_Entry
+        B       Restore_SVC
+
+Sleep_Entry
+        GetCoreWS r0
+        SetupCEnvironment r0
+Sleep
+      [ {TRUE}
+        ; WFE sleep doesn't really work, since the thread array spinlock will
+        ; SEV on release of the lock, causing us to wake again. So use
+        ; Portable_Idle instead, and rely on the reschedule IRQ to bring us out
+        ; of idle once a runnable thread is available.
+        SWI     XPortable_Idle
+        WFEVS
+      |
+        WFE
+      ]
+        ; Since the event register is set by exception returns, we can't use a
+        ; SWI to trigger the thread scheduler (the SWI return will prevent the
+        ; following WFE from sleeping). We must call the function directly.
+        BL      Kernel_C_Reschedule
+        B       Sleep
+
+Kernel_ASM_ResetVec ROUT
+Kernel_ASM_AddrExVec
+        ; ???
+        UND
+
+Kernel_ASM_UndVec ROUT
+;        SUB     lr, lr, #4 ; -> aborting instruction
+        CreateARMCtx UND32_mode
+        GetCoreWS r1
+        SetupCEnvironment r1
+        BL      Kernel_C_UndVec
+        ; Fall through...
+Restore_UND
+        GetCoreWS r2
+        RestoreCEnvironment r2
+        RestoreARMCtx sp, UND32_mode
+
+Kernel_ASM_SWIVec ROUT
+        ; No LR adjustment, assume the SWI will be handled and we'll want to return to the next instruction
+        CreateARMCtx SVC32_mode
+        ; Restore caller's IRQ state
+        TST     r1, #I32_bit
+        BNE     %FT10
+        CPSIE   i
+10
+        ; n.b. accessing core workspace with IRQs enabled is technically unsafe, since we could be rescheduled onto a different core at any time
+        ; But we're only using the core workspace to get access to the relocation offsets, so there's no harm if we end up using another core's workspace
+        GetCoreWS r1
+        SetupCEnvironment r1
+        BL      Kernel_C_SWIVec
+        ; Fall through...
+Restore_SVC
+        GetCoreWS r2
+        RestoreCEnvironment r2
+        RestoreARMCtx sp, SVC32_mode
+
+Kernel_ASM_PrefetchAbortVec ROUT
+;        SUB     lr, lr, #4 ; -> aborting instruction
+        CreateARMCtx ABT32_mode
+        GetCoreWS r1
+        SetupCEnvironment r1
+        BL      Kernel_C_PrefetchAbortVec
+        ; Fall through...
+Restore_ABT        
+        GetCoreWS r2
+        RestoreCEnvironment r2
+        RestoreARMCtx sp, ABT32_mode
+
+Kernel_ASM_DataAbortVec ROUT
+        CLREX              ; Exclusive monitor is in unpredictable state "after taking a data abort", clear it here
+;        SUB     lr, lr, #8 ; -> aborting instruction
+        CreateARMCtx ABT32_mode
+        GetCoreWS r1
+        SetupCEnvironment r1
+        ARM_read_FAR r2
+        ARM_read_FSR r3
+        BL      Kernel_C_DataAbortVec
+        B       Restore_ABT
+
+Kernel_ASM_IRQVec ROUT
+        SUB     lr, lr, #4 ; -> return address
+        CreateARMCtx IRQ32_mode
+        GetCoreWS r1
+        SetupCEnvironment r1
+        BL      Kernel_C_IRQVec
+        ; Fall through...
+Restore_IRQ
+        GetCoreWS r2
+        RestoreCEnvironment r2
+        RestoreARMCtx sp, IRQ32_mode
+
+Kernel_ASM_FIQVec ROUT
+        ; TODO: Disable all FIQs, return to caller
+        ; Can use CWS_ProcVecs + size as stack
+        UND
+
+; void Kernel_ASM_Request_Reschedule(armcontext_t *ctx);
+; Assuming we're about to return to the foreground (i.e. IRQ/ABT/UND ->
+; SVC/SYS/USR), poke the provided context 'ctx' so that we will actually run
+; the thread scheduler instead.
+; Also, interrupts must be disabled.
+Kernel_ASM_RequestReschedule ROUT
+        LDR     r2, [r0, #ARMCtx_Regs+15*4]
+        ADR     r3, Kernel_ASM_Reschedule
+        CMP     r2, r3
+        MOVEQ   pc, lr                  ; Reschedule has already been requested
+        ; OK, copy r0 to the SVC stack
+        Push    "r4-r9"
+        MRS     r3, CPSR                ; Remember old mode
+        CPS     #SVC32_mode
+        SUB     sp, sp, #ARMCtx_Size
+        MOV     r1, sp
+        MRS     r4, SPSR
+        Push    "r4, r14"               ; Save SPSR_svc, R14_svc (as expected by Kernel_ASM_Reschedule)
+        ASSERT  ARMCtx_Size = 17*4
+        ASSERT  ARMCtx_Regs+16*4=ARMCtx_Size
+        MOV     r14, r2
+        LDMIA   r0!, {r2,r4-r9,r12}     ; 8 words (PSR, r0-r6)
+        STMIA   r1!, {r2,r4-r9,r12}
+        LDMIA   r0,  {r2,r4-r9,r12}     ; 8 words (r7-r14)
+        STMIA   r1,  {r2,r4-r9,r12,r14} ; 9 words (r7-r15)
+        MOV     r2, sp                  ; Remember R13_svc
+        MSR     CPSR_c, r3              ; Back to original mode
+        ; Now fixup the context in r0 to say that we want to return to Kernel_ASM_Reschedule in SVC mode (with IRQs disabled)
+        ADR     r1, Kernel_ASM_Reschedule
+        STR     r2, [r0, #(13-7)*4]     ; Patch SP
+        BIC     r3, r3, #M32_bits
+        STR     r1, [r0, #(15-7)*4]     ; Patch PC
+        ORR     r3, r3, #SVC32_mode
+        STR     r3, [r0, #ARMCtx_PSR-8*4] ; Patch PSR
+        Pull    "r4-r9"
+        MOV     pc, lr
+        
+
+Kernel_ASM_Reschedule ROUT
+        ; Entered in SVC32 with interrupts disabled
+        ; SPSR_svc, R14_svc are stacked
+        ; ARM context on stack
+        GetCoreWS r0
+        SetupCEnvironment r0
+        BL      Kernel_C_Reschedule
+        GetCoreWS r0
+        RestoreCEnvironment r0
+        Pull    "r0, r14"
+        MSR     SPSR_cxsf, r0       ; Restore SPSR_svc
+        ADD     r7, sp, #ARMCtx_Regs
+        ADD     sp, sp, #ARMCtx_Size ; Restore R13_svc (we may be returning to USR)
+        CPS     #IRQ32_mode         ; Switch to IRQ mode to perform restore (avoid corrupting SPSR_svc, R14_svc)
+        ; Manual context restore to get sp adjustments correct
+        CLREX                       ; Will be redundant in some situations, but do it now for safety anyway
+        LDMIA   r7!, {r0-r6}        ; Restore as many unbanked regs as possible
+        LDR     r8, [r7, #ARMCtx_PSR-(ARMCtx_Regs+7*4)] ; r8 = SPSR to use
+        ANDS    r9, r8, #&F         ; Get target mode
+        MSR     SPSR_cxsf, r8       ; Restore SPSR
+        MRS     r10, CPSR
+        ASSERT  (USR32_mode :AND: &F) = 0
+        ORREQ   r9, r9, #SYS32_mode ; Use SYS mode instead of USR
+        BFI     r10, r9, #0, #4
+        LDR     r14, [r7, #(15-7)*4] ; R14_irq = PC to restore
+        MSR     CPSR_c, r10         ; Select target mode (or equiv.)
+        LDMIA   r7, {r7-r14}        ; Restore R7-R14
+        CPS     #IRQ32_mode         ; Back to IRQ mode
+        ASSERT  ARMCtx_Regs+16*4=ARMCtx_Size
+        MOVS    pc, lr              ; Return from exception
+
+; void *Kernel_ASM_SwitchThread(void *r0, threadregs_t *to, threadregs_t **from);
+; Push current context to stack, set 'from' to the pointer
+; Restore context from 'to' (popping from its stack)
+; New context will be entered with the provided r0 value
+Kernel_ASM_SwitchThread ROUT
+        ASSERT  THDCtx_PC + 4 = THDCtx_Size
+        ASSERT  THDCtx_SVCRegs + 7*4 = THDCtx_PC
+        Push    "v1-v6,fp,lr"
+        SUB     sp, sp, #THDCtx_SVCRegs ; -> start of context
+        STR     sp, [r2]            ; Save pointer to this context
+        ASSERT  THDCtx_USRRegs = 0
+        STMIA   sp, {r13,r14}^
+        MRC     p15, 0, r2, c13, c0, 3 ; TPIDRURO
+        MRC     p15, 0, r3, c13, c0, 2 ; TPIDRURW
+        ASSERT  THDCtx_TPIDRURW = THDCtx_TPIDRURO + 4
+        STRD    r2, [sp, #THDCtx_TPIDRURO]
+        ; Restore 'to' context
+        LDMIA   r1, {r13,r14}^
+        ADD     r1, r1, #8
+        LDMIA   r1!, {r2-r3,v1-v6,fp,lr}
+        MCR     p15, 0, r2, c13, c0, 3
+        MCR     p15, 0, r3, c13, c0, 2
+        ; Reset stack pointer & SL
+        MOV     sp, r1
+        BFI     r1, sl, #0, #20        ; r1 is new SL
+        MOV     sl, r1
+        ; Techincally a MP-safe IMB needs to trigger an ISB on all cores in
+        ; order to make sure they've completed their cache maintenance before
+        ; they're allowed to proceed and execute the modified code. Currently
+        ; we don't do that, so to allow safe creation of threads (using code
+        ; that's just been written to memory) we trigger an ISB here as part of
+        ; the context switch code.
+        ;
+        ; Note that we can't place the ISB in Kernel_ASM_InitThread because we
+        ; need to make sure all cores which a thread runs on will receive the
+        ; ISB, while Kernel_ASM_InitThread will only run for the first core the
+        ; thread runs on.
+        ;
+        ; Also note that this ISB means that if a user can guarantee that all
+        ; threads (which want to use the code) are suspended at the time the
+        ; code is updated then they'll be safe to use the code... but being
+        ; able to guarantee that isn't easy, so for now it's best to say this
+        ; only provides us protection for newly-created threads.
+        ISB
+        MOV     pc, lr
+
+Kernel_ASM_InitThread ROUT
+        ; Allow the C code to finish initialising the thread
+        GetCoreWS r4
+        SetupCEnvironment r4
+        BL      thread_init_thread
+        ; Now we just need to restore the ARM context
+        RestoreCEnvironment r4
+        RestoreARMCtx sp, SVC32_mode
+
+; Default LR for threads, allows user to terminate by returning from their main
+; function
+; R0 will be used as the exit code
+Kernel_ASM_TerminateThread ROUT
+        MOV     r1, r0
+        MOV     r0, #0
+        ; We could be in user mode, so terminate via the SWI
+        SWI     SMP_TerminateThread
+        UND
+
+; In: r0-r9 SWI args
+; r10 -> full ARM context
+; r11 = SWI number
+; r12 = our private word
+Kernel_ASM_MOSSWI0 ROUT
+        TEQ     r11, #OS_UpCall
+        TEQEQ   r0, #UpCall_Sleep
+        BEQ     doupcall6
+        TEQ     r11, #OS_GenerateError
+        BEQ     dogenerateerror
+        TEQ     r11, #OS_IntOn
+        BEQ     dointon
+        TEQ     r11, #OS_IntOff
+        BEQ     dointoff
+        TEQ     r11, #OS_EnterOS
+        BEQ     doenteros
+        TEQ     r11, #OS_LeaveOS
+        BEQ     doleaveos
+        TEQ     r11, #OS_Exit
+        BEQ     doexit
+badswi
+        ADR     r0, Error_NotMPSafe
+dogenerateerror
+        SETV
+        MOV     pc, lr
+
+; TODO: Move to main error list
+Error_NotMPSafe
+        DCD     ErrorBase_SMP
+        DCB     "SWI not MP-safe", 0
+        ALIGN
+
+doupcall6
+        Entry
+        MOV     r0, r1
+        SWI     XSMP_Sleep
+        MOVVC   r0, #0
+        EXIT
+
+dointon
+        LDR     r12, [r10, #ARMCtx_PSR]
+        BIC     r12, r12, #I32_bit
+        MSR     cpsr_f, r12             ; Retain original flags, as per MOS
+        STR     r12, [r10, #ARMCtx_PSR]
+        MOV     pc, lr
+
+dointoff
+        LDR     r12, [r10, #ARMCtx_PSR]
+        ORR     r12, r12, #I32_bit
+        MSR     cpsr_f, r12             ; Retain original flags, as per MOS
+        STR     r12, [r10, #ARMCtx_PSR]
+        MOV     pc, lr
+
+doenteros
+        LDR     r12, [r10, #ARMCtx_PSR]
+        BIC     r12, r12, #&F
+        ORR     r12, r12, #SVC32_mode
+        MSR     cpsr_f, r12             ; Retain original flags, as per MOS
+        STR     r12, [r10, #ARMCtx_PSR]
+        ; The ARM context will have been from the point where the SWI was called, so the correct r13_svc to use will be r10 + ARMCtx_Size
+        ADD     r12, r10, #ARMCtx_Size
+        STR     r12, [r10, #ARMCtx_Regs+13*4]
+        ; Assume context r14 doesn't need fixing up
+        MOV     pc, lr
+
+doleaveos
+        LDR     r12, [r10, #ARMCtx_PSR]
+        BIC     r12, r12, #&F
+        MSR     cpsr_f, r12             ; Retain original flags, as per MOS
+        STR     r12, [r10, #ARMCtx_PSR]
+        ; Fetching r13_usr directly should be OK
+        ADD     r12, r12, #ARMCtx_Regs+13*4
+        STMIA   r12, {r13}^
+        MOV     pc, lr
+
+doexit
+        LDR     r12, =&58454241         ; ABEX
+        CMP     r12, r1
+        MOVEQ   r1, r2                  ; Use return code if provided
+        MOVNES  r1, r0                  ; Else use 1/0 depending on whether error provided
+        MOVNE   r1, #1
+        SWI     XSMP_TerminateThread
+        UND
+
+
+; In: r0-r9 SWI args
+; r10 -> full ARM context
+; r11 = SWI number minus 64
+; r12 = our private word
+Kernel_ASM_MOSSWI1 ROUT
+        TEQ     r11, #OS_ClaimDeviceVector-64
+        BEQ     doclaim
+        TEQ     r11, #OS_ReleaseDeviceVector-64
+        BEQ     dorelease
+        B       badswi
+
+doclaim
+        ; Set things up for a call into C
+        ; This is slightly wasteful since it will poke the relocation offsets
+        ; onto the stack again, but our current SWI despatcher is horrible
+        ; anyway.
+        Entry   "r0-r3"
+        GetCoreWS r3
+        SetupCEnvironment r3
+        BL      irq_claim_swi
+        GetCoreWS r1
+        RestoreCEnvironment r1
+        CMP     r0, #0
+        ADREQ   r0, Error_BadIRQ
+        FRAMSTR r0, EQ
+        SETV    EQ
+        EXIT
+
+dorelease
+        Entry   "r0-r3"
+        GetCoreWS r3
+        SetupCEnvironment r3
+        BL      irq_release_swi
+        GetCoreWS r1
+        RestoreCEnvironment r1
+        CMP     r0, #0
+        ADREQ   r0, Error_BadIRQ
+        FRAMSTR r0, EQ
+        SETV    EQ
+        EXIT
+
+; TODO: Move to main error list
+Error_BadIRQ
+        DCD     ErrorBase_SMP
+        DCB     "Bad device claim/release", 0
+        ALIGN
+
+; Wrapper for OS_ClaimDeviceVector calls from primary core
+; This is a SWI handler, so R10-R12 trashable
+riscos_claimdevicevector ROUT
+        SUB     sp, sp, #4
+        Push    "r0-r3,lr"
+        GetCoreWS r3
+        SetupCEnvironment r3
+        BL      irq_claim_swi
+        GetCoreWS r1
+        LDR     r2, [r1, #CWS_RelocOffsets+4]
+        LDR     r3, =BranchToSWIExit
+        LDR     r2, [r2, r3]
+        RestoreCEnvironment r1
+        STR     r2, [sp, #20]
+        CMP     r0, #0
+        Pull    "r0-r3,lr"
+        ADREQ   r0, Error_BadIRQ
+        ORREQ   lr, lr, #V_bit
+        Pull    "pc" ; -> BranchToSWIExit
+
+; Wrapper for OS_ReleaseDeviceVector calls from primary core
+; This is a SWI handler, so R10-R12 trashable
+riscos_releasedevicevector ROUT
+        SUB     sp, sp, #4
+        Push    "r0-r3,lr"
+        GetCoreWS r3
+        SetupCEnvironment r3
+        BL      irq_release_swi
+        GetCoreWS r1
+        LDR     r2, [r1, #CWS_RelocOffsets+4]
+        LDR     r3, =BranchToSWIExit
+        LDR     r2, [r2, r3]
+        RestoreCEnvironment r1
+        STR     r2, [sp, #20]
+        CMP     r0, #0
+        Pull    "r0-r3,lr"
+        ADREQ   r0, Error_BadIRQ
+        ORREQ   lr, lr, #V_bit
+        Pull    "pc" ; -> BranchToSWIExit
+
+; Handle primary core interrupts
+; r0-r3, r11, r12 trashable
+riscos_irq1v ROUT
+        Entry   "r10"
+        GetCoreWS r1
+        SetupCEnvironment r1
+        MOV     r0, #0 ; No context ptr
+        BL      Kernel_C_IRQVec
+        GetCoreWS r1
+        RestoreCEnvironment r1
+        EXIT
+
+; void Kernel_ASM_Fatal(_kernel_oserror *err, armcontext_t *ctx, void *svcstack);
+; Entered in ABT/UND with IRQs disabled
+; Kill the current thread with the given error + register dump
+Kernel_ASM_Fatal ROUT
+        ; First, reset the ABT/UND/SVC stacks
+        GetCoreWS r3
+        CPS     #UND32_mode
+        LDR     sp, [r3, #CWS_UNDStack]
+        CPS     #ABT32_mode
+        LDR     sp, [r3, #CWS_ABTStack]
+        CPS     #IRQ32_mode
+        LDR     sp, [r3, #CWS_IRQStack]
+        CPS     #SVC32_mode
+        MOV     sp, r2
+        ; Copy the context from r0 to sp, to allow it to be preserved
+        ASSERT  ARMCtx_Size = 17*4
+        ASSERT  ARMCtx_PSR = 0
+        LDR     r12, [r1], #ARMCtx_Size ; Move PSR to end of dump, as per MOS register dumps
+        LDMDB   r1!, {r4-r11}
+        STMDB   sp!, {r4-r12} ; 9 regs
+        LDMDB   r1!, {r4-r11}
+        STMDB   sp!, {r4-r11}
+        ; Remember this as the new pointer
+        MOV     r1, sp
+        ; Reset irqsema so that we think we're in the foreground
+        MOV     lr, #0
+        STR     lr, [r3, #CWS_IRQsema]
+        ; Check if we were in the idle thread
+        LDR     lr, [r3, #CWS_SVCStack]
+        CMP     lr, r2
+        SWINE   XSMP_TerminateThread ; No, we can kill this thread. Use context ptr as the exit code.
+        ; Yes, re-init the idle thread (error gets thrown away!)
+        MOV     sp, r2
+        CPSIE   if
+        SWI     XSMP_Yield
+        B       Sleep_Entry
+
+        END
+

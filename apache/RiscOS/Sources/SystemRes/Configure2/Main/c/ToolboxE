@@ -1,0 +1,294 @@
+/* Copyright 1998 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/******	ToolboxE.c ********************************************************\
+
+Project:	Ursula (RISC OS for Risc PC II)
+Component:	Configure central application
+This file:	Toolbox event code
+
+History:
+Date		Who	Change
+----------------------------------------------------------------------------
+10/12/1997	BJGA	Split from Main
+			Added these headers
+15/01/1998	BJGA	Menu items now only faded/unfaded just prior to being shown
+			(ie uses Menu_AboutToBeShown)
+			Added support for 'Load CMOS' and 'Default CMOS' menu items
+			Better OS version read routine
+			Changed CMOS file format
+29/04/1998	BJGA	If Boot$OSVersion cannot be read, now saves old format CMOS file
+05/08/1998	BJGA	If !Help is already loaded, a click on "Help..." menu item now
+			broadcasts Message_HelpEnable 0 to ensure it is unsuspended.
+
+\**************************************************************************/
+
+/* CLib */
+#include <stdlib.h>
+#include <string.h>
+#include "swis.h"
+/* Exports */
+#include "Interface/HighFSI.h"
+/* Toolbox */
+#include "event.h"
+#include "toolbox.h"
+#include "window.h"
+#include "gadgets.h"
+#include "menu.h"
+#include "saveas.h"
+#include "proginfo.h"
+/* Common */
+#include "cmos.h"
+#include "message.h"
+#include "misc.h"
+/* local headers */
+#include "Main.h"
+#include "Plugin.h"
+#include "State.h"
+#include "ToolboxE.h"  /* includes prototypes for this file */
+
+#define proginfo_name		((ComponentId) 0x82b400)
+#define proginfo_purpose	((ComponentId) 0x82b401)
+#define proginfo_author		((ComponentId) 0x82b402)
+#define proginfo_version	((ComponentId) 0x82b404)
+
+#define menu_help		((ComponentId) 0x01)
+#define menu_plugin		((ComponentId) 0x05)
+
+#define menu_savecmos		((ComponentId) 0x00)
+#define menu_loadcmos		((ComponentId) 0x03)
+#define menu_defaultcmos	((ComponentId) 0x04)
+
+#ifndef Wimp_MHelpEnable
+#define Wimp_MHelpEnable 0x504
+#endif
+
+static int toolboxe_objectautocreated (int event_code, ToolboxEvent *event, IdBlock *id_block, void *handle);
+static int toolboxe_menuabouttobeshown (int event_code, ToolboxEvent *event, IdBlock *id_block, void *handle);
+static int toolboxe_menusubmenu (int event_code, ToolboxEvent *event, IdBlock *id_block, void *handle);
+static int toolboxe_menuselection (int event_code, ToolboxEvent *event, IdBlock *id_block, void *handle);
+
+int toolboxe_events [5] =     { Toolbox_ObjectAutoCreated,
+				Menu_AboutToBeShown,
+				Menu_SubMenu,
+				Menu_Selection,
+				0 };
+
+/* Used to store the icon number of the item
+ * under the pointer when the menu is opened (for sorting out the submenus).
+ */
+static int item_on_menu_opened;
+
+void toolboxe_register (void)
+{
+  throw (event_register_toolbox_handler (-1, Toolbox_ObjectAutoCreated, toolboxe_objectautocreated, NULL));
+  throw (event_register_toolbox_handler (-1, Menu_AboutToBeShown, toolboxe_menuabouttobeshown, NULL));
+  throw (event_register_toolbox_handler (-1, Menu_SubMenu, toolboxe_menusubmenu, NULL));
+  throw (event_register_toolbox_handler (-1, Menu_Selection, toolboxe_menuselection, NULL));
+}
+
+/******	toolboxe_objectautocreated() **************************************\
+
+Purpose:	Handles Toolbox_ObjectAutoCreated event
+
+\**************************************************************************/
+
+static int toolboxe_objectautocreated (int event_code, ToolboxEvent *event, IdBlock *id_block, void *handle)
+{
+  if (strcmp (((ToolboxObjectAutoCreatedEvent *) event)->template_name, "Menu") == 0) {
+    menu_id = id_block->self_id;
+  }
+  
+  if (strcmp (((ToolboxObjectAutoCreatedEvent *) event)->template_name, "CMOSMenu") == 0) {
+    cmosmenu_id = id_block->self_id;
+  }
+
+  if (strcmp (((ToolboxObjectAutoCreatedEvent *) event)->template_name, "ProgInfo") == 0) {
+    proginfo_id = id_block->self_id;
+  }
+  
+  if (strcmp (((ToolboxObjectAutoCreatedEvent *) event)->template_name, "ConProgInfo") == 0) {
+    proginfo_set_version(0, id_block->self_id, message_lookup_direct(messages, "_Version"));
+  }
+  
+  return 1;
+}
+
+/******	toolboxe_menuabouttobeshown() *************************************\
+
+Purpose:	Handles Menu_AboutToBeShown event (for main menu)
+
+\**************************************************************************/
+
+static int toolboxe_menuabouttobeshown (int event_code, ToolboxEvent *event, IdBlock *id_block, void *handle)
+{
+  WimpGetPointerInfoBlock pointer_info;
+  WimpGetWindowStateBlock state;
+  char plugin_menutext[50];
+  selector_item item = -1;
+  int icon_x, icon_y;
+
+  if (id_block->self_id == menu_id)
+  {
+    /* Figure out what's under the pointer */
+    throw(wimp_get_pointer_info(&pointer_info));
+    state.window_handle = selector_get_wimp_handle (plugin_selector);
+    throw (wimp_get_window_state (&state));
+    item = selector_get (plugin_selector, pointer_info.x - state.visible_area.xmin + state.xscroll,
+                                        pointer_info.y - state.visible_area.ymax + state.yscroll,
+                                        &icon_x, &icon_y);
+    item_on_menu_opened = item;
+
+    /* Grey the plugin menu if appropriate
+     * or change its name to be specific to the plugin under the mouse
+     */
+    throw(menu_set_fade(0, menu_id, menu_plugin, (item == -1) ? TRUE : FALSE));
+    message_lookup_buffer(plugin_menutext, messages, "PlugIn");
+    strcat(plugin_menutext, " '");
+    if (item == -1)
+    {
+      throw (menu_set_entry_help_message (0, menu_id, menu_plugin, message_lookup_direct(messages,"MenuPluginFaded")));
+    }
+    else
+    {
+      throw (menu_set_entry_help_message (0, menu_id, menu_plugin, message_lookup_direct(messages,"MenuPluginHelp")));
+      strcat(plugin_menutext, selector_get_text(plugin_selector, item));
+    }
+    strcat(plugin_menutext, "'");
+    throw(menu_set_entry_text(0, menu_id, menu_plugin, plugin_menutext));
+  }
+
+  if (id_block->self_id == cmosmenu_id)
+  {
+    if ((1 & _swi (OS_File, _INR(0,1)|_RETURN(0), OSFile_ReadNoPath, cmos_SAVED_FILE)) == 0) {
+      throw (menu_set_fade (0, cmosmenu_id, menu_loadcmos, TRUE));
+      throw (menu_set_entry_help_message (0, cmosmenu_id, menu_loadcmos, message_lookup_direct(messages,"LoadCMOSHelpFaded")));
+    }
+    else {
+      throw (menu_set_fade (0, cmosmenu_id, menu_loadcmos, FALSE));
+      throw (menu_set_entry_help_message (0, cmosmenu_id, menu_loadcmos, message_lookup_direct(messages,"LoadCMOSHelp")));
+    }
+
+    if (((1 & _swi (OS_File, _INR(0,1)|_RETURN(0), OSFile_ReadNoPath, cmos_DEFAULT_FILE)) == 0) &&
+        !got_nvm_defaults) {
+      throw (menu_set_fade (0, cmosmenu_id, menu_defaultcmos, TRUE));
+      throw (menu_set_entry_help_message (0, cmosmenu_id, menu_defaultcmos, message_lookup_direct(messages,"LoadCMOSHelpFaded")));
+    }
+    else {
+      throw (menu_set_fade (0, cmosmenu_id, menu_defaultcmos, FALSE));
+      throw (menu_set_entry_help_message (0, cmosmenu_id, menu_defaultcmos, message_lookup_direct(messages,"DefaultCMOSHelp")));
+    }
+
+    if (state_locked) {
+      throw (menu_set_fade (0, cmosmenu_id, menu_savecmos, TRUE));
+      throw (menu_set_fade (0, cmosmenu_id, menu_loadcmos, TRUE));
+      throw (menu_set_fade (0, cmosmenu_id, menu_defaultcmos, TRUE));
+      throw (menu_set_entry_help_message (0, cmosmenu_id, menu_savecmos, message_lookup_direct(messages,"SaveCMOSHelpLocked")));
+      throw (menu_set_entry_help_message (0, cmosmenu_id, menu_loadcmos, message_lookup_direct(messages,"LoadCMOSHelpLocked")));
+      throw (menu_set_entry_help_message (0, cmosmenu_id, menu_defaultcmos, message_lookup_direct(messages,"LoadCMOSHelpLocked")));
+    }
+    else {
+      throw (menu_set_fade (0, cmosmenu_id, menu_savecmos, FALSE));
+      throw (menu_set_entry_help_message (0, cmosmenu_id, menu_savecmos, message_lookup_direct(messages,"SaveCMOSHelp")));
+    }
+  }
+
+  return 1;
+}
+
+/******	toolboxe_menusubmenu() ********************************************\
+
+Purpose:	Handles Menu_SubMenu event (for InfoMenu submenus)
+
+\**************************************************************************/
+
+static int toolboxe_menusubmenu (int event_code, ToolboxEvent *event, IdBlock *id_block, void *handle)
+{
+  plugin_spec *details;
+  
+  details = plugin_list + item_on_menu_opened;
+  
+  throw (displayfield_set_value (0, proginfo_id, proginfo_name,
+    details -> info_name == -1 ? NULL : plugin_text + (details -> info_name)));
+  throw (displayfield_set_value (0, proginfo_id, proginfo_purpose,
+    details -> info_purpose == -1 ? NULL : plugin_text + (details -> info_purpose)));
+  throw (displayfield_set_value (0, proginfo_id, proginfo_author,
+    details -> info_author == -1 ? NULL : plugin_text + (details -> info_author)));
+  throw (displayfield_set_value (0, proginfo_id, proginfo_version,
+    details -> info_version == -1 ? NULL : plugin_text + (details -> info_version)));
+  
+  throw (toolbox_show_object (Toolbox_ShowObject_AsSubMenu, proginfo_id, Toolbox_ShowObject_TopLeft,
+    &(((MenuSubMenuEvent *) event) -> pos), id_block -> self_id, id_block -> self_component));
+  return 1;
+}
+
+/******	toolboxe_menuselection() ******************************************\
+
+Purpose:	Handles Menu_Selection event
+
+\**************************************************************************/
+
+static int toolboxe_menuselection (int event_code, ToolboxEvent *event, IdBlock *id_block, void *handle)
+{
+  if (id_block -> self_id == cmosmenu_id) {
+    switch (id_block -> self_component) {
+      case menu_savecmos:
+        _swi (OS_CLI, _IN(0), "SaveCMOS " cmos_SAVED_FILE);
+        toolboxe_menuabouttobeshown (0, 0, id_block, 0); /* update the menu, in case it was an Adjust click */
+        break;
+      
+      case menu_loadcmos:
+        _swi (OS_CLI, _IN(0), "LoadCMOS " cmos_SAVED_FILE);
+        break;
+      
+      case menu_defaultcmos:
+        /* Decide whether to load from file, or by querying the Kernel */
+        if (!got_nvm_defaults) {
+          _swi (OS_CLI, _IN(0), "LoadCMOS " cmos_DEFAULT_FILE);
+        }
+        else {
+          size_t offset, limit;
+          int    value;
+
+          limit = _swi (OS_NVMemory, _IN(0)|_RETURN(1), 0);
+          for (offset = 0; offset < limit; offset++) {
+            value = _swi (OS_NVMemory, _INR(0,1)|_RETURN(2), 6, offset);
+            if (value != -1) _swi (OS_NVMemory, _INR(0,2), 2, offset, value);
+          }
+        }
+        break;
+    }
+  }
+  
+  if (id_block -> self_id == menu_id) {
+    switch (id_block -> self_component) {
+      case menu_help:
+        if (getenv ("Help$Dir") == NULL) {
+          if (getenv ("Help$Start")) _swix (Wimp_StartTask, _IN(0), (int) "Run <Help$Start>");
+          else _swix (Wimp_StartTask, _IN(0), (int) "Run Resources:$.Apps.!Help");
+        }
+        else
+        {
+          WimpMessage message;
+          message.hdr.size = sizeof (message.hdr) + 4;
+          message.hdr.your_ref = 0;
+          message.hdr.action_code = Wimp_MHelpEnable;
+          message.data.words[0] = 0; /* enable help, don't bother re-reading configuration */
+          throw (wimp_send_message (Wimp_EUserMessage, &message, 0, 0, NULL));
+        }
+        break;
+    }
+  }
+  return 1;
+}

@@ -1,0 +1,142 @@
+; 
+; Copyright (c) 2016, RISC OS Open Ltd
+; All rights reserved.
+; 
+; Redistribution and use in source and binary forms, with or without
+; modification, are permitted provided that the following conditions are met: 
+;     * Redistributions of source code must retain the above copyright
+;       notice, this list of conditions and the following disclaimer.
+;     * Redistributions in binary form must reproduce the above copyright
+;       notice, this list of conditions and the following disclaimer in the
+;       documentation and/or other materials provided with the distribution.
+;     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+;       may be used to endorse or promote products derived from this software
+;       without specific prior written permission.
+; 
+; THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+; AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+; IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+; ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+; LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+; CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+; SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+; INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+; CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+; ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+; POSSIBILITY OF SUCH DAMAGE.
+; 
+
+        AREA    |RO$$Code|, CODE, READONLY, PIC
+
+        GET     ListOpts
+        GET     Macros
+        GET     Proc
+        GET     SWIs
+        GET     RISCOS
+        GET     Portable
+
+; typedef struct
+; {
+;   uint32_t r0;
+;   void *r1;
+;   void *r12;
+;   void *pc;
+; } Callback_t;
+; 
+; void invoke_callback(const Callback_t *callback)
+        EXPORT  invoke_callback
+invoke_callback
+        LDMIA   r0, {r0, r1, r12, pc}
+
+; void dsb(void)
+        EXPORT  dsb
+dsb
+        MOV     a1, #0
+        MCR     p15, 0, a1, c7, c10, 4
+        MOV     pc, lr        
+
+; uint32_t halcall_1(uint32_t r0, void *sb, void *pc)
+        EXPORT  halcall_1
+halcall_1
+        Entry   "r9"
+        MOV     r9, r1
+        MOV     lr, pc
+        MOV     pc, r2
+        EXIT
+
+        MACRO
+        HALDevEntry $prefix, $entry
+        EXPORT $prefix._asm_$entry
+        IMPORT $prefix._$entry
+$prefix._asm_$entry
+        ADRL    ip, $prefix._$entry
+        B       haldeventry
+        MEND
+
+        HALDevEntry cpuclock, Activate
+        HALDevEntry cpuclock, Deactivate
+        HALDevEntry cpuclock, Reset
+        HALDevEntry cpuclock, Sleep
+        HALDevEntry cpuclock, NumSpeeds
+        HALDevEntry cpuclock, Info
+        HALDevEntry cpuclock, Get
+        HALDevEntry cpuclock, Set
+        HALDevEntry cpuclock, GetDieTemperature        
+
+        ; N.B. this assumes we'll always be called in a mode where we can safely call SWIs
+haldeventry
+        Entry   "v1-v2,sl,fp"
+        MOV     sl, sp, LSR #20
+        LDMDB   a1, {fp,lr}             ; Get new relocation offsets (stored before device ptr) 
+        MOV     sl, sl, LSL #20
+        LDMIA   sl, {v1-v2}             ; Preserve current stack words
+        STMIA   sl, {fp,lr}             ; Write our relocation offsets in their place
+        ADD     sl, sl, #540
+        MOV     fp, #0
+        BLX     ip                      ; Call C code
+        SUB     sl, sl, #540
+        STMIA   sl, {v1-v2}             ; Restore old stack words
+        EXIT
+
+; void retry_cp15(void *a, void *b, bool (*func)(void *, void *))
+        EXPORT  retry_cp15
+retry_cp15 ROUT
+        Entry   "a1-a3, v1"
+        MRS     v1, CPSR
+10
+        ; IRQs off to avoid redundant sleeps
+        CPSID   i
+        ; Call the function
+        MOV     lr, pc
+        LDMIA   sp, {a1-a2, pc}
+        CMP     a1, #0
+        BNE     %FT90
+        SWI     XPortable_Idle          ; ARM11 has an annoying erratum, use Portable_Idle to avoid duplicating the workaround everywhere
+        ; IRQs on to allow IRQ to trigger
+        CPSIE   i
+        ; Go back round and check again
+        B       %BT10
+90
+        MSR     CPSR_c, v1
+        EXIT
+
+; void retry_wfe(void *a, void *b, bool (*func)(void *, void *))
+        EXPORT  retry_wfe
+retry_wfe ROUT
+        Entry   "a1-a3, v1"
+        MRS     v1, CPSR
+        CPSIE   i                       ; Ensure IRQs are actually enabled
+        ADR     lr, %FT50
+        MOV     pc, a3
+10
+        DSB
+        WFE
+        MOV     lr, pc
+        LDMIA   sp, {a1-a2, pc}
+50
+        CMP     a1, #0
+        BEQ     %BT10
+        MSR     CPSR_c, v1
+        EXIT
+
+        END

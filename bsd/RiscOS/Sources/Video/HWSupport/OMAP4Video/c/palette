@@ -1,0 +1,187 @@
+/*
+ * Copyright (c) 2010, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include "globals.h"
+#include "regs.h"
+#include "palette.h"
+
+#include "DebugLib/DebugLib.h"
+
+/* Null palette func - does nothing except shift the RISC OS entry right 8 bits
+   Suitable for non-16bpp modes with CPR */
+static void palette_func_null(const uint32_t *entries, uint32_t idx, uint32_t count)
+{
+	if (idx >= 256)
+		return;
+	if (count > 256 - idx)
+		count = 256 - idx;
+	uint32_t *cache = &gfx_palette_ro[idx];
+	uint32_t *out = &gfx_palette_l[idx];
+	while (count--)
+	{
+		uint32_t val = *entries++;
+		*cache++ = val;
+		*out++ = val >> 8;
+#if 1
+		dispc->gamma_table[0] = (val >> 8) | (idx << 24);
+//		dispc->gamma_table[1] = (val >> 8) | (idx << 24);
+		++idx;
+#endif
+	}
+}
+
+/* R/B swap palette func - Swaps the R & B channels
+   Suitable for palettised modes with CPR disabled */
+static void palette_func_rbswap(const uint32_t *entries, uint32_t idx, uint32_t count)
+{
+	if (idx >= 256)
+		return;
+	if (count > 256 - idx)
+		count = 256 - idx;
+	uint32_t *cache = &gfx_palette_ro[idx];
+	uint32_t *out = &gfx_palette_l[idx];
+	while (count--)
+	{
+		uint32_t val = *entries++;
+		*cache++ = val;
+		val = ((val & 0xff00) << 8) | ((val & 0xff0000) >> 8) | ((val & 0xff000000) >> 24);
+		*out++ = val;
+#if 1
+		dispc->gamma_table[0] = val | (idx << 24);
+//		dispc->gamma_table[1] = val | (idx << 24);
+		++idx;
+#endif
+	}
+}
+
+/* 555 palette func - Maps RISC OS 555 gamma table entries to OMAP 565 gamma table entries
+   Suitable for 16bpp modes (preferably with CPR for R/B swapping) */
+static void palette_func_555(const uint32_t *entries, uint32_t idx, uint32_t count)
+{
+	if (idx >= 256)
+		return;
+	if (count > 256 - idx)
+		count = 256 - idx;
+	entries -= idx;
+	uint32_t *cache = gfx_palette_ro;
+	uint8_t *out = (uint8_t *)gfx_palette_l;
+	while (count--)
+	{
+		uint32_t val = entries[idx];
+		cache[idx] = val;
+		/* Pull apart the gamma table entry to get the 0-31 indices and 0-31 values */
+		uint32_t red_idx	= idx & 0x1f;
+		uint32_t green_idx	= (idx >> 1) & 0x1f;
+		uint32_t blue_idx	= (idx >> 2) & 0x1f;
+		uint32_t red_val	= (val >> 11) & 0x1f;
+		uint32_t green_val	= (val >> 19) & 0x1f;
+		uint32_t blue_val	= (val >> 27) & 0x1f;
+		/* Now put it back together in a way that will allow the 565 OMAP to display
+		   RISC OS's 555 format (at an effective quality of 455) */
+		out[red_idx << 5] = (red_val << 3) | (red_val >> 2);
+		out[(green_idx << 4) + 1] = out[(green_idx << 4) + 513] = (green_val << 3) | (green_val >> 2);
+		out[(blue_idx << 5) + 2] = (blue_val << 4) | (blue_val & 0xf);
+		idx++;
+	}
+}
+
+/* Null mouse palette func - for use with CPR */
+static void mouse_palette_func_null(const uint32_t *entries, uint32_t idx, uint32_t count)
+{
+	if (idx >= 4)
+		return;
+	if (count > 4 - idx)
+		count = 4 - idx;
+	uint32_t *cache = &mouse_palette_ro[idx];
+	uint32_t *out = &mouse_palette_soft[idx];
+	while (count--)
+	{
+		uint32_t val = *entries++;
+		*cache++ = val;
+		val >>= 8;
+		if (*out != val)
+		{
+			*out = val;
+			mouse_dirty = true;
+		}
+		out++;
+	}
+}
+
+/* R/B swap mouse palette func - for when CPR is disabled */
+static void mouse_palette_func_rbswap(const uint32_t *entries, uint32_t idx, uint32_t count)
+{
+	if (idx >= 4)
+		return;
+	if (count > 4 - idx)
+		count = 4 - idx;
+	uint32_t *cache = &mouse_palette_ro[idx];
+	uint32_t *out = &mouse_palette_soft[idx];
+	while (count--)
+	{
+		uint32_t val = *entries++;
+		*cache++ = val;
+		val = ((val & 0xff00) << 8) | ((val & 0xff0000) >> 8) | ((val & 0xff000000) >> 24);
+		if (*out != val)
+		{
+			*out = val;
+			mouse_dirty = true;
+		}
+		out++;
+	}
+}
+
+void select_palette_func(int format, bool cpr)
+{
+	/* Select appropriate palette func for given params */
+	palette_func newfunc;
+	if (format == OVERLAY_ATTRIBUTES_FORMAT_RGB16_565)
+		newfunc = palette_func_555;
+	else if (cpr)
+		newfunc = palette_func_null;
+	else
+		newfunc = palette_func_rbswap;
+#if 0
+	if (newfunc != gfx_palette_func)
+	{
+		/* Retranslate palette */
+		gfx_palette_func = newfunc;
+		(newfunc)(gfx_palette_ro, 0, 256);
+	}
+#else
+	/* Retranslate palette */
+	gfx_palette_func = newfunc;
+	(newfunc)(gfx_palette_ro, 0, 256);
+#endif
+	newfunc = (cpr ? mouse_palette_func_null : mouse_palette_func_rbswap);
+	if (newfunc != mouse_palette_func)
+	{
+		/* Retranslate palette */
+		mouse_palette_func = newfunc;
+		(newfunc)(mouse_palette_ro, 0, 4);
+	}
+}

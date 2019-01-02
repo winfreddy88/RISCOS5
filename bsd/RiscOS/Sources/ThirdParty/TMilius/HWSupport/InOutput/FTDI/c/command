@@ -1,0 +1,423 @@
+/** @file
+
+  Implements functions to handle FTDI commands.
+
+  */
+/* Created 20.09.2010 T. Milius
+   Changed 03.10.2010 T. Milius */
+/* Copyright (c) 2010 by Thomas Milius Stade, Germany
+* All rights reserved.
+*
+* Redistribution and use in source and binary forms, with or without
+* modification, are permitted provided that the following conditions are met:
+*     * Redistributions of source code must retain the above copyright
+*       notice, this list of conditions and the following disclaimer.
+*     * Redistributions in binary form must reproduce the above copyright
+*       notice, this list of conditions and the following disclaimer in the
+*       documentation and/or other materials provided with the distribution.
+*     * Neither the name of Thomas Milius Stade, Germany nor the
+*       names of its contributors may be used to endorse or promote products
+*       derived from this software without specific prior written permission.
+*
+* THIS SOFTWARE IS PROVIDED BY Thomas Milius Stade, Germany ``AS IS'' AND ANY
+* EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+* WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+* DISCLAIMED. IN NO EVENT SHALL Thomas Milius Stade, Germany BE LIABLE FOR ANY
+* DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+* (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+* LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+* ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+* (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+* SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE. */
+/* ANSI-C */
+
+/* !!!!!!!!!! libraries !!!!!!!!!! */
+/* ---------- ANSI-C ---------- */
+#include <stdarg.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+
+/* ------------ RISC OS ------------ */
+#include "kernel.h"
+#include "swis.h"
+
+/* ---------- Own ---------- */
+#ifdef DEBUG
+#include "debug.h"
+#endif
+#include "ftdimodhead.h"
+#include "ftdimodule.h"
+
+/* !!!!!!!!!!! definitions !!!!!!!!!! */
+#define FTDI_MAX_CLAIM_CALLBACK_NO 5
+
+/* !!!!!!!!!! data structures !!!!!!!!!! */
+struct claim_callback_structure {
+char pendant_extension[40];
+char own_config_extension[40];
+unsigned int usb_device_number;
+unsigned int idVendor;
+unsigned int idProduct;
+};
+
+struct {
+int actual_number_of_pending_claims;
+struct claim_callback_structure claim_data[FTDI_MAX_CLAIM_CALLBACK_NO];
+} command_claim_callbacks = {.actual_number_of_pending_claims=0};
+
+/* !!!!!!!!!! support functions !!!!!!!!!! */
+/** Get Vendor and Device ID from variable.
+    Alternatively this information could be fetched from USB device
+    descriptor. */
+_kernel_oserror *determine_vendor_product_id(unsigned int usb_device_number,
+                                             unsigned int *idVendor,
+                                             unsigned int *idProduct)
+{
+char device_var_name[100];
+char dummy[6];
+_kernel_swi_regs regs;
+_kernel_oserror *error_os;
+
+sprintf(device_var_name,
+        "USB$Device_00_00_00_*_*_-1_-1_*_USB%d",
+        usb_device_number);
+#ifdef DEBUG
+debug_writef(DEBUG_LEVEL_REGISTRATION,
+             "Trying to find variable like %s\n",
+             device_var_name);
+#endif
+regs.r[0]=(int) device_var_name;
+/* Returns a string! */
+regs.r[1]=(int) dummy;
+regs.r[2]=4;
+regs.r[3]=0;
+regs.r[4]=0;
+if ((error_os=_kernel_swi(OS_ReadVarVal, &regs, &regs)) != NULL) return error_os;
+*idVendor=0;
+*idProduct=0;
+sscanf((char *) regs.r[3],
+       "USB$Device_00_00_00_%04x_%04x",
+       idVendor,
+       idProduct);
+return NULL;
+}
+
+/* !!!!!!!!!! functions !!!!!!!!!! */
+/** Performs FTDIDriver_Claim commands as callbacks from a list in which they have been stored.
+    It seems that the USB Alias is very fragile. Attach device service calls and registrations
+    might start a race. Also it can happen that the command for registration is done twice.
+    It seems that the USB Alias doesn't like too much storage consumption, errors and so on.
+    Starting a Taskwindow is not possible from interrupt or callback mode at which USB Alias
+    seems to start and finally this won't help in case that the Wimp is not running.
+    So all requests are queued as callbacks in a list. In case that the same device
+    shall be claimed with different parameters twice this will give an error. In case that
+    that a device is claimed twice with same parameters the last claim request is
+    rejected without error. */
+_kernel_oserror *command_callback_handler(_kernel_swi_regs *regs_ignore,
+                                          void *pw)
+{
+int irq_state;
+char *pendant_extension;
+char *own_config_extension;
+struct claim_callback_structure claim_data;
+_kernel_swi_regs regs;
+_kernel_oserror *error_os;
+
+#ifdef DEBUG
+debug_writef(DEBUG_LEVEL_REGISTRATION,
+             "CCB. PW %x\n",
+             pw);
+#endif
+if ((irq_state=_kernel_irqs_disabled()) == 0) _kernel_irqs_off;
+while(command_claim_callbacks.actual_number_of_pending_claims > 0) {
+  command_claim_callbacks.actual_number_of_pending_claims--;
+  claim_data=command_claim_callbacks.claim_data[command_claim_callbacks.actual_number_of_pending_claims];
+  if (irq_state == 0) _kernel_irqs_on;
+  if (strlen(claim_data.pendant_extension) == 0) {
+    pendant_extension=NULL;
+    }
+  else {
+    pendant_extension=claim_data.pendant_extension;
+    }
+  if (strlen(claim_data.own_config_extension) == 0) {
+    own_config_extension=NULL;
+    }
+  else {
+    own_config_extension=claim_data.own_config_extension;
+    }
+  /* Try to register the device */
+  if ((error_os=register_usb_device(claim_data.usb_device_number,
+                                    claim_data.idVendor,
+                                    claim_data.idProduct,
+                                    pendant_extension,
+                                    own_config_extension)) != NULL) {
+    /* Return error but afterwards retry for the remaining entries. */
+    regs.r[0]=(int) command_callback_handler_entry;
+    regs.r[1]=(int) pw;
+    _kernel_swi(OS_AddCallBack, &regs, &regs);
+    return error_os;
+    }
+  if ((irq_state=_kernel_irqs_disabled()) == 0) _kernel_irqs_off;
+  }
+if (irq_state == 0) _kernel_irqs_on;
+return NULL;
+}
+
+_kernel_oserror *ftdi_cmd(const char *arg_string,
+                          int argc,
+                          int cmd_no,
+                          void *pw)
+{
+
+#ifdef DEBUG
+debug_writef(DEBUG_LEVEL_REGISTRATION,
+             "CH. PW %x\n",
+             pw);
+#endif
+#ifdef DEBUG
+    debug_writef(DEBUG_LEVEL_REGISTRATION,
+                 "Command %d\n",
+                 cmd_no);
+#endif
+switch(cmd_no) {
+  case CMD_FTDIDriver_Claim: {
+    char output_result[128];
+    char **output_result_ref;
+    int i;
+    int irq_state;
+    struct claim_callback_structure claim_data;
+    _kernel_swi_regs regs;
+    _kernel_oserror *error_os;
+
+#ifdef DEBUG
+    debug_write(DEBUG_LEVEL_REGISTRATION,
+                "Claim with parameter\n");
+    /* Printf not possible because not 0 terminated */
+    {
+    const char *c;
+
+    c=arg_string;
+    while (*c>=32) {
+      debug_writef(DEBUG_LEVEL_REGISTRATION,
+                  "%c",
+                  *c);
+      c++;
+      }
+    debug_write(DEBUG_LEVEL_REGISTRATION,
+                "\n");
+    }
+#endif
+    output_result_ref=(char **) output_result;
+    regs.r[0]=(int) "/A,P/K,C/K";
+    regs.r[1]=(int) arg_string;
+    regs.r[2]=(int) output_result;
+    regs.r[3]=128;
+    if ((error_os=_kernel_swi(OS_ReadArgs, &regs, &regs)) != NULL) return error_os;
+#ifdef DEBUG
+    debug_writef(DEBUG_LEVEL_REGISTRATION,
+                 "Extract %x %x %x\n",
+                 output_result_ref[0],
+                 output_result_ref[1],
+                 output_result_ref[2]);
+#endif
+    if (output_result_ref[0] == NULL) {
+      /* Device number is mandatory. */
+      return help_PRINT_BUFFER;
+      }
+    claim_data.pendant_extension[0]='\0';
+    claim_data.own_config_extension[0]='\0';
+    claim_data.usb_device_number=atoi(output_result_ref[0]);
+    if (output_result_ref[1]) {
+      strcpy(claim_data.pendant_extension, output_result_ref[1]);
+#ifdef DEBUG
+      debug_writef(DEBUG_LEVEL_REGISTRATION,
+                   "Pendant extension is %s\n",
+                   claim_data.pendant_extension);
+#endif
+      }
+    if (output_result_ref[2]) {
+      strcpy(claim_data.own_config_extension, output_result_ref[2]);
+#ifdef DEBUG
+      debug_writef(DEBUG_LEVEL_REGISTRATION,
+                   "Own config extension is %s\n",
+                   claim_data.own_config_extension);
+#endif
+      }
+    if ((error_os=determine_vendor_product_id(claim_data.usb_device_number,
+                                              &claim_data.idVendor,
+                                              &claim_data.idProduct)) != NULL) return error_os;
+#ifdef DEBUG
+    debug_writef(DEBUG_LEVEL_REGISTRATION,
+                 "Extracted IDs V %04x P %04x\n",
+                 claim_data.idVendor,
+                 claim_data.idProduct);
+#endif
+    /* Set up the callback for registration */
+    if ((irq_state=_kernel_irqs_disabled()) == 0) _kernel_irqs_off;
+    if (command_claim_callbacks.actual_number_of_pending_claims >= FTDI_MAX_CLAIM_CALLBACK_NO) {
+      if (irq_state == 0) _kernel_irqs_on;
+      return generate_error(FTDI_ERROR_NO_CLAIM_CALLBACKS);
+      }
+    /* Check whether same request is pending with different parameters. */
+    i=0;
+    while(i<command_claim_callbacks.actual_number_of_pending_claims) {
+      if (command_claim_callbacks.claim_data[i].usb_device_number == claim_data.usb_device_number) {
+        /* Request doubled */
+        if ((command_claim_callbacks.claim_data[i].usb_device_number != claim_data.usb_device_number) ||
+            (command_claim_callbacks.claim_data[i].idVendor != claim_data.idVendor) ||
+            (command_claim_callbacks.claim_data[i].idProduct != claim_data.idProduct) ||
+            (strcmp(command_claim_callbacks.claim_data[i].pendant_extension, claim_data.pendant_extension) != 0) ||
+            (strcmp(command_claim_callbacks.claim_data[i].own_config_extension, claim_data.own_config_extension) != 0)) {
+          /* Different claims can't be tolerated */
+          if (irq_state == 0) _kernel_irqs_on;
+          return generate_error(FTDI_ERROR_CLAIM_DOUBLED);
+          }
+        else {
+          /* Exactly the same so ignore. */
+          if (irq_state == 0) _kernel_irqs_on;
+          return NULL;
+          }
+        }
+      i++;
+      }
+    command_claim_callbacks.claim_data[command_claim_callbacks.actual_number_of_pending_claims]=claim_data;
+    command_claim_callbacks.actual_number_of_pending_claims++;
+    if (irq_state == 0) _kernel_irqs_on;
+    regs.r[0]=(int) command_callback_handler_entry;
+    regs.r[1]=(int) pw;
+    return _kernel_swi(OS_AddCallBack, &regs, &regs);
+    }
+  break;
+  case CMD_FTDIDriver_DeviceAlias: {
+    char usb_bus_position[6];
+    char device_name[20];
+    char output_result[1024];
+    char alias[50];
+    char command[1024];
+    char **output_result_ref;
+    unsigned int usb_device_number;
+    unsigned int idVendor;
+    unsigned int idProduct;
+    _kernel_swi_regs regs;
+    _kernel_oserror *error_os;
+
+#ifdef DEBUG
+    debug_write(DEBUG_LEVEL_REGISTRATION,
+                "DeviceAlias with parameter\n");
+    /* Printf not possible because not 0 terminated */
+    {
+    const char *c;
+
+    c=arg_string;
+    while (*c>=32) {
+      debug_writef(DEBUG_LEVEL_REGISTRATION,
+                  "%c",
+                  *c);
+      c++;
+      }
+    debug_write(DEBUG_LEVEL_REGISTRATION,
+                "\n");
+    }
+#endif
+    output_result_ref=(char **) output_result;
+    regs.r[0]=(int) "/A,/A";
+    regs.r[1]=(int) arg_string;
+    regs.r[2]=(int) output_result;
+    regs.r[3]=128;
+    if ((error_os=_kernel_swi(OS_ReadArgs, &regs, &regs)) != NULL) return error_os;
+    if (output_result_ref[0] == NULL) {
+      /* Device number is mandatory. */
+      return help_PRINT_BUFFER;
+      }
+    usb_device_number=atoi(output_result_ref[0]);
+    if ((error_os=determine_vendor_product_id(usb_device_number,
+                                              &idVendor,
+                                              &idProduct)) != NULL) return error_os;
+#ifdef DEBUG
+    debug_writef(DEBUG_LEVEL_REGISTRATION,
+                 "Extracted IDs V %04x P %04x\n",
+                 idVendor,
+                 idProduct);
+#endif
+    sprintf(device_name,
+            "USB%d",
+            usb_device_number);
+    regs.r[0]=(int) 0x80000004; /* DeviceFSCallDevice_GetLocation */
+    regs.r[1]=(int) device_name;
+    regs.r[3]=(int) usb_bus_position;
+    if ((error_os=_kernel_swi(DeviceFS_CallDevice, &regs, &regs)) != NULL) return error_os;
+    sprintf(alias,
+            "Alias$@FTDI_%04x_%04x_P%02x%02x%02x%02x%02x%02x",
+            idVendor,
+            idProduct,
+            usb_bus_position[0],
+            usb_bus_position[1],
+            usb_bus_position[2],
+            usb_bus_position[3],
+            usb_bus_position[4],
+            usb_bus_position[5]);
+#ifdef DEBUG
+    debug_writef(DEBUG_LEVEL_REGISTRATION,
+                 "Checking for Alias %s\n",
+                 alias);
+#endif
+    /* Check for alias */
+    regs.r[0]=(int) alias;
+    regs.r[1]=NULL;
+    regs.r[2]=0x80000000;
+    regs.r[3]=0;
+    regs.r[4]=0;
+    _kernel_swi(XOS_ReadVarVal, &regs, &regs);
+    if (regs.r[2] != 0) {
+      /* Execute position alias */
+      sprintf(alias,
+              "@FTDI_%04x_%04x_P%02x%02x%02x%02x%02x%02x %d",
+              idVendor,
+              idProduct,
+              usb_bus_position[0],
+              usb_bus_position[1],
+              usb_bus_position[2],
+              usb_bus_position[3],
+              usb_bus_position[4],
+              usb_bus_position[5],
+              usb_device_number);
+#ifdef DEBUG
+      debug_writef(DEBUG_LEVEL_REGISTRATION,
+                   "Executing position alias %s\n",
+                   alias);
+#endif
+      regs.r[0]=(int) alias;
+      if ((error_os=_kernel_swi(OS_CLI, &regs, &regs)) != NULL) return error_os;
+      }
+    else {
+      if (output_result_ref[1] != NULL) {
+        /* Execute default command if given */
+        sprintf(command,
+                "%s %d",
+                output_result_ref[1],
+                usb_device_number);
+#ifdef DEBUG
+        debug_writef(DEBUG_LEVEL_REGISTRATION,
+                     "Executing default command %s\n",
+                     command);
+#endif
+        regs.r[0]=(int) command;
+        if ((error_os=_kernel_swi(OS_CLI, &regs, &regs)) != NULL) return error_os;
+        }
+      }
+    }
+  break;
+#ifdef DEBUG
+  case CMD_FTDIDriver_DebugLevel: {
+    debug_set_level(atoi(arg_string));
+    }
+  break;
+  case CMD_FTDIDriver_DebugPrint: {
+    debug_print();
+    }
+  break;
+#endif
+  }
+return NULL;
+}

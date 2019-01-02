@@ -1,0 +1,349 @@
+/* Copyright 2004 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/**************************************************************/
+/* File:    test.c                                            */
+/*                                                            */
+/* Purpose: Diagnostic testing functions.                     */
+/**************************************************************/
+
+#include <stdio.h>
+#include <string.h>
+#include "em_riscos.h"
+#include "if_em.h"
+#include "em_device.h"
+#include "info.h"
+#include "log.h"
+#include "msgs.h"
+
+/* Do not include loopback test code in distributed modules */
+#undef ALLOW_LOOPBACK
+
+#ifdef ALLOW_LOOPBACK
+#include "loopback.c"
+#endif
+
+static void do_link_test(struct adapter * adapter)
+{
+    printf("%s", messages_return_message("Tst_Link"));
+
+    em_check_for_link(&adapter->hw);
+
+    if (((E1000_READ_REG(&adapter->hw, STATUS) & E1000_STATUS_LU) != 0))
+        info_print(0, "Tst_LinkPass", 0);
+    else
+        info_print(0, "Tst_LinkFail", 0);
+}
+
+static void report_test_failure(bool * failed, const char * token, const char * format, ...)
+{
+    va_list ap;
+
+    if (!*failed)
+    {
+        info_print(0, "Tst_Fail", 0);
+        *failed = true;
+    }
+
+    va_start(ap, format);
+    info_vprintf(1, token, format, ap);
+    va_end(ap);
+}
+
+static void report_reg_test_failure(bool * failed, uint32_t offset,
+    uint32_t write_value, uint32_t read_value, uint32_t expected_value)
+{
+    report_test_failure(failed, "Tst_RegFail", "%08X\n%04X\n%08X\n%08X",
+                        write_value, offset, expected_value, read_value);
+}
+
+static void reg_pattern_test(bool * failed, struct em_hw * hw, uint32_t offset,
+    uint32_t read_mask, uint32_t write_mask)
+{
+    uint32_t patterns[] = { 0xa5a5a5a5, 0x5aa55aa5, 0xa55aa55a,
+                            0x5a5a5a5a, 0x00000000, 0xffffffff };
+
+    for (int i = 0; i < (sizeof(patterns) / sizeof(patterns[0])); i++)
+    {
+        uint32_t write_val = patterns[i] & write_mask;
+        uint32_t read_val;
+
+        E1000_WRITE_OFFSET(hw, offset, write_val);
+        read_val = E1000_READ_OFFSET(hw, offset);
+        if (read_val != (write_val & read_mask))
+        {
+            report_reg_test_failure(failed, offset, write_val, read_val,
+                                    write_val & read_mask);
+        }
+    }
+}
+
+static void reg_test(bool * failed, struct em_hw * hw, uint32_t offset,
+    uint32_t mask, uint32_t data)
+{
+    uint32_t write_val = data & mask;
+    uint32_t read_val;
+
+    E1000_WRITE_OFFSET(hw, offset, write_val);
+    read_val = E1000_READ_OFFSET(hw, offset) & mask;
+    if (read_val != write_val)
+    {
+        report_reg_test_failure(failed, offset, write_val, read_val, write_val);
+    }
+}
+
+static void reg_status_test(bool * failed, struct em_hw * hw)
+{
+    uint32_t val_before, val_after;
+
+    /* The STATUS register is read-only, so a write should not affect it. */
+    /* Bits that may toggle are ignored.                                  */
+    val_before = E1000_READ_REG(hw, STATUS) & 0xfffff833;
+    E1000_WRITE_REG(hw, STATUS, 0xffffffff);
+    val_after = E1000_READ_REG(hw, STATUS) & 0xfffff833;
+    if (val_before != val_after)
+    {
+        report_reg_test_failure(failed, E1000_REG_OFFSET(hw, STATUS), 0xffffffff, val_after, val_before);
+    }
+}
+
+static void do_register_test(struct adapter * adapter)
+{
+    bool           failed = false;
+    struct em_hw * hw = &adapter->hw;
+    int            i;
+
+    printf("%s", messages_return_message("Tst_Regs"));
+
+    reg_status_test(&failed, hw);
+
+    reg_pattern_test(&failed, hw, E1000_REG_OFFSET(hw, FCAL),  0xFFFFFFFF, 0xFFFFFFFF);
+    reg_pattern_test(&failed, hw, E1000_REG_OFFSET(hw, FCAH),  0x0000FFFF, 0xFFFFFFFF);
+    reg_pattern_test(&failed, hw, E1000_REG_OFFSET(hw, FCT),   0x0000FFFF, 0xFFFFFFFF);
+    reg_pattern_test(&failed, hw, E1000_REG_OFFSET(hw, VET),   0x0000FFFF, 0xFFFFFFFF);
+    reg_pattern_test(&failed, hw, E1000_REG_OFFSET(hw, RDTR),  0x0000FFFF, 0xFFFFFFFF);
+    reg_pattern_test(&failed, hw, E1000_REG_OFFSET(hw, RDBAH), 0xFFFFFFFF, 0xFFFFFFFF);
+    reg_pattern_test(&failed, hw, E1000_REG_OFFSET(hw, RDLEN), 0x000FFF80, 0x000FFFFF);
+    reg_pattern_test(&failed, hw, E1000_REG_OFFSET(hw, RDH),   0x0000FFFF, 0x0000FFFF);
+    reg_pattern_test(&failed, hw, E1000_REG_OFFSET(hw, RDT),   0x0000FFFF, 0x0000FFFF);
+    reg_pattern_test(&failed, hw, E1000_REG_OFFSET(hw, FCRTH), 0x0000FFF8, 0x0000FFF8);
+    reg_pattern_test(&failed, hw, E1000_REG_OFFSET(hw, FCTTV), 0x0000FFFF, 0x0000FFFF);
+    reg_pattern_test(&failed, hw, E1000_REG_OFFSET(hw, TIPG),  0x3FFFFFFF, 0x3FFFFFFF);
+    reg_pattern_test(&failed, hw, E1000_REG_OFFSET(hw, TDBAH), 0xFFFFFFFF, 0xFFFFFFFF);
+    reg_pattern_test(&failed, hw, E1000_REG_OFFSET(hw, TDLEN), 0x000FFF80, 0x000FFFFF);
+
+    reg_test(&failed, hw, E1000_REG_OFFSET(hw, RCTL), 0xFFFFFFFF, 0x00000000);
+    reg_test(&failed, hw, E1000_REG_OFFSET(hw, RCTL), 0x06DFB3FE, 0x003FFFFB);
+    reg_test(&failed, hw, E1000_REG_OFFSET(hw, TCTL), 0xFFFFFFFF, 0x00000000);
+
+    if(adapter->hw.mac_type >= em_82543)
+    {
+        reg_test(&failed, hw, E1000_REG_OFFSET(hw, RCTL), 0x06DFB3FE, 0xFFFFFFFF);
+        reg_pattern_test(&failed, hw, E1000_REG_OFFSET(hw, RDBAL), 0xFFFFFFF0, 0xFFFFFFFF);
+        reg_pattern_test(&failed, hw, E1000_REG_OFFSET(hw, TXCW),  0xC000FFFF, 0x0000FFFF);
+        reg_pattern_test(&failed, hw, E1000_REG_OFFSET(hw, TDBAL), 0xFFFFFFF0, 0xFFFFFFFF);
+        reg_pattern_test(&failed, hw, E1000_REG_OFFSET(hw, TIDV),  0x0000FFFF, 0x0000FFFF);
+
+        for(i = 0; i < E1000_RAR_ENTRIES; i++)
+        {
+            reg_pattern_test(&failed, hw, E1000_REG_OFFSET(hw, RA) + ((i << 1) << 2), 0xFFFFFFFF, 0xFFFFFFFF);
+            reg_pattern_test(&failed, hw, E1000_REG_OFFSET(hw, RA) + (((i << 1) + 1) << 2), 0x8003FFFF, 0xFFFFFFFF);
+        }
+    }
+    else
+    {
+        reg_test(&failed, hw, E1000_REG_OFFSET(hw, RCTL), 0xFFFFFFFF, 0x01FFFFFF);
+        reg_pattern_test(&failed, hw, E1000_REG_OFFSET(hw, RDBAL), 0xFFFFF000, 0xFFFFFFFF);
+        reg_pattern_test(&failed, hw, E1000_REG_OFFSET(hw, TXCW),  0x0000FFFF, 0x0000FFFF);
+        reg_pattern_test(&failed, hw, E1000_REG_OFFSET(hw, TDBAL), 0xFFFFF000, 0xFFFFFFFF);
+    }
+
+    for (i = 0; i < E1000_MC_TBL_SIZE; i++)
+        reg_pattern_test(&failed, hw, E1000_REG_OFFSET(hw, MTA) + (i << 2), 0xFFFFFFFF, 0xFFFFFFFF);
+
+    if (!failed)
+    {
+        info_print(0, "Tst_Pass", 0);
+    }
+}
+
+static void do_interrupt_test(struct adapter * adapter)
+{
+    bool           failed = false;
+    struct em_hw * hw = &adapter->hw;
+    uint32_t       icr;
+
+    printf("%s", messages_return_message("Tst_Intr"));
+
+    /* Clear all bits in the interrupt mask, disabling all interrupts */
+    E1000_WRITE_REG(hw, IMC, 0xFFFFFFFF);
+    msec_delay(10);
+
+    /* Read ICR once to clear any pending interrupts, then check by reading */
+    /* again. Since all interrupts are disabled, the second read should     */
+    /* return zero.                                                         */
+    icr = E1000_READ_REG(hw, ICR);
+    icr = E1000_READ_REG(hw, ICR);
+    if (icr != 0)
+    {
+        /* Failed to clear ICR. Other tests cannot be performed. j*/
+        report_test_failure(&failed, "Tst_IntFailC", "");
+    }
+    else
+    {
+        /* Test the first ten interrupts */
+        for (uint32_t i = 0; i < 10; i++)
+        {
+            uint32_t mask = 1 << i;
+
+            /* Enable only this interrupt, force it to happen, then  */
+            /* check that the interrupt handler actually got called. */
+            adapter->diag_icr = 0;
+            E1000_WRITE_REG(hw, IMS, mask);
+            E1000_WRITE_REG(hw, ICS, mask);
+            msec_delay(10);
+            if ((adapter->diag_icr & mask) == 0)
+            {
+                report_test_failure(&failed, "Tst_IntFailE", "%d", i);
+            }
+
+            /* Force all interrupts other than this one. As they are all */
+            /* disabled, the interrupt handler should not be called.     */
+            adapter->diag_icr = 0;
+            E1000_WRITE_REG(hw, ICS, ~mask);
+            msec_delay(10);
+            if (adapter->diag_icr != 0)
+            {
+                report_test_failure(&failed, "Tst_IntFailM", "%d\n%08X", i, adapter->diag_icr);
+            }
+
+            /* Disable the interrupt again, then force it. Check that the */
+            /* interrupt handler was not called.                          */
+            adapter->diag_icr = 0;
+            E1000_WRITE_REG(hw, IMC, mask);
+            E1000_WRITE_REG(hw, ICS, mask);
+            msec_delay(10);
+            if ((adapter->diag_icr & mask) != 0)
+            {
+                report_test_failure(&failed, "Tst_IntFailD", "%d", i);
+            }
+        }
+    }
+
+    /* Disable all the interrupts and clear the ICR again */
+    E1000_WRITE_REG(hw, IMC, 0xFFFFFFFF);
+    msec_delay(10);
+    icr = E1000_READ_REG(hw, ICR);
+
+    if (!failed)
+    {
+        info_print(0, "Tst_Pass", 0);
+    }
+}
+
+static void do_loopback_test(struct adapter * adapter)
+{
+#ifdef ALLOW_LOOPBACK
+    loopback_result result;
+
+    printf("%s", messages_return_message("Tst_Loop"));
+
+    result = run_loopback_test(adapter);
+
+    switch (result)
+    {
+        case LOOPBACK_TEST_OK:
+            info_print(0, "Tst_Pass", 0);
+            break;
+
+        case LOOPBACK_TEST_NOT_EXEC:
+            info_print(0, "Tst_Fail", 0);
+            info_print(1, "Tst_LoopFailI", 0);
+            break;
+
+        case LOOPBACK_TEST_FAILED:
+        default:
+            info_print(0, "Tst_Fail", 0);
+            break;
+    }
+#else
+    (void)adapter;
+#endif
+}
+
+void test_run(device_t dev)
+{
+    struct adapter * adapter = &dev->adapter;
+    bool             autoneg = adapter->hw.autoneg;
+    bool             interface_up;
+
+    /* Check adapter has been initialised */
+    if (!dev->initialised)
+    {
+        info_printf(0, "Inf_Failed", "%d", dev->dib.dib_unit);
+        return;
+    }
+
+    log_message(dev, "Performing diagnostic tests");
+
+    /* Do link test first */
+    do_link_test(adapter);
+
+    interface_up = (adapter->interface_data.ac_if.if_flags & IFF_RUNNING);
+
+    /* Stop and reset the adapter */
+
+    dprintf(("Misc", "%s: Reset hardware for tests\n", __func__));
+
+    if (interface_up)
+    {
+        em_stop(adapter);
+    }
+    else
+    {
+        em_reset_hw(&adapter->hw);
+    }
+
+    dev->ignore_irqs = true; /* Flag testing mode for interrupt handler */
+
+    em_init_hw(&adapter->hw);
+
+    /* Do the other tests */
+
+    dprintf(("Misc", "%s: Perform tests\n", __func__));
+
+    do_register_test(adapter);
+    do_interrupt_test(adapter);
+    do_loopback_test(adapter);
+
+    /* Reset/restart the adapter */
+
+    dprintf(("Misc", "%s: Tests finished - reset hardware\n", __func__));
+
+    adapter->hw.autoneg = autoneg;
+    dev->ignore_irqs = false;
+    if (interface_up)
+    {
+        /* Reset and restart */
+        adapter->hw.wait_autoneg_complete = 1;
+        em_ro_restart(adapter->dev);
+        adapter->hw.wait_autoneg_complete = WAIT_FOR_AUTO_NEG_DEFAULT;
+    }
+    else
+    {
+        /* Reset */
+        em_reset_hw(&adapter->hw);
+        em_init_hw(&adapter->hw);
+    }
+}

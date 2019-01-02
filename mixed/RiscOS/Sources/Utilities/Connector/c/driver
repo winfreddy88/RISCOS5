@@ -1,0 +1,247 @@
+/*                  _____________________________________________
+                  [>                                             <]
+Project           [> ARCterm VII                                 <]
+Author            [> Hugo Fiennes                                <]
+Date started      [> 05-March-1990                               <]
+                  [>                                             <]
+Module name       [> Driver loading                              <]
+Current version   [> 00.04                                       <]
+Version date      [> 09-December-1992                            <]
+State             [> Unfinished                                  <]
+                  [>                                             <]
+                  [>    This source is COPYRIGHT © 1992 by       <]
+                  [>      Hugo Fiennes of The Serial Port        <]
+                  [>_____________________________________________<]
+*/
+#include "os.h"
+#include "Desk/File.h"
+#include "Desk/Filing.h"
+#include "Desk/DeskMem.h"
+#include "Desk/WimpSWIs.h"
+#include "Desk/Icon.h"
+#include "Desk/Str.h"
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include "driver.h"
+#include "iconnames.h"
+
+
+extern void get_serial_output_buffer_size(void);
+extern void set_cserial_icons(int dnr,int pmnr,int sib,int sob,int intern);
+extern void set_driver_info_window(char *di,int dv,char *dc,int mpn,int s);
+
+int  (*driver)(int,...);
+int  *driver_speedtable,driver_flags,driver_version,driver_noofspeeds,driver_number;
+char *driver_info,*driver_creator;
+
+extern drivers_block drivers[];
+//extern int driver_block[];
+extern int *driver_block;
+extern int number_of_drivers;
+extern int max_port_nr;
+extern int driver_nr,new_driver_nr;
+extern Desk_window_handle cserial_window;
+extern Desk_window_handle driverinfo_window;
+extern char gstring[];
+extern Desk_icon_incdecblock *incdec_cserial;
+extern int max_port_nr;
+extern int serial_input_buffer_size;
+extern int serial_output_buffer_size;
+extern int serial_input_buffer;
+extern int serial_output_buffer;
+extern int internal_driver;
+
+void driver_free(void)
+{
+  if(driver_block!=NULL)
+    Desk_DeskMem_Free(driver_block);
+}
+
+void driver_init(void)
+{
+  char drivername[80];
+  char temp[256];
+  int number,seq_point;
+  int nd=0;
+  Desk_file_handle drvcheck;
+  char *s;
+
+  /* Build table of availiable drivers */
+  /* Scan directory */
+
+  seq_point=0;
+  number=1;
+  
+  s=getenv("SerialDev$Path");
+  if ((s==NULL) || (strlen(s)==0))
+    Desk_Error_ReportFatal(0,"Cannot locate block drivers, has !SerialDev been seen?");
+
+  if(!Desk_File_IsDirectory("SerialDev:Modules"))
+    Desk_Error_ReportFatal(0,"Block driver modules directory not found");
+
+  do
+  {
+    Desk_Filing_ReadDirNames("SerialDev:Modules",drivername,&number,&seq_point,60,NULL);
+    if (number)
+    {
+      /* Got filename, check driver */
+      sprintf(temp,"SerialDev:Modules.%s.Driver",drivername);
+      if ((drvcheck=Desk_File_Open(temp,Desk_file_READ))!=NULL)
+      {
+          strcpy(drivers[nd].file,drivername);
+          Desk_File_Seek(drvcheck, 0x80);
+          Desk_File_ReadBytes(drvcheck, drivers[nd].info, 32);
+          Desk_File_Seek(drvcheck, 0xc8);
+          Desk_File_ReadBytes(drvcheck, &drivers[nd++].number, 4);
+          Desk_File_Close(drvcheck);
+      }
+    }
+  }
+  while(seq_point>=0);
+
+  number_of_drivers=nd;
+  /* Terminate list */
+  drivers[nd].info[0]=0;
+}
+
+//int (*driver_load(char *drivername))(int,...)
+void *driver_load(char *drivername)
+{
+  Desk_file_handle drv;
+  int len;
+  char temp[60];
+
+  sprintf(temp,"SerialDev:Modules.%s.Driver",drivername);
+  if ((drv=Desk_File_Open(temp,Desk_file_READ))==NULL) return(NULL);
+  len=Desk_File_Size(temp);
+  if(driver_block!=NULL)
+    Desk_DeskMem_Free(driver_block);
+  driver_block = (int *)Desk_DeskMem_Malloc(len);
+
+  Desk_File_ReadBytes(drv, driver_block, len);
+  Desk_File_Close(drv);
+  Desk_SWI(1,0,0x6e|Desk_SWI_XOS_Bit,0);
+
+  /* NOTE! Should really call initialise entry before checking ANY of the below */
+  driver_flags=driver_block[49];
+  driver_version=driver_block[48];
+  driver_speedtable=&driver_block[64];
+  driver_info=(char*)&driver_block[32];
+  driver_creator=(char*)&driver_block[40];
+  driver_number=driver_block[50];
+
+  driver_noofspeeds=0;
+  while(driver_speedtable[driver_noofspeeds++]);
+  driver_noofspeeds--;
+
+  return(driver_block);
+}
+
+int (*driver_convert(int *d_block))(int,...)
+{
+  return((int (*)(int, ...))d_block);
+}
+
+int driver_check(char *drivername)
+{
+  Desk_file_handle drv;
+  int len;
+  char temp[60];
+  int *driver_block2=NULL;
+  char *error;
+  int  (*driver2)(int,...);
+  int  *ldriver_speedtable,ldriver_flags,ldriver_version,ldriver_noofspeeds,ldriver_number;
+  char *ldriver_info,*ldriver_creator;
+  unsigned int lmax_port_nr;
+  int lserial_input_buffer,lserial_output_buffer;
+  int intern=1;
+
+  sprintf(temp,"SerialDev:Modules.%s.Driver",drivername);
+  if ((drv=Desk_File_Open(temp,Desk_file_READ))==NULL)
+  {
+    Desk_Error_Report(0,"can't load %s driver",drivername);
+    //new_driver_nr=driver_nr;
+    set_cserial_icons(driver_nr,max_port_nr,serial_input_buffer,serial_output_buffer,internal_driver);
+    set_driver_info_window(driver_info,driver_version,driver_creator,max_port_nr,
+                         driver_speedtable[driver_noofspeeds-1]);
+    return(-1);
+  }
+  len=Desk_File_Size(temp);
+
+
+  driver_block2 = (int *)Desk_DeskMem_Malloc(len);
+
+  Desk_File_ReadBytes(drv, driver_block2, len);
+  Desk_File_Close(drv);
+  Desk_SWI(1,0,0x6e|Desk_SWI_XOS_Bit,0);
+
+  driver2=driver_convert(driver_block2);
+
+  if((error=(char *)(*driver2)(DRIVER_INITIALISE,-1))!=NULL)
+  {
+    Desk_Error_Report(0,"Error when initialising driver: %s",error);
+    //new_driver_nr=driver_nr;
+    set_cserial_icons(driver_nr,max_port_nr,serial_input_buffer,serial_output_buffer,internal_driver);
+    set_driver_info_window(driver_info,driver_version,driver_creator,max_port_nr,
+                         driver_speedtable[driver_noofspeeds-1]);
+    Desk_DeskMem_Free(driver_block2);
+    return(-1);
+  }
+  
+  ldriver_flags=driver_block2[49];
+  ldriver_version=driver_block2[48];
+  ldriver_speedtable=&driver_block2[64];
+  ldriver_info=(char*)&driver_block2[32];
+  ldriver_creator=(char*)&driver_block2[40];
+  ldriver_number=driver_block2[50];
+
+  ldriver_noofspeeds=0;
+  while(ldriver_speedtable[ldriver_noofspeeds++]);
+  ldriver_noofspeeds--;
+
+  lmax_port_nr=((unsigned int)ldriver_flags)>>24;
+
+  if(Desk_stricmp(drivers[new_driver_nr].file,"InternalPC") &&
+     Desk_stricmp(drivers[new_driver_nr].file,"Internal") &&
+     Desk_stricmp(drivers[new_driver_nr].file,"Internal32") )
+  {
+    lserial_input_buffer=0;
+    lserial_output_buffer=0;
+    get_serial_output_buffer_size();
+    intern=0;
+  }
+  else
+  {
+    intern=1;
+    lserial_input_buffer=1;
+    lserial_output_buffer=1;
+  }
+  
+  set_cserial_icons(new_driver_nr,lmax_port_nr,lserial_input_buffer,lserial_output_buffer,intern);
+  
+  set_driver_info_window(ldriver_info,ldriver_version,ldriver_creator,lmax_port_nr,
+                         ldriver_speedtable[ldriver_noofspeeds-1]);
+                    
+  Desk_DeskMem_Free(driver_block2);
+  
+  return(new_driver_nr);
+}
+
+void set_driver_vars(void)
+{
+  driver_flags=driver_block[49];
+  driver_version=driver_block[48];
+  driver_speedtable=&driver_block[64];
+  driver_info=(char*)&driver_block[32];
+  driver_creator=(char*)&driver_block[40];
+  driver_number=driver_block[50];
+
+  driver_noofspeeds=0;
+  while(driver_speedtable[driver_noofspeeds++]);
+  driver_noofspeeds--;
+
+  max_port_nr=((unsigned int)driver_flags)>>24;
+
+}

@@ -1,0 +1,800 @@
+;
+; Copyright (c) 2012, RISC OS Open Ltd
+; All rights reserved.
+;
+; Redistribution and use in source and binary forms, with or without
+; modification, are permitted provided that the following conditions are met:
+;     * Redistributions of source code must retain the above copyright
+;       notice, this list of conditions and the following disclaimer.
+;     * Redistributions in binary form must reproduce the above copyright
+;       notice, this list of conditions and the following disclaimer in the
+;       documentation and/or other materials provided with the distribution.
+;     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+;       may be used to endorse or promote products derived from this software
+;       without specific prior written permission.
+;
+; THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+; AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+; IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+; ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+; LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+; CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+; SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+; INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+; CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+; ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+; POSSIBILITY OF SUCH DAMAGE.
+;
+
+        EXPORT  SDIO_InitDevices
+        IMPORT  memcpy
+        IMPORT  TPSRead
+        IMPORT  TPSWrite
+        IMPORT  I2CBusRead
+        IMPORT  I2CBusWrite
+        IMPORT  HAL_CounterDelay
+        IMPORT  GPIOx_SetAsOutput
+
+        ; KEEP ; for debugging
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:OSEntries
+        GET     hdr.omap543x
+        GET     hdr.GPIO
+        GET     hdr.GPIOExtend
+        GET     hdr.irqids543x
+        GET     hdr.StaticWS
+        GET     hdr.PRCM
+
+sb      RN      9
+
+; Timings
+
+; Maximum time bus power is allowed to take to ramp up or down.
+; MMC and SD agree this is 35 ms max ramp up, but nothing is said about ramp down
+; so I'm assuming it's the same.
+BUS_POWER_RAMP          *       35000 ; in us
+
+; Number of reads of SYSSTATUS before we give up waiting for reset to complete
+RESET_TIMEOUT           *       100
+
+; Number of reads of SYSCTL before we give up waiting for SDCLK to stabilise
+CLOCKSET_TIMEOUT        *       1000
+
+; Time to leave initialisation procedure to execute
+INIT_PROCEDURE_TIME     *       1000 ; in us
+
+; Frequency of the clock which we divide to produce SDCLK
+FCLK_FREQ               *       96000 ; in kHz
+
+
+; RISC OS device numbers for each controller's IRQ line
+MMC1_IRQ                *       OMAP54XX_IRQ_MMC1
+MMC2_IRQ                *       OMAP54XX_IRQ_MMC2
+MMC3_IRQ                *       OMAP54XX_IRQ_MMC3
+
+; LEDs for IGEPv5
+; LED assignments: LEDs provided by TCA6416 GPIO extender chip
+; P0.1 == yellow, P0.2 == red, P0.3 == blue
+; blue and red are exclusive (only one can be switched on)
+IGEPv5_LED_ACT_OFF      *       TCA6416_LED_D1
+IGEPv5_LED_ACT_WRITE    *       TCA6416_LED_D3
+IGEPv5_LEDS_MASK        *       TCA6416_LED_MASK
+
+IGEPv5_LED_PORT         *       TCA6416_LED_PORT
+
+
+; LEDs for UEVM
+; LED assignments: LEDs provided by TCA6424A GPIO extender chip
+; 5 green LEDs: D4 == P0.6, D5 == P0.5, D6 == P0.4, D7 == P0.3, D8 == P0.2
+; SDIO uses LEDs D4 and D5 (nearest to SD card interface)
+UEVM_LED_ACT_OFF        *       TCA6424A_LED_D4
+UEVM_LED_ACT_WRITE      *       TCA6424A_LED_D5
+UEVM_LEDS_MASK          *       (TCA6424A_LED_D4 + TCA6424A_LED_D5)
+UEVM_ALL_LEDS_MASK      *       (UEVM_LEDS_MASK + TCA6424A_LED_D6 + TCA6424A_LED_D7 + TCA6424A_LED_D8)
+
+UEVM_LED_PORT           *       TCA6424A_OUTPUT_P0
+
+
+; GPIO pin assignments
+; IGEPv5 and UEVM use the same card detect pin
+                GBLS    OMAP5_CD_MMC1
+OMAP5_CD_MMC1   SETS    "152"
+
+
+; Selected SD controller registers and bits
+SYSCONFIG               *       &110
+SYSCONFIG_SOFTRESET     *       (1 << 1)
+SYSSTATUS               *       &114
+SYSSTATUS_RESETDONE     *       (1 << 0)
+CON                     *       &12C
+CON_OD                  *       (1 << 0)
+CON_INIT                *       (1 << 1)
+CON_DW8                 *       (1 << 5)
+CMD                     *       &20C
+HCTL                    *       &228
+HCTL_DTW                *       (1 << 1)
+HCTL_HSPE               *       (1 << 2)
+HCTL_SDBP               *       (1 << 8)
+HCTL_SDVS_1_8V          *       (5 << 9)
+HCTL_SDVS_3_0V          *       (6 << 9)
+SYSCTL                  *       &22C
+SYSCTL_ICE              *       (1 << 0)
+SYSCTL_ICS              *       (1 << 1)
+SYSCTL_CEN              *       (1 << 2)
+SYSCTL_CLKD_SHIFT       *       6
+SYSCTL_CLKD_MASK        *       (&3FF << SYSCTL_CLKD_SHIFT)
+SYSCTL_SRA              *       (1 << 24)
+SYSCTL_SRC              *       (1 << 25)
+SYSCTL_SRD              *       (1 << 26)
+STAT                    *       &230
+STAT_CC                 *       (1 << 0)
+IE                      *       &234
+IE_CC                   *       (1 << 0)
+CAPA                    *       &240
+CAPA_HSS                *       (1 << 21)
+CAPA_VS33               *       (1 << 24)
+CAPA_VS30               *       (1 << 25)
+CAPA_VS18               *       (1 << 26)
+CAPA2                   *       &244
+CAPA2_SDR50S            *       (1 << 0)
+CAPA2_SDR104S           *       (1 << 1)
+CAPA2_DDR50S            *       (1 << 2)
+
+SDHCI_STDREGS_OFFSET    *       &200
+
+
+        AREA    |Asm$$Code|, CODE, READONLY, PIC
+
+        MACRO
+$class  HALDeviceField $field, $value
+        LCLS    myvalue
+      [ "$value" = ""
+myvalue SETS    "$field"
+      |
+myvalue SETS    "$value"
+      ]
+        ASSERT  . - %A0 = HALDevice_$class$field
+      [ ?HALDevice_$class$field = 2
+        DCW     $myvalue
+   ELIF ?HALDevice_$class$field = 4
+        DCD     $myvalue
+      |
+        %       ?HALDevice_$class$field
+      ]
+        MEND
+
+; Template for device blocks
+
+Template
+0
+        HALDeviceField Type,            HALDeviceType_ExpCtl + HALDeviceExpCtl_SDIO
+        HALDeviceField ID,              HALDeviceID_SDIO_SDHCI
+        HALDeviceField Location,        HALDeviceBus_Peri + HALDevicePeriBus_Sonics3220
+        HALDeviceField Version,         0
+        HALDeviceField Description
+        HALDeviceField Address,         0 ; patched up at initialisation
+        HALDeviceField Reserved1,       0
+        HALDeviceField Activate,        0 ; patched up at initialisation
+        HALDeviceField Deactivate
+        HALDeviceField Reset
+        HALDeviceField Sleep
+        HALDeviceField Device,          MMC1_IRQ ; overridden in some cases
+        HALDeviceField TestIRQ
+        HALDeviceField ClearIRQ,        0
+        HALDeviceField Reserved2,       0
+SDHCI   HALDeviceField Flags,           HALDeviceSDHCI_Flag_32bit + HALDeviceSDHCI_Flag_R2bug
+SDHCI   HALDeviceField Slots,           1
+SDHCI   HALDeviceField SlotInfo,        0 ; patched up at initialisation
+SDHCI   HALDeviceField WriteRegister,   0
+SDHCI   HALDeviceField GetCapabilities
+SDHCI   HALDeviceField GetVddCapabilities, 0 ; overridden in some cases
+SDHCI   HALDeviceField SetVdd           ; overridden in some cases
+SDHCI   HALDeviceField SetBusMode
+SDHCI   HALDeviceField PostPowerOn
+SDHCI   HALDeviceField SetBusWidth
+SDHCI   HALDeviceField GetMaxCurrent    ; overridden in some cases
+SDHCI   HALDeviceField SetSDCLK
+SDHCI   HALDeviceField GetTMCLK
+SDHCI   HALDeviceField SetActivity,     0 ; patched up at initialisation
+SDHCI   HALDeviceField GetCardDetect    ; overridden in some cases
+SDHCI   HALDeviceField GetWriteProtect, 0 ; patched up at initialisation
+        %       %A0 + HALDevice_SDHCISize - .
+        ASSERT  . - %A0 = SDHCISB
+        DCD     0                       ; patched up at initialisation
+        ASSERT  . - %A0 = SDHCISlotInfo + HALDeviceSDHCI_SlotInfo_Flags
+        DCD     0                       ; patched up at initialisation
+        ASSERT  . - %A0 = SDHCISlotInfo + HALDeviceSDHCI_SlotInfo_StdRegs
+        DCD     0                       ; patched up at initialisation
+        ASSERT  . - %A0 = SDHCISize
+
+
+        ; Init the SDHCI HAL device(s)
+        ; a1 = BoardType value
+        ; a2 = BoardRevision value
+SDIO_InitDevices ROUT
+        Push    "a1-a2,lr"
+        MOV     a3, #0
+        ADRL    a4, SDIOWS
+        BL      InitDevice
+        Pull    "a1-a2"
+        ; IGEPv5 Lite Edition has no eMMC device and no WLAN_SDIO
+        ; check end of available RAM (Lite has only 1 GiB: end at 0xC0000000)
+        LDR     a3, [sb, #BoardConfig_EndOfRAM]
+        CMP     a3, #0xC0000000
+        Pull    "pc", EQ
+
+        Push    "a1-a2"
+        MOV     a3, #1
+        ADRL    a4, SDIOWS + SDHCISize
+        BL      InitDevice
+        Pull    "a1-a2"
+        MOV     a3, #2
+        ADRL    a4, SDIOWS + 2 * SDHCISize
+        BL      InitDevice
+        Pull    "pc"
+
+        ; Init one SDHCI HAL device
+        ; a1 = BoardType value
+        ; a2 = BoardRevision value
+        ; a3 = device number
+        ; a4 -> workspace for this device
+InitDevice ROUT
+        Push    "a1-a4,lr"
+        MOV     a1, a4
+        ADR     a2, Template
+        MOV     a3, #SDHCISize
+        BL      memcpy
+
+        Pull    "a1-a4"
+
+        ; Address and SlotInfo_StdRegs
+        LDR     ip, L4_Per_Log
+        CMP     a3, #1
+        ADDLO   lr, ip, #(L4_HSMMC1 - L4_Per)
+        ADDEQ   lr, ip, #(L4_HSMMC2 - L4_Per)
+        ADDHI   lr, ip, #(L4_MMC_SD3 - L4_Per)
+        STR     lr, [a4, #HALDevice_Address]
+        ADD     lr, lr, #SDHCI_STDREGS_OFFSET
+        STR     lr, [a4, #SDHCISlotInfo + HALDeviceSDHCI_SlotInfo_StdRegs]
+
+        ; Device
+        MOVEQ   lr, #MMC2_IRQ
+        MOVHI   lr, #MMC3_IRQ
+        STRHS   lr, [a4, #HALDevice_Device]
+
+        ; SlotInfo
+        ADD     lr, a4, #SDHCISlotInfo
+        STR     lr, [a4, #HALDevice_SDHCISlotInfo]
+
+        ; SDHCISB
+        STR     sb, [a4, #SDHCISB]
+
+        BEQ     %F20
+        BCS     %F30
+
+        ; Card slot 1 case
+        ; ----------------
+
+        ; Activate
+        ADR     lr, Activate_MMC1_IGEPv5
+        TEQ     a1, #BoardType_OMAP5_UEVM
+        ADREQ   lr, Activate_MMC1_UEVM
+        STR     lr, [a4, #HALDevice_Activate]
+
+        ; SetActivity
+        ADRL    lr, SetActivity_IGEPv5
+        TEQ     a1, #BoardType_OMAP5_UEVM
+        ADREQL  lr, SetActivity_UEVM
+        STR     lr, [a4, #HALDevice_SDHCISetActivity]
+
+        ; GetWriteProtect
+        ADRL    lr, GetWriteProtect
+        STR     lr, [a4, #HALDevice_SDHCIGetWriteProtect]
+
+        ; SlotInfo_Flags
+        MOV     lr, #HALDeviceSDHCI_SlotFlag_Bus4Bit
+        STR     lr, [a4, #SDHCISlotInfo + HALDeviceSDHCI_SlotInfo_Flags]
+
+        B       %F40
+
+20
+        ; Card slot 2 case (eMMC2)
+        ; ------------------------
+
+        ; Activate
+        ADRL    lr, Activate_eMMC2
+        STR     lr, [a4, #HALDevice_Activate]
+
+        ; GetVddCapabilities
+        ADRL    lr, GetVddCapabilities_eMMC2
+        STR     lr, [a4, #HALDevice_SDHCIGetVddCapabilities]
+
+        ; SetVdd
+        ; On OMAP5 the eMMC2 device is fixed at 3.0V and already setup by U-Boot.
+        ; We do still need to turn on the power to the controller.
+        ADRL    lr, SetVdd_eMMC2
+        STR     lr, [a4, #HALDevice_SDHCISetVdd]
+
+        ; SetActivity
+        ADR     lr, NOPEntry
+        STR     lr, [a4, #HALDevice_SDHCISetActivity]
+
+        ; GetCardDetect
+        ADRL    lr, GetCardDetect_NonRemovable
+        STR     lr, [a4, #HALDevice_SDHCIGetCardDetect]
+
+        ; SlotInfo_Flags
+        MOV     lr, #HALDeviceSDHCI_SlotFlag_Bus8Bit :OR: HALDeviceSDHCI_SlotFlag_IntegratedMem
+        STR     lr, [a4, #SDHCISlotInfo + HALDeviceSDHCI_SlotInfo_Flags]
+
+        B       %F40
+
+30
+        ; Card slot 3 case (MMC3: WLAN_SDIO)
+        ; ----------------------------------
+
+        ; Activate
+        ADRL    lr, Activate_WLAN_SDIO
+        STR     lr, [a4, #HALDevice_Activate]
+
+        ; GetVddCapabilities
+        ADRL    lr, GetVddCapabilities_WLAN_SDIO
+        STR     lr, [a4, #HALDevice_SDHCIGetVddCapabilities]
+
+        ; SetVdd
+        ; There is no level shifter between the OMAP5 and the WiFi chip, and no
+        ; possibility to change the voltage in the OMAP on MMC3 (fixed at 1.8 V).
+        ; Default SDHCI handler will do in this case.
+        MOV     lr, #0
+        STR     lr, [a4, #HALDevice_SDHCISetVdd]
+
+        ; SetActivity
+        ADR     lr, NOPEntry
+        STR     lr, [a4, #HALDevice_SDHCISetActivity]
+
+        ; GetCardDetect
+        ADRL    lr, GetCardDetect_NonRemovable
+        STR     lr, [a4, #HALDevice_SDHCIGetCardDetect]
+
+        ; SlotInfo_Flags
+        MOV     lr, #HALDeviceSDHCI_SlotFlag_Bus4Bit :OR: HALDeviceSDHCI_SlotFlag_Integrated
+        STR     lr, [a4, #SDHCISlotInfo + HALDeviceSDHCI_SlotInfo_Flags]
+
+40
+        MOV     a1, #0 ; flags
+        MOV     a2, a4
+        Pull    "lr"
+        LDR     pc, OSentries+4*OS_AddDevice ; tail call
+
+Description DATA
+        =       "TI OMAP5 SD host controller", 0
+        ALIGN
+
+NOPEntry ROUT
+        MOV     pc, lr
+
+
+Activate_MMC1_IGEPv5 ROUT
+        Push    "v1-v2,sb,lr"
+        LDR     sb, [a1, #SDHCISB]
+        ; switch OFF all LEDs
+        SUB     sp, sp, #4      ; buffer for TCA6416 register contents
+        ; read old content
+        MOV     a2, sp
+        MOV     v2, #TCA6416_IIC_BUS
+        LDR     v1, OSentries+4*OS_IICOpV
+        MOV     a4, #IGEPv5_LED_PORT
+        MOV     a1, #TCA6416_IIC_ADDR
+        MOV     a3, #1
+        BL      I2CBusRead
+        LDRB    a1, [a2]
+        BIC     a1, a1, #IGEPv5_LEDS_MASK
+        STRB    a1, [a2]
+        MOV     a1, #TCA6416_IIC_ADDR
+        BL      I2CBusWrite
+        ADD     sp, sp, #4
+10
+        ; configure Card Detect pin (GPIO5_152)
+        LDR     a4, L4_Core_Log
+        LDR     a2, =(L4_CTRL_MODULE_CORE_PAD - L4_Core)
+        ADD     a4, a2, a4
+        LDR     a3, =0x011E             ; input: IEN + PTU + Mode 6
+        ADD     a4, a4, #0x100          ; reduce offset
+        STRH    a3, [a4, #0x00D4]       ; gpio5_152 == CD_MMC1
+
+        MOV     a1, #1                  ; mark successful activation
+        Pull    "v1-v2,sb,pc"
+
+Activate_MMC1_UEVM
+        Push    "v1-v2,sb,lr"
+        LDR     sb, [a1, #SDHCISB]
+        ; switch OFF all LEDs
+        SUB     sp, sp, #4      ; buffer for TCA6424A register contents
+        ; read old content
+        MOV     a2, sp
+        MOV     v2, #TCA6424A_IIC_BUS
+        LDR     v1, OSentries+4*OS_IICOpV
+        MOV     a4, #UEVM_LED_PORT
+        MOV     a1, #TCA6424A_IIC_ADDR
+        MOV     a3, #1
+        BL      I2CBusRead
+        LDRB    a1, [a2]
+        BIC     a1, a1, #UEVM_ALL_LEDS_MASK
+        STRB    a1, [a2]
+        MOV     a1, #TCA6424A_IIC_ADDR
+        BL      I2CBusWrite
+        ADD     sp, sp, #4
+
+        B       %BT10
+
+
+Deactivate * NOPEntry
+
+Reset ROUT
+        Push    "sb,lr"
+        LDR     sb, [a1, #SDHCISB]
+        LDR     a4, [a1, #HALDevice_Address]
+        ; 24.5.1.1.2.2 MMCHS Controller Software Reset
+        MOV     a2, #SYSCONFIG_SOFTRESET
+        STR     a2, [a4, #SYSCONFIG]
+        MOV     a3, #RESET_TIMEOUT
+00      SUBS    a3, a3, #1
+        Pull    "sb,pc", EQ     ; timed out
+        LDR     a2, [a4, #SYSSTATUS]
+        TST     a2, #SYSSTATUS_RESETDONE
+        BEQ     %B00
+
+        ; 24.5.1.1.2.3 MMCHS Controller Voltage Capabilities Initialization
+        ADRL    a2, SDIOWS              ; = device for MMC1
+        TEQ     a2, a1
+        MOVEQ   a3, #CAPA_VS18 :OR: CAPA_VS30
+        ADDNE   a2, a2, #SDHCISize      ; = device for eMMC2
+        TEQNE   a2, a1
+        MOVEQ   a3, #CAPA_VS30
+        MOVNE   a3, #CAPA_VS18
+        STR     a3, [a4, #CAPA]
+        Pull    "sb,pc"
+
+Sleep ROUT
+        ; Could probably turn clock to controller on/off to
+        ; save power, but for now don't support power saving
+        MOV     a1, #0
+        MOV     pc, lr
+
+TestIRQ ROUT
+        ; Not a shared interrupt, so it must be our fault
+        MOV     a1, #1
+        MOV     pc, lr
+
+        ; fake: fast high speed modes not supported by the controller
+GetCapabilities ROUT
+        LDR     a3, [a1, #HALDevice_Address]
+        LDR     a2, [a3, #CAPA2]
+        LDR     a1, [a3, #CAPA]
+        BIC     a2, a2, #(CAPA2_SDR104S + CAPA2_DDR50S)
+        MOV     pc, lr
+
+GetVddCapabilities_eMMC2 ROUT
+        MOV     a1, #CAPA_VS30 / CAPA_VS33      ; flags start at bit 0
+        MOV     pc, lr
+
+GetVddCapabilities_WLAN_SDIO ROUT
+        MOV     a1, #CAPA_VS18 / CAPA_VS33      ; flags start at bit 0
+        MOV     pc, lr
+
+SetVdd ROUT ; MMC1 case
+        Push    "sb,lr"
+        LDR     sb, [a1, #SDHCISB]
+
+        ; Turn on|off the power internal to the SD controller
+        ADRL    a1, SDIOWS
+        LDR     a1, [a1, #HALDevice_Address]
+
+        TEQ     a3, #0
+        MOVEQ   a2, #0
+        BEQ     %F00
+        LDR     a4, =1800
+        TEQ     a3, a4
+        MOVEQ   a2, #HCTL_SDVS_1_8V
+        BEQ     %F00
+        LDR     a4, =3000
+        TEQ     a3, a4
+        MOVEQ   a2, #HCTL_SDVS_3_0V
+        BNE     %F90    ; shouldn't happen
+
+00
+        STR     a2, [a1, #HCTL]
+        TEQ     a2, #0
+        ORRNE   a2, a2, #HCTL_SDBP
+        STRNE   a2, [a1, #HCTL] ; needs to be two separate writes, the SDBP bit won't latch on the first write
+
+90
+        Pull    "sb,pc"
+
+SetVdd_eMMC2 ROUT ; eMMC2 case
+        Push    "sb,lr"
+        LDR     sb, [a1, #SDHCISB]
+        LDR     a1, [a1, #HALDevice_Address]
+        MOV     a2, #HCTL_SDVS_3_0V
+        STR     a2, [a1, #HCTL]
+        ORR     a2, a2, #HCTL_SDBP
+        STR     a2, [a1, #HCTL] ; needs to be two separate writes, the SDBP bit won't latch on the first write
+
+        ; Wait for the power to ramp up
+        MOV     a1, #BUS_POWER_RAMP
+        BL      HAL_CounterDelay
+        Pull    "sb,pc"
+
+SetBusMode ROUT
+        Push    "sb,lr"
+        LDR     a4, [a1, #HALDevice_Address]
+        LDR     ip, [a4, #CON]
+        TEQ     a3, #0
+        ORRNE   ip, ip, #CON_OD
+        BICEQ   ip, ip, #CON_OD
+        STR     ip, [a4, #CON]
+        Pull    "sb,pc"
+
+PostPowerOn ROUT
+        Push    "v1,sb,lr"
+        LDR     sb, [a1, #SDHCISB]
+        MOV     v1, a1
+
+        LDR     a4, [v1, #HALDevice_Address]
+        LDR     a1, [a4, #CON]
+        ORR     a1, a1, #(CON_INIT + CON_OD)
+        STR     a1, [a4, #CON]
+  [ {FALSE}
+        MOV     a3, #HCTL_SDVS_3_0V
+        STR     a3, [a4, #HCTL]
+  |
+        LDR     a3, [a4, #HCTL]
+        BIC     a3, a3, #HCTL_SDBP
+        STR     a3, [a4, #HCTL]
+  ]
+
+        ; set clock to 160 kHz (send CMD0 twice for 1 ms)
+        MOV     a3, #SYSCTL_ICE
+        STR     a3, [a4, #SYSCTL]
+        MOV     a2, #(600 << SYSCTL_CLKD_SHIFT)
+        ORR     a3, a3, a2
+        STR     a3, [a4, #SYSCTL]
+
+        ; wait until clock is stable
+00
+        LDR     a3, [a4, #SYSCTL]
+        TST     a3, #SYSCTL_ICS
+        BEQ     %BT00
+        ; enable clock
+        ORR     a3, a3, #SYSCTL_CEN
+        STR     a3, [a4, #SYSCTL]
+
+        LDR     a3, [a4, #HCTL]
+        ORR     a3, a3, #HCTL_SDBP
+        STR     a3, [a4, #HCTL]
+05
+        LDR     a3, [a4, #HCTL]
+        TST     a3, #HCTL_SDBP
+        BEQ     %B05
+
+        ; activate status bits
+        MOV     a2, #IE_CC
+        STR     a2, [a4, #IE]
+        ; send init command
+        MOV     a2, #0
+        STR     a2, [a4, #CMD]
+05
+        LDR     a3, [a4, #STAT]
+        TST     a3, #STAT_CC
+        BEQ     %BT05
+        MOV     a3, #STAT_CC
+        STR     a3, [a4, #STAT] ; clear CC
+        ; send it once again
+        STR     a2, [a4, #CMD]
+10
+        LDR     a3, [a4, #STAT]
+        TST     a3, #STAT_CC
+        BEQ     %BT10
+        ; deactivate status bits
+        MOV     a2, #0
+        STR     a2, [a4, #IE]
+
+        LDR     a1, [a4, #CON]
+        BIC     a1, a1, #CON_INIT
+        STR     a1, [a4, #CON]  ; end initialisation sequence
+
+        MOV     a1, #-1
+        STR     a1, [a4, #STAT] ; acknowledge all interrupts
+
+        Pull    "v1,sb,pc"
+
+SetBusWidth ROUT
+        LDR     a4, [a1, #HALDevice_Address]
+        LDR     ip, [a4, #CON]
+        TEQ     a3, #8
+        ORREQ   ip, ip, #CON_DW8
+        BICNE   ip, ip, #CON_DW8
+        STR     ip, [a4, #CON]
+        LDR     ip, [a4, #HCTL]
+        TEQ     a3, #4
+        ORREQ   ip, ip, #HCTL_DTW
+        BICNE   ip, ip, #HCTL_DTW
+        STR     ip, [a4, #HCTL]
+        MOV     pc, lr
+
+GetMaxCurrent ROUT ; MMC1 case (used also for eMMC2 [no spec found for eMMC2])
+        ; TWL6037 supplies 50 mA on LDO9 (used for SD card MMC1)
+        MOV     a1, #50
+        MOV     pc, lr
+
+SetSDCLK ROUT
+        LDR     a1, [a1, #HALDevice_Address]
+
+        LDR     ip, =FCLK_FREQ
+        ADD     a2, ip, a3
+        SUB     a2, a2, #1      ; round divider up so we round frequency down
+;       DivRem  a4, a2, a3, ip
+        UDIV    a4, a2, a3
+        CMP     a4, #(SYSCTL_CLKD_MASK :SHR: SYSCTL_CLKD_SHIFT) + 1
+        MOVHS   a4, #SYSCTL_CLKD_MASK :SHR: SYSCTL_CLKD_SHIFT
+        ; a4 = divider
+        LDR     a2, [a1, #SYSCTL]
+        BIC     a2, a2, #SYSCTL_CEN
+        STR     a2, [a1, #SYSCTL]       ; stop clock going to card
+        BIC     a2, a2, #SYSCTL_ICE
+        STR     a2, [a1, #SYSCTL]       ; stop clock
+        LDR     a3, =SYSCTL_CLKD_MASK
+        BIC     a2, a2, a3
+        ORR     a2, a2, a4, LSL #SYSCTL_CLKD_SHIFT
+        STR     a2, [a1, #SYSCTL]       ; set divider
+        ORR     a2, a2, #SYSCTL_ICE
+        STR     a2, [a1, #SYSCTL]       ; start clock
+
+        MOV     a3, #CLOCKSET_TIMEOUT
+00      SUBS    a3, a3, #1
+        MOVEQ   pc, lr                  ; timed out
+        LDR     a2, [a1, #SYSCTL]
+        TST     a2, #SYSCTL_ICS
+        BEQ     %B00
+
+        ORR     a2, a2, #SYSCTL_CEN
+        STR     a2, [a1, #SYSCTL]       ; provide clock to card
+
+        LDR     ip, =FCLK_FREQ
+;       DivRem  a1, ip, a4, a2
+        UDIV    a1, ip, a4
+
+        MOV     pc, lr
+
+GetTMCLK ROUT
+        ; Verified experimentally that the OMAP reuses SDCLK for TMCLK
+        LDR     a1, [a1, #HALDevice_Address]
+        LDR     a2, [a1, #SYSCTL]
+        LDR     a3, =SYSCTL_CLKD_MASK
+        AND     a2, a2, a3
+        MOV     a2, a2, LSR #SYSCTL_CLKD_SHIFT
+        LDR     ip, =FCLK_FREQ
+;       DivRem  a1, ip, a2, a3
+        UDIV    a1, ip, a2
+        MOV     pc, lr
+
+SetActivity_IGEPv5 ROUT
+        Push    "v1-v3,sb,lr"
+        LDR     sb, [a1, #SDHCISB]
+        SUB     sp, sp, #4      ; buffer for TCA6416 register contents
+        ; prepare LEDs
+        MOV     v3, #0
+        TEQ     a3, #HALDeviceSDHCI_ActivityOff
+        ORRNE   v3, v3, #IGEPv5_LED_ACT_OFF
+        TEQ     a3, #HALDeviceSDHCI_ActivityWrite
+        ORREQ   v3, v3, #IGEPv5_LED_ACT_WRITE
+        ; read old content
+        MOV     a2, sp
+        MOV     v2, #TCA6416_IIC_BUS
+        LDR     v1, OSentries+4*OS_IICOpV
+        MOV     a4, #IGEPv5_LED_PORT
+        MOV     a1, #TCA6416_IIC_ADDR
+        MOV     a3, #1
+        BL      I2CBusRead
+        LDRB    a1, [a2]
+        BIC     a1, a1, #IGEPv5_LEDS_MASK
+        ORR     a1, a1 ,v3
+        STRB    a1, [a2]
+        MOV     a1, #TCA6416_IIC_ADDR
+        BL      I2CBusWrite
+        ADD     sp, sp, #4
+        Pull    "v1-v3,sb,pc"
+
+SetActivity_UEVM ROUT
+        Push    "v1-v3,sb,lr"
+        LDR     sb, [a1, #SDHCISB]
+        SUB     sp, sp, #4      ; buffer for TCA6424A register contents
+        ; prepare LEDs
+        MOV     v3, #0
+        TEQ     a3, #HALDeviceSDHCI_ActivityOff
+        ORRNE   v3, v3, #UEVM_LED_ACT_OFF
+        TEQ     a3, #HALDeviceSDHCI_ActivityWrite
+        ORREQ   v3, v3, #UEVM_LED_ACT_WRITE
+        ; read old content
+        MOV     a2, sp
+        MOV     v2, #TCA6424A_IIC_BUS
+        LDR     v1, OSentries+4*OS_IICOpV
+        MOV     a4, #UEVM_LED_PORT
+        MOV     a1, #TCA6424A_IIC_ADDR
+        MOV     a3, #1
+        BL      I2CBusRead
+        LDRB    a1, [a2]
+        BIC     a1, a1, #UEVM_LEDS_MASK
+        ORR     a1, a1 ,v3
+        STRB    a1, [a2]
+        MOV     a1, #TCA6424A_IIC_ADDR
+        BL      I2CBusWrite
+        ADD     sp, sp, #4
+        Pull    "v1-v3,sb,pc"
+
+GetCardDetect ROUT
+        Push    "sb,lr"
+        LDR     sb, [a1, #SDHCISB]
+        GPIO_PrepareC a1, a2, $OMAP5_CD_MMC1
+        GPIO_GetInput a1, a1, a2
+        TEQ     a1, #0
+        MOVEQ   a1, #1  ; line is active low
+        MOVNE   a1, #0
+        Pull    "sb,pc"
+
+GetCardDetect_NonRemovable ROUT
+        MOV     a1, #1
+        MOV     pc, lr
+
+GetWriteProtect ROUT ; WP is not connected on IGEPv5/UEVM
+        MOV     a1, #0  ; permit writes
+        MOV     pc, lr
+
+Activate_eMMC2 ROUT
+        MOV     a1, #1
+        MOV     pc, lr
+
+Activate_WLAN_SDIO ROUT
+        Push    "sb,lr"
+        LDR     sb, [a1, #SDHCISB]
+
+        ; Configure GPIO pins for MMC3 usage
+        LDR     a1, L4_Core_Log
+        LDR     a2, =(L4_CTRL_MODULE_CORE_PAD - L4_Core)
+        ADD     a1, a2, a1
+        ADD     a3, a1, #0x100          ; add common offset (STRH restriction)
+        LDR     a2, =0x01180118         ; input: IEN + PTD + Mode 0 (twice)
+        STR     a2, [a1, #0x01A4]       ; gpio5_128/wlsdio_clk + gpio5_129/wlsdio_cmd
+        STR     a2, [a1, #0x01A8]       ; gpio5_130/wlsdio_data0 + gpio5_131/wlsdio_data1
+        STR     a2, [a1, #0x01AC]       ; gpio5_132/wlsdio_data2 + gpio5_133/wlsdio_data3
+        LDR     a2, =0x0006             ; output + Mode 6 (GPIO)
+        STRH    a2, [a3, #0x0BC]        ; gpio5_140/wlan_en
+
+        ; Enable MMC3 clock (if not already activated)
+        LDR     a1, L4_CM_CORE_Log
+        ADD     a1, a1, #CORE_CM_CORE
+        LDR     a2, [a1, #CM_L4PER_MMC3_CLKCTRL]
+        ANDS    a2, a2, #(3 << 16)      ; IDLEST
+        BEQ     %FT10
+        MOV     a2, #2                  ; SW_WKUP
+        STR     a2, [a1, #CM_L4PER_MMC3_CLKCTRL]
+        ; Wait until module is active
+05
+        LDR     a2, [a1, #CM_L4PER_MMC3_CLKCTRL]
+        ANDS    a2, a2, #(3 << 16)      ; IDLEST
+        BNE     %BT05
+10
+  [ {TRUE} ; test: activate WLAN_SDIO
+        MOV     a2, #1
+        MOV     a1, #140
+        BL      GPIOx_SetAsOutput
+        ; Wait for the power to ramp up
+        MOV     a1, #BUS_POWER_RAMP
+        BL      HAL_CounterDelay
+  ]
+        MOV     a1, #1
+        Pull    "sb,pc"
+
+        END

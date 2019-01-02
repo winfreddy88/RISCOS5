@@ -1,0 +1,160 @@
+; Copyright 2009 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:Machine.<Machine>
+        GET     Hdr:ImageSize.<ImageSize>
+        GET     Hdr:Proc
+
+        GET     Hdr:OSEntries
+
+        GET     hdr.omap3530
+        GET     hdr.PRCM
+        GET     hdr.StaticWS
+        GET     hdr.Timers
+
+        AREA    |Asm$$Code|, CODE, READONLY, PIC
+
+        IMPORT  Timer_Init
+
+        EXPORT  PRCM_SetClocks
+        EXPORT  PRCM_GetFreqSel
+
+PRCM_SetClocks
+        Push    "v1-v4,lr"
+        ; First we calculate the system clock speed by measuring it against the 32KHz counter
+        ; Then we make sure all system clocks are set to max
+        ; This is basically the same algorithm as u-boot uses
+        LDR     v4, L4_PowerMan_Log
+        ; Use timer 2, just so we don't have to worry about turning it off later (since it's used as HAL timer 0)
+        BL      Timer_Init ; Just (re)initialise all of them for simplicity
+        LDR     a3, Timers_Log
+        MOV     a1, #0
+        STR     a1, [a3, #TLDR] ; Start at 0
+        MOV     a1, #1
+        STR     a1, [a3, #TCLR] ; Start timer
+        LDR     a4, L4_32KTIMER_Log
+        LDR     a1, [a4, #REG_32KSYNCNT_CR]
+        ; Wait 20 ticks. But unlike u-boot, we'll properly take into account the chance of
+        ; the timer overflowing
+10
+        LDR     a2, [a4, #REG_32KSYNCNT_CR]
+        SUB     a2, a2, a1
+        CMP     a2, #20
+        BLT     %BT10
+        ; Now begin
+        LDR     a1, [a4, #REG_32KSYNCNT_CR]
+        LDR     v1, [a3, #TCRR]
+10
+        LDR     a2, [a4, #REG_32KSYNCNT_CR]
+        LDR     v2, [a3, #TCRR]
+        SUB     a2, a2, a1
+        CMP     a2, #20
+        BLT     %BT10
+        SUB     a1, v2, v1
+        ; If the system clock was being divided by two, double our value
+        ; This avoids us having to disable the divider during the measurement loop
+        ; (For systems that don't like us doing that, e.g. AM/DM37xx)
+        ADD     a2, v4, #Global_Reg_PRM
+        LDR     a2, [a2, #PRM_CLKSRC_CTRL]
+        TST     a2, #&80
+        MOVNE   a1, a1, LSL #1
+        ; Now search the lookup table for the right entry
+        ADR     a2, SysClkTable
+10
+        LDMIA   a2!,{a3,a4,v1,v2,v3}
+        CMP     a1, a3
+        BLE     %BT10
+        ; Program PRM_CLKSEL with input oscillator frequency
+        ADD     a1, v4, #Clock_Control_Reg_PRM
+        STR     v1, [a1, #PRM_CLKSEL]
+        ; Program PRM_CLKSRC_CTRL with required clock divider
+        ADD     a1, v4, #Global_Reg_PRM
+        LDR     a2, [a1, #PRM_CLKSRC_CTRL]
+        BIC     a2, a2, #&C0
+        ORR     a2, a2, v2, LSL #6
+        STR     a2, [a1, #PRM_CLKSRC_CTRL]
+        ; Calculate clock speed following divider, and store for our own use
+        CMP     v2, #2
+        MOVEQ   a4, a4, LSR #1
+        MOVEQ   v3, v3, LSR #1
+        STR     a4, sys_clk
+        STR     v3, Timer_DelayMul
+        ; Use the sys_clk value to configure DPLL5 to generate a 120MHz clock
+        ; sys_clk should be either 12MHz, 13MHz, or 19.2MHz
+        CMP     v3, #130 ; DelayMul is an easy value to compare against
+        LDR     a1, L4_ClockMan_Log
+        MOVNE   a2, #11 ; 12MHz -> 1MHz, 19.2MHz -> 1.6MHz
+        MOVEQ   a2, #12 ; 13MHz -> 1MHz
+        LDR     a3, =CM_CLKSEL4_PLL
+        ORRLE   a2, a2, #120:SHL:8 ; 1MHz -> 120MHz
+        ORRGT   a2, a2, #75:SHL:8 ; 1.6MHz -> 120MHz
+        STR     a2, [a1, a3]
+        LDR     a3, =CM_CLKSEL5_PLL
+        MOV     a2, #1 ; Divide by 1
+        STR     a2, [a1, a3]
+        LDR     a3, =CM_CLKEN2_PLL
+        MOVLE   a2, #&37 ; Fint=1MHz, FREQSEL=3
+        MOVGT   a2, #&67 ; Fint=1.6MHz, FREQSEL=6
+        STR     a2, [a1, a3]
+        ; Wait for lock
+5
+        LDR     a3, =CM_IDLEST2_CKGEN
+        LDR     a2, [a1, a3]
+        TST     a2, #1
+        BEQ     %BT5
+        Pull    "v1-v4,pc"
+
+PRCM_GetFreqSel
+        ; Return PLL FREQSEL value for a given clock frequency
+        ; In: a1=Fint
+        ; Out: a1=FREQSEL, 0 for error
+        ; Corrupts a2-a4,ip
+        ADR     ip, FreqSelTable
+10
+        LDMIA   ip!, {a2-a4}
+        CMP     a1, a2
+        CMPHS   a3, a1
+        BLO     %BT10
+        MOV     a1, a4
+        MOV     pc, lr
+
+
+SysClkTable
+        ;   Counter Clock speed SYS_CLKIN_SEL Divider DelayMul
+        DCD 19000,  38400000,   4,            2,      384
+        DCD 15200,  26000000,   3,            2,      260
+        DCD 9000,   19200000,   2,            1,      192
+        DCD 7600,   13000000,   1,            1,      130
+        DCD -1,     12000000,   0,            1,      120
+        ; Where is 16.8MHz?
+
+FreqSelTable
+        ;   Min rate  Max rate   FREQSEL value
+        DCD 750000,   1000000,   &3
+        DCD 1000000,  1250000,   &4
+        DCD 1250000,  1500000,   &5
+        DCD 1500000,  1750000,   &6
+        DCD 1750000,  2100000,   &7
+        DCD 7500000,  10000000,  &B
+        DCD 10000000, 12500000,  &C
+        DCD 12500000, 15000000,  &D
+        DCD 15000000, 17500000,  &E
+        DCD 17500000, 21000000,  &F
+        DCD 0,        &FFFFFFFF, 0 ; List terminator is catch-all for error case
+
+        END

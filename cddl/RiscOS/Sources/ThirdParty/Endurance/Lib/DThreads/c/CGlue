@@ -1,0 +1,941 @@
+/* 
+ * CDDL HEADER START
+ * 
+ * The contents of this file are subject to the terms of the
+ * Common Development and Distribution License (the "Licence").
+ * You may not use this file except in compliance with the Licence.
+ * 
+ * You can obtain a copy of the licence at
+ * RiscOS/Sources/ThirdParty/Endurance/Lib/DThreads/LICENCE.
+ * See the Licence for the specific language governing permissions
+ * and limitations under the Licence.
+ * 
+ * When distributing Covered Code, include this CDDL HEADER in each
+ * file and include the Licence file. If applicable, add the
+ * following below this CDDL HEADER, with the fields enclosed by
+ * brackets "[]" replaced with your own identifying information:
+ * Portions Copyright [yyyy] [name of copyright owner]
+ * 
+ * CDDL HEADER END
+ */
+/* 
+ * Copyright 2007 Endurance Technology Ltd.  All rights reserved.
+ * Use is subject to license terms.
+ */
+/** @file CGlue.c
+ *  Threading support code in C.
+ */
+
+/*************************************************************************/
+/* Includes. */
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <stddef.h>
+#include <string.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include "kernel.h"
+#include "swis.h"
+
+#include "DThreads/DThreads.h"
+
+/*************************************************************************/
+/* Macros and constants. */
+
+/** Claim mutex that protects our static data. */
+#define CLAIM_MUTEX do { \
+  while ( Swp(0, &DThreads_StaticDataMutex) == 0 ) \
+    { _swix(OS_UpCall, _INR(0,1), 6, &DThreads_StaticDataMutex); }; \
+  DummyCall(); } while (false)
+
+/** Release mutex that protects our static data. */
+#define RELEASE_MUTEX do { \
+  DummyCall(); \
+  DThreads_StaticDataMutex = 1; } while (false)
+
+/** Size of initial stack chunk for each thread, in bytes. */
+#define STACK_SIZE (2*1024)
+
+/** Tell compiler we don't plan to use an argument. */
+#define IGNORE(x) do { (void)(x); } while (false)
+
+/*************************************************************************/
+/* File-scope typedefs. */
+
+/** Start of module header.
+ */
+typedef union
+{
+  const char c[1]; /**< for acessing strings. */
+  struct
+  {
+    uint32_t start;         /**< module start code offset. */
+    uint32_t init;          /**< module initialisation code offset. */
+    uint32_t final;         /**< module finalisation code offset. */
+    uint32_t service;       /**< module service call handler offset. */
+    uint32_t title;         /**< module title string offset. */
+    uint32_t help;          /**< module help string offset. */
+    uint32_t command_table; /**< module help and command table offset. */
+    /* etc */
+  }
+  offset; /**< for accessing offset words. */
+}
+module_header_t;
+
+/** Handle for memory allocation.
+ */
+typedef uint32_t int_memhandle_t;
+
+/** Struct for remembering the size of each allocation.
+ */
+typedef struct mem_handle_info
+{
+  struct mem_handle_info *next; /**< pointer to next block. */
+  int_memhandle_t handle;       /**< alocation handle */
+  size_t alloc_size;            /**< number of bytes to allocate for that handle. */
+}
+mem_block_info_t;
+
+/** Header for memory block.
+ */
+typedef struct mem_block
+{
+  struct mem_block *next; /**< pointer to next memory block for the same thread. */
+  int_memhandle_t handle; /**< handle used alongside thread handle to locate this block. */
+  uint8_t data[];         /**< variable-sized handle-dependent memory. */
+}
+mem_block_t;
+
+/** Internal data structure representing a thread.
+ *  Assembler definitions need to be kept in sync with this.
+ */
+typedef struct int_thread
+{
+  mem_block_t mem_blocks;        /**< an int_thread_t doubles as a mem_block for handle 0. */
+  uint32_t task_handle;          /**< wimp task handle for this thread. */
+  uint32_t old_handlers[9];      /**< environment handlers to restore on exit. */
+  uint8_t error_buffer[4 + 256]; /**< buffer for error handler. */
+  struct int_thread *next;       /**< poiter to next int_thread_t on global list. */
+  _kernel_stack_chunk *stack;    /**< root stack chunk. */
+}
+int_thread_t;
+
+/** Internal data structure representing a mutex.
+ */
+typedef struct
+{
+  uint32_t flags;       /**< flags defining mutex variants. */
+  int_thread_t *holder; /**< current holder of mutex. */
+  uint32_t pollword;    /**< pollword used to sleep current thread. */
+}
+int_mutex_t;
+
+/** Internal data structure representing a semaphore.
+ */
+typedef struct
+{
+  uint32_t flags;     /**< flags defining semaphore variants. */
+  int_mutex_t *mutex; /**< mutex protecting access to @a count. */
+  uint32_t count;     /**< how many threads can still wait on the semaphore without blocking. */
+  uint32_t maxcount;  /**< how many threads can ever wait on the semaphore without blocking. **/
+}
+int_sem_t;
+
+/** Internal data structure representing a reader-writer mutex.
+ */
+typedef struct
+{
+  uint32_t flags;           /**< flags defining mutex variants. */
+  int_sem_t *read_sem;      /**< semaphore for managing readers. */
+  int_mutex_t *write_mutex; /**< senaphore for manging writers. */
+}
+int_rw_mutex_t;
+
+/*************************************************************************/
+/* Global variables. */
+
+/** Module name. Useful for constructing thread names.
+ */
+const char *DThreads_ModuleName;
+
+/** Mutex controlling access to DThreads static data.
+ *  Needed because all our threads are preemptive.
+ */
+extern uint32_t DThreads_StaticDataMutex;
+uint32_t DThreads_StaticDataMutex = 1;
+
+/** Flag o indicate whether any threads have been created yet.
+ */
+extern uint32_t DThreads_Initialised;
+uint32_t DThreads_Initialised = 0;
+
+/** Count of active threads.
+ *  Used to enable different handling of the first and last threads.
+ */
+extern uint32_t DThreads_ThreadCount;
+uint32_t DThreads_ThreadCount = 1;
+
+/** Command line parser buffer.
+ *  Needed because there is no stack at the time (the command line provides the stack address)
+ *  and because heap operations are not available without a stack.
+ */
+extern uint8_t DThreads_CommandLineParserBuffer[16];
+uint8_t DThreads_CommandLineParserBuffer[16];
+
+/** Temporary storage for old environment handlers.
+ */
+extern uint32_t DThreads_OldHandlers[3*3];
+uint32_t DThreads_OldHandlers[3*3];
+
+/** Buffer for initial entry error handler.
+ */
+extern char DThreads_ErrorBuffer[4+256];
+char DThreads_ErrorBuffer[4+256];
+
+/** Number (kernel's handle) of our dynamic area.
+ */
+extern uint32_t DThreads_DANumber;
+uint32_t DThreads_DANumber = 0;
+
+/** The address of our dynamic area.
+ */
+extern char *DThreads_DABase;
+char *DThreads_DABase;
+
+/*************************************************************************/
+/* File-scope variables. */
+
+/** List of all threads.
+ */
+static int_thread_t *Threads = NULL;
+
+/** List of all allocation specifications.
+ */
+static mem_block_info_t *Allocs = NULL;
+
+/** Seed for allocating new memory handles.
+ */
+static int_memhandle_t HandleSeed = 1;
+
+/** The star command to use to launch new threads.
+ */
+static const char *StarCommand;
+
+/** Whether we've called DThreads_Initialising.
+ */
+static bool CalledHook = false;
+
+/** A copy of the module private word pointer.
+ */
+static void *Copy_pw;
+
+/** A copy of the argument count.
+ */
+static int Copy_argc;
+
+/** A copy of the argument vector.
+ */
+static char **Copy_argv;
+
+/*************************************************************************/
+/* Global function declarations. */
+
+/** Allow access to the module header.
+ *  @return  Pointer to the base of the module.
+ */
+extern module_header_t *DThreads_ModuleBase(void);
+
+/*************************************************************************/
+/* File-scope function declarations. */
+
+static int ExtendHeap(int n, void **p);
+static _kernel_oserror *Main(void *arg);
+static void DummyCall(void);
+static void FreeThread(int_thread_t *t);
+
+/*************************************************************************/
+/* Local inline function declarations. */
+
+/** Amounts to an ARM SWP instruction.
+ *  @param new_value  Value to write.
+ *  @param where      Address to read and write atomically.
+ *  @return           Value held at @a where on entry.
+ */
+static inline uint32_t Swp(uint32_t new_value, uint32_t *where)
+{
+  uint32_t old_value;
+  __asm { SWP old_value, new_value, [where] }
+  return old_value;
+}
+
+/*************************************************************************/
+/* Exported function definitions. */
+
+/** Module initialisation entry point.
+ *  Do as much initialisation here as possible, because during initialisation of the first
+ *  task, it all has to be written in assembly.
+ *  SVC mode.
+ *  @param cmd_tail     Pointer to command line tail.
+ *  @param podule_base  Instantiation number or podule base address.
+ *  @param pw           Pointer to private word.
+ *  @return             A RISC OS error pointer, or NULL.
+ */
+_kernel_oserror *DThreads_ModuleInit(const char *cmd_tail, int podule_base, void *pw);
+_kernel_oserror *DThreads_ModuleInit(const char *cmd_tail, int podule_base, void *pw)
+{
+  IGNORE(cmd_tail);
+  IGNORE(podule_base);
+  _kernel_oserror *e;
+  module_header_t *hdr = DThreads_ModuleBase();
+  DThreads_ModuleName = hdr->c + hdr->offset.title;
+  StarCommand = hdr->c + hdr->offset.command_table;
+  
+  char *da_name = malloc(strlen(DThreads_ModuleName) + sizeof " heap");
+  if (!da_name)
+    return _swix(MessageTrans_ErrorLookup, _INR(0,2), &(const _kernel_oserror) { 0, "NoMem" }, 0, 0);
+  sprintf(da_name, "%s heap", DThreads_ModuleName);
+  e = _swix(OS_DynamicArea, _INR(0,8)|_OUT(1)|_OUT(3),
+            0, -1, 16*1024, -1, 128, 1024*1024, 0, 0, da_name, &DThreads_DANumber, &DThreads_DABase);
+  free(da_name);
+  if (e) return e;
+  
+  _kernel_register_slotextend(&ExtendHeap);
+  
+  Copy_pw = pw;
+  
+  return NULL;
+}
+
+/** USR mode entry point.
+ *  Called in a non-preemptive context, but after the C Library runtime has been initialised.
+ *  @param argc  Number of arguments.
+ *  @param argv  Array of pointers to arguments.
+ *  @return      Exit code.
+ */
+int main(int argc, char *argv[])
+{
+  if (DThreads_Initialising != NULL)
+  {
+    _kernel_oserror *e = DThreads_Initialising(Copy_pw);
+    if (e)
+    {
+      fprintf(stderr, e->errmess);
+      exit(EXIT_FAILURE);
+    }
+    CalledHook = true;
+  }
+  
+  Copy_argc = argc;
+  Copy_argv = argv;
+  
+  DThreads_Thread main_thread;
+  _kernel_oserror *e = DThreads_Create(Main, NULL, DThreads_ModuleName, &main_thread);
+  if (e)
+  {
+    fprintf(stderr, e->errmess);
+    exit(EXIT_FAILURE);
+  }
+  
+  return EXIT_SUCCESS;
+}
+
+/** Module finalisation entry point.
+ *  Kill off any remaining threads, and deallocate shared resources as far as is possible
+ *  in C (everything bar the destruction of the heap).
+ *  SVC mode.
+ *  @param fatal   Obsolete flag.
+ *  @param podule  Instantiation number.
+ *  @param pw      Pointer to private word.
+ *  @return        A RISC OS error pointer, or NULL.
+ */
+_kernel_oserror *DThreads_ModuleFinal(int fatal, int podule, void *pw);
+_kernel_oserror *DThreads_ModuleFinal(int fatal, int podule, void *pw)
+{
+  IGNORE(fatal);
+  IGNORE(podule);
+  if (CalledHook && DThreads_Finalising != NULL)
+  {
+    DThreads_Finalising(pw);
+  }
+  
+  /* I doubt it's safe to yield from here, so we need to rely on the thread list remaining */
+  /* coherent at all times. However, we can probably assume that all memory blocks will be */
+  /* implicitly freed by the removal of the dynamic area. */
+  for (int_thread_t *t = Threads; t; t = t->next)
+    _swix(Wimp_CloseDown, _INR(0,1), t->task_handle, *(uint32_t *)"TASK");
+  
+  return NULL;
+}
+
+/** Star command handler.
+ *  SVC mode.
+ *  @param arg_string  Pointer to command tail.
+ *  @param argv        Number of arguments.
+ *  @param cmd_no      Index into command table. Index 0 is reserved for the
+ *                     thread-launching command.
+ *  @param pw          Pointer to module private word.
+ *  @return            A RISC OS error pointer, or NULL.
+ */
+_kernel_oserror *DThreads_CommandHandler(const char *arg_string, int argc, int cmd_no, void *pw);
+_kernel_oserror *DThreads_CommandHandler(const char *arg_string, int argc, int cmd_no, void *pw)
+{
+  if (cmd_no == 0)
+  {
+    uint32_t test_parse[4];
+    if (DThreads_ThreadCount > 1 && (argc != 2 || 
+        _swix(OS_ReadArgs, _INR(0,3), "stack/K", arg_string, test_parse, sizeof test_parse) ||
+        test_parse[0] == 0))
+    {
+      /* Bad parameters for lauching a new preemptive thread. */
+      return _swix(MessageTrans_ErrorLookup, _INR(0,2),
+                   &(const _kernel_oserror) { 0, "BadParm" }, 0, 0);
+    }
+    else
+    {
+      /* Enter this module in USR mode. */
+      return _swix(OS_Module, _INR(0,2), 2, DThreads_ModuleName, arg_string);
+    }
+  }
+  else if (DThreads_AdditionalCommands)
+  {
+    /* Some other unrelated command. */
+    return DThreads_AdditionalCommands(arg_string, argc, cmd_no, pw);
+  }
+  return NULL; /* shouldn't ever get here */
+}
+
+/** Support function for environment handlers.
+ *  Ensures that the current thread is no longer referenced in our list.
+ *  Called in SVC mode.
+ */
+void DThreads_CloseDownThread(void);
+void DThreads_CloseDownThread(void)
+{
+  FreeThread((int_thread_t *) DThreads_CurrentThread());
+}
+
+_kernel_oserror *DThreads_Create(_kernel_oserror *(*thread_main)(void *),
+                                 void *thread_arg,
+                                 const char *thread_name,
+                                 DThreads_Thread *thread_handle)
+{
+  _kernel_oserror *e = NULL;
+  bool error = false;
+  int_thread_t *t = NULL;
+  _kernel_stack_chunk *stack;
+  
+  CLAIM_MUTEX;
+  
+  /* Allocate memory. */
+  stack = calloc(1, STACK_SIZE);
+  if (!stack) error = true;
+  else
+  {
+    t = calloc(1, sizeof *t);
+    if (!t) error = true;
+  }
+  mem_block_t *prev_block = &t->mem_blocks;
+  for (mem_block_info_t *mi = Allocs; !error && mi; mi = mi->next)
+  {
+    mem_block_t *block = calloc(1, sizeof *block + mi->alloc_size);
+    if (block)
+    {
+      block->handle = mi->handle;
+      prev_block->next = block;
+      prev_block = block;
+    }
+    else error = true;
+  }
+  
+  if (error)
+  {
+    /* Clean up and create RISC OS error. */
+    free(stack);
+    for (mem_block_t *block = t ? &t->mem_blocks : NULL, *next_block; block; block = next_block)
+    {
+      next_block = block->next;
+      free(block);
+    }
+    free(t);
+    e = _swix(MessageTrans_ErrorLookup, _INR(0,2), &(const _kernel_oserror) { 0, "NoMem" }, 0, 0);
+    
+    RELEASE_MUTEX;
+    return e;
+  }
+  else
+  {
+    /* Initialise stack chunk. */
+    stack->sc_mark = 0xF60690FF;
+    stack->sc_size = STACK_SIZE;
+    memcpy(stack + 1, _kernel_current_stack_chunk() + 1, 4 * 7);
+    uint32_t *stack_top = (uint32_t *) (STACK_SIZE + (uint8_t *) stack);
+    stack_top[-3] = (uint32_t) t;
+    stack_top[-2] = (uint32_t) thread_arg;
+    stack_top[-1] = (uint32_t) thread_main;
+    
+    /* Initialise thread struct and link into global list. */
+    t->stack = stack;
+    t->next = Threads;
+    Threads = t;
+    ++DThreads_ThreadCount;
+    
+    RELEASE_MUTEX;
+    
+    /* Queue the launching of the thread. */
+    char command[256];
+    sprintf(command, "StartDesktopTask TaskWindow -name \"%s\" -wimpslot 0K -quit \"%s -stack %p\"",
+                     thread_name, StarCommand, (void *) stack);
+    _swi(OS_CLI, _IN(0), command);
+    
+    *thread_handle = (DThreads_Thread) t;
+    return NULL;
+  }  
+}
+
+_kernel_oserror *DThreads_Destroy(DThreads_Thread thread_handle)
+{
+  _kernel_oserror *e = NULL;
+  int_thread_t *t = (int_thread_t *) thread_handle;
+  /* If it's a request to kill the current thread, defer until the exit handler, */
+  /* when it's safe to free the stack chunks. */
+  if (t == (int_thread_t *) DThreads_CurrentThread())
+  {
+    _swi(OS_Exit, _INR(0,2), 0, 0, 0);
+  }
+  CLAIM_MUTEX; /* in case the dying thread has it! */
+  e = _swix(Wimp_CloseDown, _INR(0,1), t->task_handle, *(uint32_t *)"TASK");
+  RELEASE_MUTEX;
+  if (!e)
+    FreeThread(t);
+  return e;
+}
+
+DThreads_Thread DThreads_CurrentThread(void)
+{
+  uint32_t task_handle;
+  _swix(Wimp_ReadSysInfo, _IN(0)|_OUT(0), 5, &task_handle);
+  if (task_handle == 0)
+    return (DThreads_Thread) 0;
+  CLAIM_MUTEX;
+  int_thread_t *t;
+  for (t = Threads; t && t->task_handle != task_handle; t = t->next);
+  RELEASE_MUTEX;
+  return (DThreads_Thread) t;
+}
+
+DThreads_Mem DThreads_AllocMem(size_t size)
+{
+  bool error = false;
+  CLAIM_MUTEX;
+  /* Alllocate struct to store information for future threads. */
+  mem_block_info_t *new_mi = malloc(sizeof *new_mi);
+  if (!new_mi)
+    error = true;
+  else
+  {
+    mem_block_info_t *prev_mi = (mem_block_info_t *)((char *)&Allocs - offsetof(mem_block_info_t, next));
+    for (mem_block_info_t *this_mi = prev_mi->next; this_mi; prev_mi = this_mi, this_mi = this_mi->next);
+    new_mi->next = NULL;
+    new_mi->handle = HandleSeed;
+    new_mi->alloc_size = size;
+    prev_mi->next = new_mi;
+  }
+  
+  /* Add an allocation at the end of each existing thread's list. */
+  for (int_thread_t *t = Threads; !error && t; t = t->next)
+  {
+    mem_block_t *new_mb = calloc(1, sizeof *new_mb + size);
+    if (!new_mb)
+      error = true;
+    else
+    {
+      mem_block_t *prev_mb = &t->mem_blocks;
+      for (mem_block_t *this_mb = prev_mb->next; this_mb; prev_mb = this_mb, this_mb = this_mb->next);
+      new_mb->handle = HandleSeed;
+      prev_mb->next = new_mb;
+    }
+  }
+  
+  if (error)
+  {
+    RELEASE_MUTEX;
+    DThreads_ReleaseMem((DThreads_Mem) HandleSeed);
+    return (DThreads_Mem) 0;
+  }
+  else
+  {
+    ++HandleSeed;
+    RELEASE_MUTEX;
+    return (DThreads_Mem) new_mi->handle;
+  }
+}
+
+void DThreads_ReleaseMem(DThreads_Mem mem_handle)
+{
+  int_memhandle_t handle = (int_memhandle_t) mem_handle;
+  CLAIM_MUTEX;
+  /* Remove from list of information for future threads. */
+  mem_block_info_t *prev_mi = (mem_block_info_t *)((char *)&Allocs - offsetof(mem_block_info_t, next));
+  mem_block_info_t *this_mi = prev_mi->next;
+  for (; this_mi && this_mi->handle != handle; prev_mi = this_mi, this_mi = this_mi->next);
+  if (this_mi)
+  {
+    prev_mi->next = this_mi->next;
+    free(this_mi);
+  }
+  
+  /* Remove from list for each thread. */
+  for (int_thread_t *t = Threads; t; t = t->next)
+  {
+    mem_block_t *prev_mb = &t->mem_blocks;
+    mem_block_t *this_mb = prev_mb->next;
+    for (; this_mb && this_mb->handle != handle; prev_mb = this_mb, this_mb = this_mb->next);
+    if (this_mb)
+    {
+      prev_mb->next = this_mb->next;
+      free(this_mb);
+    }
+  }
+  RELEASE_MUTEX;
+}
+
+void *DThreads_FindMem(DThreads_Mem mem_handle)
+{
+  int_memhandle_t handle = (int_memhandle_t) mem_handle;
+  int_thread_t *t = (int_thread_t *) DThreads_CurrentThread();
+  CLAIM_MUTEX;
+  mem_block_t *b;
+  for (b = &t->mem_blocks; b && b->handle != handle; b = b->next);
+  RELEASE_MUTEX;
+  return b ? &b->data : NULL;
+}
+
+_kernel_oserror *DThreads_MutexCreate(uint32_t flags,
+                                      DThreads_Mutex *mutex_handle)
+{
+  int_mutex_t *m = malloc(sizeof *m);
+  if (!m)
+    return _swix(MessageTrans_ErrorLookup, _INR(0,2), &(const _kernel_oserror) { 0, "NoMem" }, 0, 0);
+  
+  m->flags = flags;
+  m->holder = NULL;
+  m->pollword = 1;
+  *mutex_handle = (DThreads_Mutex) m;
+  return NULL;
+}
+
+_kernel_oserror *DThreads_MutexDestroy(DThreads_Mutex mutex_handle)
+{
+  _kernel_oserror *e = NULL;
+  int_mutex_t *m = (int_mutex_t *) mutex_handle;
+  if (!m)
+    return _swix(MessageTrans_ErrorLookup, _INR(0,2), &(const _kernel_oserror) { 0, "BadParm" }, 0, 0);
+  
+  while (!e && Swp(0, &m->pollword) == 0)
+  {
+    m->pollword = 1;
+    e = _swix(OS_UpCall, _INR(0,1), 6, &m->pollword);
+  }
+  if (!e) free(m);
+  return e;
+}
+
+_kernel_oserror *DThreads_MutexLock(DThreads_Mutex mutex_handle)
+{
+  _kernel_oserror *e = NULL;
+  int_mutex_t *m = (int_mutex_t *) mutex_handle;
+  if (!m)
+    return _swix(MessageTrans_ErrorLookup, _INR(0,2), &(const _kernel_oserror) { 0, "BadParm" }, 0, 0);
+  
+  while (!e && Swp(0, &m->pollword) == 0)
+  {
+    e = _swix(OS_UpCall, _INR(0,1), 6, &m->pollword);
+  }
+  if (!e && m->flags & DTHREADS_MUTEX_FLAG_ERRORCHECK)
+    m->holder = (int_thread_t *) DThreads_CurrentThread();
+  return e;
+}
+
+_kernel_oserror *DThreads_MutexUnlock(DThreads_Mutex mutex_handle)
+{
+  int_mutex_t *m = (int_mutex_t *) mutex_handle;
+  if (!m)
+    return _swix(MessageTrans_ErrorLookup, _INR(0,2), &(const _kernel_oserror) { 0, "BadParm" }, 0, 0);
+  
+  if ((m->flags & DTHREADS_MUTEX_FLAG_ERRORCHECK) &&
+      (m->pollword == 1 || m->holder != (int_thread_t *) DThreads_CurrentThread()))
+    return _swix(MessageTrans_ErrorLookup, _INR(0,2), &(const _kernel_oserror) { 0, "BadParm" }, 0, 0);
+  m->pollword = 1;
+  m->holder = NULL;
+  return _swix(OS_UpCall, _INR(0,1), 6, 0); /* yield in case someone's blocked on mutex */
+}
+
+_kernel_oserror *DThreads_SemaphoreCreate(uint32_t flags,
+                                          uint32_t max_count,
+                                          DThreads_Semaphore *sem_handle)
+{
+  _kernel_oserror *e = NULL;
+  int_sem_t *s = malloc(sizeof *s);
+  if (!s)
+    return _swix(MessageTrans_ErrorLookup, _INR(0,2), &(const _kernel_oserror) { 0, "NoMem" }, 0, 0);
+  
+  s->flags = flags;
+  e = DThreads_MutexCreate(0, (DThreads_Mutex *) &s->mutex);
+  if (e)
+  {
+    free(s);
+    return e;
+  }
+  s->count = s->maxcount = max_count;
+  *sem_handle = (DThreads_Semaphore) s;
+  return NULL;
+}
+
+_kernel_oserror *DThreads_SemaphoreDestroy(DThreads_Semaphore sem_handle)
+{
+  _kernel_oserror *e = NULL;
+  int_sem_t *s = (int_sem_t *) sem_handle;
+  if (!s)
+    return _swix(MessageTrans_ErrorLookup, _INR(0,2), &(const _kernel_oserror) { 0, "BadParm" }, 0, 0);
+  
+  e = DThreads_MutexLock((DThreads_Mutex) s->mutex);
+  while (!e && s->count != s->maxcount)
+  {
+    s->count = s->maxcount;
+    e = DThreads_MutexUnlock((DThreads_Mutex) s->mutex);
+    if (!e) e = _swix(OS_UpCall, _INR(0,1), 6, 0);
+    if (!e) e = DThreads_MutexLock((DThreads_Mutex) s->mutex);
+  }
+  DThreads_MutexUnlock((DThreads_Mutex) s->mutex); /* irrespective of error condition */
+  if (!e) e = DThreads_MutexDestroy(s->mutex);
+  if (!e) free(s);
+  return e;
+}
+
+_kernel_oserror *DThreads_SemaphoreWait(DThreads_Semaphore sem_handle,
+                                        uint32_t howmany)
+{
+  _kernel_oserror *e = NULL;
+  int_sem_t *s = (int_sem_t *) sem_handle;
+  if (!s || howmany > s->maxcount)
+    return _swix(MessageTrans_ErrorLookup, _INR(0,2), &(const _kernel_oserror) { 0, "BadParm" }, 0, 0);
+  
+  e = DThreads_MutexLock((DThreads_Mutex) s->mutex);
+  while (!e && s->count < howmany)
+  {
+    e = DThreads_MutexUnlock((DThreads_Mutex) s->mutex);
+    if (!e) e = _swix(OS_UpCall, _INR(0,1), 6, 0);
+    if (!e) e = DThreads_MutexLock((DThreads_Mutex) s->mutex);
+  }
+  if (!e) s->count -= howmany;
+  DThreads_MutexUnlock((DThreads_Mutex) s->mutex); /* irrespective of error condition */
+  return e;
+}
+
+_kernel_oserror *DThreads_SemaphoreSignal(DThreads_Semaphore sem_handle,
+                                          uint32_t howmany)
+{
+  _kernel_oserror *e = NULL;
+  int_sem_t *s = (int_sem_t *) sem_handle;
+  if (!s || howmany > s->maxcount)
+    return _swix(MessageTrans_ErrorLookup, _INR(0,2), &(const _kernel_oserror) { 0, "BadParm" }, 0, 0);
+  
+  e = DThreads_MutexLock((DThreads_Mutex) s->mutex);
+  if (!e) s->count += howmany;
+  DThreads_MutexUnlock((DThreads_Mutex) s->mutex); /* irrespective of error condition */
+  if (!e) e = _swix(OS_UpCall, _INR(0,1), 6, 0); /* yield in case someone's blocked on semaphore */
+  return e;
+}
+
+_kernel_oserror *DThreads_RWMutex_Create(uint32_t flags,
+                                         uint32_t max_readers,
+                                         DThreads_RWMutex *mutex_handle)
+{
+  _kernel_oserror *e = NULL;
+  int_rw_mutex_t *m = malloc(sizeof *m);
+  if (!m)
+    return _swix(MessageTrans_ErrorLookup, _INR(0,2), &(const _kernel_oserror) { 0, "NoMem" }, 0, 0);
+  
+  m->flags = flags;
+  m->read_sem = NULL;
+  e = DThreads_SemaphoreCreate(0, max_readers, (DThreads_Semaphore *) &m->read_sem);
+  if (!e) e = DThreads_MutexCreate(0, (DThreads_Mutex *) &m->write_mutex);
+  if (e)
+  {
+    DThreads_SemaphoreDestroy((DThreads_Semaphore) m->read_sem);
+    free(m);
+    return e;
+  }
+  *mutex_handle = (DThreads_RWMutex) m;
+  return NULL;
+}
+
+_kernel_oserror *DThreads_RWMutex_Destroy(DThreads_RWMutex mutex_handle)
+{
+  _kernel_oserror *e = NULL;
+  int_rw_mutex_t *m = (int_rw_mutex_t *) mutex_handle;
+  if (!m)
+    return _swix(MessageTrans_ErrorLookup, _INR(0,2), &(const _kernel_oserror) { 0, "BadParm" }, 0, 0);
+  
+  e = DThreads_MutexLock((DThreads_Mutex) m->read_sem->mutex);
+  while (!e && (m->read_sem->count != m->read_sem->maxcount || Swp(0, &m->write_mutex->pollword) == 0))
+  {
+    m->read_sem->count = m->read_sem->maxcount;
+    m->write_mutex->pollword = 1;
+    e = DThreads_MutexUnlock((DThreads_Mutex) m->read_sem->mutex);
+    if (!e) e = _swix(OS_UpCall, _INR(0,1), 6, 0);
+    if (!e) e = DThreads_MutexLock((DThreads_Mutex) m->read_sem->mutex);
+  }
+  DThreads_MutexUnlock((DThreads_Mutex) m->read_sem->mutex); /* irrespective of error condition */
+  if (!e) e = DThreads_MutexDestroy(m->write_mutex);
+  if (!e) e = DThreads_SemaphoreDestroy(m->read_sem);
+  if (!e) free(m);
+  return e;
+}
+
+_kernel_oserror *DThreads_RWMutex_LockRead(DThreads_RWMutex mutex_handle)
+{
+  int_rw_mutex_t *m = (int_rw_mutex_t *) mutex_handle;
+  if (!m)
+    return _swix(MessageTrans_ErrorLookup, _INR(0,2), &(const _kernel_oserror) { 0, "BadParm" }, 0, 0);
+  
+  return DThreads_SemaphoreWait((DThreads_Semaphore) m->read_sem, 1);
+}
+
+_kernel_oserror *DThreads_RWMutex_UnlockRead(DThreads_RWMutex mutex_handle)
+{
+  int_rw_mutex_t *m = (int_rw_mutex_t *) mutex_handle;
+  if (!m)
+    return _swix(MessageTrans_ErrorLookup, _INR(0,2), &(const _kernel_oserror) { 0, "BadParm" }, 0, 0);
+  
+  return DThreads_SemaphoreSignal((DThreads_Semaphore) m->read_sem, 1);
+}
+
+_kernel_oserror *DThreads_RWMutex_LockWrite(DThreads_RWMutex mutex_handle)
+{
+  _kernel_oserror *e = NULL;
+  int_rw_mutex_t *m = (int_rw_mutex_t *) mutex_handle;
+  if (!m)
+    return _swix(MessageTrans_ErrorLookup, _INR(0,2), &(const _kernel_oserror) { 0, "BadParm" }, 0, 0);
+  
+  e = DThreads_MutexLock((DThreads_Mutex) m->write_mutex);
+  /* Grab reader locks for ourselves one by one as they become available */
+  for (uint32_t locks = 0; !e && locks < m->read_sem->maxcount; locks++)
+    e = DThreads_SemaphoreWait((DThreads_Semaphore) m->read_sem, 1);
+  return e;
+}
+
+_kernel_oserror *DThreads_RWMutex_UnlockWrite(DThreads_RWMutex mutex_handle)
+{
+  _kernel_oserror *e = NULL;
+  int_rw_mutex_t *m = (int_rw_mutex_t *) mutex_handle;
+  if (!m)
+    return _swix(MessageTrans_ErrorLookup, _INR(0,2), &(const _kernel_oserror) { 0, "BadParm" }, 0, 0);
+  
+  /* Reader locks can be released in one go */
+  e = DThreads_SemaphoreSignal((DThreads_Semaphore) m->read_sem, m->read_sem->maxcount);
+  if (!e) e = DThreads_MutexUnlock((DThreads_Mutex) m->write_mutex);
+  return e;
+}
+
+/*************************************************************************/
+/* Local function definitions. */
+
+/** Heap extension function registered with C runtime library.
+ *  @param n  Minimum number of bytes to extend heap by.
+ *  @param p  Address at which to return address at which memory is added.
+ *  @return   Number of bytes by which heap was extended, or 0 for failure.
+ */
+#pragma no_check_stack /* because there's no heap space to allocate a new stack chunk. */
+static int ExtendHeap(int n, void **p)
+{
+  size_t old_size;
+  _kernel_oserror *e;
+  e = _swix(OS_ReadDynamicArea, _IN(0)|_OUT(1), DThreads_DANumber, &old_size);
+  if (e) return 0;
+  
+  size_t change;
+  e = _swix(OS_ChangeDynamicArea, _INR(0,1)|_OUT(1), DThreads_DANumber, n, &change);
+  if (e) return 0;
+  
+  *p = DThreads_DABase + old_size;
+  return change;
+}
+#pragma check_stack
+
+/** Wrapper for DThreads_Main that takes normal thread calling conditions.
+ *  @param arg  Opaque handle, not used.
+ *  @return     A RISC OS error pointer, or NULL.
+ */
+static _kernel_oserror *Main(void *arg)
+{
+  IGNORE(arg);
+  DThreads_Main(Copy_argc, Copy_argv);
+  return NULL;
+}
+
+/** Does nothing, but forces the caller not to cache global data across calls.
+ */
+static void DummyCall(void)
+{
+  return;
+}
+
+/** Deallocate resources used by a given thread.
+ *  @param t  Pointer to internal data structure for thread.
+ */
+static void FreeThread(int_thread_t *t)
+{
+  /* Delink the thread struct. */
+  CLAIM_MUTEX;
+  --DThreads_ThreadCount;
+  if (t == NULL)
+  {
+    /* the initial context doesn't have an associated thread. */
+    RELEASE_MUTEX;
+    return;
+  }
+  int_thread_t *prev_t = (int_thread_t *)((char *)&Threads - offsetof(int_thread_t, next));
+  for (; prev_t && prev_t->next != t; prev_t = prev_t->next);
+  if (prev_t)
+    prev_t->next = t->next;
+  RELEASE_MUTEX;
+  if (!prev_t)
+    return; /* shouldn't happen, but return if wasn't a valid pointer */
+  
+  /* Free the thread's stack. */
+  _kernel_stack_chunk *prev_sc = t->stack;
+  _kernel_stack_chunk *this_sc = prev_sc->sc_next;
+  _kernel_stack_chunk *next_sc;
+  for (; this_sc; this_sc = next_sc)
+  {
+    next_sc = this_sc->sc_next;
+    if (this_sc->sc_deallocate)
+    {
+      this_sc->sc_deallocate(this_sc);
+      prev_sc->sc_next = next_sc;
+      if (next_sc)
+        next_sc->sc_prev = prev_sc;
+    }
+    else
+    {
+      prev_sc = this_sc;
+    }
+  }
+  if (t->stack->sc_next)
+    t->stack->sc_next->sc_prev = NULL;
+  free(t->stack);
+  
+  /* Free the thread's memory blocks. */
+  mem_block_t *this_mb = t->mem_blocks.next;
+  mem_block_t *next_mb;
+  for (; this_mb; this_mb = next_mb)
+  {
+    next_mb = this_mb->next;
+    free(this_mb);
+  }
+  
+  /* Finally we can free the thread block. */
+  free(t);
+}

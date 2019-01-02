@@ -1,0 +1,628 @@
+; Copyright 2009 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+
+; -----------------------------------------------------------------------------
+;
+; mjs Oct 2000 kernel/HAL split
+;
+; macros that can be switched between doing real HAL calls and pseudo
+; HAL calls with r9-> mjs pseudo HAL workspace
+;
+; these have been handy for interim HALising of kernel code in-situ
+; (particularly used for video stuff), but can probably disappear later
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:Machine.<Machine>
+        GET     Hdr:ImageSize.<ImageSize>
+        GET     Hdr:UserIF.<UserIF>
+        $GetCPU
+        $GetIO
+        $GetMEMC
+        $GetMEMM
+        $GetVIDC
+
+        GET     hdr.Options
+        GET     hdr.Copro15ops
+        GET     hdr.ARMops
+        GET     hdr.HALDevice
+        GET     hdr.HALEntries
+
+        EXPORT  ZeroPage
+        IMPORT  notmain
+
+        MACRO
+        DebugTX $str
+    [ DebugHALTX
+        BL      DebugHALPrint
+        =       "$str", 0
+        ALIGN
+    ]
+        MEND
+
+a1      RN      0
+a2      RN      1
+a3      RN      2
+a4      RN      3
+v1      RN      4
+v2      RN      5
+v3      RN      6
+v4      RN      7
+v5      RN      8
+v6      RN      9
+sb      RN      9
+v7      RN      10
+v8      RN      11
+
+; Set sb up ready for CallHAL.
+        MACRO
+        AddressHAL $zero
+ [ "$zero" <> ""
+        LDR     sb, [$zero, #HAL_Workspace]
+ |
+        ADRL    sb, ZeroPage
+        LDR     sb, [sb, #HAL_Workspace]
+ ]
+        MEND
+
+; Calls the HAL. $rout is the routine. sb must have been set up by AddressHAL
+        MACRO
+        CallHAL $rout, $cond
+        MOV$cond lr, pc
+        LDR$cond pc, [sb, #-(EntryNo_$rout+1) * 4]
+        MEND
+
+; Checks whether a HAL routine exists. If it does, a1 points to it (probably
+; not useful), and Z is clear. lr corrupted.
+        MACRO
+        CheckHAL $rout
+        LDR     a1, [sb, #-(EntryNo_$rout+1) * 4]
+        ADRL    lr, NullHALEntry
+        TEQ     a1, lr
+        MEND
+
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Various constants
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+PageSize          * (4*1024)       ;MMU page size (normal pages)
+Log2PageSize      * 12             ;for shifts
+
+MinAplWork * 40*1024         ; minimum size of AplWork
+
+; Manifests
+
+CR * 13
+LF * 10
+space * " "
+
+; Registers
+
+SPIRQ RN R13
+
+
+        SUBT    Arthur Code
+        OPT     4
+
+        AREA    |!!!!OSBase|,CODE,READONLY
+
+        ENTRY                   ; Not really, but we need it to link
+KernelBase
+
+; *****************************************************************************
+;
+;  Now ready to start the code: off we go!
+;
+; *****************************************************************************
+
+; RISC OS image header
+RISCOS_Header
+        =       "OSIm"
+        DCD     0
+        DCD     OSROM_ImageSize*1024 - 64*1024
+        DCD     RISCOS_Entries - RISCOS_Header
+        DCD     (RISCOS_Entries_End - RISCOS_Entries) / 4
+
+RISCOS_Entries
+        DCD     RISCOS_InitARM   - RISCOS_Entries
+        DCD     RISCOS_AddRAM    - RISCOS_Entries
+        DCD     RISCOS_Start     - RISCOS_Entries
+        DCD     RISCOS_MapInIO   - RISCOS_Entries
+        DCD     RISCOS_AddDevice - RISCOS_Entries
+        DCD     RISCOS_LogToPhys - RISCOS_Entries
+        DCD     RISCOS_IICOpV    - RISCOS_Entries
+RISCOS_Entries_End
+
+                   ^    0
+HAL_StartFlags     #    4
+HAL_Descriptor     #    4
+HAL_Workspace      #    4
+HAL_WsSize         #    4
+HAL_JumpTable      #    4 ; AKA HALWorkspace
+HAL_NCNBWorkspace  #    4
+RAM_List           #    4 ; The 'ref' pointer built up by AddRAM
+
+ZeroPage ; Fakey zero-page memory used to store pointers to HAL stuff
+        DCD     0
+        DCD     0
+        DCD     0
+        DCD     0
+        DCD     0
+        DCD     0
+        DCD     0
+
+; ARM keep changing their mind about ID field layout.
+; Here's a summary, courtesy of the ARM ARM (v5):
+;
+; pre-ARM 7:   xxxx0xxx
+; ARM 7:       xxxx7xxx where bit 23 indicates v4T/~v3
+; post-ARM 7:  xxxanxxx where n<>0 or 7 and a = architecture (1=4,2=4T,3=5,4=5T)
+;
+
+; int Init_ARMarch(void)
+; Returns architecture, as above in a1. Also EQ if ARMv3, NE if ARMv4 or later.
+; Corrupts only ip, no RAM usage.
+Init_ARMarch
+        ARM_read_ID ip
+        ANDS    a1, ip, #&0000F000
+        MOVEQ   pc, lr                          ; ARM 3 or ARM 6
+        TEQ     a1, #&00007000
+        BNE     %FT20
+        TST     ip, #&00800000                  ; ARM 7 - check for Thumb
+        MOVNE   a1, #ARMv4T
+        MOVEQ   a1, #ARMv3
+        MOV     pc, lr
+20      ANDS    a1, ip, #&000F0000              ; post-ARM 7
+        MOV     a1, a1, LSR #16
+        MOV     pc, lr
+
+; void RISCOS_InitARM(unsigned int flags)
+;
+RISCOS_InitARM
+        MOV     a4, lr
+        ; Check if we're architecture 3. If so, don't read the control register.
+        BL      Init_ARMarch
+        MOVEQ   a1, #0
+        ARM_read_control a1, NE
+        ; Late abort (ARM6 only), 32-bit Data and Program space. No Write buffer (ARM920T
+        ; spec says W bit should be set, but I reckon they're bluffing).
+        ;
+        ; The F bit's tricky. (1 => CPCLK=FCLK, 0=>CPCLK=FCLK/2). The only chip using it was the
+        ; ARM700, it never really reached the customer, and it's always been programmed with
+        ; CPCLK=FCLK. Therefore we'll keep it that way, and ignore the layering violation.
+        ORR     a1, a1, #MMUC_F+MMUC_L+MMUC_D+MMUC_P
+        ; All of these bits should be off already, but just in case...
+        BIC     a1, a1, #MMUC_B+MMUC_W+MMUC_C+MMUC_A+MMUC_M
+        BIC     a1, a1, #MMUC_RR+MMUC_V+MMUC_I+MMUC_Z+MMUC_R+MMUC_S
+
+        ; Off we go.
+        ARM_write_control a1
+
+        ; In case it wasn't a hard reset
+        MOV     a2, #0
+        MCR     ARM_config_cp,0,a2,ARMv4_cache_reg,C7           ; invalidate I+D caches
+        MCREQ   ARM_config_cp,0,a2,ARMv3_TLBflush_reg,C0        ; flush TLBs
+        MCRNE   ARM_config_cp,0,a2,ARMv4_TLB_reg,C7             ; flush TLBs
+
+        ; We assume that ARMs with an I cache can have it enabled while the MMU is off.
+        [ :LNOT:CacheOff
+        ORRNE   a1, a1, #MMUC_I
+        ARM_write_control a1, NE                                ; whoosh
+        ]
+
+        ; Check if we are in a 26-bit mode.
+        MRS     a2, CPSR
+        ; Keep a soft copy of the CR in a banked register (R13_und)
+        MSR     CPSR_c, #F32_bit+I32_bit+UND32_mode
+        MOV     sp, a1
+        ; Switch into SVC32 mode (we may have been in SVC26 before).
+        MSR     CPSR_c, #F32_bit+I32_bit+SVC32_mode
+
+        ; If we were in a 26-bit mode, the lr value given to us would have had PSR flags in.
+        TST     a2, #2_11100
+        MOVNE   pc, a4
+        BICEQ   pc, a4, #ARM_CC_Mask
+
+; void *RISCOS_AddRAM(unsigned int flags, void *start, void *end, uintptr_t sigbits, void *ref)
+;   Entry:
+;     flags   bit 0: video memory (currently only one block permitted)
+;             bit 1: video memory is not suitable for general use
+;             bits 8-11: speed indicator (arbitrary, higher => faster)
+;             other bits reserved (SBZ)
+;     start   = start address of RAM (inclusive) (no alignment requirements)
+;     end     = end address of RAM (exclusive) (no alignment requirements, but must be >= start)
+;     sigbits = significant address bit mask (1 => this bit of addr decoded, 0 => this bit ignored)
+;     ref     = reference handle (NULL for first call)
+
+; A table is built up at the head of the first block of memory.
+; The table consists of (addr, len, flags) pairs, terminated by a count of those pairs; ref points to that
+; counter.
+; Twelve bits of flags are stored at the bottom of the length word.
+
+        ROUT
+RISCOS_AddRAM
+        Push    "v1,v2,v3,v4,lr"
+        LDR     v4, [sp, #20]           ; Get ref
+
+        ; Round to pages. If we were extra sneaky we could not do this and chuck out incomplete
+        ; pages after concatanation, but it would be a weird HAL that gave us pages split across
+        ; calls.
+        ;
+        ADD     a2, a2, #4096           ; round start address up
+        SUB     a2, a2, #1
+        MOV     a2, a2, LSR #12
+        MOV     a2, a2, LSL #12
+        MOV     a3, a3, LSR #12         ; round end address down
+        MOV     a3, a3, LSL #12
+
+        CMP     a3, a2
+        BLS     %FT90                   ; check we aren't now null
+
+        CMP     v4, #0
+        BEQ     %FT20
+
+        ; We are not dealing with the first block since v4 != 0.  Make an attempt to merge this block
+        ; with the previous block.
+        LDMDB   v4, {v1, v2}            ; Get details of the previous block
+        MOV     v3, v2, LSL #20         ; Isolate flags
+        BIC     v2, v2, v3, LSR #20     ; And strip from length
+        ADD     v2, v1, v2              ; Get the end address
+        EOR     v2, v2, a2              ; Compare with the current block start address...
+        TST     v2, a4                  ; ... but only check the decoded bits.
+        EOR     v2, v2, a2              ; Restore the previous block end address.
+        TEQEQ   v3, a1, LSL #20         ; And are the page flags the same?
+        BNE     %FT10                   ; We can't merge it after the previous block
+
+        ; v1 = previous start
+        ; v2 = previous end
+        ; The block is just after the previous block.  That means the start address is unchanged, but
+        ; the length is increased.
+        SUB     v2, v2, v1              ; Calculate the previous block length.
+        SUB     a3, a3, a2              ; Find the length of the new block.
+        ; a3 = length of block
+        ADD     v2, v2, a3              ; Add it to the previous length.
+        ORR     v2, v2, v3, LSR #20     ; And put the flags back in.
+        STR     v2, [v4, #-4]           ; Update the block size in memory.
+        MOV     a1,v4
+        Pull    "v1,v2,v3,v4,pc"
+
+        ; The block is not just after the previous block, but it may be just before.  This may be the
+        ; case if we are softloaded.
+10      SUB     v1, v1, #1              ; Compare the address before the previous block start ...
+        SUB     a3, a3, #1              ; ... with the address of the last byte in this block ...
+        EOR     v1, v1, a3
+        TST     v1, a4                  ; ... but check only the decoded bits.
+        ADD     a3, a3, #1              ; Restore the end address.
+        TEQEQ   v3, a1, LSL #20         ; And are the page flags the same?
+        BNE     %FT20                   ; Skip if we cannot merge the block.
+
+        ; The block is just before the previous block.  The start address and length both change.
+        LDR     v1, [v4, #-8]           ; Get the previous block start again.
+
+        SUB     a3, a3, a2              ; Calculate the current block size.
+        SUB     v1, v1, a3              ; Subtract from the previous block start address.
+        SUB     v2, v2, v1              ; Calculate the new length=end-start
+        ORR     v2, v2, v3, LSR #20     ; And put the flags back in.
+        STMDB   v4, {v1, v2}            ; Update the block info in memory.
+        MOV     a1,v4
+        Pull    "v1,v2,v3,v4,pc"
+
+        ; We now have a region which does not merge with a previous region.  We move it up to the
+        ; highest address we can in the hope that this block will merge with the next block.
+20      SUB     a3, a3, a2              ; Calculate the block size
+        MOV     a1, a1, LSL #20
+        ORR     a3, a3, a1, LSR #20     ; Put the flags at the bottom
+        MVN     v1, a4                  ; Get the non-decoded address lines.
+        ORR     a2, v1, a2              ; Set the non-decoded address bit in the start address.
+
+30      CMP     v4, #0                  ; If the workspace has not been allocated...
+        MOVEQ   v4, a2                  ; ... use this block.
+        MOVEQ   v1, #0                  ; Initialise the counter.
+
+        ; The block/fragment to be added is between a2 and a2+a3.
+        LDRNE   v1, [v4]                ; Get the old counter if there was one.
+        STMIA   v4!, {a2, a3}           ; Store address and size.
+        ADD     v1, v1, #1              ; Increment the counter.
+        STR     v1, [v4]                ; Store the counter.
+
+90      MOV     a1,v4
+        Pull    "v1,v2,v3,v4,pc"        ; We've done with this block now.
+
+
+;void RISCOS_Start(unsigned int flags, int *riscos_header, int *hal_header, void *ref)
+;
+
+        ROUT
+RISCOS_Start
+; Allocate workspace for the HAL
+        ADR     v1, ZeroPage ; Where we'll store our pointers to stuff
+        STR     a1, [v1, #HAL_StartFlags]
+        STR     a3, [v1, #HAL_Descriptor] ; remember HAL descriptor ptr
+        STR     a4, [v1, #RAM_List]
+        ADD     a4, a4, #4 ; Point past table length
+        STR     a4, [v1, #HAL_JumpTable]
+        MOV     v2, a4 ; Remember start of RAM
+
+        LDR     lr, [a3, #HALDesc_Workspace]            ; their workspace
+        LDR     ip, [a3, #HALDesc_NumEntries]           ; plus 1 word per entry
+        CMP     ip, #KnownHALEntries
+        MOVLO   ip, #KnownHALEntries
+        ADD     lr, lr, ip, LSL #2
+        MOV     a3, lr, LSR #12                         ; round workspace up to whole
+        MOV     a3, a3, LSL #12                         ; number of pages
+        CMP     a3, lr
+        ADDNE   a3, a3, #&1000
+        STR     a3, [v1, #HAL_WsSize]                   ; Make a note of allocated space
+        ADD     ip, a4, ip, LSL #2                      ; Their workspace starts
+        STR     ip, [v1, #HAL_Workspace]                ; after our table of entries
+        ADD     v4, v2, a3 ; End of HAL workspace, start of NCNB workspace (if required)
+
+        LDR     a3, [v1, #HAL_Descriptor]               ; recover pushed HAL header
+        LDR     lr, [a3, #HALDesc_Flags]
+        TST     lr, #HALFlag_NCNBWorkspace              ; do they want uncacheable workspace?
+        BEQ     %FT10
+        STR     v4, [v1, #HAL_NCNBWorkspace]
+        MOV     a1, v4
+        ADD     v4, v4, #32*1024
+        ; Clear the uncacheable workspace
+        MOV     a3, #32*1024
+        MOV     a2, #0
+        BL      memset
+
+10
+        ; Clear HAL workspace
+        MOV     a1, v2
+        ADR     a2, ZeroPage
+        LDR     a3, [a2, #HAL_WsSize]
+        MOV     a2, #0
+        BL      memset
+
+        ; Set up entry table
+        BL      SetUpHALEntryTable
+
+        ; Debug!
+        DebugTX "HAL entry table initialised"
+
+        ; Init HAL
+        ADR     a1, RISCOS_Header
+        ADR     a2, ZeroPage
+        LDR     a2, [a2, #HAL_NCNBWorkspace]
+        AddressHAL
+        CallHAL HAL_Init
+
+        DebugTX "HAL initialised"
+
+        ADR     a1, ZeroPage ; ZeroPage passed in as a parameter - no way of generating position independent C code without it being a module?
+        B       notmain 
+
+; void *RISCOS_AccessPhysicalAddress(unsigned int flags, void *addr, void **oldp)
+RISCOS_AccessPhysicalAddress
+        MOV     a1, a2
+        MOV     pc, lr
+
+;
+; In:  a1 = flags  (L1_B,L1_C,L1_AP)
+;      a2 = physical address
+;      a3 = size
+; Out: a1 = assigned logical address, or 0 if failed (no room)
+;
+; Will detect and return I/O space already mapped appropriately, or map and return new space
+; For simplicity and speed of search, works on a section (1Mb) granularity
+;
+
+MapInFlag_DoublyMapped * 1:SHL:20
+MapInFlag_APSpecified * 1:SHL:21
+
+RISCOS_MapInIO
+        MOV     a1, a2
+        MOV     pc, lr
+
+; void RISCOS_AddDevice(unsigned int flags, struct device *d)
+RISCOS_AddDevice
+        MOV     pc, lr
+
+; uint32_t RISCOS_LogToPhys(const void *log)
+RISCOS_LogToPhys
+        MOV     pc, lr
+
+; kernel_oserror *RISCOS_IICOpV(int ndesc, IICDesc *descs)
+RISCOS_IICOpV
+        MOV     pc, lr
+
+SetUpHALEntryTable ROUT
+        ADR     a1, ZeroPage
+        LDR     a2, [a1, #HAL_Descriptor]
+        LDR     a3, [a1, #HAL_Workspace]
+        LDR     a4, [a2, #HALDesc_Entries]
+        LDR     ip, [a2, #HALDesc_NumEntries]
+        ADD     a4, a2, a4                              ; a4 -> entry table
+        MOV     a2, a4                                  ; a2 -> entry table (increments)
+10      SUBS    ip, ip, #1                              ; decrement counter
+        LDRCS   a1, [a2], #4
+        BCC     %FT20
+        TEQ     a1, #0
+        ADREQ   a1, NullHALEntry
+        ADDNE   a1, a4, a1                              ; convert offset to absolute
+        STR     a1, [a3, #-4]!                          ; store backwards below HAL workspace
+        B       %BT10
+20      ADR     a1, ZeroPage                           ; pad table with NullHALEntries
+        LDR     a4, [a1, #HAL_JumpTable]                       ; in case where HAL didn't supply enough
+        ADR     a1, NullHALEntry
+30      CMP     a3, a4
+        STRHI   a1, [a3, #-4]!
+        BHI     %BT30
+        MOV     pc, lr
+
+NullHALEntry
+        MOV     pc, lr
+
+ [ DebugTerminal
+DebugTerminal_Rdch
+        Push    "a2-a4,sb,ip"
+        WritePSRc SVC_mode, r1
+        MOV     sb, ip
+20
+        CallHAL HAL_DebugRX
+        CMP     a1, #-1
+        Pull    "a2-a4,sb,ip,pc",NE     ; claim it
+        B       %BT20
+
+
+DebugTerminal_Wrch
+        Push    "a1-a4,sb,ip,lr"
+        MOV     sb, ip
+        CallHAL HAL_DebugTX
+        Pull    "a1-a4,sb,ip,pc"        ; don't claim it
+ ]
+
+ [ DebugHALTX
+DebugHALPrint
+        Push    "a1-a4,v1,sb,ip"
+        AddressHAL
+        MOV     v1, lr
+10      LDRB    a1, [v1], #1
+        TEQ     a1, #0
+        BEQ     %FT20
+        CallHAL HAL_DebugTX
+        B       %BT10
+20      MOV     a1, #13
+        CallHAL HAL_DebugTX
+        MOV     a1, #10
+        CallHAL HAL_DebugTX
+        ADD     v1, v1, #3
+        BIC     lr, v1, #3
+        Pull    "a1-a4,v1,sb,ip"
+        MOV     pc, lr
+ ]
+
+; void *memset(void *s, int c, size_t n) -----------------------------------
+
+        ROUT
+memset
+        TEQ     a3, #0                                  ; return immediately if zero bytes
+        MOVEQ   pc, lr
+
+        ADD     a1, a1, a3
+        TST     a1, #3                                  ; check for unaligned end
+        BNE     %FT80
+05      SUBS    a3, a3, #32                             ; if at least 32, do 32 at a time
+        BLO     %FT50
+
+        Push    "v1-v5"
+        AND     a2, a2, #&FF
+        ORR     a2, a2, a2, LSL #8
+        ORR     a2, a2, a2, LSL #16
+        MOV     a4, a2
+        MOV     v1, a2
+        MOV     v2, a2
+        MOV     v3, a2
+        MOV     v4, a2
+        MOV     v5, a2
+        MOV     ip, a2
+10      STMDB   a1!, {a2,a4,v1,v2,v3,v4,v5,ip}
+        SUBS    a3, a3, #32
+        BHS     %BT10
+        Pull    "v1-v5"
+
+50      ADDS    a3, a3, #32-4                           ; if at least 4, do 4 at a time
+        BMI     %FT70
+60      STR     a2, [a1, #-4]!
+        SUBS    a3, a3, #4
+        BPL     %BT60
+
+70      ADDS    a3, a3, #4
+        MOVEQ   pc, lr
+
+80      STRB    a2, [a1, #-1]!                          ; byte at a time until finished or
+        SUBS    a3, a3, #1                              ; aligned (if at end, will finish)
+        MOVEQ   pc, lr
+        TST     a1, #3
+        BNE     %BT80
+        B       %BT05
+
+; unsigned __rt_udiv(unsigned divisor, unsigned dividend) --------------------------------
+        ROUT
+|__rt_udiv|
+; Unsigned divide of a2 by a1: returns quotient in a1, remainder in a2
+; Destroys a3 and ip only
+
+        MOV     a3, #0
+        RSBS    ip, a1, a2, LSR #3
+        BCC     u_sh2
+        RSBS    ip, a1, a2, LSR #8
+        BCC     u_sh7
+        MOV     a1, a1, LSL #8
+        ORR     a3, a3, #&FF000000
+        RSBS    ip, a1, a2, LSR #4
+        BCC     u_sh3
+        RSBS    ip, a1, a2, LSR #8
+        BCC     u_sh7
+        MOV     a1, a1, LSL #8
+        ORR     a3, a3, #&00FF0000
+        RSBS    ip, a1, a2, LSR #8
+        MOVCS   a1, a1, LSL #8
+        ORRCS   a3, a3, #&0000FF00
+        RSBS    ip, a1, a2, LSR #4
+        BCC     u_sh3
+        RSBS    ip, a1, #0
+        BCS     dividebyzero
+u_loop  MOVCS   a1, a1, LSR #8
+u_sh7   RSBS    ip, a1, a2, LSR #7
+        SUBCS   a2, a2, a1, LSL #7
+        ADC     a3, a3, a3
+u_sh6   RSBS    ip, a1, a2, LSR #6
+        SUBCS   a2, a2, a1, LSL #6
+        ADC     a3, a3, a3
+u_sh5   RSBS    ip, a1, a2, LSR #5
+        SUBCS   a2, a2, a1, LSL #5
+        ADC     a3, a3, a3
+u_sh4   RSBS    ip, a1, a2, LSR #4
+        SUBCS   a2, a2, a1, LSL #4
+        ADC     a3, a3, a3
+u_sh3   RSBS    ip, a1, a2, LSR #3
+        SUBCS   a2, a2, a1, LSL #3
+        ADC     a3, a3, a3
+u_sh2   RSBS    ip, a1, a2, LSR #2
+        SUBCS   a2, a2, a1, LSL #2
+        ADC     a3, a3, a3
+u_sh1   RSBS    ip, a1, a2, LSR #1
+        SUBCS   a2, a2, a1, LSL #1
+        ADC     a3, a3, a3
+u_sh0   RSBS    ip, a1, a2
+        SUBCS   a2, a2, a1
+        ADCS    a3, a3, a3
+        BCS     u_loop
+        MOV     a1, a3
+        MOV     pc, lr
+
+dividebyzero
+        B       dividebyzero
+
+; CPU examination
+        EXPORT  CPU_examine
+CPU_examine
+        ARM_read_ID ip
+        STR     ip, [a1], #4
+        ARM_read_cachetype ip
+        STR     ip, [a1], #4
+        ARM_read_control ip
+        STR     ip, [a1], #4
+        MOV     pc, lr
+
+
+        END

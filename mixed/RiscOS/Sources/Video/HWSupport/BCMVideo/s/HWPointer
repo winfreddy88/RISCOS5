@@ -1,0 +1,519 @@
+; Copyright 2012 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+
+        GBLL    HWPDebug
+HWPDebug SETL   Debug :LAND: {FALSE}
+
+        GBLL    HiDebug
+HiDebug SETL    Debug :LAND: {FALSE}        
+
+HWP_Init    ROUT
+        Entry   "r0-r7"
+        ; Ensure dispmanx is initialised
+        BL      Dispmanx_Init
+        LDR     r0, DispManServiceC
+        CMP     r0, #0
+        EXIT    EQ
+        ; Create resource
+        MOV     r0, #EDispmanResourceCreate
+        MOV     r1, #Format_ARGB8888
+        MOV     r2, #32
+        MOV     r3, #32
+        STMDB   sp!, {r0-r3}
+        MOV     r0, #16
+        BL      Dispmanx_Send
+        ADD     sp, sp, #16
+        FRAMSTR r0,VS
+        EXIT    VS
+        STR     r0, HWPResource
+      [ HWPDebug
+        bl DebugTXStrInline
+        DCB "HWP_Init OK",10,13,0
+        ALIGN
+      ]  
+        ; Mark as available
+        MOV     r0, #0
+        STR     r0, RTActive
+        MOV     r0, #1
+        STRB    r0, HWPPalDirty ; Just to make sure initial image gets sent
+        STR     pc, RTDead
+        STR     pc, HWPActive
+        CLRV
+        EXIT
+
+HWP_Finalise ROUT
+        Entry   "r0-r7"
+        LDR     r0, DispManServiceC
+        CMP     r0, #0
+        EXIT    EQ
+      [ HWPDebug
+        bl DebugTXStrInline
+        DCB "HWP_Finalise",10,13,0
+        ALIGN
+      ]
+        ; Disable pointer
+        LDR     r0, HWPActive
+        CMP     r0, #0
+        MOV     r0, #0
+        STRNE   r0, HWPActive
+        BLNE    HWP_Remove
+        ; Wait for RTSupport thread to terminate
+        ADR     r1, RTDead
+        BL      WaitForR1
+        ; Release resources
+        MOV     r0, #EDispmanResourceDelete
+        LDR     r1, HWPResource
+        STMDB   sp!, {r0-r1}
+        MOV     r0, #8
+        BL      Dispmanx_Send
+        ADD     sp, sp, #8
+        ; Done
+      [ HWPDebug
+        bl DebugTXStrInline
+        DCB "HWP_Finalise OK",10,13,0
+        ALIGN
+      ]  
+        EXIT
+
+HWP_Update  ROUT
+        ; Wrapper to make sure we're not in IRQ mode during SWI calls
+        Push    "r5"
+        MRS     r5, CPSR
+        MSR     CPSR_c, #SVC32_mode + I32_bit
+        Push    "lr"
+        BL      %FT01
+        Pull    "lr"
+        MSR     CPSR_c, r5
+        Pull    "r5,pc"
+01
+        TST     r0, #1
+        MOVEQ   r4, #0 ; Claim GraphicsV call
+        BEQ     HWP_Remove
+        ; Enable/update cursor
+        Entry   "r0-r7"
+      [ HiDebug
+        bl DebugHexTX4
+        bl DebugTXStrInline
+        DCB "HWP_Update",10,13,0
+        ALIGN
+      ]  
+        ; Start by copying update data into workspace
+        STR     r1, HWPXCoord
+        STR     r2, HWPYCoord
+        LDRB    r1, HWPPalDirty
+        TST     r0, #2 ; Shape updated?
+        TEQEQ   r1, #0 ; Palette changed?
+        MOV     r0, #0
+        STRB    r0, HWPPalDirty
+        BEQ     %FT50
+        LDR     r0, HWPImage
+        ADR     r1, CurPalette
+        LDRB    r2, [r3, #1] ; Get height
+        ADD     r4, r0, #32*32*4
+        TEQ     r2, #0
+        BEQ     %FT30
+        LDR     r3, [r3, #4] ; Get image
+        ; To avoid fringing caused by alpha blending, we fill all transparent pixels with the value of the last non-transparent pixel (just with an alpha of 0 instead of 1)
+        ; For the first block of pixels we merely use the first non-transparent palette entry, which is conveniently the light blue of the standard cursor image
+        LDR     r7, [r1, #4]
+        REV     r7, r7
+10
+        LDR     r5, =&88888888
+        LDRB    r6, [r3], #1
+20
+        ANDS    lr, r6, #3
+        LDRNE   r7, [r1, lr, LSL #2]
+        REVNE   r7, r7
+        ORRNE   r7, r7, #&ff000000
+        BICEQ   r7, r7, #&ff000000
+        STR     r7, [r0], #4
+        MOV     r6, r6, LSR #2
+        MOVS    r5, r5, LSR #1
+        LDRHIB  r6, [r3], #1
+        BNE     %BT20
+        SUBS    r2, r2, #1
+        BNE     %BT10
+30
+        BIC     r1, r7, #&ff000000
+        BIC     r2, r7, #&ff000000
+        BIC     r3, r7, #&ff000000
+        BIC     r5, r7, #&ff000000
+40
+        TEQ     r0, r4
+        STMNEIA r0!, {r1,r2,r3,r5}
+        BNE     %BT40
+        MOV     r0, #1
+        STRB    r0, HWPImgDirty
+50
+        ; The pointer will fail to display if the GPU X coord is >= 2048
+        ; If the pointer is outside the valid area, disable it and indicate to
+        ; the OS that the software pointer should be used (by not claiming the
+        ; GraphicsV call)
+        LDR     r0, DisplayWidth
+        CMP     r0, #2048
+        BLE     %FT60 ; Mode not big enough to require software pointer
+        SUB     sp, sp, #32
+        MOV     r0, sp
+        ADD     r1, sp, #16
+        BL      HWP_CalcCursorPos ; Calculate GPU coords
+        LDMIA   sp, {r0-r1}
+        ADD     sp, sp, #32
+        CMP     r0, #2048
+        MOVGE   r0, #0
+        BGE     %FT70
+60
+        ; Turn pointer on and claim the GraphicsV call
+        MOV     r0, #0
+        STR     r0, [sp, #4*4]
+        MOV     r0, #1
+70
+        BL      HWP_KickRTSupport
+      [ HiDebug
+        bl DebugTXStrInline
+        DCB "HWP_Update OK",10,13,0
+        ALIGN
+      ]  
+        EXIT
+
+HWP_Remove  ROUT
+        Entry   "r0-r7"
+      [ HiDebug
+        bl DebugTXStrInline
+        DCB "HWP_Remove",10,13,0
+        ALIGN
+      ]  
+        ; Disable pointer & kill RTSupport
+        MOV     r0, #0
+        BL      HWP_KickRTSupport
+        EXIT
+
+HWP_KickRTSupport
+        ; In: r0 = 1 if RTSupport should be alive (cursor visible), 0 for dead (cursor invisible)
+        ; Out: r0-r7 corrupt
+        Entry
+      [ HiDebug
+        bl DebugHexTX4
+        bl DebugTXStrInline
+        DCB "HWP_KickRTSupport",10,13,0
+        ALIGN
+      ]  
+        MRS     r5, CPSR
+        ORR     r4, r5, #I32_bit
+        MSR     CPSR_c, r4
+        STRB    r0, HWPVisible
+        LDR     r1, RTDead
+        CMP     r0, #0
+        BEQ     %FT20
+        CMP     r1, #0
+        BNE     %FT10
+        ; It's alive and we want it to be alive. Kick it if necessary.
+05
+      [ HiDebug
+        bl DebugTXStrInline
+        DCB "->kick",10,13,0
+        ALIGN
+      ]  
+        LDR     r1, RTActive
+        STR     pc, RTActive
+        MSR     CPSR_c, r5
+        CMP     r1, #0
+        ADREQL  r1, pollword_1
+        SWIEQ   XRT_Yield
+        EXIT
+10
+        ; It's not alive. Create it.
+      [ HiDebug
+        bl DebugTXStrInline
+        DCB "->create",10,13,0
+        ALIGN
+      ]  
+        MOV     r0, #0
+        ADR     r1, HWP_RTRoutine
+        MOV     r2, #0
+        MOV     r3, r12
+        ADR     r4, RTActive
+        ADRL    r6, RTStack+?RTStack
+        ADRL    r7, RTPriority
+        SWI     XRT_Register
+        STRVC   r0, RTHandle
+        STRVC   r2, RTDead
+        MSR     CPSR_c, r5
+        EXIT
+20
+        CMP     r1, #0
+        BEQ     %BT05 ; It's alive and we want it to be dead. Kick it if necessary.
+        ; It's dead and we want it to be dead
+        MSR     CPSR_c, r5
+        EXIT        
+
+HWP_RTRoutine   ROUT
+        Entry   , 128
+        ; Disable IRQs while we work out what to do
+        MRS     r9, CPSR
+        ORR     r0, r9, #I32_bit
+        MSR     CPSR_c, r0
+01
+        MOV     r0, #0
+        STR     r0, RTActive
+        LDRB    r1, HWPImgDirty
+        STRB    r0, HWPImgDirty
+        LDRB    r0, HWPVisible
+        MSR     CPSR_c, r9
+      [ HWPDebug
+        Push "r0"
+        bl DebugHexTX4
+        MOV r0, r1
+        bl DebugHexTX4
+        Pull "r0"
+        bl DebugTXStrInline
+        DCB "HWP_RTRoutine",10,13,0
+        ALIGN
+      ]  
+        CMP     r0, #0
+        BEQ     %FT40
+        ; Update image if necessary
+        CMP     r1, #0
+        BEQ     %FT10
+        MOV     r0, #EDispmanBulkWrite + NoReply
+        LDR     r1, HWPResource
+        MOV     r2, #0
+        MOV     r3, #32*32*4
+        STMIA   sp, {r0-r3}
+        MOV     r0, #16
+        BL      Dispmanx_Send
+        BVS     %FT10
+        LDR     r0, DispManServiceC
+        SWI     XVCHIQ_ServiceUse
+        BVS     %FT10
+        LDR     r0, DispManServiceC
+        LDR     r1, HWPImage
+        MOV     r2, #32*32*4
+        MOV     r3, #VCHI_FLAGS_BLOCK_UNTIL_QUEUED ; VCHI_FLAGS_BLOCK_UNTIL_DATA_READ
+        MOV     r4, #0
+        SWI     XVCHIQ_BulkQueueTransmit
+        LDR     r0, DispManServiceC
+        SWI     XVCHIQ_ServiceRelease
+10
+        ; Set position by adding/updating element
+        MOV     r0, #EDispmanUpdateStart
+        MOV     r1, #10
+        STMIA   sp, {r0-r1}
+        MOV     r0, #8
+        BL      Dispmanx_Send
+        BVS     %FT30
+        MOV     r8, r0
+        LDRB    r0, HWPIsVisible
+        CMP     r0, #0
+        BNE     %FT20
+        ; Add element
+        MOV     r0, #EDispmanElementAdd
+        MOV     r1, r8
+        LDR     r2, DispHandle
+        MOV     r3, #Depth_Pointer
+        STMIA   sp, {r0-r3}
+        LDR     r0, HWPResource
+        STR     r0, [sp, #32]
+        MOV     r1, #0
+        STR     r1, [sp, #52] ; protection
+        STR     r1, [sp, #56] ; src alpha
+        STR     r1, [sp, #60] ; opacity
+        STR     r1, [sp, #64] ; mask image
+        STR     r1, [sp, #68] ; clamp mode
+        STR     r1, [sp, #72] ; clamp key mask
+        STR     r1, [sp, #76] ; yy_upper
+        STR     r1, [sp, #80] ; yy_lower
+        STR     r1, [sp, #84] ; cr_upper
+        STR     r1, [sp, #88] ; cr_lower
+        STR     r1, [sp, #92] ; cb_upper
+        STR     r1, [sp, #96] ; cb_lower
+        STR     r1, [sp, #100] ; replace_balue
+        STR     r1, [sp, #104] ; transform
+        ADD     r0, sp, #16 ; dest rect
+        ADD     r1, sp, #36 ; src rect
+        BL      HWP_CalcCursorPos
+        MOV     r0, #108
+        BLVC    Dispmanx_Send
+        STRVC   r0, HWPElement
+        MOVVC   r0, #1
+        STRVCB  r0, HWPIsVisible
+        B       %FT30
+20
+        ; Move existing element
+        MOV     r0, #EDispmanElementChangeAttributes + NoReply
+        MOV     r1, r8
+        LDR     r2, HWPElement
+        MOV     r3, #1<<2+(1<<3)
+        MOV     r4, #0 ; layer
+        MOV     r5, #0 ; opacity
+        MOV     r6, #0 ; mask
+        MOV     r7, #0 ; transform
+        STMIA   sp, {r0-r7}
+        ADD     r0, sp, #32 ; dest rect
+        ADD     r1, sp, #48 ; src rect
+        BL      HWP_CalcCursorPos
+        BVS     %FT35
+        MOV     r0, #64
+        BL      Dispmanx_Send
+30
+        MOV     r0, #EDispmanUpdateSubmit
+        MOV     r1, r8
+        STMIA   sp, {r0-r1}
+        MOV     r0, #8
+        BL      Dispmanx_Send
+        ; Done; go back to sleep
+      [ HWPDebug
+        bl DebugTXStrInline
+        DCB "HWP_RTRoutine sleep",10,13,0
+        ALIGN
+      ]
+        MOV     r0, #0  
+        EXIT
+
+35
+        ; Invalid position: Remove image and go to sleep
+        MOV     r0, #EDispmanElementRemove + NoReply
+        MOV     r1, r8
+        LDR     r2, HWPElement
+        STMIA   sp, {r0-r2}
+        MOV     r0, #12
+        BL      Dispmanx_Send
+        MOV     r0, #0
+        STRB    r0, HWPIsVisible
+        B       %BT30
+
+40
+        ; Remove image and kill ourselves
+        LDRB    r0, HWPIsVisible
+        CMP     r0, #0
+        BEQ     %FT60
+        MOV     r0, #EDispmanUpdateStart
+        MOV     r1, #10
+        STMIA   sp, {r0-r1}
+        MOV     r0, #8
+        BL      Dispmanx_Send
+        BVS     %FT50
+        MOV     r8, r0
+        MOV     r0, #EDispmanElementRemove + NoReply
+        MOV     r1, r8
+        LDR     r2, HWPElement
+        STMIA   sp, {r0-r2}
+        MOV     r0, #12
+        BL      Dispmanx_Send
+50
+        MOV     r0, #EDispmanUpdateSubmit
+        MOV     r1, r8
+        STMIA   sp, {r0-r1}
+        MOV     r0, #8
+        BL      Dispmanx_Send
+        MOV     r0, #0
+        STRB    r0, HWPIsVisible
+60
+        ; Foreground usually doesn't synchronise when it requests us to die
+        ; This means the death message may have been cancelled
+        ; So disable IRQs and double check that we're still meant to be dead
+        ORR     r0, r9, #I32_bit
+        MSR     CPSR_c, r0
+        LDRB    r0, HWPVisible
+        CMP     r0, #0
+        BNE     %BT01 ; Yes, stay alive
+        ; No, die
+      [ HWPDebug
+        bl DebugTXStrInline
+        DCB "HWP_RTRoutine die",10,13,0
+        ALIGN
+      ]  
+        STR     pc, RTDead
+        MOV     r0, #0
+        STR     r0, RTActive
+        STR     r0, RTHandle
+        SWI     XRT_ReadInfo ; Get our handle (although RTHandle should have been accurate?)
+        MOV     r1, r0
+        MOV     r0, #0
+        SWI     XRT_Deregister
+        ; If we're still alive, something is very wrong. Just crash horribly.
+        UND     #0
+
+HWP_CalcCursorPos ROUT
+        ; In: r0 = dest rect ptr (x, y, w, h in pixels)
+        ;     r1 = src rect ptr (x, y, w, h in 1/65536th pixels)
+        ; Out: r0-r6 corrupt
+        ;     V set if position invalid
+        LDR     r2, HWPXCoord
+        LDR     r3, XScale
+        LDR     r4, XOffset
+        ; Write out dest rect
+        MUL     r2, r3, r2
+        ADD     r4, r4, r2, ASR #16
+        STR     r4, [r0, #0]
+        MOV     r5, r3, LSR #16-5 ; 32 pixels
+        STR     r5, [r0, #8]
+        STR     r5, [r0, #12]
+        ; Check if off right edge of screen
+        LDR     r3, DisplayWidth
+        CMP     r4, r3
+        BGE     %FT90
+        LDR     r5, HWPYCoord
+        LDR     r3, YScale
+        LDR     r4, YOffset
+        MUL     r5, r3, r5
+        ADD     r4, r4, r5, ASR #16
+        STR     r4, [r0, #4]
+        ; Check if off bottom of screen
+        LDR     r2, DisplayHeight
+        CMP     r4, r2
+        BGE     %FT90
+        ; Write out src rect
+        ; TODO - use sub-pixel offsets to make sure the image lines up with the correct pixels below
+        MOV     r2, #0
+        MOV     r6, #32<<16
+        STR     r2, [r1, #0]
+        STR     r2, [r1, #4]
+        STR     r6, [r1, #8]
+        STR     r6, [r1, #12]
+        ; Clamp Y coord to 0; negative Y causes the cursor to vanish completely. Negative X seems fine.
+        CMP     r4, #0
+        BGE     %FT10
+        LDR     r3, [r0, #12]
+        ADDS    r3, r3, r4
+        BLE     %FT90 ; Don't do anything if it's fully off screen (if we clamp the height to <1, it'll just end up being displayed scaled up to fit the screen. doh!)
+        LDR     r5, YInvScale
+        RSB     r4, r4, #0
+        MUL     r4, r5, r4
+        SUBS    r6, r6, r4
+        BLE     %FT90 ; Paranoia - Don't clamp if src height becomes <=0 either (not sure whether it's the src height or dest height that's the problem)
+        STR     r2, [r0, #4] ; Clamp dest y
+        STR     r3, [r0, #12] ; Reduce dest height
+        STR     r4, [r1, #4] ; Offset src y
+        STR     r6, [r1, #12] ; Reduce src height
+10
+        ; Check if completely off left edge of screen
+        LDR     r2, [r0, #0]
+        LDR     r3, [r0, #8]
+        ADDS    r2, r2, r3
+        BLE     %FT90
+        CLRV
+        MOV     pc, lr
+
+90
+        ; We've arrived here because the image is fully off-screen
+        ; Avoid trying to display it, it can cause issues on some firmware
+        ; (e.g. 30 Mar 2014 - large pointer filling screen if off left edge,
+        ; or large square of colours if off top edge)
+        SETV
+        MOV     pc, lr
+
+        LTORG
+
+        END

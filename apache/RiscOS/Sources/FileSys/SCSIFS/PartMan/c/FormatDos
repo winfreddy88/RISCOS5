@@ -1,0 +1,419 @@
+/* Copyright 2016 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+// Format routine for DOS style partition...
+// computes format parameters and lays out disc specified
+//
+//
+//
+//
+//
+//
+//
+
+#include        "PMInclude.h"
+#include        "Format.h"
+#include        "Diagnostic.h"
+
+extern void wimp_error(_kernel_oserror *er);
+static _kernel_oserror er;
+
+
+// Compute and write DOS disc format to SCSI device ID
+//  At sector offset Offset, for Size sectors
+//  ...assumes megabyte aligned disc start and size
+//  ... non zero return value if any failure
+int MakeDosFormat(int              ID,
+                  unsigned int     AccessKey,
+                  int              SecSize,
+                  int              BaseOffset,
+                  int              SecCount,
+                  int		   TotalDiscSize,
+                  char             *name,
+                  int              *defect,
+                  int              dospartition,
+                  char             bootoption)
+{
+   dosbootsector   boot;
+   dosformatbootsector *fb;
+   dospart         *k=0;
+   int             g,i,*j,cyl,hd,sec,clusters,clustersecs,fatcount,temp,secspertrack=0,headspercyl=0;
+   struct tm       *timep;
+   time_t          tmt;
+   int    	   utmp,vtmp;
+   IGNORE(bootoption);
+   IGNORE(defect);
+
+  testprint("\n Dos format ID:%x SecSize:%x Offset:%x Count:%x dospart:%d",ID,SecSize,BaseOffset,SecCount,dospartition);
+
+  // ensure SecCount max endpoint cannot exceed 2Gb for FAT16
+  vtmp=((1<<20)/SecSize)<<11;           // conversion to 2Gb in sector units
+  if(BaseOffset>=(vtmp-((1<<20)/SecSize)))
+  {
+    er.errnum=0; strcpy(er.errmess,"Dos partition MUST start at or below 2047Mb. Re format within DOS");
+    wimp_error(&er);
+  }
+  utmp=SecCount+BaseOffset;             // end sector
+ testprint("\n utmp:%x vtmp:%x ",(int)utmp,(int)vtmp);
+  if(utmp>vtmp)                         // if too big
+  {
+    SecCount=vtmp-BaseOffset;
+    SecCount-=(((1<<20)/SecSize)-BaseOffset);  // & 1Mb exact
+ testprint("\n new SecCount %x",SecCount);
+    er.errnum=0; strcpy(er.errmess,"Dos partition set to the 2047Mb maximum");
+    wimp_error(&er);
+  }
+
+
+
+//   if(((SecSize/128)*SecCount)>(2<<20)) SecCount= ((2<<20)/SecSize)-1;  // FAT16 only allowed 2Gb
+
+// build data needed there
+   j=(int*)&boot;
+   for(g=0;g<0x80;g++)
+   {
+     *(j+g)=0;
+   }
+   *(j++) = (int)0x8EC033FA;
+   *(j++) = (int)0x7C00BCD0;
+   *(j++) = (int)0x0750F48B;
+   *(j++) = (int)0xFCFB1F50;
+
+   *(j++) = (int)0xB90600BF;
+   *(j++) = (int)0xA5F20100;
+   *(j++) = (int)0x00061DEA;
+   *(j++) = (int)0x07BEBE00;
+
+   *(j++) = (int)0x3C8004B3;
+   *(j++) = (int)0x800E7480;
+   *(j++) = (int)0x1C75003C;
+   *(j++) = (int)0xFE10C683;
+
+   *(j++) = (int)0xCDEF75CB;
+   *(j++) = (int)0x8B148B18;
+   *(j++) = (int)0xEE8B024C;
+   *(j++) = (int)0xFE10C683;
+
+   *(j++) = (int)0x801A74CB;
+   *(j++) = (int)0xF474003C;
+   *(j++) = (int)0xAC068BBE;
+   *(j++) = (int)0x0B74003C;
+
+   *(j++) = (int)0x0007BB56;
+   *(j++) = (int)0x10CD0EB4;
+   *(j++) = (int)0xEBF0EB5E;
+   *(j++) = (int)0x0005BFFE;
+
+   *(j++) = (int)0xB87C00BB; //6
+   *(j++) = (int)0xCD570201;
+   *(j++) = (int)0x0C735F13;
+   *(j++) = (int)0x13CDC033;
+
+   *(j++) = (int)0xBEED754F;
+   *(j++) = (int)0xD3EB06A3;
+   *(j++) = (int)0xBF06C2BE;
+   *(j++) = (int)0x3D817DFE;
+
+   *(j++) = (int)0xC775AA55;
+   *(j++) = (int)0x00EAF58B;
+   *(j++) = (int)0x4900007C;
+   *(j++) = (int)0x6C61766E;
+
+   *(j++) = (int)0x70206469;
+   *(j++) = (int)0x69747261;
+   *(j++) = (int)0x6E6F6974;
+   *(j++) = (int)0x62617420;
+
+   *(j++) = (int)0x4500656C;
+   *(j++) = (int)0x726F7272;
+   *(j++) = (int)0x616F6C20;
+   *(j++) = (int)0x676E6964;
+
+   *(j++) = (int)0x65706F20;
+   *(j++) = (int)0x69746172;
+   *(j++) = (int)0x7320676E;
+   *(j++) = (int)0x00007379;
+
+
+   if (dospartition !=-1)
+   {
+// build DOS partition table
+   if(dospartition==0)k = (dospart*)&boot.bootable1;
+   if(dospartition==1)k = (dospart*)&boot.bootable2;
+   if(dospartition==2)k = (dospart*)&boot.bootable3;
+   if(dospartition==3)k = (dospart*)&boot.bootable4;
+   k->bootable = 0x80;
+   k->parttype = 0x6;
+   headspercyl=64; secspertrack=32;
+// make sure total disc is computable within limits defined by hds, secs, cyls
+// dos Partn table limits: Cylinders: 1024(0-1023), Heads:256(0-255), sectors:63
+   while(cyl = (TotalDiscSize)/headspercyl/secspertrack,cyl>1023)
+   {
+     headspercyl++;
+     if(headspercyl>254)
+     {
+       secspertrack++;
+       headspercyl=32;
+     }
+   }
+
+   hd  = ((BaseOffset+SecCount)-(cyl*headspercyl*secspertrack))/secspertrack;
+   sec = (BaseOffset+SecCount) - (cyl*headspercyl*secspertrack) - (hd*secspertrack);
+   k->stopside = hd;
+   k->stopcylhisec = ((1+sec)&0x3f) + ((cyl>>8)<<6);
+   k->stopcyllo = cyl;
+   cyl = (BaseOffset)/headspercyl/secspertrack;
+   hd  = ((BaseOffset)-(cyl*headspercyl*secspertrack))/secspertrack;
+   sec = (BaseOffset) - (cyl*headspercyl*secspertrack) - (hd*secspertrack);
+   k->startside = hd;
+   k->startcylhisec = ((1+sec)&0x3f) + ((cyl>>8)<<6);
+   k->startcyllo = cyl;
+
+   k->start.relsecs[0] = BaseOffset;
+   k->start.relsecs[1] = BaseOffset >>8;
+   k->start.relsecs[2] = BaseOffset >>16;
+   k->start.relsecs[3] = BaseOffset >>24;
+   k->size.sizesecs[0] = (SecCount-1);
+   k->size.sizesecs[1] = (SecCount-1) >>8;
+   k->size.sizesecs[2] = (SecCount-1) >>16;
+   k->size.sizesecs[3] = (SecCount-1) >>24;
+
+
+// write dos key bytes
+   boot.key[0] = 0x55; boot.key[1] = 0xaa;
+
+// write DOS boot sector
+   wimp_error( SecWrite(ID, AccessKey, &boot, sizeof(dosbootsector), BaseOffset,  SecSize));
+   }
+// compute various required DOS parameters
+   clusters=SecCount-1;
+   clustersecs=1;
+   while(clusters>0xfffd){clusters/=2;clustersecs*=2;}  // 2 cluster entries used at table start, 2 bytes/entry (FAT16!)
+   clusters+=((clusters*clustersecs)<(SecCount-1))?1:0;  // ensure enough clusters to cover whole disc
+
+    testprint("\nClustersecs:%d clusters:%d ",clustersecs,clusters);
+   fatcount=((2*clusters)/SecSize)+((((2*clusters)%SecSize)>0)?1:0);         // 2 bytes/cluster.. round clusters up
+
+
+
+
+    testprint("secs used/ fat:%d ",fatcount);
+
+// get space for boot sector, FAT area & root dir
+   if( (fb = (dosformatbootsector*) calloc(sizeof(dosformatbootsector)+(2*fatcount*SecSize)+(512*48),1)) == NULL)
+   {
+     return(-1);
+   }
+
+// build data for boot sector
+   j=(int*)fb;
+   *(j)=0x00903CEB;            // 3 bytes DOS jump, then OS ID  bytes,
+   i=offsetof(dosformatbootsector,postdata[0]);
+   j+=i/sizeof(int);
+   *(j++)=(int)0xBCD08EC0;
+   *(j++)=(int)0x07167C00;
+   *(j++)=(int)0x360078BB;
+   *(j++)=(int)0x561E37C5;
+   *(j++)=(int)0x3EBF5316;
+   *(j++)=(int)0x000BB97C;
+   *(j++)=(int)0x06A4F3FC;
+   *(j++)=(int)0xFE45C61F;
+   *(j++)=(int)0x180E8B0F;
+   *(j++)=(int)0xF94D887C;
+   *(j++)=(int)0xC7024789;
+   *(j++)=(int)0xFB7C3E07;
+   *(j++)=(int)0x797213CD;
+   *(j++)=(int)0x0639C033;
+   *(j++)=(int)0x08747C13;
+   *(j++)=(int)0x7C130E8B;
+   *(j++)=(int)0x7C200E89;
+   *(j++)=(int)0xF77C10A0;
+   *(j++)=(int)0x037C1626;
+   *(j++)=(int)0x137C1C06;
+   *(j++)=(int)0x037C1E16;
+   *(j++)=(int)0x837C0E06;
+   *(j++)=(int)0x50A300D2;
+   *(j++)=(int)0x5216897C;
+   *(j++)=(int)0x7C49A37C;
+   *(j++)=(int)0x7C4B1689;
+   *(j++)=(int)0xF70020B8;
+   *(j++)=(int)0x8B7C1126;
+   *(j++)=(int)0x037C0B1E;
+   *(j++)=(int)0xF3F748C3;
+   *(j++)=(int)0x7C490601;
+   *(j++)=(int)0x7C4B1683;
+   *(j++)=(int)0x0500BB00;
+   *(j++)=(int)0x7C52168B;
+   *(j++)=(int)0xE87C50A1;
+   *(j++)=(int)0x1D720092;
+   *(j++)=(int)0xACE801B0;
+   *(j++)=(int)0x8B167200;
+   *(j++)=(int)0x000BB9FB;
+   *(j++)=(int)0xF37DE6BE;
+   *(j++)=(int)0x8D0A75A6;
+   *(j++)=(int)0x0BB9207F;
+   *(j++)=(int)0x74A6F300;
+   *(j++)=(int)0x7D9EBE18;
+   *(j++)=(int)0x33005FE8;
+   *(j++)=(int)0x5E16CDC0;
+   *(j++)=(int)0x8F048F1F;
+   *(j++)=(int)0x19CD0244;
+   *(j++)=(int)0xEB585858;
+   *(j++)=(int)0x1A478BE8;
+   *(j++)=(int)0x1E8A4848;
+   *(j++)=(int)0xFF327C0D;
+   *(j++)=(int)0x0603E3F7;
+   *(j++)=(int)0x16137C49;
+   *(j++)=(int)0x00BB7C4B;
+   *(j++)=(int)0x0003B907;
+   *(j++)=(int)0xE8515250;
+   *(j++)=(int)0xD872003A;
+   *(j++)=(int)0x54E801B0;
+   *(j++)=(int)0x585A5900;
+   *(j++)=(int)0x0105BB72;
+   *(j++)=(int)0x00D28300;
+   *(j++)=(int)0x7C0B1E03;
+   *(j++)=(int)0x2E8AE2E2;
+   *(j++)=(int)0x168A7C15;
+   *(j++)=(int)0x1E8B7C24;
+   *(j++)=(int)0x4BA17C49;
+   *(j++)=(int)0x0000EA7C;
+   *(j++)=(int)0x0AAC0070;
+   *(j++)=(int)0xB42974C0;
+   *(j++)=(int)0x0007BB0E;
+   *(j++)=(int)0xF2EB10CD;
+   *(j++)=(int)0x7C18163B;
+   *(j++)=(int)0x36F71973;
+   *(j++)=(int)0xC2FE7C18;
+   *(j++)=(int)0x7C4F1688;
+   *(j++)=(int)0x36F7D233;
+   *(j++)=(int)0x16887C1A;
+   *(j++)=(int)0x4DA37C25;
+   *(j++)=(int)0xF9C3F87C;
+   *(j++)=(int)0x8B02B4C3;
+   *(j++)=(int)0xB17C4D16;
+   *(j++)=(int)0x0AE6D206;
+   *(j++)=(int)0x8B7C4F36;
+   *(j++)=(int)0x8AE986CA;
+   *(j++)=(int)0x8A7C2416;
+   *(j++)=(int)0xCD7C2536;
+   *(j++)=(int)0x0A0DC313;
+   *(j++)=(int)0x2D6E6F4E;
+   *(j++)=(int)0x74737953;
+   *(j++)=(int)0x64206D65;
+   *(j++)=(int)0x206B7369;
+   *(j++)=(int)0x6420726F;
+   *(j++)=(int)0x206B7369;
+   *(j++)=(int)0x6F727265;
+   *(j++)=(int)0x520A0D72;
+   *(j++)=(int)0x616C7065;
+   *(j++)=(int)0x61206563;
+   *(j++)=(int)0x7020646E;
+   *(j++)=(int)0x73736572;
+   *(j++)=(int)0x796E6120;
+   *(j++)=(int)0x79656B20;
+   *(j++)=(int)0x65687720;
+   *(j++)=(int)0x6572206E;
+   *(j++)=(int)0x0D796461;
+   *(j++)=(int)0x4249000A;
+   *(j++)=(int)0x4F49424D;
+   *(j++)=(int)0x4F432020;
+   *(j++)=(int)0x4D42494D;
+   *(j++)=(int)0x20534F44;
+   *(j++)=(int)0x4D4F4320;
+   *(j++)=(int)0xAA550000;
+   strcpy(fb->dfboemname,"Castle  ");		// 8 chars.. null will be overwritten
+   fb->dfbbytespersec[0]=SecSize;
+   fb->dfbbytespersec[1]=SecSize>>8;
+   fb->dfbspc=clustersecs;
+   fb->dfbreservedsecs[0] = 1;  		// 1 sector needed for this header code
+   fb->dfbreservedsecs[1] = 0;
+   fb->dfbfatcopies=2;
+   fb->dfbdirent[0] = 0x00;
+   fb->dfbdirent[1] = 0x02;     		// 512 dir entries
+   fb->dfbsecsonolddisc[0]=0;
+   fb->dfbsecsonolddisc[1]=0;
+   fb->dfbmediadescriptor=0xf8;
+   fb->dfbfatcount[0] = fatcount;
+   fb->dfbfatcount[1] = fatcount>>8;
+   fb->dfbsectors[0] = secspertrack;
+   fb->dfbsectors[1] = secspertrack>>8;
+   fb->dfbheads[0] = headspercyl;
+   fb->dfbheads[1] = headspercyl>>8;
+   fb->dfbbaseoffset = BaseOffset;
+   fb->dfbdiscsecsize = SecCount-1;;
+   fb->spare3 = 0;
+   fb->spare4 = 0;
+   fb->space = 0x20;
+   for(i=0;i<11;i++)
+   {
+     if(i < strlen(name))
+     {
+       fb->dfbvolname[i] = toupper(name[i]);
+     }
+     else
+     {
+       fb->dfbvolname[i] = 0x20;
+     }
+   }
+   fb->serial[0] = fb->dfbvolname[0]^fb->dfbvolname[4];
+   fb->serial[1] = fb->dfbvolname[1]^fb->dfbvolname[5];
+   fb->serial[2] = fb->dfbvolname[2]^fb->dfbvolname[6];
+   fb->serial[3] = fb->dfbvolname[3]^fb->dfbvolname[7];
+   strcpy(fb->dfbformattype,"FAT16  ");
+   fb->dfbformattype[7]=' ';            // last space instead of null
+   fb->dataend[0] = 0xfa;
+   fb->dataend[1] = 0x33;
+
+// initialise the FAT area
+   j=(int*)(((int)fb) + SecSize);
+   *j=(int)0xfffffff8;
+   j += SecSize*fatcount/sizeof(int);
+   *j=(int)0xfffffff8;
+
+
+// Init the root directory
+   tmt=time((time_t*)0);
+   timep =gmtime(&tmt);
+   j += SecSize*fatcount/sizeof(int);
+   i=(timep->tm_year-80)<<1;
+   g = (timep->tm_mon+1)<<13;
+   g+=g>>16;
+   i+=g;
+   i+=(timep->tm_mday)<<8;       // date stuff;
+   g=timep->tm_hour<<3;
+   g+=timep->tm_min<<13;
+   g+=g>>16;                     // time stuff
+
+// write vol name
+   for(temp=0;temp<11;temp++)
+   {
+     *(((char*)j) +temp)=fb->dfbvolname[temp];
+   }
+   *(((char*)j) +11)= 0x28;           // attributes
+   *(((char*)j) +22)= g>>8;
+   *(((char*)j) +23)= g;
+   *(((char*)j) +24)= i>>8;
+   *(((char*)j) +25)= i;
+
+// write DOS format boot sector, FAT area, & ROOT dir
+   wimp_error( SecWrite(ID, AccessKey, fb, sizeof(dosformatbootsector)+(2*fatcount*SecSize)+(512*48), BaseOffset,  SecSize));
+
+   if(fb != NULL) free(fb);
+
+
+
+   return (0);
+}
+

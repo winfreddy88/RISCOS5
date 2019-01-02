@@ -1,0 +1,483 @@
+; Copyright 2015 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:Machine.<Machine>
+        GET     Hdr:ImageSize.<ImageSize>
+        $GetIO
+
+        GET     Hdr:OSEntries
+        GET     Hdr:HALEntries
+        GET     Hdr:Proc
+        GET     Hdr:Portable
+
+        GET     hdr.omap543x
+        GET     hdr.StaticWS
+        GET     hdr.Timers
+
+        AREA    |Asm$$Code|, CODE, READONLY, PIC
+
+        EXPORT  BMU_Init
+        EXPORT  BMU_InitDevice
+        EXPORT  BMUParams_TWL6037
+
+        IMPORT  TPSRead
+        IMPORT  TPSWrite
+
+
+; some definitions for TWL6037 PMIC (related to battery charger)
+TWL6037_ADDR_ID1        *       (0x48 << 1)     ; ID1 group
+TWL6037_ADDR_ID2        *       (0x49 << 1)     ; ID2 group
+TWL6037_ADDR_ID3        *       (0x4A << 1)     ; ID3 group
+
+; PMC PMU_CONTROL Register Map (ID1 group)
+BACKUP_BATTERY_CTRL     *       0xA8
+
+; bits in BACKUP_BATTERY_CTRL
+BACKUP_BATTERY_CTRL_BB_CHG_EN           *       (1 << 0)
+BACKUP_BATTERY_CTRL_BB_SEL              *       (3 << 1)
+BACKUP_BATTERY_CTRL_BB_SEL_3V0          *       (0 << 1)
+BACKUP_BATTERY_CTRL_BB_SEL_2V5          *       (1 << 1)
+BACKUP_BATTERY_CTRL_BB_SEL_3V15         *       (2 << 1)
+BACKUP_BATTERY_CTRL_BB_SEL_VBAT         *       (3 << 1)
+BACKUP_BATTERY_CTRL_BBS_BBC_LOW_ICHRG   *       (1 << 3)
+BACKUP_BATTERY_CTRL_VRTC_PWEN           *       (1 << 4)
+BACKUP_BATTERY_CTRL_VRTC_EN_OFF         *       (1 << 5)
+BACKUP_BATTERY_CTRL_VRTC_EN_SLP         *       (1 << 6)
+BACKUP_BATTERY_CTRL_VRTC_18_15          *       (1 << 7)
+
+; INTERRUPT Register Map (ID2 group)
+INT2_STATUS             *       0x15
+INT2_MASK               *       0x16
+INT2_LINE_STATE         *       0x17
+
+; bit defintions for INT2_STATUS, INT2_MASK, INT2_LINE_STATE
+INT2_RTC_ALARM          *       (1 << 0)
+INT2_RTC_TIMER          *       (1 << 1)
+INT2_WDT                *       (1 << 2)
+INT2_BATREMOVAL         *       (1 << 3)
+INT2_RESET_IN           *       (1 << 4)
+INT2_FBI_BB             *       (1 << 5)
+INT2_SHORT              *       (1 << 6)
+INT2_VAC_ACOK           *       (1 << 7)
+
+; GPADC Control Register Map (ID2 group)
+GPADC_CTRL1             *       0xC0
+GPADC_CTRL2             *       0xC1
+GPADC_RT_CTRL           *       0xC2
+GPADC_AUTO_CTRL         *       0xC3
+GPADC_STATUS            *       0xC4
+GPADC_RT_SELECT         *       0xC5
+GPADC_RT_CONV0_LSB      *       0xC6
+GPADC_RT_CONV0_MSB      *       0xC7
+GPADC_AUTO_SELECT       *       0xC8
+GPADC_AUTO_CONV0_LSB    *       0xC9
+GPADC_AUTO_CONV0_MSB    *       0xCA
+GPADC_AUTO_CONV1_LSB    *       0xCB
+GPADC_AUTO_CONV1_MSB    *       0xCC
+GPADC_SW_SELECT         *       0xCD
+GPADC_SW_CONV0_LSB      *       0xCE
+GPADC_SW_CONV0_MSB      *       0xCF
+
+; bits in GPADC_SW_SELECT
+GPADC_SW_SELECT_SW_CONV0_SEL    *       (15 << 0)
+GPADC_SW_SELECT_SW_START_CONV0  *       ( 1 << 4)
+GPADC_SW_SELECT_SW_CONV_EN      *       ( 1 << 7)
+
+; GPADC_TRIM Register Map (ID3 group)
+GPADC_TRIM1             *       0xCD
+GPADC_TRIM2             *       0xCE
+GPADC_TRIM3             *       0xCF
+GPADC_TRIM4             *       0xD0
+GPADC_TRIM5             *       0xD1
+GPADC_TRIM6             *       0xD2
+GPADC_TRIM7             *       0xD3
+GPADC_TRIM8             *       0xD4
+GPADC_TRIM9             *       0xD5
+GPADC_TRIM10            *       0xD6
+GPADC_TRIM11            *       0xD7
+GPADC_TRIM12            *       0xD8
+GPADC_TRIM13            *       0xD9
+GPADC_TRIM14            *       0xDA
+GPADC_TRIM15            *       0xDB
+GPADC_TRIM16            *       0xDC
+
+; TRIMx register contain calibration constants for GPADC channels
+; battery backup voltage is measured on GPADC channel 8
+GPADC_VBACKUP_CHANNEL   *       8
+
+; calibration constants for voltage calculation
+; reference points for calibration
+CODE_X1                 *       2064
+CODE_X2                 *       3112
+; voltage values at reference points [mV] for channel 8
+VOLTAGE_V1              *       3150
+VOLTAGE_V2              *       4750
+; TRIMx register for channel 8
+GPADC_VBACKUP_TRIM1     *       GPADC_TRIM9
+GPADC_VBACKUP_TRIM2     *       GPADC_TRIM10
+
+; calibration formula
+; trim values: d1 := [GPADC_VBACKUP_TRIM1]; d2 := [GPADC_VBACKUP_TRIM2]
+; raw_code := GPADC raw value
+; gain := (v2 - v1) / (x2 - x1)
+; gain_error := 1 + (d2 - d1) / (x2 - x1)
+; offset_error := d1 - x1 * (d2 - d1) / (x2 - x1)
+; corrected_code := (raw_code - offset_error) / gain_error
+; channel_value := corrected_code * gain
+;
+; defining new constants (calculated once when trim values are known)
+;    kC1 := d1 * x2 - d2 * x1
+;    kC2 := d2 - d1 + x2 - x1
+; ==>
+; corrected_code := [raw_code * (x2 - x1) - kC1] / kC2
+
+BMU_CalcVoltage
+        ; In: a1 == raw_code
+        ;     a2 == kC1
+        ;     a3 == kC2
+        Entry   "v1,v2"
+        MOV     v1, #(CODE_X2 - CODE_X1)
+        MUL     a1, v1, a1
+        SUB     a1, a1, a2
+        ADD     a1, a1, a3, LSR #1      ; add 0.5 (for rounding)
+        SDIV    a1, a1, a3
+        MOV     v2, #(VOLTAGE_V2 - VOLTAGE_V1)
+        MUL     a1, v2, a1
+        SDIV    a1, a1, v1
+
+        EXIT
+
+
+BMU_Init ROUT
+        ; In: none
+        ; Out: a1 = 1 ==> battery present, 0 ==> battery removed
+        Entry   "v1", 4
+ [ Debug :LAND: {FALSE}
+        DebugTX "Testing backup battery presence"
+ ]
+        MOV     a2, sp
+        MOV     a3, #1
+        LDR     v1, OSentries+4*OS_IICOpV
+        ; Check bit BATREMOVAL in INT2_LINE_STATE
+        MOV     a1, #TWL6037_ADDR_ID2
+        MOV     a4, #INT2_LINE_STATE
+        BL      TPSRead
+        CMP     a1, #0
+        BNE     %FT5            ; Fail, just skip it
+        LDRB    ip, [a2]
+        TST     ip, #INT2_BATREMOVAL
+        BNE     %FT5            ; backup battery is removed, just skip it
+
+ [ Debug :LAND: {FALSE}
+        DebugTX "Enabling backup battery charger"
+ ]
+        ; read charger control reg
+        MOV     a3, #1
+        MOV     a1, #TWL6037_ADDR_ID1
+        MOV     a4, #BACKUP_BATTERY_CTRL
+        BL      TPSRead
+        CMP     a1, #0
+        BNE     %FT5
+        LDRB    ip, [a2]
+        BIC     ip, ip, #(BACKUP_BATTERY_CTRL_BBS_BBC_LOW_ICHRG + BACKUP_BATTERY_CTRL_BB_SEL)
+        ORR     ip, ip, #(BACKUP_BATTERY_CTRL_BB_CHG_EN + BACKUP_BATTERY_CTRL_BB_SEL_VBAT)
+        STRB    ip, [a2]
+        MOV     a3, #1
+        MOV     a1, #TWL6037_ADDR_ID1
+        MOV     a4, #BACKUP_BATTERY_CTRL
+        BL      TPSWrite
+        CMP     a1, #0
+        MOVEQ   a1, #1
+5
+        MOVNE   a1, #0
+
+        EXIT
+
+; Device parameters
+                                ^ 0
+BMUParams_TypeID                # 4
+BMUParams_Location              # 4
+BMUParams_Version               # 4
+BMUParams_DevDesc               # 4
+BMUParams_Activate              # 4
+BMUParams_DesignCapacity        # 4
+BMUParams_Flags                 # 4
+BMUParams_ReadVariables         # 4
+BMUParams_StatusFlagsMask       # 4
+BMUParams_Size                  # 0
+
+BMU_InitDevice  ROUT
+        ; In: a1 = workspace
+        ;     a2 = device params
+        Entry   "v1-v4"
+        ; Fill in the device struct
+        ASSERT  (BMUParams_TypeID = 0) :LAND: (HALDevice_Type = 0)
+        ASSERT  (BMUParams_Location = 4) :LAND: (HALDevice_Location = 4)
+        ASSERT  (BMUParams_Version = 8) :LAND: (HALDevice_Version = 8)
+        ASSERT  (BMUParams_DevDesc = 12) :LAND: (HALDevice_Description = 12)
+        LDMIA   a2, {v1-v4}
+        STMIA   a1, {v1-v4}
+        LDR     a3, [a2, #BMUParams_Activate]
+        STR     a3, [a1, #HALDevice_Activate]
+        ADR     a3, BMU_Deactivate
+        STR     a3, [a1, #HALDevice_Deactivate]
+        ADR     a3, BMU_Reset
+        STR     a3, [a1, #HALDevice_Reset]
+        ADR     a3, BMU_Sleep
+        STR     a3, [a1, #HALDevice_Sleep]
+        MVN     a3, #0
+        STR     a3, [a1, #HALDevice_Device]
+        ; Fill in the BMU device bits
+        LDR     a3, [a2, #BMUParams_Flags]
+        STR     a3, [a1, #HALDevice_BMUFlags]
+        LDR     a3, [a2, #BMUParams_ReadVariables]
+        STR     a3, [a1, #HALDevice_BMUReadVariables]
+        LDR     a3, [a2, #BMUParams_StatusFlagsMask]
+        STR     a3, [a1, #HALDevice_BMUStatusFlagsMask]
+        ; Fill in our bits
+        STR     sb, [a1, #BMUWS]
+        STR     a2, [a1, #BMUParams]
+        ; Register with OS
+        MOV     a2, a1
+        MOV     a1, #0
+        CallOS  OS_AddDevice
+        EXIT
+
+BMUParams_TWL6037
+        DCD     HALDeviceType_SysPeri + HALDeviceSysPeri_BMU + (HALDeviceID_BMU_TWL6037 << 16)
+        DCD     HALDeviceBus_Ser + HALDeviceSerBus_IIC
+        DCD     0
+        DCD     DevDesc_TWL6037
+        DCD     BMU_TWL6037_Activate
+        DCD     70
+        DCD     PortableBMUDF_RTC       ; backup battery for RTC (not handled by BatMgrHAL)
+        DCD     BMU_TWL6037_ReadVariables
+        DCD     PortableBMUF_BatteryPresent + PortableBMUF_Charging
+        ASSERT  . - BMUParams_TWL6037 = BMUParams_Size
+
+DevDesc_TWL6037
+        =       "TWL6037 backup battery management unit", 0
+        ALIGN
+
+BMU_Activate
+        MOV     a1, #1
+BMU_Deactivate
+BMU_Reset
+        MOV     pc, lr
+
+BMU_Sleep
+        MOV     a1, #0
+        MOV     pc, lr
+
+
+;
+; TWL6037 code
+;
+
+BMU_TWL6037_Activate
+        ; Read GPADC_TRIMx values for backup battery channel
+        Entry   "v1,v5,sb", 4
+        LDR     sb, [a1, #BMUWS]
+        LDR     v1, OSentries+4*OS_IICOpV
+        MOV     v5, a1
+        MOV     a1, #TWL6037_ADDR_ID3
+        MOV     a2, sp
+        MOV     a3, #2
+        MOV     a4, #GPADC_VBACKUP_TRIM1
+        BL      TPSRead
+        CMP     a1, #0
+        MOVNE   a1, #0
+        BNE     %FT10
+
+  [ {TRUE}
+        ; Prepare first (dummy) conversion
+        ADR     a1, GPADC_Voltage_Request
+        MOV     a2, #1
+        BLX     v1
+        CMP     a1, #0
+        MOVNE   a1, #0
+        BNE     %FT10
+  ]
+
+        ; Calculate calibration constants
+        LDRB    a3, [sp, #0]    ; value d1
+        LDRB    a4, [sp, #1]    ; value d2
+        ; kC1 := d1 * x2 - d2 * x1
+        MOV     ip, #CODE_X2
+        MUL     a1, a3, ip
+        MOV     ip, #CODE_X1
+        MLS     a2, a4, ip, a1
+        STR     a2, [v5, #BMUkC1]
+        ; kC2 := x2 - x1 + d2 - d1
+        MOV     ip, #(CODE_X2 - CODE_X1)
+        SUB     a1, a4, a3
+        ADD     a2, ip, a1
+        STR     a2, [v5, #BMUkC2]
+        MOV     a1, #1
+10
+        EXIT
+
+BMU_TWL6037_ReadVariables ROUT
+        ; TWL6037 is somewhat limited, the only information we can effectively return is:
+        ; * Status flags (from BCI)
+        ; * Instantaneous voltage (from GPADC channel 8)
+
+        Entry   "v1-v5,sb"
+        LDR     sb, [a1, #BMUWS]
+        LDR     v1, OSentries+4*OS_IICOpV
+        MOVS    v2, a2
+        EXIT    EQ
+        MOV     v3, a3
+        MOV     v5, a1
+10
+        LDR     a1, [v3, #PortableReadBMUVars_VarNo]
+        CMP     a1, #PortableBMUV_NominalCapacity
+        LDREQ   a1, [v5, #BMUParams]
+        LDREQ   a1, [a1, #BMUParams_DesignCapacity]
+        STREQ   a1, [v3, #PortableReadBMUVars_Value]
+        BEQ     %FT30
+        CMP     a1, #PortableBMUV_Flags
+        ADREQ   lr, %FT40
+        BEQ     ReadFlags_TWL6037
+        CMP     a1, #PortableBMUV_Voltage
+        MOVNE   a1, #PortableBMUR_Unsupported
+        BNE     %FT40
+        ; Read voltage from GPADC channel
+        ; First wait for any current conversion to finish
+        BL      WaitForGPADC
+        CMP     a1, #PortableBMUR_Success
+        BNE     %FT40
+        ; Now request conversion
+        ADR     a1, GPADC_Voltage_Request
+        MOV     a2, #1
+        BLX     v1
+        CMP     a1, #0
+        MOVNE   a1, #PortableBMUR_Error
+        BNE     %FT40
+        ; Wait for result
+        BL      WaitForGPADC
+        CMP     a1, #PortableBMUR_Success
+        BNE     %FT40
+        ; Grab it
+        ADD     a2, v3, #PortableReadBMUVars_Value
+        MOV     a1, #TWL6037_ADDR_ID2
+        MOV     a3, #2
+        MOV     a4, #GPADC_SW_CONV0_LSB
+        BL      TPSRead
+        CMP     a1, #0
+        MOVNE   a1, #PortableBMUR_Error
+        BNE     %FT40
+        LDRH    a1, [a2]                ; raw_code
+        LDR     a2, [v5, #BMUkC1]       ; kC1
+        LDR     a3, [v5, #BMUkC2]       ; kC2
+        BL      BMU_CalcVoltage
+        STR     a1, [v3, #PortableReadBMUVars_Value]
+30
+        MOV     a1, #PortableBMUR_Success
+40
+        STR     a1, [v3, #PortableReadBMUVars_Result]
+        ADD     v3, v3, #PortableReadBMUVars_Size
+        SUBS    v2, v2, #1
+        BNE     %BT10
+        EXIT
+
+WaitForGPADC    ROUT
+        ; Wait for GPADC software conversion to finish
+        ; In:
+        ;  v1 = OS_IICOpV
+        ; Out:
+        ;  a1 = BMU result code
+        ;  a2-a4, ip corrupt
+        Entry   "v2,v4", 4
+        LDR     v2, L4_COUNTER_32K_Log
+        LDR     v4, [v2, #COUNTER_32K_CR]
+        ADD     v4, v4, #2048   ; 64ms should be an adequate timeout
+        MOV     a2, sp
+        MOV     a3, #1
+10
+        MOV     a1, #TWL6037_ADDR_ID2
+        MOV     a4, #GPADC_SW_SELECT
+        BL      TPSRead
+        CMP     a1, #0
+        BNE     %FT20
+        LDRB    ip, [a2]
+        TST     ip, #GPADC_SW_SELECT_SW_START_CONV0
+        MOVEQ   a1, #PortableBMUR_Success
+        BEQ     %FT30
+20
+        LDR     ip, [v2, #COUNTER_32K_CR]
+        SUBS    ip, ip, v4
+        BLT     %BT10
+        MOV     a1, #PortableBMUR_Error
+30
+        EXIT
+
+ReadFlags_TWL6037 ROUT
+        ; Read status flags from TWL6037
+        ; In:
+        ;   v1 = OS_IICOpV
+        ;   v3 = BMU vars to store result in
+        ; Out:
+        ;   a1 = BMU result
+        ;   a2-a4, ip corrupt
+        Entry   "v2", 4
+        MOV     v2, #0
+        ; BatteryPresent can be fetched from INT2_LINE_STATE
+        MOV     a1, #TWL6037_ADDR_ID2
+        MOV     a2, sp
+        MOV     a3, #1
+        MOV     a4, #INT2_LINE_STATE
+        BL      TPSRead
+        CMP     a1, #0
+        MOVNE   a1, #PortableBMUR_Error
+        BNE     %FT10
+        LDRB    a1, [a2]
+        TST     a1, #INT2_BATREMOVAL
+        ORREQ   v2, v2, #PortableBMUF_BatteryPresent
+        BNE     %FT05
+
+        ; Charging can be fetched from BACKUP_BATTERY_CTRL
+        MOV     a1, #TWL6037_ADDR_ID1
+        MOV     a3, #1
+        MOV     a4, #BACKUP_BATTERY_CTRL
+        BL      TPSRead
+        CMP     a1, #0
+        MOVNE   a1, #PortableBMUR_Error
+        BNE     %FT10
+        LDRB    a1, [a2]
+        TST     a1, #BACKUP_BATTERY_CTRL_BB_CHG_EN
+        ORRNE   v2, v2, #PortableBMUF_Charging
+05
+        STR     v2, [v3, #PortableReadBMUVars_Value]
+        MOV     a1, #PortableBMUR_Success
+10
+        EXIT
+
+
+GPADC_Voltage_Request   ; IIC transfer structure
+        DCD     TWL6037_ADDR_ID2        ; address and flags
+        DCD     GPADC_Voltage_Data      ; pointer to buffer
+        DCD     2                       ; transfer size
+
+GPADC_Voltage_Data
+        DCB     GPADC_SW_SELECT
+        DCB     GPADC_SW_SELECT_SW_CONV_EN+GPADC_SW_SELECT_SW_START_CONV0+GPADC_VBACKUP_CHANNEL
+        ALIGN
+
+
+        END

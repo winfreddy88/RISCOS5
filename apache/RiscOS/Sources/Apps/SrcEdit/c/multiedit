@@ -1,0 +1,285 @@
+/* Copyright 2007 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/* File:   multiedit.c
+ * Purpose: To stop re-opening of edited files
+ * Author:  IDJ
+ * History: 26-Feb-90: IDJ: Created
+ *          27-Feb-90: IDJ: added setting of mouse bbox
+ *          28-Feb-90: IDJ: back to using an open handler
+ *          28-Feb-90: IDJ: acknowledge load before putting up dbox, otherwise
+ *                          wimp tells other end we didn't get the file!!
+ *          01-Mar-90: IDJ: slight change to message in warning box
+ *          01-Mar-90: IDJ: hide text when already modified copy is reloaded
+ *          01-Mar-90: IDJ: set dot to get input focus back when showing after hiding
+ *                          when loading already modified version of file
+ *          30-Oct-90: IDJ: fixed bug whereby multiedit can cause windows to disappear!
+ *          15-Mar-91: IDJ: do case insensitive filename comparison
+ *          15-Mar-91: IDJ: use msgs.h
+ *
+ *          Re-release
+ *          14-Nov-91: IDJ: use utils.h for cistrcmp
+ *
+ */
+
+
+#include <string.h>
+#include <ctype.h>
+
+#include "msgs.h"
+#include "txt.h"
+#include "txtedit.h"
+#include "win.h"
+#include "dbox.h"
+#include "werr.h"
+#include "wimp.h"
+#include "os.h"
+#include "bbc.h"
+#include "wimpt.h"
+#include "akbd.h"
+#include "event.h"
+#include "xferrecv.h"
+
+#include "bool.h"
+#include "options.h"
+#include "multiedit.h"
+#include "srcedmenus.h"
+#include "utils.h"
+
+#define multiedit_IReadOnly    1
+#define multiedit_IEditable    2
+#define multiedit_ICancelEdit  3
+
+static txt_event_proc multiedit__oldtxthandler;
+static BOOL multiedit__closeit;
+
+/* mouse bounding box */
+#define SetMouse 21
+typedef struct {  char sub_reason;
+                  char left_lsb, left_msb,
+                       bottom_lsb, bottom_msb,
+                       right_lsb, right_msb,
+                       top_lsb, top_msb;
+               } mouse_bbox;
+
+
+
+static void multiedit__setup_box(int x0, int y0, int x1, int y1)
+{
+   mouse_bbox box;
+
+   box.sub_reason = 1;  /* define mouse coord bbox */
+   box.left_lsb = x0;
+   box.left_msb = x0 >> 8;
+   box.bottom_lsb = y0;
+   box.bottom_msb = y0 >> 8;
+   box.right_lsb = x1;
+   box.right_msb = x1 >> 8;
+   box.top_lsb = y1;
+   box.top_msb = y1 >> 8;
+   os_word(SetMouse, (void *)&box);
+}
+
+static dbox_field multiedit__dbox_popup(char *name, char *message)
+{
+   dbox_field result;
+   dbox d = dbox_new(name);
+   wimp_wstate ws;
+
+   /* get window coords and set mouse bbox to it */
+   wimp_get_wind_state(dbox_syshandle(d), &ws);
+   multiedit__setup_box(ws.o.box.x0, ws.o.box.y0, ws.o.box.x1, ws.o.box.y1);
+
+   /* popup the dialogue box */
+   dbox_setfield(d, 0, message);
+   dbox_show(d);
+   result = dbox_fillin(d);
+   dbox_dispose(&d);
+   
+   /* reset mouse bounding box to screen */
+   multiedit__setup_box(0, 0, 
+                        (bbc_vduvar(bbc_XWindLimit)) << bbc_vduvar(bbc_XEigFactor),
+                        (bbc_vduvar(bbc_YWindLimit)) << bbc_vduvar(bbc_YEigFactor));
+
+   return result;
+}
+
+
+static void multiedit__eventhandler(txt t, void *handle)
+{
+   /* allow moving through the text, and other harmless activities */
+   txt_eventcode e = txt_get(t);
+
+   if ((e & txt_MOUSECODE) != 0)
+   {
+        txt_unget(t, e);
+        multiedit__oldtxthandler(t, handle);
+   }
+   else
+   {
+
+      switch (e)
+      {
+          /* allowable events */
+          case txt_EXTRACODE + akbd_Fn + 1:                     /* help request */
+          case akbd_Fn + 1:                                     /* help */
+          case akbd_Fn + 5:                                     /* goto line */
+          case akbd_Fn + akbd_Sh + 6:                           /* clear select */
+          case txt_EXTRACODE + akbd_Fn + 127:
+          case akbd_Fn + akbd_Ctl + 2:                          /* close window */
+          case 3:                                               /* Ctrl-C */
+          case 26:                                              /* Ctrl-Z */
+          case 12:                                              /* Ctrl-L */
+          case 1:                                               /* Ctrl-A */
+          case akbd_LeftK:                                      /* left-arrow */
+          case akbd_RightK:                                     /* right arrow */
+          case akbd_UpK:                                        /* up arrow */
+          case akbd_DownK:                                      /* down arrow */
+          case akbd_Sh + akbd_Ctl + akbd_UpK:
+          case txt_EXTRACODE + akbd_Sh + akbd_Ctl + akbd_UpK:   /* going up */
+          case  akbd_Sh + akbd_Ctl + akbd_DownK:
+          case txt_EXTRACODE + akbd_Sh + akbd_Ctl + akbd_DownK: /* going down */
+          case akbd_Sh + akbd_LeftK:                            /* word left */
+          case akbd_Sh + akbd_RightK:                           /* word right */
+          case akbd_Sh + akbd_UpK:
+          case txt_EXTRACODE + akbd_Sh + akbd_UpK:              /* going up */
+          case akbd_Sh + akbd_DownK:
+          case txt_EXTRACODE + akbd_Sh + akbd_DownK:            /* going down */
+          case akbd_Ctl + akbd_LeftK:                           /* bol */
+          case akbd_Ctl + akbd_RightK:                          /* eol */
+          case akbd_Ctl + akbd_UpK:
+          case 30:                                              /* home */
+          case akbd_Ctl + akbd_DownK:                           /* eof */
+          case akbd_PrintK:                                     /* print */
+               
+               /* pass this event on to the default handler in risc_oslib */
+               txt_unget(t, e);
+               multiedit__oldtxthandler(t, handle);
+               break;                             
+
+
+          /* disallow all other events (since they will/may cause changes) */
+          default:
+               /* do nothing */
+               break;
+      }
+   }
+}
+
+
+
+extern BOOL multiedit_closeit(void)
+{
+   return multiedit__closeit;
+}
+
+
+extern void multiedit_reset_closeit(void)
+{
+   multiedit__closeit = FALSE;
+}
+
+
+
+extern void multiedit_open_handler(char *filename, txtedit_state *s, void *handle)
+{
+   char message[256];
+   txtedit_state *states;
+   dbox_field result; 
+   void *multiedit__oldtxthandle;
+   char title[356];  /* same value as used by !Edit for title length */
+
+   handle = handle;
+
+   multiedit__closeit = FALSE;
+
+   /* attach our own menumaker */
+   event_attachmenumaker(txt_syshandle(s->t), srcedmenus_menumaker, 
+                         srcedmenus_menuproc, s);
+
+   /* see if user wants to be warned */
+   if (!options_warn_multiple()) return;
+
+   /* search for this text */
+   states = txtedit_getstates();
+   while (states != 0)
+   {
+      if (filename[0] != 0 && !cistrcmp(filename, states->filename) && (txt_charoptions(states->t) & txt_UPDATED) != 0)
+         break;
+      else
+         states = states->next;
+   }
+   if (states == 0) return;
+
+   /* 01-Mar-90: IDJ: experiment */
+   txt_hide(s->t);
+
+   /* must do this to stop wimp thinking we didn't get the file */
+   xferrecv_insertfileok();
+
+   /* build message, popup dbox and see what he does */
+   strncpy(message, msgs_lookup("multied1:Modified buffer already exists for "), 255);
+   strncat(message, filename, 255);
+
+   result = multiedit__dbox_popup("MultiEdit", message);
+
+   switch (result)
+   {
+       case dbox_CLOSE:
+         /* 01-Mar-90: IDJ: experiment */
+         txt_show(s->t);
+         txt_setdot(s->t, 0);  
+         break;  /* do nothing if he clicks outside */
+
+       case multiedit_IReadOnly:
+         /* splat the old txt event-handler and menu maker */
+         /* read default event handler */
+         /* we cheat a bit here: we know there is only one handler in risc_oslib
+            for txts, so we only need to remember the one copy. We then get the
+            handler's handle passed to us and just pass it on. 
+          */
+         txt_readeventhandler(s->t, &multiedit__oldtxthandler, &multiedit__oldtxthandle); 
+
+         /* stick in our own handler */
+         txt_eventhandler(s->t, multiedit__eventhandler, multiedit__oldtxthandle);
+
+         /* attach our own menumaker */
+         event_attachmenumaker(txt_syshandle(s->t), srcedmenus_readonly_menumaker, 
+                               srcedmenus_menuproc, s);
+
+         /* 01-Mar-90: IDJ: experiment */
+         txt_show(s->t);
+         txt_setdot(s->t, 0);
+
+         /* set title as read-only */
+         strcpy(title, filename);
+         strcat(title, msgs_lookup("multied2: (Read-only)"));
+         txt_settitle(s->t, title);
+
+         /* inform RISC_OSLib it can't accept paste requests */
+         txt_setcharoptions(s->t, txt_READONLY, txt_READONLY);         
+         break;
+
+       case multiedit_IEditable:
+         /* 01-Mar-90: IDJ: experiment */
+         txt_show(s->t);
+         txt_setdot(s->t, 0);
+         break;  /* do nothing, cos it's editable already */
+
+       case multiedit_ICancelEdit:
+         /* dispose of this edit state by telling srcedit to do it */
+         multiedit__closeit = TRUE;
+         break;
+   }
+}

@@ -1,0 +1,301 @@
+;
+; CDDL HEADER START
+;
+; The contents of this file are subject to the terms of the
+; Common Development and Distribution License (the "Licence").
+; You may not use this file except in compliance with the Licence.
+;
+; You can obtain a copy of the licence at
+; cddl/RiscOS/Sources/HAL/Titanium/LICENCE.
+; See the Licence for the specific language governing permissions
+; and limitations under the Licence.
+;
+; When distributing Covered Code, include this CDDL HEADER in each
+; file and include the Licence file. If applicable, add the
+; following below this CDDL HEADER, with the fields enclosed by
+; brackets "[]" replaced with your own identifying information:
+; Portions Copyright [yyyy] [name of copyright owner]
+;
+; CDDL HEADER END
+;
+;
+; Copyright 2014 Elesar Ltd.  All rights reserved.
+; Use is subject to license terms.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:OSEntries
+
+        GET     hdr.RegMap
+        GET     hdr.StaticWS
+                 
+        AREA    |Interrupts$$Code|, CODE, READONLY, PIC
+
+        EXPORT  HAL_IRQMax
+        EXPORT  HAL_IRQEnable
+        EXPORT  HAL_IRQDisable
+        EXPORT  HAL_IRQClear
+        EXPORT  HAL_IRQSource
+        EXPORT  HAL_IRQStatus
+        EXPORT  InterruptInit
+        IMPORT  PCIIRQEnable
+        IMPORT  PCIIRQDisable
+        IMPORT  PCIIRQClear
+        IMPORT  PCIIRQSource
+        IMPORT  PCIIRQStatus
+
+        MACRO
+        SplitGICNumber $num, $reg, $bit, $tmp
+        ASSERT  GICD_ISENABLERn_ENABLE_PER_REG = 32
+        ASSERT  GICD_ICENABLERn_ENABLE_PER_REG = 32
+        ASSERT  GICD_ISPENDRn_PEND_PER_REG = 32
+        ASSERT  GICD_ICPENDRn_PEND_PER_REG = 32
+        ASSERT  GICD_ISACTIVERn_ACTIVE_PER_REG = 32
+        ASSERT  GICD_ICACTIVERn_ACTIVE_PER_REG = 32
+        LDR     $reg, GIC_LogBase
+        MOV     $tmp, $num, LSR #5      ; Value of n
+        ADD     $reg, $reg,$tmp, LSL #2 ; Offset of Rn
+        AND     $bit, $num, #31
+        MOV     $tmp, #1
+        MOV     $bit, $tmp, LSL $bit    ; Mask bit within Rn
+        MEND
+
+; InterruptInit
+InterruptInit ROUT
+        Push    "lr"
+
+        ; Map in the controller
+        MOV     a1, #0
+        LDR     a2, =GIC_PhysBase
+        MOV     a3, #GIC_PhysSize
+        CallOS  OS_MapInIO
+        ADD     a1, a1, #GIC_PhysAdjust
+        STR     a1, GIC_LogBase
+
+        ; Stop forwarding for a moment
+        LDR     a2, [a1, #GICD_CTLR]
+        BIC     a2, a2, #GICD_CTLR_ENABLE_GRP0 :OR: GICD_CTLR_ENABLE_GRP1
+        STR     a2, [a1, #GICD_CTLR]
+
+        ; Configure all the same
+        MOV     ip, #0
+        MOV     a2, a1                  ; 1 bpi
+        MOV     a3, a1                  ; 8 bpi
+        MOV     a4, a1                  ; 2 bpi
+10
+        ; Group 0, not enabled, not pending, not active
+        ASSERT  (GICD_IGROUPRn_GROUP_PER_REG = 32) :LAND: \
+                (GICD_ICENABLERn_ENABLE_PER_REG = 32) :LAND: \
+                (GICD_ICPENDRn_PEND_PER_REG = 32)
+        TST     ip, #31
+        MOVEQ   lr, #0
+        STREQ   lr, [a2, #GICD_IGROUPRn]
+        MOVEQ   lr, #-1
+        STREQ   lr, [a2, #GICD_ICENABLERn]
+        STREQ   lr, [a2, #GICD_ICPENDRn]
+        STREQ   lr, [a2, #GICD_ICACTIVERn]
+        ADDEQ   a2, a2, #4
+
+        ; Middle priority, always for CPU 0
+        ASSERT  (GICD_IPRIORITYRn_PRIORITY_PER_REG = 4) :LAND: \
+                (GICD_ITARGETSRn_TARGET_PER_REG = 4)
+        TST     ip, #3
+        MOVEQ   lr, #&8080
+        ORREQ   lr, lr, lr, LSL #16
+        STREQ   lr, [a3, #GICD_IPRIORITYRn]
+        MOVEQ   lr, #&0101
+        ORREQ   lr, lr, lr, LSL #16
+        STREQ   lr, [a3, #GICD_ITARGETSRn]
+        ADDEQ   a3, a3, #4
+
+        ; Level triggered
+        ASSERT  GICD_ICFGRn_CONFIG_PER_REG = 16
+        ASSERT  GICD_ICFGRn_LEVEL_SENSITIVE = 0
+        TST     ip, #15
+        MOVEQ   lr, #0
+        STREQ   lr, [a4, #GICD_ICFGRn]
+        ADDEQ   a4, a4, #4
+        
+        ; Loop over all GIC inputs (16 x SGI, 16 x private PI, IRQCount x shared PI)
+        ADD     ip, ip, #1
+        TEQ     ip, #IRQCount + IRQGICCount
+        BNE     %BT10
+
+        ; Set binary point for gggg.ssss
+        MOV     a2, #3
+        STR     a2, [a1, #GICC_BPR]
+        
+        ; Set priority to let everything pass
+        MOV     a2, #&F0
+        STR     a2, [a1, #GICC_PMR]
+
+        ; Enable CPU 0 interface
+        MOV     a2, #GICC_ENABLE_GRP0
+        STR     a2, [a1, #GICC_CTLR]
+        
+        ; Enable forwarding again in the distributor
+        LDR     a2, [a1, #GICD_CTLR]
+        ORR     a2, a2, #GICD_CTLR_ENABLE_GRP0
+        STR     a2, [a1, #GICD_CTLR]
+
+        Pull    "pc"
+
+; HAL_IRQEnable
+; => a1 = device number
+; <= a1 = 0 was previously disabled
+HAL_IRQEnable ROUT
+        CMP     a1, #IRQCount
+        MOVCS   a1, #0
+        MOVCS   pc, lr
+
+      [ PCIInts
+        ; Send PCIe expansion to the naughty step
+        SUB     a2, a1, #DevNoPCIInts
+        CMP     a2, #IRQPCICount
+        BCC     PCIIRQEnable
+      ]
+        ; Convert device number to reg/bit pair
+        ADD     a1, a1, #IRQGICCount
+        SplitGICNumber a1, a3, a2, ip
+
+        ; Be atomic while updating enable bits
+        MRS     a4, CPSR
+        ORR     ip, a4, #F32_bit :OR: I32_bit
+        MSR     CPSR_c, ip
+
+        LDR     a1, [a3, #GICD_ISENABLERn]
+        STR     a2, [a3, #GICD_ISENABLERn]
+
+        MSR     CPSR_c, a4
+
+        AND     a1, a1, a2              ; Was it previously enabled?
+        MOV     pc, lr
+
+; HAL_IRQDisable
+; => a1 = device number
+; <= a1 = 0 was previously disabled
+HAL_IRQDisable ROUT
+        CMP     a1, #IRQCount
+        MOVCS   a1, #0
+        MOVCS   pc, lr
+
+      [ PCIInts
+        ; Send PCIe expansion to the naughty step
+        SUB     a2, a1, #DevNoPCIInts
+        CMP     a2, #IRQPCICount
+        BCC     PCIIRQDisable
+      ]
+        Push    "lr"
+
+        ; Convert device number to reg/bit pair
+        ADD     a1, a1, #IRQGICCount
+        SplitGICNumber a1, a3, a2, ip
+
+        ; Be atomic while updating disable bits
+        MRS     a4, CPSR
+        ORR     ip, a4, #F32_bit :OR: I32_bit
+        MSR     CPSR_c, ip
+
+        LDR     lr, [a3, #GICD_ISENABLERn]
+        LDR     ip, [a3, #GICD_ISACTIVERn]
+        STR     a2, [a3, #GICD_ICENABLERn]
+
+        ; If it was active, do the EOI side effects too
+        TST     ip, a2
+        LDRNE   a3, GIC_LogBase
+        MRCNE   p15, 0, ip, c0, c0, 5   ; Get CPU id from MPIDR to qualify EOIR
+        BFINE   a1, ip, #GICC_EOIR_CPU_ID_SHIFT, #2
+        STRNE   a1, [a3, #GICC_EOIR]
+        DSB     SY                      ; Ensure write got to the GIC
+
+        MSR     CPSR_c, a4
+
+        AND     a1, lr, a2              ; Report old state
+        Pull    "pc"
+
+; HAL_IRQClear
+; => a1 = device number
+HAL_IRQClear ROUT
+        CMP     a1, #IRQCount
+        MOVCS   pc, lr
+
+      [ PCIInts
+        ; Send PCIe expansion to the naughty step
+        SUB     a2, a1, #DevNoPCIInts
+        CMP     a2, #IRQPCICount
+        BCC     PCIIRQClear
+      ]
+        ; Convert device number to reg/bit pair
+        ADD     a1, a1, #IRQGICCount
+        SplitGICNumber a1, a3, a2, ip
+
+        ; If active signal EOI
+        LDR     a4, [a3, #GICD_ISACTIVERn]
+        TST     a4, a2
+        LDRNE   a3, GIC_LogBase
+        MRCNE   p15, 0, ip, c0, c0, 5   ; Get CPU id from MPIDR to qualify EOIR
+        BFINE   a1, ip, #GICC_EOIR_CPU_ID_SHIFT, #2
+        STRNE   a1, [a3, #GICC_EOIR]
+        DSB     SY                      ; Ensure write got to the GIC
+        MOV     pc, lr
+
+; HAL_IRQSource
+; <= a1 = device number of current interrupt (or -1 if none)
+HAL_IRQSource ROUT
+        LDR     a3, GIC_LogBase
+        LDR     a2, [a3, #GICC_IAR]
+        BIC     a1, a2, #GICC_IAR_CPU_ID_MASK
+        CMP     a1, #IRQCount + IRQGICCount
+      [ PCIInts
+        BCS     %FT10
+
+        SUB     a1, a1, #IRQGICCount
+        TEQ     a1, #DevNoPCIe0MSI
+        TEQNE   a1, #DevNoPCIe1MSI
+        MOVNE   pc, lr                  ; Not a special one
+        B       PCIIRQSource
+10
+      |
+        SUBCC   a1, a1, #IRQGICCount
+        MOVCC   pc, lr
+      ]
+        ; Probably spurious, just cancel it
+        STR     a2, [a3, #GICC_EOIR]
+        DSB     SY                      ; Ensure write got to the GIC
+        MOV     a1, #-1
+        MOV     pc, lr
+
+; HAL_IRQStatus
+; => a1 = device number
+; <= a1 = 0 if not interrupting
+HAL_IRQStatus ROUT
+        CMP     a1, #IRQCount
+        MOVCS   a1, #0
+        MOVCS   pc, lr
+
+      [ PCIInts
+        ; Send PCIe expansion to the naughty step
+        SUB     a2, a1, #DevNoPCIInts
+        CMP     a2, #IRQPCICount
+        BCC     PCIIRQStatus
+      ]
+        ; Convert device number to reg/bit pair
+        ADD     a1, a1, #IRQGICCount
+        SplitGICNumber a1, a3, a2, ip
+
+        ; Consider to be interrupting if pending or active
+        LDR     a1, [a3, #GICD_ISACTIVERn]
+        LDR     a4, [a3, #GICD_ISPENDRn]
+        ORR     ip, a1, a4
+        AND     a1, a2, ip              ; Report current state
+        MOV     pc, lr
+
+; HAL_IRQMax
+; <= a1 = number of possible interrupt sources
+HAL_IRQMax ROUT
+        MOV     a1, #IRQCount
+        MOV     pc, lr
+
+        END

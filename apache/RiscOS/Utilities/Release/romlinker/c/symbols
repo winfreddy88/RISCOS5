@@ -1,0 +1,392 @@
+/* Copyright 2016 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <math.h>
+#include <limits.h>
+
+/* C library extension header files */
+#include "err.h"
+
+/* ROM linker implementation header files */
+#include "symbols.h"
+#include "memory.h"
+#include "romlinker.h"
+
+typedef struct {
+  uint32_t start; /* Start address */
+  char *name; /* Function name */
+} gpa_func;
+
+typedef struct {
+  uint32_t start;
+  uint32_t end;
+  char *name;
+  gpa_func *funcs; /* GPA functions */
+  int numfunc;
+  int funcbufsize;
+  const char *image;
+} module;
+
+#define ROM_BASE 0xFC000000
+
+uint8_t *symbols_buffer;
+static int symbols_buffer_pos;
+
+#define SYMBOLS_BUFFER_SIZE (512<<10)
+
+/* 63 characters - 64th currently undefined */
+#define SYMBOLS_ENCODING "_0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+static uint8_t symbols_encoding[256];
+
+symbols_index_entry *symbols_index;
+int symbols_index_count;
+
+/*
+
+  Utility functions
+
+*/
+
+static void trim(char *buf)
+{
+  char *end = buf+strlen(buf);
+  while ((end > buf) && (end[-1] <= 32)) {
+    *--end = 0;
+  }
+}
+
+static bool good_name(const char *name)
+{
+  if (!*name) {
+    return false;
+  }
+  char c;
+  while ((c = *name++) != 0) {
+    if (symbols_encoding[c] == 0x40) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/*
+
+  Search internals
+
+*/
+
+static int FunctionCompareFunc(const void *a, const void *b)
+{
+  gpa_func *af = (gpa_func *) a;
+  gpa_func *bf = (gpa_func *) b;
+  if (af->start < bf->start) {
+    return -1;
+  }
+  else if (af->start > bf->start) {
+    return 1;
+  }
+  return 0;
+}
+
+/*
+
+  Data loading/management
+
+*/
+
+static module *AddModule(uint32_t start, uint32_t end, const char *name, const char *image)
+{
+  module *m = safe_alloc(sizeof(module));
+  memset(m,0,sizeof(module));
+  m->start = start;
+  m->end = end;
+  m->name = safe_alloc(strlen(name)+1);
+  strcpy(m->name,name);
+  m->image = image;
+  return m;
+}
+
+static void AddGPAFunction(module *m,const char *name,uint32_t start,uint32_t end)
+{
+  (void) end; /* Function end addresses ignored in this version of the code */
+  /* Discard symbols that look like they're data - we only care about functions */
+  if ((start & 3) || (end && ((end & 3) != 3))) {
+    return;
+  }
+  /* Noddy code vs. data check: 90% of functions will start with an unconditonal instruction
+     This will generate false positives, but it should be good enough for most purposes */
+  if ((m->image[start-m->start+3] & 0xF0) != 0xE0) {
+    return;
+  }
+  /* Discard functions with unsupported names */
+  if (!good_name(name)) {
+    return;
+  }
+  gpa_func *f;
+  if (m->numfunc == m->funcbufsize) {
+    m->funcbufsize += 128;
+    m->funcs = safe_realloc(m->funcs, sizeof(gpa_func)*m->funcbufsize);
+  }
+  f = &m->funcs[m->numfunc++];
+  memset(f,0,sizeof(gpa_func));
+  f->start = start;
+  f->name = safe_alloc(strlen(name)+1);
+  strcpy(f->name,name);
+}
+
+static void KillGPA(module *m)
+{
+  while(m->numfunc--)
+    free(m->funcs[m->numfunc].name);
+  if(m->funcs)
+    free(m->funcs);
+  m->numfunc = m->funcbufsize = 0;
+  m->funcs = 0;
+}
+
+static void KillModule(module *m)
+{
+  KillGPA(m);
+  free(m->name);
+  free(m);
+}
+
+static bool LoadGPA(module *m, const char *gpa)
+{
+  char buf[1024];
+  FILE *f = fopen(gpa, "r");
+  if (!f)
+  {
+    return false;
+  }
+  uint32_t offset=0; /* Offset to apply to all addresses to map GPA address -> runtime address */
+  int offset_valid=0;
+  int section=-1; /* 0=start address, 1=functions, 2=lines */
+  KillGPA(m);
+  buf[0] = 0;
+  while (!feof(f) && fgets(buf, 1024, f)) {
+    trim(buf);
+    if (buf[0] == '[') {
+      int newsection=-1;
+      if (!strcmp(buf, "[SECTIONS]")) {
+        newsection = 0;
+      }
+      else if (!strcmp(buf, "[FUNCTIONS]")) {
+        newsection = 1;
+      }
+      else if (!strcmp(buf, "[SOURCE LINES]")) {
+        newsection = 2;
+      }
+      /* To start with, offset is just the lowest section listed in the file. We then translate it to a true offset here. */
+      if ((section == 0) && (newsection != section)) {
+        offset = m->start-offset;
+      }
+      section = newsection;
+    }
+    else if(buf[0]) {
+      switch (section) {
+      case 0: {
+          uint32_t start;
+          uint32_t end;
+          char c;
+          if (sscanf(buf, "R%c %08x..%08x", &c, &start, &end) == 3) {
+            if (!offset_valid || (start < offset)) {
+              offset = start;
+              offset_valid = 1;
+            }
+          }
+        }
+        break;
+      case 1: {
+          uint32_t start;
+          uint32_t end;
+          char *name = buf+strlen(buf)+1;
+          if (sscanf(buf, "%s %08x..%08x", name, &start, &end) == 3) {
+            AddGPAFunction(m, name, start+offset, end+offset);
+          }
+        }
+        break;
+      case 2:
+        /* Ignore line number information */
+        break;
+      }
+    }
+    buf[0] = 0;
+  }
+  fclose(f);
+  /* For the moment, assume that the entries in the GPA file are already sorted in address order */
+  if (verbose) {
+    err_report("GPA for module '%s' loaded. %d functions.", m->name, m->numfunc);
+  }
+  return true;
+}
+
+static bool LoadSyms(module *m, const char *syms)
+{
+  char buf[1024];
+  KillGPA(m);
+  FILE *f = fopen(syms, "r");
+  if (!f) {
+    return false;
+  }
+  buf[0] = 0;
+  while (!feof(f) && fgets(buf, 1024, f)) {
+    trim(buf);
+    if (buf[0] && strcmp(buf,"Symbol Table")) {
+      /* Looks like a symbol definition */
+      char *c = strchr(buf,' ');
+      if (c) {
+        *c++ = 0;
+        uint32_t address = strtoul(c,NULL,16);
+        if (address && (address >= m->start) && (address < m->end)) {
+          /* Ignore ...$$Base and ...$$Limit symbols, and $<char> symbols */
+          if (!strstr(buf, "$$Base") && !strstr(buf, "$$Limit") && ((buf[0] != '$') || (strlen(buf) > 2))) {
+            AddGPAFunction(m, buf, address, 0);
+          }
+        }
+      }
+    }
+    buf[0] = 0;
+  }
+  fclose(f);
+  /* Sort functions by address */
+  qsort(m->funcs, m->numfunc, sizeof(gpa_func), FunctionCompareFunc);
+  if (verbose) {
+    err_report("Symbols for module '%s' loaded. %d functions.", m->name, m->numfunc);
+  }
+  return true;
+}
+
+static void init_symbols(void)
+{
+  if (!symbols_buffer) {
+    symbols_buffer = safe_alloc(SYMBOLS_BUFFER_SIZE);
+    /* Build the character coding table */
+    memset(symbols_encoding, 0x40, sizeof(symbols_encoding));
+    const char *c = SYMBOLS_ENCODING;
+    int i = 0;
+    while (*c) {
+      symbols_encoding[*c++] = i++;
+    }
+  }
+}
+
+static void symbolbuffer_write(uint8_t c)
+{
+  if (symbols_buffer_pos < SYMBOLS_BUFFER_SIZE) {
+    symbols_buffer[symbols_buffer_pos++] = c;
+  }
+}
+
+static void write_numbers(uint32_t namelen, uint32_t offset)
+{
+  /* Encode name length and offset in a halfword
+     Bits 0-4 are name length (characters minus one)
+     Bits 5-14 are offset from previous symbol to start of this symbol (words minus one)
+     If either value is too large, bit 15 is set, indicating another halfword is present. First halfword contains the low bits of the value.
+  */
+  do {
+    uint32_t enc = (namelen & 0x1f) | ((offset & 0x3ff) << 5);
+    namelen >>= 5;
+    offset >>= 10;
+    if (namelen || offset) {
+      enc |= 1<<15;
+    }
+    symbolbuffer_write(enc);
+    symbolbuffer_write(enc>>8);
+  }
+  while (namelen || offset);
+}
+
+static void write_string(const char *str)
+{
+  /* Convert to a 6 bit encoding */
+  uint32_t byte = 0;
+  uint32_t bits = 0;
+  char c;
+  while ((c = *str++) != 0) {
+    byte |= (symbols_encoding[c] & 0x3f) << bits;
+    bits += 6;
+    if (bits >= 8) {
+      symbolbuffer_write(byte);
+      bits -= 8;
+      byte >>= 8;
+    }
+  }
+  if (bits) {
+    symbolbuffer_write(byte);
+  }
+}
+
+static void compress_symbols(module *m)
+{
+  uint32_t old_addr = m->start;
+  for (int i=0;i<m->numfunc;i++) {
+    uint32_t addr = m->funcs[i].start;
+    uint32_t offset = (addr-old_addr) >> 2;
+    if (offset) {
+      size_t namelen = strlen(m->funcs[i].name);
+      write_numbers(namelen-1, offset-1);
+      write_string(m->funcs[i].name);
+      old_addr = addr;
+    } 
+  }
+}
+
+void load_symbols(const char *file, unsigned long rom_position, const char *image, unsigned long size)
+{
+  char namebuf[2048];
+
+  init_symbols();
+
+  module *m = AddModule(rom_position + ROM_BASE, rom_position + ROM_BASE + size, file, image);
+
+  /* Try loading GPA file */
+  sprintf(namebuf, "%s_gpa", file);
+  if (!LoadGPA(m, namebuf)) {
+    /* Try loading symbols file */
+    sprintf(namebuf, "%s_sym", file);
+    if (!LoadSyms(m, namebuf)) {
+      /* Give up */
+      if (verbose) {
+        err_report("%s: no symbols",file);
+      }
+      KillModule(m);
+      return;
+    }
+  }
+
+  /* Compress the symbol data */
+  int old_pos = symbols_buffer_pos;
+  compress_symbols(m);
+  if (verbose) {
+    err_report("Symbols compressed to %d bytes (%d total)",symbols_buffer_pos-old_pos,symbols_buffer_pos);
+  }
+
+  /* Add index table entry */
+  if ((symbols_buffer_pos < SYMBOLS_BUFFER_SIZE) && (old_pos != symbols_buffer_pos)) {
+    symbols_index = safe_realloc(symbols_index, sizeof(symbols_index_entry)*(symbols_index_count+1));
+    symbols_index[symbols_index_count].rom_start = rom_position;
+    symbols_index[symbols_index_count].rom_end = rom_position + size;
+    symbols_index[symbols_index_count].syms_start = old_pos;
+    symbols_index[symbols_index_count].syms_end = symbols_buffer_pos;
+    symbols_index_count++;
+  }
+
+  KillModule(m);
+}

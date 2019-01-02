@@ -1,0 +1,184 @@
+/* Copyright 2011 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/* HAL version of ehcimodule.c */
+#include <dev/usb/usbhal.h>
+
+#include <string.h>
+#include <stdlib.h>
+#include <limits.h>
+#include <machine/bus.h>
+
+#include <sys/queue.h>
+#include <sys/types.h>
+#include <sys/systm.h>
+
+#include <dev/usb/usb.h>
+#include <dev/usb/usbdi.h>
+#include <dev/usb/usbdivar.h>
+#include <dev/usb/ehcireg.h>
+#include <dev/usb/ehcivar.h>
+
+#include "Global/RISCOS.h"
+#include "Global/Services.h"
+#include "Global/HALEntries.h"
+
+/* Have to avoid including stdio as there's a clash with the BSD stuff */
+#define __stdio_h
+
+#include "DebugLib/DebugLib.h"
+
+typedef struct
+{
+    int type;
+    int flags;
+    void *hw;
+    int devno;
+} usbinfo;
+
+extern size_t HAL_USBControllerInfo(int idx,usbinfo *info,size_t size);
+extern int HAL_IRQEnable(int device);
+extern int HAL_IRQDisable(int device);
+extern void HAL_IRQClear(int device);
+extern int (*GetHAL_USBPortPower(void))(int idx,int port,int state);
+extern device_ptr_t register_bus(device_ptr_t bus);
+
+static void init_device(usbinfo *info,int idx)
+{
+	ehci_softc_t *ehci = malloc(sizeof(ehci_softc_t));
+	memset(ehci,0,sizeof(ehci_softc_t));
+	sprintf(ehci->sc_bus.bdev.dv_xname,"EHCI%d",idx);
+	ehci->sc_irqdevno = info->devno;
+	ehci->sc_ncomp = 2;
+	/* Abuse iot & ioh members to store base addr & flags */
+	ehci->iot = (bus_space_tag_t) info->hw;
+	ehci->ioh = (bus_space_handle_t) info->flags;
+	if(info->flags & HALUSBControllerFlag_EHCI_ETTF)
+		ehci->sc_flags |= EHCIF_ETTF;
+	ehci_init(ehci);
+	/* Enable IRQ */
+	HAL_IRQEnable(ehci->sc_irqdevno);
+	/* Register with USBDriver */
+	register_bus((device_ptr_t) ehci);
+	/* Switch on the ports (if under HAL control) */
+	if(info->flags & HALUSBControllerFlag_HAL_Port_Power && GetHAL_USBPortPower() != NULL)
+	{
+		for (int i = 0; i < ehci->sc_noport; i++)
+		{
+			GetHAL_USBPortPower()(idx, i, 1);
+		}
+	}
+}
+
+void USBHAL_EHCIDriver_Init(void)
+{
+	/* Find and initialise all controllers. Note that this currently only
+	   supports controllers exposed via HAL_USBControllerInfo */
+	int idx=0;
+	do {
+		usbinfo info;
+		size_t usbinfolen = HAL_USBControllerInfo(idx,&info,sizeof(info));
+		if((usbinfolen == sizeof(info)) && (info.type == HALUSBControllerType_EHCI))
+			init_device(&info,idx);
+		else if(!usbinfolen)
+			return;
+		idx++;
+	} while(1);
+}
+
+int usbhal_ehci_do_intr(struct usbd_bus *bus,int irqdevno)
+{
+	ehci_softc_t *sc = (ehci_softc_t *)bus;
+	if(irqdevno != sc->sc_irqdevno)
+		return 0;
+	int ret = ehci_intr(sc);
+	return ret;
+}
+
+void usbhal_ehci_shutdown(struct usbd_bus *bus)
+{
+	ehci_softc_t *sc = (ehci_softc_t *)bus;
+	/* Disable IRQ */
+	HAL_IRQDisable(sc->sc_irqdevno);
+	/* Reset controller */
+	EOWRITE4(sc, EHCI_USBCMD, 0);
+	EOWRITE4(sc, EHCI_USBCMD, EHCI_CMD_HCRESET);
+	EOREAD4(sc, EHCI_USBCMD);/* flush the command */
+	/* Wait a bit */
+	delay(1000);
+	/* Clear any lingering IRQ */
+	HAL_IRQClear(sc->sc_irqdevno);
+}
+
+/* #define these because I'm feeling lazy */
+#define ehci_base ((volatile int *)iot)
+#define registers_32bit (((int)ioh) & HALUSBControllerFlag_32bit_Regs)
+
+void bus_space_write_4 (bus_space_tag_t iot, bus_space_handle_t ioh, int o, int x)
+{
+    ehci_base[o>>2] = x;
+}
+
+int bus_space_read_4 (bus_space_tag_t iot, bus_space_handle_t ioh, int o)
+{
+    return ehci_base[o>>2];
+}
+
+void bus_space_write_2 (bus_space_tag_t iot, bus_space_handle_t ioh, int o, int x)
+{
+    if (registers_32bit)
+    {
+      x &= 0xFFFF;
+      if (o&2)
+        ehci_base[o>>2]=(ehci_base[o>>2]&0xFFFF)|(x<<16);
+      else
+        ehci_base[o>>2]=(ehci_base[o>>2]&0xFFFF0000)|x;
+    }
+    else
+      ((uint16_t*) ehci_base)[o>>1] = x;
+}
+
+int bus_space_read_2 (bus_space_tag_t iot, bus_space_handle_t ioh, int o)
+{
+    if (registers_32bit)
+    {
+      if (o&2)
+        return ((uint32_t*)ehci_base)[o>>2]>>16;
+      else
+        return ((uint32_t*)ehci_base)[o>>2]&0xFFFF;
+    }
+    return ((uint16_t*) ehci_base)[o>>1];
+}
+
+void bus_space_write_1 (bus_space_tag_t iot, bus_space_handle_t ioh, int o, int x)
+{
+    if (registers_32bit)
+    {
+      x &= 0xFF;
+      int t = ehci_base[o>>2];
+      t &= ~(0xFF<<((o&3)*8));
+      t |= x<<((o&3)*8);
+      ehci_base[o>>2] = t;
+    }
+    else
+      ((uint8_t*) ehci_base)[o] = x;
+}
+
+int bus_space_read_1 (bus_space_tag_t iot, bus_space_handle_t ioh, int o)
+{
+    if (registers_32bit)
+      return (((uint32_t*)ehci_base)[o/4]>>((o&3)*8))&0xff;
+    return ((uint8_t*) ehci_base)[o];
+}

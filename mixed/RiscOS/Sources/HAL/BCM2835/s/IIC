@@ -1,0 +1,385 @@
+;
+; Copyright (c) 2012, RISC OS Open Ltd
+; Copyright (c) 2012, Dave Higton
+; All rights reserved.
+;
+; Redistribution and use in source and binary forms, with or without
+; modification, are permitted provided that the following conditions are met:
+;     * Redistributions of source code must retain the above copyright
+;       notice, this list of conditions and the following disclaimer.
+;     * Redistributions in binary form must reproduce the above copyright
+;       notice, this list of conditions and the following disclaimer in the
+;       documentation and/or other materials provided with the distribution.
+;     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+;       may be used to endorse or promote products derived from this software
+;       without specific prior written permission.
+;
+; THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+; AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+; IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+; ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+; LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+; CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+; SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+; INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+; CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+; ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+; POSSIBILITY OF SUCH DAMAGE.
+;
+
+        AREA    |ARM$$code|, CODE, READONLY, PIC
+
+        GET     Hdr:ListOpts
+        GET     Hdr:HALEntries
+        GET     hdr.BCM2835
+        GET     hdr.StaticWS
+
+        EXPORT   IIC_Init
+        EXPORT   HAL_IICBuses
+        EXPORT   HAL_IICType
+        EXPORT   HAL_IICTransfer
+        EXPORT   HAL_IICMonitorTransfer
+
+        MACRO
+$label  BaseAddr  $r1, $r2           ; Form a pointer to the device's
+        LDR     $r1, PeriBase        ; base address in register $r1
+        LDR	$r2, IIC_Base        ; Get the offset to the controller
+        ADD     $r1, $r1, $r2
+        MEND
+
+; IIC version times 100
+IICVersion             * 210         ; Rev. 2.1, from section 3.1 of BCM2835 ARM Peripherals
+; IIC divider to give 100 kHz
+IICDivider             * 2496
+; Definitions of RISC OS IIC flags in iic_transfer structure
+IICFlag_Retry          * 1 << 29     ; Ignored at this level
+IICFlag_ChecksumOnly   * 1 << 30
+IICFlag_NoStart        * 1 << 31
+; Register field values
+; Control
+IIC_I2CEN              * 1 << 15     ; Enable controller
+IIC_READ               * 1           ; Read/write
+IIC_ST                 * 1 << 7      ; Start transfer
+IIC_CLEAR              * 1 << 4      ; FIFO clear
+; Status
+IIC_CLKTBit            * 1 << 9
+IIC_ERR                * 1 << 8
+IIC_RXF                * 1 << 7      ; 1 -> RX FIFO full, 0 -> not full
+IIC_TXE                * 1 << 6      ; 1 -> TX FIFO empty, 0 -> not empty
+IIC_RXD                * 1 << 5
+IIC_TXD                * 1 << 4
+IIC_RXR                * 1 << 3      ; 1 -> RX FIFO has data, 0 -> no data
+IIC_TXW                * 1 << 2      ; 1 -> TX has space, 0 -> no space
+IIC_DONE               * 1 << 1      ; 1 -> Transfer complete
+IIC_TA                 * 1 << 0      ; 1 -> Transfer active
+
+IIC_Init
+        DoMemBarrier a2              ; Ensure all peripheral registers
+; Choose the controller to use for RISC OS IIC bus 0
+        LDR     a2, Board_Revision   ; Read the board revision code
+        CMP     a2, #4               ; Codes 4 upwards denote swapped
+        MOV     a2, #IIC_Base0 :AND: &FFFF; Start with BSC0
+        ADD     a2, a2, #IIC_Base0 :AND: &FFFF0000
+        MOVHS   a2, #IIC_Base1 :AND: &FFFF; If rev code 4 upwards, use BSC1
+        ADDHS   a2, a2, #IIC_Base1 :AND: &FFFF0000
+        STR     a2, IIC_Base         ; Store the choice
+; Set up pins GPIO0 to SDA0, GPIO1 to SCL0 or
+;             GPIO2 to SDA1, GPIO3 to SCL1
+; Only adjust the configuration of the pins for the controller we're using -
+; the other pins/controller might be being used for a different purpose (e.g.
+; Pi 3, GPIO 0/SDA0 seems related to power control/under-voltage detection)
+        LDR     a2, PeriBase
+        ADD     a3, a2, #GPIO_Base
+        LDR     a2, [a3, #GPFSel0] 
+        BICLO   a2, a2, #8_00000077  
+        BICHS   a2, a2, #8_00007700
+        ORRLO   a2, a2, #8_00000044  ; Set FSEL to ALT0 which is binary 100
+        ORRHS   a2, a2, #8_00004400
+        STR     a2, [a3, #GPFSel0]
+        DoMemBarrier a1              ; Ensure all peripheral registers
+; Enable the controller
+        BaseAddr a4, a1              ; a4 -> IIC controller
+        LDR     a1, [a4, #IIC_C]     ; a1 = Control reg's contents
+        ORR     a1, a1, #IIC_I2CEN   ; Enable the controller
+        STR     a1, [a4, #IIC_C]
+        MOV     a1, #IICDivider      ; Set the clock divider to give a
+        STR     a1, [a4, #IIC_DIV]   ; bus frequency of 100 kHz
+        DoMemBarrier a1              ; Ensure all peripheral registers
+        MOV     a1, #0
+        STR     a1, IIC_Status       ; Say the IIC system is not busy
+        MOV     pc, lr
+
+HAL_IICBuses
+        MOV     a1, #1
+        MOV     pc, lr
+
+HAL_IICType
+        MOV     a1, #(IICVersion << IICFlag_ProtocolVersionShift) ; IIC version
+        ORR     a1, a1, #IICFlag_HighLevel ; Add in the HAL flags
+        MOV     pc,lr
+
+; Get the total length of transfers linked with nostart set
+; Enter with
+; a2 = number of transfers
+; a3 -> iic_transfer list
+; Return length in a1
+; Don't change any other registers
+get_linked_transfer_length
+        STMFD   sp!, {a2, a3, lr}
+        MOV     a1, #0               ; Clear accumulator
+get_ltl_loop
+        LDR     lr, [a3, #8]         ; Get length
+        ADD     a1, a1, lr           ; Accumulate
+        SUBS    a2, a2, #1           ; Decrement loop counter
+        LDMLEFD sp!, {a2, a3, pc}    ; Return if no more transfers
+        ADD     a3, a3, #12          ; Point to next iic_transfer
+        LDR     lr, [a3, #0]         ; Get flags of NEXT transfer
+        TST     lr, #IICFlag_NoStart ; Next transfer continues unbroken?
+        BNE     get_ltl_loop         ; Loop round if so,
+        LDMFD   sp!, {a2, a3, pc}    ; otherwise return
+
+HAL_IICTransfer
+; Check for bus 0 - any other is an error
+        CMP     a1, #0
+        MOVNE   a1, #IICStatus_Error ; Return this code if not bus 0
+        MOVNE   pc, lr
+; It's bus 0.  Look if we're busy.
+        LDR     a1, IIC_Status       ; 0 -> not busy, !0 -> busy
+        CMP     a1, #0
+        MOVNE   a1, #IICStatus_Busy
+        MOVNE   pc,lr
+; It's bus 0 and we're not busy.  Process the request.
+; a2 = number of iic_transfers
+; a3 -> iic_transfer list.
+; List contains a2 iic_transfer members, each of which is:
+; word 0  b0 = Write/Read
+;      b7..1 = slave address
+;     b28..8 = reserved
+;        b29 = Retry flag (no significance here)
+;        b30 = Return checksum only
+;        b31 = Don't send start or re-send the address, the transfer
+;              continues from where the previous sub-transfer left off.
+; word 1  Pointer to memory for data to be sent/received
+; word 2  Length of data to be sent/received
+        MVN     a1, #0               ; Flag us as busy before we go further
+        STR     a1, IIC_Status
+        STMFD   sp!, {v1, v2, v3, v4, v5, lr}
+        DoMemBarrier lr
+        BaseAddr v1, lr              ; v1 -> IIC controller regs
+        MOV     a1, #IIC_DONE        ; Clear the Transfer Done bit
+        ORR     a1, a1, #IIC_CLKTBit :OR: IIC_ERR; and the error flags
+        STR     a1, [v1, #IIC_S]     ; by writing 1s to them
+linked_transfer_0
+        LDR     a4, [v1, #IIC_C]     ; Read IIC Control reg
+        BIC     a4, a4, #IIC_READ    ; Clear R/nW bit
+        LDR     a1, [a3, #0]         ; Get 1st word of iic_transfer struct,
+        LDR     v2, [a3, #4]         ; pointer to data block
+        LDR     v3, [a3, #8]         ; and transfer length
+        MOV     v4, #0               ; Clear checksum
+; Ensure that a write transfer has not been requested with checksum only
+        TST     a1, #IICFlag_ChecksumOnly
+        BEQ     transfer_notCSonly
+; If checksum only, set pointer to 0 - this value is used to prevent
+; the loop from writing data to a non-existent data block
+        MOV     v2, #0               ; "Pointer" must be in v2
+        B       transfer_0
+
+transfer_notCSonly
+; Not just checksum, so check that we have a non-null data block pointer
+        CMP     v2, #0
+        BEQ     transfer_error
+transfer_0
+        MOV     lr, a1, LSR #1       ; Right align address into lr
+        AND     lr, lr, #&7F         ; Mask in address
+        STR     lr, [v1, #IIC_A]     ; Into controller Address reg
+        AND     a1, a1, #IIC_READ
+        ORR     a4, a4, a1           ; Splice in read/write bit
+        ORR     a4, a4, #IIC_CLEAR   ; and clear FIFO bit
+        STR     a4, [v1, #IIC_C]
+; From here on down:
+; a1 = scratch
+; a2 = number of transfers
+; a3 -> iic_transfer list
+; a4 = scratch
+; v1 -> IIC controller registers
+; v2 -> data block for transfer (=0 if checksum only required)
+; v3 = transfer length remaining
+; v4 = checksum
+; v5 = (at the moment, as a diagnostic) loop count
+; lr = scratch
+        BL      get_linked_transfer_length
+        CMP     a1, #65536           ; Max length controller can handle
+        BHS     transfer_error       ; Error if too high,
+        STR     a1, [v1, #IIC_DLEN]  ; else put into controller`s DLEN reg
+; If the transfer is a write, prime the FIFO
+        LDR     a1, [v1, #IIC_C]
+        TST     a1, #IIC_READ        ; b0 = 0 -> write
+        BLEQ    write_to_fifo
+; Kick the transfer off
+        LDR     a1, [v1, #IIC_C]
+        ORR     a1, a1, #IIC_ST      ; Set start transfer bit
+        STR     a1, [v1, #IIC_C]
+; Wait for transfer active to respond
+        MOV     v5, #0               ; Clear loop counter
+IIC_WaitForTA_loop
+        LDR     a1, [v1, #IIC_S]
+        TST     a1, #IIC_TA
+        BNE     IIC_Transfer_loop
+        ADD     v5, v5, #1
+        CMP     v5, #1024            ; Don't get stuck here
+        BLO     IIC_WaitForTA_loop
+; Now loop until complete
+IIC_Transfer_loop
+        LDR     a1, [v1, #IIC_C]     ; Get direction of transfer
+        TST     a1, #IIC_READ
+        BNE     transfer_read
+; This is a write transfer
+        BL      write_to_fifo
+; Check for linked transfer after this one
+        CMP     a2, #1               ; More than one transfer?
+        BLS     transfer_read_write  ; No linked transfer
+; There is at least one.  Are we ready yet to move on to it?
+        BL      is_write_finished    ; Has the transfer completed?
+        BNE     transfer_read_write  ; No, loop round ordinarily
+; If the nostart of the next transfer is set, we can move to it now,
+; because it's simply an extension of the data space.
+        LDR     a1, [a3, #12]        ; Get the flags of the next transfer
+        TST     a1, #IICFlag_NoStart
+        BEQ     transfer_link_write_1; Branch if nostart is clear
+; Nostart is set, so simply move the pointer on
+transfer_next_nostart
+        SUB     a2, a2, #1           ; Decrement no. of transfers
+        ADD     a3, a3, #12          ; a3 -> next iic_transfer
+        LDR     v2, [a3, #4]         ; v2 -> data block
+        LDR     v3, [a3, #8]         ; v3 = transfer length
+        B       transfer_read_write
+
+transfer_link_write_1
+; Linked write transfer, nostart is clear, so we need to start another
+; transfer when the write FIFO is empty
+        LDR     a1, [v1, #IIC_S]     ; Read status reg
+        TST     a1, #IIC_TXE         ; TX FIFO empty?
+        BEQ     transfer_read_write  ; Not yet, just loop
+; Time to start the linked transfer.
+transfer_next_with_start
+        SUB     a2, a2, #1           ; Decrement no. of transfers
+        ADD     a3, a3, #12          ; a3 -> next iic_transfer
+        B       linked_transfer_0
+
+transfer_read
+        BL      read_from_fifo
+; Check for linked transfer after this one
+        CMP     a2, #1               ; More than one transfer?
+        BLS     transfer_read_write  ; No linked transfer
+        BL      are_all_bytes_transferred; Is the present one finished?
+        BNE     transfer_read_write  ; No, loop round ordinarily
+        LDR     a1, [a3, #12]        ; Get the next transfer's flags
+        TST     a1, #IICFlag_NoStart ; NoStart set?
+        BNE     transfer_next_nostart
+        B       transfer_next_with_start
+
+transfer_read_write
+        LDR     a1, [v1, #IIC_S]     ; Check for transfer active
+        TST     a1, #IIC_TA
+        BNE     IIC_Transfer_loop    ; Loop back while transfer active
+        CMP     v2, #0               ; Did we ask for checksum only?
+        STREQ   v4, [a3, #4]         ; If yes, return it
+        TST     a1, #IIC_CLKTBit     ; CLKT true implies an error
+        BNE     transfer_error
+        TST     a1, #IIC_ERR         ; ERR true implies no ACK
+        BEQ     transfer_OK
+transfer_noACK
+        MOV     a1, #IICStatus_NoACK
+        B       transfer_exit
+
+transfer_error
+        MOV     a1, #IICStatus_Error
+        B       transfer_exit
+
+transfer_OK
+        MOV     a1, #IICStatus_Completed
+; This is where we exit:
+transfer_exit
+        DoMemBarrier a2              ; Ensure all peripheral registers
+        MOV     a2, #0               ; No longer busy
+        STR     a2, IIC_Status
+        LDMFD   sp!, {v1, v2, v3, v4, v5, pc}
+
+; Fill the FIFO for a write.  Enter with
+; v1 -> controller base
+; v2 -> memory buffer
+; v3 = remaining length
+; Uses/destroys a1, destroys flags
+; Updates v2, v3
+write_to_fifo
+        CMP     v3, #0               ; Don't write beyond end of transfer
+        MOVLS   pc, lr
+write_to_fifo_loop
+        LDR     a1, [v1, #IIC_S]     ; Read status reg
+        TST     a1, #IIC_TXD         ; Space in TX FIFO?
+        MOVEQ   pc, lr
+        LDRB    a1, [v2], #1         ; Get byte and bump pointer
+        STRB    a1, [v1, #IIC_FIFO]  ; Put into controller
+        SUBS    v3, v3, #1           ; Decrement transfer length
+        BHI     write_to_fifo_loop   ; Loop back if more remain
+        MOV     pc, lr
+
+; Empty the FIFO for a read.  Enter with
+; v1 -> controller base
+; v2 -> memory buffer
+; v3 = remaining length
+; v4 = checksum
+; Uses/destroys a1, destroys flags
+; Updates v2, v3, v4, memory buffer
+; Unlike write_to_fifo, this function dumps any byte read if there is
+; no space in the buffer - shouldn't ever happen but it's covered
+read_from_fifo
+        LDR     a1, [v1, #IIC_S]     ; Read status reg
+        TST     a1, #IIC_RXD         ; Anything to read?
+        MOVEQ   pc, lr               ; Return if not
+        LDRB    a1, [v1, #IIC_FIFO]  ; Get byte from FIFO
+        ADD     v4, v4, a1           ; Update checksum
+        CMP     v3, #0               ; Space left in buffer?
+        BLS     read_from_fifo       ; Dump & loop back if none
+        CMP     v2, #0               ; Mem ptr == 0 says checksum only
+        STRNEB  a1, [v2], #1         ; Write to buffer and bump pointer
+        SUBS    v3, v3, #1           ; Decrement transfer length
+        B       read_from_fifo       ; Loop back to check for more
+
+; Check if a write transfer has finished.
+; Enter with
+; v1 -> controller base
+; v3 = remaining length
+; Return EQ if finished, NE if not finished.
+; Destroys a1
+is_write_finished
+        CMP     v3, #0
+        MOVNE   pc, lr
+        LDR     a1, [v1, #IIC_S]
+        EOR     a1, a1, #IIC_TXE     ; Swap state of TXE bit so we can
+        TST     a1, #IIC_TXE         ; return EQ if the empty bit is set
+        MOV     pc, lr
+
+; Check if a read transfer has finished.
+; Enter with
+; v1 -> controller base
+; v3 = remaining length
+; Return EQ if finished, NE if not finished.
+are_all_bytes_transferred
+        CMP     v3, #0
+        MOV     pc, lr
+
+HAL_IICMonitorTransfer
+; Check for bus 0 - any other is an error
+        CMP     a1, #0
+        MOVNE   a1, #IICStatus_Error ; Return this code if not bus 0
+        MOVNE   pc, lr
+; It's bus 0, so check our known status
+        LDR     a1, IIC_Status       ; 0 -> not busy, !0 -> busy
+        CMP     a1, #0
+        MOVEQ   a1, #IICStatus_Completed ; Yes, I know it's the same
+        MOVNE   a1, #IICStatus_Busy
+        MOV     pc,lr
+
+        END
+

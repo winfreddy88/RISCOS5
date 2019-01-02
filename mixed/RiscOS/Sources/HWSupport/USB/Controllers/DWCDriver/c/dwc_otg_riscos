@@ -1,0 +1,854 @@
+/*
+ * Copyright (c) 2012, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include <stdarg.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include "kernel.h"
+#include "swis.h"
+#include "cmodule.h"
+#include "tboxlibint/messages.h"
+#include "modhead.h"
+#include "Global/HALEntries.h"
+#include "Global/Services.h"
+#include "callx/callx.h"
+
+#include <sys/callout.h>
+#include <sys/queue.h>
+
+#include <machine/bus.h>
+#include <dev/usb/usb.h>
+#include <dev/usb/usbdi.h>
+#include <dev/usb/usbdivar.h>
+
+#include "dwc_os.h"
+#include "dwc_otg_riscos.h"
+#include "dwc_common_riscos.h"
+
+#include "dwc/driver/dwc_otg_hcd_if.h"
+#include "dwc/driver/dwc_otg_dbg.h"
+#include "dwc/driver/dwc_otg_driver.h"
+#include "dwc/driver/dwc_otg_regs.h"
+#include "dwc/driver/dwc_otg_fiq_fsm.h"
+
+/* CIL & HCD interface for RISC OS */
+
+struct dwc_otg_driver_module_params {
+	int32_t opt;
+	int32_t otg_cap;
+	int32_t dma_enable;
+	int32_t dma_desc_enable;
+	int32_t dma_burst_size;
+	int32_t speed;
+	int32_t host_support_fs_ls_low_power;
+	int32_t host_ls_low_power_phy_clk;
+	int32_t enable_dynamic_fifo;
+	int32_t data_fifo_size;
+	int32_t dev_rx_fifo_size;
+	int32_t dev_nperio_tx_fifo_size;
+	uint32_t dev_perio_tx_fifo_size[MAX_PERIO_FIFOS];
+	int32_t host_rx_fifo_size;
+	int32_t host_nperio_tx_fifo_size;
+	int32_t host_perio_tx_fifo_size;
+	int32_t max_transfer_size;
+	int32_t max_packet_count;
+	int32_t host_channels;
+	int32_t dev_endpoints;
+	int32_t phy_type;
+	int32_t phy_utmi_width;
+	int32_t phy_ulpi_ddr;
+	int32_t phy_ulpi_ext_vbus;
+	int32_t i2c_enable;
+	int32_t ulpi_fs_ls;
+	int32_t ts_dline;
+	int32_t en_multiple_tx_fifo;
+	uint32_t dev_tx_fifo_size[MAX_TX_FIFOS];
+	uint32_t thr_ctl;
+	uint32_t tx_thr_length;
+	uint32_t rx_thr_length;
+	int32_t pti_enable;
+	int32_t mpi_enable;
+	int32_t lpm_enable;
+	int32_t ic_usb_cap;
+	int32_t ahb_thr_ratio;
+	int32_t power_down;
+	int32_t reload_ctl;
+	int32_t dev_out_nak;
+	int32_t cont_on_bna;
+	int32_t ahb_single;
+	int32_t otg_ver;
+	int32_t adp_enable;
+};
+
+static const bool use_fiq_fix = true; /* True if we're allowed to use the FIQ fix */
+static const bool use_fiq_fsm = true; /* True if we're allowed to use the full FIQ FSM */
+bool reclaim_fiq_vector = false; /* True if we should attempt to claim FIQs (i.e. driver is initialised and use_fiq_fix) */
+bool own_fiq_vector = false; /* True if we currently own the FIQ vector */
+
+static uint32_t fiq_stack[512];
+
+/* Support for downgrading to IRQ when FIQ is claimed by someone else is incomplete */
+//#define DOWNGRADE_TO_IRQ
+
+#ifdef RISCOS_FIQ_DOWNGRADE
+fiq_downgrade_t fiq_downgrade;
+#endif
+
+bool fiq_enable = false;
+bool fiq_fsm_enable = false;
+uint16_t nak_holdoff = 8;
+unsigned short fiq_fsm_mask = 0x0F;
+
+
+/*
+
+			Misc
+
+*/
+
+static _kernel_oserror *softc_root_intr_ticker(_kernel_swi_regs *r,void *pw,void *handle)
+{
+	dwc_softc_t *sc = (dwc_softc_t *) handle;
+	usbd_xfer_handle xfer = sc->sc_intrxfer;
+	if(!xfer || !xfer->length)
+		return NULL;
+	if(dwc_otg_hcd_is_status_changed(sc->dwc_dev.hcd,sc->port) <= 0)
+		return NULL;
+	u_char *p = KERNADDR(&xfer->dmabuf, 0);
+	memset(p,0,xfer->length);
+	*p = 2;
+	xfer->actlen = xfer->length;
+	xfer->status = USBD_NORMAL_COMPLETION;
+	usb_transfer_complete(xfer);
+	return NULL;
+}
+
+/*
+
+			Calls from USBDriver to us
+
+*/
+
+static usbd_status softc_allocm(struct usbd_bus *bus, usb_dma_t *dma, u_int32_t size);
+static void softc_freem(struct usbd_bus *bus, usb_dma_t *dma);
+static usbd_xfer_handle softc_allocx(struct usbd_bus *bus);
+static void softc_freex(struct usbd_bus *bus, usbd_xfer_handle xfer);
+static usbd_status softc_open(usbd_pipe_handle pipe);
+static void softc_poll(struct usbd_bus *bus);
+static void softc_softintr(void *v);
+static void softc_noop(usbd_pipe_handle pipe);
+
+static struct usbd_pipe_methods softc_root_ctrl_methods = {
+	softc_root_ctrl_transfer,
+	softc_root_ctrl_start,
+	softc_root_ctrl_abort,
+	softc_root_ctrl_close,
+	softc_noop,
+	softc_root_ctrl_done,
+};
+
+static struct usbd_pipe_methods softc_root_intr_methods = {
+	softc_root_intr_transfer,
+	softc_root_intr_start,
+	softc_root_intr_abort,
+	softc_root_intr_close,
+	softc_noop,
+	softc_root_intr_done,
+};
+
+static struct usbd_pipe_methods softc_device_methods = {
+	softc_device_transfer,
+	softc_device_start,
+	softc_device_abort,
+	softc_device_close,
+	softc_device_clear_toggle,
+	softc_device_done,
+};
+
+static struct usbd_bus_methods softc_bus_methods = {
+	softc_open,
+	softc_softintr,
+	softc_poll,
+	softc_allocm,
+	softc_freem,
+	softc_allocx,
+	softc_freex,
+	NULL, NULL, NULL, NULL, /* 4x unused HC overrides */
+};
+
+usbd_status softc_allocm(struct usbd_bus *bus, usb_dma_t *dma, u_int32_t size)
+{
+	usbd_status err;
+	(void) bus;
+	/* For IN transfers, dwc_otg_hc_start_transfer will round the request size up to a whole number of packets when it programs it into the controller.
+	   This means we must also round up the buffer size, otherwise a device which sends a longer packet than expected will overflow the buffer
+	   Unfortunately at this point we don't know the direction of the transfer or the max packet size of the device, so the best we can do is round all buffers to a multiple of 512 bytes */
+	size = (size+511) & ~511;
+	*dma = malloc_contig(size,0);
+	if(*dma)
+		err = USBD_NORMAL_COMPLETION;
+	else
+		err = USBD_NOMEM;
+	return err;
+}
+
+void softc_freem(struct usbd_bus *bus, usb_dma_t *dma)
+{
+	(void) bus;
+	free_contig((void **) dma);
+	*dma = 0;
+}
+
+usbd_xfer_handle softc_allocx(struct usbd_bus *bus)
+{
+	struct dwc_softc *sc = (struct dwc_softc *)bus;
+	usbd_xfer_handle xfer;
+
+	xfer = SIMPLEQ_FIRST(&sc->sc_free_xfers);
+	if (xfer != NULL) {
+		SIMPLEQ_REMOVE_HEAD(&sc->sc_free_xfers, next);
+	} else {
+		xfer = malloc(sizeof(struct dwc_softc_xfer));
+	}
+	if (xfer != NULL) {
+		memset(xfer, 0, sizeof (struct dwc_softc_xfer));
+	}
+	return xfer;
+}
+
+void softc_freex(struct usbd_bus *bus, usbd_xfer_handle xfer)
+{
+	struct dwc_softc *sc = (struct dwc_softc *)bus;
+
+	SIMPLEQ_INSERT_HEAD(&sc->sc_free_xfers, xfer, next);
+}
+
+usbd_status softc_open(usbd_pipe_handle pipe)
+{
+	usbd_device_handle dev = pipe->device;
+	dwc_softc_t *sc = (dwc_softc_t *)dev->bus;
+	usb_endpoint_descriptor_t *ed = pipe->endpoint->edesc;
+	u_int8_t addr = dev->address;
+	u_int8_t xfertype = ed->bmAttributes & UE_XFERTYPE;
+	struct dwc_softc_pipe *epipe = (struct dwc_softc_pipe *)pipe;
+
+	DPRINTFN(1, ("softc_open: pipe=%p addr=%d endpt=%d type=%d\n",epipe,addr,ed->bEndpointAddress,xfertype));
+
+	epipe->dwc_priv = NULL;
+
+	if(addr == sc->sc_addr) {
+		switch(ed->bEndpointAddress) {
+		case USB_CONTROL_ENDPOINT:
+			epipe->pipe.methods = &softc_root_ctrl_methods;
+			break;
+		case UE_DIR_IN | DWC_SOFTC_INTR_ENDPT:
+			epipe->pipe.methods = &softc_root_intr_methods;
+			break;
+		default:
+			return USBD_INVAL;
+		}
+		return USBD_NORMAL_COMPLETION;
+	}
+
+	/* DWCTODO - ISOC needs extra stuff in softc_device_start for urb  setup */
+	if(xfertype == UE_ISOCHRONOUS)
+		return USBD_INVAL;
+
+	epipe->pipe.methods = &softc_device_methods;
+
+	/* Allocate URB */
+	epipe->urb = dwc_otg_hcd_urb_alloc(sc->dwc_dev.hcd,0,0); /* DWCTODO - ISOC */
+	if(!epipe->urb)
+		return USBD_NOMEM;
+
+	if(xfertype == UE_CONTROL)
+	{
+		/* Allocate DMA buffer for request packet */
+		epipe->request = dwc_dma_alloc(NULL,sizeof(usb_device_request_t),&epipe->dma_req);
+		if(!epipe->request)
+		{
+			dwc_free(NULL,epipe->urb);
+			return USBD_NOMEM;
+		}
+	}
+	else
+	{
+		/* Set urb pipe info
+		   Note that control transfers do this on a per-xfer basis, as
+		   direction and max packet size is changeable */
+		dwc_otg_hcd_urb_set_pipeinfo(epipe->urb,dev->address,UE_GET_ADDR(ed->bEndpointAddress),xfertype,UE_GET_DIR(ed->bEndpointAddress),UE_GET_SIZE(UGETW(ed->wMaxPacketSize)));
+
+		epipe->request = NULL;
+		epipe->dma_req = 0;
+	}
+
+	epipe->xfer = NULL;
+
+	return USBD_NORMAL_COMPLETION;
+}
+
+void softc_poll(struct usbd_bus *bus)
+{
+	/* We don't support polling for interrupts */
+	(void) bus;
+}
+
+void softc_softintr(void *v)
+{
+	/* We don't use soft interrupts */
+	(void) v;
+}
+
+void softc_noop(usbd_pipe_handle pipe)
+{
+	(void) pipe;
+}
+
+/*
+
+			Calls from DWC to us
+
+*/
+
+static int hcd_op_start(dwc_otg_hcd_t *hcd)
+{
+	dprintf(("","hcd_op_start\n"));
+	return 0;
+}
+
+static int hcd_op_disconnect(dwc_otg_hcd_t *hcd)
+{
+	dprintf(("","hcd_op_disconnect\n"));
+	return 0;
+}
+
+static int hcd_op_hub_info(dwc_otg_hcd_t *hcd,void *urb_handle,uint32_t *hub_addr,uint32_t *port_addr)
+{
+	struct dwc_softc_xfer *ex = (struct dwc_softc_xfer *) urb_handle;
+	struct dwc_softc_pipe *epipe = (struct dwc_softc_pipe *) ex->xfer.pipe;
+	struct usbd_device *dev = epipe->pipe.device;
+	struct usbd_port *hsport = dev->myhsport;
+//	dprintf(("","hcd_op_hub_info xfer %08x\n",ex));
+	if(hsport)
+	{
+		*hub_addr = hsport->parent->address;
+		*port_addr = hsport->portno;
+	}
+	else
+	{
+		dprintf(("","!!! no hsport !!!\n"));
+		*hub_addr = 0;
+		*port_addr = 0;
+	}
+	return 0;
+}
+
+static int hcd_op_speed(dwc_otg_hcd_t *hcd,void *urb_handle)
+{
+	struct dwc_softc_xfer *ex = (struct dwc_softc_xfer *) urb_handle;
+	struct dwc_softc_pipe *epipe = (struct dwc_softc_pipe *) ex->xfer.pipe;
+	struct usbd_device *dev = epipe->pipe.device;
+	dprintf(("","hcd_op_speed xfer %08x\n",ex));
+	return dev->speed;
+}
+
+static int hcd_op_complete(dwc_otg_hcd_t *hcd,void *urb_handle,dwc_otg_hcd_urb_t *dwc_otg_urb,int32_t status)
+{
+	struct dwc_softc_xfer *ex = (struct dwc_softc_xfer *) urb_handle;
+	struct dwc_softc_pipe *epipe = (struct dwc_softc_pipe *) ex->xfer.pipe;
+	struct usbd_device *dev = epipe->pipe.device;
+	dprintf(("","hcd_op_complete xfer %08x DWC status %d\n",ex,status));
+
+	dwc_assert(epipe->xfer,"Pipe is idle!");
+	dwc_assert(epipe->xfer == ex,"Wrong xfer!");
+
+	/* Set xfer length, status */
+	ex->xfer.actlen = dwc_otg_hcd_urb_get_actual_length(dwc_otg_urb);
+	switch(status)
+	{
+	case -DWC_E_PROTOCOL:
+		ex->xfer.status = USBD_IOERROR;
+		break;
+	case -DWC_E_IN_PROGRESS: /* DWCTODO - How can this happen? */
+		ex->xfer.status = USBD_IN_PROGRESS;
+		break;
+	case -DWC_E_PIPE:
+		ex->xfer.status = USBD_STALLED;
+		break;
+	case -DWC_E_IO:
+		ex->xfer.status = USBD_IOERROR;
+		break;
+	case -DWC_E_TIMEOUT:
+		ex->xfer.status = USBD_TIMEOUT;
+		break;
+	case -DWC_E_OVERFLOW:
+		ex->xfer.status = USBD_IOERROR;
+		break;
+	case -DWC_E_SHUTDOWN:
+		ex->xfer.status = USBD_CANCELLED;
+		break;
+	case 0:
+		ex->xfer.status = USBD_NORMAL_COMPLETION;
+		break;
+	default:
+		ex->xfer.status = USBD_IOERROR;
+		break;
+	}
+
+	/* DWCTODO - Extra isoc stuff */
+
+	/* Disable the endpoint after each control transfer
+
+	   This seems to be necessary as the DWC driver caches the max packet
+	   size in a dwc_hc_t struct associated with the endpoint. But the BSD
+	   layer changes the max packet size that it uses without reopening the
+	   pipe (when a device is first connected, a max packet size of 8 is
+	   used until the real max size can be read from the device descriptor)
+
+	   However, we can't disable the endpoint from within this callback, as
+	   this transfer is still contained within its transfer list. So instead
+	   we'll do it from within a callback, which should guarantee that the
+	   transfer list is empty.
+	   */
+	if(epipe->request)
+	{
+		register_endpoint_disable_cb(epipe->dwc_priv);
+		epipe->dwc_priv = 0;
+	}
+
+	/* Mark pipe as idle */
+	epipe->xfer = NULL;
+
+	int s = splusb();
+
+	/* Cancel any timeout */
+	callout_stop(&(ex->xfer.timeout_handle));
+	/* And cancel the associated callback */
+	riscos_cancel_abort_pipe(&ex->xfer);
+
+	/* Tell USBDriver */
+	usb_transfer_complete(&ex->xfer);
+
+	splx(s);
+
+	return 0;
+}
+
+static int hcd_op_get_b_hnp_enable(dwc_otg_hcd_t *hcd)
+{
+	dprintf(("","hcd_op_get_b_hnp_enable\n"));
+	/* No HNP for us */
+	return 0;
+}
+
+static struct dwc_otg_hcd_function_ops hcd_ops = {
+	hcd_op_start,
+	hcd_op_disconnect,
+	hcd_op_hub_info,
+	hcd_op_speed,
+	hcd_op_complete,
+	hcd_op_get_b_hnp_enable,
+};
+
+/*
+
+			Initialisation
+
+*/
+
+static bool veneers_built = false;
+static struct {
+    struct usbd_bus_methods methods;
+    struct {
+        int load;
+        int branch;
+    } veneer[sizeof (struct usbd_bus_methods) / sizeof (void*)];
+} softc_bus_methods_entry;
+
+static struct {
+    struct usbd_pipe_methods methods;
+    struct {
+        int load;
+        int branch;
+    } veneer[sizeof (struct usbd_pipe_methods) / sizeof (void*)];
+} softc_root_ctrl_methods_entry,
+  softc_root_intr_methods_entry,
+  softc_device_methods_entry;
+
+_kernel_oserror *dwc_otg_riscos_init(const uint32_t *hw_base,const uint8_t *mphi_base,int usb_device_number,int mphi_device_number,dwc_softc_t *softc)
+{
+	/* Initialise veneers */
+#ifdef __riscos
+	if (!veneers_built)
+	{
+		build_veneer((int*)&softc_bus_methods_entry, (int*)&softc_bus_methods, sizeof(softc_bus_methods));
+		build_veneer((int*)&softc_root_ctrl_methods_entry, (int*)&softc_root_ctrl_methods, sizeof(softc_root_ctrl_methods));
+		build_veneer((int*)&softc_root_intr_methods_entry, (int*)&softc_root_intr_methods, sizeof(softc_root_intr_methods));
+		build_veneer((int*)&softc_device_methods_entry, (int*)&softc_device_methods, sizeof(softc_device_methods));
+		veneers_built = true;
+	}
+#endif
+
+	/* Set up softc members */
+	memset(softc,0,sizeof(dwc_softc_t));
+	softc->sc_bus.usbrev = USBREV_2_0;
+	softc->sc_bus.methods = &softc_bus_methods;
+	softc->sc_bus.pipe_size = sizeof(struct dwc_softc_pipe);
+
+	softc->usb_device_number = softc->device_number = usb_device_number;
+	softc->mphi_device_number = mphi_device_number;
+	SIMPLEQ_INIT(&softc->sc_free_xfers);
+
+#ifndef FALLBACK_TO_IRQ
+	/* FIQ FSM enable flags must be set to correct values prior to init */
+	fiq_enable = use_fiq_fix;
+	fiq_fsm_enable = use_fiq_fsm;
+#endif
+
+	/* Initialise the common interface layer */
+	dprintf(("","dwc_otg_cil_init\n"));
+	softc->dwc_dev.core_if = dwc_otg_cil_init(hw_base);
+
+	/* DWCTODO - params should come from HAL */
+	struct dwc_otg_driver_module_params s_params;
+	memset(&s_params,-1,sizeof(s_params));
+	s_params.lpm_enable = 0; /* From dwc_otg_driver.c */
+	struct dwc_otg_driver_module_params *params = &s_params;
+
+
+	int ret = 0;
+
+	/* Set device parameters */
+	dprintf(("","Setting device parameters\n"));
+#define SETPARAM(X) \
+	if(params->X != -1) \
+		ret += dwc_otg_set_param_ ## X(softc->dwc_dev.core_if,params->X);
+	SETPARAM(otg_cap)
+	SETPARAM(dma_enable)
+	SETPARAM(dma_desc_enable)
+	SETPARAM(opt)
+	SETPARAM(dma_burst_size)
+	SETPARAM(host_support_fs_ls_low_power)
+	SETPARAM(enable_dynamic_fifo)
+	SETPARAM(data_fifo_size)
+	SETPARAM(dev_rx_fifo_size)
+	SETPARAM(dev_nperio_tx_fifo_size)
+	SETPARAM(host_rx_fifo_size)
+	SETPARAM(host_nperio_tx_fifo_size)
+	SETPARAM(host_perio_tx_fifo_size)
+	SETPARAM(max_transfer_size)
+	SETPARAM(max_packet_count)
+	SETPARAM(host_channels)
+	SETPARAM(dev_endpoints)
+	SETPARAM(phy_type)
+	SETPARAM(speed)
+	SETPARAM(host_ls_low_power_phy_clk)
+	SETPARAM(phy_ulpi_ddr)
+	SETPARAM(phy_ulpi_ext_vbus)
+	SETPARAM(phy_utmi_width)
+	SETPARAM(ulpi_fs_ls)
+	SETPARAM(ts_dline)
+	SETPARAM(i2c_enable)
+	SETPARAM(en_multiple_tx_fifo)
+	for(int i=0;i<15;i++)
+	{
+		if(params->dev_perio_tx_fifo_size[i] != -1)
+			ret += dwc_otg_set_param_dev_perio_tx_fifo_size(softc->dwc_dev.core_if,params->dev_perio_tx_fifo_size[i],i);
+		if(params->dev_tx_fifo_size[i] != -1)
+			ret += dwc_otg_set_param_dev_tx_fifo_size(softc->dwc_dev.core_if,params->dev_tx_fifo_size[i],i);
+	}
+	SETPARAM(thr_ctl)
+	SETPARAM(mpi_enable)
+	SETPARAM(pti_enable)
+	SETPARAM(lpm_enable)
+	SETPARAM(ic_usb_cap)
+	SETPARAM(tx_thr_length)
+	SETPARAM(rx_thr_length)
+	SETPARAM(ahb_thr_ratio)
+	SETPARAM(power_down)
+	SETPARAM(reload_ctl)
+	SETPARAM(dev_out_nak)
+	SETPARAM(cont_on_bna)
+	SETPARAM(ahb_single)
+	SETPARAM(otg_ver)
+	SETPARAM(adp_enable)
+
+	if(ret)
+	{
+		dwc_otg_cil_remove(softc->dwc_dev.core_if);
+		return make_error(ErrorNumber_DWC_BadDevParms, 0);
+	}
+
+	/* Disable global interrupts */
+	dprintf(("","Setting up IRQs\n"));
+	dwc_otg_disable_global_interrupts(softc->dwc_dev.core_if);
+
+	/* Claim IRQ */
+#ifndef FALLBACK_TO_IRQ
+	if (use_fiq_fix)
+	{
+		_swix (OS_ClaimDeviceVector, _INR(0,4), softc->mphi_device_number, usb_irq_entry, private_word, 0, 0);
+		softc->device_number = softc->mphi_device_number;
+	}
+	else
+#endif
+	{
+		_swix (OS_ClaimDeviceVector, _INR(0,4), softc->usb_device_number, usb_irq_entry, private_word, 0, 0);
+		_swix (OS_Hardware, _IN(0) | _INR(8,9), softc->usb_device_number, 0, EntryNo_HAL_IRQEnable);
+	}
+
+	/* Initialise CIL */
+	dprintf(("","dwc_otg_core_init\n"));
+	dwc_otg_core_init(softc->dwc_dev.core_if);
+
+	/* Create HCD instance */
+	dprintf(("","dwc_otg_hcd_alloc_hcd\n"));
+	softc->dwc_dev.hcd = dwc_otg_hcd_alloc_hcd();
+
+	/* Initialise */
+	dprintf(("","dwc_otg_hcd_init\n"));
+	ret = dwc_otg_hcd_init(softc->dwc_dev.hcd, softc->dwc_dev.core_if);
+	if(ret)
+	{
+		/* DWCTODO - Tidy up properly */
+		return make_error(ErrorNumber_DWC_FailInitHCD, 0);
+	}
+
+	/* Get port number */
+	softc->port = dwc_otg_hcd_otg_port(softc->dwc_dev.hcd);
+
+	/* Set up variables needed by the FIQ code */
+	dprintf(("","Registers at %08x %08x\n",hw_base,mphi_base));
+	if (use_fiq_fix)
+	{
+		softc->dwc_dev.hcd->fiq_state->mphi_regs.base    = (volatile void *) (mphi_base);
+		softc->dwc_dev.hcd->fiq_state->mphi_regs.ctrl    = (volatile void *) (mphi_base + 0x4c);
+		softc->dwc_dev.hcd->fiq_state->mphi_regs.outdda  = (volatile void *) (mphi_base + 0x28);
+		softc->dwc_dev.hcd->fiq_state->mphi_regs.outddb  = (volatile void *) (mphi_base + 0x2c);
+		softc->dwc_dev.hcd->fiq_state->mphi_regs.intstat = (volatile void *) (mphi_base + 0x50);
+		softc->dwc_dev.hcd->fiq_state->dwc_regs_base = (uint8_t *) hw_base;
+	
+		/* Enable MPHI peripheral */
+		DWC_WRITE_REG32(softc->dwc_dev.hcd->fiq_state->mphi_regs.ctrl,0x80000000);
+
+#ifdef RISCOS_FIQ_DOWNGRADE
+		fiq_downgrade.fiq_downgrade_device = mphi_device_number;
+
+		/* Get the MPHI generating an interrupt now */
+		FIQ_WRITE( softc->dwc_dev.hcd->fiq_state->mphi_regs.outdda, (int) softc->dwc_dev.hcd->fiq_state->dummy_send);
+		FIQ_WRITE( softc->dwc_dev.hcd->fiq_state->mphi_regs.outddb, (1 << 29));
+
+		_swix(OS_Hardware,_INR(8,9)|_OUTR(0,1),1,EntryNo_HAL_IRQEnable,&fiq_downgrade.hal_irqenable,&fiq_downgrade.hal_sb);
+		_swix(OS_Hardware,_INR(8,9)|_OUT(0),1,EntryNo_HAL_IRQDisable,&fiq_downgrade.hal_irqdisable);
+#endif
+	}
+
+	/* Enable IRQs */
+	dprintf(("","dwc_otg_enable_global_interrupts\n"));
+	dwc_otg_enable_global_interrupts(softc->dwc_dev.core_if);
+
+	/* Start HCD */
+	dprintf(("","dwc_otg_hcd_start\n"));
+	softc->hcd_on = true;
+	ret = dwc_otg_hcd_start(softc->dwc_dev.hcd, &hcd_ops);
+	if(ret)
+	{
+		/* DWCTODO - Tidy up properly */
+		return make_error(ErrorNumber_DWC_FailStartHCD, 0);
+	}
+
+	if (use_fiq_fix)
+	{
+		/* Try using FIQs - must occur after hcd_start to avoid issues with FIQ FSM generating HCD IRQs before hcd_intr is able to deal with them */
+		dwc_otg_riscos_try_use_fiqs(softc,true);
+	}
+
+	/* We don't get any notification from the DWC layer when the root hub status changes. For now, just use a ticker event that will poll the driver at regular intervals. */
+	callx_add_callevery(10,softc_root_intr_ticker,softc);
+
+	dprintf(("","done!\n"));
+
+	return NULL;
+}
+
+void dwc_otg_riscos_shutdown(dwc_softc_t *softc)
+{
+	if(softc->hcd_on)
+	{
+		callx_remove_callevery(softc_root_intr_ticker,softc);
+
+		dwc_otg_hcd_stop(softc->dwc_dev.hcd);
+		softc->hcd_on = false;
+	}
+
+	if(softc->dwc_dev.hcd)
+	{
+		dwc_otg_hcd_remove(softc->dwc_dev.hcd);
+		softc->dwc_dev.hcd = NULL;
+	}
+
+	/* Release FIQ */
+	if(own_fiq_vector)
+	{
+		/* Prevent automatically reclaiming the vector when we try to release it */
+		reclaim_fiq_vector = false;
+		dwc_otg_riscos_release_fiq(softc);
+		_swix(OS_ServiceCall,_IN(1),Service_ReleaseFIQ);
+	}
+
+	/* Release IRQ */
+	_swix (OS_ReleaseDeviceVector, _INR(0,4), softc->device_number, usb_irq_entry, private_word, 0, 0);
+
+	if(softc->dwc_dev.core_if)
+	{
+		dwc_otg_cil_remove(softc->dwc_dev.core_if);
+		softc->dwc_dev.core_if = NULL;
+	}
+
+	/* Free remaining memory */
+	usbd_xfer_handle xfer;
+	while((xfer = SIMPLEQ_FIRST(&softc->sc_free_xfers)) != NULL)
+	{
+		SIMPLEQ_REMOVE_HEAD(&softc->sc_free_xfers, next);
+		free(xfer);
+	}
+}
+
+int dwc_otg_riscos_irq(dwc_softc_t *softc)
+{
+	/* Return 0 for success, 1 for failure */
+	int ret = 0;
+
+	if(softc->hcd_on)
+	{
+		/* Check HCD interrupt first, likely to be more common */
+		ret = dwc_otg_hcd_handle_intr(softc->dwc_dev.hcd);
+	}
+
+	/* Check CIL */
+	ret |= dwc_otg_handle_common_intr(&softc->dwc_dev);
+	if(ret)
+	{
+		return 0;
+	}
+
+	/* Unhandled (spurious?) IRQs may happen every so often when using the FIQ fix. Try not to worry about it! */
+	return (use_fiq_fix?0:1);
+}
+
+extern void install_fiq(uint32_t *stack,uint32_t stacksize,void *param1,int param2,void *func);
+
+void dwc_otg_riscos_try_use_fiqs(dwc_softc_t *softc, bool need_to_claim)
+{
+	if(!use_fiq_fix)
+	{
+		reclaim_fiq_vector = false;
+		return;
+	}
+
+	dprintf(("","Claiming FIQ vector\n"));
+
+	if(need_to_claim)
+	{
+		/* Claim FIQs (from foreground, guaranteed to succeed) */
+		_swix(OS_ServiceCall,_IN(1),Service_ClaimFIQ);
+	}
+
+	/* Ensure any previous interrupts are disabled */
+	_swix (OS_Hardware, _INR(8,9), 0, EntryNo_HAL_FIQDisableAll);
+
+	/* Install FIQ handler */
+	install_fiq(fiq_stack,sizeof(fiq_stack),softc->dwc_dev.hcd->fiq_state,softc->dwc_dev.core_if->core_params->host_channels,(use_fiq_fsm?(void *)dwc_otg_fiq_fsm:(void *)dwc_otg_fiq_nop));
+
+	/* Disable IRQs+FIQs while we switch state */
+	int flags;
+	local_irq_save(flags);
+	local_fiq_disable();
+
+#ifdef FALLBACK_TO_IRQ
+	/* Switch the IRQ handler from USB to MPHI */
+	_swix (OS_ReleaseDeviceVector, _INR(0,4), softc->usb_device_number, usb_irq_entry, private_word, 0, 0);
+	_swix (OS_ClaimDeviceVector, _INR(0,4), softc->mphi_device_number, usb_irq_entry, private_word, 0, 0);
+	softc->device_number = softc->mphi_device_number;
+#endif
+
+#if defined(RISCOS_FIQ_DOWNGRADE)
+	/* Ensure the FIQ routine will enable the interrupt */
+	fiq_downgrade.irq_masked = false;
+	fiq_downgrade.fiq_trigger = false;
+#else
+	/* Enable MPHI IRQ */
+	_swix (OS_Hardware, _IN(0) | _INR(8,9), softc->mphi_device_number, 0, EntryNo_HAL_IRQEnable);
+#endif
+
+	/* Enable FIQ interrupt from USB */
+	_swix (OS_Hardware, _IN(0) | _INR(8,9), softc->usb_device_number, 0, EntryNo_HAL_FIQEnable);
+
+	/* Flag to DWC that the FIQ code is enabled */
+	fiq_enable = use_fiq_fix;
+
+	/* Also enable the fiq FSM */
+	fiq_fsm_enable = use_fiq_fsm;
+
+	/* Flag that we own the vector, and should reclaim it if we lose it */
+	own_fiq_vector = reclaim_fiq_vector = true;
+
+	local_irq_restore(flags);
+}
+
+void dwc_otg_riscos_release_fiq(dwc_softc_t *softc)
+{
+	dprintf(("","Releasing FIQ vector\n"));
+
+	int flags;
+
+#ifdef FALLBACK_TO_IRQ
+	TODO: Shutdown FIQ FSM
+#endif
+
+	/* Release our claim on the FIQ vector */
+	local_irq_save(flags);
+	local_fiq_disable();
+
+	/* Disable the interrupt */
+	_swix (OS_Hardware, _INR(8,9), 0, EntryNo_HAL_FIQDisableAll);
+
+	/* Flag that we no longer own the vector */
+	own_fiq_vector = false;
+
+#ifdef FALLBACK_TO_IRQ
+	/* Switch the IRQ handler from MPHI to USB */
+	_swix (OS_ReleaseDeviceVector, _INR(0,4), softc->mphi_device_number, usb_irq_entry, private_word, 0, 0);
+	_swix (OS_ClaimDeviceVector, _INR(0,4), softc->usb_device_number, usb_irq_entry, private_word, 0, 0);
+	softc->device_number = softc->usb_device_number;
+
+	/* Enable USB IRQ */
+	_swix (OS_Hardware, _IN(0) | _INR(8,9), softc->usb_device_number, 0, EntryNo_HAL_IRQEnable);
+#endif
+
+	local_irq_restore(flags);
+}

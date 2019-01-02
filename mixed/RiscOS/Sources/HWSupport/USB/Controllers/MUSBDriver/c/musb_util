@@ -1,0 +1,186 @@
+/*
+ * Copyright (c) 2004, 2009 The NetBSD Foundation, Inc.
+ * All rights reserved.
+ *
+ * This code is derived from software contributed to The NetBSD Foundation
+ * by Lennart Augustsson (lennart@augustsson.net), Charles M. Hannum, and
+ * Jeffrey Lee (me@phlamethrower.co.uk)
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. All advertising materials mentioning features or use of this software
+ *    must display the following acknowledgement:
+ *        This product includes software developed by the NetBSD
+ *        Foundation, Inc. and its contributors.
+ * 4. Neither the name of The NetBSD Foundation nor the names of its
+ *    contributors may be used to endorse or promote products derived
+ *    from this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE NETBSD FOUNDATION, INC. AND CONTRIBUTORS
+ * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE FOUNDATION OR CONTRIBUTORS
+ * BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include "modhead.h"
+#include "swis.h"
+#include "callx/callx.h"
+#include <limits.h>
+#include <machine/bus.h>
+
+#include <sys/malloc.h>
+#include <sys/queue.h>
+#include <sys/types.h>
+#include <sys/systm.h>
+
+#include <dev/usb/usb.h>
+#include <dev/usb/usbdi.h>
+#include <dev/usb/usbdivar.h>
+
+#include "Global/RISCOS.h"
+#include "Global/HALEntries.h"
+#include "cmodule.h"
+
+/* Have to avoid including stdio as there's a clash with the BSD stuff */
+#define __stdio_h
+
+#include "musb.h"
+#include "musb_util.h"
+
+/*
+
+				Utility functions
+
+*/
+
+int
+musb_str(usb_string_descriptor_t* p, int l, char *s)
+{
+	int i;
+
+	if (l == 0)
+		return (0);
+	p->bLength = 2 * strlen(s) + 2;
+	if (l == 1)
+		return (1);
+	p->bDescriptorType = UDESC_STRING;
+	l -= 2;
+	for (i = 0; s[i] && l > 1; i++, l -= 2)
+		USETW2(p->bString[i], 0, s[i]);
+	return (2*i+2);
+}
+
+u32 musb_calc_port_status(int devctl,int power,u32 port_status)
+{
+	/* Calculate new port_status flags */
+	int i=0;
+	if(devctl & DEVCTL_HOSTMODE)
+	{
+		i |= UPS_CURRENT_CONNECT_STATUS; /* Always connected when in host mode? */
+		i |= UPS_PORT_ENABLED; /* Always enabled? */
+		if(power & POWER_SUSPENDM)
+			i |= UPS_SUSPEND;
+		/* todo: overcurrent */
+		if(power & POWER_RESET)
+			i |= UPS_RESET;
+		i |= UPS_PORT_POWER; /* Always powered in host mode? */
+		if(power & POWER_HSMODE)
+			i |= UPS_HIGH_SPEED;
+		else if(devctl & DEVCTL_LSDEV)
+			i |= UPS_LOW_SPEED;
+	}
+	/* Update wPortStatus */
+	if((i & UPS_CURRENT_CONNECT_STATUS) != (port_status & UPS_CURRENT_CONNECT_STATUS))
+		i |= UPS_C_CONNECT_STATUS<<16;
+	if(!(i & UPS_PORT_ENABLED) && (port_status & UPS_PORT_ENABLED))
+		i |= UPS_C_PORT_ENABLED<<16;
+	if((i & UPS_OVERCURRENT_INDICATOR) != (port_status & UPS_OVERCURRENT_INDICATOR))
+		i |= UPS_C_OVERCURRENT_INDICATOR<<16;
+	if((i & UPS_RESET) && !(port_status & UPS_RESET))
+		i |= UPS_C_PORT_RESET<<16;
+	return (port_status & 0xffff0000) | i;
+}
+
+void *musb_fiforead(volatile musb_regs *musb_base,int ep,void *dest,int bytes)
+{
+	DPRINTFN(20,("musb_fiforead: %d: ",bytes));
+	volatile musb_fifo *fifo = &(musb_base->fifo[ep]);
+	if(!(((u32)dest)&3))
+	{
+		u32 *d = (u32 *) dest;
+		while(bytes>=4)
+		{
+			*d++ = fifo->_u32;
+			DPRINTFN(20,("%08x ",d[-1]));
+			bytes -= 4;
+		}
+		dest = (void *) d;
+	}
+	if(!(((u32)dest)&1))
+	{
+		u16 *d = (u16 *) dest;
+		while(bytes>=2)
+		{
+			*d++ = fifo->_u16;
+			DPRINTFN(20,("%04x ",d[-1]));
+			bytes -= 2;
+		}
+		dest = (void *) d;
+	}
+	char *c = (char *) dest;
+	while(bytes--)
+	{
+		*c++ = fifo->_u8;
+		DPRINTFN(20,("%02x ",c[-1]));
+	}
+	DPRINTFN(20,("\n"));
+	return (void *) c;
+}
+
+void *musb_fifowrite(volatile musb_regs *musb_base,int ep,void *src,int bytes)
+{
+	DPRINTFN(20,("musb_fifowrite: %d: ",bytes));
+	volatile musb_fifo *fifo = &(musb_base->fifo[ep]);
+	if(!(((u32)src)&3))
+	{
+		u32 *d = (u32 *) src;
+		while(bytes>=4)
+		{
+			fifo->_u32 = *d++;
+			DPRINTFN(20,("%08x ",d[-1]));
+			bytes -= 4;
+		}
+		src = (void *) d;
+	}
+	if(!(((u32)src)&1))
+	{
+		u16 *d = (u16 *) src;
+		while(bytes>=2)
+		{
+			fifo->_u16 = *d++;
+			DPRINTFN(20,("%04x ",d[-1]));
+			bytes -= 2;
+		}
+		src = (void *) d;
+	}
+	char *c = (char *) src;
+	while(bytes--)
+	{
+		fifo->_u8 = *c++;
+		DPRINTFN(20,("%02x ",c[-1]));
+	}
+	DPRINTFN(20,("\n"));
+	return (void *) c;
+}

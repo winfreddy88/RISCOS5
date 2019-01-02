@@ -1,0 +1,581 @@
+/* Copyright 2003 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*-*-C-*-
+ *
+ * Manipulate window flags.  This module implements the dialogue
+ * box that lets the user tweak the window flags.
+ */
+
+/*
+ * TODO: when window is renamed
+ *       when window is deleted
+ */
+
+#include "resed.h"
+
+
+/*
+ * This table encodes the mapping from icon numbers
+ * to the flag bits.  The icon is set if (flags & mask) == value.
+ * Mask == 0 means don't select this, but shade it.
+ */
+
+static struct
+{
+    int icon;
+    unsigned int mask;
+    unsigned int value;
+} lookup[] =
+{
+    I_WINFLAGS_OPT_TITLE, WF_TITLE, WF_TITLE,
+    I_WINFLAGS_OPT_BACK, WF_BACK, WF_BACK,
+    I_WINFLAGS_OPT_CLOSE, WF_CLOSE, WF_CLOSE,
+    I_WINFLAGS_OPT_TOGGLE, WF_TOGGLE, WF_TOGGLE,
+    I_WINFLAGS_OPT_HSCROLL, WF_HSCROLL, WF_HSCROLL,
+    I_WINFLAGS_OPT_VSCROLL, WF_VSCROLL, WF_VSCROLL,
+    I_WINFLAGS_OPT_SIZE, WF_RESIZE, WF_RESIZE,          /* Note: only allowed if a scrollbar present */
+    I_WINFLAGS_OPT_PANE, WF_PANE, WF_PANE,
+    I_WINFLAGS_OPT_MOVEABLE, WF_MOVEABLE, WF_MOVEABLE,
+    I_WINFLAGS_OPT_ALLOWOFF, WF_ALLOW_OFF, WF_ALLOW_OFF,
+    I_WINFLAGS_OPT_REAL, WF_GCOL, WF_GCOL,
+    I_WINFLAGS_OPT_BACKDROP, WF_BACKDROP, WF_BACKDROP,
+    I_WINFLAGS_OPT_HOTKEYS, WF_HOTKEYS, WF_HOTKEYS,
+    I_WINFLAGS_OPT_AUTODRAW, WF_AUTO_REDRAW, WF_AUTO_REDRAW,
+
+    I_WINFLAGS_RAD_OFF, WF_USER_SCROLL, 0,
+    I_WINFLAGS_RAD_AUTO, WF_USER_SCROLL | WF_NO_REPEAT, WF_USER_SCROLL,
+    I_WINFLAGS_RAD_DEBOUNCED, WF_USER_SCROLL | WF_NO_REPEAT, WF_USER_SCROLL | WF_NO_REPEAT,
+
+    I_WINFLAGS_TITLE, 0, 0,
+    I_WINFLAGS_MAX, 0, 0,
+    I_WINFLAGS_BUTTYPE, 0, 0,
+    I_WINFLAGS_BUTTYPE_MENU, 0, 0,
+    I_WINFLAGS_OK, 0, 0,
+/*    I_WINFLAGS_CANCEL, 0, 0*/
+};
+
+
+/*
+ * This is a singly-instantiated dialogue.
+ * Remember whether we are open or not.
+ */
+
+static Bool open = FALSE;
+
+/*
+ * Which resource is the dbox currently displaying?  When NULL, the
+ * box is inactive and should be greyed.
+ */
+
+static ResourcePtr disp = NULL;
+static WindowPtr window;
+static int nameindex;
+
+MenuPtr butmenu = NULL;
+
+
+/*
+ * Create the window, but don't open it yet.  This step is done once at the
+ * beginning of execution.
+ */
+
+error * winflags_load_prototypes ()
+{
+    int i;
+
+    ER ( wimp_load_template("WinFlags", &window) );
+    ER ( _swix(Wimp_CreateWindow, _IN(1) | _OUT(0),
+               &window->visarea,
+               &window->handle) );
+    ER ( registry_register_window (window->handle, Winflags, (void *) window) );
+
+    /* Determine index of the window name in the title string.
+     * If the message is not found, then atoi on the tag string
+     * will return zero, so the name will start at the beginning
+     * of the titlebar... harmless.
+     */
+
+    nameindex = atoi(message_lookup (&msgs, "WFlgInd"));
+
+    /* Use this opportunity to create the button menu */
+
+    ER ( menu_create (16, message_lookup(&msgs, "ButType"), &butmenu) );
+    for (i = 0; i < 16; i++)
+    {
+        char tag[20], buf[100];
+        sprintf(tag, "ButType%d", i);
+        sprintf(buf, "%2d %s", i, message_lookup (&msgs, tag));
+        ER ( menu_entry (butmenu, i, buf, 0, 0, -1, -1, NULL) );
+    }
+
+    return NULL;
+}
+
+
+
+/*
+ * Enable/disable certain icons depending on the settings of others.
+ */
+
+static error * enable_disable ()
+{
+    /* The Title and Max icons are only available if Title option is on */
+
+    unsigned int eor = dbox_getbutton(window, I_WINFLAGS_OPT_TITLE) ? 0 : IF_SHADED;
+    ER ( dbox_iconflag (window, I_WINFLAGS_TITLE, IF_SHADED, eor) );
+    ER ( dbox_iconflag (window, I_WINFLAGS_MAX, IF_SHADED, eor) );
+    
+    /* The Size icon is only available if one or both scrollbars are on */
+    eor = dbox_getbutton(window, I_WINFLAGS_OPT_VSCROLL) || dbox_getbutton(window, I_WINFLAGS_OPT_HSCROLL) ? 0 : IF_SHADED;
+    return dbox_iconflag (window, I_WINFLAGS_OPT_SIZE, IF_SHADED, eor);
+}
+
+
+
+/*
+ * Return value of button type setting
+ */
+
+int winflags_get_but_display (WindowPtr win, int icon)
+{
+    int i;
+    char *s = dbox_getstring (win, icon);
+    for (i = 0; i < 16; i++)
+    {
+        char tag[20];
+        sprintf(tag, "ButType%d", i);
+        if (strcmp(s, message_lookup(&msgs, tag)) == 0)
+            return i;
+    }
+    return 0;                   /* Failed */
+}
+
+
+
+/*
+ * Set the value of the button type setting
+ */
+
+void winflags_set_but_display (WindowPtr win, int icon, int value)
+{
+    char tag[20];
+    dprintf("WINFLAGS_SET_BUT_DISPLAY to %d\n" _ value);
+    sprintf(tag, "ButType%d", value);
+    dbox_setstring (win, icon, message_lookup(&msgs, tag));
+}
+
+
+
+/*
+ * Get all icon settings from the window flags
+ */
+
+static error * get_values (ResourcePtr res)
+{
+    unsigned int flags = res->window.flags;
+    int i;
+
+    /* Do the option/radio buttons */
+
+    for (i = 0; i < NUMBER(lookup); i++)
+    {
+        if (lookup[i].mask == 0)
+            continue;
+        if ((flags & lookup[i].mask) == lookup[i].value)
+        {
+            ER (dbox_iconflag (window, lookup[i].icon, IF_SELECTED, IF_SELECTED));
+        }
+        else
+        {
+            ER (dbox_iconflag (window, lookup[i].icon, IF_SELECTED, 0));
+        }
+    }
+    
+    /* Do the title and maxlength fields */
+
+    block
+    {
+        char *s = flags & WF_TITLE ? (char *) res->window.titledata[0] : "";
+        int n = flags & WF_TITLE ? res->window.titledata[2] : 0;
+
+        ER ( dbox_setstring (window, I_WINFLAGS_TITLE, s) );
+        ER ( dbox_setint (window, I_WINFLAGS_MAX, n) );
+    }
+
+    /* And the button type */
+    winflags_set_but_display (window, I_WINFLAGS_BUTTYPE, IF_GET_FIELD(TYPE, res->window.workareaflags));
+
+    return enable_disable ();
+}
+
+
+
+/*
+ * Set all window flags from the icon settings.  Activated by the OK
+ * button.  This has to delete and re-create the window (but only
+ * if it is open).
+ */
+
+static error * set_values (ResourcePtr res)
+{
+    unsigned int flags = (unsigned int) WF_NEWSTYLE;
+    int i;
+
+    dprintf("Flags initially %x\n" _ flags);
+
+    /* Do the option/radio buttons */
+
+    for (i = 0; i < NUMBER(lookup); i++)
+    {
+        if (lookup[i].mask == 0)
+            continue;
+        if (dbox_getflags (window, lookup[i].icon) & IF_SELECTED)
+            flags |= lookup[i].value;
+    }
+
+    dprintf("Flags finally %x\n" _ flags);
+    
+    /* Do the title and maxlength */
+
+    if (flags & WF_TITLE)
+    {
+        /* Check title */
+        char *s = dbox_getstring (window, I_WINFLAGS_TITLE);
+        int max = atoi (dbox_getstring(window, I_WINFLAGS_MAX));
+
+        if (strlen(s) + 1 > max)
+        {
+            max = strlen(s) + 1;
+            ER ( dbox_setint (window, I_WINFLAGS_MAX, max) );
+        }
+
+        if (max != res->window.titledata[2])
+        {
+            /* Malloc failure? */
+            char *new = malloc (max);
+            free((char *) res->window.titledata[0]);
+            res->window.titledata[0] = (int) new;
+        }
+        
+        strcpy ((char *) res->window.titledata[0], s);
+        res->window.titledata[2] = max;
+
+        /* NB: The validation string is carried around,
+         * uneditable, until the user turns the title
+         * option off, when the string is disposed of.
+         */
+
+        res->window.titleflags &= ~IF_IST;
+        res->window.titleflags |= IF_INDIR | IF_TEXT;
+    }
+    else
+    {
+        /*
+         * No title; free the buffers if necessary
+         */
+        free ((char *) res->window.titledata[0]);
+        if (res->window.titledata[1] != -1)
+            free ((char *) res->window.titledata[1]);
+        res->window.titledata[0] = res->window.titledata[2] = 0;
+        res->window.titledata[1] = -1;
+        res->window.titleflags &= ~IF_IST;
+    }
+
+    /*
+     * Do the button type
+     */
+
+    IF_SET_FIELD(TYPE, res->window.workareaflags, winflags_get_but_display(window, I_WINFLAGS_BUTTYPE));
+
+    /*
+     * Now if the window is open, we need to delete/recreate it
+     * to effect the change as far as the window manager is concerned.
+     */
+
+
+    if (res->window.handle != -1)
+    {
+        WindowRec temp;
+
+        /* Get 'behind' handle afresh */
+        _swix(Wimp_GetWindowState, _IN(1),
+              &res->window);
+
+        res->window.flags = flags;
+        temp = res->window;
+
+        if (res->window.colours.workBG == 0xff)
+            temp.colours.workBG = 0;
+
+        ER ( registry_deregister_window (res->window.handle) );
+        ER ( _swix(Wimp_DeleteWindow, _IN(1),
+                   &res->window) );
+
+        /* Create window, doctoring some of the flag values */
+        temp.flags &= ~(WF_AUTO_REDRAW | WF_BACKDROP);
+        temp.workareaflags = 10 << 12;
+        ER ( _swix(Wimp_CreateWindow, _IN(1) | _OUT(0),
+                   &temp.visarea,
+                   &res->window.handle) );
+        ER ( registry_register_window(res->window.handle, Template, (void *) res) );
+
+        /* Raise */
+        ER ( _swix(Wimp_OpenWindow, _IN(1),
+                   &res->window) );
+    }
+    else
+        res->window.flags = flags;
+
+    return document_modified (res->owner, TRUE);
+}
+
+
+    
+/*
+ * Open window (and/or bring it to the top)
+ */
+
+error * winflags_show_window ()
+{
+    winflags_retitle (disp);
+    window->behind = -1;
+    ER ( _swix(Wimp_OpenWindow, _IN(1),
+               window) );
+    open = TRUE;
+    return NULL;
+}
+
+
+
+static error * shade_all (Bool shaded)
+{
+    unsigned int eor = shaded ? IF_SHADED : 0;
+    int i;
+    for (i = 0; i < NUMBER(lookup); i++)
+    {
+        ER ( dbox_iconflag (window, lookup[i].icon, IF_SHADED, eor) );
+    }
+    return NULL;
+}
+
+
+
+/*
+ * If win is NULL, then shade the whole window.
+ * If win is non-NULL, unshade and setup the window.
+ * Don't auto-open it though.
+ */
+
+error * winflags_select (ResourcePtr res)
+{
+    dprintf("winflags_select %x\n" _ (int) res);
+
+    if (res == disp)
+    {
+        return NULL;
+    }
+
+    else if (res && !disp)
+    {
+        dprintf("Unshading window\n");
+        ER ( shade_all (FALSE) );
+    }
+    else if (!res && disp)
+    {
+        dprintf("Shading window\n");
+        ER ( shade_all (TRUE) );
+    }
+
+    disp = res;
+    winflags_retitle (res);    
+
+    if (disp)
+    {
+        ER ( get_values (disp) );
+    }
+    return NULL;
+}
+
+
+
+/*
+ * Change the titlebar of the winflags window.  This is called
+ * when winflags_select, and also when the user renames a resource.
+ * NB: the name field of res is expected to fit!  (and should).
+ */
+
+error * winflags_retitle (ResourcePtr res)
+{
+    char *title = (char *) window->titledata[0];
+    if (res)
+        sprintf (title + nameindex, " - %s", res->name);
+    else
+        title[nameindex] = 0;
+
+    if (open)
+    {
+        WindowRedrawRec win, vis;
+        win.handle = vis.handle = window->handle;
+        ER ( _swix(Wimp_GetWindowOutline, _IN(1),
+                   &win) );
+        ER ( _swix(Wimp_GetWindowState, _IN(1),
+                   &vis) );
+dprintf("FORCE of %d %d %d %d\n" _ win.visarea.minx _ vis.visarea.maxy _ win.visarea.maxx _ win.visarea.maxy);
+        ER ( _swix(Wimp_ForceRedraw, _INR(0,4),
+                   -1, win.visarea.minx, vis.visarea.maxy, win.visarea.maxx, win.visarea.maxy) );
+    }
+    return NULL;
+}
+
+
+/*
+ * Button menu callback.  Called with choice == NULL if the menu is
+ * being cancelled.
+ */
+
+static error * callback (MenuPtr menu, int *choice, void *closure, Bool reopen)
+{
+    if (choice != NULL)
+    {
+        dprintf("BUTTON MENU HIT %d\n" _ *choice);
+        if (*choice >= 0)
+        {
+            winflags_set_but_display (window, I_WINFLAGS_BUTTYPE, *choice);
+            if (reopen)
+                menu_tick_menu (menu, *choice);
+        }
+    }
+    return NULL;
+}
+
+
+/*
+ * Receive mouse clicks.
+ */
+
+error * winflags_mouse_click (MouseClickPtr mouse, unsigned int modifiers)
+{
+    switch (mouse->buttons)
+    {
+    case MB_SINGLECLICK(MB_SELECT):
+    case MB_SINGLECLICK(MB_ADJUST):
+        dprintf("Single click on button %d\n" _ mouse->iconhandle);
+        ER ( enable_disable() );
+        break;
+
+    case MB_CLICK(MB_SELECT):
+    case MB_CLICK(MB_ADJUST):
+        dprintf("click on button %d\n" _ mouse->iconhandle);
+        ER ( enable_disable() );
+
+        switch (mouse->iconhandle)
+        {
+        case I_WINFLAGS_OK:
+            if (disp)
+            {
+                ER ( set_values (disp) );
+                if (mouse->buttons == MB_CLICK(MB_SELECT))
+                {
+                    ER ( winflags_close_window () );
+                }
+            }
+            break;
+        case I_WINFLAGS_CANCEL:
+            ER ( winflags_close_window () );
+            break;
+        case I_WINFLAGS_BUTTYPE_MENU:
+            menu_tick_menu (butmenu, winflags_get_but_display (window, I_WINFLAGS_BUTTYPE));
+            ER ( menu_post (butmenu, &mouse->position, FALSE, callback, NULL) );
+            break;
+        }
+        break;
+
+    case MB_MENU:
+        switch (mouse->iconhandle)
+        {
+        case I_WINFLAGS_BUTTYPE_MENU:
+        case I_WINFLAGS_BUTTYPE:
+            menu_tick_menu (butmenu, winflags_get_but_display (window, I_WINFLAGS_BUTTYPE));
+            ER ( menu_post (butmenu, &mouse->position, FALSE, callback, NULL) );
+            break;
+        }
+        break;
+    }
+    return NULL;
+}
+
+
+
+/*
+ * Close window if open.  Leave the window created though.
+ */
+
+error * winflags_close_window ()
+{
+    if (open)
+    {
+        ER ( _swix(Wimp_CloseWindow, _IN(1),
+                   window) );
+        ER ( winflags_select (NULL) );
+        open = FALSE;
+    }
+    return NULL;
+}
+
+
+
+/* 
+ * Respond to open_window_request on the winflags window.
+ * Note: the 'win' parameter is only a partial window structure
+ * (just the fields returned with Open_Window_Request).
+ */
+
+error * winflags_open_window (WindowPtr win)
+{
+    window->visarea = win->visarea;
+    window->scrolloffset = win->scrolloffset;
+    window->behind = win->behind;
+    return _swix(Wimp_OpenWindow, _IN(1),
+                 window);
+}
+
+
+
+/*
+ * Check for RETURN in the window.
+ */
+
+error * winflags_key_pressed (KeyPressPtr key, Bool *consumed)
+{
+    *consumed = FALSE;
+    if (key->caret.windowhandle == window->handle &&
+        key->code == 0x0d)
+    {
+        *consumed = TRUE;
+        if (disp)
+        {
+            ER ( set_values (disp) );
+        }
+        ER ( winflags_close_window () );
+    }
+    return NULL;
+}
+
+
+
+ResourcePtr winflags_current ()
+{
+    return disp;
+}

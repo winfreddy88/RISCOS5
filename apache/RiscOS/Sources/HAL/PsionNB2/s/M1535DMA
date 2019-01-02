@@ -1,0 +1,684 @@
+; Copyright 2005 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+
+
+; HAL code for the DMA controller in the M1535+ PCI Bridge / Super I/O chip
+
+; For compatibility with PCs, we are using the channels as follows:
+;   DMA channel  Used for
+;    0 (slave)    -
+;    1 (slave)    Parallel
+;    2 (slave)    Floppy
+;    3 (slave)    FIR (IrDA)
+;    4 (master)   Slave DMA controller
+;    5 (master)   -
+;    6 (master)   -
+;    7 (master)   -
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:APCS.<APCS>
+        GET     Hdr:System
+
+        GET     Hdr:DMA
+        GET     Hdr:DMADevice
+        GET     Hdr:OSEntries
+
+        GET     hdr.StaticWS
+
+        EXPORT  M1535DMA_Init
+
+        IMPORT  memcpy
+        IMPORT  PCI_TungstenSecondaryBus
+
+        MACRO
+        CallOS  $entry
+        ASSERT  $entry <= HighestOSEntry
+        MOV     lr, pc
+        LDR     pc, OSentries + 4*$entry
+        MEND
+
+
+
+; Relevant I/O space addresses
+; First 16 locations are compatible way back to the Intel 8237A DMA controller
+
+                ^       &000
+Ch0BaseAddr     #       0       ; &000 w  16 bit (double byte accesses)
+Ch0CurrentAddr  #       1       ; &000 r  16 bit (double byte accesses)
+Ch0BaseCount    #       0       ; &001 w  16 bit (double byte accesses)
+Ch0CurrentCount #       1       ; &001 r  16 bit (double byte accesses)
+Ch1BaseAddr     #       0       ; &002 w  16 bit (double byte accesses)
+Ch1CurrentAddr  #       1       ; &002 r  16 bit (double byte accesses)
+Ch1BaseCount    #       0       ; &003 w  16 bit (double byte accesses)
+Ch1CurrentCount #       1       ; &003 r  16 bit (double byte accesses)
+Ch2BaseAddr     #       0       ; &004 w  16 bit (double byte accesses)
+Ch2CurrentAddr  #       1       ; &004 r  16 bit (double byte accesses)
+Ch2BaseCount    #       0       ; &005 w  16 bit (double byte accesses)
+Ch2CurrentCount #       1       ; &005 r  16 bit (double byte accesses)
+Ch3BaseAddr     #       0       ; &006 w  16 bit (double byte accesses)
+Ch3CurrentAddr  #       1       ; &006 r  16 bit (double byte accesses)
+Ch3BaseCount    #       0       ; &007 w  16 bit (double byte accesses)
+Ch3CurrentCount #       1       ; &007 r  16 bit (double byte accesses)
+SlaveCommand    #       0       ; &008 w
+SlaveStatus     #       1       ; &008 r
+SlaveRequest    #       1       ; &009 w
+SlaveMaskBit    #       1       ; &00A w
+SlaveMode       #       1       ; &00B w
+SlaveBytePtr    #       1       ; &00C w  reset 16 bit register flip-flop
+SlaveMasterClear #      1       ; &00D w  same as hardware reset
+SlaveClearMask  #       1       ; &00E w  clear mask for all 4 channels
+SlaveMask       #       1       ; &00F wr (w on 8237A) read/write all 4 masks
+                ^       &081
+Ch2PageReg      #       1       ; &081 wr
+Ch3PageReg      #       1       ; &082 wr
+Ch1PageReg      #       4       ; &083 wr
+Ch0PageReg      #       2       ; &087 wr
+Ch6PageReg      #       1       ; &089 wr
+Ch7PageReg      #       1       ; &08A wr
+Ch5PageReg      #       4       ; &08B wr
+PageRegRefresh  #       1       ; &08F wr
+                ^       &0C0
+Ch4BaseAddr     #       0       ; &0C0 w  16 bit (double byte accesses)
+Ch4CurrentAddr  #       2       ; &0C0 r  16 bit (double byte accesses)
+Ch4BaseCount    #       0       ; &0C2 w  16 bit (double byte accesses)
+Ch4CurrentCount #       2       ; &0C2 r  16 bit (double byte accesses)
+Ch5BaseAddr     #       0       ; &0C4 w  16 bit (double byte accesses)
+Ch5CurrentAddr  #       2       ; &0C4 r  16 bit (double byte accesses)
+Ch5BaseCount    #       0       ; &0C6 w  16 bit (double byte accesses)
+Ch5CurrentCount #       2       ; &0C6 r  16 bit (double byte accesses)
+Ch6BaseAddr     #       0       ; &0C8 w  16 bit (double byte accesses)
+Ch6CurrentAddr  #       2       ; &0C8 r  16 bit (double byte accesses)
+Ch6BaseCount    #       0       ; &0CA w  16 bit (double byte accesses)
+Ch6CurrentCount #       2       ; &0CA r  16 bit (double byte accesses)
+Ch7BaseAddr     #       0       ; &0CC w  16 bit (double byte accesses)
+Ch7CurrentAddr  #       2       ; &0CC r  16 bit (double byte accesses)
+Ch7BaseCount    #       0       ; &0CE w  16 bit (double byte accesses)
+Ch7CurrentCount #       2       ; &0CE r  16 bit (double byte accesses)
+MasterCommand   #       0       ; &0D0 w
+MasterStatus    #       2       ; &0D0 r
+MasterRequest   #       2       ; &0D2 w
+MasterMaskBit   #       2       ; &0D4 w
+MasterMode      #       2       ; &0D6 w
+MasterBytePtr   #       2       ; &0D8 w  reset 16 bit register flip-flop
+MasterMasterClear #     2       ; &0DA w  same as hardware reset
+MasterClearMask #       2       ; &0DC w  clear mask for all 4 channels
+MasterMask      #       2       ; &0DE wr (w on 8237A) read/write all 4 masks
+                ^       &40B
+SlaveExtModeReg #       1       ; &40B w
+                ^       &481
+Ch2HighPageReg  #       1       ; &481 wr
+Ch3HighPageReg  #       1       ; &482 wr
+Ch1HighPageReg  #       4       ; &483 wr
+Ch0HighPageReg  #       2       ; &487 wr
+Ch6HighPageReg  #       1       ; &489 wr
+Ch7HighPageReg  #       1       ; &48A wr
+Ch5HighPageReg  #       1       ; &48B wr
+                ^       &4D6
+MasterExtModeReg #      1       ; &4D6 w
+
+
+Command_M2MEnable       *       1:SHL:0 ; memory-to-memory enable
+Command_AddrHold        *       1:SHL:1 ; channel 0/4 address hold enable
+Command_CtrlrDisable    *       1:SHL:2 ; controller disable
+Command_Compressed      *       1:SHL:3 ; compressed timing
+Command_RotPrior        *       1:SHL:4 ; rotating priority
+Command_ExtWrSel        *       1:SHL:5 ; extended write selection
+Command_DREQActiveLow   *       1:SHL:6 ; DREQ sense active low
+Command_DACKActiveHigh  *       1:SHL:7 ; DACK sense active high
+
+Status_Ch0TC            *       1:SHL:0 ; channel 0/4 has reached TC
+Status_Ch1TC            *       1:SHL:1 ; channel 1/5 has reached TC
+Status_Ch2TC            *       1:SHL:2 ; channel 2/6 has reached TC
+Status_Ch3TC            *       1:SHL:3 ; channel 3/7 has reached TC
+Status_Ch0Rq            *       1:SHL:4 ; channel 0/4 requesting service
+Status_Ch1Rq            *       1:SHL:5 ; channel 1/5 requesting service
+Status_Ch2Rq            *       1:SHL:6 ; channel 2/6 requesting service
+Status_Ch3Rq            *       1:SHL:7 ; channel 3/7 requesting service
+
+Request_ChMask          *       3:SHL:0 ; channel select field
+Request_SetNotClear     *       1:SHL:2 ; set (vs clear) request for channel
+
+MaskBit_ChMask          *       3:SHL:0 ; channel select field
+MaskBit_SetNotClear     *       1:SHL:2 ; set (vs clear) mask for channel
+
+Mode_ChMask             *       3:SHL:0 ; channel select field
+Mode_TransType_Verify   *       0:SHL:2 ; set channel to do verify transfer
+Mode_TransType_Write    *       1:SHL:2 ; set channel to write *memory*
+Mode_TransType_Read     *       2:SHL:2 ; set channel to read *memory*
+Mode_TransTypeMask      *       3:SHL:2
+Mode_AutoInit           *       1:SHL:4 ; autoinitialisation enable for channel
+Mode_AddrDecNotInc      *       1:SHL:5 ; decrement address for channel
+Mode_Mode_Demand        *       0:SHL:6 ; set channel to use demand mode
+Mode_Mode_Single        *       1:SHL:6 ; set channel to use single mode
+Mode_Mode_Block         *       2:SHL:6 ; set channel to use block mode
+Mode_Mode_Cascade       *       3:SHL:6 ; set channel to use cascade mode
+Mode_ModeMask           *       3:SHL:6
+
+ExtModeReg_ChMask       *       3:SHL:0 ; channel select field
+ExtModeReg_AdrMode_8b   *       0:SHL:2 ; use 8-bit I/O, count by bytes
+ExtModeReg_AdrMode_16w  *       1:SHL:2 ; use 16-bit I/O, count by words
+ExtModeReg_AdrMode_32b  *       2:SHL:2 ; use 32-bit I/O, count by bytes
+ExtModeReg_AdrMode_16b  *       3:SHL:2 ; use 16-bit I/O, count by bytes
+ExtModeReg_AdrModeMask  *       3:SHL:2
+ExtModeReg_Timing_ISA   *       0:SHL:4 ; use ISA-compatible timing
+ExtModeReg_Timing_A     *       1:SHL:4 ; use type A timing
+ExtModeReg_Timing_B     *       2:SHL:4 ; use type B timing
+ExtModeReg_Timing_Burst *       3:SHL:4 ; use burst DMA mode
+ExtModeReg_TimingMask   *       3:SHL:4
+ExtModeReg_NotTCOut     *       1:SHL:6 ; clear => TC is output for channel
+ExtModeReg_StopDisable  *       1:SHL:7 ; disable stop register
+
+
+        AREA    |Asm$$Code|, CODE, READONLY, PIC
+
+M1535DMA_Init
+        Push    "v1-v3,lr"
+        ADR     v1, M1535DMAWS
+        MOV     a1, v1
+        ADR     a2, ControllerTemplate
+        MOV     a3, #M1535DMAC_DeviceSize
+        BL      memcpy
+
+        LDR     v3, [v1, #HALDevice_Location]
+        BL      PCI_TungstenSecondaryBus
+        ORR     v3, v3, a1, LSL #16
+        STR     v3, [v1, #HALDevice_Location]
+
+        ADD     a2, v1, #M1535DMAC_DeviceSize
+        ADD     a2, a2, #(M1535DMADevices - 1) * M1535DMA_DeviceSize
+        ADD     a3, v1, #:INDEX:M1535DMACPhysList
+        MOV     a4, #M1535DMADevices
+01      SUBS    a4, a4, #1
+        STRPL   a2, [a3], #4
+        SUBPL   a2, a2, #M1535DMA_DeviceSize
+        BPL     %BT01
+
+        MOV     a2, v1
+        MOV     a1, #0
+        CallOS  OS_AddDevice
+
+        ADR     v1, M1535DMAWS + M1535DMAC_DeviceSize
+        MOV     v2, #(M1535DMADevices - 1) * 2  ; makes LDRH easier
+10      MOV     a1, v1
+        ADR     a2, ChannelTemplate
+        MOV     a3, #M1535DMA_DeviceSize
+        BL      memcpy
+
+        STR     v3, [a1, #HALDevice_Location]
+        ADR     lr, M1535DMADescList
+        LDRB    a4, [lr, v2, LSR #1]
+        ADD     lr, lr, a4
+        STR     lr, [a1, #HALDevice_Description]
+        ADR     lr, M1535DMAWS          ; sb-relative
+        STR     lr, [a1, #HALDevice_DMAController]
+        LDR     lr, PCI_IO_Address      ; sb-relative
+        STR     lr, M1535DMAIOBase      ; a1-relative
+        ADRL    a3, M1535DMAPageRegList
+        LDRH    a3, [a3, v2]
+        ADD     a3, lr, a3
+        STR     a3, M1535DMAPageReg     ; a1-relative
+        ADRL    a3, M1535DMAHighPageRegList
+        LDRH    a3, [a3, v2]
+        ADD     a3, lr, a3
+        STR     a3, M1535DMAHighPageReg ; a1-relative
+        ADRL    lr, M1535DMAChannelList
+        LDRB    lr, [lr, v2, LSR #1]
+        AND     a4, lr, #3
+        STRB    a4, M1535DMAChannel     ; a1-relative
+        MOV     a4, lr, LSR #2
+        STRB    a4, M1535DMAMaster      ; a1-relative
+
+        MOV     a2, a1
+        MOV     a1, #0
+        CallOS  OS_AddDevice
+
+        SUBS    v2, v2, #2
+        ADDPL   v1, v1, #M1535DMA_DeviceSize
+        BPL     %BT10
+        Pull    "v1-v3,pc"
+
+; DMA controller HAL device
+
+ControllerTemplate
+        DCW     HALDeviceType_SysPeri + HALDeviceSysPeri_DMAC
+        DCW     HALDeviceID_DMAC_M1535
+        DCD     HALDeviceBus_Exp + HALDeviceExpBus_PCI + 2:SHL:8
+        DCD     0               ; API version
+        DCD     M1535DMACDesc
+        DCD     0               ; Address - N/A
+        %       12              ; Reserved
+        DCD     M1535DMACActivate
+        DCD     M1535DMACDeactivate
+        DCD     M1535DMACReset
+        DCD     M1535DMACSleep
+        DCD     -1              ; Device
+        DCD     0               ; TestIRQ cannot be called
+        %       8
+        DCD     M1535DMACFeatures
+        DCD     M1535DMACEnumerate
+        DCD     M1535DMACAllocate
+        DCD     M1535DMACDeallocate
+        ASSERT  (.-ControllerTemplate) = HALDevice_DMAC_Size
+        %       4 * M1535DMADevices
+        DCB     0, 0
+        ALIGN
+
+        ASSERT  (.-ControllerTemplate) = M1535DMAC_DeviceSize
+
+; DMA physical channel HAL device
+
+ChannelTemplate
+        ; Public interface
+        DCW     HALDeviceType_SysPeri + HALDeviceSysPeri_DMAB
+        DCW     HALDeviceID_DMAB_M1535
+        DCD     0               ; same location as controller
+        DCD     0               ; API version
+        DCD     0               ; Description
+        DCD     0               ; Address - N/A
+        %       12              ; Reserved
+        DCD     M1535DMAActivate
+        DCD     M1535DMADeactivate
+        DCD     M1535DMAReset
+        DCD     M1535DMASleep
+        DCD     -1              ; Device
+        DCD     0               ; TestIRQ cannot be called
+        %       8
+        DCD     M1535DMAFeatures
+        DCD     0               ; DMA controller device
+        DCD     M1535DMAAbort
+        DCD     M1535DMASetOptions
+        DCD     M1535DMASetCurrentTransfer
+        DCD     M1535DMASetNextTransfer
+        DCD     M1535DMATransferState
+        DCD     M1535DMAIRQClear
+        DCD     M1535DMAStatus
+        DCD     M1535DMASetCurrentTransfer2
+        DCD     M1535DMASetNextTransfer2
+        DCD     M1535DMATransferState2
+        ASSERT  (.-ChannelTemplate) = HALDevice_DMA_Size
+        ; Private interface
+        DCD     0
+        DCD     0
+        DCD     0
+        DCD     0
+        DCD     0
+        DCB     0, 0
+        ALIGN
+
+        ASSERT  (.-ChannelTemplate) = M1535DMA_DeviceSize
+
+M1535DMACDesc
+        =       "Acer M1535+ legacy DMA controller", 0
+        ALIGN
+
+M1535DMADescList
+        DCB     %FT00 - M1535DMADescList
+        DCB     %FT01 - M1535DMADescList
+        DCB     %FT02 - M1535DMADescList
+        DCB     %FT03 - M1535DMADescList
+        DCB     %FT05 - M1535DMADescList
+        DCB     %FT06 - M1535DMADescList
+        DCB     %FT07 - M1535DMADescList
+00
+        =       "Acer M1535+ legacy DMA channel 0", 0
+01
+        =       "Acer M1535+ legacy DMA channel 1", 0
+02
+        =       "Acer M1535+ legacy DMA channel 2", 0
+03
+        =       "Acer M1535+ legacy DMA channel 3", 0
+05
+        =       "Acer M1535+ legacy DMA channel 5", 0
+06
+        =       "Acer M1535+ legacy DMA channel 6", 0
+07
+        =       "Acer M1535+ legacy DMA channel 7", 0
+
+M1535DMAChannelList
+        DCB     0, 1, 2, 3, 5, 6, 7
+
+        ALIGN   2
+
+M1535DMAPageRegList
+        DCW     Ch0PageReg
+        DCW     Ch1PageReg
+        DCW     Ch2PageReg
+        DCW     Ch3PageReg
+        DCW     Ch5PageReg
+        DCW     Ch6PageReg
+        DCW     Ch7PageReg
+
+M1535DMAHighPageRegList
+        DCW     Ch0HighPageReg
+        DCW     Ch1HighPageReg
+        DCW     Ch2HighPageReg
+        DCW     Ch3HighPageReg
+        DCW     Ch5HighPageReg
+        DCW     Ch6HighPageReg
+        DCW     Ch7HighPageReg
+
+        ALIGN
+
+
+; DMA controller device
+; ---------------------
+
+M1535DMACActivate
+        LDR     a4, [a1, #M1535DMAC_DeviceSize + :INDEX: M1535DMAIOBase]
+        STRB    a4, [a4, #SlaveMasterClear]
+        STRB    a4, [a4, #MasterMasterClear]
+        MOV     a2, #Mode_Mode_Demand :OR: 0
+        STRB    a2, [a4, #SlaveMode]
+        MOV     a2, #Mode_Mode_Cascade :OR: 0
+        STRB    a2, [a4, #MasterMode]
+        MOV     a2, #Mode_Mode_Demand :OR: 1
+        STRB    a2, [a4, #SlaveMode]
+        STRB    a2, [a4, #MasterMode]
+        MOV     a2, #Mode_Mode_Demand :OR: 2
+        STRB    a2, [a4, #SlaveMode]
+        STRB    a2, [a4, #MasterMode]
+        MOV     a2, #Mode_Mode_Demand :OR: 3
+        STRB    a2, [a4, #SlaveMode]
+        STRB    a2, [a4, #MasterMode]
+        MOV     a2, #&F
+        STRB    a2, [a4, #SlaveMask]
+        MOV     a2, #&E
+        STRB    a2, [a4, #MasterMask]           ; cascade channel never masked
+        MOV     a2, #Command_RotPrior
+        STRB    a2, [a4, #SlaveCommand]
+        STRB    a2, [a4, #MasterCommand]
+        MOV     a2, #ExtModeReg_Timing_Burst :OR: ExtModeReg_AdrMode_8b :OR: 0
+        STRB    a2, [a4, #SlaveExtModeReg]
+        MOV     a2, #ExtModeReg_Timing_Burst :OR: ExtModeReg_AdrMode_8b :OR: 1
+        STRB    a2, [a4, #SlaveExtModeReg]
+        STRB    a2, [a4, #MasterExtModeReg]
+        MOV     a2, #ExtModeReg_Timing_Burst :OR: ExtModeReg_AdrMode_8b :OR: 2
+        STRB    a2, [a4, #SlaveExtModeReg]
+        STRB    a2, [a4, #MasterExtModeReg]
+        MOV     a2, #ExtModeReg_Timing_Burst :OR: ExtModeReg_AdrMode_8b :OR: 3
+        STRB    a2, [a4, #SlaveExtModeReg]
+        STRB    a2, [a4, #MasterExtModeReg]
+        MOV     a2, #&F
+        STRB    a2, M1535DMACSlaveOverrun
+        STRB    a4, M1535DMACMasterOverrun
+        MOV     a1, #1
+        MOV     pc, lr
+
+M1535DMACDeactivate
+        ; Just do the same as on a reset...
+M1535DMACReset
+        LDR     a4, [a1, #M1535DMAC_DeviceSize + :INDEX: M1535DMAIOBase]
+        STRB    a4, [a4, #MasterMasterClear]
+        STRB    a4, [a4, #SlaveMasterClear]
+        MOV     pc, lr
+
+M1535DMACSleep
+        ; Nothing we can do
+        MOV     a1, #0
+        MOV     pc, lr
+
+M1535DMACFeatures
+        MOV     a1, #0
+        MOV     pc, lr
+
+M1535DMACEnumerate
+        ADR     a1, M1535DMACPhysList
+        MOV     a2, #M1535DMADevices
+        MOV     pc, lr
+
+M1535DMACAllocate
+        MOV     a3, #0
+        SUB     a2, a2, #&100
+        TEQ     a2, #DMALC_Parallel - &100
+        ADDEQ   a3, a1, #M1535DMAC_DeviceSize + (6-1) * M1535DMA_DeviceSize
+        TEQ     a2, #DMALC_Floppy - &100
+        ADDEQ   a3, a1, #M1535DMAC_DeviceSize + (6-2) * M1535DMA_DeviceSize
+        TEQ     a2, #DMALC_IrDA0 - &100
+        ADDEQ   a3, a1, #M1535DMAC_DeviceSize + (6-3) * M1535DMA_DeviceSize
+        MOV     a1, a3
+        MOV     pc, lr
+
+M1535DMACDeallocate
+        MOV     pc, lr
+
+
+; DMA channel device
+; ------------------
+
+M1535DMAActivate
+        MOV     a1, #1
+        MOV     pc, lr
+
+M1535DMADeactivate
+        Push    "v1,v2,lr"
+        LDRB    a3, M1535DMAMaster
+        LDR     a4, M1535DMAIOBase
+        LDRB    v1, M1535DMAChannel
+        LDR     v2, [a1, #HALDevice_DMAController]
+        MOV     lr, #1
+        TEQ     a3, #1
+        MRS     a3, CPSR
+        ORR     a2, a3, #I32_bit
+        MOV     v1, lr, LSL v1
+        BNE     %FT40
+        BEQ     %FT20
+
+10      LDRB    lr, [a4, #MasterStatus]
+        ORR     ip, ip, lr
+        STRB    ip, [v2, #:INDEX: M1535DMACMasterOverrun]
+        MSR     CPSR_c, a3              ; give interrupts a chance
+20      MSR     CPSR_c, a2              ; interrupts off
+        LDRB    ip, [v2, #:INDEX: M1535DMACMasterOverrun]
+        TST     ip, v1
+        BEQ     %BT10                   ; loop until channel has overrun
+        MSR     CPSR_c, a3
+        LDRB    v1, M1535DMAChannel
+        ORR     v1, v1, #Request_SetNotClear
+        STRB    v1, [a4, #MasterMaskBit]
+        Pull    "v1,v2,pc"
+
+30      LDRB    lr, [a4, #SlaveStatus]
+        ORR     ip, ip, lr
+        STRB    ip, [v2, #:INDEX: M1535DMACSlaveOverrun]
+        MSR     CPSR_c, a3              ; give interrupts a chance
+40      MSR     CPSR_c, a2              ; interrupts off
+        LDRB    ip, [v2, #:INDEX: M1535DMACSlaveOverrun]
+        TST     ip, v1
+        BEQ     %BT30                   ; loop until channel has overrun
+        MSR     CPSR_c, a3
+        LDRB    v1, M1535DMAChannel
+        ORR     v1, v1, #Request_SetNotClear
+        STRB    v1, [a4, #SlaveMaskBit]
+        Pull    "v1,v2,pc"
+
+M1535DMAReset
+        MOV     pc, lr
+
+M1535DMASleep
+        ; Nothing we can do
+        MOV     a1, #0
+        MOV     pc, lr
+
+M1535DMAFeatures
+        MOV     a1, #0
+        MOV     pc, lr
+
+M1535DMAAbort
+        Push    "lr"
+        LDRB    a2, M1535DMAMaster
+        LDRB    a3, M1535DMAChannel
+        LDR     a4, M1535DMAIOBase
+        ORR     a3, a3, #Request_SetNotClear
+        TEQ     a2, #1
+        STRNEB  a3, [a4, #SlaveMaskBit]
+        STREQB  a3, [a4, #MasterMaskBit]
+        Pull    "pc"
+
+M1535DMASetOptions
+        Push    "v1,lr"
+        LDR     a4, M1535DMAIOBase
+        LDRB    v1, M1535DMAChannel
+        LDRB    lr, M1535DMAMaster
+        TST     a2, #DMASetOptionsFlag_Write
+        ORRNE   a3, v1, #Mode_Mode_Demand :OR: Mode_TransType_Read
+        ORREQ   a3, v1, #Mode_Mode_Demand :OR: Mode_TransType_Write
+        TEQ     lr, #1
+        STRNEB  a3, [a4, #SlaveMode]
+        STREQB  a3, [a4, #MasterMode]
+        AND     ip, a2, #DMASetOptionsMask_Width
+        CMP     ip, #2 :SHL: DMASetOptionsShift_Width
+        ORRLO   a3, v1, #ExtModeReg_AdrMode_8b
+        ORREQ   a3, v1, #ExtModeReg_AdrMode_16b
+        ORRHI   a3, v1, #ExtModeReg_AdrMode_32b
+        TST     a2, #DMASetOptionsFlag_NoBursts
+        ORRNE   a3, a3, #ExtModeReg_Timing_ISA
+        ORREQ   a3, a3, #ExtModeReg_Timing_Burst
+        TEQ     lr, #1
+        STRNEB  a3, [a4, #SlaveExtModeReg]
+        STREQB  a3, [a4, #MasterExtModeReg]
+        Pull    "v1,pc"
+
+M1535DMASetCurrentTransfer
+        Push    "v1,v2,lr"
+        LDRB    v1, M1535DMAChannel
+        LDRB    lr, M1535DMAMaster
+        STR     a2, M1535DMABaseAddr
+        STR     a3, M1535DMABaseCount
+        SUB     a3, a3, #1
+        MRS     ip, CPSR
+        ORR     a4, ip, #I32_bit
+        MSR     CPSR_c, a4
+        LDR     a4, M1535DMAIOBase
+        TEQ     lr, #1
+        ASSERT  :INDEX: Ch0BaseAddr = 0
+        MOV     v2, a4
+        ADDEQ   v2, v2, #:INDEX: Ch4BaseAddr - :INDEX: Ch0BaseAddr
+        ADD     v2, v2, v1, LSL #1      ; channels offset by 2 bytes for slave
+        ADDEQ   v2, v2, v1, LSL #1      ; channels offset by 4 bytes for master
+        STRNEB  lr, [a4, #SlaveBytePtr]
+        STREQB  lr, [a4, #MasterBytePtr]
+        STRB    a2, [v2]                ; lsb first
+        MOV     a2, a2, LSR #8
+        STRB    a2, [v2], #1
+        ADDEQ   v2, v2, #1
+        STRNEB  lr, [a4, #SlaveBytePtr]
+        STREQB  lr, [a4, #MasterBytePtr]
+        STRB    a3, [v2]
+        MOV     a3, a3, LSR #8
+        STRB    a3, [v2]
+        MSR     CPSR_c, ip
+        MOV     a2, a2, LSR #8
+        LDR     v2, M1535DMAPageReg
+        STRB    a2, [v2]
+        MOV     a2, a2, LSR #8
+        LDR     v2, M1535DMAHighPageReg
+        STRB    a2, [v2]
+        STRB    a2, [a4, #PageRegRefresh]
+        ; Now we can set it going...
+        MOV     a2, #1
+        LDR     a3, [a1, #HALDevice_DMAController]
+        MOV     lr, a2, LSL v1
+        ORR     a2, ip, #I32_bit
+        MSR     CPSR_c, a2
+        LDRNEB  a2, [a3, #:INDEX: M1535DMACSlaveOverrun]!
+        LDREQB  a2, [a3, #:INDEX: M1535DMACMasterOverrun]!
+        BIC     a2, a2, lr              ; no longer overrunning
+        STRB    a2, [a3]
+        MSR     CPSR_c, ip
+        STRNEB  v1, [a4, #SlaveMaskBit] ; unmask DMA request
+        STREQB  v1, [a4, #MasterMaskBit]
+        Pull    "v1,v2,pc"
+
+M1535DMASetNextTransfer
+        ; N/A
+        MOV     pc, lr
+
+M1535DMATransferState
+        Push    "lr"
+        LDRB    a2, M1535DMAChannel
+        LDRB    a3, M1535DMAMaster
+        TEQ     a3, #1
+        MRS     lr, CPSR
+        ORR     a4, lr, #I32_bit
+        MSR     CPSR_c, a4
+        LDR     a4, M1535DMAIOBase
+        ASSERT  :INDEX: Ch0BaseAddr = 0
+        MOV     ip, a4
+        ADDEQ   ip, ip, #:INDEX: Ch4BaseAddr - :INDEX: Ch0BaseAddr
+        ADD     ip, ip, a2, LSL #1      ; channels offset by 2 bytes for slave
+        ADDEQ   ip, ip, a2, LSL #1      ; channels offset by 4 bytes for master
+        STRNEB  lr, [a4, #SlaveBytePtr]
+        STREQB  lr, [a4, #MasterBytePtr]
+        LDRB    a2, [ip]
+        LDRB    a3, [ip], #1
+        ADDEQ   ip, ip, #1
+        STRNEB  lr, [a4, #SlaveBytePtr]
+        STREQB  lr, [a4, #MasterBytePtr]
+        LDRB    a4, [ip]
+        LDRB    ip, [ip]
+        MSR     CPSR_c, lr
+        CMP     a4, a2                  ; if second read of lsb is higher then
+        ORRHI   a2, a4, ip, LSL #8      ; we've wrapped during or after the first
+                                        ; read, so we must rely on the second read
+        ORRLS   a2, a2, a3, LSL #8      ; else first read was valid
+        ADD     a2, a2, #1              ; convert back to a countdown to 0
+        BIC     a2, a2, #1:SHL:16       ; clear bit 16 if hardware returned &FFFF
+        ADR     a3, M1535DMABaseAddr
+        ASSERT  :INDEX: M1535DMABaseCount = :INDEX: M1535DMABaseAddr + 4
+        LDMIA   a3, {a3, a4}
+        SUB     a1, a4, a2
+        ADD     a1, a3, a1
+        Pull    "pc"
+
+M1535DMAIRQClear
+        ; N/A
+        MOV     pc, lr
+
+M1535DMAStatus
+        Push    "lr"
+        LDRB    a2, M1535DMAChannel
+        LDRB    a3, M1535DMAMaster
+        MOV     a4, #1
+        LDR     lr, [a1, #HALDevice_DMAController]
+        MOV     a2, a4, LSL a2
+        LDR     a4, M1535DMAIOBase
+        TEQ     a3, #1
+        ADDNE   lr, lr, #:INDEX: M1535DMACSlaveOverrun
+        ADDEQ   lr, lr, #:INDEX: M1535DMACMasterOverrun
+        ADDNE   a4, a4, #SlaveStatus
+        ADDEQ   a4, a4, #MasterStatus
+        MRS     a3, CPSR
+        ORR     ip, a3, #I32_bit
+        MSR     CPSR_c, ip
+        LDRB    ip, [lr]
+        TST     ip, a2                  ; If not already in overrun state,
+        LDREQB  a4, [a4]                ; check to see if TC has been asserted
+        ORREQ   ip, ip, a4              ; Staus register is self-clearing
+        STREQB  ip, [lr]                ; so we have to cache the results
+        MSR     CPSR_c, a3
+        ANDS    a1, ip, a2
+        MOVNE   a1, #DMAStatusFlag_Overrun
+        ORR     a1, a1, #DMAStatusFlag_NoUnstarted
+        Pull    "pc"
+
+M1535DMASetCurrentTransfer2
+M1535DMASetNextTransfer2
+M1535DMATransferState2
+        ; N/A
+        MOV     pc, lr
+
+
+        END

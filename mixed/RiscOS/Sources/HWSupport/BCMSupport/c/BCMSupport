@@ -1,0 +1,379 @@
+/*
+ * Copyright (c) 2016, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include "BCMSupportHdr.h"
+#include "swis.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stddef.h>
+#include "Global/HALEntries.h"
+#include "Global/Services.h"
+
+#include "globals.h"
+#include "mailbox.h"
+#include "errors.h"
+#include "cpuclock.h"
+
+void *private_word;
+int instance;
+
+MessagesFD messages;
+
+void *hal_sb;
+void *hal_irqenable;
+void *hal_irqdisable;
+void *hal_irqclear;
+retryfn retry;
+
+#ifdef STANDALONE
+extern void* Resources(void);
+#endif
+
+#define TEMP_BUFFER_SIZE 1024
+static void *temp_buffer;
+static uint32_t temp_buffer_phys;
+static volatile uint32_t temp_buffer_lock = 0; /* 0 = unlocked, 1 = locked */
+
+_kernel_oserror* module_init(const char *cmd_tail, int podule_base, void *pw)
+{
+	(void) cmd_tail;
+
+	_kernel_oserror* e = NULL;
+
+	synclib_init();
+
+	/* set up debugging */
+	debug_initialise(Module_Title, "", "");
+	debug_set_device(HAL_OUTPUT);
+	debug_set_unbuffered_files(TRUE);
+
+	instance = podule_base;
+
+	private_word = pw;
+
+	/* Get HAL entries */
+	e = _swix(OS_Hardware, _INR(8,9)|_OUTR(0,1), OSHW_LookupRoutine, EntryNo_HAL_IRQEnable, &hal_irqenable, &hal_sb);
+	if (!e) e = _swix(OS_Hardware, _INR(8,9)|_OUT(0), OSHW_LookupRoutine, EntryNo_HAL_IRQDisable, &hal_irqdisable); 
+	if (!e) e = _swix(OS_Hardware, _INR(8,9)|_OUT(0), OSHW_LookupRoutine, EntryNo_HAL_IRQClear, &hal_irqclear);
+	if (e)
+	{
+		return e;
+	} 
+
+	/* Set up messages */
+#ifdef STANDALONE
+	e = _swix(ResourceFS_RegisterFiles,_IN(0),Resources());
+	if(e)
+		goto error;
+#endif
+
+	e = _swix(MessageTrans_OpenFile,_INR(0,2),&messages,"Resources:$.Resources.BCMSupport.Messages",0);
+	if(e)
+		goto error1;
+
+	/* Claim the temp buffer */
+	e = _swix(PCI_RAMAlloc,_INR(0,2)|_OUTR(0,1),TEMP_BUFFER_SIZE,16,0,&temp_buffer,&temp_buffer_phys);
+	if(e)
+		goto error2;
+
+	/* Set up the correct retry function pointer
+	   On ARM11 we have to use CP15 WFI
+	   Newer Pi's are assumed to all be multi-core, so use WFE */
+	uint32_t midr;
+	__asm("MRC p15,0,midr,c0,c0,0");
+	if ((midr & 0xfff0) == 0xb760)
+	{
+		dprintf(("","Using retry_cp15\n"));
+		retry = retry_cp15;
+	}
+	else
+	{
+		dprintf(("","Using retry_wfe\n"));
+		retry = retry_wfe;
+	}
+
+	e = mailbox_init();
+
+	if(!e)
+	{
+		return NULL;
+	}
+
+
+	_swix(PCI_RAMFree,_IN(0),temp_buffer);
+error2:
+	_swix(MessageTrans_CloseFile,_IN(0),&messages);
+error1:
+#ifdef STANDALONE
+	_swix(ResourceFS_DeregisterFiles,_IN(0),Resources());
+error:
+#endif
+	return e;
+}
+
+_kernel_oserror *module_final(int fatal, int podule, void *pw)
+{
+	(void) podule;
+	(void) fatal;
+	(void) pw;
+
+	_kernel_oserror *e = cpuclock_shutdown();
+	if (e)
+	{
+		return e;
+	}
+
+	mailbox_shutdown();
+
+	_swix(PCI_RAMFree,_IN(0),temp_buffer);
+
+	/* Close messages */
+	_swix(MessageTrans_CloseFile,_IN(0),&messages);
+
+#ifdef STANDALONE
+	_swix(ResourceFS_DeregisterFiles,_IN(0),Resources());
+#endif
+
+	return NULL;
+}
+
+void module_service(int service_number, _kernel_swi_regs *r, void *pw)
+{
+	(void) pw;
+	if ((service_number == Service_ModulePostInit) && !strcmp((const char *) r->r[2], Module_Title))
+	{
+		cpuclock_init();
+	}
+}
+
+typedef struct
+{
+	volatile uint32_t done;
+	volatile uint32_t response;
+} myresponse_t;
+
+static void blocking_callback(uint32_t r0, uint32_t response)
+{
+	myresponse_t *resp = (myresponse_t *) r0;
+	resp->response = response;
+	barrier();
+	resp->done = 1;
+}
+
+static bool blocking_done(myresponse_t *resp)
+{
+	barrier();
+	return resp->done;
+}
+
+/* Temp buffer alloc/free routines
+   At the moment we just have one buffer (temp_buffer) which we allow one client to use at a time. If the buffer is already in use, or the requested length is too long, we fall back to PCI_RAMAlloc.
+   This should be sufficient for most purposes - if the user wants to avoid the possibility of heap calls, they should be using preallocated buffers of their own! */
+static _kernel_oserror *gettempbuffer(uint32_t len, void **log, uint32_t *phys)
+{
+	if ((len <= TEMP_BUFFER_SIZE) && !atomic_update(1,&temp_buffer_lock))
+	{
+		barrier(); /* Sync with contents of buffer */
+		*log = temp_buffer;
+		*phys = temp_buffer_phys;
+		return NULL;
+	}
+	return _swix(PCI_RAMAlloc, _INR(0,2)|_OUTR(0,1), len, 16, 0, log, phys); 
+}
+
+static void freetempbuffer(void *log)
+{
+	if (log == temp_buffer)
+	{
+		barrier(); /* Sync contents of buffer */
+		temp_buffer_lock = 0;
+	}
+	else
+	{
+		_swix(PCI_RAMFree, _IN(0), log);
+	} 
+}
+
+static _kernel_oserror *send_core(uint32_t value, uint32_t flags, MBResponse_t *resp, uint32_t *response)
+{
+	if (flags & ~SendMBMessage_ValidFlags)
+	{
+		return geterror(Error_BadParm);
+	}
+	myresponse_t myresponse;
+	bool block_for_response = !(flags & SendMBMessage_Async);
+	if (!resp->mask)
+	{
+		resp = NULL;
+		block_for_response = false;
+	}
+	/* Substitute our own callback function if necessary
+	   n.b. in SMP this assumes the stack is shareable memory */
+	else if (block_for_response)
+	{
+		resp->callback.r0 = (uint32_t) &myresponse;
+		/* n.b. r12 not required since the callback is entered with our C environment still set up */
+		resp->callback.pc = (void *) blocking_callback;
+		myresponse.done = 0;
+	}
+	/* Queue message */
+	if (flags & SendMBMessage_DontWaitForSpace)
+	{
+		if (!mailbox_send(value, resp))
+		{
+			return geterror(Error_MBFull);
+		}
+	}
+	else
+	{
+		/* N.B. we can't get IRQs when space becomes available in the send mailbox, so if we're out of send space this will end up sleeping longer than necessary.
+		   However the fact that the USB controller generates an interrupt every microframe should help us to avoid any significant amounts of oversleeping */
+		retry((void *) value, resp, (bool (*)(void *, void *)) mailbox_send);
+	}
+	if (block_for_response)
+	{
+		/* Wait for response */
+		retry(&myresponse, NULL, (bool (*)(void *, void *)) blocking_done);
+		barrier();
+		dprintf(("","blocking resp %08x\n",myresponse.response));
+		if (response)
+		{
+			*response = myresponse.response;
+		}
+	}
+	return NULL;
+}
+
+#define SWINO(x) (BCMSupport_##x - BCMSupport_00)
+
+_kernel_oserror *module_swi(int swi_offset, _kernel_swi_regs *r, void *pw)
+{
+	(void) pw;
+	switch(swi_offset)
+	{
+	case SWINO(SendMBMessage):
+		{
+			MBResponse_t resp = {0};
+			resp.mask = r->r[2];
+			resp.value = r->r[3];
+			resp.callback.r0 = r->r[4];
+			resp.callback.r1 = NULL;
+			resp.callback.r12 = (void *) r->r[5];
+			resp.callback.pc = (void *) r->r[6];
+			return send_core(r->r[0], r->r[1], &resp, (uint32_t *) &r->r[0]);
+		}
+	case SWINO(MBSync):
+		{
+			if ((r->r[0] & ~MBSync_ValidFlags) || !r->r[0])
+			{
+				return geterror(Error_BadParm);
+			}
+			MBResponse_t mask = {0};
+			mask.mask = r->r[1];
+			mask.value = r->r[2];
+			mask.callback.r0 = r->r[3];
+			/* r1 irrelevant */
+			mask.callback.r12 = (void *) r->r[4];
+			mask.callback.pc = (void *) r->r[5];
+			retry((void *) r->r[0], &mask, (bool (*)(void *, void *)) mailbox_peek);
+			return NULL;
+		}
+	case SWINO(AllocPropertyBuffer):
+		return _swix(PCI_RAMAlloc, _INR(0,2)|_OUT(0), r->r[0], 16, 0, &r->r[0]);
+	case SWINO(FreePropertyBuffer):
+		return _swix(PCI_RAMFree, _IN(0), r->r[0]);
+	case SWINO(SendPropertyBuffer):
+		{
+			if (!r->r[0] || (r->r[0] & 15) /* Basic buffer sanity check */
+			 || ((r->r[1] & SendMBMessage_Async) && !r->r[4])) /* Async operation with no callback is forbidden */
+			{
+				return geterror(Error_BadParm);
+			}
+			/* Get ARM physical address of buffer */
+			int block[3];
+			block[1] = r->r[0];
+			_kernel_oserror *e = _swix(OS_Memory, _INR(0,2), (1<<9) | (1<<13), block, 1);
+			if (e)
+			{
+				return e;
+			}
+			/* Compute mailbox value */
+			uint32_t value = block[2] | MB_Chan_ARM2VC;
+			/* Build response structure */
+			MBResponse_t resp = {0};
+			resp.mask = ~0;
+			resp.value = value;
+			resp.callback.r0 = r->r[2];
+			resp.callback.r1 = (void *) r->r[0]; /* Override r1 to be the original buffer pointer, rather than the mailbox response value */
+			resp.callback.r12 = (void *) r->r[3];
+			resp.callback.pc = (void *) r->r[4];
+			/* Send the message */
+			return send_core(value, r->r[1], &resp, NULL);
+		}
+	case SWINO(SendTempPropertyBuffer):
+		{
+			/* Basic buffer sanity checks */
+			const uint32_t *input = (const uint32_t *) r->r[0];
+			if (!r->r[0] || (r->r[0] & 3)
+			 || !r->r[1] || (r->r[1] & 3)
+			 || (*input < 24) /* Minimum length is 8 byte header, 12 byte tag, 4 byte end marker */
+			 || r->r[2]) /* All flags reserved */
+			{
+				return geterror(Error_BadParm);
+			}
+			
+			/* Get a temp buffer */
+			uint32_t len = *input;
+			void *log;
+			uint32_t phys;
+			_kernel_oserror *e = gettempbuffer(len, &log, &phys);
+			if (e)
+			{
+				return e;
+			}
+			/* Copy content */
+			memcpy(log, input, len);
+			/* Build response structure */
+			uint32_t value = phys | MB_Chan_ARM2VC;
+			MBResponse_t resp = {0};
+			resp.mask = ~0;
+			resp.value = value;
+			/* Send */
+			e = send_core(value, 0, &resp, NULL);
+			if (!e)
+			{
+				/* Copy response */
+				memcpy((void *) r->r[1], log, len);
+			}
+			/* Free temp buffer */
+			freetempbuffer(log);
+			return e;
+		}
+	}
+	return error_BAD_SWI;
+}

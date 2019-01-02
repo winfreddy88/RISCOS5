@@ -1,0 +1,693 @@
+/* Copyright 2016 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#include "PMInclude.h"
+
+#include "swis.h"
+#include "debuglib/debuglib.h"
+#include "Global/Services.h"
+#include "Global/RISCOS.h"
+#include "Global/Upcall.h"
+#include "callx/callx.h"
+
+#include "ModuleHdr.h"
+#include "PMModule.h"
+#include "scsisvce.h"
+#include "asm.h"
+#include "GPThdr.h"
+#include "FormatBits.h"
+#include "Format.h"
+#include "SectorRW.h"
+
+#include "Diagnostic.h"
+
+void *module_wsp;                // so we can know the module pwp globally
+static int msg_struct[4];
+static _kernel_oserror msg_buff;
+static _kernel_swi_regs rg;
+
+typedef struct partitionArray{
+  unsigned char used;
+  unsigned char drive;
+  unsigned char mounted;
+  unsigned char reported;
+ int           partitionLBA;
+}partitionArray;
+
+#define MaxPartitions 8
+typedef struct driveArray{
+  partitionArray  partition[MaxPartitions];// at start of struct to alias address
+  int scsiid;
+  int mountcount;
+  struct driveArray * next;       // drivArray following or NULL if last
+  struct driveArray * last;       // driveArray preceeding, orNULL if first
+}driveArray;
+
+static driveArray *Drives;
+driveArray * scsiID2Array(int id);
+driveArray * scsiDisc2Array(int scsifsdisc);
+void freeDriveArray(driveArray* array);
+partitionArray * registerDrive(int id, int LBA);
+driveArray* ReadDrivePartitions (int drive);
+_kernel_oserror *PM_Sizes(_kernel_swi_regs *r, void *pw);
+_kernel_oserror *PM_Reset(_kernel_swi_regs *r, void *pw);
+
+
+#define task_name "Partition Manager"          /* the name of our task */
+static _kernel_swi_regs reg;
+
+const char *module_lookup(const char *token)
+{
+    if (_swix(MessageTrans_Lookup, _INR(0,7),
+              msg_struct, token, &msg_buff, sizeof(msg_buff), 0, 0, 0, 0) != NULL)
+    {
+        return "";
+    }
+    return (const char *)&msg_buff;
+}
+
+_kernel_oserror *module_error(unsigned err)
+{
+    char token[12];
+    _kernel_oserror *e;
+
+    if (err > 256) return (_kernel_oserror *) err;
+
+    sprintf(token, "@@@@E%02x", err);
+    e = _swix(MessageTrans_ErrorLookup, _INR(0,3),
+              token, msg_struct, &msg_buff, sizeof(msg_buff));
+    if (e->errnum == 0x40404040)
+    {
+        /* Same error number out as went in, looked up OK */
+        msg_buff.errnum = PartMan_ErrorBase + err;
+    }
+    return e;
+}
+
+void wimp_error(_kernel_oserror *er)
+{
+  /*
+   * Generic routine to handle error reporting
+   * through the wimp
+   */
+
+  if(er!=(_kernel_oserror *)NULL)
+  {
+   reg.r[0] = (int) er;
+   reg.r[1] =       0;
+   reg.r[2] = (int) task_name;
+   _kernel_swi(Wimp_ReportError, &reg, &reg);
+  }
+}
+
+// initial scan to see what may already be mounted
+static _kernel_oserror* ScanCallBack (_kernel_swi_regs* r, void* pw, void* h)
+{
+  (void) r;
+  (void) pw;
+  (void) h;
+  _kernel_oserror* myerr;
+  int i,type;
+  driveArray* dr;
+
+  for(i=0;i<32;i++)
+  {
+    // first we find what partitioned scsi devices are attached (*dev.)
+    type=-1;
+    myerr=Inquiry(i,OverrideKey,&type);
+    testprint("err %s type %x\n",(myerr)?myerr->errmess:"none",type);
+    if(!myerr && !type)
+    {
+      dr=ReadDrivePartitions(i);
+      testprint("SCB got dr:%p\n",dr);
+      if(dr)
+      {
+        int j=0;
+        while(dr->partition[j].used && j<MaxPartitions)
+        {
+          MountedDiscNum(i, dr->partition[j].partitionLBA,&type);
+          if(type>=0)
+          {
+            dr->partition[j].drive=type;
+          }
+          j++;
+         }
+      }
+
+    }
+  }
+  return NULL;
+}
+
+_kernel_oserror *module_initialise(const char *cmd_tail, int podule_base, void *pw)
+{
+    (void) cmd_tail;
+    (void) podule_base;
+    _kernel_oserror *err = NULL;
+    bool UpCall = false;
+    module_wsp = pw;
+    debug_initialise ("PartMan", "", 0);
+    debug_set_device(DADEBUG_OUTPUT);
+    debug_set_unbuffered_files (TRUE);
+    debug_set_stamp_debug (TRUE);
+    testfileinit();
+    callx_init(pw);
+    Drives = NULL;
+#ifndef ROM
+    err = _swix(ResourceFS_RegisterFiles, _IN(0), Resources());
+    if (err != NULL) goto failinit;
+#endif
+    err = _swix(MessageTrans_OpenFile, _INR(0,2), msg_struct, Module_MessagesFile, 0);
+    if (err != NULL) goto faildereg;
+
+    if(err = _swix(OS_Claim, _INR(0,2), UpCallV, upcallvhandler,
+              module_wsp), !err) UpCall = true;
+
+    callx_add_callback(ScanCallBack,(void*)NULL);
+
+    return NULL;
+
+faildereg:
+#ifndef ROM
+    _swix(ResourceFS_DeregisterFiles, _IN(0), Resources());
+failinit:
+#endif
+    if(UpCall) _swix(OS_Release, _INR(0,2), UpCallV, upcallvhandler,
+                            module_wsp);
+
+
+    return err;
+}
+
+_kernel_oserror *module_finalise(int fatal, int podule, void *pw)
+{
+    (void) fatal;
+    (void) podule;
+    (void) pw;
+    _swix(OS_Release, _INR(0,2), UpCallV, upcallvhandler,
+                            module_wsp);
+
+    callx_remove_all_callbacks();
+    /* Tidy up the messages (and deregister from ResourceFS if not in ROM) */
+    _swix(MessageTrans_CloseFile, _IN(0), msg_struct);
+#ifndef ROM
+    _swix(ResourceFS_DeregisterFiles, _IN(0), Resources());
+#endif
+
+// remove any drive arrays
+
+  char buf[32];
+testprint(" Dieing.. Drives:%p\n",Drives);
+  while (Drives)
+  {
+    // for each drive seen, dismount any reported discs and free memory
+    driveArray * dr = Drives;
+    Drives =(driveArray *)dr->next;
+    for (int i=0; i<MaxPartitions;i++)
+    {
+      testprint("mod die: dr:%p partn:%p drive%x used:%x mounted:%x\n",
+                dr,&(dr->partition[i]),dr->partition[i].drive,dr->partition[i].used,dr->partition[i].mounted);
+      sprintf(buf,"*scsi:dismount :%1d",dr->partition[i].drive);
+      if((dr->partition[i].used)&&(dr->partition[i].mounted))
+      {
+         testprint("%s\n",buf);
+        _kernel_oscli(buf);
+      }
+    }
+    free(dr);
+  }
+
+
+
+    return NULL;
+}
+
+_kernel_oserror *UpCallVHandler(_kernel_swi_regs *r, void *pw)
+{
+  pw=pw;
+  switch(r->r[0])
+  {
+    case UpCall_DriveRemoved:
+  {
+      testprint("UpCallDriveRemoved r0:%x r1:%x *r1:&x r2:%x r3:%x \n",r->r[0],r->r[1],*(int*)(r->r[1]),r->r[2],r->r[3]);
+    if(*(int*)(r->r[1]) == 0x49534353)
+    {
+      int drive = (int)*(char*)(r->r[1]+6) -0x30;
+        driveArray * dr = scsiDisc2Array(drive);
+        testprint("UpCallV removing %d, dr:%p\n",drive,dr);
+        if(dr)
+        {
+          testprint("dr:%p mc this dr:%d\n",dr,dr->mountcount);
+          if(dr->mountcount<=1)
+          {
+            testprint("UpCallV1 removed and freed  %d, dr:%p\n",drive,dr);
+            freeDriveArray(dr);
+          }
+          else
+          {
+            dr->mountcount--;
+            testprint("UpCallV2 removed %d, dr:%p mc:%d\n",drive,dr,dr->mountcount);
+    }
+  }
+  }
+    }
+    break;
+    case UpCall_DriveAdded:
+      {
+      testprint("UpCallDriveAdded r0:%x r1:%x *r1:%x r2:%x r3:%x \n",r->r[0],r->r[1],*(int*)(r->r[1]),r->r[2],r->r[3]);
+
+      }
+      break;
+      default: break;
+
+  }
+  return NULL;
+}
+
+
+// return drive array for this drive, or NULL
+driveArray * scsiID2Array(int id)
+{
+  driveArray * dr = Drives;
+  while(dr)
+  {
+  testprint("d2a dr:%p id:%x dr->id:%x\n", dr,id,dr->scsiid);
+    if(dr->scsiid==id) return dr;
+    dr = (dr->next);
+  }
+  return NULL;
+}
+// return drive array for this scsifs disc
+driveArray * scsiDisc2Array(int scsifsdisc)
+{
+  driveArray * dr = Drives;
+  while(dr)
+  {
+    for(int i=0; i<=7; i++)
+    {
+      if(dr->partition[i].used && dr->partition[i].mounted && (dr->partition[i].drive==scsifsdisc)) return dr;
+    }
+  testprint("drive2a dr:%p id:%x mc:%x\n", dr,scsifsdisc,dr->mountcount);
+    dr = (dr->next);
+  }
+  return NULL;
+}
+// return next free partitionArray pointer for scsi ID
+// or array relevant to this LBA
+// if LBA = -1 then return address of first partition array
+// or null if all used,
+partitionArray * registerDrive(int id, int LBA)
+{
+  driveArray * dr = Drives;
+  driveArray * newdrlast = dr;
+  testprint("in rD %x id %x Drives addr is %x\n",(int)dr,id,(int)&Drives);
+  while(dr)
+  {
+    if(dr->scsiid==id) break;
+    newdrlast = dr;
+    dr = (dr->next);
+  }
+  if(!dr)
+  {
+    testprint("rD need new drive array\n");
+    dr = (driveArray *)calloc(1,sizeof(driveArray));
+    if(dr)
+    {
+      dr->scsiid=id;
+testprint("rD id %x stored at %p in dr:%p\n",id,&(dr->scsiid),dr);
+      if(newdrlast)
+      {
+        dr->last = newdrlast;
+        dr->last->next=dr;
+      }
+      else
+      {
+        Drives=dr;
+      }
+    }
+    else
+    {   // allocation failure
+      return NULL;
+  }
+  }
+  testprint("rD Drives:%p ,pa:%p, set:%p as last, id:%x stored at %p\n", Drives,dr,dr->last,dr->scsiid,&dr->scsiid);
+
+  if(LBA==-1) return &(dr->partition[0]);
+  for (int i=0;i<MaxPartitions;i++)
+  {
+    if ((!dr->partition[i].used)
+    || (dr->partition[i].partitionLBA == LBA))
+    {
+      testprint("rD returning actual pa=%p lba=%x\n",&(dr->partition[i]), dr->partition[i].partitionLBA);
+      return &(dr->partition[i]);
+    }
+  }
+      testprint("rD returning NULL\n");
+  return NULL;
+}
+
+// unlink and free a drive array
+void freeDriveArray(driveArray* array)
+{
+  driveArray  *temp = array;
+  bool irqs_were_off = _kernel_irqs_disabled();
+  if (!irqs_were_off) _kernel_irqs_off();
+
+  testprint("FDA array:%p \n",array);
+  if(array)
+  {
+    testprint("FDA last:%p next:%p\n",array->last,array->next);
+    if(array->last)   // we're not the first array
+    {
+        array->last->next=array->next;
+        if(array->next)array->next->last=array->last;
+      }
+      else
+    {   // we're the first
+      if(array->next)   // and something follows
+      {
+        Drives = array->next;
+        array->next->last=NULL;
+    }
+    else
+      {       // ony one
+      Drives = NULL;
+    }
+  }
+    free(array);
+    testprint("FDA freed driveArray:%p\n",temp);
+  }
+  if (!irqs_were_off) _kernel_irqs_on();
+}
+
+// returns a driveArray* if partitions successfully found on drive
+driveArray* ReadDrivePartitions (int drive)
+{
+  driveArray* dr=scsiID2Array(drive);
+  partitionArray* pa=registerDrive(drive, -1);
+    testprint("RDA dr:%p pa:%p\n", dr,pa);
+  if (!pa->used)
+  { // drive not evaluated yet.. get the partition table
+    testprint("about to cgptv %d\n",drive);
+    // first to inquiry on scsi ID (incl LUN)
+    if(CheckGPTValid(drive))
+    { // found partition info
+      GUIDPartn* myGP;
+      extern GUIDPartn* gpt; // set up by CheckGPTValid()
+      extern GPTHeader* gpth;
+      testprint("through cgptv\n");
+      myGP=gpt;
+      for (int i=0; i<gpth->GUIDPnum;i++)
+      {
+        if(GUIDValid((char*)(myGP->PTypeGUID)))
+        {
+          pa=registerDrive(drive, myGP->StartLBA[0]);
+        testprint("pa found %x\n", (int)pa);
+          if(pa)
+          {
+          pa->partitionLBA = myGP->StartLBA[0];
+          pa->used = 2; testprint("1:used addr:%p pa:%p\n", &pa->used,pa);
+          }
+         testprint("Got drive start LBA %x, pa=%x\n",myGP->StartLBA[0],(int)pa);
+        }
+        myGP++;
+      }
+      if(!dr)dr=scsiID2Array(drive);
+    }
+    else
+    { // couldnt get partition info
+      pa=registerDrive(drive, 0);
+      testprint("pa found %x\n", (int)pa);
+      if(pa)
+      {
+        pa->partitionLBA = 0;
+        pa->used = 2; testprint("1:used addr:%p pa:%p\n", &pa->used,pa);
+      }
+      testprint("Got drive start LBA %x, pa=%x\n",0,(int)pa);
+      testprint("\ncgptv failed.. reporting non partitioned\n");
+      return NULL;
+    }
+  }
+  testprint("rD returning %p\n",dr);
+  return dr;
+}
+
+
+static int inACB = 0;
+static _kernel_oserror* AttachCallBack (_kernel_swi_regs* r, void* pw, void* h)
+{
+  (void) r;
+  (void) pw;
+  if(inACB)return NULL;
+  inACB=1;
+  testprint("AttachedCB id %d\n",(int)h);
+  ReadDrivePartitions((int)h);
+  rg.r[0]=(int)h;
+  rg.r[1]=PartMan_MorePartitions; // use swi number ..
+  rg.r[2]=0x1f;
+  _kernel_swi(OS_ServiceCall,&rg,&rg);
+  inACB=0;
+  return NULL;
+}
+
+
+void module_service_handler(int service_number, _kernel_swi_regs *r, void *pw)
+{
+  (void) pw;
+//  testprint("Service %x\n",service_number);
+  switch (service_number)
+  {
+    // attach and detach have device in r0 and mask in r2
+  case Service_SCSIAttached:
+  {
+      testprint("SvceSCSIAttached id=%02x mask=%02x\n",r->r[0],r->r[2]);
+      callx_add_callback(AttachCallBack,(void*)r->r[0]);
+  }
+      break;
+    case Service_SCSIDetached:
+    {
+      driveArray* dr = scsiID2Array(r->r[0]&r->r[2]);
+
+      if(dr)
+      {
+        testprint("Detached id:%x mc:%d %s freeing dr:%p %s\n",r->r[0]&r->r[2],dr->mountcount,dr->mountcount?"not":"",dr,dr->mountcount?"till upcall":"");
+         if(!dr->mountcount) freeDriveArray(dr);
+      }
+    }
+      break;
+  case Service_SCSIMounting:
+    {  // r3 = scsi id, r2 = scsifs drive no
+      driveArray* dr=scsiID2Array(r->r[3]);
+      testprint("\nSCSIFS is mounting %x %x %x %x dr:%p\n",r->r[0],r->r[1],r->r[2],r->r[3],dr);
+
+       // Check in this drive, or get its table address
+       partitionArray* pa=&dr->partition[0];
+       testprint("pa found %p\n",pa);
+    partitionArray* pabase=pa;
+// now report next unused partition
+      if(pabase)
+      {
+        for (int i=0;i<MaxPartitions;i++)
+        {
+          if(pabase->used&&!pabase->mounted)
+          {
+             pabase->mounted=4;
+             dr->mountcount++;
+             pabase->drive=r->r[2];
+         testprint("give partition offset for drive %d, ID %x as %x\n",r->r[2],r->r[3],pabase->partitionLBA);
+            _swix(SCSIFS_Partitions,_INR(0,2),0,r->r[2],pabase->partitionLBA);
+             i = MaxPartitions+1;
+          }
+          pabase++;
+           if(i>=MaxPartitions)testprint("%s %x\n",(i==(MaxPartitions+1))?"One of ours.. offset ":"Not one of ours. ignored");
+        }
+      }
+    }
+
+ break;
+
+#ifndef ROM
+    case Service_ResourceFSStarting:
+    {
+        /* Reregister our resources */
+        (*(void (*)(void *, void *, void *, void *))r->r[2])(Resources(), 0, 0, (void *)r->r[3]);
+    }
+    break;
+  #endif
+  default:
+  {
+//    (void) service_number;
+//    (void) r;
+    break;
+  }
+  }
+  }
+// evaluate current partition offset, issue relevant scsifs_partition swi
+// and work out if further partitions possible
+// On entry, r->r[1] = scsiID, r->r[2] =1
+// On exit r->r[1] unchanged, r->r[2] = 0 if more partitions available
+ // if r->r[1] = -1 just exit no error (indicates module presence)
+_kernel_oserror *PM_MorePartitions(_kernel_swi_regs *r, void *pw)
+{
+  (void) pw;
+   if(r->r[1]==-1)  return (NULL);     
+
+
+  driveArray* dr =scsiID2Array (r->r[1]);
+    testprint("PMMoreP id=%d dr= %p %d",r->r[1],dr,r->r[2]);
+  if(dr)
+  { // this is a drive we've seen attached
+      partitionArray* pap=&dr->partition[0];
+      for (int i=0;i<MaxPartitions;i++)
+      {
+      if((pap->used)&&!(pap->reported))
+        {
+        pap->reported=8;
+        if((i<MaxPartitions-1)&&(++pap)&& (pap->used))
+        { // check if more partitions
+           r->r[2]=0;  // 0 if yes
+        }
+           testprint("end PMMorep reporting :%d\n",r->r[2]);
+          return NULL;
+        }
+        pap++;
+      }
+      testprint("Q\n");
+    }
+  testprint("end PMMoreP %d\n", r->r[2]);
+  return (NULL);
+}
+_kernel_oserror *PM_Reset(_kernel_swi_regs *r, void *pw)
+{
+  (void)r;
+  (void)pw;
+  return(NULL);
+}
+
+// return an array of scsiID, partition start block and partition length
+// in blocks, SCSIFSDrive number
+// On entry r0=SCSI ID . if r0=-1 then return min buffer size
+//          r1-> buffer to receive data. Must be at least min buffer size
+// on exit
+//   if r0 was -1 r0=buffer space needed
+//   otherwise    r0= partition count found
+//                buffer filled in
+_kernel_oserror *PM_Sizes(_kernel_swi_regs *r, void *pw)
+{
+  (void) pw;
+  driveArray* dr;
+  int capacity, sectorsize,temp;
+  mountInfo* bp = (mountInfo*)(r->r[1]);
+
+  // return buffer size needed if -1
+  if(r->r[0]==-1){r->r[0]=(MaxPartitions*sizeof(mountInfo));return(NULL);}
+
+  ReadDiscCapacity(r->r[0], OverrideKey,&capacity,&sectorsize);
+  dr =ReadDrivePartitions(r->r[0]);
+  if(dr)
+  {
+    int i=0;
+    testprint("swilp got dr:%p\n",dr);
+     while(dr->partition[i].used && i<MaxPartitions)
+     {
+        bp[i].id=r->r[0];
+        bp[i].start=dr->partition[i].partitionLBA;
+        bp[i].size=capacity;
+        bp[i+1].start=capacity;
+        MountedDiscNum(bp[i].id, bp[i].start,&temp);
+    testprint("mdn gave %x for %x %x\n",temp,bp[i].id, bp[i].start);
+        bp[i].mountno=temp;
+       // dr->partition[i].drive;//
+        i++;
+     }
+     r->r[0]=i;
+     for(i=0;i<r->r[0];i++)
+     {
+       bp[i].size=bp[i+1].start-bp[i].start;
+     }
+  }
+  else
+    {
+
+    bp->id=r->r[0];
+    bp->start=0;
+    bp->size=capacity?capacity:0;
+    r->r[0]=capacity?1:0;
+  }
+
+  return (NULL);
+}
+
+
+_kernel_oserror *module_swi_handler(int swi_offset, _kernel_swi_regs *r, void *pw)
+{
+    (void) pw;
+
+    switch (swi_offset)
+    {
+    case PartMan_MorePartitions - PartMan_00:
+            return PM_MorePartitions(r,pw);
+    case PartMan_Reset - PartMan_00:
+            return PM_Reset(r,pw);
+    case PartMan_Sizes - PartMan_00:
+            return PM_Sizes(r,pw);
+//        case PM_Transfer - PM_00:
+//            return PM_Transfer(r,pw);
+//        case PM_Status - PM_00:
+//            return PM_Status(r,pw);
+    }
+    return module_error(PartMan_SWIUnKn);
+}
+
+_kernel_oserror *module_cmd_handler(const char *arg_string, int argc, int cmd_no, void *pw)
+{
+//    (void) arg_string;
+    (void) argc;
+//    (void) cmd_no;
+    (void) pw;
+    int id=0,n=0,i,*p;
+
+    switch(cmd_no)
+    {
+    case CMD_ListPartitions:
+      n=sscanf(arg_string,"%d",&id);
+      if(n)
+      {
+        rg.r[0]=-1;
+        _kernel_swi(PartMan_Sizes,&rg,&rg);
+        rg.r[1]=(int)calloc(rg.r[0],1);
+        p=(int*)rg.r[1];
+        rg.r[0]=id;
+        _kernel_swi(PartMan_Sizes,&rg,&rg);
+        printf("\nFound %d disc partitions\n",rg.r[0]);
+        for(i=0;i<rg.r[0];i++)
+        {
+          printf("SCSI ID:%02x Start %08x Size %08x SCSIFSdisc %d\n",p[0],p[1],p[2],p[3]);
+          p+=4;
+        }
+        free((void*)rg.r[1]);
+      }
+      else
+      {
+        printf("Drive %d not present\n",id);
+      }
+
+      return NULL;
+    }
+
+
+    return module_error(PartMan_UnKnCmd);
+}
+
+

@@ -1,0 +1,1393 @@
+/*
+ * Copyright (c) 1995, Andreas Zieringer
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include "Desk/WimpSWIs.h"          /* Low-level WIMP commands         */
+#include "Desk/Window.h"            /* Window handling automation      */
+#include "Desk/Core.h"              /* usefull core functions          */
+#include "Desk/Dialog.h"            /* High-level dialogue windows     */
+#include "Desk/Error.h"             /* Error despatcher                */
+#include "Desk/Event.h"             /* Event despatcher                */
+#include "Desk/EventMsg.h"          /* Wimp Message event dispatcher   */
+#include "Desk/File.h"              /* Low level file handling         */
+#include "Desk/GFX.h"               /* Graphics routines (GFX_Wait)    */
+#include "Desk/Handler.h"           /* Default/example event handlers  */
+#include "Desk/Hourglass.h"         /* Hourglass module interfaces     */
+#include "Desk/Icon.h"              /* Icon handling automation        */
+#include "Desk/Menu.h"              /* Menu create & show support      */
+#include "Desk/Msgs.h"              /* Message translation code        */
+#include "Desk/Resource.h"          /* Handles finding resource files  */
+#include "Desk/Screen.h"            /* Getting screen size info, etc   */
+#include "Desk/Sound.h"             /* Sound System control            */
+#include "Desk/Template.h"          /* Template loading and caching    */
+#include "Desk/Slider.h"            /* "Easy" slider handling          */
+#include "Desk/Kbd.h"               /* Read hotkeys                    */
+#include "Desk/Time.h"              /* "TIME"                          */
+#include "Desk/KernelSWIs.h"        /* OS_Byte                         */
+#include "Desk/Dialog2.h"           /* windows on menus made easy      */
+#include "Desk/Pane2.h"
+#include "Desk/Import.h"
+#include "Desk/Save.h"
+#include "Desk/error2.h"
+#include "Desk/DeskMem.h"
+#include "Desk/slider.h"
+#include "Desk/drag.h"
+#include "Desk/Time.h"
+#include "Desk/font.h"
+#include "Desk/Str.h"
+#include "Desk/Filing.h"
+#include "Desk/MsgTrans.h"
+
+#include "osspriteop.h"
+#include "osserialop.h"
+#include "wimp.h"
+
+#include "event.h"
+#include "kernel.h"
+#include "global.h"
+#include "inout.h"
+#include "iconnames.h"
+#include "misc.h"
+#include "spool.h"
+#include "serialbuff.h"
+#include "ansi.h"
+#include "vt100.h"
+#include "script.h"
+#include "import.h"
+
+#include "flex.h"
+/*#include "kernel.h"*/
+/*#include "HeapGraph.HeapGraph.h"*/
+
+#include <time.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+
+#define SLOT_SIZE 476
+
+typedef int (*Desk_slider_updateproc)( void *, void *);
+
+
+extern int (*driver_load(char*))(int,...);
+extern unsigned int attrib;
+extern void consoleInit(void);
+extern void consoleSetup(void);
+extern void start_dial(int,int);
+
+extern void init_colormap(void);
+extern void init_fonts(void);
+extern void init_layer6(void);
+
+static char startup_command[256];
+
+static const char *program_name=Name_String;
+
+static void setup_menus(void);
+void setup_templates(void);
+void build_startupcommand(void);
+static Desk_bool save_desktop(Desk_event_pollblock *event, void *reference);
+static Desk_icon_incdecblock *incdec_spool;
+
+static int auto_start_script_nr=-1;
+/*
+static int counter=0;
+static int do_error_check=0;
+#define EE if (do_error_check) Desk_Error_Report(0,"%d",counter++)
+*/
+
+Desk_font_handle outlfont;
+
+Desk_error2_block *error_handler(Desk_error2_block *error)
+{
+  switch(error->type)
+  {
+    case Desk_error2_type_MISC:
+      Desk_Error_Report(0,"Misc Error");
+    break;
+    case Desk_error2_type_OSERROR:
+      if(strlen(error->data.oserror->errmess)<=1)
+        Desk_Error_Report(0,"OS Error (%d)",error->data.oserror->errnum);
+      else
+        Desk_Error_Report(0,error->data.oserror->errmess);
+    break;
+    case Desk_error2_type_DESKMEM:
+      Desk_Error_Report(0,"Can't allocate %d bytes of memory",error->data.deskmem->size);
+    break;
+    case Desk_error2_type_SIGNAL:
+      if(logon_file!=-1)
+      {
+        Desk_File_Close(logon_file);
+        logon_file=-1;
+      }
+      if(spool_file!=-1)
+      {
+        Desk_File_Close(spool_file);
+        spool_file=-1;
+      }
+      Desk_Error_ReportFatal(0,"%s",Desk_Error2_signalnames[error->data.signal]);
+    break;
+    case Desk_error2_type_MEM:
+    break;
+    case Desk_error2_type_TEXT:
+      Desk_Error_Report(0,error->data.text);
+    break;
+    default:
+      Desk_Error_Report(0,"Unknown Error");
+    break;
+  }
+  //return(error2_HANDLED);
+  return(error);
+}
+
+
+static int update_spool_slider(Desk_slider_info *info, void *reference)
+{
+   int currentval = Desk_Slider_ReadValue(info);
+
+   Desk_Icon_SetInteger(spool_window,SPOOL_POS,currentval/100);
+   return(0);
+}
+
+
+static void init_slider(void)
+{
+  spool_slider.window = spool_window;
+  spool_slider.icon   = SPOOL_SLIDER;
+  spool_slider.value  = 0;
+  spool_slider.limits.min = 0;
+  spool_slider.limits.max = 100;
+  spool_slider.colour.foreground = 11;
+  spool_slider.colour.background = 0;
+  spool_slider.border.x = spool_slider.border.y = 12;
+  spool_slider.knob.spritearea = 0;
+  spool_slider.knob.sprite = 0;
+  spool_slider.flags.vertical = FALSE;
+  spool_slider.flags.rgb = FALSE;
+  spool_slider.flags.dragging = FALSE;
+  spool_slider.flags.clickstop = FALSE;
+  spool_slider.flags.reserved = 0;
+  spool_slider.update = (Desk_slider_updateproc) update_spool_slider;
+  spool_slider.reference = NULL;
+
+  filetrans_slider.window = filetrans_window;
+  filetrans_slider.icon   = FILETRANS_SLIDER;
+  filetrans_slider.value  = 0;
+  filetrans_slider.limits.min = 0;
+  filetrans_slider.limits.max = 100;
+  filetrans_slider.colour.foreground = 11;
+  filetrans_slider.colour.background = 0;
+  filetrans_slider.border.x = filetrans_slider.border.y = 12;
+  filetrans_slider.knob.spritearea = 0;
+  filetrans_slider.knob.sprite = 0;
+  filetrans_slider.flags.vertical = FALSE;
+  filetrans_slider.flags.rgb = FALSE;
+  filetrans_slider.flags.dragging = FALSE;
+  filetrans_slider.flags.clickstop = FALSE;
+  filetrans_slider.flags.reserved = 0;
+  filetrans_slider.update = NULL; //(Desk_slider_updateproc) update_filetrans_slider;
+  filetrans_slider.reference = NULL;
+}
+
+/*
+void flex_moved(int b4, void *handle)
+{
+  Desk_Template_UseSpriteArea(usericonsprites);
+  Desk_Error_Report(0,"Flex moved");
+}
+*/
+
+void get_key_mem(void)
+{
+  int i;
+
+  for(i=0;i<12;i++)
+    fkeys[i] = (char *)Desk_DeskMem_Malloc(81);
+
+  for(i=0;i<12;i++)
+    fkeys_0[i] = (char *)Desk_DeskMem_Malloc(81);
+
+  for(i=0;i<12;i++)
+    t_fkeys[i] = (char *)Desk_DeskMem_Malloc(81);
+}
+
+void set_default_keys(void)
+{
+  int i;
+
+  for(i=0;i<12;i++)
+    strcpy(fkeys[i],fkeys_0[i]);
+}
+
+void get_sb_mem(void)
+{
+  int i;
+
+  for(i=0;i<8;i++)
+  {
+    sb_label[i] = (char *)Desk_DeskMem_Malloc(15);
+    sb_data[i] = (char *)Desk_DeskMem_Malloc(41);
+  }
+
+  for(i=0;i<8;i++)
+  {
+    sb_label_0[i] = (char *)Desk_DeskMem_Malloc(15);
+    sb_data_0[i] = (char *)Desk_DeskMem_Malloc(41);
+  }
+
+  for(i=0;i<8;i++)
+  {
+    t_sb_label[i] = (char *)Desk_DeskMem_Malloc(15);
+    t_sb_data[i] = (char *)Desk_DeskMem_Malloc(41);
+  }
+
+}
+
+void set_default_sb(void)
+{
+  int i;
+
+  for(i=0;i<8;i++)
+  {
+    strcpy(sb_label[i],sb_label_0[i]);
+    strcpy(sb_data[i],sb_data_0[i]);
+  }
+}
+
+static void calc_online_time_width(void)
+{
+  /*
+  Desk_font_state state;
+  Desk_font_info info;
+  int width_0,width_1;
+
+  Desk_Font_CurrentFont(&state);
+  Desk_Font_CharBBox(state.font,'0',16,&info);
+  width_0 = info.maxx-info.minx;
+  Desk_Font_CharBBox(state.font,':',16,&info);
+  width_1 = info.maxx-info.minx;
+  online_time_width = width_0*6+width_1*2;
+
+  Desk_Error_Report(0,"%d,%d,%d",width_0,width_1,online_time_width);
+  */
+  if(xwimptextop_string_width("00:00:00",8,&online_time_width)!=NULL)
+    online_time_width=128; // wenn swi nicht existiert dann system font < RiscOS 3.5
+}
+
+static Desk_bool calc_online_time_width_handler(Desk_event_pollblock *poll_block, void *reference)
+{
+  calc_online_time_width();
+  return(Desk_TRUE);
+}
+
+void load_fonts(int vt,int ansi)
+{
+  FILE *f;
+
+  f=NULL;
+  if(vt)
+  {
+    f=fopen("<Connector$Dir>.Fonts.vt8x16","rb");
+    vt_charheight=16;
+  }
+  else
+  {
+    f=fopen("<Connector$Dir>.Fonts.vt8x18","rb");
+    vt_charheight=18;
+  }
+  if(f!=NULL)
+  {
+    fread(iso_bitfont,1,6912,f);
+    fclose(f);
+  }
+  else
+  {
+    Desk_Error_Report(0,"Couldn't open font file");
+    vt_charheight=18;
+  }
+
+
+  f=NULL;
+  if(ansi)
+  {
+    f=fopen("<Connector$Dir>.Fonts.ansi8x16","rb");
+    ansi_charheight=16;
+  }
+  else
+  {
+    f=fopen("<Connector$Dir>.Fonts.ansi8x18","rb");
+    ansi_charheight=18;
+  }
+  if(f!=NULL)
+  {
+    fread(bitfont,1,6912,f);
+    fclose(f);
+  }
+  else
+  {
+    Desk_Error_Report(0,"Couldn't open font file");
+    ansi_charheight=18;
+  }
+
+}
+
+/*
+int key_handler(int event,const Desk_event_pollblock *eventdata,const int task)
+{
+  Desk_Error_Report(0,"wumm");
+}
+*/
+
+
+/******************************* MAIN PROGRAM ********************************/
+
+int main(int argc, char *argv[])
+{
+  int i,step;
+  static int messages[] = { Desk_message_QUIT, Desk_message_RAMFETCH,
+                                            Desk_message_DATASAVEACK, Desk_message_DATALOAD,
+                                            Desk_message_MODECHANGE,Desk_message_SAVEDESK,
+                                            Desk_message_DEVICECLAIM
+                           };
+  Desk_window_info window_info;
+  char *p;
+  char c;
+  int number,seq_point;
+  char name[40];
+  int current,next,old_next,free;
+
+
+/*
+  if(argc==2)
+  {
+    if(!strcmp(argv[1],"-debug"))
+      do_error_check=1;
+  }
+*/
+
+
+
+  //int *wumm;
+
+  //flex_initx(program_name,NULL,TRUE,-1,FALSE);
+  //flex_init(program_name,NULL);
+  //_kernel_register_slotextend(flex_budge);
+
+  //IMem_UseDynamicArea("Connector",-1);
+  /*
+  if (!IMem_Init())
+    Desk_Error_ReportFatal(0,"Not enough memory to run, please free up some more memory");
+  IMem_Budge();
+  IMem_AutoCompactType(imem_FULLCOMPACT);
+  */
+
+
+/*
+  wumm=(int *)heap_alloc_save(80000);
+  for(i=0;i<20000;i++)
+    wumm[i]=123;
+  heap_free(wumm);
+*/
+
+/*
+  factors.xmul=1  *3;
+  factors.ymul=16 *3;
+  factors.xdiv=1  *2;
+  factors.ydiv=10 *2;
+*/
+/*
+  factors.xmul=1;
+  factors.ymul=1; //125;
+  factors.xdiv=1;
+  factors.ydiv=1; //100;
+*/
+
+  //HeapGraph_RedirectAllocFns( NULL);
+
+  // delete Serinptbuffer
+
+
+
+
+  /* create icon for text plotting */
+  /*
+  text_icon.workarearect.min.x=0;
+  text_icon.workarearect.min.y=-36;
+  text_icon.workarearect.max.x=16;
+  text_icon.workarearect.max.y=0;
+  text_icon.flags.value=0x80000039;
+  strcpy(text_icon.data.text,"Andreas");
+  */
+  Desk_Error2_Init_JumpSig();
+  Desk_Error2_SetHandler(error_handler);
+
+  //Desk_Font_FindFont(&outlfont,"corpus.bold",12*16,12*16,0,0);
+  //Desk_Font_SetFont(outlfont);
+
+
+  Desk_Resource_Initialise(program_name);
+  Desk_Msgs_LoadFile("Messages");
+
+  /*
+  * create startup command for Desktop Boot file
+  */
+  build_startupcommand();
+
+  Desk_Event_Initialise3(program_name,300,messages);
+  Desk_EventMsg_Initialise();
+
+  Desk_SWI(2,0,Desk_SWI_OS_Module|Desk_XOS_Bit,4,"SerinptBuffer");
+
+
+
+  trans_tab=(osspriteop_trans_tab *)Desk_DeskMem_Malloc(256);
+    for(i=0;i<256;i++)
+      trans_tab->c[i]=i;
+
+
+  strcpy(log_number,"");
+  strcpy(log_name,"");
+
+  calc_online_time_width();
+
+  strcpy(filetypes,"txt fff,doc fff,asc fff,dat ffd,arc ddc,spk ddc,zip ddc,gif 695, \
+                    pcx 697,tga 69d,tif ff0");
+
+  for(i=0;i<MAX_SCRIPTS;i++)
+    t_filename[i]=NULL;
+
+  for(i=0;i<MAX_NUMBERS;i++)
+  {
+    //if(!flex_alloc((flex_ptr)&t_number[i],80))
+    //  Desk_Error_Report(0,"Couldn't allocate 80 bytes for number array");
+    t_number[i] = (char *)Desk_DeskMem_Malloc(80);
+    *(t_number[i])=0;
+  }
+
+  for(i=0;i<12;i++)
+  {
+    fkeys[i]=NULL;
+    fkeys_0[i]=NULL;
+    t_fkeys[i]=NULL;
+  }
+  get_key_mem();
+  strcpy(fkeys_0[0],"|[[11~");
+  strcpy(fkeys_0[1],"|[[12~");
+  strcpy(fkeys_0[2],"|[[13~");
+  strcpy(fkeys_0[3],"|[[14~");
+  strcpy(fkeys_0[4],"|[[15~");
+  strcpy(fkeys_0[5],"|[[17~");
+  strcpy(fkeys_0[6],"|[[18~");
+  strcpy(fkeys_0[7],"|[[19~");
+  strcpy(fkeys_0[8],"|[[20~");
+  strcpy(fkeys_0[9],"|[[21~");
+  strcpy(fkeys_0[10],"|[[23~");
+  //strcpy(fkeys_0[11],"|[[24~");
+  strcpy(fkeys_0[11],"");
+  set_default_keys();
+
+  get_sb_mem();
+  strcpy(sb_label_0[0],"");
+  strcpy(sb_data_0[0],"");
+  strcpy(sb_label_0[1],"");
+  strcpy(sb_data_0[1],"");
+  strcpy(sb_label_0[2],"");
+  strcpy(sb_data_0[2],"");
+  strcpy(sb_label_0[3],"");
+  strcpy(sb_data_0[3],"");
+  strcpy(sb_label_0[4],"");
+  strcpy(sb_data_0[4],"");
+  strcpy(sb_label_0[5],"");
+  strcpy(sb_data_0[5],"");
+  strcpy(sb_label_0[6],"");
+  strcpy(sb_data_0[6],"");
+  strcpy(sb_label_0[7],"");
+  strcpy(sb_data_0[7],"");
+
+  set_default_sb();
+
+
+  //Desk_Font_FindFont(&font_handle,"Ansi",13*16,15*16,0,0);
+
+  //LinkList_Init(&Files);
+
+  //loaddaten();
+  tx_window=-1;
+
+  strcpy(block_driver_name,"Internal"); // default name falls kein config file vorhanden ist.
+
+  /* Base path to read/write config from */
+  strcpy(config_filename,"<Choices$Write>.Connector.Config.");
+  if(Desk_File_IsDirectory("Choices:Connector.Config"))
+    strcpy(config_ro_filename,"Choices:Connector.Config.");
+  else
+    strcpy(config_ro_filename,"<Connector$Dir>."); // defaults held here
+
+  p = "config"; // defaults
+  for(i=1;i<argc;i++)
+  {
+    if(!strcmp(argv[i],"-config"))
+    {
+      p = argv[i+1];
+      break;
+    }
+  }
+  strcat(config_ro_filename,p);
+  strcat(config_filename,p);
+
+
+  //Desk_Error_Report(0,"%s",config_filename);
+
+  loadconfiguration();
+  filetypes_menu=Desk_Menu_New("Filetypes",filetypes);
+
+  if(use_dosmap)
+    create_filetypes_from_dosmap();
+
+  mousebuffer=(char *)Desk_DeskMem_Malloc(2048);
+  mousebuffer[0]=0;
+
+
+  if(vt_font!=0 || ansi_font!=0)
+  {
+    load_fonts(vt_font,ansi_font);
+  }
+  else
+  {
+    vt_charheight=18;
+    ansi_charheight=18;
+  }
+
+  //get_filename_length();
+
+
+  // tx_window wurde entfernt ==> wenn tx_window_size>0 dann ...
+  // damit es zum alten config kompatible ist.
+  if(tx_window==0)
+    tx_window_size=0;
+
+  normal_attr=((backcolor<<12)|(forecolor<<8))&0x0000ff00;
+  normal_attr=normal_attr|(normal_attr<<8);
+  attrib=normal_attr;
+  strcpy(spool_filename,"<Wimp$ScrapDir>.Connector.SpoolFiles.Spool");
+
+
+  Desk_Screen_CacheModeInfo();
+
+  Desk_EventMsg_Claim(Desk_message_MODECHANGE, Desk_event_ANY, Desk_Handler_ModeChange, NULL);
+  Desk_EventMsg_Claim(Desk_message_QUIT, Desk_event_ANY, Quit, NULL);
+
+  Desk_EventMsg_Claim(Desk_message_DEVICECLAIM, Desk_event_ANY, claim_device_handler, NULL);
+  Desk_EventMsg_Claim(0x400cf,Desk_event_ANY,calc_online_time_width_handler, NULL);
+
+ /*
+  * install default event handlers
+  */
+  Desk_Event_Claim(Desk_event_REDRAW, Desk_event_ANY, Desk_event_ANY, Desk_Handler_NullRedraw, NULL);
+  Desk_Event_Claim(Desk_event_OPEN, Desk_event_ANY, Desk_event_ANY, Desk_Handler_OpenWindow, NULL);
+  Desk_Event_Claim(Desk_event_NULL, Desk_event_ANY, Desk_event_ANY, null, NULL);
+  Desk_Event_Claim(Desk_event_KEY, Desk_event_ANY, Desk_event_ANY, input_haupt_window, NULL);
+  Desk_Event_Claim(Desk_event_GAINCARET, Desk_event_ANY, Desk_event_ANY, Gain_caret, NULL);
+  Desk_Event_Claim(Desk_event_LOSECARET, Desk_event_ANY, Desk_event_ANY, Lose_caret, NULL);
+
+  //Desk_Filter_RegisterPreFilter("KeyFilter",key_handler,0,Desk_Event_taskhandle);
+
+ /*
+  * install savedesktop file message handler to insert startup command into
+  * Desktop Boot file
+  */
+  Desk_EventMsg_Claim(Desk_message_SAVEDESK, Desk_event_ANY, save_desktop, NULL);
+
+ /*
+  * load window definitions
+  */
+  Desk_Screen_CacheModeInfo();
+  highres=(Desk_screen_eig.y==Desk_screen_eig.x) ? TRUE : FALSE;
+  setup_templates();
+
+  //create_pane_icons();
+
+  sprintf(gstring,"%s.!Files!",SCRIPTS_PATH);
+
+
+  if(!Desk_File_Exists(gstring))
+    scan_scripts_dir();
+
+
+  auto_start_script_nr=-1;
+  if(argc==2)
+  {
+    for(i=0;i<number_of_scripts;i++)
+    {
+      if(!Desk_stricmp(argv[1],t_filename[i]))
+      {
+        auto_start_script_nr=i;
+        break;
+      }
+    }
+  }
+  //scan_files();
+
+/*
+  send_serial_port_claim_message();
+
+  t=Time_Monotonic();
+  while(t+100>Time_Monotonic())
+    Desk_Wimp_Poll(Desk_event_mask, &Desk_Event_lastevent);
+*/
+
+  //install_serial_buffer();
+    // 17
+
+  number_of_drivers=0;
+  driver_init();
+  driver_nr=-1;
+  for(i=0;i<number_of_drivers;i++)
+    if(!strcmp(drivers[i].file,block_driver_name))
+      driver_nr=i;
+
+  if(driver_nr<0)
+  {
+    driver_nr=0;
+    Desk_Error_Report(0,"Can't find block driver %s, loading %s driver instead",
+                      block_driver_name,drivers[driver_nr].file);
+  }
+  new_driver_nr=driver_nr;
+  choosed_driver_nr=driver_nr;
+
+  claim_serial_port();
+
+  local_max_port_nr=max_port_nr;
+
+ /*
+  * event handler to close windows and beep if I have messed the code up
+  */
+  Desk_Event_Claim(Desk_event_CLOSE, Desk_event_ANY, Desk_event_ANY, CloseWindow, NULL);
+
+ /*
+  * build menus
+  */
+
+  setup_menus();
+
+  /* Import/Export File Handlers */
+
+  Desk_EventMsg_Claim(Desk_message_DATALOAD, Desk_event_ANY, load_handler, NULL);
+  Desk_EventMsg_Claim(Desk_message_DATASAVE, Desk_event_ANY, load_handler, NULL);
+  Desk_EventMsg_Claim(Desk_message_RAMTRANSMIT, Desk_event_ANY, load_handler, NULL);
+
+  Desk_EventMsg_Claim(Desk_message_DATASAVEACK, Desk_event_ANY, save_handler, NULL);
+  Desk_EventMsg_Claim(Desk_message_DATALOADACK, Desk_event_ANY, save_handler, NULL);
+  Desk_EventMsg_Claim(Desk_message_RAMFETCH, Desk_event_ANY, save_handler, NULL);
+
+/*
+  Desk_Event_Claim(Desk_event_USERMESSAGE, Desk_event_ANY, Desk_event_ANY, load_handler, NULL);
+  Desk_Event_Claim(Desk_event_USERMESSAGEACK, Desk_event_ANY, Desk_event_ANY, load_handler, NULL);
+  Desk_Event_Claim(Desk_event_USERMESSAGERECORDED, Desk_event_ANY, Desk_event_ANY, load_handler, NULL);
+*/
+  Desk_Event_Claim(Desk_event_USERMESSAGEACK, Desk_event_ANY, Desk_event_ANY, ack_handler, NULL);
+
+  if(export_data_text)
+    icon_change_sprite(exportdata_window,1,"file_fff");
+  else
+    icon_change_sprite(exportdata_window,1,"file_ffd");
+
+  Desk_Icon_SetSelect(exportdata_window,4,export_data_text);
+
+  incdec_spool=Desk_Icon_InitIncDecHandler(spool_window,SPOOL_SPEED,SPOOL_UP,
+                                      SPOOL_DOWN,Desk_FALSE,1,0,1000,spool_speed);
+
+/*
+  if(max_port_nr==0)
+  {
+    step=0;
+    Desk_Icon_Shade(cserial_window,CSERIAL_UP);
+    Desk_Icon_Shade(cserial_window,CSERIAL_DOWN);
+  }
+  else
+  {
+    step=1;
+    Desk_Icon_Unshade(cserial_window,CSERIAL_UP);
+    Desk_Icon_Unshade(cserial_window,CSERIAL_DOWN);
+  }
+*/
+
+/*
+  incdec_cserial=Desk_Icon_InitIncDecHandler(cserial_window,CSERIAL_PORT,CSERIAL_UP,
+                                        CSERIAL_DOWN,Desk_FALSE,step,0,max_port_nr,0);
+*/
+
+  Desk_Icon_InitIncDecHandler(cterminal_window,CTERMINAL_LOCAL,CTERMINAL_UP,
+                                        CTERMINAL_DOWN,Desk_FALSE,1,1,22,11);
+  Desk_Icon_InitIncDecHandler(cterminal_window,CTERMINAL_REMOTE,CTERMINAL_DOWN,
+                                        CTERMINAL_UP,Desk_FALSE,1,1,22,12);
+
+  //Desk_Icon_InitIncDecHandler(edit_window,EDIT_NR,EDIT_UP,EDIT_DOWN,FALSE,1,1,5,1);
+
+  Desk_Drag_Initialise(Desk_TRUE);
+  init_slider();
+  init_zmodem_receive_string();
+
+  modechange(NULL, NULL);
+
+  if(dial_terminal_nr==3)
+    create_cept_sprite();
+
+  init_colormap();
+  init_fonts();
+  if(dial_terminal_nr==3)
+    init_layer6();
+
+
+  consoleInit();
+  lineMode=0;
+  terminal_height=24;
+  consoleSetup();
+  VTInit();
+  ansiInit();
+
+  init_text_buffer(1);
+  setmodemspeed(dial_terminal_nr,dial_baud_nr,dial_data_nr,transfer_type_nr,TRUE);
+
+
+  (*driver)(DRIVER_FLUSHTX,portnumber,0);
+  (*driver)(DRIVER_FLUSHRX,portnumber,0);
+
+  /*
+  (*driver)(DRIVER_CONTROLLINES,portnumber,0,0);
+  t=Time_Monotonic()+100;
+  while(Time_Monotonic()<t)
+  {
+    (*driver)(DRIVER_POLL,portnumber,0,0);
+    Desk_Wimp_Poll(Desk_Event_mask, &Desk_Event_lastevent);
+    Desk_Event_Process(&Desk_Event_lastevent);
+  }
+  (*driver)(DRIVER_CONTROLLINES,portnumber,3,0);
+  */
+
+
+  (*driver)(DRIVER_FLOWCONTROL,portnumber,flow_type_nr,0);
+  if(init_modem)
+    send_string(modem.init);
+
+  if(banner_exist)
+    Desk_Icon_SetFlags(banner_window,0,0x1700311a,Desk_TRUE);
+
+  title_bar_height=get_title_bar_height();
+
+  set_smartbuttons();
+  set_configure_icons();
+  //create_send_list();
+
+  // Im configure window title den config filenamen anzeigen.
+
+  Desk_Window_GetInfo3(configure_window,&window_info);
+  //strcpy(gstring,window_info.block.title.indirecttext.buffer);
+  //geht nicht da der string nicht mit 0 sondern <32 abgeschlossen wird 13 ?
+  i=0;
+  while((c=window_info.block.title.indirecttext.buffer[i])>=32)
+    gstring[i++]=c;
+  gstring[i]=0;
+  p=strrchr(config_filename,'.');
+  strcat(gstring," (");
+  strcat(gstring,p+1);
+  strcat(gstring,")");
+  Desk_Window_SetTitle(configure_window,gstring);
+
+
+  if(auto_start_script_nr!=-1)
+    start_dial(auto_start_script_nr,0);
+
+  while (TRUE)
+  {
+    Desk_Wimp_Poll(Desk_Event_mask, &Desk_Event_lastevent);
+    Desk_Event_Process(&Desk_Event_lastevent);
+  }
+  return(0);
+}
+
+
+/******************************************************************************
+ *                              setup routines                                *
+ ******************************************************************************/
+
+static void setup_menus(void)
+{
+  char menudescription[260];
+  char menutitle[15];
+  int lookup=NULL,i;
+
+  Desk_Msgs_Lookup("title.icon", menutitle, 15);
+  Desk_Msgs_Lookup("menu.icon", menudescription, 260);
+  icon_menu  = Desk_Menu_New(menutitle, menudescription);
+  Desk_Menu_AddSubWindow(icon_menu,0,info_window);
+  Desk_Event_Claim(Desk_event_MENU, Desk_event_ANY, Desk_event_ANY, MenuChoice_baricon_menu, NULL);
+
+  lookup=Desk_Msgs_Lookup("title.haupt", menutitle, 15);
+  lookup=Desk_Msgs_Lookup("menu.haupt", menudescription, 260);
+  haupt_menu  = Desk_Menu_New(menutitle, menudescription);
+  Desk_Menu_AddSubWindow(haupt_menu,3,exporttext_window);
+  Desk_Menu_AddSubWindow(haupt_menu,4,exportdata_window);
+  Desk_Menu_SetFlags(haupt_menu,5,toolbar,0);
+  Desk_Event_Claim(Desk_event_MENU, Desk_event_ANY, Desk_event_ANY, MenuChoice_haupt_menu, NULL);
+
+  lookup=Desk_Msgs_Lookup("title.transfer", menutitle, 15);
+  lookup=Desk_Msgs_Lookup("menu.transfer", menudescription, 260);
+  transfer_menu  = Desk_Menu_New(menutitle, menudescription);
+  Desk_Menu_AddSubMenu(haupt_menu,1,transfer_menu);
+
+
+  lookup=Desk_Msgs_Lookup("title.modem", menutitle, 15);
+  lookup=Desk_Msgs_Lookup("menu.modem", menudescription, 260);
+  modem_menu  = Desk_Menu_New(menutitle, menudescription);
+  Desk_Menu_AddSubWindow(modem_menu,1,dial_window);
+  Desk_Menu_AddSubMenu(haupt_menu,0,modem_menu);
+
+  lookup=Desk_Msgs_Lookup("title.terminal", menutitle, 15);
+  lookup=Desk_Msgs_Lookup("menu.terminal", menudescription, 260);
+  terminal_menu  = Desk_Menu_New(menutitle, menudescription);
+  Desk_Event_Claim(Desk_event_MENU,  Desk_event_ANY, Desk_event_ANY, MenuChoice_terminal_menu, NULL);
+  Desk_Menu_AddSubWindow(terminal_menu,1,ansi_window);
+  Desk_Menu_AddSubWindow(terminal_menu,0,vt100_window);
+
+
+  lookup=Desk_Msgs_Lookup("title.baud", menutitle, 15);
+  lookup=Desk_Msgs_Lookup("menu.baud", menudescription, 260);
+  baud_menu  = Desk_Menu_New(menutitle, menudescription);
+  //baud_menu=NULL;
+  Desk_Event_Claim(Desk_event_MENU,  Desk_event_ANY, Desk_event_ANY, MenuChoice_baud_menu, NULL);
+
+  lookup=Desk_Msgs_Lookup("title.data", menutitle, 15);
+  lookup=Desk_Msgs_Lookup("menu.data", menudescription, 260);
+  data_menu  = Desk_Menu_New(menutitle, menudescription);
+  Desk_Event_Claim(Desk_event_MENU,  Desk_event_ANY, Desk_event_ANY, MenuChoice_data_menu, NULL);
+
+  lookup=Desk_Msgs_Lookup("title.transt", menutitle, 15);
+  lookup=Desk_Msgs_Lookup("menu.transt", menudescription, 260);
+  transfertype_menu  = Desk_Menu_New(menutitle, menudescription);
+  Desk_Menu_AddSubWindow(transfertype_menu,0,xmodem_window);
+  Desk_Menu_AddSubWindow(transfertype_menu,1,ymodem_window);
+
+  Desk_Menu_AddSubWindow(transfertype_menu,2,zmodem_window);
+  //Desk_Menu_Warn(transfertype_menu,2,Desk_bool_TRUE,zmodem_warn,NULL);
+
+  Desk_Menu_AddSubWindow(transfertype_menu,3,ascii_window);
+  //Desk_Menu_Warn(transfertype_menu,3,Desk_bool_TRUE,ascii_warn,NULL);
+
+  Desk_Event_Claim(Desk_event_MENU,  Desk_event_ANY, Desk_event_ANY, MenuChoice_transfertype_menu, NULL);
+
+  lookup=Desk_Msgs_Lookup("title.special", menutitle, 15);
+  lookup=Desk_Msgs_Lookup("menu.special", menudescription, 260);
+  special_menu  = Desk_Menu_New(menutitle, menudescription);
+  Desk_Menu_AddSubWindow(special_menu,2,fkeys2_window);
+  Desk_Menu_AddSubWindow(special_menu,3,sbedit2_window);
+  Desk_Event_Claim(Desk_event_MENU,  Desk_event_ANY, Desk_event_ANY, MenuChoice_special_menu, NULL);
+
+/*
+  lookup=Desk_Msgs_Lookup("title.ascii", menutitle, 16);
+  lookup=Desk_Msgs_Lookup("menu.ascii", menudescription, 260);
+  ascii_menu  = Desk_Menu_New(menutitle, menudescription);
+  Desk_Event_Claim(Desk_event_MENU,  Desk_event_ANY, Desk_event_ANY, MenuChoice_ascii_menu, NULL);
+*/
+
+  lookup=Desk_Msgs_Lookup("text.1", menudescription, 260);
+  ascii_trans_str[0]=(char *)Desk_DeskMem_Malloc(strlen(menudescription)+1);
+  strcpy(ascii_trans_str[0],menudescription);
+  lookup=Desk_Msgs_Lookup("text.2", menudescription, 260);
+  ascii_trans_str[1]=(char *)Desk_DeskMem_Malloc(strlen(menudescription)+1);
+  strcpy(ascii_trans_str[1],menudescription);
+  lookup=Desk_Msgs_Lookup("text.3", menudescription, 260);
+  ascii_trans_str[2]=(char *)Desk_DeskMem_Malloc(strlen(menudescription)+1);
+  strcpy(ascii_trans_str[2],menudescription);
+  lookup=Desk_Msgs_Lookup("text.4", menudescription, 260);
+  ascii_trans_str[3]=(char *)Desk_DeskMem_Malloc(strlen(menudescription)+1);
+  strcpy(ascii_trans_str[3],menudescription);
+
+  lookup=Desk_Msgs_Lookup("title.logon", menutitle, 15);
+  lookup=Desk_Msgs_Lookup("menu.logon", menudescription, 260);
+  logon_menu  = Desk_Menu_New(menutitle, menudescription);
+  Desk_Event_Claim(Desk_event_MENU,  Desk_event_ANY, Desk_event_ANY, MenuChoice_logon_menu, NULL);
+
+  lookup=Desk_Msgs_Lookup("title.import", menutitle, 15);
+  lookup=Desk_Msgs_Lookup("menu.import", menudescription, 260);
+  import_menu  = Desk_Menu_New(menutitle, menudescription);
+  Desk_Event_Claim(Desk_event_MENU,  Desk_event_ANY, Desk_event_ANY, MenuChoice_import_menu, NULL);
+
+/*
+  lookup=Desk_Msgs_Lookup("title.status", menutitle, 15);
+  lookup=Desk_Msgs_Lookup("menu.status", menudescription, 260);
+  status_menu  = Desk_Menu_New(menutitle, menudescription);
+  Desk_Event_Claim(Desk_event_MENU,  Desk_event_ANY, Desk_event_ANY, MenuChoice_status_menu, NULL);
+*/
+  lookup=Desk_Msgs_Lookup("title.flow", menutitle, 15);
+  lookup=Desk_Msgs_Lookup("menu.flow", menudescription, 260);
+  flow_menu  = Desk_Menu_New(menutitle, menudescription);
+  Desk_Event_Claim(Desk_event_MENU,  Desk_event_ANY, Desk_event_ANY, MenuChoice_flow_menu, NULL);
+
+  lookup=Desk_Msgs_Lookup("title.send", menutitle, 15);
+  lookup=Desk_Msgs_Lookup("menu.send", menudescription, 260);
+  send_menu  = Desk_Menu_New(menutitle, menudescription);
+  Desk_Event_Claim(Desk_event_MENU,  Desk_event_ANY, Desk_event_ANY, MenuChoice_send_menu, NULL);
+
+
+  if(!lookup)
+    Desk_Error_Report(0,"Menudefinition missing in Messages File");
+
+  strcpy(driver_menu_string,"Info|");
+  for(i=0;i<number_of_drivers;i++)
+  {
+    strcat(driver_menu_string,drivers[i].file);
+    strcat(driver_menu_string,",");
+  }
+  driver_menu_string[strlen(driver_menu_string)-1]=0;
+  driver_menu = Desk_Menu_New("Block-Driver",(char*)driver_menu_string);
+  Desk_Event_Claim(Desk_event_MENU,  Desk_event_ANY, Desk_event_ANY, MenuChoice_driver_menu, NULL);
+  Desk_Menu_AddSubWindow(driver_menu,0,driverinfo_window);
+
+  if(dial_menu==NULL)
+    dial_menu  = Desk_Menu_New("Dial", "");
+  Desk_Event_Claim(Desk_event_MENU, Desk_event_ANY, Desk_event_ANY, MenuChoice_dial_menu, NULL);
+
+  /* Messages */
+  for(i=0;i<NR_OF_MESSAGES;i++)
+  {
+    sprintf(menutitle,"msg.%d",i);
+    Desk_Msgs_Lookup(menutitle,msg[i].text,80);
+  }
+}
+
+/******************************************************************************/
+
+static Desk_icon_handle create_baricon(char *name)
+{
+  Desk_icon_createblock icon;
+  Desk_icon_handle icon_nr;
+  int ysize;
+
+  //static char sprite[15];
+  if(highres)
+    ysize=32;
+  else
+    ysize=20;
+
+  icon.window=Desk_iconbar_RIGHT;
+  icon.icondata.workarearect.min.x=0;
+  icon.icondata.workarearect.min.y=0;//-16;
+  icon.icondata.workarearect.max.x=32<<Desk_screen_eig.x;//164;
+  icon.icondata.workarearect.max.y=ysize<<Desk_screen_eig.y;//64+24;
+  icon.icondata.flags.value=0x17003103+8+128-1;
+
+  //strcpy(sprite,"S");
+  //strcat(sprite,name);
+
+  icon.icondata.data.indirectsprite.name=name;
+  icon.icondata.data.indirectsprite.spritearea=usericonsprites;
+  icon.icondata.data.indirectsprite.nameisname=12;
+  //icon.icondata.data.indirecttext.validstring=sprite;
+  //icon.icondata.data.indirecttext.buffer=iconbar_text;
+  //icon.icondata.data.indirecttext.bufflen=12;
+
+  Desk_Wimp_CreateIcon(&icon,&icon_nr);
+
+  return(icon_nr);
+
+  //return(Desk_Icon_BarIconUser(name,Desk_iconbar_RIGHT,(unsigned int *)usericonsprites)); //->firstoffset));
+}
+
+#ifdef banner
+static void create_banner_icon(void)
+{
+  Desk_icon_createblock icon;
+  Desk_icon_handle icon_nr;
+
+  icon.window=banner_window;
+  icon.icondata.workarearect.min.x=0;
+  icon.icondata.workarearect.min.y=-banner_ysize;
+  icon.icondata.workarearect.max.x=banner_xsize;;
+  icon.icondata.workarearect.max.y=0;
+  icon.icondata.flags.value=0x1700011a;
+
+  icon.icondata.data.indirectsprite.name="banner";
+  icon.icondata.data.indirectsprite.spritearea=bannersprite;
+  icon.icondata.data.indirectsprite.nameisname=12;
+  //icon.icondata.data.indirecttext.validstring=sprite;
+  //icon.icondata.data.indirecttext.buffer=iconbar_text;
+  //icon.icondata.data.indirecttext.bufflen=12;
+
+  Desk_Wimp_CreateIcon(&icon,&icon_nr);
+}
+#endif
+
+static void load_spritefile(const char *filename)
+{
+  int          blksize;
+  blksize = Desk_File_Size(filename);
+
+  /* Add a bit of room for extra header info & safety padding */
+  blksize += 16;
+
+  /* Allocate memory for this block */
+  usericonsprites=(Desk_sprite_area) Desk_DeskMem_Malloc(blksize);
+
+  /* Initialise sprite area */
+  usericonsprites->areasize    = blksize;
+  usericonsprites->firstoffset = 16;
+
+  Desk_Sprite_InitArea(usericonsprites);
+
+  /* Try to load sprite file */
+  Desk_Sprite_Load(usericonsprites, filename);
+}
+
+#ifdef banner
+static void load_banner_spritefile(const char *filename)
+{
+  int          blksize;
+  Desk_sprite_info info;
+
+  if(Desk_File_Exists(filename))
+  {
+    banner_exist=1;
+    blksize = Desk_File_Size(filename);
+
+    /* Add a bit of room for extra header info & safety padding */
+    blksize += 16;
+
+    /* Allocate memory for this block */
+    bannersprite=(Desk_sprite_area) Desk_DeskMem_Malloc(blksize);
+
+    /* Initialise sprite area */
+    bannersprite->areasize    = blksize;
+    bannersprite->firstoffset = 16;
+
+    Desk_Sprite_InitArea(bannersprite);
+    Desk_Sprite_Load(bannersprite, filename);
+    Desk_Sprite_ReadInfo(bannersprite,"banner",&info);
+    banner_xsize=(info.width<<1);
+    banner_ysize=(info.height<<1);
+  }
+  else
+    banner_exist=0;
+}
+#endif
+
+
+void setup_templates(void)
+{
+  char spritefile[50];
+  char bannerfile[50];
+  char info[64];
+  char resloc[96];
+  Desk_wimp_point zerooffset = {0, 0};
+  Desk_wimp_point offset = {16, 16};
+  Desk_window_block *wblock;
+  Desk_msgtrans_filedesc *desc;
+
+  strncpy(spritefile, Desk_resource_pathname, 39);
+  strncpy(bannerfile, Desk_resource_pathname, 39);
+  strcat(bannerfile, "banner");
+
+  if(Desk_screen_eig.y == Desk_screen_eig.x)
+     strcat(spritefile, "Sprites22");
+  else
+     strcat(spritefile, "Sprites");
+  load_spritefile(spritefile);
+#ifdef banner
+  load_banner_spritefile(bannerfile);
+#endif
+
+  //usericonsprites = Sprite_LoadFile(spritefile);
+
+
+  strcpy(Desk_resource_pathname,"<Connector$Dir>.");
+  Desk_Template_Initialise();
+  /* Desk_Template_UseOutlineFonts(); */
+  Desk_Template_LoadFile("Templates");
+  Desk_Template_UseSpriteArea(usericonsprites);
+
+  /* create Windows */
+
+  //baricon = Desk_Icon_BarIconUser(program_name,iconbar_RIGHT,(unsigned int *) usericonsprites);
+  baricon = create_baricon("connectors");
+  Desk_Event_Claim(Desk_event_CLICK, -2, baricon, Click_baricon, NULL);
+
+  exporttext_window=Desk_Window_CreateOrig("export_text");//, Desk_template_TITLEMIN);
+  Desk_Event_Claim(Desk_event_CLICK, exporttext_window, Desk_event_ANY, Click_exporttext_window, NULL);
+  exportdata_window=Desk_Window_CreateOrig("export_data"); //, Desk_template_TITLEMIN);
+  Desk_Event_Claim(Desk_event_CLICK, exportdata_window, Desk_event_ANY, Click_exportdata_window, NULL);
+
+  dial_window=Desk_Window_CreateOrig("dial");//, Desk_template_TITLEMIN);
+  //Desk_Event_Claim(Desk_event_CLOSE, dial_window, Desk_event_ANY, Close_dial_window, NULL);
+  //Desk_Event_Claim(Desk_event_CLICK, dial_window, Desk_event_ANY, Click_dial_window, NULL);
+
+  filetrans_window=Desk_Window_CreateOrig("filetrans");//, Desk_template_TITLEMIN);
+  Desk_Event_Claim(Desk_event_REDRAW, filetrans_window, Desk_event_ANY, Redraw_filetrans_window, NULL);
+  Desk_Event_Claim(Desk_event_CLICK, filetrans_window, Desk_event_ANY, Click_filetrans_window, NULL);
+
+  send_window=Desk_Window_CreateOrig("send");//, Desk_template_TITLEMIN);
+  Desk_Event_Claim(Desk_event_CLOSE, send_window, Desk_event_ANY, Close_send_window, NULL);
+  Desk_Event_Claim(Desk_event_CLICK, send_window, Desk_event_ANY, Click_send_window, NULL);
+
+/*
+  receive_window=Desk_Window_CreateOrig("receive");//, Desk_template_TITLEMIN);
+  Desk_Event_Claim(Desk_event_CLICK, receive_window, Desk_event_ANY, Click_receive_window, NULL);
+*/
+  colours_window=Desk_Window_CreateOrig("colours");//, Desk_template_TITLEMIN);
+  Desk_Event_Claim(Desk_event_CLICK, colours_window, Desk_event_ANY, Click_colours_window, NULL);
+
+  //status_window=Desk_Window_CreateOrig("status", Desk_template_TITLEMIN);
+  //Desk_Event_Claim(Desk_event_CLOSE, status_window, Desk_event_ANY, Close_status_window, NULL);
+
+  spool_window=Desk_Window_CreateOrig("spool");//, Desk_template_TITLEMIN);
+  //Desk_Event_Claim(Desk_event_CLOSE, spool_window, Desk_event_ANY, Close_spool_window, NULL);
+  Desk_Event_Claim(Desk_event_CLICK, spool_window, Desk_event_ANY, Click_spool_window, NULL);
+  Desk_Event_Claim(Desk_event_REDRAW, spool_window, Desk_event_ANY, Redraw_spool_window, NULL);
+
+  info_window=Desk_Window_CreateOrig("Info");//, Desk_template_TITLEMIN);
+  Desk_Icon_SetText(info_window,0,Name_String);
+  Desk_Icon_SetText(info_window,2,Author_String);
+  Desk_Msgs_Lookup("app.purpose",info,sizeof(info));
+  Desk_Icon_SetText(info_window,1,info);
+  // The build system doesn't use <group.tag> style tags in Messages
+  // so pick out the token with MsgTrans.
+  sprintf(resloc,"%sMessages", Desk_resource_pathname);
+  Desk_MsgTrans_LoadFile(&desc,resloc);
+  Desk_MsgTrans_Lookup(desc,"_Version",info,sizeof(info)-1);
+  Desk_MsgTrans_LoseFile(desc);
+  Desk_Icon_SetText(info_window,3,info);
+
+  //create_online_time_icon();
+
+
+  if(Desk_screen_size.x<((640+20)<<Desk_screen_eig.x))
+  {
+    wblock=Desk_Template_Find("Haupt");
+    wblock->flags.data.nobounds=Desk_TRUE;
+    Desk_Wimp_CreateWindow(wblock,&haupt_window);
+  }
+  else
+  {
+    haupt_window=Desk_Window_CreateOrig("Haupt");//, Desk_template_TITLEMIN);
+  }
+  //Desk_Event_Claim(Desk_event_OPEN, haupt_window, Desk_event_ANY, Open_haupt_window, NULL);
+  Desk_Pane2_AddMain(haupt_window);
+
+  tools_window=Desk_Window_CreateOrig("Tools"); //, Desk_template_TITLEMIN);
+  Desk_Event_Claim(Desk_event_CLICK, tools_window, Desk_event_ANY, Click_tools_window, NULL);
+
+  create_toolbar(0,sinfo_open);
+
+  unten_window=Desk_Window_CreateOrig("unten");//, Desk_template_TITLEMIN);
+  Desk_Pane2_AddPane(haupt_window,unten_window, &zerooffset, NULL,
+                         Desk_pane2_FIXED|Desk_pane2_HRESIZE|Desk_pane2_HSTRETCH);
+
+  smartbutton_window=Desk_Window_CreateOrig("smartbutton");
+
+  Desk_Event_Claim(Desk_event_OPEN, haupt_window, Desk_event_ANY, Open_haupt_window, NULL);
+  Desk_Event_Claim(Desk_event_CLOSE, haupt_window, Desk_event_ANY, Close_haupt_window, NULL);
+  Desk_Event_Claim(Desk_event_CLICK, haupt_window, Desk_event_ANY, Click_haupt_window, NULL);
+  Desk_Event_Claim(Desk_event_REDRAW, haupt_window, Desk_event_ANY, Redraw_haupt_window, NULL);
+  Desk_Event_Claim(Desk_event_PTRLEAVE, haupt_window, Desk_event_ANY, leave_haupt_window, NULL);
+  Desk_Event_Claim(Desk_event_PTRENTER, haupt_window, Desk_event_ANY, enter_haupt_window, NULL);
+  Desk_Event_Claim(Desk_event_CLICK, unten_window, Desk_event_ANY, Click_unten_window, NULL);
+  Desk_Event_Claim(Desk_event_CLICK, smartbutton_window, Desk_event_ANY, Click_smartbutton_window, NULL);
+  //Desk_Event_Claim(Desk_event_REDRAW, unten_window, Desk_event_ANY, Redraw_unten_window, NULL);
+  //Desk_EventMsg_Claim(Desk_message_MODECHANGE, haupt_window, modechange, NULL);
+
+  Desk_EventMsg_Claim(Desk_message_MODECHANGE, Desk_event_ANY, modechange, NULL);
+
+  /* Dir Window  */
+  //paneoffset.x=-76;
+  //paneoffset.y=0;
+  pane_window=Desk_Window_CreateOrig("pane");
+  Desk_Pane2_AddMain(pane_window);
+  dir_window=Desk_Window_CreateOrig("dir");
+  Desk_Pane2_AddPane(pane_window,dir_window, &zerooffset, NULL,
+                     Desk_pane2_FIXED|Desk_pane2_HRESIZE|Desk_pane2_HSTRETCH);
+  Desk_Event_Claim(Desk_event_CLOSE, pane_window, Desk_event_ANY, Close_dir_window, NULL);
+  Desk_Event_Claim(Desk_event_CLICK, dir_window, Desk_event_ANY, Click_dir_window, NULL);
+  Desk_Event_Claim(Desk_event_CLICK, pane_window, Desk_event_ANY, Click_pane_window, NULL);
+  /*
+  dir_window=Desk_Window_CreateOrig("dir");//, Desk_template_TITLEMIN);
+  Desk_Pane2_AddMain(dir_window);
+  pane_window=Desk_Window_CreateOrig("pane");//, Desk_template_TITLEMIN);
+  Desk_Pane2_AddPane(dir_window, pane_window, &zerooffset, NULL,
+                Desk_pane2_FIXED|Desk_pane2_MAINTOP|Desk_pane2_PANETOP);
+  Desk_Event_Claim(Desk_event_CLOSE, dir_window, Desk_event_ANY, Close_dir_window, NULL);
+  Desk_Event_Claim(Desk_event_CLICK, dir_window, Desk_event_ANY, Click_dir_window, NULL);
+  Desk_Event_Claim(Desk_event_CLICK, pane_window, Desk_event_ANY, Click_pane_window, NULL);
+  */
+  /* Edit Window */
+  edit_window=Desk_Window_CreateOrig("edit");//, Desk_template_TITLEMIN);
+  Desk_Event_Claim(Desk_event_CLICK, edit_window, Desk_event_ANY, Click_edit_window, NULL);
+
+#ifdef banner
+  if(banner_exist)
+  {
+    banner_window=Desk_Window_CreateOrig("banner");//, Desk_template_TITLEMIN);
+    Desk_Window_SetExtent(banner_window,0,-banner_ysize,banner_xsize,0);
+    create_banner_icon();
+    Desk_Event_Claim(Desk_event_CLICK, banner_window, Desk_event_ANY, Click_banner_window, NULL);
+    Desk_Window_Show(banner_window,Desk_open_CENTERED);
+    banner_time=Desk_Time_Monotonic();
+  }
+#endif
+
+  fkeys_window=Desk_Window_CreateOrig("fkeys");
+  Desk_Event_Claim(Desk_event_CLICK, fkeys_window, Desk_event_ANY, Click_fkeys_window, NULL);
+
+  fkeys2_window=Desk_Window_CreateOrig("fkeys2");
+  Desk_Event_Claim(Desk_event_CLICK, fkeys2_window, Desk_event_ANY, Click_fkeys2_window, NULL);
+
+  xmodem_window=Desk_Window_CreateOrig("xmodem");
+  Desk_Event_Claim(Desk_event_CLICK, xmodem_window, Desk_event_ANY, Click_xmodem_window, NULL);
+
+  ymodem_window=Desk_Window_CreateOrig("ymodem");
+  Desk_Event_Claim(Desk_event_CLICK, ymodem_window, Desk_event_ANY, Click_ymodem_window, NULL);
+
+  zmodem_window=Desk_Window_CreateOrig("zmodem");
+  Desk_Event_Claim(Desk_event_CLICK, zmodem_window, Desk_event_ANY, Click_zmodem_window, NULL);
+
+  ascii_window=Desk_Window_CreateOrig("ascii");
+  Desk_Event_Claim(Desk_event_CLICK, ascii_window, Desk_event_ANY, Click_ascii_window, NULL);
+
+  sbedit_window=Desk_Window_CreateOrig("sbedit");
+  Desk_Event_Claim(Desk_event_CLICK, sbedit_window, Desk_event_ANY, Click_sbedit_window, NULL);
+
+  sbedit2_window=Desk_Window_CreateOrig("sbedit2");
+  Desk_Event_Claim(Desk_event_CLICK, sbedit2_window, Desk_event_ANY, Click_sbedit2_window, NULL);
+
+  driverinfo_window=Desk_Window_CreateOrig("DriverInfo");
+
+  ansi_window=Desk_Window_CreateOrig("ansi");
+  Desk_Event_Claim(Desk_event_CLICK, ansi_window, Desk_event_ANY, Click_ansi_window, NULL);
+
+  vt100_window=Desk_Window_CreateOrig("vt100");
+  Desk_Event_Claim(Desk_event_CLICK, vt100_window, Desk_event_ANY, Click_vt100_window, NULL);
+
+  configure_window=Desk_Window_CreateOrig("configure"); //, template_TITLEMIN);
+  Desk_Event_Claim(Desk_event_CLICK, configure_window, Desk_event_ANY, Click_configure_window, NULL);
+  cmodem_window=Desk_Window_CreateOrig("cmodem");//, template_TITLEMIN);
+  Desk_Event_Claim(Desk_event_CLICK, cmodem_window, Desk_event_ANY, Click_cmodem_window, NULL);
+  //Event_Claim(event_CLOSE, cmodem_window, event_ANY, Close_cmodem_window, NULL);
+  cterminal_window=Desk_Window_CreateOrig("cterminal");//, template_TITLEMIN);
+  Desk_Event_Claim(Desk_event_CLICK, cterminal_window, Desk_event_ANY, Click_cterminal_window, NULL);
+  //Event_Claim(event_CLOSE, cterminal_window, event_ANY, Close_cterminal_window, NULL);
+  cserial_window=Desk_Window_CreateOrig("cserial");//, template_TITLEMIN);
+  Desk_Event_Claim(Desk_event_CLICK, cserial_window, Desk_event_ANY, Click_cserial_window, NULL);
+  //Event_Claim(event_CLOSE, cserial_window, event_ANY, Close_cserial_window, NULL);
+  cfiletr_window=Desk_Window_CreateOrig("cfiletr"); //, template_TITLEMIN);
+  Desk_Event_Claim(Desk_event_CLICK, cfiletr_window, Desk_event_ANY, Click_cfiletr_window, NULL);
+  //Event_Claim(event_CLOSE, cfiletr_window, event_ANY, Close_cfiletr_window, NULL);
+/*
+  config_window=Desk_Window_CreateOrig("config");//, Desk_template_TITLEMIN);
+  Desk_Pane2_AddMain(config_window);
+  config_pane_window=Desk_Window_CreateOrig("configpane");//, Desk_template_TITLEMIN);
+  Desk_Pane2_AddPane(config_window, config_pane_window, &offset, NULL,
+                Desk_pane2_FIXED|Desk_pane2_MAINTOP|Desk_pane2_PANETOP);
+  Desk_Event_Claim(Desk_event_CLICK, config_window, Desk_event_ANY, Click_config_window, NULL);
+  Desk_Event_Claim(Desk_event_CLOSE, config_window, Desk_event_ANY, Close_config_window, NULL);
+  Desk_Event_Claim(Desk_event_CLICK, config_pane_window, Desk_event_ANY, Click_config_pane_window, NULL);
+*/
+
+  sinfo_window=Desk_Window_CreateOrig("sinfo");
+  if(sinfo_open)
+  {
+    Desk_Icon_AlterValidation(unten_window,UNTEN_SHOW,"r5;Sup,pup");
+    zerooffset.y+=4;
+    Desk_Pane2_AddPane(haupt_window, sinfo_window, &zerooffset, NULL,
+                       Desk_pane2_FIXED|Desk_pane2_PANETOP);
+  }
+  else
+  {
+    Desk_Icon_AlterValidation(unten_window,UNTEN_SHOW,"r5;Sdown,pdown");
+  }
+
+  //Desk_Pane2_Show(config_window,Desk_open_CENTERED);
+  /* Dialog */
+  ok_dialog=Desk_Dialog_Create("ok",Desk_template_TITLEMIN);
+  message_dialog=Desk_Dialog_Create("message",Desk_template_TITLEMIN);
+
+}
+
+
+/******************************************************************************
+ *                              misc routines                                 *
+ ******************************************************************************/
+
+/******************************************************************************/
+
+void build_startupcommand(void)
+{
+ /*
+  * build startup command for DesktopBoot file from resource pathname
+  */
+  char resourcepath[40];
+  //_kernel_swi_regs r;
+
+  strcpy(resourcepath, "/");
+  strncat(resourcepath, Desk_resource_pathname, 38);
+
+ /*
+  * remove "." from end of path
+  */
+  resourcepath[strlen(resourcepath) - 1] = 0;
+
+  //r.r[0] = (int) resourcepath;
+  //r.r[1] = (int) startup_command;
+  //r.r[2] = 256;
+  //_kernel_swi( XOS_Bit | OS_GSTrans , &r, &r );
+  Desk_SWI(3,0,Desk_XOS_Bit | Desk_SWI_OS_GSTrans,(int) resourcepath,(int) startup_command,256);
+
+}
+
+/******************************************************************************/
+
+static Desk_bool save_desktop(Desk_event_pollblock *event, void *reference)
+{
+ /*
+  * save startup command to DesktopBoot file
+  */
+  Desk_file_handle channel;
+  //Desk_message_block message;
+
+  channel = (Desk_file_handle) event->data.message.data.words[0];
+
+  Desk_File_WriteBytes(channel, startup_command, strlen(startup_command));
+  Desk_File_WriteByte(channel, '\n');
+
+  //if(error)
+  //{ /* acknowledge message */
+  //   message.header.yourref = message.header.myref;
+  //   Desk_Wimp_SendMessage(Desk_event_USERMESSAGEACK, &message, message.header.sender, NULL);
+  //}
+
+  return(Desk_TRUE);
+}
+
+
+

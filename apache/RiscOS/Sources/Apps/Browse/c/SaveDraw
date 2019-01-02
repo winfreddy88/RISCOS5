@@ -1,0 +1,1307 @@
+/* Copyright 1997 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/**************************************************************/
+/* File:    SaveDraw.c                                        */
+/*          (C) 2000 Pace Micro Technology PLC                */
+/*          All rights reserved                               */
+/*                                                            */
+/* Purpose: Save a web page as a Draw file.                   */
+/*                                                            */
+/* Author:  A.D.Hodgkinson, including various functions from  */
+/*          original Customer browser by Merlyn Kline.       */
+/*                                                            */
+/* History: 13-Nov-1997 (ADH): Created.                       */
+/*          24-May-2000 (ADH): 64-wide comments adopted.      */
+/**************************************************************/
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+
+#include <kernel.h>
+#include <swis.h>
+#include <tboxlibs/flex.h>
+
+#include <HTMLLib/HTMLLib.h>
+
+#include <tboxlibs/wimp.h>
+#include <tboxlibs/wimplib.h>
+#include <tboxlibs/event.h>
+
+#include "Global.h"
+#include "FromROSLib.h"
+#include "MiscDefs.h"
+#include "Utils.h"
+
+#include "Browser.h"
+#include "ChoiceDefs.h"
+#include "CSIM.h"
+#include "Fetch.h" /* (Which itself includes URLstat.h) */
+#include "FileTypes.h"
+#include "FontManage.h"
+#include "Forms.h"
+#include "Frames.h"
+#include "Images.h"
+#include "Object.h"
+#include "Printing.h" /* Only for the PrintSplitFraction definition at present */
+#include "PrintStyle.h"
+#include "Redraw.h"
+#include "RedrawCore.h"
+#include "Reformat.h"
+#include "Save.h"
+#include "Scale.h"
+#include "Tables.h"
+#include "TokenUtils.h"
+#include "Toolbars.h"
+
+#ifdef UNIFONT
+  #include <Unicode/iso10646.h>
+  #include "Unifont.h"
+#endif
+
+#include "SaveDraw.h"
+
+/* Local definitions */
+
+#define DRAWMARGIN 0
+
+/* Local statics */
+
+static FILE * outfile = NULL;
+
+/* Static function prototypes */
+
+static _kernel_oserror * savedraw_rectangle_fill   (int x, int y, int w, int h, unsigned int c);
+static _kernel_oserror * savedraw_triangle_fill    (int x1, int y1, int x2, int y2, int x3, int y3, unsigned int c);
+static _kernel_oserror * savedraw_create           (browser_data * b, int bgimages, int * size);
+
+/* Saved clipping rectangle information (in user-points, */
+/* screen origin).                                       */
+
+static const browser_data * clipping_browser = NULL;
+static BBox                 clipping_rectangle;
+
+/* Draw output redraw primitives */
+
+static _kernel_oserror * savedraw_jmptbl_line
+                         (
+                           const browser_data * restrict b,
+                           const BBox         * restrict ends,
+                           unsigned int                  colour,
+
+                           size_t             * restrict r_size
+                         );
+
+static _kernel_oserror * savedraw_jmptbl_rectangle
+                         (
+                           const browser_data * restrict b,
+                           const BBox         * restrict rect,
+                           unsigned int                  colour,
+                           unsigned int                  border,
+
+                           size_t             * restrict r_size
+                         );
+
+static _kernel_oserror * savedraw_jmptbl_triangle
+                         (
+                           const browser_data * restrict b,
+                           int                           x1,
+                           int                           y1,
+                           int                           x2,
+                           int                           y2,
+                           int                           x3,
+                           int                           y3,
+                           unsigned int                  colour,
+
+                           size_t             * restrict r_size
+                         );
+
+static _kernel_oserror * savedraw_jmptbl_text
+                         (
+                           const browser_data * restrict b,
+                           fm_face                       handle,
+                           int                           x,
+                           int                           y,
+                           const char         * restrict string,
+                           unsigned int                  numbytes,
+                           unsigned int                  fgcolour,
+                           unsigned int                  bgcolour,
+                           unsigned int                  blend,
+
+                           size_t             * restrict r_size
+                         );
+
+static _kernel_oserror * savedraw_jmptbl_image
+                         (
+                           const browser_data * restrict b,
+                           unsigned int                  image,
+                           int                           x,
+                           int                           y,
+                           unsigned int                  width,
+                           unsigned int                  height,
+
+                           size_t             * restrict r_size
+                         );
+
+static _kernel_oserror * savedraw_jmptbl_sprite
+                         (
+                           const browser_data * restrict b,
+                           const char         * restrict name,
+                           int                           x,
+                           int                           y,
+
+                           size_t             * restrict r_size
+                         );
+
+static _kernel_oserror * savedraw_jmptbl_clipping
+                         (
+                           const browser_data * restrict b,
+                           const BBox         * restrict desired,
+
+                           size_t             * restrict r_size
+                         );
+
+/* Draw output redraw table */
+
+static redrawcore_function_table_t rtable_drawfile =
+                                   {
+                                     savedraw_jmptbl_line,
+                                     savedraw_jmptbl_rectangle,
+                                     savedraw_jmptbl_triangle,
+                                     NULL, /* Don't need circles - used for debug only */
+
+                                     savedraw_jmptbl_text,
+
+                                     savedraw_jmptbl_image,
+                                     savedraw_jmptbl_sprite,
+
+                                     savedraw_jmptbl_clipping,
+
+                                     NULL, /* Not interested in sections/anchors/links */
+                                     NULL,
+                                     NULL
+                                   };
+
+/**************************************************************/
+/* savedraw_write_bytes()                                     */
+/*                                                            */
+/* Outputs a given number of bytes of a given string to the   */
+/* FILE * set up in the global 'outfile', returning a success */
+/* flag.                                                      */
+/*                                                            */
+/* Parameters: Pointer to an array of bytes;                  */
+/*                                                            */
+/*             Number of characters from the array to save.   */
+/*                                                            */
+/* Returns:    1 if successful, 0 if failed.                  */
+/*                                                            */
+/* Assumes:    An appropriately opened file is accessible     */
+/*             through the global FILE * 'outfile'.           */
+/**************************************************************/
+
+_kernel_oserror * savedraw_write_bytes(const char * restrict s, size_t n)
+{
+  size_t written;
+
+  if (!s || !outfile) return NULL;
+
+  written = fwrite(s, sizeof(*s), n, outfile);
+
+  if (written != n) return _kernel_last_oserror();
+  else              return NULL;
+}
+
+/**************************************************************/
+/* savedraw_rectangle_fill()                                  */
+/*                                                            */
+/* Output a filled rectangle.                                 */
+/*                                                            */
+/* Parameters: x position of the item in Draw coordinates;    */
+/*                                                            */
+/*             y position of the item in Draw coordinates;    */
+/*                                                            */
+/*             Item's width in Draw coordinates;              */
+/*                                                            */
+/*             Item's height in Draw coordinates;             */
+/*                                                            */
+/*             Colour of the rectangle.                       */
+/**************************************************************/
+
+static _kernel_oserror * savedraw_rectangle_fill(int x, int y, int w, int h, unsigned int c)
+{
+  draw_pathstrhdr * ph;
+  int             * i;
+  char              d[DSIZE_FRECT];
+
+  if (w <= 0 || h <= 0)
+  {
+    #ifdef TRACE
+
+      erb.errnum = Utils_Error_Custom_Normal;
+
+      StrNCpy0(erb.errmess,
+               "Rectangle width or height is zero in savedraw_rectangle_fill, so no object written out - if calculating file size, the value will be incorrect.");
+
+      show_error_ret(&erb);
+
+    #endif
+
+    return NULL;
+  }
+
+  /* We'll compile the structure in 'd' */
+
+  ph = (draw_pathstrhdr *) d;
+
+  /* Fill in the header items */
+
+  ph->tag                   = draw_OBJPATH;
+  ph->size                  = DSIZE_FRECT;
+
+  ph->bbox.xmin             = x;
+  ph->bbox.xmax             = x + w;
+  ph->bbox.ymin             = y;
+  ph->bbox.ymax             = y + h;
+
+  ph->fillcolour            = c;
+  ph->pathcolour            = -1;
+  ph->pathwidth             = 0;
+
+  ph->pathstyle.joincapwind = 0;
+  ph->pathstyle.reserved8   = 0;
+  ph->pathstyle.tricapwid   = 0;
+  ph->pathstyle.tricaphei   = 0;
+
+  /* Now do the body */
+
+  i = (int *) (d + sizeof(draw_pathstrhdr));
+
+  *i++ = draw_PathMOVE;
+  *i++ = x;
+  *i++ = y;
+
+  *i++ = draw_PathLINE;
+  *i++ = x;
+  *i++ = y + h - 1;
+
+  *i++ = draw_PathLINE;
+  *i++ = x + w - 1;
+  *i++ = y + h - 1;
+
+  *i++ = draw_PathLINE;
+  *i++ = x + w - 1;
+  *i++ = y;
+
+  *i++ = draw_PathLINE;
+  *i++ = x;
+  *i++ = y;
+
+  *i++ = draw_PathTERM;
+
+  return savedraw_write_bytes(d, sizeof(d));
+}
+
+/**************************************************************/
+/* savedraw_triangle_fill()                                   */
+/*                                                            */
+/* Output a filled triangle.                                  */
+/*                                                            */
+/* Parameters: x and y coordinates of the three vertices, in  */
+/*             Draw coordinates;                              */
+/*                                                            */
+/*             Colour of the triangle.                        */
+/**************************************************************/
+
+static _kernel_oserror * savedraw_triangle_fill(int x1, int y1, int x2, int y2, int x3, int y3, unsigned int c)
+{
+  draw_pathstrhdr * ph;
+  int             * i;
+  char              d[DSIZE_FTRIA];
+
+  /* We'll compile the structure in 'd' */
+
+  ph = (draw_pathstrhdr *) d;
+
+  /* Fill in the header items */
+
+  ph->tag                   = draw_OBJPATH;
+  ph->size                  = DSIZE_FTRIA;
+
+
+  if (x1 < x2) ph->bbox.xmin = x1, ph->bbox.xmax = x2;
+  else         ph->bbox.xmin = x2, ph->bbox.xmax = x1;
+  if (y1 < y2) ph->bbox.ymin = y1, ph->bbox.ymax = y2;
+  else         ph->bbox.ymin = y2, ph->bbox.ymax = y1;
+
+  if (x3 < ph->bbox.xmin) ph->bbox.xmin = x3;
+  if (y3 < ph->bbox.ymin) ph->bbox.ymin = y3;
+  if (x3 > ph->bbox.xmax) ph->bbox.xmax = x3;
+  if (y3 > ph->bbox.ymax) ph->bbox.ymax = y3;
+
+  ph->fillcolour            = c;
+  ph->pathcolour            = -1;
+  ph->pathwidth             = 0;
+
+  ph->pathstyle.joincapwind = 0;
+  ph->pathstyle.reserved8   = 0;
+  ph->pathstyle.tricapwid   = 0;
+  ph->pathstyle.tricaphei   = 0;
+
+  /* Now do the body */
+
+  i = (int *) (d + sizeof(draw_pathstrhdr));
+
+  *i++ = draw_PathMOVE;
+  *i++ = x1;
+  *i++ = y1;
+
+  *i++ = draw_PathLINE;
+  *i++ = x2;
+  *i++ = y2;
+
+  *i++ = draw_PathLINE;
+  *i++ = x3;
+  *i++ = y3;
+
+  *i++ = draw_PathLINE;
+  *i++ = x1;
+  *i++ = y1;
+
+  *i++ = draw_PathTERM;
+
+  return savedraw_write_bytes(d, sizeof(d));
+}
+
+/**************************************************************/
+/* savedraw_jmptbl_line()                                     */
+/*                                                            */
+/* Veneer function for the redraw table. Writes a Draw file   */
+/* converting user-points to Draw units.                      */
+/*                                                            */
+/* Parameters: See redraw_line_fn_ptr_t, RedrawCore.h.        */
+/*                                                            */
+/* Returns:    See redraw_line_fn_ptr_t, RedrawCore.h.        */
+/**************************************************************/
+
+static _kernel_oserror * savedraw_jmptbl_line
+                         (
+                           const browser_data * restrict b,
+                           const BBox         * restrict ends,
+                           unsigned int                  colour,
+
+                           size_t             * restrict r_size
+                         )
+{
+  if (r_size == NULL)
+  {
+    BBox              draw;
+    draw_pathstrhdr * ph;
+    int             * i;
+    char              d[DSIZE_FLINE];
+
+    scale_box_user_to_draw(b, ends, &draw);
+
+    /* We'll compile the structure in 'd' */
+
+    ph = (draw_pathstrhdr *) d;
+
+    /* Fill in the header items */
+
+    ph->tag                   = draw_OBJPATH;
+    ph->size                  = DSIZE_FLINE;
+
+    if (draw.xmin < draw.xmax) ph->bbox.xmin = draw.xmin, ph->bbox.xmax = draw.xmax;
+    else                       ph->bbox.xmax = draw.xmin, ph->bbox.xmin = draw.xmax;
+
+    if (draw.ymin < draw.ymax) ph->bbox.ymin = draw.ymin, ph->bbox.ymax = draw.ymax;
+    else                       ph->bbox.ymax = draw.ymin, ph->bbox.ymin = draw.ymax;
+
+    ph->fillcolour            = -1;
+    ph->pathcolour            = colour;
+    ph->pathwidth             = scale_user_to_draw(b, scale_os_to_user(b, 1)); /* 2 OS units looks too think, so use 1 instead */
+
+    ph->pathstyle.joincapwind = 0;
+    ph->pathstyle.reserved8   = 0;
+    ph->pathstyle.tricapwid   = 0;
+    ph->pathstyle.tricaphei   = 0;
+
+    /* Now do the body */
+
+    i = (int *) (d + sizeof(draw_pathstrhdr));
+
+    *i++ = draw_PathMOVE;
+    *i++ = draw.xmin;
+    *i++ = draw.ymin;
+
+    *i++ = draw_PathLINE;
+    *i++ = draw.xmax;
+    *i++ = draw.ymax;
+
+    *i++ = draw_PathTERM;
+
+    return savedraw_write_bytes(d, sizeof(d));
+  }
+  else
+  {
+    *r_size = DSIZE_FLINE;
+    return NULL;
+  }
+}
+
+/**************************************************************/
+/* savedraw_jmptbl_rectangle()                                */
+/*                                                            */
+/* Veneer function for the redraw table. Writes a Draw file   */
+/* converting user-points to Draw units.                      */
+/*                                                            */
+/* Parameters: See redraw_rectangle_fn_ptr_t, RedrawCore.h.   */
+/*                                                            */
+/* Returns:    See redraw_rectangle_fn_ptr_t, RedrawCore.h.   */
+/**************************************************************/
+
+static _kernel_oserror * savedraw_jmptbl_rectangle
+                         (
+                           const browser_data * restrict b,
+                           const BBox         * restrict rect,
+                           unsigned int         colour,
+                           unsigned int         border,
+
+                           size_t             * restrict r_size
+                         )
+{
+  if (r_size == NULL)
+  {
+    BBox         draw;
+    unsigned int width, height;
+
+    scale_box_user_to_draw(b, rect, &draw);
+
+    width  = draw.xmax - draw.xmin;
+    height = draw.ymax - draw.ymin;
+
+    if (border != 0)
+    {
+      unsigned int thickness = scale_user_to_draw(b, border);
+
+      if (thickness == 0) thickness = 1;
+
+      RetError(savedraw_rectangle_fill(draw.xmin,             draw.ymin,             width,     thickness, colour));
+      RetError(savedraw_rectangle_fill(draw.xmin,             draw.ymin,             thickness, height,    colour));
+      RetError(savedraw_rectangle_fill(draw.xmin,             draw.ymax - thickness, width,     thickness, colour));
+      return   savedraw_rectangle_fill(draw.xmax - thickness, draw.ymin,             thickness, height,    colour);
+    }
+    else
+    {
+      return   savedraw_rectangle_fill(draw.xmin, draw.ymin, width, height, colour);
+    }
+  }
+  else
+  {
+    if (border != 0) *r_size = DSIZE_FRECT * 4;
+    else             *r_size = DSIZE_FRECT;
+
+    return NULL;
+  }
+}
+
+/**************************************************************/
+/* savedraw_jmptbl_triangle()                                 */
+/*                                                            */
+/* Veneer function for the redraw table. Writes a Draw file   */
+/* converting user-points to Draw units.                      */
+/*                                                            */
+/* Parameters: See redraw_triangle_fn_ptr_t, RedrawCore.h.    */
+/*                                                            */
+/* Returns:    See redraw_triangle_fn_ptr_t, RedrawCore.h.    */
+/**************************************************************/
+
+static _kernel_oserror * savedraw_jmptbl_triangle
+                         (
+                           const browser_data * restrict b,
+                           int                           x1,
+                           int                           y1,
+                           int                           x2,
+                           int                           y2,
+                           int                           x3,
+                           int                           y3,
+                           unsigned int                  colour,
+
+                           size_t             * restrict r_size
+                         )
+{
+  if (r_size == NULL)
+  {
+    int draw_x1, draw_y1;
+    int draw_x2, draw_y2;
+    int draw_x3, draw_y3;
+
+    scale_pair_user_to_draw(b, x1, y1, &draw_x1, &draw_y1);
+    scale_pair_user_to_draw(b, x2, y2, &draw_x2, &draw_y2);
+    scale_pair_user_to_draw(b, x3, y3, &draw_x3, &draw_y3);
+
+    return savedraw_triangle_fill(draw_x1,
+                                  draw_y1,
+                                  draw_x2,
+                                  draw_y2,
+                                  draw_x3,
+                                  draw_y3,
+                                  colour);
+  }
+  else
+  {
+    *r_size = DSIZE_FTRIA;
+    return NULL;
+  }
+}
+
+/**************************************************************/
+/* savedraw_jmptbl_text()                                     */
+/*                                                            */
+/* Veneer function for the redraw table. Writes a Draw file   */
+/* converting user-points to Draw units.                      */
+/*                                                            */
+/* Parameters: See redraw_text_fn_ptr_t, RedrawCore.h.        */
+/*                                                            */
+/* Returns:    See redraw_text_fn_ptr_t, RedrawCore.h.        */
+/**************************************************************/
+
+static _kernel_oserror * savedraw_jmptbl_text
+                         (
+                           const browser_data * restrict b,
+                           fm_face                       handle,
+                           int                           x,
+                           int                           y,
+                           const char         * restrict string,
+                           unsigned int                  numbytes,
+                           unsigned int                  fgcolour,
+                           unsigned int                  bgcolour,
+                           unsigned int                  blend,
+
+                           size_t             * restrict r_size
+                         )
+{
+  int  mp_width;
+  int  user_height, user_width;
+  int  user_leeway;
+
+  /* Always work with length-limited output herein */
+
+  if (numbytes == 0) numbytes = strlen(string);
+
+  /* Clipping rectangles can be a small amount out and still look  */
+  /* OK in Draw files, so give some leeway for text that might not */
+  /* otherwise be output because it is deemed to spill beyond the  */
+  /* clipping rectangle. This can happen because of rounding down  */
+  /* in the scaling system meeting accurate height values below.   */
+
+  user_leeway = scale_millipoints_to_user(b, scale_os_to_user(b, 2));
+
+  /* Get the height as accurately as we can */
+
+  if (fm_system_font())
+  {
+    BBox os_font;
+
+    RetError(fm_font_box(handle, &os_font));
+    user_height = scale_os_to_user(b, os_font.ymax - os_font.ymin);
+  }
+  else
+  {
+    struct
+    {
+      int x_spc_off;
+      int y_spc_off;
+      int x_ltr_off;
+      int y_ltr_off;
+      int split;
+      int xmin;
+      int ymin;
+      int xmax;
+      int ymax;
+    }
+    params;
+
+    params.x_spc_off = 0;
+    params.y_spc_off = 0;
+    params.x_ltr_off = 0;
+    params.y_ltr_off = 0;
+    params.split     = -1;
+    params.xmin      = 0;
+    params.ymin      = 0;
+    params.xmax      = 0;
+    params.ymax      = 0;
+
+    /* For outline fonts use a more accurate routine to find the */
+    /* height of this *specific* string in millipoints.          */
+
+    RetError(_swix(Font_ScanString,
+                   _INR(0,7),
+
+                   handle, string,
+                   FM_GivenHandle | FM_Kern | (1u<<5) | (1u<<18), /* Bit 5 -> block given in R5; bit 18 -> return bounding box in R5 block */
+                   Reformat_AsWideAsPossible_MP,
+                   Reformat_AsWideAsPossible_MP,
+                   &params, NULL,
+                   numbytes));
+
+    user_height = scale_millipoints_to_user(b, params.ymax - params.ymin);
+
+    if (user_height <= 0)
+    {
+      BBox os_font;
+
+      RetError(fm_font_box(handle, &os_font));
+      user_height = scale_os_to_user(b, os_font.ymax - os_font.ymin);
+    }
+  }
+
+  /* Now get the string width */
+
+  RetError(fm_get_string_width(handle,
+                               string,
+                               Reformat_AsWideAsPossible_MP,
+                               numbytes,
+                               -1,
+                               NULL,
+                               &mp_width));
+
+  user_width = scale_millipoints_to_user(b, mp_width);
+
+  /* Do we have to worry about a clipping rectangle? */
+
+  if (clipping_browser == b)
+  {
+    /* If the text won't fit in vertically, can't output anything - */
+    /* Draw doesn't do clipping.                                    */
+    /*                                                              */
+    /* This output routine never expects to be asked to plot text   */
+    /* with the left hand coordinate outside of the clipping area - */
+    /* since it would take a lot of work to start moving along the  */
+    /* input string, advancing the start coordinate with each       */
+    /* character and seeing if we were in the clipping area yet, we */
+    /* don't bother. It's not worth writing code that at the time   */
+    /* of writing would never run.                                  */
+
+    if (
+         y               < clipping_rectangle.ymin - user_leeway ||
+         y + user_height > clipping_rectangle.ymax + user_leeway ||
+         x               < clipping_rectangle.xmin - user_leeway
+       )
+    {
+      if (r_size != NULL) *r_size = 0;
+      return NULL;
+    }
+
+    /* We may well get text that's too long to fit in the region,  */
+    /* though. Keep chopping off characters until it fits if so... */
+
+    while (
+            x + user_width >= clipping_rectangle.xmax + user_leeway &&
+            --numbytes > 0
+          )
+    {
+      RetError(fm_get_string_width(handle,
+                                   string,
+                                   Reformat_AsWideAsPossible_MP,
+                                   numbytes,
+                                   -1,
+                                   NULL,
+                                   &mp_width));
+
+      user_width = scale_millipoints_to_user(b, mp_width);
+    }
+
+    if (x + user_width > clipping_rectangle.xmax + user_leeway)
+    {
+      if (r_size != NULL) *r_size = 0;
+      return NULL;
+    }
+  }
+
+  /* The text should fit with 'numbytes' possibly adjusted now. */
+  /* Make sure no trailing CR/LF is included.                   */
+
+  while (numbytes > 0 && string[numbytes - 1] < ' ') numbytes--;
+
+  if (numbytes == 0)
+  {
+    if (r_size != NULL) *r_size = 0;
+    return NULL;
+  }
+
+  /* Allow for a terminating NUL byte */
+
+  numbytes += 1;
+
+  if (r_size == NULL)
+  {
+    draw_trfmtextstrhdr hdr;
+    int                 draw_x, draw_y, draw_width, draw_height;
+    int                 index, mp_sizex, mp_sizey;
+    char                null = '\0';
+
+    scale_pair_user_to_draw(b, x,          y,           &draw_x,     &draw_y);
+    scale_pair_user_to_draw(b, user_width, user_height, &draw_width, &draw_height);
+
+    if (fm_system_font())
+    {
+      index = 0;
+    }
+    else
+    {
+      index = fm_find_font_index_by_handle(handle, &mp_sizex, &mp_sizey);
+      index++; /* Means returning -1 for problems -> 0 -> system font */
+    }
+
+    /* "62" is to convert 16ths of a point into millipoints (1000/16=62) */
+
+    if (index == 0)
+    {
+      if (fm_system_font())
+      {
+        mp_sizex = FM_System_Size_X(handle) * 62;
+        mp_sizey = FM_System_Size_Y(handle) * 62;
+      }
+      else
+      {
+        index    = 1;
+        mp_sizex = choices.font_size * 62;
+        mp_sizey = choices.font_size * 62;
+      }
+    }
+    else
+    {
+      mp_sizex *= 62;
+      mp_sizey *= 62;
+    }
+
+    /* Construct the header */
+
+    hdr.tag                  = draw_OBJTEXTTRFM;
+    hdr.size                 = sizeof(draw_trfmtextstrhdr) + (int) WordAlign(numbytes);
+    hdr.bbox.xmin            = draw_x;
+    hdr.bbox.xmax            = draw_x + draw_width;
+    hdr.bbox.ymin            = draw_y;
+    hdr.bbox.ymax            = draw_y + draw_height;
+    hdr.matrix[0]            = 0x10000;
+    hdr.matrix[1]            = 0;
+    hdr.matrix[2]            = 0;
+    hdr.matrix[3]            = 0x10000;
+    hdr.matrix[4]            = 0;
+    hdr.matrix[5]            = 0;
+    hdr.fontflags            = SaveDraw_FontFlags_Kerned;
+    hdr.textcolour           = fgcolour;
+    hdr.background           = bgcolour;
+    hdr.textstyle.fontref    = index;
+    hdr.textstyle.reserved8  = 0;
+    hdr.textstyle.reserved16 = 0;
+    hdr.fsizex               = scale_user_to_draw(b, scale_millipoints_to_user(b, mp_sizex));
+    hdr.fsizey               = scale_user_to_draw(b, scale_millipoints_to_user(b, mp_sizex));
+
+    if (fm_system_font()) hdr.fsizex /= 2;
+
+    hdr.coord.x              = draw_x;
+    hdr.coord.y              = draw_y;
+
+    /* Write the header */
+
+    RetError(savedraw_write_bytes((char *) &hdr, sizeof(hdr)));
+
+    /* Write the text itself */
+
+    RetError(savedraw_write_bytes(string,  numbytes - 1));
+    RetError(savedraw_write_bytes(&null, 1));
+
+    if (numbytes != (int) WordAlign(numbytes))
+    {
+      RetError(savedraw_write_bytes("    ", (int) WordAlign(numbytes) - numbytes));
+    }
+  }
+  else
+  {
+    *r_size = sizeof(draw_trfmtextstrhdr) + (int) WordAlign(numbytes);
+  }
+
+  return NULL;
+}
+
+/**************************************************************/
+/* savedraw_jmptbl_image()                                    */
+/*                                                            */
+/* Veneer function for the redraw table. Writes a Draw file   */
+/* converting user-points to Draw units.                      */
+/*                                                            */
+/* Parameters: See redraw_image_fn_ptr_t, RedrawCore.h.       */
+/*                                                            */
+/* Returns:    See redraw_image_fn_ptr_t, RedrawCore.h.       */
+/**************************************************************/
+
+static _kernel_oserror * savedraw_jmptbl_image
+                         (
+                           const browser_data * restrict b,
+                           const unsigned int            image,
+                           int                           x,
+                           int                           y,
+                           unsigned int                  width,
+                           unsigned int                  height,
+
+                           size_t             * restrict r_size
+                         )
+{
+  draw_spristrhdr h;
+  size_t          size;
+
+  RetError(image_to_draw_file(b,
+                              outfile,
+                              image,
+                              width,
+                              height,
+                              &size));
+
+  /* Calculate total size */
+
+  if (size != 0)
+  {
+    h.size = sizeof(h) + (int) WordAlign(size);
+
+    if (r_size != NULL)
+    {
+      *r_size = h.size;
+      return NULL;
+    }
+  }
+  else
+  {
+    if (r_size != NULL) *r_size = 0;
+    return NULL;
+  }
+
+  /* Output the image */
+
+  h.tag       = draw_OBJSPRITE;
+  h.bbox.xmin = x;
+  h.bbox.ymin = y;
+  h.bbox.xmax = x + width;
+  h.bbox.ymax = y + height;
+
+  scale_box_user_to_draw(b, &h.bbox, &h.bbox);
+
+  if (size > 0)
+  {
+    RetError(savedraw_write_bytes((char *) &h, sizeof(h)));
+    RetError(image_to_draw_file(b,
+                                outfile,
+                                image,
+                                width,
+                                height,
+                                NULL));
+  }
+
+  /* Ensure 4-byte alignment after sprite data */
+
+  if (size != (int) WordAlign(size))
+  {
+    RetError(savedraw_write_bytes("    ", (int) WordAlign(size) - size));
+  }
+
+  return NULL;
+}
+
+/**************************************************************/
+/* savedraw_jmptbl_sprite()                                   */
+/*                                                            */
+/* Veneer function for the redraw table. Writes a Draw file   */
+/* converting user-points to Draw units.                      */
+/*                                                            */
+/* Parameters: See redraw_sprite_fn_ptr_t, RedrawCore.h.      */
+/*                                                            */
+/* Returns:    See redraw_sprite_fn_ptr_t, RedrawCore.h.      */
+/**************************************************************/
+
+static _kernel_oserror * savedraw_jmptbl_sprite
+                         (
+                           const browser_data * restrict b,
+                           const char         * restrict name,
+                           int                           x,
+                           int                           y,
+
+                           size_t             * restrict r_size
+                         )
+{
+  draw_spristrhdr   h;
+  sprite_header   * sh;
+  int               asize = 0;
+  int               wid, hei;
+
+  h.tag = draw_OBJSPRITE;
+
+  /* Find the sprite block and its dimensions */
+
+  RetError(_swix(OS_SpriteOp,
+                 _INR(0,2) | _OUT(2),
+
+                 280,
+                 sprite_block,
+                 name,
+
+                 &sh));
+
+  RetError(utils_read_sprite_size(name, &wid, &hei));
+
+  asize  = sh->next + sizeof(h);
+  h.size = (int) WordAlign(asize);
+
+  if (r_size == NULL)
+  {
+    x = scale_user_to_draw(b, x);
+    y = scale_user_to_draw(b, y);
+
+    h.bbox.xmin = x;
+    h.bbox.ymin = y;
+    h.bbox.xmax = h.bbox.xmin + scale_user_to_draw(b, scale_os_to_user(b, wid));
+    h.bbox.ymax = h.bbox.ymin + scale_user_to_draw(b, scale_os_to_user(b, hei));
+
+    RetError(savedraw_write_bytes((char *) &h, sizeof(h)));
+    RetError(savedraw_write_bytes((char *) sh, asize - sizeof(h)));
+
+    /* Align to a 4-byte boundary using spaces */
+
+    if (asize != h.size)
+    {
+      return savedraw_write_bytes("    ", h.size - asize);
+    }
+  }
+  else *r_size = h.size;
+
+  return NULL;
+}
+
+/**************************************************************/
+/* savedraw_jmptbl_clipping()                                 */
+/*                                                            */
+/* Veneer function for the redraw table. Writes a Draw file   */
+/* converting user-points to Draw units.                      */
+/*                                                            */
+/* Parameters: See redraw_clipping_fn_ptr_t, RedrawCore.h.    */
+/*                                                            */
+/* Returns:    See redraw_clipping_fn_ptr_t, RedrawCore.h.    */
+/**************************************************************/
+
+static _kernel_oserror * savedraw_jmptbl_clipping
+                         (
+                           const browser_data * restrict b,
+                           const BBox         * restrict desired,
+
+                           size_t             * restrict r_size
+                         )
+{
+  /* Must record the clipping region whether or not we're */
+  /* just calculating sizes as the amount of data output  */
+  /* by, say, the text routine, depends on the clipping   */
+  /* rectangle.                                           */
+
+  clipping_browser   = b;
+  clipping_rectangle = *desired;
+
+  if (r_size != NULL) *r_size = 0;
+
+  return NULL;
+}
+
+/**************************************************************/
+/* savedraw_create()                                          */
+/*                                                            */
+/* Output a Draw file representing the contents of a given    */
+/* browser, or find out how big the file would be. The static */
+/* 'outfile' local to this file should hold a valid FILE * to */
+/* output to in the first case.                               */
+/*                                                            */
+/* Parameters: Pointer to a browser_data struct to represent  */
+/*             in the Draw file;                              */
+/*                                                            */
+/*             1 to include any background image present on   */
+/*             the browser's page, else 0;                    */
+/*                                                            */
+/*             Pointer to an int to take the file size if     */
+/*             that's all you want, or NULL to actually       */
+/*             output the file.                               */
+/**************************************************************/
+
+static _kernel_oserror * savedraw_create(browser_data * b, int bgimages, int * size)
+{
+  WimpRedrawWindowBlock   r;
+  _kernel_oserror       * e;
+  HStream               * selected;
+  int                     tsize = 0; /* Total size */
+  int                     height;
+  draw_fileheader         h;
+
+  /* Compile a pseudo-redraw block for the Draw file, */
+  /* in screen coordinates.                           */
+
+  height = reformat_return_extent(b, b->cell);
+  if (height < b->display_height) height = b->display_height;
+
+  r.visible_area.xmin = r.redraw_area.xmin = 0;
+  r.visible_area.ymin = r.redraw_area.ymin = 0;
+  r.visible_area.xmax = r.redraw_area.xmax = b->display_extent;
+  r.visible_area.ymax = r.redraw_area.ymax = height;
+
+  r.window_handle = b->window_handle;
+  r.xscroll       = 0;
+  r.yscroll       = 0;
+
+  /* If required, write the Draw file header */
+
+  tsize += DSIZE_FRECT; /* Background */
+
+  if (size)
+  {
+    tsize = sizeof(h);
+  }
+  else
+  {
+    /* Draw file ID */
+
+    strncpy(h.title, "Draw", sizeof(h.title));
+
+    /* Draw file version */
+
+    h.majorstamp = 201;
+    h.minorstamp = 0;
+
+    /* Program name - we do not rely on a field immediately */
+    /* after 'progident' to take a string terminator here.  */
+
+    strncpy(h.progident, program_name, sizeof(h.progident));
+
+    if (strlen(program_name) < sizeof(h.progident))
+    {
+      int i = strlen(program_name);
+      int j = sizeof(h.progident) - i;
+
+      while (j) h.progident[i++] = ' ', j--;
+    }
+
+    /* Whole file's bounding box */
+
+    h.bbox.xmin = DRAWMARGIN     + OTD(r.redraw_area.xmin);
+    h.bbox.ymin = DRAWMARGIN     + OTD(r.redraw_area.ymin);
+    h.bbox.xmax = DRAWMARGIN * 2 + OTD(r.redraw_area.xmax);
+    h.bbox.ymax = DRAWMARGIN * 2 + OTD(r.redraw_area.ymax);
+
+    RetError(savedraw_write_bytes((char *) &h, sizeof(h)));
+  }
+
+  /* Unless we're in system font, list the fonts used */
+
+  if (!fm_system_font())
+  {
+    int  f, i, b, n;
+    char fontname[Limits_FontName];
+    int  fsize;
+
+    fsize = 8;
+
+    for (f = 0; f < 12; f++) /* 12 faces */
+    {
+      n = f / 4;        /* Internal font number     */
+      i = (f % 4) & 1;  /* Italic flag, lsb (bit 0) */
+      b = (f % 4) >> 1; /* Bold flag, bit 1         */
+
+      e = fm_write_name(n, fontname, i, b);
+      if (e) show_error_ret(e);
+
+      fsize += strlen(fontname) + 2;
+    }
+
+    /* If required, write the header out */
+
+    if (size)
+    {
+      tsize += (int) WordAlign(fsize);
+    }
+    else
+    {
+      *(int*) fontname       = draw_OBJFONTLIST;
+      *(int*) (fontname + 4) = (int) WordAlign(fsize);
+
+      RetError(savedraw_write_bytes(fontname, 8));
+
+      for (f = 0; f < 12; f++) /* 12 faces */
+      {
+        n = f / 4;        /* Internal font number     */
+        i = (f % 4) & 1;  /* Italic flag, lsb (bit 0) */
+        b = (f % 4) >> 1; /* Bold flag, bit 1         */
+
+        e = fm_write_name(n, fontname + 1, i, b);
+        if (e) show_error_ret(e);
+
+        fontname[0] = f + 1;
+
+        RetError(savedraw_write_bytes(fontname, strlen(fontname + 1) + 2));
+      }
+
+      /* Word align the file contents */
+
+      if (fsize != (int) WordAlign(fsize))
+      {
+        RetError(savedraw_write_bytes("    ", (int) WordAlign(fsize) - fsize));
+      }
+    }
+  }
+
+  /* Don't want the selection highlight appearing in the output */
+
+  selected    = b->selected;
+  b->selected = NULL;
+
+  /* Set up the DrawFile redraw output table */
+
+  redrawcore_replace_table(&rtable_drawfile);
+
+  /* Count sizes only? */
+
+  if (size != NULL)  redrawcore_count_sizes();
+
+  /* Do the redraw */
+
+  e = redraw_draw(b, &r, NULL, !bgimages, NULL);
+
+  /* Get the size count (errors or otherwise)? */
+
+  if (size != NULL) tsize += redrawcore_return_count();
+
+  /* Restore the old table */
+
+  redrawcore_default_table();
+
+  /* Restore the selection highlight */
+
+  b->selected = selected;
+
+  /* Finished - return the size or any errors */
+
+  if (e != NULL)
+  {
+    if (size) *size = 0;
+    return e;
+  }
+  else
+  {
+    if (size) *size = tsize;
+    return NULL;
+  }
+}
+
+/**************************************************************/
+/* savedraw_save_draw()                                       */
+/*                                                            */
+/* Save a given browser page as a Draw file.                  */
+/*                                                            */
+/* Parameters: Pointer to a browser_data struct relevant to   */
+/*             the page to save as a Draw file;               */
+/*                                                            */
+/*             Pointer to the pathname to save to;            */
+/*                                                            */
+/*             1 to include background image tiling if there  */
+/*             is such an image, else 0 (0 recommended!).     */
+/**************************************************************/
+
+_kernel_oserror * savedraw_save_draw(browser_data * b, const char * pathname, int bgimages)
+{
+  /* If we seem to have left a file open, close it */
+
+  if (outfile)
+  {
+    fclose(outfile);
+    outfile = NULL;
+  }
+
+  /* Only proceed if we've got a pathname */
+
+  if (pathname && *pathname)
+  {
+    _kernel_oserror * e;
+
+    _swix(Hourglass_On, 0);
+
+    save_record_path(pathname);
+
+    /* Open the file */
+
+    outfile = fopen(pathname, "wb");
+
+    if (!outfile) RetLastE;
+
+    /* Create the file */
+
+    e = savedraw_create(b, bgimages, NULL);
+
+    fclose(outfile);
+    outfile = NULL;
+
+    _swix(Hourglass_Off, 0);
+
+    if (e != NULL) return e;
+
+    /* Set the filetype */
+
+    return _swix(OS_File,
+                 _INR(0,2),
+
+                 18,
+                 pathname,
+                 FileType_DRAW);
+  }
+
+  return NULL;
+}
+
+/**************************************************************/
+/* savedraw_draw_size()                                       */
+/*                                                            */
+/* Returns the size of file that would be written by          */
+/* savedraw_save_draw for the given browser.                  */
+/*                                                            */
+/* Parameters: Pointer to a browser_data struct relevant to   */
+/*             the page to save as a Draw file, for which the */
+/*             file size is to be returned;                   */
+/*                                                            */
+/*             1 to include background image tiling in the    */
+/*             count if there is such an image, else 0.       */
+/*                                                            */
+/* Returns:    Size of file that would be written by          */
+/*             savedraw_save_draw for the given browser.      */
+/**************************************************************/
+
+unsigned int savedraw_draw_size(browser_data * b, int bgimages)
+{
+  /* This works but is very slow, almost doubling the time taken */
+  /* to write the file. Images are particularly painful. Since   */
+  /* the function is only used for messages returning sizes and  */
+  /* nobody seems to care if the size is a default 4K, the code  */
+  /* is commented out for now (when last tested, it worked OK).  */
+
+//  int size;
+//
+//  _swix(Hourglass_On, 0);
+//  savedraw_create(b, bgimages, &size);
+//  _swix(Hourglass_Off, 0);
+//
+//  return size;
+
+  return 4096;
+}

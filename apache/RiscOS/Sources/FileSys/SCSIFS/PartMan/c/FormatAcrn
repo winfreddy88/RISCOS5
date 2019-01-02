@@ -1,0 +1,546 @@
+/* Copyright 2016 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+// Format routine...
+// computes format parameters and lays out disc specified
+//
+//
+//
+//
+//
+//
+//
+
+#include        "PMInclude.h"
+#include        "Format.h"
+#include        "Diagnostic.h"
+
+#define CHSRound(c,h,s,secs) {c=0;h=16;s=63;do{h++;c=secs/h;s=63;while(c%s)s--;c/=s;}while((c>=65536)||(h>=256));/*secs=c*h*s;*/}
+
+// Possible layout limits :
+// (f is the FormatArray*)
+#define MaxZonesNormalDir (0x7f)  // max number of zones to permit in a format without big dirs
+#define MaxZonesBigDir    (0x7fff)// max number of zones to permit in a format with big dirs
+#define ZonesMax          (f->bigdisc?MaxZonesBigDir:MaxZonesNormalDir)
+#define IDlenMax          (f->bigdir?19:15)
+#define IDlenMin          (f->log2secsize+3)
+#define IDsMax            ((1<<IDlenMax)-1)
+#define BigDiscSize       (((512<<20)/(f->SecSize))-1)
+#define ShareSizeMax      (15)
+#define ZW                (4*8)
+#define ZWZone0x          (60*8)
+#define RootDirLen        (0x800)
+#define BootReservedLen   (0xe00)
+#define ZoneCap           ((f->SecSize*8)-ZW)
+// fragment count zones can hold
+#define Zb                (((ZoneCap)/(f->idlen+1))*(f->idlen+1))
+#define Z0b               (Zb-ZWZone0x)
+// MaxZones is the max zone count to keep the root dir address in range
+#define MaxZones          (2*((1<<f->idlen)-1)/(Zb/8))
+
+// write a fragment into a zone
+// Assume FragmentID and FragmentLen are legitimate
+void fragwrite(char* mapsector, int position, int FragmentID, int FragmentLen, int IDlen)
+{
+  testprint("FW: mapsec:%x pos:%x id:%x len:%x idlen%x mapoffxet byte %x\n",
+             (int)mapsector,position,FragmentID,FragmentLen,IDlen,position/8);
+  FragmentID=(FragmentID>>8)<<(position%8);
+  // n.b. offset of 1 added to position to allow for zone cksum at byte 0 of zone
+  mapsector[1+(position/8)] |= (FragmentID>>0 );
+  mapsector[2+(position/8)] |= (FragmentID>>8 );
+  mapsector[3+(position/8)] |= (FragmentID>>16);
+  mapsector[4+(position/8)] |= (FragmentID>>24);
+  // terminate object
+  position+=FragmentLen-1;
+  mapsector[1+(position/8)] |= 1<<(position%8);
+}
+
+
+// create root directory 0x800 long
+void MakeRootDir(int bigdir , char* map, int rootaddress)
+{
+  int *j,i,l;
+// create root dir
+   if(!bigdir)
+   {
+     map[1] = 'N';
+     map[2] = 'i';
+     map[3] = 'c';
+     map[4] = 'k';
+     map[0x800-38] = (char)rootaddress;
+     map[0x800-37] = (char)(rootaddress>>8);
+     map[0x800-36] = (char)(rootaddress>>16);
+     map[0x800-35] = '$';
+     map[0x800-16] = '$';
+     map[0x800-5] = 'N';
+     map[0x800-4] = 'i';
+     map[0x800-3] = 'c';
+     map[0x800-2] = 'k';
+     j = (int*)map;
+     l = *j;
+     l = *(j+1) ^ (((l>>13) & 0x7ffff)+(l<<19) );
+     i = 0x800 -40;
+     while((i&3)>0)
+     {
+       l = ((int)map[i]) ^ (((l>>13) & 0x7ffff)+(l<<19) );
+       i++;
+     }
+     while(i<(0x800-4))
+     {
+       l = *(j+(i/4)) ^ (((l>>13) & 0x7ffff)+(l<<19) );
+       i+=4;
+     }
+     i=l^(l>>8)^(l>>16)^(l>>24);
+     map[0x800-1] = (unsigned char)i;
+   }
+   else
+   {  // write bigdir header
+     map[0] =  0;
+     map[1] =  0;
+     map[2] =  0;
+     map[3] =  0;
+
+     map[4] = 'S';
+     map[5] = 'B';
+     map[6] = 'P';
+     map[7] = 'r';
+
+     map[8] =  1; // dir name length
+     map[9] =  0;
+     map[10] = 0;
+     map[11] = 0;
+
+     map[12] = 0x00; // dir length in bytes
+     map[13] = 0x08;
+     map[14] = 0x00;
+     map[15] = 0x00;
+
+     map[16] = 0; // no of entries in dir
+     map[17] = 0;
+     map[18] = 0;
+     map[19] = 0;
+
+     map[20] = 0; // no of bytes allocated for names
+     map[21] = 0;
+     map[22] = 0;
+     map[23] = 0;
+
+     map[24] = (char)(rootaddress>>0 ); // indirect disc addr of parent dir
+     map[25] = (char)(rootaddress>>8 );
+     map[26] = (char)(rootaddress>>16);
+     map[27] = (char)(rootaddress>>24);
+
+     map[28] ='$';  // root dir name and CR
+     map[29] =13;
+     map[30] = 0;
+     map[31] = 0;
+
+   // new dir tail
+     map[0x800-8] = 'o';
+     map[0x800-7] = 'v';
+     map[0x800-6] = 'e';
+     map[0x800-5] = 'n';
+     map[0x800-4] = 0;  // to match byte 0
+     map[0x800-3] = 0;
+     map[0x800-2] = 0;
+     j = (int*)map;     // use *j as int access, map as char access
+     l = 0;
+     i=0;
+     while(i<(32))      // first 28 bytes
+     {
+       l = *(j+(i/4)) ^ (((l>>13) & 0x7ffff)+(l<<19) );
+       i+=4;
+     }
+     l = *(j+((0x800-8)/4)) ^ (((l>>13) & 0x7ffff)+(l<<19) );
+     l = map[0x800-4] ^ (((l>>13) & 0x7ffff)+(l<<19) );
+     l = map[0x800-3] ^ (((l>>13) & 0x7ffff)+(l<<19) );
+     l = map[0x800-2] ^ (((l>>13) & 0x7ffff)+(l<<19) );
+     i=l^(l>>8)^(l>>16)^(l>>24);
+     map[0x800-1] = (unsigned char)i;
+   }
+}
+
+
+// Compute and write disc format to SCSI device ID
+//  At sector offset Offset, for Size sectors
+int MakeAcornFormat(int         ID,
+               unsigned int     AccessKey,
+               int              SecSize,
+               int              PartnBase,
+               int              SecCount,
+               char             *name,
+               int              *defect,
+               char             bootoption,
+               int              bigdir)
+{
+   bootsector   *boot;
+   int          *j,i,k,offset2next=0,base,zonestart,zoneend,temp;
+   int           shift,insecoffset,zoneendbit,dirsectors,zonesectors,mapbase;
+   char         *map,*newname,*tfbuf;
+   static FormatArray fa,*f=&fa;
+
+   fa.SecSize = SecSize; fa.SecCount = SecCount;
+   fa.bigdir = (char)bigdir;
+   fa.rootdirsize = RootDirLen;
+
+   // suggest a head/cylinder/lfau setup
+   CHSRound(fa.cyls,fa.heads,fa.spt,fa.SecCount);
+
+   if(tfbuf=calloc((SecSize>0x200)?SecSize:0x200,1),!tfbuf) return -1;
+   // first read in the sector there
+   wimp_error( SecRead(ID, AccessKey, tfbuf, (SecSize>0x200)?SecSize:0x200, (0xc00/SecSize)+PartnBase,  SecSize));
+   insecoffset=0xc00-((0xc00/SecSize)*SecSize);
+   boot=(bootsector*)((int)tfbuf+insecoffset);
+   newname=name;
+
+   // compute format parameters
+   fa.SecSize=SecSize; fa.SecCount=SecCount;
+
+   // decide whether to use bigdisc parameters
+   fa.bigdisc=fa.SecCount>BigDiscSize?1:0;
+
+   // default to big directory style
+   fa.bigdir=1;
+
+   // compute log2 secsize
+   temp=fa.SecSize; fa.log2secsize=0;
+   while(temp>1){fa.log2secsize++;temp/=2;}
+   // start at idlenmax
+   //    at present its the only value used....
+   fa.idlen=IDlenMax;
+   fa.log2zsize=0;
+   fa.log2bpmb = fa.log2secsize+3;
+
+   // maxzones is the theoretical max zonecount for this idlen which
+   // keeps the root directory address < idlen bits
+   fa.zonec=((fa.SecCount-1)/Zb)+1; // total zones needed
+   // get zonecount viable by increasing LFAU (bits/mapbit)
+   while( (fa.zonec>>(fa.log2bpmb-fa.log2secsize)) > ((ZonesMax>MaxZones)?MaxZones:ZonesMax) ){fa.log2bpmb++; }
+
+   fa.zonec>>=(fa.log2bpmb-fa.log2secsize);
+
+   // scale this zonecount so it fits in 8 bits
+   while((fa.zonec>>fa.log2zsize)>255)fa.log2zsize++;
+
+   // we know total zones for this disc size
+   // we know log2zsize needed to get total zone count < ZonesMax
+   // bpmb comes in here.. its what we use to get zone count acceptable
+   // log2zsize is used to get the reported zone count < 256 as that is needed
+   // for root dir address.
+   // round this out
+   fa.zonec=(fa.zonec>>fa.log2zsize)<<fa.log2zsize;
+
+
+   // we now know fa.zonec (0-fa.zonec-1 gives fa.zonec zones), fa.log2zsize,
+   // fa.log2bpmb, fa.secsize, fa.idlen, fa.bigdisc, fa.bigdir - compute the rest
+   shift= fa.log2bpmb-fa.log2secsize;
+
+   fa.zonespare = (fa.SecSize*8) - Zb;
+   fa.SecCount=(((fa.zonec-1)*Zb)+Z0b)<<(fa.log2bpmb-fa.log2secsize);
+
+   fa.zonec=((fa.zonec>>fa.log2zsize)<<fa.log2zsize);
+   fa.zonecount  = fa.zonec;
+   fa.zonecount2 = (fa.zonec)>>8;
+   fa.discsize   = fa.SecCount<<    fa.log2secsize;
+   fa.discsizehi = fa.SecCount>>(32-fa.log2secsize);
+
+   reportfmt(&fa);
+   // build disc record in boot sector
+   j = (int*)(boot);
+   for(i=0;i<128;i++)
+   {
+     *(j+i) = 0;                    // clear to null
+   }
+   k=0;
+   while(defect&&(*(defect+k)>0)&&(*(defect+k)<(0x1fffffff>>fa.log2secsize)))
+   {
+     boot->defects[k] = *(defect+k)<<fa.log2secsize;
+     k++;
+   }
+   boot->defects[k]=0x20000000;
+   if(fa.bigdisc == 1)
+   {
+     while(defect&&*(defect+k)>0)
+     {
+       boot->defects[k+1] = *(defect+k);
+       k++;
+     }
+     boot->defects[k+1]=0x40000000;
+   }
+   DefectChecksum((int*)&boot->defects[0],fa.bigdisc);
+   boot->dr.l2secsize    = fa.log2secsize;
+   boot->dr.spt          = fa.spt;
+   boot->dr.heads        = fa.heads;
+   boot->dr.skew         = fa.skew;
+   boot->dr.idlen        = fa.idlen;
+   boot->dr.l2bpmb       = fa.log2bpmb;
+   boot->dr.bootoption   = bootoption;
+   boot->dr.nzones       = fa.zonecount;
+   boot->dr.zonespare[0] = (char)fa.zonespare;
+   boot->dr.zonespare[1] = (char)((fa.zonespare)>>8);
+   boot->dr.discsize     = fa.discsize;
+   boot->dr.discsizehi   = fa.discsizehi;
+   boot->dr.log2zsize    = fa.log2zsize;
+   boot->dr.discid[0]    = newname[0]^newname[2]^newname[4]^newname[6]^newname[8];
+   boot->dr.discid[1]    = newname[1]^newname[3]^newname[5]^newname[7]^newname[9];
+   for (i=0; i<=9; i++)
+   {
+     if(strlen(newname) >=i)
+     {
+       boot->dr.discname[i] = newname[i];
+     }
+     else
+     {
+       boot->dr.discname[i] = 0x0d;
+     }
+   }
+   boot->dr.disctype= 0;
+   boot->dr.bigflag = fa.bigdisc;
+   boot->dr.nzones2 = (bigdir>0)?fa.zonecount2:0;
+   boot->dr.bdspare1= 0;              // must be 0
+   boot->dr.formatversion= (bigdir>0)?1:0;
+   boot->dr.rootdirsize=(bigdir>0)?RootDirLen:0;
+   // we'll write this once root address is calculated
+
+   // get space for building map
+   if((map = (char*)calloc(((SecSize*fa.zonec)),1)),!map)
+   {
+     if(tfbuf) free(tfbuf);
+     return(-1);
+   }
+
+   // Create zone maps
+   base=0;
+   zonestart = zoneend = mapbase = 0;
+
+   for(k=0; k<fa.zonec;k++)
+   {
+     //   init freelink pointer
+     map[1+base] = 0x18;    // pointer past byte 1 to first free bit in zone
+     map[2+base] = 0x80;    // hi bit terminates zonespare segment
+     map[3+base] = 0xff;    // zone crosscheck init to &ff in all zones
+                            // (see z0 later)
+
+     // handle defect mapping out on zone by zone basis
+
+     //   compute zonestart & zoneend disc addresses (bits==sectors)
+     //   units here are sectors
+     zonestart = zoneend;
+     zoneend   = zonestart + (((k)?Zb:Z0b)<<shift);
+
+     // check if defect is in this zone ***********check code?********
+     while(defect&&(*defect)&&(*defect>=zonestart)&&(*defect<zoneend))
+     {
+       // compute bitpos & offset2next of frag start to map out defect sector
+       i = offset2next = (((*(defect++)-zonestart)<<shift))+0x18;
+       // map out the fragment with the defect
+       fragwrite((char*)(map+base), i, 0x100, fa.idlen+1,fa.idlen+1);
+     }
+
+     if(k==0) // Create zone 0 map...
+     {
+       // a) copy in disc record
+       for(i=4;i<64;i++) { map[i+base] =(char)*(((char*)&(boot->dr))+i-4);}
+
+       // b) write in first fragment to map out boot area
+       int bbits = fa.idlen;
+       while((bbits*(1<<fa.log2bpmb))<0xe00)bbits++;
+       i=(1<<bbits);// this gets  end bit, then
+       i+=2;        // 2 is the type that maps out boot stuff
+       map[64+base] = (char)i;
+       map[65+base] = (char)(i>>8);
+       map[66+base] = (char)(i>>16);
+       map[67+base] = (char)(i>>24);
+
+       // c) update and write freelink
+       offset2next  = (int)map[1+base] + ((((int)map[2+base])*0x100)&0x7f00);
+       offset2next += (ZWZone0x)+bbits+1;       // first free alloc unit after
+       map[1+base] = (char)offset2next;
+       map[2+base] = (char)((offset2next)>>8) + (0x80);
+       // d) ensure EOR of all Zonechecks->0xff
+       map[3+base] = (fa.zonec&1)?0xff:0x00;
+     }
+     if(k == (fa.zonec/2)) //root dir zone is 1/2 way through
+     { // write map adding in root dir allocation
+       // mark as used fragments for map and root dir
+       // work out sector address for root dir.
+
+       fa.rootdiradd = zonestart + (fa.zonec*2);
+       // make sure its at start of shared map bit, rounded up
+       if(fa.rootdiradd%(1<<fa.log2zsize))
+       {
+         fa.rootdiradd>>=fa.log2zsize;
+         fa.rootdiradd+=1;
+         fa.rootdiradd<<=fa.log2zsize;
+       }
+       // remember base address of map
+       mapbase=zonestart;
+
+       // compute root dir fragment address
+       dirsectors = (fa.SecSize>=RootDirLen)?1:(RootDirLen/fa.SecSize);
+       zonesectors =(fa.bigdir)? 0:dirsectors;
+       zonesectors += 2*(fa.zonec);
+
+       fa.bootsecbits = BootReservedLen/fa.SecSize;
+       if(BootReservedLen%fa.SecSize)fa.bootsecbits +=1;
+       if(shift>=0)  // 1 or more sectors/mapbit
+       {
+         fa.dirbits     = dirsectors     >> shift;
+         fa.mapbits     = zonesectors    >> shift;
+         fa.bootsecbits = fa.bootsecbits >> shift;
+         // round up to integer count above if needed
+         if(shift)if ( dirsectors%(1<<shift)) fa.dirbits++;
+         if(shift)if (zonesectors%(1<<shift)) fa.mapbits++;
+       }
+       else          // more than 1 mapbits/sector
+       {
+         fa.dirbits     = dirsectors     << (-shift);
+         fa.mapbits     = zonesectors    << (-shift);
+         fa.bootsecbits = fa.bootsecbits << (-shift);
+       }
+       //  ensure these are at least min length
+       if(fa.bootsecbits<(fa.idlen+1)) fa.bootsecbits = (fa.idlen+1);
+       if(fa.mapbits    <(fa.idlen+1)) fa.mapbits=(fa.idlen+1);
+       if(fa.dirbits    <(fa.idlen+1)) fa.dirbits=(fa.idlen+1);
+
+       // compute expected root dir disc address
+       if(fa.bigdir==0)
+       {
+         fa.rootaddress = 0x201+(((2*(fa.zonec))+(1<<fa.log2zsize)-1)/(1<<fa.log2zsize));
+         fa.rootdiradd=(((2*(fa.zonec))*fa.log2zsize-1)/(1<<fa.log2zsize))*(1<<fa.log2zsize);
+       }
+       else
+       {
+         fa.rootaddress = 1+((((fa.zonec/2)*(Zb/(fa.idlen+1))))<<8);
+         fa.rootdiradd  = zonestart + (fa.mapbits<<(shift));
+       }
+       // update boot sector view of root address
+       boot->dr.root    = fa.rootaddress;
+       boot->bootchksum = bootvalidbyte ( boot);
+       // copy into zone map too
+       for(i=4;i<64;i++) { map[i] =(char)*(((char*)&(boot->dr))+i-4);}
+       map[0] = mapvalidbyte(map,fa.log2secsize,0);
+
+       // Write sector(s) with bootblock  out again
+       wimp_error( SecWrite(ID, AccessKey, tfbuf, (SecSize>0x200)?SecSize:0x200, (0xc00/SecSize)+PartnBase,  SecSize));
+       // compute bit offset & offset2next of frag start
+       i = (int)map[1+base] + ((((int)map[2+base])<<8)&0x7f00);
+       fragwrite((char*)(map+base), i, 0x201, fa.mapbits,fa.idlen+1);
+
+       i += (fa.mapbits);
+       if(fa.bigdir)
+       {
+         fragwrite((char*)(map+base),i,fa.rootaddress, fa.dirbits,fa.idlen+1);
+         i += (fa.dirbits);
+       }
+       map[1+base] = (char)i;
+       map[2+base] = ((char)(i>>8))+ 0x80;
+     }
+     // all zones
+     zoneendbit = Zb -1 + ZW;
+     // terminate zone before zonespare section
+     map[(zoneendbit/8)+base] |= 1<<(zoneendbit%8);
+     map[0+base] = mapvalidbyte(map,fa.log2secsize,k);
+     base+=fa.SecSize;
+   }
+
+   // Write out Zone map & copy
+   wimp_error( SecWrite(ID, AccessKey, map, SecSize*fa.zonec, mapbase+PartnBase,  SecSize));
+   wimp_error( SecWrite(ID, AccessKey, map, SecSize*fa.zonec, mapbase+fa.zonec+PartnBase,  SecSize));
+   if(map) free(map);
+   if(tfbuf) free(tfbuf);
+
+   // get space for building rootdir
+   if(map = (char*)calloc(0x800,1),!map)
+   {
+     return(-1);
+   }
+   // create root dir
+   MakeRootDir(fa.bigdir,map,fa.rootaddress);
+   // write out root dir
+   wimp_error( SecWrite(ID, AccessKey, map, 0x800, fa.rootdiradd+PartnBase,  SecSize));
+   if(map) free(map);
+
+   return (0);
+}
+
+unsigned char mapvalidbyte( void const * const map,
+                            int log2secsize,
+                            unsigned int zone)
+{
+  unsigned char const * const mapbase = map;
+  unsigned int sum0=0,sum1=0,sum2=0,sum3=0,zonestart,rover;
+
+  zonestart = zone<<log2secsize;
+  for( rover = ((zone+1)<<log2secsize)-4;
+       rover > zonestart;
+       rover -= 4)
+  {
+    sum0 += mapbase[rover + 0] + (sum3 >>8);
+    sum3 &= 0xff;
+    sum1 += mapbase[rover + 1] + (sum0 >>8);
+    sum0 &= 0xff;
+    sum2 += mapbase[rover + 2] + (sum1 >>8);
+    sum1 &= 0xff;
+    sum3 += mapbase[rover + 3] + (sum2 >>8);
+    sum2 &= 0xff;
+  }
+
+  sum0 += (sum3>>8);
+  sum1 += mapbase[rover + 1] + (sum0 >>8);
+  sum2 += mapbase[rover + 2] + (sum1 >>8);
+  sum3 += mapbase[rover + 3] + (sum2 >>8);
+  return (unsigned char)
+         ( sum0^sum1^sum2^sum3);
+}
+
+unsigned char bootvalidbyte ( bootsector* boot)
+{
+  int i,sum = 0 ,cc=0,  same= 0, last = *((char*)boot);
+
+  for(i=0;i < 511; i++)
+  {
+    cc=sum +=*((char*)boot + i);
+    if(last!=*((char*)boot + i))same=1;// flag that sector is not all ientical
+    if(sum>0xff)sum-=0xff;
+  }
+  if((cc==0) || (same==0))sum++;// fudge to catch an all zero sector
+                                // and or an all identical sector
+  return (unsigned char) (sum);
+}
+
+
+// compute defect list checksums
+void DefectChecksum(int *defect, int disctype)
+{
+  int a,b=0;
+// put in standard chksum
+  while((a=*(defect++))<0x20000000)
+  {
+     b = a ^ (((b>>13) & 0x7ffff)+(b<<19) );
+  }
+  *(defect-1)= 0x20000000 + ((b^(b>>8)^(b>>16)^(b>>24))&0xff);
+  b=0;
+// put in extended bit if needed
+  if(disctype == 1)
+  {
+    while((a=*(defect++))<0x40000000)
+    {
+       b = a ^ (((b>>13) & 0x7ffff)+(b<<19) );
+    }
+    *(defect-1)= 0x40000000 + ((b^(b>>8)^(b>>16)^(b>>24))&0xff);
+  }
+
+}
+

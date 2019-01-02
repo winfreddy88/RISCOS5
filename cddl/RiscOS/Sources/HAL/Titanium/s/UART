@@ -1,0 +1,660 @@
+;
+; CDDL HEADER START
+;
+; The contents of this file are subject to the terms of the
+; Common Development and Distribution License (the "Licence").
+; You may not use this file except in compliance with the Licence.
+;
+; You can obtain a copy of the licence at
+; cddl/RiscOS/Sources/HAL/Titanium/LICENCE.
+; See the Licence for the specific language governing permissions
+; and limitations under the Licence.
+;
+; When distributing Covered Code, include this CDDL HEADER in each
+; file and include the Licence file. If applicable, add the
+; following below this CDDL HEADER, with the fields enclosed by
+; brackets "[]" replaced with your own identifying information:
+; Portions Copyright [yyyy] [name of copyright owner]
+;
+; CDDL HEADER END
+;
+;
+; Copyright 2014 Elesar Ltd.  All rights reserved.
+; Use is subject to license terms.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:OSEntries
+
+        GET     hdr.RegMap
+        GET     hdr.StaticWS
+                
+        AREA    |UART$$Code|, CODE, READONLY, PIC
+
+        EXPORT  UARTInit
+        EXPORT  HAL_UARTDefault
+        EXPORT  HAL_UARTPorts
+        EXPORT  HAL_UARTStartUp
+        EXPORT  HAL_UARTShutdown
+        EXPORT  HAL_UARTFeatures
+        EXPORT  HAL_UARTReceiveByte
+        EXPORT  HAL_UARTTransmitByte
+        EXPORT  HAL_UARTLineStatus
+        EXPORT  HAL_UARTInterruptEnable
+        EXPORT  HAL_UARTRate
+        EXPORT  HAL_UARTFormat
+        EXPORT  HAL_UARTFIFOSize
+        EXPORT  HAL_UARTFIFOClear
+        EXPORT  HAL_UARTFIFOEnable
+        EXPORT  HAL_UARTFIFOThreshold
+        EXPORT  HAL_UARTInterruptID
+        EXPORT  HAL_UARTBreak
+        EXPORT  HAL_UARTModemControl
+        EXPORT  HAL_UARTModemStatus
+        EXPORT  HAL_UARTDevice
+        IMPORT  GPIOMakeOutput
+        IMPORT  GPIOSetPinLow
+        IMPORT  GPIOSetPinHigh
+        IMPORT  GPIOReadPin
+
+                ^ 0                     ; Modem GPIO table format
+UARTModemDCD    # 2                     ; Input
+UARTModemDSR    # 2                     ; Input
+UARTModemDTR    # 2                     ; Output
+UARTModemRI     # 2                     ; Input
+UARTModemSize   # 0
+
+        MACRO
+        SubstituteGPIO $hw, $mask, $regbit, $lines, $line
+        LDRH    a1, [$lines, #$line]
+        MOV     lr, a1, LSR #8          ; Port number
+        TEQ     lr, #&FF
+        BEQ     %FT10                   ; Not GPIO
+
+        BL      GPIOReadPin
+        TEQ     a1, #0
+        ORREQ   $hw, $hw, #$regbit
+        BICNE   $hw, $hw, #$regbit
+        ORR     $mask, $mask, #$regbit
+10
+        MEND
+
+; There are 10 UART controllers assigned as
+; UART1  => serial 1 => PL904B (bottom)
+; UART8  => serial 2 => PL904A (top)
+; others => unused
+UARTDevices
+        ASSERT  IRQCount < 256
+        DCB     DevNoUART1, DevNoUART8
+        ALIGN
+UARTModemGPIO
+        DCW     &FFFF, &FFFF, &FFFF, &FFFF
+        DCW     &070E, &070F, &0710, &0711
+UARTClocks
+        DCD     CM_L4PER_UART1_CLKCTRL
+        DCD     CM_L4PER2_UART8_CLKCTRL
+UARTBases
+        DCD     UART1_PhysBase
+        DCD     UART8_PhysBase
+UARTCount       * (. - UARTBases):SHR:2
+        ASSERT  ?UART_LogBase = (4 * UARTCount)        
+
+; UARTInit
+UARTInit ROUT
+        Push    "v1-v5, lr"
+
+        MOV     v1, #0
+        ADR     v2, UARTBases
+        ADR     v3, UART_LogBase
+        LDR     v4, CMCoreL4PER_LogBase
+10
+        ; Map in the UART controller
+        MOV     a1, #0
+        LDR     a2, [v2, v1, LSL #2]
+        MOV     a3, #UART_PhysSize
+        CallOS  OS_MapInIO
+        STR     a1, [v3, v1, LSL #2]    ; Assigned logical base
+
+        ; Turn on the clock
+        MOV     a3, #CM_CLKCTRL_MODULEMODE_ENABLED
+        ADR     a2, UARTClocks
+        LDR     a2, [a2, v1, LSL #2]    ; Respective CLKCTRL offset
+        STR     a3, [v4, a2]
+
+        ; Default the GPIO output handshake line, if any
+        ADR     a2, UARTModemGPIO
+        ASSERT  UARTModemSize = 8
+        ADD     a2, a2, v1, LSL #3
+        LDRH    v5, [a2, #UARTModemDTR]
+        MOV     a2, v5, LSR #8          ; Port number
+        TEQ     a2, #&FF
+        BEQ     %FT20
+
+        MOV     a1, v5
+        BL      GPIOSetPinLow
+        MOV     a1, v5
+        BL      GPIOMakeOutput
+20
+        ADD     v1, v1, #1
+        TEQ     v1, #UARTCount
+        BNE     %BT10
+
+        Pull    "v1-v5, pc"
+
+; HAL_UARTDevice
+; => a1 = port number
+; <= a1 = IRQ device number 
+HAL_UARTDevice ROUT
+        CMP     a1, #UARTCount
+        ADRCC   a2, UARTDevices
+        LDRCCB  a1, [a2, a1]
+        MOVCS   a1, #-1
+        MOV     pc, lr
+
+; HAL_UARTDefault
+; <= a1 = port number of preferred port
+HAL_UARTDefault ROUT
+        MOV     a1, #0
+        MOV     pc, lr
+
+; HAL_UARTPorts
+; <= a1 = number of ports
+HAL_UARTPorts ROUT
+        MOV     a1, #UARTCount
+        MOV     pc, lr
+
+; HAL_UARTFeatures
+; => a1 = port number
+; <= a1 = feature mask
+HAL_UARTFeatures ROUT
+        CMP     a1, #UARTCount
+        MOVCC   a1, #2_101              ; FIFOs and modem lines
+        MOVCS   a1, #0
+        MOV     pc, lr
+
+; HAL_UARTReceiveByte
+; => a1 = port number
+;    a2 = pointer to word for line status
+; <= a1 = byte read  
+HAL_UARTReceiveByte ROUT
+        CMP     a1, #UARTCount
+        MOVCS   pc, lr
+        TEQ     a2, #0
+        ADR     ip, UART_LogBase
+        LDR     ip, [ip, a1, LSL #2]
+        LDRNEB  a3, [ip, #UART_LSR]
+        STRNE   a3, [a2]
+        LDRB    a1, [ip, #UART_RHR]
+        MOV     pc, lr
+
+; HAL_UARTTransmitByte
+; => a1 = port number
+;    a2 = byte to send
+HAL_UARTTransmitByte ROUT
+        CMP     a1, #UARTCount
+        ADRCC   ip, UART_LogBase
+        LDRCC   ip, [ip, a1, LSL #2]
+        STRCCB  a2, [ip, #UART_THR]
+        MOV     pc, lr
+
+; HAL_UARTLineStatus
+; => a1 = port number
+; <= a1 = 16550 style line status
+HAL_UARTLineStatus ROUT
+        CMP     a1, #UARTCount
+        ADRCC   ip, UART_LogBase
+        LDRCC   ip, [ip, a1, LSL #2]
+        LDRCCB  a1, [ip, #UART_LSR]
+        MOVCS   a1, #0
+        MOV     pc, lr
+
+; HAL_UARTBreak
+; => a1 = port number
+;    a2 = enable
+; <= a1 = previous enable setting
+HAL_UARTBreak ROUT
+        CMP     a1, #UARTCount
+        MOVCS   a1, #0
+        MOVCS   pc, lr
+        ADR     ip, UART_LogBase
+        LDR     ip, [ip, a1, LSL #2]
+        TEQ     a2, #0
+
+        ; Be atomic while flipping line control bits
+        MRS     a4, CPSR
+        ORR     a3, a4, #I32_bit
+        MSR     CPSR_c, a3
+
+        LDRB    a2, [ip, #UART_LCR]
+        BICEQ   a3, a2, #UART_LCR_BREAK_EN
+        ORRNE   a3, a2, #UART_LCR_BREAK_EN
+        STRB    a3, [ip, #UART_LCR]
+
+        MSR     CPSR_c, a4
+
+        ANDS    a1, a2, #UART_LCR_BREAK_EN
+        MVNNE   a1, #0
+
+        MOV     pc, lr
+
+; HAL_UARTRate
+; => a1 = port number
+;    a2 = baud rate * 16 (or -1 to read)
+; <= a1 = previous rate
+HAL_UARTRate ROUT
+        CMP     a1, #UARTCount
+        MOVCS   a1, #0
+        MOVCS   pc, lr
+
+      [ Debug
+        TEQ     a1, #DebugPortNum       ; Leave it alone
+        MOVEQ   pc, lr
+      ]
+        Push    "v1-v2, lr"
+
+        ADR     ip, UART_LogBase
+        LDR     ip, [ip, a1, LSL #2]
+        CMP     a2, #-1
+        BEQ     %FT10                   ; Only reading
+
+        ; Stop it running while writing
+        MOV     a1, #UART_MDR1_MODE_SELECT_DISABLE
+        STRB    a1, [ip, #UART_MDR1]
+
+        LDR     a3, =ClkPer4
+        ADD     a3, a3, a2, LSR #1      ; Round up halves
+        UDIV    a1, a3, a2              ; Where setting = ClkPer4 / (16 * baud)
+10
+        ; Be atomic while banked register switching
+        MRS     a4, CPSR
+        ORR     a3, a4, #I32_bit
+        MSR     CPSR_c, a3
+
+        LDRB    a2, [ip, #UART_LCR]
+        ORR     a3, a3, #UART_LCR_DIV_EN
+        STRB    a3, [ip, #UART_LCR]
+        LDRB    v1, [ip, #UART_DLL]     ; Read old setting
+        LDRB    v2, [ip, #UART_DLH]
+        STRNEB  a1, [ip, #UART_DLL]     ; Write new setting (if NE)
+        MOVNE   a1, a1, LSR #8
+        STRNEB  a1, [ip, #UART_DLH]
+        STRB    a2, [ip, #UART_LCR]     ; Put back original bank
+
+        MSR     CPSR_c, a4
+
+        ORRS    a1, v1, v2, LSL #8      ; Where setting = ClkPer4 / (16 * baud)
+        LDRNE   a3, =ClkPer4
+        UDIVNE  a1, a3, a1              ;  => 16 * baud = ClkPer4 / setting
+
+        ; Go
+        MOV     a3, #UART_MDR1_MODE_SELECT_UART16
+        STRB    a3, [ip, #UART_MDR1]
+
+        Pull    "v1-v2, pc"
+
+; HAL_UARTFormat
+; => a1 = port number
+;    a2 = 16550 style format
+; <= a1 = previous format
+HAL_UARTFormat ROUT
+        CMP     a1, #UARTCount
+        MOVCS   a1, #0
+        MOVCS   pc, lr
+      [ Debug
+        TEQ     a1, #DebugPortNum       ; Leave it alone
+        MOVEQ   a1, #0
+        MOVEQ   pc, lr
+      ]
+        ADR     ip, UART_LogBase
+        LDR     ip, [ip, a1, LSL #2]
+        CMP     a2, #-1
+
+        ; Be atomic while flipping line control bits
+        MRS     a4, CPSR
+        ORR     a3, a4, #I32_bit
+        MSR     CPSR_c, a3
+
+        LDRB    a1, [ip, #UART_LCR]     ; Read old setting
+        ANDNE   a2, a2, #UART_LCR_PARITY_MASK :OR: \
+                         UART_LCR_CHAR_LENGTH_MASK :OR: \
+                         UART_LCR_NB_STOP2_OR_1P5
+        BICNE   a3, a1, #UART_LCR_PARITY_MASK :OR: \
+                         UART_LCR_CHAR_LENGTH_MASK :OR: \
+                         UART_LCR_NB_STOP2_OR_1P5
+        ORRNE   a3, a3, a2
+        STRNEB  a3, [ip, #UART_LCR]     ; Write new settings (if NE)
+
+        MSR     CPSR_c, a4
+
+        AND     a1, a1, #UART_LCR_PARITY_MASK :OR: \
+                         UART_LCR_CHAR_LENGTH_MASK :OR: \
+                         UART_LCR_NB_STOP2_OR_1P5
+        MOV     pc, lr
+
+; HAL_UARTInterruptID
+; => a1 = port number
+; <= a1 = 16550 style interrupt type (or -1 if none)
+HAL_UARTInterruptID ROUT
+        CMP     a1, #UARTCount
+        ADRCC   ip, UART_LogBase
+        LDRCC   ip, [ip, a1, LSL #2]
+        LDRCCB  a1, [ip, #UART_IIR]
+        MOVCS   a1, #0
+        TST     a1, #UART_IIR_IT_PENDING
+        UBFXEQ  a1, a1, #UART_IIR_IT_TYPE_SHIFT, #UART_IIR_IT_TYPE_BITS
+        MVNNE   a1, #0                  ; No interrupt
+        MOV     pc, lr
+
+; HAL_UARTInterruptEnable
+; => a1 = port number
+;    a2 = EOR mask
+;    a3 = AND mask
+; <= a1 = previous 16550 style interrupt setting
+HAL_UARTInterruptEnable ROUT
+        CMP     a1, #UARTCount
+        MOVCS   a1, #0
+        MOVCS   pc, lr
+      [ Debug
+        TEQ     a1, #DebugPortNum       ; Leave it alone
+        MOVEQ   a1, #0
+        MOVEQ   pc, lr
+      ]
+        ADR     ip, UART_LogBase
+        LDR     ip, [ip, a1, LSL #2]
+
+        ; Be atomic while flipping interrupt enable bits
+        MRS     a4, CPSR
+        ORR     a1, a4, #I32_bit
+        MSR     CPSR_c, a1
+
+        LDRB    a1, [ip, #UART_IER]
+        AND     a3, a1, a3
+        EOR     a3, a3, a2
+        STRB    a3, [ip, #UART_IER]
+
+        MSR     CPSR_c, a4
+
+        MOV     pc, lr
+
+; HAL_UARTStartUp
+; => a1 = port number
+HAL_UARTStartUp ROUT
+        CMP     a1, #UARTCount
+        MOVCS   pc, lr
+      [ Debug
+        TEQ     a1, #DebugPortNum       ; Leave it alone
+        MOVEQ   pc, lr
+      ]
+        ADR     ip, UART_LogBase
+        LDR     ip, [ip, a1, LSL #2]
+
+        ; Get back all the defaults with a reset
+        MOV     a3, #UART_SYSC_SOFTRESET
+        STRB    a3, [ip, #UART_SYSC]
+10
+        LDRB    a3, [ip, #UART_SYSC]
+        TST     a3, #UART_SYSC_SOFTRESET
+        BNE     %BT10
+
+        ; Some sensible defaults
+        ADR     a2, UARTSoftFCR
+        MOV     a3, #0                  
+        STRB    a3, [a2, a1]            ; Soft FCR follows hardware
+
+        MOV     a1, #UART_LCR_PARITY_NONE :OR: UART_LCR_NB_STOP1 :OR: \
+                     UART_LCR_CHAR_LENGTH8
+        STRB    a1, [ip, #UART_LCR]     ; 8N1
+
+        MOV     pc, lr
+
+; HAL_UARTShutdown
+; => a1 = port number
+HAL_UARTShutdown ROUT
+        MOV     pc, lr                  ; Nothing to do
+
+; HAL_UARTModemControl
+; => a1 = port number
+;    a2 = EOR mask
+;    a3 = AND mask
+; <= a1 = previous 16550 control outputs
+HAL_UARTModemControl ROUT
+        CMP     a1, #UARTCount
+        MOVCS   a1, #0
+        MOVCS   pc, lr
+
+        Push    "v1, lr"
+
+        ADR     ip, UART_LogBase
+        LDR     ip, [ip, a1, LSL #2]
+
+        ; Only fiddle with DTR and RTS
+        MVN     a4, #UART_MCR_DTR :OR: UART_MCR_RTS
+        BIC     a2, a2, a4
+        ORR     a3, a3, a4
+
+        ; Be atomic while flipping control lines
+        MRS     a4, CPSR
+        ORR     lr, a4, #I32_bit
+        MSR     CPSR_c, lr
+
+        LDRB    v1, [ip, #UART_MCR]
+        AND     a3, v1, a3
+        EOR     a3, a3, a2
+        STRB    a3, [ip, #UART_MCR]
+
+        MSR     CPSR_c, a4
+
+        ; Check if the modem lines are actually GPIO
+        ADR     a2, UARTModemGPIO
+        ASSERT  UARTModemSize = 8
+        ADD     a2, a2, a1, LSL #3
+        LDRH    a1, [a2, #UARTModemDTR]
+        MOV     a4, a1, LSR #8          ; Port number
+        TEQ     a4, #&FF
+        BEQ     %FT20                   ; Not GPIO
+
+        TST     a3, #UART_MCR_DTR
+        BNE     %FT10
+        BL      GPIOSetPinHigh
+        B       %FT20
+10
+        BL      GPIOSetPinLow
+20
+        AND     a1, v1, #UART_MCR_DTR :OR: UART_MCR_RTS
+        Pull    "v1, pc"
+
+; HAL_UARTModemStatus
+; => a1 = port number
+; <= a1 = 16550 style modem status
+HAL_UARTModemStatus ROUT
+        CMP     a1, #UARTCount
+        MOVCS   a1, #0
+        MOVCS   pc, lr
+
+        Push    "v1-v3, lr"
+
+        ADR     ip, UART_LogBase
+        LDR     ip, [ip, a1, LSL #2]
+        ADR     v1, UARTModemGPIO
+        ASSERT  UARTModemSize = 8
+        ADD     v1, v1, a1, LSL #3
+        MOV     v3, #0                  ; Mask of GPIO implemented bits
+
+        ; Be atomic while sampling status lines
+        MRS     a4, CPSR
+        ORR     lr, a4, #I32_bit
+        MSR     CPSR_c, lr
+
+        LDRB    v2, [ip, #UART_MSR]     ; Hardware view
+
+        ; Mix in any GPIO implemented bits
+        Push    "a1, a4"
+        SubstituteGPIO v2, v3, UART_NDCD_STS, v1, UARTModemDCD
+        SubstituteGPIO v2, v3, UART_NDSR_STS, v1, UARTModemDSR
+        SubstituteGPIO v2, v3, UART_NRI_STS,  v1, UARTModemRI
+        Pull    "a1, a4"
+        
+        ADRL    a2, UARTLastMSR
+        LDRB    a3, [a2, a1]            ; Last
+        STRB    v2, [a2, a1]            ; Current
+
+        MSR     CPSR_c, a4
+
+        ; Calculate changes in the GPIO pins
+        ! 0, "TODO! Could use GPIO7 interrupts to emulate modem status change int"
+        AND     a2, v2, v3
+        AND     a3, a3, v3
+        EOR     a1, a2, a3
+        ASSERT  UART_NDCD_STS = UART_DCD_STS_CH :SHL: 4
+        ASSERT  UART_NDSR_STS = UART_DSR_STS_CH :SHL: 4
+        ASSERT  UART_NRI_STS  = UART_RI_STS_CH :SHL: 4
+        BIC     v2, v2, v3, LSR #4
+        ORR     a1, v2, a1, LSR #4
+
+        Pull    "v1-v3, pc"
+
+; HAL_UARTFIFOSize
+; => a1 = port number
+;    a2 = pointer to word for rx size
+;    a3 = pointer to work for tx size
+HAL_UARTFIFOSize ROUT
+        CMP     a1, #UARTCount
+        MOVCS   a4, #0
+        MOVCC   a4, #64                 ; Both directions the same
+        TEQ     a2, #0
+        STRNE   a4, [a2]
+        TEQ     a3, #0
+        STRNE   a4, [a3]
+        MOV     pc, lr
+
+; HAL_UARTFIFOClear
+; => a1 = port number
+;    a2 = mask of requests to clear (b0 = input, b1 = output)
+HAL_UARTFIFOClear ROUT
+        CMP     a1, #UARTCount
+        MOVCS   pc, lr
+      [ Debug
+        TEQ     a1, #DebugPortNum       ; Leave it alone
+        MOVEQ   pc, lr
+      ]
+        ADR     ip, UART_LogBase
+        LDR     ip, [ip, a1, LSL #2]
+
+        ; Be atomic while manipulating the FIFO control register
+        MRS     a4, CPSR
+        ORR     a3, a4, #I32_bit
+        MSR     CPSR_c, a3
+
+        ; Write only FCR goes via a soft copy
+        ADR     a3, UARTSoftFCR
+        LDRB    a3, [a3, a1]
+        ASSERT  UART_FCR_RX_FIFO_CLEAR = 2
+        ASSERT  UART_FCR_TX_FIFO_CLEAR = 4
+        BFI     a3, a2, #1, #2
+        STRB    a3, [ip, #UART_FCR]     ; Self clears
+
+        MSR     CPSR_c, a4
+
+        MOV     pc, lr
+
+; HAL_UARTFIFOEnable
+; => a1 = port number
+;    a2 = enable (or -1 to read)
+; <= a1 = previous state
+HAL_UARTFIFOEnable ROUT
+        CMP     a1, #UARTCount
+        MOVCS   pc, lr
+      [ Debug
+        TEQ     a1, #DebugPortNum       ; Leave it alone
+        MOVEQ   pc, lr
+      ]
+        ADR     ip, UART_LogBase
+        LDR     ip, [ip, a1, LSL #2]
+
+        Push    "lr"
+
+        ADR     lr, UARTSoftFCR
+        CMP     a2, #-1
+        LDREQB  a3, [lr, a1]
+        BEQ     %FT10
+
+        ; Be atomic while manipulating the FIFO control register
+        MRS     a4, CPSR
+        ORR     a3, a4, #I32_bit
+        MSR     CPSR_c, a3
+
+        LDRB    a3, [lr, a1]
+        TEQ     a2, #0
+        BICEQ   a3, a3, #UART_FCR_FIFO_EN
+        ORRNE   a3, a3, #UART_FCR_FIFO_EN
+        STRB    a3, [ip, #UART_FCR]
+        STRB    a3, [lr, a1]
+
+        MSR     CPSR_c, a4
+10
+        ANDS    a1, a3, #UART_FCR_FIFO_EN
+        MOVNE   a1, #1                  ; Clean 0/1 result
+
+        Pull    "pc"
+
+; HAL_UARTFIFOThreshold
+; => a1 = port number
+;    a2 = threshold for rx interrupt (or -1 to read)
+; <= a1 = previous threshold
+HAL_UARTFIFOThreshold ROUT
+        CMP     a1, #UARTCount
+      [ Debug
+        TEQ     a1, #DebugPortNum       ; Leave it alone
+        MOVEQ   a1, #0
+        MOVEQ   pc, lr
+      ]
+        MOVCS   a1, #0
+        MOVCS   pc, lr
+
+        Push    "v1-v2, lr"
+
+        ADR     v1, UARTSoftFCR
+        CMP     a2, #-1
+        LDREQB  a3, [v1, a1]
+        BEQ     %FT20
+
+        ; Encode the threshold into an FCR
+        MOV     a4, #0
+        MOV     v2, #0
+        ADR     a3, %FT30
+10
+        LDRB    lr, [a3, a4]
+        CMP     a2, lr
+        MOVCS   v2, a4                  ; Index of the high water mark
+        ADD     a4, a4, #1
+        TEQ     a4, #4
+        BNE     %BT10
+
+        ADR     ip, UART_LogBase
+        LDR     ip, [ip, a1, LSL #2]
+
+        ; Be atomic while manipulating the FIFO control register
+        MRS     a4, CPSR
+        ORR     a3, a4, #I32_bit
+        MSR     CPSR_c, a3
+
+        LDRB    a3, [v1, a1]            ; Last FCR write
+        BIC     a3, a3, #UART_FCR_RX_FIFO_TRIG_MASK
+        ORR     a3, a3, v2, LSL #UART_FCR_RX_FIFO_TRIG_SHIFT
+        STRB    a3, [ip, #UART_FCR]
+        STRB    a3, [v1, a1]            ; Sync soft copy
+
+        MSR     CPSR_c, a4
+20
+        ; Decode the FCR back to a threshold
+        AND     a3, a3, #UART_FCR_RX_FIFO_TRIG_MASK
+        ADR     a1, %FT30
+        LDRB    a1, [a1, a3, LSR #UART_FCR_RX_FIFO_TRIG_SHIFT]
+
+        Pull    "v1-v2, pc"
+30
+        DCD     UART_FCR_RX_FIFO_TRIG_OPTS
+
+        END

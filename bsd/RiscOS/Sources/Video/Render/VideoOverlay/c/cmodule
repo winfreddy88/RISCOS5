@@ -1,0 +1,622 @@
+/*
+ * Copyright (c) 2017, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <limits.h>
+#include "kernel.h"
+#include "swis.h"
+
+#include "wimp.h"
+
+#include "DebugLib/debuglib.h"
+
+#include "AsmUtils/rminfo.h"
+
+#include "Global/RISCOS.h"
+#include "Global/Services.h"
+//#include "Global/NewErrors.h"
+#include "Global/GraphicsV.h"
+#include "Global/VduExt.h"
+#include "Global/ModHand.h"
+//#include "Global/VIDCList.h"
+
+#undef Module_Title
+#include "modhead.h"
+
+#include "globals.h"
+#include "overlays.h"
+#include "errors.h"
+#include "events.h"
+#include "utils.h"
+
+void *private_word;
+static int instance;
+vduvars_t vduvars;
+msgtrans_control_block messages;
+
+#define HEADS_MASK 1
+
+#ifdef STANDALONE
+extern void* Resources(void);
+#endif
+
+/* TODO:
+   - Catch Wimp_DestroyWindow
+   - Be smarter with EventV & overlay updates
+   - Add debug output
+   - Manage TCK/alpha?
+   - Manage Basic overlay quirks
+*/
+
+static void read_vduvars(void)
+{
+	vduvars.xeig = VduExt_XEigFactor;
+	vduvars.yeig = VduExt_YEigFactor;
+	vduvars.ylimit = VduExt_YWindLimit;
+	vduvars.gvdriver = VduExt_CurrentGraphicsVDriver;
+	vduvars.terminator = -1;
+	_swix(OS_ReadVduVariables,_INR(0,1),&vduvars,&vduvars);
+}
+
+static void destroy_cb(overlay_t *o, void *param)
+{
+	/* Treat param as an optional task handle to filter by */
+	if (param && (o->task != (int) param))
+	{
+		return;
+	}
+	if (o->gvoverlay)
+	{
+		_swix(OS_CallAVector,_IN(4)|_IN(9),GraphicsV_DestroyOverlay | (vduvars.gvdriver<<24) | (o->gvoverlay<<16),GraphicsV);
+	}
+	overlay_free(o);
+}
+
+static void loss_cb(overlay_t *o, void *param)
+{
+	(void) param;
+	if (o->gvoverlay)
+	{
+		/* Destroy the overlay just in case it survived the mode change. Note: This makes it dangerous for anything to create overlays within Service_ModeChange handlers. */
+		_swix(OS_CallAVector,_IN(4)|_IN(9),GraphicsV_DestroyOverlay | (vduvars.gvdriver<<24) | (o->gvoverlay<<16),GraphicsV);
+		o->gvoverlay = 0;
+	}
+	o->lost = true;
+}
+
+_kernel_oserror* module_init(const char *cmd_tail, int podule_base, void *pw)
+{
+	(void) cmd_tail;
+
+	_kernel_oserror *e = NULL;
+    
+	/* set up debugging */
+	debug_initialise(Module_Title, "", "");
+	debug_set_device(DADEBUG_OUTPUT);
+	debug_set_unbuffered_files(TRUE);
+
+	instance = podule_base;
+    
+	private_word = pw;
+
+#ifdef STANDALONE
+	/* Register resources */
+	e = _swix(ResourceFS_RegisterFiles,_IN(0),Resources());
+	if(e)
+		goto error1;
+#endif
+
+	/* Open messages */
+	e = msgtrans_open_file(&messages,Module_MessagesFile,0);
+	if(e)
+		goto error2;
+
+	read_vduvars();
+
+	/* TODO: Be smarter with this */
+	e = events_init();
+	if(e)
+		goto error3;
+
+	return NULL;
+
+error3:
+	/* Close messages */
+	msgtrans_close_file(&messages);
+error2:
+#ifdef STANDALONE
+	_swix(ResourceFS_DeregisterFiles,_IN(0),Resources());
+#endif
+error1:
+	return e;
+}
+
+_kernel_oserror *module_final(int fatal, int podule, void *pw)
+{
+	(void) podule;
+	(void) fatal;
+	(void) pw;
+
+	overlay_iterate(destroy_cb,NULL);
+
+	events_shutdown();
+
+	/* Close messages */
+	msgtrans_close_file(&messages);
+
+#ifdef STANDALONE
+	_swix(ResourceFS_DeregisterFiles,_IN(0),Resources());
+#endif
+    
+	return NULL;
+}
+
+void module_service(int service_number, _kernel_swi_regs *r, void *pw)
+{
+	(void) pw;
+
+	switch(service_number)
+	{
+	case Service_DisplayChanged:
+		if((r->r[0] == DisplayChanged_Changed) && (r->r[2] != vduvars.gvdriver))
+		{
+			overlay_iterate(loss_cb,NULL);
+			/* Update the driver number, since that's the most important bit. If any of the others need changing, we should receive a Service_ModeChange. */
+			vduvars.gvdriver = r->r[2];
+		}
+		break;
+	case Service_WimpCloseDown:
+		if(!r->r[0])
+		{
+			overlay_iterate(destroy_cb,(void *) r->r[2]);
+		}
+		break;
+	case Service_ModeChange:
+		overlay_iterate(loss_cb,NULL);
+		read_vduvars();
+		break;
+	}
+}
+
+static void hide_overlay(overlay_t *o)
+{
+	if (o->visible)
+	{
+		o->visible = false;
+		_swix(OS_CallAVector,_IN(1)|_IN(4)|_IN(9),0,GraphicsV_SetOverlayPosition | (vduvars.gvdriver<<24) | (o->gvoverlay<<16),GraphicsV);
+	}
+}
+
+void show_overlay(overlay_t *o,bool force)
+{
+	overlay_pos_t pos;
+	if (!o->gvoverlay)
+	{
+		return;
+	}
+	if (o->buffer < 0)
+	{
+		hide_overlay(o);
+		return;
+	}
+	/* Compute overlay position */
+	pos = compute_overlay_pos(o);
+	if (!pos.visible)
+	{
+		hide_overlay(o);
+		return;
+	}
+	/* Set new coordinates */
+	if ((pos.x != o->x) || (pos.y != o->y) || force || !o->visible)
+	{
+		o->x = pos.x;
+		o->y = pos.y;
+		o->visible = true;
+		int args[3];
+		args[0] = 0;
+		args[1] = pos.x;
+		args[2] = pos.y;
+		_swix(OS_CallAVector,_INR(0,2)|_IN(4)|_IN(9),args,1,o->buffer,GraphicsV_SetOverlayPosition | (vduvars.gvdriver<<24) | (o->gvoverlay<<16),GraphicsV);
+	}
+	/* Set new clipping rectangle */
+	if ((pos.clip[0] != o->clip[0]) || (pos.clip[1] != o->clip[1]) || (pos.clip[2] != o->clip[2]) || (pos.clip[3] != o->clip[3]))
+	{
+		memcpy(o->clip,pos.clip,sizeof(o->clip));
+		_swix(OS_CallAVector,_INR(0,7)|_IN(9),o->clip[0],o->clip[1],o->clip[2],o->clip[3],GraphicsV_SetOverlayTransform | (vduvars.gvdriver<<24) | (o->gvoverlay<<16),o->width,o->height,o->aspect,GraphicsV);
+	}
+}
+
+static overlay_t *get_valid(uint32_t id,_kernel_oserror **e)
+{
+	overlay_t *o;
+	o = overlay_get(id);
+	if (!o)
+	{
+		*e = ERROR(BadOverlay);
+		return NULL;
+	}
+	if (o->lost)
+	{
+		/* Attempt to recreate the overlay */
+		o->lost = false;
+		int i,j,k;
+		if (!_swix(OS_CallAVector,_INR(0,3)|_IN(4)|_IN(9)|_OUTR(0,1)|_OUT(4),o->desc,o->aspect,o->flags,HEADS_MASK,GraphicsV_CreateOverlay | (vduvars.gvdriver<<24),GraphicsV,&i,&j,&k) && !k)
+		{
+			/* Success */
+			o->gvoverlay = i;
+			o->type = j & 255;
+			/* Restore scale */
+			if (o->flags & GVOverlayFlag_Scalable)
+			{
+				_swix(OS_CallAVector,_INR(0,7)|_IN(9)|_OUTR(5,6),o->clip[0],o->clip[1],o->clip[2],o->clip[3],GraphicsV_SetOverlayTransform | (vduvars.gvdriver<<24) | (o->gvoverlay<<16),o->width,o->height,o->aspect,GraphicsV,&o->width,&o->height);
+			}
+			/* TODO - Restore other state */
+		}
+	}
+	if (!o->gvoverlay)
+	{
+		*e = ERROR(OverlayLost);
+		o = NULL;
+	}
+	return o;
+}
+
+static _kernel_oserror *swi_create(_kernel_swi_regs *r)
+{
+	overlay_t *o;
+	_kernel_oserror *e = NULL;
+	int i,j,k,dims[4];
+	o = overlay_new((const modeselector_t *) r->r[0],r->r[2],r->r[3]);
+	if (!o)
+	{
+		return ERROR(TooManyOverlays);
+	}
+	e = _swix(OS_CallAVector,_INR(0,3)|_IN(4)|_IN(9)|_OUTR(0,6),r->r[0],r->r[1],r->r[2],HEADS_MASK,GraphicsV_CreateOverlay | (vduvars.gvdriver<<24),GraphicsV,&i,&j,&dims[0],&dims[1],&k,&dims[2],&dims[3]);
+	if (!e && k)
+	{
+		e = ERROR(CallFailed);
+	}
+	if (e)
+	{
+		overlay_free(o);
+		return e;
+	}
+	o->gvoverlay = i;
+	o->type = j & 255;
+	const modeselector_t *desc = (const modeselector_t *) r->r[0];
+	int modeflags = 0;
+	for(const modevarpair_t *vars = desc->modevars;vars->var != -1;vars++)
+	{
+		if (vars->var == VduExt_ModeFlags)
+			modeflags = vars->val;
+	}
+	if (modeflags & ModeFlag_Transform_Rotate90)
+	{
+		o->width = desc->yres;
+		o->height = desc->xres;
+	}
+	else
+	{
+		o->width = desc->xres;
+		o->height = desc->yres;
+	}
+	o->clip[0] = o->clip[1] = 0;
+	o->clip[2] = o->width;
+	o->clip[3] = o->height;
+	o->aspect = r->r[1];
+	r->r[0] = o->id;
+	r->r[1] = j;
+	r->r[2] = dims[0];
+	r->r[3] = dims[1];
+	r->r[4] = dims[2];
+	r->r[5] = dims[3];
+	return NULL;
+}
+
+static _kernel_oserror *swi_destroy(_kernel_swi_regs *r)
+{
+	overlay_t *o;
+	o = overlay_get(r->r[0]);
+	if (o)
+	{
+		destroy_cb(o,NULL);
+	}
+	return NULL;
+}
+
+static _kernel_oserror *swi_displaybuffer(_kernel_swi_regs *r)
+{
+	overlay_t *o;
+	_kernel_oserror *e = NULL;
+	o = get_valid(r->r[0],&e);
+	if (!o)
+	{
+		return e;
+	}
+	if (o->buffer != r->r[1])
+	{
+		bool toggle = (o->buffer < 0) != (r->r[1] < 0);
+		if (toggle)
+		{
+			request_redraw(o);
+		}
+		o->buffer = r->r[1];
+		if (toggle)
+		{
+			request_redraw(o);
+		}
+		show_overlay(o,true);
+	}
+	return NULL;
+}
+
+static _kernel_oserror *swi_mapbuffer(_kernel_swi_regs *r)
+{
+	overlay_t *o;
+	_kernel_oserror *e = NULL;
+	int i,j;
+	o = get_valid(r->r[0],&e);
+	if (!o)
+	{
+		return e;
+	}
+	e = _swix(OS_CallAVector,_IN(0)|_IN(4)|_IN(9)|_OUT(0)|_OUT(4),r->r[1],GraphicsV_MapOverlayBuffer | (vduvars.gvdriver<<24) | (o->gvoverlay<<16),GraphicsV,&i,&j);
+	if (e)
+	{
+		return e;
+	}
+	if (j)
+	{
+		return ERROR(CallFailed);
+	}
+	r->r[0] = i;
+	return NULL;
+}
+
+static _kernel_oserror *swi_unmapbuffer(_kernel_swi_regs *r)
+{
+	overlay_t *o;
+	_kernel_oserror *e = NULL;
+	int k;
+	o = get_valid(r->r[0],&e);
+	if (!o)
+	{
+		return e;
+	}
+	e = _swix(OS_CallAVector,_IN(0)|_IN(4)|_IN(9)|_OUT(4),r->r[1],GraphicsV_UnmapOverlayBuffer | (vduvars.gvdriver<<24) | (o->gvoverlay<<16),GraphicsV,&k);
+	if (e)
+	{
+		return e;
+	}
+	if (k)
+	{
+		return ERROR(CallFailed);
+	}
+	return NULL;
+}
+
+static _kernel_oserror *swi_discardbuffer(_kernel_swi_regs *r)
+{
+	overlay_t *o;
+	_kernel_oserror *e = NULL;
+	int k;
+	o = get_valid(r->r[0],&e);
+	if (!o)
+	{
+		return e;
+	}
+	e = _swix(OS_CallAVector,_IN(0)|_IN(4)|_IN(9)|_OUT(4),r->r[1],GraphicsV_DiscardOverlayBuffer | (vduvars.gvdriver<<24) | (o->gvoverlay<<16),GraphicsV,&k);
+	if (e)
+	{
+		return e;
+	}
+	if (k)
+	{
+		return ERROR(CallFailed);
+	}
+	return NULL;
+}
+
+static _kernel_oserror *swi_vet(_kernel_swi_regs *r)
+{
+	_kernel_oserror *e = NULL;
+	int j,k,dims[4];
+	e = _swix(OS_CallAVector,_INR(0,3)|_IN(4)|_IN(9)|_OUTR(1,6),r->r[0],r->r[1],r->r[2],HEADS_MASK,GraphicsV_VetOverlay | (vduvars.gvdriver<<24),GraphicsV,&j,&dims[0],&dims[1],&k,&dims[2],&dims[3]);
+	if (e)
+	{
+		return e;
+	}
+	if (!k)
+	{
+		return ERROR(CallFailed); /* TODO: Some other response for overlay not being acceptable */
+	}
+	r->r[1] = j;
+	r->r[2] = dims[0];
+	r->r[3] = dims[1];
+	r->r[4] = dims[2];
+	r->r[5] = dims[3];
+	return NULL;
+}
+
+static _kernel_oserror *swi_setscale(_kernel_swi_regs *r)
+{
+	overlay_t *o;
+	_kernel_oserror *e = NULL;
+	int k;
+	o = get_valid(r->r[0],&e);
+	if (!o)
+	{
+		return e;
+	}
+	if ((o->width == r->r[1]) && (o->height == r->r[2]))
+	{
+		return NULL;
+	}
+	/* TODO: Optimise to only redraw the required areas */
+	request_redraw(o);
+	e = _swix(OS_CallAVector,_INR(0,7)|_IN(9)|_OUTR(0,6),o->clip[0],o->clip[1],o->clip[2],o->clip[3],GraphicsV_SetOverlayTransform | (vduvars.gvdriver<<24) | (o->gvoverlay<<16),r->r[1],r->r[2],r->r[3],GraphicsV,&o->clip[0],&o->clip[1],&o->clip[2],&o->clip[3],&k,&o->width,&o->height);
+	if (e)
+	{
+		return e;
+	}
+	if (k)
+	{
+		return ERROR(CallFailed);
+	}
+	o->aspect = r->r[3];
+	request_redraw(o);
+	r->r[1] = o->width;
+	r->r[2] = o->height;
+	/* Recalc clipping rectangle (TODO: unnecessary?) */
+	show_overlay(o,false);
+	return NULL;
+}
+
+static _kernel_oserror *swi_setwindow(_kernel_swi_regs *r)
+{
+	overlay_t *o;
+	_kernel_oserror *e = NULL;
+	o = get_valid(r->r[0],&e);
+	if (!o)
+	{
+		return e;
+	}
+	request_redraw(o);
+	o->window = r->r[1];
+	request_redraw(o);
+	/* Recalc clipping rectangle (TODO: unnecessary?) */
+	show_overlay(o,false);
+	return NULL;
+}
+
+static _kernel_oserror *swi_setposition(_kernel_swi_regs *r)
+{
+	overlay_t *o;
+	_kernel_oserror *e = NULL;
+	o = get_valid(r->r[0],&e);
+	if (!o)
+	{
+		return e;
+	}
+	if ((o->x_offset == r->r[1]) && (o->y_offset == r->r[2]) && (o->win_clip[0] == r->r[3]) && (o->win_clip[1] == r->r[4]) && (o->win_clip[2] == r->r[5]) && (o->win_clip[3] == r->r[6]))
+	{
+		return NULL;
+	}
+	/* TODO: Optimise to only redraw the required areas */
+	request_redraw(o);
+	o->x_offset = r->r[1];
+	o->y_offset = r->r[2];
+	o->win_clip[0] = r->r[3];
+	o->win_clip[1] = r->r[4];
+	o->win_clip[2] = r->r[5];
+	o->win_clip[3] = r->r[6];
+	request_redraw(o);
+	return NULL;
+}
+
+static _kernel_oserror *swi_redrawwindow(_kernel_swi_regs *r)
+{
+	overlay_t *o;
+	_kernel_oserror *e = NULL;
+	o = get_valid(r->r[0],&e);
+	if (!o)
+	{
+		return e;
+	}
+	if (o->buffer < 0)
+	{
+		return NULL;
+	}
+	const wimp_redrawstr *redraw = (const wimp_redrawstr *) r->r[1];
+	/* Calculate position in OS units */
+	int rect[4];
+	rect[0] = o->x_offset;
+	rect[1] = o->y_offset - (o->height << vduvars.yeig);
+	rect[2] = o->x_offset + (o->width << vduvars.xeig);
+	rect[3] = o->y_offset;
+	if (rect[0] < o->win_clip[0])
+		rect[0] = o->win_clip[0];
+	if (rect[1] < o->win_clip[1])
+		rect[1] = o->win_clip[1];
+	if (rect[2] > o->win_clip[2])
+		rect[2] = o->win_clip[2];
+	if (rect[3] > o->win_clip[3])
+		rect[3] = o->win_clip[3];
+	/* Offset by window position */
+	int ofsx = redraw->box.x0-redraw->scx; 
+	int ofsy = redraw->box.y1-redraw->scy;
+	rect[0] += ofsx;
+	rect[1] += ofsy;
+	rect[2] += ofsx;
+	rect[3] += ofsy;
+	if ((rect[0] >= rect[2]) || (rect[1] >= rect[3]))
+	{
+		return NULL;
+	}
+	/* Set correct clear colour */
+	uint32_t clear_colour = 0;
+	_swix(OS_CallAVector,_INR(0,2)|_IN(4)|_IN(9)|_OUT(1),GVPaletteType_ColourKey,0,0,GraphicsV_ReadPaletteEntry | (vduvars.gvdriver<<24),GraphicsV,&clear_colour);
+	_swix(OS_SetColour,_INR(0,1),0,clear_colour);
+	_swix(OS_Plot,_INR(0,2),4,rect[0],rect[1]);
+	_swix(OS_Plot,_INR(0,2),5+96,rect[2]-1,rect[3]-1);
+	return NULL;
+}
+
+_kernel_oserror *module_swis(int swi_offset, _kernel_swi_regs *r, void *pw)
+{
+	(void) pw;
+
+	switch(swi_offset)
+	{
+	case VideoOverlay_Create - VideoOverlay_00:
+		return swi_create(r);
+	case VideoOverlay_Destroy - VideoOverlay_00:
+		return swi_destroy(r);
+	case VideoOverlay_DisplayBuffer - VideoOverlay_00:
+		return swi_displaybuffer(r);
+	case VideoOverlay_MapBuffer - VideoOverlay_00:
+		return swi_mapbuffer(r);
+	case VideoOverlay_UnmapBuffer - VideoOverlay_00:
+		return swi_unmapbuffer(r);
+	case VideoOverlay_DiscardBuffer - VideoOverlay_00:
+		return swi_discardbuffer(r);
+	case VideoOverlay_Vet - VideoOverlay_00:
+		return swi_vet(r);
+	case VideoOverlay_SetScale - VideoOverlay_00:
+		return swi_setscale(r);
+	case VideoOverlay_SetWindow - VideoOverlay_00:
+		return swi_setwindow(r);
+	case VideoOverlay_SetPosition - VideoOverlay_00:
+		return swi_setposition(r);
+	case VideoOverlay_RedrawWindow - VideoOverlay_00:
+		return swi_redrawwindow(r);
+	default:
+		return error_BAD_SWI;
+	}
+}

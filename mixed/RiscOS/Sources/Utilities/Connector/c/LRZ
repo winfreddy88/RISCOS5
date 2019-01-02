@@ -1,0 +1,1719 @@
+/* lrz.c cosmetic modifications by Matt Porter
+ * from rz.c By Chuck Forsberg
+ *
+ *  A program for Linux to receive files and commands from computers running
+ *  zmodem, ymodem, or xmodem protocols.
+ *  lrz uses Unix buffered input to reduce wasted CPU time.
+ *
+ */
+#include "Desk/File.h"
+#include "Desk/Filing.h"
+#include "Desk/DeskMem.h"
+#include "Desk/Icon.h"
+#include "Desk/Str.h"
+#include "Desk/SWI.h"
+#include "kernel.h"
+#include "swis.h"
+
+#include "osargs.h"
+#include "osfscontrol.h"
+#include "osfind.h"
+
+#include "iconnames.h"
+#include "global.h"
+#include "misc.h"
+#include "zmodem.h"
+#include "zm.h"
+#include "crctab.h"
+#include "zmisc.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdarg.h>
+#include <signal.h>
+#include <ctype.h>
+#include <errno.h>
+#include <string.h>
+//#include <sys/time.h>
+#include <time.h>
+#include "timing.h"
+
+int wcreceive(void);
+int tryz(void);
+int rzfiles(void);
+int rzfile(void);
+void zmputs(char *s);
+int closeit(void);
+void ackbibi(void);
+int wcrxpn(char *rpn);
+int procheader(char *name);
+void checkpath(char *name);
+int wcrx(void);
+int wcgetsec(char *rxbuf,int maxtime);
+int putsec(char *buf,register int n);
+int IsAnyLower(register char *s);
+void uncaps(register char *s);
+
+#define LONG_NAME "!!0123456789012345678901234567890123456789012345678901234567"
+#define LONG_NAME_LENGTH 60
+
+#define SS_NORMAL 0
+#define LOGFILE "/var/adm/rzlog"
+
+
+//extern int errno;
+//#define ACKINTERVALL 1
+
+//#define MAX_BLOCK 8192
+#define MAX_BLOCK 1024
+//#define DISC_BUFFER_SIZE 16384
+
+/* Ward Christensen / CP/M parameters - Don't change these! */
+
+#define ERRORMAX 5
+#define RETRYMAX 5
+#define WCEOT (-10)
+#define PATHLEN 1024	/* ready for 4.2 bsd ? */
+#define UNIXFILE 0xF000	/* The S_IFMT file mask bit for stat */
+
+FILE *fout;
+
+
+
+int Firstsec;
+
+#define DEFBYTL 2000000000L	/* default rx file size */
+long Modtime;		/* Unix style mod time for incoming file */
+int Filemode;		/* Unix style mode for incoming file */
+char Pathname[PATHLEN];
+
+
+int Batch=0;
+int MakeLCPathname=FALSE;	/* make received pathname lower case */
+int Nflag = 0;		/* Don't really transfer files */
+int Rxclob=FALSE;	/* Clobber existing file */
+int Rxbinary=FALSE;	/* receive all files in bin mode */
+int Rxascii=FALSE;	/* receive files in ascii (translate) mode */
+int Thisbinary;		/* current file is to be received in bin mode */
+int Blklen;		/* record length of received packets */
+
+int try_resume=FALSE;
+int allow_remote_commands=FALSE;
+
+int exitcode=0;
+
+char secbuf[MAX_BLOCK + 1];
+
+time_t timep[2];
+
+int tryzhdrtype=ZRINIT;	/* Header type to send corresponding to Last rx close */
+static int xmodem=0;
+
+Desk_file_handle ftest;
+
+/*
+static int get_filename_length(void)
+{
+  FILE *ff;
+  int number,seq_point;
+  int l,length;
+
+  sprintf(gstring,"%s.%s",downloads_directory,LONG_NAME);
+  ff=fopen(gstring,"wb");
+  fclose(ff);
+
+  seq_point=0;
+  number=1;
+  do
+  {
+    Desk_Filing_ReadDirNames(downloads_directory,gstring,&number,&seq_point,1024,NULL);
+    if(strstr(LONG_NAME,gstring))
+    {
+      length=strlen(gstring);
+      break;
+    }
+    if(seq_point==0)
+    {
+      length=10;
+      break;
+    }
+  }
+  while(seq_point>=0);
+
+  sprintf(gstring,"%s.%s",downloads_directory,LONG_NAME);
+  l=strlen(gstring);
+  gstring[l-(LONG_NAME_LENGTH-length)]=0;
+
+  Desk_File_Delete(gstring);
+
+  if(length<10)
+    length=10;
+
+  return(length);
+}
+*/
+
+static void arcify(char *name,char *out)
+{
+  //Desk_file_handle file;
+  FILE *file;
+  int i,l,l2,z;
+  char new_name[40];
+  int filenamelength=10;
+
+  if(receive_file_action!=RENAME) // && (receive_file_action!=CRASHRECOVERY && !xmodem) )
+  {
+    /*
+    if(longfilenames)
+      filenamelength=get_filename_length();
+    else
+      filenamelength=10;
+    */
+    filenamelength=truncate_filename;
+
+    l=strlen(name);
+    if(l>filenamelength)
+      l=filenamelength;
+
+    for(i=0;i<l;i++)
+    {
+      if (name[i]=='.')
+        out[i]='/';
+      else if( !isalpha(name[i]) && !isdigit(name[i]) && name[i]!='!')
+             out[i]='_';
+           else
+             out[i]=name[i];
+    }
+    out[i]=0;
+  }
+  else
+  {
+    /*
+    if(longfilenames)
+      filenamelength=get_filename_length();
+    else
+      filenamelength=10;
+    */
+    filenamelength=truncate_filename;
+
+    l=strlen(name);
+    if(l>filenamelength)
+      l=filenamelength;
+
+    for(i=0;i<l;i++)
+    {
+      if (name[i]=='.')
+        out[i]='/';
+      else if( !isalpha(name[i]) && !isdigit(name[i]) && name[i]!='!')
+             out[i]='_';
+           else
+             out[i]=name[i];
+    }
+    out[l]=0;
+
+    strcpy(new_name,out);
+
+    sprintf(gstring,"%s.%s",downloads_directory,out);
+    //file=Desk_File_Open(gstring,Desk_file_READ);
+    file=fopen(gstring,"rb");
+    //Desk_Error_Report(0,"hier:%d",file);
+    if(file!=NULL)
+    {
+      // file existiert schon
+      z=0;
+      do
+      {
+        strcpy(out,new_name);
+        //Desk_File_Close(file);
+        fclose(file);
+        sprintf(gstring,"%d",z++);
+        l2=strlen(gstring);
+        if(l>(filenamelength-l2))
+          out[l-l2]=0;
+        strcat(out,gstring);
+        sprintf(gstring,"%s.%s",downloads_directory,out);
+        //file=Desk_File_Open(gstring,Desk_file_READ);
+        file=fopen(gstring,"rb");
+      }
+      while(file!=NULL);
+    }
+    fclose(file);
+  }
+}
+
+static int get_ext_filetype(char *name)
+{
+  char ext[12];
+  char type[12];
+  char *p,*dot;
+  int i,j;
+  _kernel_swi_regs r;
+
+  dot=strrchr(name,'.');
+  if(dot==NULL)
+  {
+    if(Thisbinary)
+      return(0xffd); // data
+    else
+      return(0xfff); // text
+  }
+
+  ext[0]='.';
+  type[0]='&';
+  strcpy(gstring,filetypes);
+  p=strtok(gstring,",");
+
+  while(p!=NULL && *p!=0)
+  {
+    j=0;
+    for(i=1;p[j]!=32;i++)
+      ext[i]=p[j++];
+      ext[i]=0;
+    while(p[j]==32)
+      j++;
+    for(i=1;p[j]!=32 && p[j]!=0;i++)
+      type[i]=p[j++];
+    type[i]=0;
+    if(!Desk_stricmp(dot,ext))
+    {
+      r.r[0]=16;
+      r.r[1]=(int)type;
+      r.r[2]=0;
+      _kernel_swi( OS_ReadUnsigned, &r, &r );
+      return(r.r[2]);
+    }
+    p=strtok(NULL,",");
+  }
+  if(Thisbinary)
+    return(0xffd); // data
+  else
+    return(0xfff); // text
+}
+
+/*
+ * Routine to calculate the free bytes on the current file system
+ *  ~0 means many free bytes (unknown)
+ */
+
+static long getfree()
+{
+  int free,max,size;
+  bits free_lo,size_lo,size_hi;
+  int free_hi;
+
+
+  if(xosfscontrol_free_space64(downloads_directory,&free_lo,&free_hi,&max,&size_lo,&size_hi))
+  {
+    if(xosfscontrol_free_space(downloads_directory,&free,&max,&size))
+      return(~0);
+  }
+  if(max<0)
+    return(~0);
+
+  return(max);
+
+/*
+  Desk_os_error *e;
+  unsigned int free,max,size;
+  unsigned int free_hi,free_lo,size_hi,size_lo;
+
+  if(e=Desk_SWI(2,5,Desk_SWI_OS_FSControl,55,downloads_directory,&free_lo,&free_hi,&max,&size_lo,&size_hi))
+  {
+    if(e=Desk_SWI(2,3,Desk_SWI_OS_FSControl,49,downloads_directory,&free,&max,&size))
+      max=2147483136;
+  }
+if(max>2147483136)
+  max=2147483136;
+return(max);
+*/
+
+}
+
+/*
+static long getfree()
+{
+  char filing_system[8];
+  char disc_name[20];
+  int free=0;
+  os_error *e=NULL;
+  int spare;
+  char *p;
+  int i;
+  int flag;
+
+  Desk_Filing_CanonicalisePath(downloads_directory,gstring,1024,&spare);
+  p=gstring;
+  i=0;
+  while(*p!=':')
+    filing_system[i++]=*p++;
+  filing_system[i]=0;
+  p=strrchr(gstring,':');
+  p++;
+  i=0;
+  while(*p!='.')
+    disc_name[i++]=*p++;
+  disc_name[i]=0;
+
+  flag=0;
+  if(!Desk_stricmp(filing_system,"adfs"))
+  {
+    e=xadfs_free_space(disc_name,&free,NULL);
+    flag=1;
+  }
+  else
+    if(!Desk_stricmp(filing_system,"scsi"))
+    {
+      e=xscsifs_free_space(disc_name,&free,NULL);
+      flag=1;
+    }
+  if(e!=NULL)
+  {
+    return(~0L);
+  }
+  if(!flag)
+    return(~0L);
+
+  return(free);
+}
+*/
+
+void receive(int type)
+{
+  	Restricted=0;
+  	bad_crc_counter=0;
+ 	Rxpos=0;
+	Txpos=0;
+  	Readnum = BUFFER_SIZE;
+  	filetr_finished=FALSE;
+        xmodem=0;
+	fout=NULL;
+	Zmodem=0;		/* ZMODEM protocol requested */
+	Nozmodem = 0;	/* If invoked as "rb" */
+	Batch=0;
+
+	timeleft=-1;
+	rxbytes=0;
+	last_bps=0;
+	Bytesleft=0;
+	filesize=0;
+	resume_filesize=0;
+
+	Rxtimeout = 100;
+	mode(1);
+
+        if(receive_file_action==CRASHRECOVERY)
+	  try_resume=1;
+        else
+          try_resume=0;
+
+	vfile("Negotiating...");
+
+	switch(type)
+	{
+		case 0:
+		  if(xmodem_crc)
+		    Crcflg=TRUE;
+		  else
+		    Crcflg=FALSE;
+		break;
+		case 1:
+		  Batch = Nozmodem = TRUE; // YModem
+		  if(ymodem_crc)
+		    Crcflg=TRUE;
+		  else
+		    Crcflg=FALSE;
+		break;
+		case 2:
+			Batch = TRUE; // Zmodem
+		break;
+	}
+
+	if (wcreceive()==ZERROR)
+	{
+		exitcode=0200;
+		canit();
+	}
+	mode(0);
+	if (exitcode && !Zmodem)	/* bellow again with all thy might. */
+		canit();
+	//if (exitcode)
+	//	cucheck();
+	//exit(exitcode ? exitcode:SS_NORMAL);
+}
+
+
+
+#if 0
+
+main(int argc,char *argv[])
+{
+	register char *cp;
+	register npats;
+	char *virgin, **patts;
+	char *getenv();
+	int exitcode=0;
+	int under_rsh=FALSE;
+
+	Rxtimeout = 100;
+	setbuf(stderr, NULL);
+	if ((cp=getenv("SHELL")) && (strstr(cp, "rsh") || strstr(cp, "rksh")
+		|| strstr(cp,"rbash")))
+		under_rsh=TRUE;
+	if ((cp=getenv("ZMODEM_RESTRICTED"))!=NULL)
+		Restricted=2;
+
+	from_cu();
+	chkinvok(virgin=argv[0]);	/* if called as [-]rzCOMMAND set flag */
+	npats = 0;
+	while (--argc) {
+		cp = *++argv;
+		if (*cp == '-') {
+			while( *++cp) {
+				switch(*cp) {
+				case '\\':
+					 cp[1] = toupper(cp[1]);  continue;
+				case '+':
+					Lzmanag = ZMAPND; break;
+				case 'a':
+					Rxascii=TRUE;  break;
+				case 'b':
+					Rxbinary=TRUE; break;
+				case 'c':
+					Crcflg=TRUE; break;
+				case 'C':
+					allow_remote_commands=TRUE; break;
+				case 'D':
+					Nflag = TRUE; break;
+				case 'e':
+					Zctlesc = 1; break;
+				case 'h':
+					usage(); break;
+				case 'O':
+					no_timeout=TRUE; break;
+				case 'p':
+					Lzmanag = ZMPROT;  break;
+				case 'q':
+					Quiet=TRUE; Verbose=0; break;
+				case 'r':
+					try_resume=TRUE;  break;
+				case 'R':
+					Restricted++;  break;
+				case 'S':
+					break;
+				case 't':
+					if (--argc < 1) {
+						usage();
+					}
+					Rxtimeout = atoi(*++argv);
+					if (Rxtimeout<10 || Rxtimeout>1000)
+						usage();
+					break;
+				case 'w':
+					if (--argc < 1) {
+						usage();
+					}
+					Zrwindow = atoi(*++argv);
+					break;
+				case 'u':
+					MakeLCPathname=FALSE; break;
+				case 'U':
+					if (!under_rsh)
+						Restricted=0;
+					else {
+	fputs("security violation: running under restricted shell\n", stderr);
+						exit(1);
+					}
+					break;
+				case 'v':
+					++Verbose; break;
+				case 'y':
+					Rxclob=TRUE; break;
+				default:
+					usage();
+				}
+			}
+		}
+		else if ( !npats && argc>0) {
+			if (argv[0][0]) {
+				npats=argc;
+				patts=argv;
+			}
+		}
+	}
+	if (npats > 1)
+		usage();
+	if (Batch && npats)
+		usage();
+	if (Restricted && allow_remote_commands)
+		allow_remote_commands=FALSE;
+
+	if (Fromcu && !Quiet) {
+		if (Verbose == 0)
+			Verbose = 2;
+	}
+	vfile("%s %s for %s\n", Progname, VERSION, OS);
+	mode(1);
+#ifndef linux
+	if (signal(SIGINT, bibi) == SIG_IGN) {
+		signal(SIGINT, SIG_IGN); signal(SIGKILL, SIG_IGN);
+	}
+	else {
+		signal(SIGINT, bibi); signal(SIGKILL, bibi);
+	}
+	signal(SIGTERM, bibi);
+#endif
+	if (wcreceive(npats, patts)==ZERROR) {
+		exitcode=0200;
+		canit();
+	}
+	mode(0);
+	if (exitcode && !Zmodem)	/* bellow again with all thy might. */
+		canit();
+	if (exitcode)
+		cucheck();
+	exit(exitcode ? exitcode:SS_NORMAL);
+}
+#endif
+
+
+/*
+usage()
+{
+	cucheck();
+	fprintf(stderr,"Usage: lrz [-abeuvy] [-L FILE] (ZMODEM)\n");
+	fprintf(stderr,"or     lrb [-abuvy] [-L FILE]      (YMODEM)\n");
+	fprintf(stderr,"or     lrx [-abcv] [-L FILE] file  (XMODEM or XMODEM-1k)\n");
+	fprintf(stderr,"	  -a ASCII transfer (strip CR)\n");
+	fprintf(stderr,"	  -b Binary transfer for all files\n");
+	fprintf(stderr,"	  -c Use 16 bit CRC	(XMODEM)\n");
+	fprintf(stderr,"	  -e Escape control characters	(ZMODEM)\n");
+	fprintf(stderr,"          -h Help, print this usage message\n");
+	fprintf(stderr,"	  -R restricted, more secure mode\n");
+	fprintf(stderr,"	  -v Verbose more v's give more info\n");
+	fprintf(stderr,"	  -y Yes, clobber existing file if any\n");
+	fprintf(stderr,"\t%s version %s for %s %s\n",
+	  Progname, VERSION, CPU, OS);
+	exit(SS_NORMAL);
+}
+*/
+
+/*
+ * Let's receive something already.
+ */
+
+
+int wcreceive(void)
+{
+	register int c;
+	//char new_name[40];
+
+
+
+	if (Batch) // || argc==0)
+	{
+		Crcflg=1;
+		Desk_Window_SetTitle(filetrans_window,"Zmodem receive");
+		if (c=tryz())
+		{
+			if (c == ZCOMPL)
+				return OK;
+			if (c == ZERROR)
+				goto fubar;
+			c = rzfiles();
+			if (c)
+				goto fubar;
+		}
+		else if (!filetr_abort)
+		{
+			Desk_Window_SetTitle(filetrans_window,"YModem receive");
+			while(!filetr_abort)
+			{
+			  bad_crc_counter=0;
+				if (wcrxpn(secbuf)== ZERROR)
+					goto fubar;
+				if (secbuf[0]==0)
+					return OK;
+				if (procheader(secbuf) == ZERROR)
+					goto fubar;
+				if (wcrx()==ZERROR)
+					goto fubar;
+			}
+		}
+	}
+	else
+	{
+	        xmodem=TRUE;
+		Desk_Window_SetTitle(filetrans_window,"XModem receive");
+		Bytesleft = DEFBYTL; Filemode = 0; Modtime = 0L;
+		procheader("xmodem");
+		//arcify("xmodem",new_name);
+		//sprintf(Pathname,"%s.%s",downloads_directory,new_name); checkpath(Pathname);
+		Desk_Icon_SetText(filetrans_window,FILETRANS_FILENAME,"xmodem");
+		//filetransfer_window->init_receive("xmodem");
+
+		//if ((fout=fopen(Pathname, "w")) == NULL)
+		//	return ZERROR;
+		Desk_File_SetType(Pathname,0xffd);
+		timing(1);
+		if (wcrx()==ZERROR)
+			goto fubar;
+		if (fout)
+		   fclose(fout);
+	}
+	return OK;
+fubar:
+	canit();
+	if (fout)
+		fclose(fout);
+	/*
+	if (Restricted)
+	{
+		unlink(Pathname);
+		//fprintf(stderr, "\r\n%s: %s removed.\r\n", Progname, Pathname);
+		printf("restricted\n");
+	}
+	*/
+	return ZERROR;
+}
+
+
+/*
+ * Fetch a pathname from the other end as a C ctyle ASCIZ string.
+ * Length is indeterminate as long as less than Blklen
+ * A null string represents no more files (YMODEM)
+ */
+int wcrxpn(char *rpn) /* receive a pathname */
+{
+	register int c;
+
+//#ifdef NFGVMIN
+//	readline(1);
+//#else
+	purgeline();
+//#endif
+
+et_tu:
+	Firstsec=TRUE;  Eofseen=FALSE; filetr_finished=FALSE;
+	sendline(Crcflg?WANTCRC:NAK); flushmo();
+	Lleft=0;	/* Do read next time ... */
+	while ((c = wcgetsec(rpn, 100)) != 0)
+	{
+		if (c == WCEOT)
+		{
+			zperr( "Pathname fetch returned %d", c);
+			sendline(ACK); flushmo();
+			Lleft=0;	/* Do read next time ... */
+			readline(1);
+			goto et_tu;
+		}
+		return ZERROR;
+	}
+	sendline(ACK); flushmo();
+	return OK;
+}
+
+/*
+ * Adapted from CMODEM13.C, written by
+ * Jack M. Wierda and Roderick W. Hart
+ */
+
+int wcrx(void)
+{
+	register int sectnum, sectcurr;
+	register char sendchar;
+	register char *p;
+	int cblklen;			/* bytes to dump this block */
+	int hilf;
+	int nn=0;
+
+	Firstsec=TRUE;sectnum=0; Eofseen=FALSE;
+	sendchar=Crcflg?WANTCRC:NAK;
+
+	while(!filetr_abort)
+	{
+		sendline(sendchar);	/* send it now, we're ready! */
+		flushmo();
+		Lleft=0;	/* Do read next time ... */
+		sectcurr=wcgetsec(secbuf, (sectnum&0177)?50:130);
+		if(sectcurr!=WCEOT)
+		{
+			rxbytes+=Blklen;
+			//if(rxbytes>filesize)
+			//	rxbytes=filesize;
+			
+			if(rxbytes>21000000)
+			  last_bps=((rxbytes/timing(0))*100);
+			else
+			  last_bps=(rxbytes*100/timing(0));
+			//last_bps=((rxbytes*100)/timing(0));
+			
+			if (last_bps > 0 && filesize!=DEFBYTL)
+			{
+			  	hilf=filesize-rxbytes;
+			  	if(hilf>21000000)
+				  timeleft = (hilf/last_bps)*100;
+				else
+				  timeleft = (hilf*100)/last_bps;
+			}
+		}
+		else
+		{
+			timeleft=0;
+			if(filesize!=DEFBYTL)
+				rxbytes=filesize;
+		}
+		if(!xmodem)
+		{
+		  Icon_printf_Update(filetrans_window,FILETRANS_SIZE,"%d / %d",rxbytes,filesize);
+           	  show_time(filetrans_window,FILETRANS_EXPECTED,timing(0),timeleft,TRUE);
+		  Icon_SetInteger_Update(filetrans_window,FILETRANS_CPS,last_bps);
+		  if(filesize>0)
+	            Desk_Slider_SetValue(&filetrans_slider,(rxbytes*100)/filesize, NULL, NULL);
+                }
+                else
+                {
+                  if(Blklen==1024 || (nn==4 && Blklen==128))
+                  {
+                    Icon_SetInteger_Update(filetrans_window,FILETRANS_CPS,last_bps);
+                    show_time(filetrans_window,FILETRANS_EXPECTED,timing(0),0,TRUE);
+                    Icon_SetInteger_Update(filetrans_window,FILETRANS_SIZE,rxbytes);
+                    nn=0;
+                  }
+                  nn++;
+                }
+		if (sectcurr==(sectnum+1 &0377))
+		{
+			sectnum++;
+			cblklen = Bytesleft>Blklen ? Blklen:Bytesleft;
+			if (putsec(secbuf, cblklen)==ZERROR)
+				return ZERROR;
+			if ((Bytesleft-=cblklen) < 0)
+				Bytesleft = 0;
+			sendchar=ACK;
+		}
+		else if (sectcurr==(sectnum&0377)) {
+			zperr( "Received dup Sector");
+			sendchar=ACK;
+		}
+		else if (sectcurr==WCEOT)
+		{
+			if (closeit())
+				return ZERROR;
+			sendline(ACK); flushmo();
+			Lleft=0;	/* Do read next time ... */
+			filetr_finished=TRUE;
+			vfile("Finished.");
+			return OK;
+		}
+		else if (sectcurr==ZERROR)
+			return ZERROR;
+		else {
+			zperr( "Sync Error");
+			return ZERROR;
+		}
+	}
+}
+
+/*
+ * Wcgetsec fetches a Ward Christensen type sector.
+ * Returns sector number encountered or ERROR if valid sector not received,
+ * or CAN CAN received
+ * or WCEOT if eot sector
+ * time is timeout for first char, set to 4 seconds thereafter
+ ***************** NO ACK IS SENT IF SECTOR IS RECEIVED OK **************
+ *    (Caller must do that when he is good and ready to get next sector)
+ */
+
+int wcgetsec(char *rxbuf,int maxtime)
+{
+	register int checksum, wcj, firstch;
+	register unsigned short oldcrc;
+	register char *p;
+	int sectcurr;
+
+	for (Lastrx=errors=0; errors<RETRYMAX; errors++)
+	{
+		if ((firstch=readline(maxtime))==STX) {
+			Blklen=1024; goto get2;
+		}
+		if (firstch==SOH) {
+			Blklen=128;
+get2:
+			sectcurr=readline(1);
+			if ((sectcurr+(oldcrc=readline(1)))==0377) {
+				oldcrc=checksum=0;
+				for (p=rxbuf,wcj=Blklen; --wcj>=0; ) {
+					if ((firstch=readline(1)) < 0)
+						goto bilge;
+					oldcrc=updcrc(firstch, oldcrc);
+					checksum += (*p++ = firstch);
+				}
+				if ((firstch=readline(1)) < 0)
+					goto bilge;
+				if (Crcflg) {
+					oldcrc=updcrc(firstch, oldcrc);
+					if ((firstch=readline(1)) < 0)
+						goto bilge;
+					oldcrc=updcrc(firstch, oldcrc);
+					if (oldcrc & 0xFFFF)
+						zperr( "CRC");
+					else {
+						Firstsec=FALSE;
+						return sectcurr;
+					}
+				}
+				else if (((checksum-firstch)&0377)==0) {
+					Firstsec=FALSE;
+					return sectcurr;
+				}
+				else
+					zperr( "Checksum");
+			}
+			else
+				zperr("Sector number garbled");
+		}
+		/* make sure eot really is eot and not just mixmash */
+//#ifdef NFGVMIN
+//		else if (firstch==EOT && readline(1)==TIMEOUT)
+//			return WCEOT;
+//#else
+		else if (firstch==EOT && Lleft==0) //serialbufferempty()) //Lleft==0)
+			return WCEOT;
+//#endif
+		else if (firstch==CAN) {
+			if (Lastrx==CAN) {
+				zperr( "Sender CANcelled");
+				return ZERROR;
+			} else {
+				Lastrx=CAN;
+				continue;
+			}
+		}
+		else if (firstch==TIMEOUT) {
+			if (Firstsec)
+				goto humbug;
+bilge:
+			zperr( "TIMEOUT");
+		}
+		else
+			zperr( "Got 0%o sector header", firstch);
+
+humbug:
+		Lastrx=0;
+		while(readline(1)!=TIMEOUT)
+			;
+		if (Firstsec) {
+			sendline(Crcflg?WANTCRC:NAK); flushmo();
+			Lleft=0;	/* Do read next time ... */
+		} else {
+			maxtime=40; sendline(NAK);
+			Lleft=0;	/* Do read next time ... */
+		}
+	}
+	/* try to stop the bubble machine. */
+	canit();
+	return ZERROR;
+}
+
+/*
+ * Process incoming file information header
+ */
+int procheader(char *name)
+{
+	register char *openmode, *p, **pp;
+	int tabs, tab_num;
+	//static char *s=disc_buffer;
+	int filetype;
+	os_error *error;
+	int fsize;
+	char new_name[20];
+	int free;
+	int i;
+	_kernel_swi_regs r;
+	//struct stat st;
+	//Desk_file_handle fhandle;
+
+	/* set default parameters and overrides */
+	openmode = "w";
+	Thisbinary = (!Rxascii) || Rxbinary;
+	if (Lzmanag)
+		zmanag = Lzmanag;
+
+	/*
+	 *  Process ZMODEM remote file management requests
+	 */
+	if (!Rxbinary && zconv == ZCNL)	/* Remote ASCII override */
+		Thisbinary = 0;
+	if (zconv == ZCBIN)	/* Remote Binary override */
+		Thisbinary = TRUE;
+	else if (zmanag == ZMAPND)
+		openmode = "a";
+	if (Thisbinary && zconv == ZCBIN && try_resume)
+	{
+		zconv=ZCRESUM;
+        }
+	/* Check for existing file */
+	filetype=get_ext_filetype(name);
+	Desk_Icon_SetText(filetrans_window,FILETRANS_FILENAME,name);
+	arcify(name,new_name);
+
+	sprintf(Pathname,"%s.%s",downloads_directory,new_name);
+	if (zconv != ZCRESUM && !Rxclob && (zmanag&ZMMASK) != ZMCLOB && (fout=fopen(Pathname, "r")))
+	{
+		fclose(fout);
+		//Desk_Error_Report(0,"hier");
+		if(receive_file_action!=OVERWRITE)
+		  return ZERROR;
+	}
+
+	Bytesleft = DEFBYTL; Filemode = 0; Modtime = 0L;
+
+	p = name + 1 + strlen(name);
+
+        //Desk_Error_Report(0,"davor: %s",p);
+	if (*p)
+	{	/* file coming from Unix or DOS system */
+		sscanf(p, "%ld%lo%o", &Bytesleft, &Modtime, &Filemode);
+		if(Bytesleft<=0) // sonst division durch 0
+		  Bytesleft=1;
+		filesize=Bytesleft;
+
+
+		if (Filemode & UNIXFILE)
+			++Thisbinary;
+	}
+
+	p = p +1 +strlen(p); // acorn filetype
+	//Desk_Error_Report(0,"%s",p);
+
+        if(p[0]=='t' && p[1]=='y' && p[2]=='p' && p[3]=='e' && p[4]==' ' && p[5]=='&')
+        {
+          r.r[0]=16;
+          r.r[1]=(int)&p[5];
+          r.r[2]=0;
+          _kernel_swi( OS_ReadUnsigned, &r, &r );
+          filetype=r.r[2];
+        }
+	//Desk_Icon_SetInteger(filetrans_window,FILETRANS_SIZE,Bytesleft);
+	Desk_Icon_printf(filetrans_window,FILETRANS_SIZE,"%d / %d",0,Bytesleft);
+/*
+	if (!Zmodem && MakeLCPathname && !IsAnyLower(name)
+	  && !(Filemode&UNIXFILE))
+		uncaps(name);
+	sprintf(Pathname,"%s.%s",downloads_directory,name);
+*/
+		//strcpy(Pathname, name);
+		//if (Verbose)
+		Desk_Icon_SetText(filetrans_window,FILETRANS_STATUS,"Receiving...");
+		timing(1);
+		checkpath(name);
+		if (Nflag)
+			name = "/dev/null";
+
+		if (Thisbinary && zconv==ZCRESUM)
+		{
+
+			fout = fopen(Pathname, "r+");
+			//if (fout && 0==fstat(fileno(fout),&st))
+			if(fout)
+			{
+				/* retransfer whole blocks */
+				//vfile("resuming...");
+				//rxbytes = st.st_size & ~(1024);
+				fsize=Desk_File_GetLength(Pathname);
+				rxbytes=fsize & ~(1024);
+				resume_filesize=rxbytes;
+				/* Bytesleft == filelength on remote */
+				if (rxbytes < Bytesleft) {
+					if (fseek(fout, rxbytes, 0)) {
+						fclose(fout);
+						return ZFERR;
+					}
+				}
+				goto buffer_it;
+			}
+			rxbytes=0;
+			if (fout)
+				fclose(fout);
+		}
+#ifdef ENABLE_MKDIR
+		fout = fopen(Pathname, openmode);
+		Desk_File_SetType(Pathname,filetype);
+		if ( !fout && Restricted < 2)
+			if (make_dirs(name))
+				fout = fopen(Pathname, openmode);
+#else
+                /*
+		ftest=-1;
+		ftest=Desk_File_Open("SCSI::Work.$.downloads.bruell",Desk_file_WRITE);
+		if(ftest==-1)
+		  Desk_Error_Report(0,"error");
+		else
+		  Desk_File_Close(ftest);
+                */
+		free=getfree();
+
+                if(free<filesize && free!=~0)
+                {
+                  Desk_Error_Report(0,"Not enough space left on disc");
+                  return ZERROR;
+                }
+
+		fout = fopen(Pathname, openmode);
+#endif
+		if ( !fout && !xmodem)
+		{
+			//int e=errno;
+			//vfile("Cannot open %s: %s\n", name,
+			//	strerror(e));
+			Desk_Error_Report(0,"Cannot open '%s', perhaps the maximum number of items in a directory has been reached.", name/*,strerror(errno)*/);
+			return ZERROR;
+		}
+		if(!xmodem)
+		  Desk_File_SetType(Pathname,filetype);
+buffer_it:
+
+/*
+		if (!s) {
+			s=(char *)DeskMem_Malloc(16384);
+			if (!s) {
+				fprintf(stderr,"lrz: out of memory\r\n");
+				exit(1);
+			}
+			setvbuf(fout,s,_IOFBF,16384);
+		}
+*/
+ 
+        if(disc_buffer==NULL)
+        {
+          disc_buffer=(char *)Desk_DeskMem_Malloc(discbuffer*1024);
+          if(disc_buffer==NULL)
+          {
+            discbuffer=16;
+            disc_buffer=(char *)Desk_DeskMem_Malloc(discbuffer*1024); 
+          }
+        }
+	setvbuf(fout,disc_buffer,_IOFBF,discbuffer*1024); //DISC_BUFFER_SIZE);
+	//filetransfer_window->init_receive(name);
+
+	return OK;
+}
+
+#ifdef ENABLE_MKDIR
+/*
+ *  Directory-creating routines from Public Domain TAR by John Gilmore
+ */
+
+/*
+ * After a file/link/symlink/dir creation has failed, see if
+ * it's because some required directory was not present, and if
+ * so, create all required dirs.
+ */
+int make_dirs(register char *pathname)
+{
+	register char *p;		/* Points into path */
+	int madeone = 0;		/* Did we do anything yet? */
+	int save_errno = errno;		/* Remember caller's errno */
+	char *strchr();
+
+	if (errno != ENOENT)
+		return 0;		/* Not our problem */
+
+	for (p = strchr(pathname, '/'); p != NULL; p = strchr(p+1, '/')) {
+		/* Avoid mkdir of empty string, if leading or double '/' */
+		if (p == pathname || p[-1] == '/')
+			continue;
+		/* Avoid mkdir where last part of path is '.' */
+		if (p[-1] == '.' && (p == pathname+1 || p[-2] == '/'))
+			continue;
+		*p = 0;				/* Truncate the path there */
+		if ( !mkdir(pathname, 0777)) {	/* Try to create it as a dir */
+			vfile("Made directory %s\n", pathname);
+			madeone++;		/* Remember if we made one */
+			*p = '/';
+			continue;
+		}
+		*p = '/';
+		if (errno == EEXIST)		/* Directory already exists */
+			continue;
+		/*
+		 * Some other error in the mkdir.  We return to the caller.
+		 */
+		break;
+	}
+	errno = save_errno;		/* Restore caller's errno */
+	return madeone;			/* Tell them to retry if we made one */
+}
+
+#endif /* ENABLE_MKDIR */
+
+/*
+ * Putsec writes the n characters of buf to receive file fout.
+ *  If not in binary mode, carriage returns, and all characters
+ *  starting with CPMEOF are discarded.
+ */
+int putsec(char *buf,register int n)
+{
+	register char *p;
+
+	if (n == 0)
+		return OK;
+	if (Thisbinary)
+	{
+		if (fwrite(buf,n,1,fout)!=1)
+		{
+		  	Desk_Error_Report(0,"Write error ! (Disc full ?)");
+		  	filetr_abort=1;
+			return ZERROR;
+		}
+	}
+	else
+	{
+		if (Eofseen)
+			return OK;
+		for (p=buf; --n>=0; ++p )
+		{
+			if ( *p == '\r')
+				continue;
+			if (*p == CPMEOF)
+			{
+				Eofseen=TRUE; return OK;
+			}
+			putc(*p ,fout);
+		}
+	}
+	return OK;
+}
+
+
+/* make string s lower case */
+void uncaps(register char *s)
+{
+	for ( ; *s; ++s)
+		if (isupper(*s))
+			*s = tolower(*s);
+}
+/*
+ * IsAnyLower returns TRUE if string s has lower case letters.
+ */
+int IsAnyLower(register char *s)
+{
+	for ( ; *s; ++s)
+		if (islower(*s))
+			return TRUE;
+	return FALSE;
+}
+
+
+/*
+ * Totalitarian Communist pathname processing
+ */
+void checkpath(char *name)
+{
+	if (Restricted)
+	{
+		if (fopen(name, "r") != NULL) {
+			canit();
+			vfile("%s exists\n", name);
+			//bibi(-1);
+		}
+		/* restrict pathnames to current tree or uucppublic */
+		if ( strstr(name, "../")
+#ifdef PUBDIR
+		 || (name[0]== '/' && strncmp(name, PUBDIR,
+		 	strlen(PUBDIR)))
+#endif
+		) {
+			canit();
+			vfile("Security Violation");
+			//bibi(-1);
+		}
+		if (Restricted > 1) {
+			if (name[0]=='.' || strstr(name,"/.")) {
+				canit();
+				vfile("Security Violation");
+				//bibi(-1);
+			}
+		}
+	}
+}
+
+/*
+ * Initialize for Zmodem receive attempt, try to activate Zmodem sender
+ *  Handles ZSINIT frame
+ *  Return ZFILE if Zmodem filename received, -1 on error,
+ *   ZCOMPL if transaction finished,  else 0
+ */
+int tryz(void)
+{
+	register int c, n;
+	register int cmdzack1flg;
+
+	if (Nozmodem)		/* Check for "rb" program name */
+		return 0;
+
+
+	for (n=Zmodem?15:5; --n>=0; ) {
+		/* Set buffer length (0) and capability flags */
+		stohdr(0L);
+//#ifdef CANBREAK
+		Txhdr[ZF0] = CANFC32|CANFDX|CANOVIO|CANBRK;
+//#else
+//		Txhdr[ZF0] = CANFC32|CANFDX|CANOVIO;
+//#endif
+
+                //if(ackint>0)
+                //{
+		  Txhdr[ZP0]=0; // Rxbuflen=64*256 bytes
+                  Txhdr[ZP1]=ackint*4; // all X Kbyte ein Ack
+                //}
+                
+		if (Zctlesc)
+			Txhdr[ZF0] |= TESCCTL; /* TESCCTL == ESCCTL */
+		zshhdr(tryzhdrtype, Txhdr);
+		if (tryzhdrtype == ZSKIP)	/* Don't skip too far */
+			tryzhdrtype = ZRINIT;	/* CAF 8-21-87 */
+again:
+		switch (zgethdr(Rxhdr, 0))
+		{
+		case ZRQINIT:
+			continue;
+		case ZEOF:
+			continue;
+		case TIMEOUT:
+			continue;
+		case ZFILE:
+			zconv = Rxhdr[ZF0];
+			zmanag = Rxhdr[ZF1];
+			ztrans = Rxhdr[ZF2];
+			tryzhdrtype = ZRINIT;
+			c = zrdata(secbuf, MAX_BLOCK);
+			mode(3);
+			if (c == GOTCRCW)
+				return ZFILE;
+			zshhdr(ZNAK, Txhdr);
+			goto again;
+		case ZSINIT:
+			Zctlesc = TESCCTL & Rxhdr[ZF0];
+			if (zrdata(Attn, ZATTNLEN) == GOTCRCW)
+			{
+				stohdr(1L);
+				zshhdr(ZACK, Txhdr);
+				goto again;
+			}
+			zshhdr(ZNAK, Txhdr);
+			goto again;
+		case ZFREECNT:
+			stohdr(getfree());
+			zshhdr(ZACK, Txhdr);
+			goto again;
+		case ZCOMMAND:
+/*
+			cmdzack1flg = Rxhdr[ZF0];
+			if (zrdata(secbuf, MAX_BLOCK) == GOTCRCW)
+			{
+				if (Verbose)
+				{
+					fprintf(stderr,"lrz: remote requested command\n");
+					fprintf(stderr,"lrz: %s\n",secbuf);
+				}
+				if (!allow_remote_commands)
+				{
+					if (Verbose)
+						fprintf(stderr,"lrz: not executed\n");
+					zshhdr(ZCOMPL, Txhdr);
+					return ZCOMPL;
+				}
+				if (cmdzack1flg & ZCACK1)
+					stohdr(0L);
+				else
+					stohdr((long)sys2(secbuf));
+				purgeline();
+				do {
+					zshhdr(ZCOMPL, Txhdr);
+				}
+				while (++errors<20 && zgethdr(Rxhdr,1) != ZFIN);
+				ackbibi();
+				if (cmdzack1flg & ZCACK1)
+					exec2(secbuf);
+				return ZCOMPL;
+			}
+			zshhdr(ZNAK, Txhdr); goto again;
+*/
+		case ZCOMPL:
+			goto again;
+		default:
+			continue;
+		case ZFIN:
+			ackbibi(); return ZCOMPL;
+		case ZCAN:
+			return ZERROR;
+		}
+	}
+	return 0;
+}
+
+/*
+ * Receive 1 or more files with ZMODEM protocol
+ */
+int rzfiles(void)
+{
+	register int c;
+
+	while(!filetr_abort)
+	{
+		switch (c = rzfile())
+		{
+		case ZEOF:
+		case ZSKIP:
+			switch (tryz()) {
+			case ZCOMPL:
+				return OK;
+			default:
+				return ZERROR;
+			case ZFILE:
+				break;
+			}
+			continue;
+		default:
+			return c;
+		case ZERROR:
+			return ZERROR;
+		}
+	}
+}
+
+/*
+ * Receive a file with ZMODEM protocol
+ *  Assumes file name frame is in secbuf
+ */
+int rzfile(void)
+{
+	register int c, n;
+	long last_rxbytes=0;
+	long not_printed=0;
+	int hilf;
+	int current_time;
+	int current_bps;
+
+	Eofseen=FALSE;
+
+        bad_crc_counter=0;
+	n = 20; rxbytes = 0l;
+
+	if (procheader(secbuf) == ZERROR) {
+		return (tryzhdrtype = ZSKIP);
+	}
+
+
+	//for (;;)
+	while(!filetr_abort)
+	{
+		stohdr(rxbytes);
+		zshhdr(ZRPOS, Txhdr);
+nxthdr:
+		switch (c = zgethdr(Rxhdr, 0))
+		{
+		default:
+			vfile("zgethdr returned %d", c);
+			return ZERROR;
+		case ZCAN:
+                        vfile("Sender cancelled\n");
+                        return ZERROR;
+		case ZNAK:
+		       if ( --n < 0)
+		       {
+				vfile("got ZNAK");
+				return ERROR;
+			}
+			continue;
+		case TIMEOUT:
+			if ( --n < 0)
+			{
+				vfile("TIMEOUT");
+				return ZERROR;
+			}
+			continue;
+		case ZFILE:
+			zrdata(secbuf, MAX_BLOCK);
+			continue;
+		case ZEOF:
+			if (rclhdr(Rxhdr) != rxbytes) {
+				/*
+				 * Ignore eof if it's at wrong place - force
+				 *  a timeout because the eof might have gone
+				 *  out before we sent our zrpos.
+				 */
+				errors = 0;  goto nxthdr;
+			}
+				//if(timing(0)>0)
+				
+				hilf=rxbytes-resume_filesize;
+				if(hilf>21000000)
+				  last_bps=((hilf/timing(0))*100);
+				else
+				  last_bps=(hilf*100/timing(0));
+				
+				//last_bps=((rxbytes-resume_filesize)*100/timing(0));
+
+				//if (last_bps > 0)
+				//	timeleft = (Bytesleft-rxbytes)/last_bps;
+				if(last_bps>0)
+				{
+				  hilf=Bytesleft-rxbytes;
+         			  if(hilf>21000000)
+           			    show_time(filetrans_window,FILETRANS_EXPECTED,timing(0),(hilf/last_bps)*100,TRUE);
+         			  else
+           			    show_time(filetrans_window,FILETRANS_EXPECTED,timing(0),(hilf*100)/last_bps,TRUE);
+           			}
+           			Icon_printf_Update(filetrans_window,FILETRANS_SIZE,"%d / %d",rxbytes,Bytesleft);
+				Icon_SetInteger_Update(filetrans_window,FILETRANS_CPS,last_bps);
+				Desk_Slider_SetValue(&filetrans_slider,rxbytes*100/Bytesleft, NULL, NULL);
+				/*
+				fprintf(stderr, "\rBytes Received: %7ld/%7ld   BPS:%-6ld                   \r\n",
+					rxbytes, Bytesleft, last_bps, minleft, secleft);
+				*/
+
+			if (closeit()) {
+				tryzhdrtype = ZFERR;
+				vfile("closeit returned <> 0");
+				return ZERROR;
+			}
+			filetr_finished=TRUE;
+			vfile("Finished.");
+			return c;
+		case ZERROR:	/* Too much garbage in header search error */
+			if ( --n < 0)
+			{
+				vfile("zgethdr returned %d", c);
+				return ZERROR;
+			}
+			zmputs(Attn);
+			continue;
+		case ZSKIP:
+			closeit();
+			vfile("Sender SKIPPED file");
+			return c;
+		case ZDATA:
+			if (rclhdr(Rxhdr) != rxbytes) {
+				if ( --n < 0) {
+					return ZERROR;
+				}
+				zmputs(Attn);  continue;
+			}
+moredata:
+			if(filetr_abort)
+			{
+			  canit();
+			  return ZERROR;
+			}
+			if ( (not_printed > 7 || rxbytes > last_bps / 2 + last_rxbytes))
+			{
+				int minleft =  0;
+				int secleft =  0;
+				//if(timing(0)>0)
+				hilf=rxbytes-resume_filesize;
+				if(hilf>21000000)
+				  last_bps=((hilf/timing(0))*100);
+				else
+				  last_bps=(hilf*100/timing(0));
+				
+				//last_bps=((rxbytes-resume_filesize)*100/timing(0));
+				//current_bps=Rxcount*100/(Time_Monotonic()-current_time);
+				//if (last_bps > 0)
+				//	timeleft = (Bytesleft-rxbytes)/last_bps;
+				if(last_bps>0)
+				{
+				  hilf=Bytesleft-rxbytes;
+         			  if(hilf>21000000)
+           			    show_time(filetrans_window,FILETRANS_EXPECTED,timing(0),(hilf/last_bps)*100,TRUE);
+         			  else
+           			    show_time(filetrans_window,FILETRANS_EXPECTED,timing(0),(hilf*100)/last_bps,TRUE);
+           			}
+           			Icon_printf_Update(filetrans_window,FILETRANS_SIZE,"%d / %d",rxbytes,Bytesleft);
+				Icon_SetInteger_Update(filetrans_window,FILETRANS_CPS,last_bps);
+				Desk_Slider_SetValue(&filetrans_slider,rxbytes*100/Bytesleft, NULL, NULL);
+				/*
+				fprintf(stderr, "\rBytes Received: %7ld/%7ld   BPS:%-6ld ETA %02d:%02d  ",
+				 rxbytes, Bytesleft, last_bps, minleft, secleft);
+				*/
+				last_rxbytes=rxbytes;
+				not_printed=0;
+			}
+			not_printed++;
+
+			//if(Desk_Time_Monotonic()-null_event_time>=5)
+       			//  Desk_Event_Poll();
+
+			//current_time=Time_Monotonic();
+			//waitforreadbytes();
+			switch (c = zrdata(secbuf, MAX_BLOCK))
+			{
+			case ZCAN:
+				vfile("zgethdr returned %d", c);
+				return ZERROR;
+			case ZERROR:	/* CRC error */
+				if ( --n < 0) {
+					vfile("zgethdr returned %d", c);
+					return ZERROR;
+				}
+				zmputs(Attn);
+				continue;
+			case TIMEOUT:
+				if ( --n < 0) {
+					vfile("zgethdr returned %d", c);
+					return ZERROR;
+				}
+				continue;
+			case GOTCRCW:       // haengt von rxbuflen ab alle x kbyte
+				n = 20;
+				putsec(secbuf, Rxcount);
+				rxbytes += Rxcount;
+				stohdr(rxbytes);
+				sendline(XON);
+				zshhdr(ZACK, Txhdr);
+				goto nxthdr;
+			case GOTCRCQ:       // wenn TxWindow
+				n = 20;
+				putsec(secbuf, Rxcount);
+				rxbytes += Rxcount;
+				stohdr(rxbytes);
+				zshhdr(ZACK, Txhdr);
+				goto moredata;
+			case GOTCRCG: // wenn nicht TxWindow
+				n = 20;
+				putsec(secbuf, Rxcount);
+				rxbytes += Rxcount;
+				goto moredata;
+			case GOTCRCE: // letzte block
+				n = 20;
+				putsec(secbuf, Rxcount);
+				rxbytes += Rxcount;
+				goto nxthdr;
+			}
+		}
+	}
+}
+
+/*
+ * Send a string to the modem, processing for \336 (sleep 1 sec)
+ *   and \335 (break signal)
+ */
+void zmputs(char *s)
+{
+   register int c;
+
+        while (*s) {
+                switch (c = *s++) {
+                case '\336':
+                        pause(100); continue;
+                case '\335':
+                        sendbrk(); continue;
+                default:
+                        sendline(c);
+                }
+        }
+  /*
+	char *p;
+
+	while (s && *s)
+	{
+		p=strpbrk(s,"\335\336");
+		if (!p)
+		{
+			//write(1,s,strlen(s));
+			//serial_port->Write(s,strlen(s));
+			(*driver)(DRIVER_PUTBLOCK,portnumber,s,strlen(s));
+			return;
+		}
+		if (p!=s)
+		{
+			//write(1,s,p-s);
+			//serial_port->Write(s,p-s);
+			(*driver)(DRIVER_PUTBLOCK,portnumber,s,p-s);
+			s=p;
+		}
+		if (*p=='\336')
+		{
+			pause(100);
+		}
+		else
+			sendbrk();
+		p++;
+	}
+	*/
+}
+
+/*
+ * Close the receive dataset, return OK or ERROR
+ */
+int closeit(void)
+{
+	time_t time();
+
+	if (fclose(fout))
+	{
+		//fprintf(stderr, "file close error: %s\n",strerror(errno));
+		/* this may be any sort of error, including random data corruption */
+		//unlink(Pathname);
+		return ZERROR;
+	}
+	if (Modtime)
+	{
+		//timep[0] = time(NULL);
+		//timep[1] = Modtime;
+		//utime(Pathname, timep);
+	}
+	/*
+	if ((Filemode&S_IFMT) == S_IFREG)
+		chmod(Pathname, (07777 & Filemode));
+	*/
+	return OK;
+}
+
+/*
+ * Ack a ZFIN packet, let byegones be byegones
+ */
+void ackbibi(void)
+{
+	register int n;
+
+	Readnum = 1;
+	stohdr(0L);
+	for (n=3; --n>=0; ) {
+		purgeline();
+		Lleft=0;
+		zshhdr(ZFIN, Txhdr);
+		switch (readline(100)) {
+		case 'O':
+			readline(1);	/* Discard 2nd 'O' */
+			filetr_finished=TRUE;
+			vfile("Finished.");
+			return;
+		case RCDO:
+			return;
+		case TIMEOUT:
+		default:
+			break;
+		}
+	}
+}
+
+
+/* End of lrz.c */
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

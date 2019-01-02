@@ -1,0 +1,184 @@
+/*
+ * Copyright (c) 2010, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include "dss.h"
+#include "regs.h"
+#include "mouse.h"
+#include "dsi.h"
+
+#include <stdlib.h>
+#include <time.h>
+
+#include "DebugLib/DebugLib.h"
+
+_kernel_oserror *dss_reset(void)
+{
+	/* Perform system reset as per OMAP4 TRM 10.2.4.2 */
+	dprintf(("","dss_reset\n"));
+
+	dss->ctrl = 0;
+
+	/* reset DISPC module */
+	dispc->sysconfig = SYSCONFIG_SOFTRESET;
+	int timeout = 1000000;
+	while (!(dispc->sysstatus & SYSSTATUS_RESETDONE) && --timeout) {};
+	if (!timeout)
+	{
+		dprintf(("","dss_reset: Timeout waiting for SYSSTATUS_RESETDONE!\n"));
+	}
+
+	/* use fixed divisor value for LCD1 */
+	dispc->divisor1 = (1 << DISPC_DIVISOR_LCD_SHIFT) | (1 << DISPC_DIVISOR_PCD_SHIFT);
+	/* disable OMAP35xx compatibility mode */
+	dispc->divisor  = (1 << DISPC_DIVISOR_LCD_SHIFT) | (1 << 0);
+#if 1
+	/* exchange FIFO buffer between GFX and WB */
+	dispc->global_buffer = (4 <<  0) | (4 <<  3)	/* WB */
+						 | (1 <<  6) | (1 <<  9)	/* VID1 */
+						 | (2 << 12) | (2 << 15)	/* VID2 */
+						 | (3 << 18) | (3 << 21)	/* VID3 */
+						 | (0 << 24) | (0 << 27);	/* GFX */
+#endif
+
+	/* DSS reset also causes DSI PLL reset, so reset the cached state */
+	dsi_pll_current_pixel_rate = 0;
+	/* Ensure mouse transparency colour gets reprogrammed */
+	mouse_dirty = true;
+	/* Clear ban flag? */
+	clear_ban(BHUB_OFF);
+
+	return (_kernel_oserror *)0;
+}
+
+/* These definitions are only used in this module */
+#define FREQ_PLL_MAX	186000000
+#define FREQ_PCLK_MAX	170000000
+#define FREQ_SYS		38400000
+#define MAX_DSI_PHY_CLK	1800000000
+#define FINT_MAX		2500000
+#define FINT_MIN		500000
+#define REGN_MIN		((FREQ_SYS / FINT_MAX) + 1)
+#define REGN_MAX		((FREQ_SYS / FINT_MIN) + 1)
+#define RESOLUTION		16384
+
+clock_divider_t calculate_dss_clock_divider(uint32_t pixel_rate)
+{
+	/* Calculate DSI_PLL_REGM, DSI_PLL_REGN, DSI_PLL_REGM4 values
+	   required for the given pixel rate (in Hz)
+	   Output values aren't guaranteed to be within range
+
+	   The full clock flow is as follows:
+	     DSI PLL input = DSI_PLL_REFCLK (= DSS2_ALWON_FCLK = sys_clk)
+	     Data lane freq = DSIPHY = 2*pixel rate*DSI_BPP/DSI_LANES
+	     DSIPHY = 2*DSI_PLL_REGM/(DSI_PLL_REGN+1)*DSI_PLL_REFCLK
+	   Also, 0.5MHz <= Fint <= 2.5MHz where Fint = DSI_PLL_REFCLK/(DSI_PLL_REGN+1)
+	   DSIPHY is then used as the source for the HSDIVIDER, which does the following:
+	     DSIn_PCLK1 = DSIPHY/(REGM4+1)
+	     DSIn_PCLK2 = DSIPHY/(REGM5+1)
+	   Both must be <= 186MHz
+	   DSIn_PCLK2 can be used to drive the DSI module, except we don't care much for that
+	   DSIn_PCLK1 is what we use to drive the DISPC pixel clock:
+	     pixel rate = (DSIn_PCLK1/LCD)/PCD
+	     1 <= LCD <= 255
+	     1 <= PCD <= 255
+	   We aren't using the DSI output module, so we can ignore the data lane frequency
+	   This increases the number of DSI PLL register combinations available, so to keep this
+	   code simple we remove LCD and PCD from the equation by forcing them to their minimal
+	   values. This also helps power usage a bit since DISPC will be clocked with the lowest
+	   possible clock (for a given pixel rate).
+	*/
+
+	clock_divider_t best;
+	uint32_t delta, bestdelta;
+	uint32_t i, m4;
+	uint64_t ratio, m, dm;
+
+	best.regm  = 0;
+	best.regn  = 1;
+	best.regm4 = 2 - 1;
+	best.pcd   = 2;
+
+	if (!pixel_rate)
+	{
+		return best;
+	}
+
+	/* check for max pixel_rate (for adjusting pcd value) */
+	if ((pixel_rate * 2) > FREQ_PLL_MAX)
+	{
+		best.pcd = 1;
+	}
+	else
+	{
+		pixel_rate *= 2;	/* LCD*PCD=2 */
+	}
+
+	/* search for value pair REGM,REGN with |2 * REGM * RESOLUTION / REGN - v| ==> 0 */
+	for (i = REGN_MIN, bestdelta = RESOLUTION; i <= REGN_MAX; ++i)
+	{
+		/* iterate over REGM4 */
+		for (m4 = 1; m4 < 32; ++m4)
+		{
+			/* find a pixel clock within 0.006 % of requested value (i.e. 1 / 16384) */
+			ratio = (uint64_t)pixel_rate * (uint64_t)m4 * RESOLUTION / FREQ_SYS;
+
+			/* add 0.5 for correct rounding */
+			m = ((uint64_t)i * ratio + RESOLUTION) / (2 * RESOLUTION);
+			/* check for allowed frequency range */
+			if ((2 * m * FREQ_SYS / (uint64_t)i) > MAX_DSI_PHY_CLK)
+				break;
+			dm = m * 2 * RESOLUTION / (uint64_t)i;
+			/* look at difference */
+			if (dm > ratio)
+			{
+				delta = (uint32_t)(dm - ratio);
+			}
+			else
+			{
+				delta = (uint32_t)(ratio - dm);
+			}
+
+			if (delta < bestdelta)
+			{
+				bestdelta = delta;
+				best.regm = (uint32_t)m;
+				best.regn = i - 1;
+				best.regm4 = m4 - 1;
+				if (delta < 1)
+				{
+					break;
+				}
+			}
+		}
+		if (bestdelta < 1)
+		{
+			break;
+		}
+	}
+
+	return best;
+}

@@ -1,0 +1,228 @@
+/*
+ * Copyright (c) 2012, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include "kernel.h"
+#include "swis.h"
+
+#include "Global/HALEntries.h"
+#include "Global/RISCOS.h"
+#include "Global/Keyboard.h"
+
+#include "nubs.h"
+#include "gpio.h"
+#include "pandorakey.h"
+
+nub_mode nub_mode_left,nub_mode_right;
+
+static volatile bool nubs_in_reset = false;
+
+typedef enum {
+  NUB_ACT_NONE = 0,
+  NUB_ACT_SELECT = 1,
+  NUB_ACT_MENU = 2,
+  NUB_ACT_ADJUST = 4,
+  NUB_ACT_DBLCLICK = 8,
+} nub_mouse_action;
+
+typedef struct {
+  nub_mouse_action action; /* Current action */
+  nub_mouse_action deb_action; /* Action being debounced, will be promoted to current once debounce timer hits limit */
+  uint8_t deb_timer; /* Debounce timer for deb_action */
+
+  uint8_t buttons; /* Current button state as far as the OS is concerned */
+  uint8_t repeat_count; /* Counter for double-click action */
+} nub_button_state;
+
+static nub_button_state nub_states[2];
+
+#define DEBOUNCE_TIME 1
+
+
+static void update_buttons(uint32_t buttons,uint32_t msg)
+{
+  if(buttons & 1)
+    _swix(OS_CallAVector,_INR(0,1)|_IN(9),msg,KeyNo_LeftMouse,KEYV);
+  if(buttons & 2)
+    _swix(OS_CallAVector,_INR(0,1)|_IN(9),msg,KeyNo_CentreMouse,KEYV);
+  if(buttons & 4)
+    _swix(OS_CallAVector,_INR(0,1)|_IN(9),msg,KeyNo_RightMouse,KEYV);
+}
+
+void nubs_init(void)
+{
+  /* Ensure GPIOs are configured */
+  gpio_atomic_update(GPIO_BANK(NUB_LEFT_GPIO),GPIO_OE,GPIO_BIT(NUB_LEFT_GPIO),~GPIO_BIT(NUB_LEFT_GPIO)); /* Input */
+  gpio_atomic_update(GPIO_BANK(NUB_RIGHT_GPIO),GPIO_OE,GPIO_BIT(NUB_RIGHT_GPIO),~GPIO_BIT(NUB_RIGHT_GPIO)); /* Input */
+  gpio_atomic_update(GPIO_BANK(NUB_RESET_GPIO),GPIO_OE,0,~GPIO_BIT(NUB_RESET_GPIO)); /* Output */
+
+  /* Set default mode */
+  nub_mode_left = NUB_MODE_MOUSE;
+  nub_mode_right = NUB_MODE_BUTTONS;
+  
+  /* Perform a reset */
+  nubs_reset();
+}
+
+void nubs_shutdown(void)
+{
+  /* Release buttons */
+  nubs_in_reset = true;
+  for(int i=0;i<2;i++)
+  {
+    update_buttons(nub_states[i].buttons,KeyV_KeyUp);
+    memset(&nub_states[i],0,sizeof(nub_button_state));
+  }
+}
+
+void nubs_reset(void)
+{
+  nubs_in_reset = true;
+  gpio_write(GPIO_BANK(NUB_RESET_GPIO),GPIO_SETDATAOUT,GPIO_BIT(NUB_RESET_GPIO));
+  /* Wait a while to ensure they're reset */
+  _swix(OS_Hardware,_IN(0)|_INR(8,9),10000,OSHW_CallHAL,EntryNo_HAL_CounterDelay);
+  /* Enable */
+  gpio_write(GPIO_BANK(NUB_RESET_GPIO),GPIO_CLEARDATAOUT,GPIO_BIT(NUB_RESET_GPIO));
+  nubs_in_reset = false;
+}
+
+static void nub_update(uint32_t gpio,uint32_t iic,nub_mode mode,nub_button_state *state)
+{
+  if(gpio_read(GPIO_BANK(gpio),GPIO_DATAIN) & GPIO_BIT(gpio))
+    return;
+
+  /* Read data */
+  int8_t data[4];
+
+  uint32_t transfer[3];
+  transfer[0] = (iic<<1)+1;
+  transfer[1] = (uint32_t) data;
+  transfer[2] = sizeof(data);
+  if(_swix(OS_IICOp,_INR(0,1),transfer,(NUB_BUS<<24)+1))
+    return;
+
+  /* Process */
+#define NUB_RX ((int)data[0])
+#define NUB_RY ((int)data[1])
+#define NUB_AX ((int)data[2])
+#define NUB_AY ((int)data[3])
+#define ABS(X) ((X)>0?(X):-(X))
+#define BUTTON_THRESHOLD 20
+  switch(mode)
+  {
+  case NUB_MODE_MOUSE:
+    mouse_x += NUB_RX;
+    mouse_y += NUB_RY;
+    break;
+  case NUB_MODE_BUTTONS:
+    {
+      /* Determine the desired action */
+      nub_mouse_action action = NUB_ACT_NONE;
+      if(ABS(NUB_AY) > ABS(NUB_AX)+4)
+      {
+        if(NUB_AY < -BUTTON_THRESHOLD)
+        {
+          /* Down = Menu */
+          action = NUB_ACT_MENU;
+        }
+        else if (NUB_AY > BUTTON_THRESHOLD)
+        {
+          /* Up = Double click Select */
+          action = NUB_ACT_DBLCLICK;
+        }
+      }
+      else if(ABS(NUB_AX) > ABS(NUB_AY)+4)
+      {
+        if(NUB_AX > BUTTON_THRESHOLD)
+        {
+          /* Right = Adjust */
+          action = NUB_ACT_ADJUST;
+        }
+        else if(NUB_AX < -BUTTON_THRESHOLD)
+        {
+          /* Left = Select */
+          action = NUB_ACT_SELECT;
+        }
+      }
+
+      /* Debounce it */
+      if (action == state->deb_action)
+      {
+        if (state->deb_timer < DEBOUNCE_TIME)
+        {
+          state->deb_timer++;
+        }
+        else
+        {
+          state->action = action;
+        }
+      }
+      else
+      {
+        state->deb_action = action;
+        state->deb_timer = 0;
+      }
+      action = state->action;
+
+      /* Act on it */
+      uint32_t new_buttons = 0;
+      if (action == NUB_ACT_DBLCLICK)
+      {
+        if(state->repeat_count < 8)
+        {
+          new_buttons = ((state->repeat_count & 2)?0:1);
+          state->repeat_count++;
+        }
+      }
+      else
+      {
+        /* Conveniently all the other actions map directly to button masks */
+        new_buttons = action;
+        state->repeat_count = 0;
+      }
+
+      if(new_buttons ^ state->buttons)
+      {
+        update_buttons(state->buttons & ~new_buttons,KeyV_KeyUp);
+        update_buttons(new_buttons & ~state->buttons,KeyV_KeyDown);
+        state->buttons = new_buttons;
+      }
+    }
+    break;
+  }       
+}
+
+void nubs_update(void)
+{
+  if(nubs_in_reset)
+    return;
+
+  nub_update(NUB_LEFT_GPIO,NUB_LEFT_IIC,nub_mode_left,&nub_states[0]);
+  nub_update(NUB_RIGHT_GPIO,NUB_RIGHT_IIC,nub_mode_right,&nub_states[1]);
+}

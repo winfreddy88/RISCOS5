@@ -1,0 +1,391 @@
+; Copyright 1998 Acorn Computers Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+;
+;  s.Task - task management
+;
+
+
+clipboard_text
+        =       "_TaskName", 0
+        ALIGN
+
+messages_list
+        &       Message_DataSave
+        &       Message_DataSaveAck
+        &       Message_DataLoad
+        &       Message_DataLoadAck
+        &       Message_RAMFetch
+        &       Message_RAMTransmit
+        &       Message_ClaimEntity
+        &       Message_DataRequest
+      [ DragNDrop
+        &       Message_Dragging
+        &       Message_DragClaim
+      ]
+        &       Message_PutRequest
+        &       Message_Paste
+        &       0
+
+;-------------------------------------------------------------------------------
+;
+; Start - module entry point
+;
+;-------------------------------------------------------------------------------
+Start
+        LDR     R12, [R12]
+        LDR     R0, mytaskhandle
+        CMP     R0, #0
+        ; Close down any existing task
+        LDRGT   R1, TASK
+        SWIGT   Wimp_CloseDown
+        LDR     R2, mystack
+        TEQ     R2, #0
+        BNE     %FT01
+        ; Claim ourselves a stack
+        MOV     R0, #ModHandReason_Claim
+        MOV     R3, #UserStackSize
+        SWI     OS_Module
+        STR     R2, mystack
+        ; Find our task name
+01      ADD     R13, R2, #UserStackSize
+        ADR     R0, MessagesBlock
+        ADR     R1, clipboard_text
+        ADR     R2, PollBlock
+        MOV     R3, #?PollBlock
+        SWI     MessageTrans_Lookup             ; R2->task name
+        ; Initialise the Wimp
+        LDR     R0, =310
+        LDR     R1, TASK
+        ADR     R3, messages_list
+        SWI     Wimp_Initialise
+        STR     R1, mytaskhandle
+
+        Debug   tmp,"Init handle",r1
+        ; Initialise other things
+        MOV     R0, #0
+        STR     R0, MsgQueue
+        STR     R0, ClipboardTask
+      [ DragNDrop
+        STR     R0, DragTask
+      ]
+        STR     R0, Actions
+        BL      InstallHandlers
+
+        ; Enter the poll loop
+PollLoop
+        LDR     R0, =null_bit:OR:pollword_enable
+        ADR     R1, PollBlock
+        ADR     R3, MsgQueue
+        SWI     Wimp_Poll
+        CMP     R0, #19
+        ADDLS   PC, PC, R0, LSL #2
+        B       PollLoop
+        B       NullReasonCode
+        B       PollLoop
+        B       PollLoop
+        B       PollLoop
+        B       PollLoop
+        B       PollLoop
+        B       PollLoop
+        B       UserDragBox
+        B       KeyPressed
+        B       PollLoop
+        B       PollLoop
+        B       PollLoop
+        B       PollLoop
+        B       PollWordNonZero
+        B       PollLoop
+        B       PollLoop
+        B       PollLoop
+        B       UserMessage
+        B       UserMessage
+        B       UserMessageAcknowledge
+
+
+;-------------------------------------------------------------------
+;
+; Wimp event handlers
+;
+
+NullReasonCode
+UserDragBox
+KeyPressed
+        B       PollLoop
+
+
+PollWordNonZero
+        LDR     R5, MsgQueue
+01      TEQ     R5, #0
+        STREQ   R5, MsgQueue
+        BEQ     PollLoop
+
+        ADD     R1, R5, #MsgQ_Data              ; -> Wimp message block
+        ADD     R14, R5, #MsgQ_EventCode
+        LDMIA   R14, {R0, R2-R4}                ; R0, R2, R3 are Wimp_SendMessage params,
+                                                ; R4 -> word to store my_ref in
+        SWI     XWimp_SendMessage               ; nowhere to report error to
+        LDR     R14, [R1, #ms_myref]
+        TEQ     R4, #0
+        STRNE   R14, [R4]
+
+        MOV     R2, R5
+        LDR     R5, [R2, #MsgQ_Next]            ; -> next message queue block, or 0
+        MOV     R0, #ModHandReason_Free
+        SWI     XOS_Module                      ; free the block we've just dealt with
+
+        B       %BT01                           ; loop
+
+
+UserMessage
+        LDR     R5, [R1, #ms_action]
+        Debug   tmp,"User Msg",r5
+
+        TEQ     R5, #Message_Quit
+        BEQ     MessageQuit
+
+        TEQ     R5, #Message_ClaimEntity
+        BEQ     MessageClaimEntity
+
+        TEQ     R5, #Message_DataRequest
+        BEQ     MessageDataRequest
+
+        TEQ     R5, #Message_DataSave
+        TEQNE   R5, #Message_DataSaveAck
+        TEQNE   R5, #Message_DataLoad
+        TEQNE   R5, #Message_DataLoadAck
+        TEQNE   R5, #Message_RAMFetch
+        TEQNE   R5, #Message_RAMTransmit
+        BNE     %FT01
+        LDR     R11, [R1, #ms_yourref]
+        Debug   tmp, "yourref",r11
+        BL      GetActionHandle
+        Debug   tmp, "ActionHandle",r11
+        CMP     R11, #0                         ; was an action handle found?
+        BLNE    StateHandler
+        SWIVS   OS_GenerateError
+01
+        B       PollLoop
+
+
+UserMessageAcknowledge
+        LDR     R5, [R1, #ms_action]
+        Debug   tmp,"User Msg ack",r5
+
+        TEQ     R5, #Message_DataSave
+        TEQNE   R5, #Message_DataSaveAck
+        TEQNE   R5, #Message_DataLoad
+        TEQNE   R5, #Message_RAMFetch
+        TEQNE   R5, #Message_RAMTransmit
+        TEQNE   R5, #Message_DataRequest
+        TEQNE   R5, #Message_PutRequest
+        LDRNE   R14, =Message_Paste
+        TEQNE   R5, R14
+        BNE     %FT01
+        LDR     R11, [R1, #ms_myref]
+        BL      GetActionHandle
+        CMP     R11, #0                         ; was an action handle found?
+        BLNE    StateHandler
+        SWIVS   OS_GenerateError
+01
+        B       PollLoop
+
+
+;-------------------------------------------------------------------
+;
+; Wimp message handlers (excluding those involved in data transfer)
+;
+
+;
+; Message_Quit - exit task
+;
+MessageQuit
+        BL      CloseDown
+        SWI     OS_Exit
+
+
+;-------------------------------------------------------------------------------
+;
+; Message_ClaimEntity - junk our clipboard if someone else has nobbled it
+;
+;-------------------------------------------------------------------------------
+MessageClaimEntity
+        Debug   tmp,"MessageClaimEntity"
+        LDR     R0, [R1, #msClaimEntity_flags]
+        TST     R0, #4
+        BEQ     PollLoop
+        LDR     R0, [R1, #ms_taskhandle]
+        LDR     R14, mytaskhandle
+        Debug   tmp,"sender",r0
+        Debug   tmp,"handle",r14
+        TEQ     R0, R14                  ; ignore our broadcasts...
+        BLNE    FreeClipboard
+        B       PollLoop
+
+
+;-------------------------------------------------------------------------------
+;
+; Message_DataRequest - someone wants the clipboard contents
+;
+;-------------------------------------------------------------------------------
+MessageDataRequest
+        Debug   tmp,"MessageDataRequest"
+        LDR     R0, [R1, #ms_taskhandle]
+        LDR     R14, mytaskhandle
+        TEQ     R0, R14                  ; ignore our broadcasts...
+        BEQ     PollLoop
+
+        LDR     R0, [R1, #msDataRequest_flags]
+        TST     R0, #msDataRequest_SendFromClipboard
+        BEQ     PollLoop                 ; ignore any non-Clipboard protocol
+
+        LDR     R0, ClipboardTask
+        TEQ     R0, #0
+        BEQ     PollLoop                 ; ignore it if we can't help
+
+        ; Gather information from the DataRequest block
+        BL      NewAction
+        SWIVS   OS_GenerateError
+        LDR     R0, [R1, #ms_taskhandle]
+        STR     R0, [R11, #Act_Task]
+        ADD     R0, R1, #msDataRequest_window
+        LDMIA   R0, {R2-R5}
+        ADD     R0, R11, #Act_Window
+        STMIA   R0, {R2-R5}
+        ADD     R0, R1, #msDataRequest_filetypes
+        BL      CopyTypes
+        SWIVS   OS_GenerateError
+        STR     R0, [R11, #Act_List]
+        LDR     R0, [R1, #ms_myref]
+        STR     R0, [R11, #Act_DataRequestRef]
+
+        Debug   tmp,"Check state"
+        ; Branch according to clipboard state
+        LDR     R0, ClipboardFlags
+        TST     R0, #msPutRequest_SendPutRequest
+        BNE     %FT10
+
+        ; We hold the clipboard - enter State_DataSave
+        MOV     R0, #State_DataSave
+        STR     R0, [R11, #Act_State]
+        LDR     R0, ClipboardAddr
+        STR     R0, [R11, #Act_BufAddr]
+        LDR     R0, ClipboardLen
+        STR     R0, [R11, #Act_BufLen]
+        MOV     R0, #1                   ; don't free clipboard!
+        STR     R0, [R11, #Act_IntFlags]
+
+        LDR     R0, [R1, #ms_myref]
+        STR     R0, [R1, #ms_yourref]
+        MOV     R0, #Message_DataSave
+        STR     R0, [R1, #ms_action]
+        LDR     R0, ClipboardLen
+        STR     R0, [R1, #msDataTransfer_filesize]
+        LDR     R0, ClipboardType
+        STR     R0, [R1, #msDataTransfer_filetype]
+        LDR     R0, ClipboardName
+        ADD     R2, R1, #msDataTransfer_filename
+01      LDRB    R14, [R0], #1
+        STRB    R14, [R2], #1
+        TEQ     R14, #0
+        BNE     %BT01
+        SUB     R0, R2, R1
+        ADD     R0, R0, #3
+        BIC     R0, R0, #3
+        STR     R0, [R1, #ms_size]
+        MOV     R0, #User_Message_Recorded
+        LDR     R2, [R1, #ms_taskhandle]
+        ADD     R4, R11, #Act_MyRef
+        BL      MySendMessage
+        SWIVS   OS_GenerateError
+
+        Debug   tmp,"Data req done"
+        B       PollLoop
+
+10      ; We are proxying - enter State_PutRequest1
+        MOV     R0, #State_PutRequest1
+        STR     R0, [R11, #Act_State]
+
+        LDR     R0, [R1, #ms_myref]
+        STR     R0, [R1, #ms_yourref]
+        MOV     R0, #User_Message_Acknowledge
+        LDR     R2, [R1, #ms_taskhandle]
+        MOV     R4, #0
+        BL      MySendMessage            ; acknowledge the DataRequest
+        SWIVS   OS_GenerateError         ; because we won't reply immediately
+
+        MOV     R0, #Message_PutRequest
+        STR     R0, [R1, #ms_action]
+        MOV     R0, #0
+        STR     R0, [R1, #ms_yourref]
+        MOV     R0, #msPutRequest_size
+        STR     R0, [R1, #ms_size]
+        LDR     R0, ClipboardFlags
+        AND     R0, R0, #ClipboardPut_Wimp
+        ORR     R0, R0, #msPutRequest_SendClipboard
+        STR     R0, [R1, #msPutRequest_flags]
+        ADD     R0, R11, #Act_Window
+        LDMIA   R0, {R2-R5}
+        ADD     R0, R1, #msPutRequest_window
+        STMIA   R0, {R2-R5}
+        LDR     R0, [R11, #Act_List]
+        STR     R0, [R1, #msPutRequest_datatypes]
+        MOV     R0, #User_Message_Recorded
+        LDR     R2, ClipboardTask
+        ADD     R4, R11, #Act_MyRef
+        BL      MySendMessage
+        SWIVS   OS_GenerateError
+
+        B       PollLoop
+
+
+;-------------------------------------------------------------------
+;
+; CloseDown - close down task, but leave module active
+; Called from module finalisation, exit/upcall handlers and task exit (after Message_Quit)
+; R12 and R13 must be valid
+;
+
+CloseDown
+        Entry   "R0-R2"
+
+        BL      RestoreHandlers         ; remove our error handler *first*
+
+        BL      DeleteActions           ; free actions list
+
+      [ DragNDrop
+        BL      StopDragging            ; stop Wimp drag and free dynamic drag data
+      ]
+
+        BL      FreeClipboard           ; free clipboard and dynamic clipboard data
+
+        BL      FreeMsgQueue            ; free message queue
+
+        LDR     R0, mytaskhandle
+        LDR     R1, TASK
+        SWI     XWimp_CloseDown         ; close down task
+        MOV     R0, #0
+        STR     R0, mytaskhandle
+
+        MOV     R0, #ModHandReason_Free
+        LDR     R2, mystack
+        SWI     XOS_Module
+        MOV     R14, #0
+        STR     R14, mystack            ; free task stack
+
+        EXIT
+
+        LTORG
+
+        END

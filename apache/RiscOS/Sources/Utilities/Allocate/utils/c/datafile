@@ -1,0 +1,273 @@
+/*
+ * Name   : datafile.c
+ * Desc   : datafile control for the !allocate application
+ * Auther : James Bye
+ * Date   : 21-Jul-1994
+ *
+ *
+ */
+
+
+/*-- from CLib --*/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include "kernel.h"
+
+/*-- from RISC_OSLib --*/
+
+/*-- from my headers --*/
+
+#include "object.h"
+#include "datafile.h"
+#include "guard.h"
+#include "details.h"
+
+
+/*************************************************
+ * Internal structures                           *
+ *************************************************/
+
+#define DataFile_Name     "ALLOCATE"
+#define DataFile_Version  100
+
+typedef struct
+{
+  char name[8];        /*-- must be set to be 'ALLOCATE' --*/
+  int version;
+  int no_objects;
+} DataFileHdr;
+
+
+/*-- some errors --*/
+
+static _kernel_oserror badhdr = {0,"Bad file header"};
+static _kernel_oserror badver = {0,"Version of file is not understood"};
+static _kernel_oserror nomem  = {0,"Not enough memory for file read"};
+
+
+/*************************************************
+ * Static variables                              *
+ *************************************************/
+
+static char writeb[2048];  /*-- scratch space for buffering file output --*/
+
+/*************************************************
+ * Static functions                              *
+ *************************************************/
+
+/*
+ * new C generic version
+ */
+
+int file_readbytes(FILE *f, void *buffer, int nread, int seqptr)
+{
+  if (seqptr!=-1)
+  {
+    printf("file_readbytes can't set the pointer\n");
+    exit(1);
+  }
+  fread(buffer, 1, nread, f);
+  return(0);
+}
+
+/*
+ * does the reading of objects from the data file
+ */
+
+static _kernel_oserror *do_read_objects ( FILE *fh, DataFileObjectList **objects_ptr,
+                                                                      int no_objects )
+{
+_kernel_oserror *e = NULL;
+int objects_read = 0;
+DataFileObjectList *objects = NULL;
+DataFileObjectList *new;
+DataFileObjectList *start = NULL;
+
+  /*-- loop reading all the objects from the file --*/
+
+  while(objects_read < no_objects)
+  {
+     /*-- allocate a new object list element --*/
+
+     if((new = malloc(sizeof(DataFileObjectList))) == NULL)
+     {
+       e = &nomem;
+       goto finish;
+     }
+
+     new->next = NULL;
+
+     /*-- allocate some space for the object in the object list --*/
+
+     if((new->object = malloc(sizeof(ObjectBlock))) == NULL)
+     {
+       e = &nomem;
+       goto finish;
+     }
+
+     /*-- read the first two words of the object --*/
+
+     file_readbytes(fh,new->object,sizeof(int)*2,-1);
+
+     /*-- check the object id because the filetype object is a special --*/
+     /*-- case                                                         --*/
+
+     if(new->object->id == Object_FileType)
+     {
+       /*-- read the filetype data apart from the three file data elements --*/
+
+       file_readbytes(fh,&new->object->data.filetype,
+                sizeof(FileType) - (sizeof(FileData)*3),-1);
+
+       /*-- read the size of sprite data, alloc space and load it --*/
+
+       file_readbytes(fh,&new->object->data.filetype.sprite.size,
+                            sizeof(int),-1);
+
+       if((new->object->data.filetype.sprite.data =
+                   malloc(new->object->data.filetype.sprite.size)) == NULL)
+       {
+         e = &nomem;
+         goto finish;
+       }
+
+       file_readbytes(fh,new->object->data.filetype.sprite.data,
+             new->object->data.filetype.sprite.size,-1);
+
+       /*-- read the size of prod_desc data, alloc space and load it --*/
+
+       file_readbytes(fh,&new->object->data.filetype.prod_desc.size,
+                            sizeof(int),-1);
+
+       if((new->object->data.filetype.prod_desc.data =
+                   malloc(new->object->data.filetype.prod_desc.size)) == NULL)
+       {
+         e = &nomem;
+         goto finish;
+       }
+
+       file_readbytes(fh,new->object->data.filetype.prod_desc.data,
+             new->object->data.filetype.prod_desc.size,-1);
+
+       /*-- read the size of format data, alloc space and load it --*/
+
+       file_readbytes(fh,&new->object->data.filetype.format.size,
+                            sizeof(int),-1);
+
+       if((new->object->data.filetype.format.data =
+                   malloc(new->object->data.filetype.format.size)) == NULL)
+       {
+         e = &nomem;
+         goto finish;
+       }
+
+       file_readbytes(fh,new->object->data.filetype.format.data,
+             new->object->data.filetype.format.size,-1);
+
+     }
+     else
+     {
+       file_readbytes(fh,&new->object->data,new->object->size,-1);
+     }
+
+     /*-- add the new object to the object list --*/
+
+     if(objects == NULL)
+     {
+       objects = new;
+       start = objects;
+     }
+     else
+     {
+       objects->next = new;
+       objects = objects->next;
+     }
+
+     /*-- increment the number of objects read counter --*/
+
+     objects_read++;
+  }
+
+
+finish:
+
+  *objects_ptr = start;
+
+  return(e);
+}
+
+
+#ifndef DateUtils_TodaysDate
+#define DateUtils_TodaysDate 0x46c42
+#endif
+
+/*************************************************
+ * External functions                            *
+ *************************************************/
+
+/*
+ * Name     : datafile_load_file
+ * Desc     : loads an allocate data file
+ * Parms    : char *filename
+ *            DataFileObjectList **objects - destination for linked list pointer
+ * Returns  : True or False on result
+ */
+
+extern BOOL datafile_load_file ( char *filename, DataFileObjectList **objects )
+{
+_kernel_oserror *e = NULL;
+FILE *fh = 0;
+DataFileHdr hdr;
+DetailsInfo dinfo;
+
+  /*-- open the file --*/
+
+  fh=fopen(filename,"r");
+  if (fh==0)
+  {
+    printf("Couldn't open file\n");
+    exit(1);
+  }
+
+  /*-- load and check the file header --*/
+
+  file_readbytes(fh,&hdr,sizeof(DataFileHdr),-1);
+
+  if(strncmp(hdr.name,DataFile_Name,8) != 0)
+  {
+    e = &badhdr;
+    goto finish;
+  }
+
+  if(hdr.version > DataFile_Version)
+  {
+    e = &badver;
+    goto finish;
+  }
+
+  /*-- load and set the developers details --*/
+
+  file_readbytes(fh,&dinfo,sizeof(DetailsInfo),-1);
+
+  details_set(&dinfo);
+
+  /*-- read the objects from the file --*/
+
+  do_read_objects(fh,objects,hdr.no_objects);
+
+
+finish:
+
+  if(fh != 0)
+    fclose(fh);
+
+  return(0);
+}
+
+
+/*-- end --*/
+
+

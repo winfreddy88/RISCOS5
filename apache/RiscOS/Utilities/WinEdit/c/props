@@ -1,0 +1,2542 @@
+/* Copyright 2003 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*
+ * Item properties dialogue box
+ */
+
+
+#include "resed.h"
+
+#define BIG 999999
+
+/*
+ * This is a singly-instantiated dialogue.
+ * Remember whether we are open or not.
+ */
+
+static Bool mainopen = FALSE;
+
+/*
+ * Has user asked for more information?
+ */
+
+static Bool moreopen = FALSE;
+
+/*
+ * Which resource and item are we displaying?  If dispitem is NULL,
+ * then we are not displaying one - either the window is closed, or
+ * greyed out.  Because we want to remember which type of window
+ * it currently is, we keep a separate record of this in the
+ * variable type.
+ *
+ * dispitem is used as the flag for whether there is a current item or not.
+ */
+
+static ResourcePtr dispres = NULL;
+static ItemInfoPtr dispitem = NULL;
+static ItemType type = None;
+
+/*
+ * Windows are created and deleted whenever we need to
+ * change the type of window.  These hold the current
+ * ones; the prototypes are copied in each time we need to
+ * create.
+ */
+
+static WindowRec mainwin, morewin;
+
+static PropsInfoRec info [13];
+
+
+
+/*
+ * The font menu.
+ */
+
+static MenuPtr fontmenu = NULL;
+
+
+/*
+ * Strings to hold validation strings during the edit process.
+ */
+
+static char validation [VALID_BUFFER_LEN];
+static int fg_colour, bg_colour;
+
+
+/*
+ * Caret position history.  lastwindow == NULL means we don't have
+ * a history.
+ */
+
+static WindowPtr lastwindow = NULL;
+static int lasticon;
+static RegistryType lasttype;   /* only valid if lastwindow != -1 */
+
+
+static void fill_in (void);
+
+static void apply (Bool);
+
+
+/*
+ * We have lost the caret.  Update our record of where we think it
+ * was so that we can attempt to put it back later.
+ */
+
+error * props_lose_caret (CaretPositionPtr caret)
+{
+    void *closure;
+    ItemType type;
+
+    dprintf ("PROPS LOSE CARET: window %d _ icon %d\n" _ caret->windowhandle _ caret->iconhandle);
+
+    switch (type = registry_lookup_window (caret->windowhandle, &closure))
+    {
+    case Props:
+    case MoreProps:
+        lastwindow = (WindowPtr) closure;
+        lasticon = caret->iconhandle;
+        lasttype = type;
+    }
+
+    return NULL;
+}
+
+
+/*
+ * Locate the named unshaded writeable icon.  If NULL is passed
+ * as the name, then return the first one.  Return -1 if no match.
+ */
+
+static int match_writeable_name (WindowPtr win, char *name)
+{
+    int handles[256], i;
+    char match[100];
+    if (_swix(Wimp_WhichIcon, _INR(0,3),
+              win->handle, handles, IF_INDIR | IF_TEXT | IF_FIELD(TYPE, 0xF) | IF_SHADED, IF_INDIR | IF_TEXT | IF_FIELD(TYPE, 0xF)) == NULL)
+        for (i = 0; handles[i] != -1; i++)
+        {
+            if (name == NULL ||
+                template_read_icon_name (&win->icons[handles[i]], match) && strcmp (name, match) == 0)
+                return handles[i];
+        }
+    return -1;
+}
+
+
+/*
+ * Put the caret back in the same place in the props window it last
+ * was, as near as possible.
+ */
+
+static error * putback ()
+{
+    WindowPtr main = info[type].main, more = info[type].more, target;
+    int targeticon = -1;        /* default is background */
+
+    if (!mainopen)
+        return NULL;
+
+#if 0  /* Not needed, because you cannot change which item is in the
+        * props window without losing the caret first!!
+        */
+
+    /* Check where the sod currently is */
+
+    ER ( _swix(Wimp_GetCaretPosition, _IN(1),
+               &caret) );
+    ER ( props_lose_caret (&caret) );
+
+#endif
+
+    /* Now decide where it is going */
+
+    if (lastwindow == NULL)
+        target = main;
+    else
+    {
+        if (lasttype == Props)
+            target = main;
+        else
+            target = moreopen ? more : main;
+    }
+
+    /* If it is the same window as before, use the previous icon */
+    if (target == lastwindow)
+        targeticon = lasticon;
+
+    /* Try for an identically-named writeable icon */
+    if (targeticon == -1 && lastwindow != NULL && lasticon >= 0)
+    {
+        char name[100];
+        if (template_read_icon_name (&lastwindow->icons[lasticon], name))
+            targeticon = match_writeable_name (target, name);
+    }
+
+    /* Try for a writeable named "TEXT" */
+    if (targeticon == -1)
+        targeticon = match_writeable_name (target, "TEXT");
+
+    /* Try for *any* writeable icon */
+    if (targeticon == -1)
+        targeticon = match_writeable_name (target, NULL);
+
+    /* Set the caret.  If there is no icon, then set it to the background.
+     * Otherwise set it to the given icon, at the start of the string.
+     */
+    if (targeticon != -1)
+    {
+        char *str = (char *) target->icons[targeticon].data[0];
+        ER ( _swix(Wimp_SetCaretPosition, _INR(0,1) | _INR(4,5),
+                   target->handle, targeticon, -1, strlen (str)) );
+    }
+    else
+    {
+        ER ( _swix(Wimp_SetCaretPosition, _INR(0,5),
+                   target->handle, -1, 0, 0, BIT(25) /* invisible */, 0) );
+    }
+
+    return NULL;
+}
+
+
+/*
+ * Load in all templates, create but don't open the windows.
+ * Register them with the registry.
+ */
+
+error * props_load_prototypes ()
+{
+    int i;
+    for (i = 0; i < NUMBER(info); i++)
+    {
+        char name[20];
+
+        if (i == 6)
+            continue;           /* 5 and 6 share */
+
+        sprintf(name, "Props%d", i);
+        ER ( wimp_load_template(name, &info[i].main) );
+        ER ( _swix(Wimp_CreateWindow, _IN(1) | _OUT(0),
+                   &info[i].main->visarea,
+                   &info[i].main->handle) );
+        ER ( registry_register_window (info[i].main->handle, Props, (void *) info[i].main) );
+
+        sprintf(name, "More%d", i);
+        ER ( wimp_load_template(name, &info[i].more) );
+        ER ( _swix(Wimp_CreateWindow, _IN(1) | _OUT(0),
+                   &info[i].more->visarea,
+                   &info[i].more->handle) );
+        ER ( registry_register_window (info[i].more->handle, MoreProps, (void *) info[i].more) );
+    }
+
+    info[6].main = info[5].main;                /* 5 and 6 share */
+    info[6].more = info[5].more;
+
+    return NULL;
+}
+
+
+
+/*
+ * Open window (and/or bring it to the top)
+ */
+
+/*
+ * If open, just raise the window (and more window if it's open).
+ * else
+ *   if a current item
+ *     open window for that type, and fill it in
+ *   else (also if item's type invalid)
+ *     open 'none' window
+ */
+
+static PointRec mainpos, morepos;
+static Bool mainseen = FALSE;
+static Bool moreseen = FALSE;
+
+
+error * props_show_window ()
+{
+    dprintf ("props_show_window() ");
+    if (mainopen)
+    {
+        info[type].main->behind = -1;
+        ER ( _swix(Wimp_OpenWindow, _IN(1),
+                   info[type].main) );
+        if (moreopen)
+        {
+            info[type].more->behind = -1;
+            ER ( _swix(Wimp_OpenWindow, _IN(1),
+                       info[type].more) );
+        }
+    }
+    else
+    {
+        if (!dispitem || dispitem->type < 0 || dispitem->type >= NUMBER(info))
+            type = None;
+        else
+            type = dispitem->type;
+        dprintf ("type = %d; " _ type);
+
+        if (mainseen)
+            wimp_move_window (info[type].main, mainpos.x, mainpos.y);
+
+        info[type].main->behind = -1;
+        ER ( _swix(Wimp_OpenWindow, _IN(1),
+                   info[type].main) );
+        dprintf ("Opened it\n");
+        mainopen = TRUE;
+
+        if (!mainseen)
+        {
+            if (_swix(Wimp_GetWindowState, _IN(1),
+                      info[type].main) == NULL)
+            {
+                mainpos.x = info[type].main->visarea.minx;
+                mainpos.y = info[type].main->visarea.maxy;
+                mainseen = TRUE;
+            }
+        }
+
+        if (type != None)
+        {
+            fill_in ();
+        }
+    }
+
+    ER ( putback () );
+
+    return NULL;
+}
+
+
+
+/*
+ * Select the item to be displayed by the props window.
+ * A item argument of NULL means "show no item".
+ * If the window is currently open, then re-display as
+ * appropriate, but don't raise or open any windows.
+ */
+
+/*
+ * If open
+ *   If different type to before
+ *     close current window(s)
+ *     open correct window(s)
+ *   fill in correct window(s)
+ * else
+ *   remember which item & type
+ */
+
+error * props_select (ResourcePtr res, ItemInfoPtr item)
+{
+    ItemType newtype = item ? item->type : None;
+    dprintf ("props_select (%x, %x) type=%d\n" _ (int) res _ (int) item _ type);
+
+    if (newtype < 0 || newtype >= NUMBER(info))
+        newtype = None;
+
+    if (mainopen && item != dispitem)
+    {
+        if (newtype != type)
+        {
+            if (_swix(Wimp_GetWindowState, _IN(1),
+                      info[type].main) == NULL)
+                info[newtype].main->behind = info[type].main->behind;
+            ER ( _swix(Wimp_CloseWindow, _IN(1),
+                       info[type].main) );
+            wimp_move_window (info[newtype].main, mainpos.x, mainpos.y);
+            ER ( _swix(Wimp_OpenWindow, _IN(1),
+                       info[newtype].main) );
+        }
+    }
+
+    if (moreopen && item != dispitem)
+    {
+        if (newtype != type)
+        {
+            if (_swix(Wimp_GetWindowState, _IN(1),
+                      info[type].more) == NULL)
+                info[newtype].more->behind = info[type].more->behind;
+            ER ( _swix(Wimp_CloseWindow, _IN(1),
+                       info[type].more) );
+            wimp_move_window (info[newtype].more, morepos.x, morepos.y);
+            ER ( _swix(Wimp_OpenWindow, _IN(1),
+                       info[newtype].more) );
+        }
+    }
+
+    type = newtype;
+    dispitem = item;
+    dispres = res;
+
+    /* Note: fill in the more window even if it not open.  This
+     * is so that we can safely read the values out again when
+     * the user hits OK in the main window.
+     */
+
+    if (mainopen)
+    {
+        fill_in ();
+    }
+    return NULL;
+}
+
+
+
+/*
+ * Respond to open_window_request on any of our windows
+ * Note: the 'win' parameter is only a partial window structure
+ * (just the fields returned with Open_Window_Request).
+ */
+
+error * props_open_window (WindowPtr win, RegistryType rt, void *closure)
+{
+    WindowPtr w = (WindowPtr) closure;
+    PointPtr p;
+
+    if (rt == Props)
+    {
+        p = &mainpos;
+        mainseen = TRUE;
+    }
+    else if (rt == MoreProps)
+    {
+        p = &morepos;
+        moreseen = TRUE;
+    }
+    else
+        return NULL;
+
+    w->visarea = win->visarea;
+    w->scrolloffset = win->scrolloffset;
+    w->behind = win->behind;
+    p->x = w->visarea.minx;
+    p->y = w->visarea.maxy;
+
+    return _swix(Wimp_OpenWindow, _IN(1),
+                 win);
+}
+
+
+
+/*
+ * Close the main props window.
+ */
+
+static error * close_main ()
+{
+    if (mainopen)
+    {
+        ER ( _swix(Wimp_CloseWindow, _IN(1),
+                   info[type].main) );
+        mainopen = FALSE;
+    }
+    return NULL;
+}
+
+
+
+/*
+ * Close the more props window
+ */
+
+static error * close_more ()
+{
+    if (moreopen)
+    {
+        ER ( _swix(Wimp_CloseWindow, _IN(1),
+                   info[type].more) );
+        moreopen = FALSE;
+    }
+    return NULL;
+}
+
+
+
+/*
+ * Open the 'more props' window, or raise it.  Only called in
+ * response to user pushing "more" button.
+ */
+
+static error * show_more_window ()
+{
+    /* Assert: mainopen == TRUE && more window has been created and filled in */
+
+    if (moreopen)
+    {
+        info[type].more->behind = -1;
+        ER ( _swix(Wimp_OpenWindow, _IN(1),
+                   info[type].more) );
+    }
+    else
+    {
+        if (moreseen)
+            wimp_move_window (info[type].more, morepos.x, morepos.y);
+
+        info[type].more->behind = -1;
+        ER ( _swix(Wimp_OpenWindow, _IN(1),
+                   info[type].more) );
+        moreopen = TRUE;
+
+        if (!moreseen)
+        {
+            if (_swix(Wimp_GetWindowState, _IN(1),
+                      info[type].more) == NULL)
+            {
+                morepos.x = info[type].more->visarea.minx;
+                morepos.y = info[type].more->visarea.maxy;
+                moreseen = TRUE;
+            }
+        }
+    }
+    return NULL;
+}
+
+
+/*
+ * Check for RETURN in props and details windows.
+ */
+
+error * props_key_pressed (KeyPressPtr key, Bool *consumed)
+{
+    if (key->code == 13)
+    {
+        *consumed = TRUE;
+        apply ((wimp_read_modifiers() & MODIFIER_SHIFT) != 0);
+    }
+    return NULL;
+}
+
+
+/*
+ * In the following code it is safe to assume that type, dispitem and dispres
+ * refer to a valid item, since we won't get called if this is not the case.
+ */
+
+
+/*
+ * Generate a font menu, and return ptr to it.  The memory should be
+ * freed after use.  The menu includes an entry for "system font", and
+ * an entry must be ticked.
+ *
+ * XXX This needs work for I18N; get Font_ListFonts to return the
+ * internationalised names, and convert to/from font identifiers as required.
+ *
+ * On entry, if *menublk is NULL, then the memory required is allocated and
+ * *menublk is set to point to it.  If it is non-NULL, it is assumed to
+ * point to sufficient memory for the menu, and this memory is used
+ * instead.
+ */
+
+
+/*
+ * Caller of make_font_menu should fill in these for the callback to access
+ */
+
+static struct
+{
+    int f, s, d, u;
+    void (*notify) (WindowPtr, Bool);
+} fontmenudata;
+
+
+static error * make_font_menu (IconInfoPtr icon, /* icon whose font we are adjusting */
+                               char *ticked,     /* ignored if icon is in System Font */
+                               MenuPtr *menublk)
+{
+    int bufsize, indsize, check;
+    char *mem = (char *) *menublk;
+    error *err = NULL;
+
+    dprintf("Ticking *%s*\n" _ ticked ? ticked : "");
+
+    /* was (icon->icon.flags & IF_FONT) == 0 || */
+    if (ticked == NULL || strcmp(ticked, message_lookup(&msgs, "SysFont")) == 0)
+        ticked = (char *) 1;                     /* tick System Font */
+
+    ER ( _swix(Font_ListFonts, _INR(1,2) | _IN(4) | _IN(6) | _OUT(3) | _OUT(5),
+               0, BIT(19) | BIT(20) | BIT(21) /* menu | systemfont | ticked */, 0, ticked,
+               &bufsize, &indsize) );
+
+    bufsize = (bufsize + 3) & ~3;
+
+    /* Allocate one blob of memory to make it easier to free */
+
+    if (mem == NULL)
+        if ((mem = malloc (bufsize + indsize)) == NULL)
+            return error_lookup("NoMem");
+
+    EG ( fail, _swix(Font_ListFonts, _INR(1,6) | _OUT(3),
+                     mem, BIT(19) | BIT(20) | BIT(21) /* menu | systemfont | ticked */, bufsize, mem + bufsize, indsize, ticked,
+                     &check) );
+
+    if (check)
+    {
+        *menublk = (MenuPtr) mem;
+        return NULL;
+    }
+
+    /* If the menu was null, it's not an error, but we want to
+     * free the memory and return a null menu ptr.  Falling
+     * through achieves this.
+     */
+
+fail:
+    free (mem);
+    return err;
+}
+
+
+static void do_fontsize (WindowPtr win, Bool shaded, char *val)
+{
+    dbox_setstring (win, fontmenudata.s, val);
+    dbox_shade (win, fontmenudata.s, shaded);
+    dbox_shade (win, fontmenudata.d, shaded);
+    dbox_shade (win, fontmenudata.u, shaded);
+    if (fontmenudata.notify)
+        (*fontmenudata.notify) (win, shaded);
+}
+
+
+/*
+ * Menu callback for the font menu.
+ */
+
+static error * font_menu_cb (MenuPtr menu, int *choice, void *closure, Bool adjust)
+{
+    /* assert menu == fontmenu */
+
+    WindowPtr win = (WindowPtr) closure;
+    char buf[100], *sys, *cur, *newticked = NULL;
+
+    dprintf("font_menu_cb in\n");
+
+    if (choice == NULL)
+    {
+        /* We are being told to go away.  Free up the memory */
+        dprintf("(being cancelled)\n");
+        free ((char *) fontmenu);
+        fontmenu = NULL;
+        return NULL;
+    }
+
+    sys = message_lookup(&msgs, "SysFont");
+    cur = dbox_getstring (win, fontmenudata.f);
+
+    if (choice[0] == 0)                          /* Hit was on "System Font" */
+    {
+        if (strcmp (cur, sys) != 0)
+        {
+            dprintf("Fancy -> System\n");
+            do_fontsize (win, TRUE, "");
+            dbox_setstring (win, fontmenudata.f, sys);
+        }
+        else
+            /* If the current font is system, do nothing */
+            dprintf("System -> System\n");
+    } else                                       /* Hit was on a fancy font */
+    {
+        Bool check;
+        ER ( _swix(Font_DecodeMenu, _INR(0,4) | _OUT(4),
+                   0, fontmenu, choice, buf, sizeof(buf),
+                   &check) );
+
+        if (check)              /* got a match */
+        {
+            if (strcmp (cur, sys) == 0)          /* System -> Fancy */
+            {
+                dprintf("System -> Fancy (%s)\n" _ buf);
+                do_fontsize (win, FALSE, message_lookup(&msgs, "FontSize"));
+                /* NB value of sys lost */
+            }
+            else
+                dprintf("Fancy (%s) -> Fancy (%s)\n" _ cur _ buf);
+
+            /* Trim the junk off of the fontname */
+            block
+            {
+                char *fp;
+                _swix(Font_FindField, _INR(1,2) | _OUT(1),
+                      buf, 'F',
+                      &newticked);
+                for (fp = newticked; *fp && *fp != '\\'; fp++) ;
+                *fp = 0;
+                dprintf("The vanilla font name looks like *%s*\n" _ newticked);
+                dbox_setstring (win, fontmenudata.f, newticked);
+            }
+        }
+    }
+
+    if (adjust)                 /* re-make menu in same memory - should still fit! */
+    {
+        ER ( make_font_menu (NULL, newticked, &fontmenu) );
+    }
+
+    return NULL;
+}
+
+
+/*
+ * Post the font menu for the current item.  Uses dispres and dispitem
+ * to determine which item to display for, but allows you to specify
+ * which icon in a multi-icon item is taken.  Gets initial font to
+ * tick from the contents of the field G_FONT_VAL.
+ */
+
+static error * post_font_menu (WindowPtr win, int f, int s, int d, int u,
+                               IconInfoPtr iconinfo, PointPtr position,
+                               void (*notify)(WindowPtr, Bool))
+{
+    error *err = NULL;
+
+    interactor_cancel ();                        /* Just in case */
+
+    fontmenu = NULL;            /* forces below function to malloc space */
+    ER ( make_font_menu (iconinfo,
+                         dbox_getstring(win, f),
+                         &fontmenu) );
+
+    fontmenudata.f = f;
+    fontmenudata.s = s;
+    fontmenudata.d = d;
+    fontmenudata.u = u;
+    fontmenudata.notify = notify;
+
+    EG ( fail, menu_post (fontmenu, position, FALSE, font_menu_cb, (void *) win) );
+    return NULL;
+
+fail:
+    free ((char *) fontmenu);
+    fontmenu = NULL;
+    return err;
+}
+
+
+static int from_hex (char c)
+{
+    int x;
+    char s[2];
+    s[0] = c;
+    s[1] = 0;
+    sscanf(s, "%x", &x);
+    return x;
+}
+
+
+static char to_hex (int x)
+{
+    char s[10];
+    sprintf(s, "%x", x);
+    return *s;
+}
+
+
+/*
+ * Remember what the colours of this icon are, either from the
+ * validation string or the icon flags.  If there was an 'F'
+ * entry in the v-string, remove it.
+ */
+
+static void get_icon_colours (IconPtr icon, char *valid)
+{
+    char colours[20];
+    fg_colour = 7; bg_colour = 1;               /* fallbacks */
+    template_edit_validation (valid, "f", NULL, colours);
+
+    if (icon->flags & IF_FONT)
+    {
+        if (strlen(colours) >= 2)
+        {
+            bg_colour = from_hex(colours[0]);
+            fg_colour = from_hex(colours[1]);
+        }
+    }
+    else
+    {
+        fg_colour = IF_GET_FIELD(FG, icon->flags);
+        bg_colour = IF_GET_FIELD(BG, icon->flags);
+    }
+    dprintf("get_icon_colours: FG %x and BG %x\n" _ fg_colour _ bg_colour);
+}
+
+
+/*
+ * Set icon's colours as stored by the fill_in step.
+ */
+
+static void set_icon_colours (IconPtr icon, char *valid)
+{
+    if (icon->flags & IF_FONT)
+    {
+        if (valid)
+        {
+            char colours[3];
+            sprintf(colours, "%c%c", to_hex(bg_colour), to_hex(fg_colour));
+            template_edit_validation (valid, "f", colours, NULL);
+        }
+    }
+    else
+    {
+        IF_SET_FIELD(FG, icon->flags, fg_colour);
+        IF_SET_FIELD(BG, icon->flags, bg_colour);
+    }
+
+    /* Makes sure that the 'IF_FILLED' bit is turned off for
+     * fancy font + sprite icons.
+     * XXX This is not the correct test.  Ought to tabulate the default
+     * icon flags for the different types, I guess.
+     */
+#if 0
+    if ((icon->flags & (IF_FONT | IF_SPRITE)) == (IF_FONT | IF_SPRITE))
+        icon->flags &= ~IF_FILLED;
+    else
+        icon->flags |= IF_FILLED;
+#endif
+}
+
+
+/*
+ * Set the background colour of an icon to newbg.  Used by the code
+ * in colours.c that alters the window background colour.
+ */
+
+void props_set_icon_bg (IconInfoPtr icon, int newbg)
+{
+    int oldfg = fg_colour, oldbg = bg_colour;     /* yuck, sorry */
+    char valid[256];
+
+    template_read_validation (&icon->icon, valid);
+    get_icon_colours (&icon->icon, valid);
+    if (newbg != bg_colour)
+    {
+        bg_colour = newbg;
+        set_icon_colours (&icon->icon, valid);
+        template_write_validation (&icon->icon, valid);
+    }
+
+    if (icon->owner && icon->owner == dispitem)
+        fill_in ();
+    else
+    {
+        fg_colour = oldfg;
+        bg_colour = oldbg;
+    }
+}
+
+
+/*
+ * Try to change font of 'icon' to 'fontname'.  Ignore errors.
+ * We expect fg_colour and bg_colour to be set to the colours
+ * of the icon.  If we are changing to a fancy font, these colours
+ * are put into the validation string passed in.
+ */
+
+static void change_font (char *fontname, char *fontsize, IconPtr icon, char *valid)
+{
+    if (strcmp (fontname, message_lookup(&msgs, "SysFont")) == 0)
+    {
+        if (icon->flags & IF_FONT)
+        {
+            _swix(Font_LoseFont, _IN(0),
+                  IF_GET_FIELD(FONT, icon->flags));
+            icon->flags &= ~IF_FONT;
+        }
+    }
+    else
+    {
+        int size;
+        size = atoi (fontsize) * 16;
+        if (size > 0)
+        {
+            if (icon->flags & IF_FONT)
+            {
+                char buf[100];
+                int height;
+
+                _swix(Font_ReadDefn, _INR(0,1) | _OUT(3),
+                      IF_GET_FIELD(FONT, icon->flags), buf,
+                      &height);
+
+                if (size != height || strcmp(fontname, buf) != 0)
+                {
+                    /* Different font or size */
+                    int handle;
+                    if (_swix(Font_FindFont, _INR(1,5) | _OUT(0),
+                              fontname, size, size, 0, 0,
+                              &handle) == NULL)
+                    {
+                        _swix(Font_LoseFont, _IN(0),
+                              IF_GET_FIELD(FONT, icon->flags));
+                        IF_SET_FIELD(FONT, icon->flags, handle);
+                    }
+                }
+            }
+            else
+            {
+                int handle;
+                if (_swix(Font_FindFont, _INR(1,5) | _OUT(0),
+                          fontname, size, size, 0, 0,
+                          &handle) == NULL)
+                {
+                    IF_SET_FIELD(FONT, icon->flags, handle);
+                    icon->flags |= IF_FONT;
+                }
+            }
+        }
+        else
+            error_box (error_lookup ("BadSize", size));
+    }
+    set_icon_colours (icon, valid);
+}
+
+
+static void fill_in_dimensions (WindowPtr win, int w, int h, RectPtr bbox)
+{
+    dbox_setint (win, w, bbox->maxx - bbox->minx);
+    dbox_setint (win, h, bbox->maxy - bbox->miny);
+}
+
+
+static void fill_in_font (WindowPtr win, int f, int s, int d, int u, IconPtr icon)
+{
+    char buf[100];
+    int size;
+    if (icon->flags & IF_FONT)
+    {
+        dbox_shade (win, s, FALSE);
+        dbox_shade (win, u, FALSE);
+        dbox_shade (win, d, FALSE);
+        if (_swix(Font_ReadDefn, _INR(0,1) | _OUT(3),
+                  IF_GET_FIELD(FONT, icon->flags), buf,
+                  &size) == NULL)
+        {
+            dbox_setstring (win, f, buf);
+            dbox_setint (win, s, size / 16);
+            return;
+        }
+    }
+
+    dbox_shade (win, s, TRUE);
+    dbox_shade (win, u, TRUE);
+    dbox_shade (win, d, TRUE);
+    dbox_setstring (win, f, message_lookup (&msgs, "SysFont"));
+    dbox_setstring (win, s, "");
+}
+
+
+
+
+
+static JustifyType get_justification (WindowPtr win, int l, int r)
+{
+    if (dbox_getbutton (win, l)) return Left;
+    else if (dbox_getbutton (win, r)) return Right;
+    else return Centre;
+}
+
+
+/*
+ * Increment/decrement a numeric field.  Keep within
+ * specified range.  dbox_setint won't change the value
+ * unless it fits in the max. length of the icon.
+ */
+
+static void numeric (WindowPtr win, int i, int dir, int min, int max)
+{
+    int t = atoi(dbox_getstring (win, i)) + dir;
+    if (t >= min && t <= max)
+        dbox_setint (win, i, t);
+}
+
+
+
+/*
+ * Receive mouse clicks.  Dispatch thru type-specific code.
+ */
+
+error * props_mouse_click (MouseClickPtr mouse, unsigned int modifiers, WindowPtr win)
+{
+    /* Check for unexpected calls */
+    if (win != info[type].main && win != info[type].more)
+        return NULL;
+
+    if (info[type].mouseclick != NULL)
+        (*info[type].mouseclick) (win, mouse);
+
+    return NULL;
+}
+
+
+/*
+ * Fill in the current item
+ */
+
+static void fill_in ()
+{
+    RectRec bbox;
+    if (!dispitem || dispitem->type < 0 || dispitem->type >= NUMBER(info))
+        return;
+    template_item_bbox (dispres, dispitem, &bbox);
+    (*info[type].fillin) (info[type].main, info[type].more, &bbox);
+}
+
+
+/*
+ * Apply changes to current item
+ */
+
+static void apply (Bool adjust)
+{
+    RectRec bbox, newbbox;
+    Bool resize;
+
+    if (!dispitem || dispitem->type < 0 || dispitem->type >= NUMBER(info))
+        return;
+
+    template_item_bbox (dispres, dispitem, &bbox);
+    newbbox = bbox;
+
+    resize = (*info[type].apply) (info[type].main, info[type].more, &newbbox.maxx, &newbbox.miny);
+
+    newbbox.maxx = newbbox.minx + newbbox.maxx;
+    newbbox.miny = newbbox.maxy - newbbox.miny;
+
+    if (resize || wimp_bboxes_different (&bbox, &newbbox))
+    {
+        resize_item (dispres, dispitem, &newbbox);
+        wimp_merge_bboxes (&bbox, &bbox, &newbbox);
+    }
+
+    template_adjust_item_bbox (AddHighlight, &bbox, &bbox);
+    wimp_invalidate (&dispres->window, &bbox);
+
+    document_modified (dispres->owner, TRUE);
+
+    if (adjust)
+        fill_in ();
+    else
+    {
+        close_more ();
+        close_main ();
+    }
+}
+
+
+
+
+/*
+ * Return current dispres and dispitem.  If item is NULL,
+ * no item currently displayed.
+ */
+
+ItemInfoPtr props_current (ResourcePtr *res)
+{
+    if (res) *res = dispitem ? dispres : NULL;
+    return dispitem;
+}
+
+
+/*
+ * Return current props type
+ */
+
+ItemType props_type ()
+{
+    return type;
+}
+
+
+
+/*
+ * Update view of colours if palette changes
+ */
+
+void props_palette ()
+{
+    if (type == SimpleIcon)
+    {
+        colours_set_colour_display (info[type].more, I_MORE0_FG, -1);
+        colours_set_colour_display (info[type].more, I_MORE0_BG, -1);
+    }
+}
+
+
+
+/*
+ * TYPE SPECIFIC PROCS
+ */
+
+
+/*
+ * TYPE 0 - ICON
+ */
+
+
+static error * type0_menu_cb (MenuPtr menu, int *choice, void *closure, Bool reopen)
+{
+    WindowPtr win = (WindowPtr) closure;
+    if (choice != NULL)
+    {
+        dprintf("PROPS0 BUTTON TYPE MENU HIT %d\n" _ *choice);
+        if (*choice >= 0 && menu == butmenu)
+        {
+            winflags_set_but_display (win, I_MORE0_BUTTON, *choice);
+            if (reopen)
+                menu_tick_menu (menu, *choice);
+        }
+    }
+    return NULL;
+}
+
+
+/*
+ * Fill in the icon's data as appropriate to flags settings given.
+ */
+
+static void get_icon_data (IconPtr icon, unsigned int flags, char *buf)
+{
+    *buf = 0;
+    switch (flags & (IF_INDIR | IF_TEXT | IF_SPRITE))
+    {
+    case IF_TEXT:
+    case IF_SPRITE:
+    case IF_TEXT | IF_SPRITE:
+        sprintf (buf, "%.*s", 11, (char *) &icon->data);
+        template_control_to_null (buf);
+        break;
+    case IF_INDIR | IF_TEXT:
+    case IF_INDIR | IF_SPRITE:
+    case IF_INDIR | IF_TEXT | IF_SPRITE:
+        strcpy (buf, (char *) icon->data[0]);
+        break;
+    }
+}
+
+
+static void shade (Bool t, Bool s, Bool i)
+{
+    WindowPtr main = info[type].main;
+
+    dbox_shade (main, I_PROPS0_NAME, !(i && t));
+    dbox_shade (main, I_PROPS0_DATA, !(t || s));
+    dbox_shade (main, I_PROPS0_VALID, !(i && t));
+    dbox_shade (main, I_PROPS0_LENGTH, !(i && t || i && s));
+    dbox_shade (main, I_PROPS0_LENGTH_ADJ_DOWN, !(i && t || i && s));
+    dbox_shade (main, I_PROPS0_LENGTH_ADJ_UP, !(i && t || i && s));
+}
+
+
+static void notify_font (WindowPtr win, Bool system)
+{
+    dbox_shade (win, I_MORE0_FG, !system);
+    dbox_shade (win, I_MORE0_FG_MENU, !system);
+    dbox_shade (win, I_MORE0_BG, !system);
+    dbox_shade (win, I_MORE0_BG_MENU, !system);
+}
+
+
+static void flag_bit (IconPtr icon, WindowPtr win, int i, unsigned int bit)
+{
+    if (dbox_getbutton (win, i))
+        icon->flags |= bit;
+    else
+        icon->flags &= ~bit;
+}
+
+
+static void ICON_fill_in (WindowPtr main, WindowPtr more, RectPtr bbox)
+{
+    IconInfoPtr master = dispres->icons + dispitem->u.master;
+    unsigned int flags = master->icon.flags;
+    char buf[256];
+    char *v = template_get_validation (&master->icon);
+    if (!v)
+        v = "";
+
+    dbox_setstring (main, I_PROPS0_NAME, dispitem->name);
+    dbox_shade (main, I_PROPS0_NAME, !((flags & (IF_INDIR | IF_TEXT)) == (IF_INDIR | IF_TEXT)));
+    dbox_setbutton (main, I_PROPS0_TEXT, flags & IF_TEXT);
+    dbox_setbutton (main, I_PROPS0_SPRITE, flags & IF_SPRITE);
+    dbox_setbutton (main, I_PROPS0_INDIR, flags & IF_INDIR);
+    get_icon_data (&master->icon, flags, buf);
+    dbox_setstring (main, I_PROPS0_DATA, buf);
+
+    shade (flags & IF_TEXT, flags & IF_SPRITE, flags & IF_INDIR);
+
+    dbox_setstring (main, I_PROPS0_VALID, v);
+    if (flags & IF_INDIR)
+        dbox_setint (main, I_PROPS0_LENGTH,  master->icon.data[2]);
+    else
+        dbox_setstring (main, I_PROPS0_LENGTH, "");
+
+    fill_in_dimensions (more, I_MORE0_WIDTH, I_MORE0_HEIGHT, bbox);
+    fill_in_font (more, I_MORE0_FONT, I_MORE0_FONTSIZE,
+                  I_MORE0_FONTSIZE_ADJ_DOWN, I_MORE0_FONTSIZE_ADJ_UP, &master->icon);
+    dbox_setint (more, I_MORE0_ICON, dispitem->u.master);
+    dbox_setbutton (more, I_MORE0_BORDER, flags & IF_BORDER);
+    dbox_setbutton (more, I_MORE0_FILLED, flags & IF_FILLED);
+    dbox_setbutton (more, I_MORE0_HCENT, flags & IF_HCENT);
+    dbox_setbutton (more, I_MORE0_VCENT, flags & IF_VCENT);
+    dbox_setbutton (more, I_MORE0_RJUST, flags & IF_RJUST);
+    dbox_setbutton (more, I_MORE0_HELP, flags & IF_HELP);
+    dbox_setbutton (more, I_MORE0_ADJUST, flags & IF_ADJUST);
+    dbox_setbutton (more, I_MORE0_HALFSIZE, flags & IF_HALFSIZE);
+    dbox_setbutton (more, I_MORE0_SELECTED, flags & IF_SELECTED);
+    dbox_setbutton (more, I_MORE0_SHADED, flags & IF_SHADED);
+    winflags_set_but_display (more, I_MORE0_BUTTON, IF_GET_FIELD(TYPE, flags));
+    dbox_shade (more, I_MORE0_FG, flags & IF_FONT);
+    dbox_shade (more, I_MORE0_FG_MENU, flags & IF_FONT);
+    dbox_shade (more, I_MORE0_BG, flags & IF_FONT);
+    dbox_shade (more, I_MORE0_BG_MENU, flags & IF_FONT);
+    colours_set_colour_display (more, I_MORE0_FG, flags & IF_FONT ? 7 : IF_GET_FIELD(FG, flags));
+    colours_set_colour_display (more, I_MORE0_BG, flags & IF_FONT ? 0 : IF_GET_FIELD(BG, flags));
+    dbox_setint (more, I_MORE0_ESG, IF_GET_FIELD (ESG, flags));
+}
+
+
+static void ICON_mouse_click (WindowPtr win, MouseClickPtr mouse)
+{
+    int buttons = mouse->buttons;
+    int icon = mouse->iconhandle;
+    int dir = buttons == MB_CLICK(MB_ADJUST) ? -1 : 1;
+    WindowPtr main = info[type].main;
+    WindowPtr more = info[type].more;
+
+    if (win == main)
+    {
+        if (buttons == MB_CLICK(MB_SELECT) || buttons == MB_CLICK(MB_ADJUST))
+        {
+            switch (mouse->iconhandle)
+            {
+            case I_PROPS0_MORE:
+                show_more_window ();
+                break;
+            case I_PROPS0_CANCEL:
+                close_more ();
+                close_main ();
+                break;
+            case I_PROPS0_OK:
+                apply (dir == -1);
+                break;
+            case I_PROPS0_TEXT:
+            case I_PROPS0_SPRITE:
+            case I_PROPS0_INDIR:
+                shade (dbox_getbutton (main, I_PROPS0_TEXT),
+                       dbox_getbutton (main, I_PROPS0_SPRITE),
+                       dbox_getbutton (main, I_PROPS0_INDIR));
+                break;
+            case I_PROPS0_LENGTH_ADJ_DOWN:
+                dir = -dir;
+            case I_PROPS0_LENGTH_ADJ_UP:
+                numeric (win, I_PROPS0_LENGTH, dir, 1, BIG);
+                break;
+            }
+        }
+    }
+    else if (win == more)
+    {
+        if (buttons == MB_CLICK(MB_MENU) && (icon == I_MORE0_FONTMENU || icon == I_MORE0_FONT)
+            || buttons == MB_CLICK(MB_SELECT) && icon == I_MORE0_FONTMENU)
+            post_font_menu (win, I_MORE0_FONT, I_MORE0_FONTSIZE,
+                            I_MORE0_FONTSIZE_ADJ_DOWN, I_MORE0_FONTSIZE_ADJ_UP,
+                            dispres->icons + dispitem->u.master, &mouse->position,
+                            notify_font);
+        else if (buttons == MB_CLICK(MB_MENU) && (icon == I_MORE0_FG_MENU || icon == I_MORE0_FG)
+                 || buttons == MB_CLICK(MB_SELECT) && icon == I_MORE0_FG_MENU)
+        {
+            colours_do_colour_menu (win, I_MORE0_FG, &mouse->position, FALSE);
+        }
+        else if (buttons == MB_CLICK(MB_MENU) && (icon == I_MORE0_BG_MENU || icon == I_MORE0_BG)
+                 || buttons == MB_CLICK(MB_SELECT) && icon == I_MORE0_BG_MENU)
+        {
+            colours_do_colour_menu (win, I_MORE0_BG, &mouse->position, FALSE);
+        }
+        else if (buttons == MB_CLICK(MB_MENU) && (icon == I_MORE0_BUTTON_MENU || icon == I_MORE0_BUTTON)
+                 || buttons == MB_CLICK(MB_SELECT) && icon == I_MORE0_BUTTON_MENU)
+        {
+            menu_tick_menu (butmenu, winflags_get_but_display (more, I_MORE0_BUTTON));
+            menu_post (butmenu, &mouse->position, FALSE, type0_menu_cb, (void *) more);
+        }
+        else if (buttons == MB_CLICK(MB_SELECT) || buttons == MB_CLICK(MB_ADJUST))
+        {
+            switch (mouse->iconhandle)
+            {
+            case I_MORE0_WIDTH_ADJ_DOWN:
+                dir = -dir;
+            case I_MORE0_WIDTH_ADJ_UP:
+                numeric (win, I_MORE0_WIDTH, dir, 0, BIG);
+                break;
+            case I_MORE0_HEIGHT_ADJ_DOWN:
+                dir = -dir;
+            case I_MORE0_HEIGHT_ADJ_UP:
+                numeric (win, I_MORE0_HEIGHT, dir, 0, BIG);
+                break;
+            case I_MORE0_FONTSIZE_ADJ_DOWN:
+                dir = -dir;
+            case I_MORE0_FONTSIZE_ADJ_UP:
+                numeric (win, I_MORE0_FONTSIZE, dir, 1, BIG);
+                break;
+            case I_MORE0_FONTMENU:
+                post_font_menu (win, I_MORE0_FONT, I_MORE0_FONTSIZE,
+                                I_MORE0_FONTSIZE_ADJ_DOWN, I_MORE0_FONTSIZE_ADJ_UP,
+                                dispres->icons + dispitem->u.master, &mouse->position,
+                                NULL);
+                break;
+            case I_MORE0_ESG_ADJ_DOWN:
+                dir = -dir;
+            case I_MORE0_ESG_ADJ_UP:
+                numeric (win, I_MORE0_ESG, dir, 0, 31);
+                break;
+            case I_MORE0_CLOSE:
+                close_more ();
+                break;
+            }
+        }
+    }
+}
+
+
+static Bool ICON_apply (WindowPtr main, WindowPtr more, int *width, int *height)
+{
+    IconInfoPtr master = dispres->icons + dispitem->u.master;
+    IconPtr icon = &master->icon;
+    char *s;
+    int esg;
+
+    sprintf (dispitem->name, "%.*s", ITEMNAMELEN - 1, dbox_getstring (main, I_PROPS0_NAME));
+    strcpy (validation, dbox_getstring (main, I_PROPS0_VALID));
+
+    /*
+     * Free any storage associated with old data.  These functions do
+     * nothing if the flags say that it is not appropriate.
+     */
+
+    template_write_text (icon, NULL, 0);
+    template_write_validation (icon, "");
+    icon->data[0] = icon->data[2] = 0;
+    icon->data[1] = -1;
+
+    fg_colour = colours_get_colour_display (more, I_MORE0_FG);
+    bg_colour = colours_get_colour_display (more, I_MORE0_BG);
+
+    change_font (dbox_getstring (more, I_MORE0_FONT),
+                 dbox_getstring (more, I_MORE0_FONTSIZE), icon, NULL);
+
+    /* should use a table for this! */
+    flag_bit (icon, main, I_PROPS0_TEXT, IF_TEXT);
+    flag_bit (icon, main, I_PROPS0_SPRITE, IF_SPRITE);
+    flag_bit (icon, main, I_PROPS0_INDIR, IF_INDIR);
+    flag_bit (icon, more, I_MORE0_BORDER, IF_BORDER);
+    flag_bit (icon, more, I_MORE0_FILLED, IF_FILLED);
+    flag_bit (icon, more, I_MORE0_HCENT, IF_HCENT);
+    flag_bit (icon, more, I_MORE0_VCENT, IF_VCENT);
+    flag_bit (icon, more, I_MORE0_RJUST, IF_RJUST);
+    flag_bit (icon, more, I_MORE0_HELP, IF_HELP);
+    flag_bit (icon, more, I_MORE0_ADJUST, IF_ADJUST);
+    flag_bit (icon, more, I_MORE0_HALFSIZE, IF_HALFSIZE);
+    flag_bit (icon, more, I_MORE0_SELECTED, IF_SELECTED);
+    flag_bit (icon, more, I_MORE0_SHADED, IF_SHADED);
+
+    switch (icon->flags & IF_IST)
+    {
+    case IF_TEXT:
+    case IF_SPRITE:
+    case IF_TEXT | IF_SPRITE:
+        sprintf ((char *) icon->data, "%.*s", 11, dbox_getstring (main, I_PROPS0_DATA));
+        s = strchr ((char *) icon->data, 0);
+        if (s)
+            *s = 13;
+        break;
+    case IF_INDIR | IF_TEXT:
+    case IF_INDIR | IF_TEXT | IF_SPRITE:
+        template_write_text (icon, dbox_getstring (main, I_PROPS0_DATA), atoi (dbox_getstring (main, I_PROPS0_LENGTH)));
+        template_write_validation (icon, dbox_getstring (main, I_PROPS0_VALID));
+        break;
+    case IF_INDIR | IF_SPRITE:
+        template_write_text (icon, dbox_getstring (main, I_PROPS0_DATA), atoi (dbox_getstring (main, I_PROPS0_LENGTH)));
+        icon->data[1] = -1;
+        break;
+    }
+
+    IF_SET_FIELD (TYPE, icon->flags, winflags_get_but_display (more, I_MORE0_BUTTON));
+
+    esg = atoi (dbox_getstring (more, I_MORE0_ESG));
+    if (esg < 0 || esg > 31)
+        error_box (error_lookup ("BadESG", esg));
+    else
+        IF_SET_FIELD (ESG, icon->flags, esg);
+
+    *width = atoi(dbox_getstring(more, I_MORE0_WIDTH));
+    *height = atoi(dbox_getstring(more, I_MORE0_HEIGHT));
+
+    /* Renumbering */
+
+    ED ( template_renumber_icon (dispres, dispitem, dispitem->u.master,
+                                 atoi(dbox_getstring(more, I_MORE0_ICON))) );
+    return FALSE;
+}
+
+
+/*
+ * TYPE 1: BUTTON
+ */
+
+static void BUTTON_fill_in (WindowPtr main, WindowPtr more, RectPtr bbox)
+{
+    IconInfoPtr master = dispres->icons + dispitem->u.master;
+    char spritename[100];
+
+    template_read_validation (&master->icon, validation);
+    template_edit_validation (validation, "s", NULL, spritename);
+
+    get_icon_colours (&master->icon, validation);
+
+    dbox_setstring (main, I_PROPS1_NAME, dispitem->name);
+    dbox_setstring (main, I_PROPS1_TEXT, (char *) master->icon.data[0]);
+    dbox_setstring (main, I_PROPS1_SPRITE, spritename);
+
+    fill_in_dimensions (more, I_MORE1_WIDTH, I_MORE1_HEIGHT, bbox);
+    fill_in_font (more, I_MORE1_FONT, I_MORE1_FONTSIZE,
+                  I_MORE1_FONTSIZE_ADJ_DOWN, I_MORE1_FONTSIZE_ADJ_UP, &master->icon);
+
+
+    dbox_setint (more, I_MORE1_ICON, dispitem->u.master);
+}
+
+
+static void BUTTON_mouse_click (WindowPtr win, MouseClickPtr mouse)
+{
+    int dir = mouse->buttons == MB_CLICK(MB_ADJUST) ? -1 : 1;
+
+    if (mouse->buttons == MB_CLICK(MB_MENU) && win == info[type].main
+        && mouse->iconhandle == I_MORE1_FONTMENU)
+    {
+        post_font_menu (win, I_MORE1_FONT, I_MORE1_FONTSIZE,
+                        I_MORE1_FONTSIZE_ADJ_DOWN, I_MORE1_FONTSIZE_ADJ_UP,
+                        dispres->icons + dispitem->u.master, &mouse->position,
+                        NULL);
+    }
+    else if (mouse->buttons == MB_CLICK(MB_SELECT) ||
+             mouse->buttons == MB_CLICK(MB_ADJUST))
+    {
+        if (win == info[type].main)
+        {
+            switch (mouse->iconhandle)
+            {
+            case I_PROPS1_MORE:
+                show_more_window ();
+                break;
+            case I_PROPS1_CANCEL:
+                close_more ();
+                close_main ();
+                break;
+            case I_PROPS1_OK:
+                apply (dir == -1);
+                break;
+            }
+        }
+        else if (win == info[type].more)
+        {
+            switch (mouse->iconhandle)
+            {
+            case I_MORE1_WIDTH_ADJ_DOWN:
+                dir = -dir;
+            case I_MORE1_WIDTH_ADJ_UP:
+                numeric (win, I_MORE1_WIDTH, dir, 0, BIG);
+                break;
+            case I_MORE1_HEIGHT_ADJ_DOWN:
+                dir = -dir;
+            case I_MORE1_HEIGHT_ADJ_UP:
+                numeric (win, I_MORE1_HEIGHT, dir, 0, BIG);
+                break;
+            case I_MORE1_FONTSIZE_ADJ_DOWN:
+                dir = -dir;
+            case I_MORE1_FONTSIZE_ADJ_UP:
+                numeric (win, I_MORE1_FONTSIZE, dir, 1, BIG);
+                break;
+            case I_MORE1_FONTMENU:
+                post_font_menu (win, I_MORE1_FONT, I_MORE1_FONTSIZE,
+                                I_MORE1_FONTSIZE_ADJ_DOWN, I_MORE1_FONTSIZE_ADJ_UP,
+                                dispres->icons + dispitem->u.master, &mouse->position,
+                                NULL);
+                break;
+            case I_MORE1_CLOSE:
+                close_more ();
+                break;
+            }
+        }
+    }
+}
+
+
+static Bool BUTTON_apply (WindowPtr main, WindowPtr more, int *width, int *height)
+{
+    IconInfoPtr master = dispres->icons + dispitem->u.master;
+    char *spritename = dbox_getstring (main, I_PROPS1_SPRITE);
+    char *text = dbox_getstring (main, I_PROPS1_TEXT);
+
+    sprintf (dispitem->name, "%.*s", ITEMNAMELEN - 1, dbox_getstring (main, I_PROPS1_NAME));
+
+    if (*spritename)
+    {
+        master->icon.flags |= IF_SPRITE;
+        template_edit_validation (validation, "S", spritename, NULL);
+    }
+    else
+        master->icon.flags &= ~IF_SPRITE;
+
+    template_write_text (&master->icon, text, -1);
+    change_font (dbox_getstring (more, I_MORE1_FONT),
+                 dbox_getstring (more, I_MORE1_FONTSIZE), &master->icon, validation);
+    template_write_validation (&master->icon, validation);
+
+    *width = atoi(dbox_getstring(more, I_MORE1_WIDTH));
+    *height = atoi(dbox_getstring(more, I_MORE1_HEIGHT));
+
+    /* Renumbering */
+
+    ED ( template_renumber_icon (dispres, dispitem, dispitem->u.master,
+                                 atoi(dbox_getstring(more, I_MORE1_ICON))) );
+    return FALSE;
+}
+
+
+
+/*
+ * TYPE 2 - LABEL
+ */
+
+static void LABEL_fill_in (WindowPtr main, WindowPtr more, RectPtr bbox)
+{
+    IconInfoPtr master = dispres->icons + dispitem->u.master;
+    JustifyType just = justify_type (master);
+    char spritename[100];
+
+    template_read_validation (&master->icon, validation);
+    template_edit_validation (validation, "s", NULL, spritename);
+    get_icon_colours (&master->icon, validation);
+
+    dbox_setstring (main, I_PROPS2_NAME, dispitem->name);
+    dbox_setstring (main, I_PROPS2_TEXT, (char *) master->icon.data[0]);
+    dbox_setstring (main, I_PROPS2_SPRITE, spritename);
+    dbox_setbutton (main, I_PROPS2_LEFT, just == Left);
+    dbox_setbutton (main, I_PROPS2_RIGHT, just == Right);
+    dbox_setbutton (main, I_PROPS2_CENTRE, just == Centre);
+
+    fill_in_dimensions (more, I_MORE2_WIDTH, I_MORE2_HEIGHT, bbox);
+    fill_in_font (more, I_MORE2_FONT, I_MORE2_FONTSIZE,
+                  I_MORE2_FONTSIZE_ADJ_DOWN, I_MORE2_FONTSIZE_ADJ_UP, &master->icon);
+
+    dbox_setint (more, I_MORE2_ICON, dispitem->u.master);
+}
+
+
+static void LABEL_mouse_click (WindowPtr win, MouseClickPtr mouse)
+{
+    int dir = mouse->buttons == MB_CLICK(MB_ADJUST) ? -1 : 1;
+
+    if (mouse->buttons == MB_CLICK(MB_MENU) && win == info[type].main
+        && mouse->iconhandle == I_MORE2_FONTMENU)
+    {
+        post_font_menu (win, I_MORE2_FONT, I_MORE2_FONTSIZE,
+                        I_MORE2_FONTSIZE_ADJ_DOWN, I_MORE2_FONTSIZE_ADJ_UP,
+                        dispres->icons + dispitem->u.master, &mouse->position,
+                        NULL);
+    }
+    else if (mouse->buttons == MB_CLICK(MB_SELECT) ||
+             mouse->buttons == MB_CLICK(MB_ADJUST))
+    {
+        if (win == info[type].main)
+        {
+            switch (mouse->iconhandle)
+            {
+            case I_PROPS2_MORE:
+                show_more_window ();
+                break;
+            case I_PROPS2_CANCEL:
+                close_more ();
+                close_main ();
+                break;
+            case I_PROPS2_OK:
+                apply (dir == -1);
+                break;
+            }
+        }
+        else if (win == info[type].more)
+        {
+            switch (mouse->iconhandle)
+            {
+            case I_MORE2_WIDTH_ADJ_DOWN:
+                dir = -dir;
+            case I_MORE2_WIDTH_ADJ_UP:
+                numeric (win, I_MORE2_WIDTH, dir, 0, BIG);
+                break;
+            case I_MORE2_HEIGHT_ADJ_DOWN:
+                dir = -dir;
+            case I_MORE2_HEIGHT_ADJ_UP:
+                numeric (win, I_MORE2_HEIGHT, dir, 0, BIG);
+                break;
+            case I_MORE2_FONTSIZE_ADJ_DOWN:
+                dir = -dir;
+            case I_MORE2_FONTSIZE_ADJ_UP:
+                numeric (win, I_MORE2_FONTSIZE, dir, 1, BIG);
+                break;
+            case I_MORE2_FONTMENU:
+                post_font_menu (win, I_MORE2_FONT, I_MORE2_FONTSIZE,
+                                I_MORE2_FONTSIZE_ADJ_DOWN, I_MORE2_FONTSIZE_ADJ_UP,
+                                dispres->icons + dispitem->u.master, &mouse->position,
+                                NULL);
+                break;
+            case I_MORE2_CLOSE:
+                close_more ();
+                break;
+            }
+        }
+    }
+}
+
+
+static Bool LABEL_apply (WindowPtr main, WindowPtr more, int *width, int *height)
+{
+    IconInfoPtr master = dispres->icons + dispitem->u.master;
+    char *spritename = dbox_getstring (main, I_PROPS2_SPRITE);
+    char *text = dbox_getstring (main, I_PROPS2_TEXT);
+
+    sprintf (dispitem->name, "%.*s", ITEMNAMELEN - 1, dbox_getstring (main, I_PROPS2_NAME));
+
+    if (*spritename)
+    {
+        master->icon.flags |= IF_SPRITE;
+        template_edit_validation (validation, "S", spritename, NULL);
+    }
+    else
+        master->icon.flags &= ~IF_SPRITE;
+
+    justify_settype (master, get_justification (main, I_PROPS2_LEFT, I_PROPS2_RIGHT));
+    template_write_text (&master->icon, text, -1);
+    change_font (dbox_getstring (more, I_MORE2_FONT),
+                 dbox_getstring (more, I_MORE2_FONTSIZE), &master->icon, validation);
+    template_write_validation (&master->icon, validation);
+
+    *width = atoi(dbox_getstring(more, I_MORE2_WIDTH));
+    *height = atoi(dbox_getstring(more, I_MORE2_HEIGHT));
+
+    /* Renumbering */
+
+    ED ( template_renumber_icon (dispres, dispitem, dispitem->u.master,
+                                 atoi(dbox_getstring(more, I_MORE2_ICON))) );
+    return FALSE;
+}
+
+
+
+/*
+ * TYPE 3 - DISPLAY
+ */
+
+static void DISPLAY_fill_in (WindowPtr main, WindowPtr more, RectPtr bbox)
+{
+    IconInfoPtr master = dispres->icons + dispitem->u.master;
+    JustifyType just = justify_type (master);
+    char spritename[100];
+
+    template_read_validation (&master->icon, validation);
+    template_edit_validation (validation, "s", NULL, spritename);
+    get_icon_colours (&master->icon, validation);
+
+    dbox_setstring (main, I_PROPS3_NAME, dispitem->name);
+    dbox_setstring (main, I_PROPS3_TEXT, (char *) master->icon.data[0]);
+    dbox_setstring (main, I_PROPS3_SPRITE, spritename);
+    dbox_setbutton (main, I_PROPS3_LEFT, just == Left);
+    dbox_setbutton (main, I_PROPS3_RIGHT, just == Right);
+    dbox_setbutton (main, I_PROPS3_CENTRE, just == Centre);
+
+    fill_in_dimensions (more, I_MORE3_WIDTH, I_MORE3_HEIGHT, bbox);
+    fill_in_font (more, I_MORE3_FONT, I_MORE3_FONTSIZE,
+                  I_MORE3_FONTSIZE_ADJ_DOWN, I_MORE3_FONTSIZE_ADJ_UP, &master->icon);
+
+    dbox_setint (more, I_MORE3_LENGTH, master->icon.data[2]);
+    dbox_setint (more, I_MORE3_ICON, dispitem->u.master);
+}
+
+
+static void DISPLAY_mouse_click (WindowPtr win, MouseClickPtr mouse)
+{
+    int dir = mouse->buttons == MB_CLICK(MB_ADJUST) ? -1 : 1;
+
+    if (mouse->buttons == MB_CLICK(MB_MENU) && win == info[type].main
+        && mouse->iconhandle == I_MORE3_FONTMENU)
+    {
+        post_font_menu (win, I_MORE3_FONT, I_MORE3_FONTSIZE,
+                        I_MORE3_FONTSIZE_ADJ_DOWN, I_MORE3_FONTSIZE_ADJ_UP,
+                        dispres->icons + dispitem->u.master, &mouse->position,
+                        NULL);
+    }
+    else if (mouse->buttons == MB_CLICK(MB_SELECT) ||
+             mouse->buttons == MB_CLICK(MB_ADJUST))
+    {
+        if (win == info[type].main)
+        {
+            switch (mouse->iconhandle)
+            {
+            case I_PROPS3_MORE:
+                show_more_window ();
+                break;
+            case I_PROPS3_CANCEL:
+                close_more ();
+                close_main ();
+                break;
+            case I_PROPS3_OK:
+                apply (dir == -1);
+                break;
+            }
+        }
+        else if (win == info[type].more)
+        {
+            switch (mouse->iconhandle)
+            {
+            case I_MORE3_WIDTH_ADJ_DOWN:
+                dir = -dir;
+            case I_MORE3_WIDTH_ADJ_UP:
+                numeric (win, I_MORE3_WIDTH, dir, 0, BIG);
+                break;
+            case I_MORE3_HEIGHT_ADJ_DOWN:
+                dir = -dir;
+            case I_MORE3_HEIGHT_ADJ_UP:
+                numeric (win, I_MORE3_HEIGHT, dir, 0, BIG);
+                break;
+            case I_MORE3_FONTSIZE_ADJ_DOWN:
+                dir = -dir;
+            case I_MORE3_FONTSIZE_ADJ_UP:
+                numeric (win, I_MORE3_FONTSIZE, dir, 1, BIG);
+                break;
+            case I_MORE3_LENGTH_ADJ_DOWN:
+                dir = -dir;
+            case I_MORE3_LENGTH_ADJ_UP:
+                numeric (win, I_MORE3_LENGTH, dir, 1, BIG);
+                break;
+            case I_MORE3_FONTMENU:
+                post_font_menu (win, I_MORE3_FONT, I_MORE3_FONTSIZE,
+                                I_MORE3_FONTSIZE_ADJ_DOWN, I_MORE3_FONTSIZE_ADJ_UP,
+                                dispres->icons + dispitem->u.master, &mouse->position,
+                                NULL);
+                break;
+            case I_MORE3_CLOSE:
+                close_more ();
+                break;
+            }
+        }
+    }
+}
+
+
+static Bool DISPLAY_apply (WindowPtr main, WindowPtr more, int *width, int *height)
+{
+    IconInfoPtr master = dispres->icons + dispitem->u.master;
+    char *spritename = dbox_getstring (main, I_PROPS3_SPRITE);
+    char *text = dbox_getstring (main, I_PROPS3_TEXT);
+
+    sprintf (dispitem->name, "%.*s", ITEMNAMELEN - 1, dbox_getstring (main, I_PROPS3_NAME));
+
+    if (*spritename)
+    {
+        master->icon.flags |= IF_SPRITE;
+        template_edit_validation (validation, "S", spritename, NULL);
+    }
+    else
+        master->icon.flags &= ~IF_SPRITE;
+
+    justify_settype (master, get_justification (main, I_PROPS3_LEFT, I_PROPS3_RIGHT));
+
+    template_write_text (&master->icon, text, atoi (dbox_getstring (more, I_MORE3_LENGTH)));
+    change_font (dbox_getstring (more, I_MORE3_FONT),
+                 dbox_getstring (more, I_MORE3_FONTSIZE), &master->icon, validation);
+    template_write_validation (&master->icon, validation);
+
+    *width = atoi(dbox_getstring(more, I_MORE3_WIDTH));
+    *height = atoi(dbox_getstring(more, I_MORE3_HEIGHT));
+
+    /* Renumbering */
+
+    ED ( template_renumber_icon (dispres, dispitem, dispitem->u.master,
+                                 atoi(dbox_getstring(more, I_MORE3_ICON))) );
+    return FALSE;
+}
+
+
+/*
+ * TYPE 4 - WRITEABLE
+ */
+
+static void WRITEABLE_fill_in (WindowPtr main, WindowPtr more, RectPtr bbox)
+{
+    IconInfoPtr master = dispres->icons + dispitem->u.master;
+    JustifyType just = justify_type (master);
+
+    template_read_validation (&master->icon, validation);
+    get_icon_colours (&master->icon, validation);
+
+    dbox_setstring (main, I_PROPS4_NAME, dispitem->name);
+    dbox_setstring (main, I_PROPS4_TEXT, (char *) master->icon.data[0]);
+    dbox_setstring (main, I_PROPS4_VALID, validation);
+    dbox_setbutton (main, I_PROPS4_LEFT, just == Left);
+    dbox_setbutton (main, I_PROPS4_RIGHT, just == Right);
+    dbox_setbutton (main, I_PROPS4_CENTRE, just == Centre);
+
+    fill_in_dimensions (more, I_MORE4_WIDTH, I_MORE4_HEIGHT, bbox);
+    fill_in_font (more, I_MORE4_FONT, I_MORE4_FONTSIZE,
+                  I_MORE4_FONTSIZE_ADJ_DOWN, I_MORE4_FONTSIZE_ADJ_UP, &master->icon);
+
+    dbox_setint (more, I_MORE4_LENGTH, master->icon.data[2]);
+    dbox_setint (more, I_MORE4_ICON, dispitem->u.master);
+}
+
+
+static void WRITEABLE_mouse_click (WindowPtr win, MouseClickPtr mouse)
+{
+    int dir = mouse->buttons == MB_CLICK(MB_ADJUST) ? -1 : 1;
+
+    if (mouse->buttons == MB_CLICK(MB_MENU) && win == info[type].main
+        && mouse->iconhandle == I_MORE4_FONTMENU)
+    {
+        post_font_menu (win, I_MORE4_FONT, I_MORE4_FONTSIZE,
+                        I_MORE4_FONTSIZE_ADJ_DOWN, I_MORE4_FONTSIZE_ADJ_UP,
+                        dispres->icons + dispitem->u.master, &mouse->position,
+                        NULL);
+    }
+    else if (mouse->buttons == MB_CLICK(MB_SELECT) ||
+             mouse->buttons == MB_CLICK(MB_ADJUST))
+    {
+        if (win == info[type].main)
+        {
+            switch (mouse->iconhandle)
+            {
+            case I_PROPS4_MORE:
+                show_more_window ();
+                break;
+            case I_PROPS4_CANCEL:
+                close_more ();
+                close_main ();
+                break;
+            case I_PROPS4_OK:
+                apply (dir == -1);
+                break;
+            }
+        }
+        else if (win == info[type].more)
+        {
+            switch (mouse->iconhandle)
+            {
+            case I_MORE4_WIDTH_ADJ_DOWN:
+                dir = -dir;
+            case I_MORE4_WIDTH_ADJ_UP:
+                numeric (win, I_MORE4_WIDTH, dir, 0, BIG);
+                break;
+            case I_MORE4_HEIGHT_ADJ_DOWN:
+                dir = -dir;
+            case I_MORE4_HEIGHT_ADJ_UP:
+                numeric (win, I_MORE4_HEIGHT, dir, 0, BIG);
+                break;
+            case I_MORE4_FONTSIZE_ADJ_DOWN:
+                dir = -dir;
+            case I_MORE4_FONTSIZE_ADJ_UP:
+                numeric (win, I_MORE4_FONTSIZE, dir, 1, BIG);
+                break;
+            case I_MORE4_LENGTH_ADJ_DOWN:
+                dir = -dir;
+            case I_MORE4_LENGTH_ADJ_UP:
+                numeric (win, I_MORE4_LENGTH, dir, 1, BIG);
+                break;
+            case I_MORE4_FONTMENU:
+                post_font_menu (win, I_MORE4_FONT, I_MORE4_FONTSIZE,
+                                I_MORE4_FONTSIZE_ADJ_DOWN, I_MORE4_FONTSIZE_ADJ_UP,
+                                dispres->icons + dispitem->u.master, &mouse->position,
+                                NULL);
+                break;
+            case I_MORE4_CLOSE:
+                close_more ();
+                break;
+            }
+        }
+    }
+}
+
+
+static Bool WRITEABLE_apply (WindowPtr main, WindowPtr more, int *width, int *height)
+{
+    IconInfoPtr master = dispres->icons + dispitem->u.master;
+    char *text = dbox_getstring (main, I_PROPS4_TEXT);
+
+    sprintf (dispitem->name, "%.*s", ITEMNAMELEN - 1, dbox_getstring (main, I_PROPS4_NAME));
+    strcpy (validation, dbox_getstring (main, I_PROPS4_VALID));
+
+    justify_settype (master, get_justification (main, I_PROPS4_LEFT, I_PROPS4_RIGHT));
+
+    template_write_text (&master->icon, text, atoi (dbox_getstring (more, I_MORE4_LENGTH)));
+    change_font (dbox_getstring (more, I_MORE4_FONT),
+                 dbox_getstring (more, I_MORE4_FONTSIZE), &master->icon, validation);
+    template_write_validation (&master->icon, validation);
+
+    *width = atoi(dbox_getstring(more, I_MORE4_WIDTH));
+    *height = atoi(dbox_getstring(more, I_MORE4_HEIGHT));
+
+    /* Renumbering */
+
+    ED ( template_renumber_icon (dispres, dispitem, dispitem->u.master,
+                                 atoi(dbox_getstring(more, I_MORE4_ICON))) );
+    return FALSE;
+}
+
+
+
+/*
+ * TYPE 5/6 - SLIDER
+ */
+
+static void SLIDER_fill_in (WindowPtr main, WindowPtr more, RectPtr bbox)
+{
+    dbox_setstring (main, I_PROPS5_NAME, dispitem->name);
+    fill_in_dimensions (more, I_MORE5_WIDTH, I_MORE5_HEIGHT, bbox);
+    dbox_setint (more, I_MORE5_WELL_ICON, dispitem->u.slider.well);
+    dbox_setint (more, I_MORE5_TRACK_ICON, dispitem->u.slider.track);
+    dbox_setint (more, I_MORE5_KNOB_ICON, dispitem->u.slider.knob);
+}
+
+
+static void SLIDER_mouse_click (WindowPtr win, MouseClickPtr mouse)
+{
+    int dir = mouse->buttons == MB_CLICK(MB_ADJUST) ? -1 : 1;
+
+    if (mouse->buttons == MB_CLICK(MB_SELECT) ||
+        mouse->buttons == MB_CLICK(MB_ADJUST))
+    {
+        if (win == info[type].main)
+        {
+            switch (mouse->iconhandle)
+            {
+            case I_PROPS5_MORE:
+                show_more_window ();
+                break;
+            case I_PROPS5_CANCEL:
+                close_more ();
+                close_main ();
+                break;
+            case I_PROPS5_OK:
+                apply (dir == -1);
+                break;
+            }
+        }
+        else if (win == info[type].more)
+        {
+            switch (mouse->iconhandle)
+            {
+            case I_MORE5_WIDTH_ADJ_DOWN:
+                dir = -dir;
+            case I_MORE5_WIDTH_ADJ_UP:
+                numeric (win, I_MORE5_WIDTH, dir, 0, BIG);
+                break;
+            case I_MORE5_HEIGHT_ADJ_DOWN:
+                dir = -dir;
+            case I_MORE5_HEIGHT_ADJ_UP:
+                numeric (win, I_MORE5_HEIGHT, dir, 0, BIG);
+                break;
+            case I_MORE5_CLOSE:
+                close_more ();
+                break;
+            }
+        }
+    }
+}
+
+
+static Bool SLIDER_apply (WindowPtr main, WindowPtr more, int *width, int *height)
+{
+    sprintf (dispitem->name, "%.*s", ITEMNAMELEN - 1, dbox_getstring (main, I_PROPS5_NAME));
+
+    *width = atoi(dbox_getstring(more, I_MORE5_WIDTH));
+    *height = atoi(dbox_getstring(more, I_MORE5_HEIGHT));
+
+    /* Renumbering */
+
+    ED ( template_renumber_icon (dispres, dispitem, dispitem->u.slider.well,
+                                 atoi(dbox_getstring(more, I_MORE5_WELL_ICON))) );
+    ED ( template_renumber_icon (dispres, dispitem, dispitem->u.slider.track,
+                                 atoi(dbox_getstring(more, I_MORE5_TRACK_ICON))) );
+    ED ( template_renumber_icon (dispres, dispitem, dispitem->u.slider.knob,
+                                 atoi(dbox_getstring(more, I_MORE5_KNOB_ICON))) );
+    return FALSE;
+}
+
+
+
+/*
+ * TYPE 7 - OPTION
+ */
+
+static void OPTION_fill_in (WindowPtr main, WindowPtr more, RectPtr bbox)
+{
+    IconInfoPtr master = dispres->icons + dispitem->u.master;
+
+    template_read_validation (&master->icon, validation);
+    get_icon_colours (&master->icon, validation);
+
+    dbox_setstring (main, I_PROPS7_NAME, dispitem->name);
+    dbox_setstring (main, I_PROPS7_TEXT, (char *) master->icon.data[0]);
+    dbox_setbutton (main, I_PROPS7_SELECTED, master->icon.flags & IF_SELECTED);
+
+    fill_in_dimensions (more, I_MORE7_WIDTH, I_MORE7_HEIGHT, bbox);
+    fill_in_font (more, I_MORE7_FONT, I_MORE7_FONTSIZE,
+                  I_MORE7_FONTSIZE_ADJ_DOWN, I_MORE7_FONTSIZE_ADJ_UP, &master->icon);
+
+    dbox_setint (more, I_MORE7_ICON, dispitem->u.master);
+}
+
+
+static void OPTION_mouse_click (WindowPtr win, MouseClickPtr mouse)
+{
+    int dir = mouse->buttons == MB_CLICK(MB_ADJUST) ? -1 : 1;
+
+    if (mouse->buttons == MB_CLICK(MB_MENU) && win == info[type].main
+        && mouse->iconhandle == I_MORE7_FONTMENU)
+    {
+        post_font_menu (win, I_MORE7_FONT, I_MORE7_FONTSIZE,
+                        I_MORE7_FONTSIZE_ADJ_DOWN, I_MORE7_FONTSIZE_ADJ_UP,
+                        dispres->icons + dispitem->u.master, &mouse->position,
+                        NULL);
+    }
+    else if (mouse->buttons == MB_CLICK(MB_SELECT) ||
+             mouse->buttons == MB_CLICK(MB_ADJUST))
+    {
+        if (win == info[type].main)
+        {
+            switch (mouse->iconhandle)
+            {
+            case I_PROPS7_MORE:
+                show_more_window ();
+                break;
+            case I_PROPS7_CANCEL:
+                close_more ();
+                close_main ();
+                break;
+            case I_PROPS7_OK:
+                apply (dir == -1);
+                break;
+            }
+        }
+        else if (win == info[type].more)
+        {
+            switch (mouse->iconhandle)
+            {
+            case I_MORE7_WIDTH_ADJ_DOWN:
+                dir = -dir;
+            case I_MORE7_WIDTH_ADJ_UP:
+                numeric (win, I_MORE7_WIDTH, dir, 0, BIG);
+                break;
+            case I_MORE7_HEIGHT_ADJ_DOWN:
+                dir = -dir;
+            case I_MORE7_HEIGHT_ADJ_UP:
+                numeric (win, I_MORE7_HEIGHT, dir, 0, BIG);
+                break;
+            case I_MORE7_FONTSIZE_ADJ_DOWN:
+                dir = -dir;
+            case I_MORE7_FONTSIZE_ADJ_UP:
+                numeric (win, I_MORE7_FONTSIZE, dir, 1, BIG);
+                break;
+            case I_MORE7_FONTMENU:
+                post_font_menu (win, I_MORE7_FONT, I_MORE7_FONTSIZE,
+                                I_MORE7_FONTSIZE_ADJ_DOWN, I_MORE7_FONTSIZE_ADJ_UP,
+                                dispres->icons + dispitem->u.master, &mouse->position,
+                                NULL);
+                break;
+            case I_MORE7_CLOSE:
+                close_more ();
+                break;
+            }
+        }
+    }
+}
+
+
+static Bool OPTION_apply (WindowPtr main, WindowPtr more, int *width, int *height)
+{
+    IconInfoPtr master = dispres->icons + dispitem->u.master;
+    char *text = dbox_getstring (main, I_PROPS7_TEXT);
+
+    sprintf (dispitem->name, "%.*s", ITEMNAMELEN - 1, dbox_getstring (main, I_PROPS7_NAME));
+
+    if (dbox_getbutton (main, I_PROPS7_SELECTED))
+        master->icon.flags |= IF_SELECTED;
+    else
+        master->icon.flags &= ~IF_SELECTED;
+
+    template_write_text (&master->icon, text, -1);
+    change_font (dbox_getstring (more, I_MORE7_FONT),
+                 dbox_getstring (more, I_MORE7_FONTSIZE), &master->icon, validation);
+    template_write_validation (&master->icon, validation);
+
+    *width = atoi(dbox_getstring(more, I_MORE7_WIDTH));
+    *height = atoi(dbox_getstring(more, I_MORE7_HEIGHT));
+
+    /* Renumbering */
+
+    ED ( template_renumber_icon (dispres, dispitem, dispitem->u.master,
+                                 atoi(dbox_getstring(more, I_MORE7_ICON))) );
+    return FALSE;
+}
+
+
+
+/*
+ * TYPE 8 - RADIO
+ * XXX It would be nice if selecting one of these deselected the others
+ * in the ESG.
+ */
+
+static void RADIO_fill_in (WindowPtr main, WindowPtr more, RectPtr bbox)
+{
+    IconInfoPtr master = dispres->icons + dispitem->u.master;
+
+    template_read_validation (&master->icon, validation);
+    get_icon_colours (&master->icon, validation);
+
+    dbox_setstring (main, I_PROPS8_NAME, dispitem->name);
+    dbox_setstring (main, I_PROPS8_TEXT, (char *) master->icon.data[0]);
+    dbox_setbutton (main, I_PROPS8_SELECTED, master->icon.flags & IF_SELECTED);
+    dbox_setint (more, I_MORE8_ESG, IF_GET_FIELD(ESG, master->icon.flags));
+
+    fill_in_dimensions (more, I_MORE8_WIDTH, I_MORE8_HEIGHT, bbox);
+    fill_in_font (more, I_MORE8_FONT, I_MORE8_FONTSIZE,
+                  I_MORE8_FONTSIZE_ADJ_DOWN, I_MORE8_FONTSIZE_ADJ_UP, &master->icon);
+
+    dbox_setint (more, I_MORE8_ICON, dispitem->u.master);
+}
+
+
+static void RADIO_mouse_click (WindowPtr win, MouseClickPtr mouse)
+{
+    int dir = mouse->buttons == MB_CLICK(MB_ADJUST) ? -1 : 1;
+
+    if (mouse->buttons == MB_CLICK(MB_MENU) && win == info[type].main
+        && mouse->iconhandle == I_MORE8_FONTMENU)
+    {
+        post_font_menu (win, I_MORE8_FONT, I_MORE8_FONTSIZE,
+                        I_MORE8_FONTSIZE_ADJ_DOWN, I_MORE8_FONTSIZE_ADJ_UP,
+                        dispres->icons + dispitem->u.master, &mouse->position,
+                        NULL);
+    }
+    else if (mouse->buttons == MB_CLICK(MB_SELECT) ||
+             mouse->buttons == MB_CLICK(MB_ADJUST))
+    {
+        if (win == info[type].main)
+        {
+            switch (mouse->iconhandle)
+            {
+            case I_PROPS8_MORE:
+                show_more_window ();
+                break;
+            case I_PROPS8_CANCEL:
+                close_more ();
+                close_main ();
+                break;
+            case I_PROPS8_OK:
+                apply (dir == -1);
+                break;
+            }
+        }
+        else if (win == info[type].more)
+        {
+            switch (mouse->iconhandle)
+            {
+            case I_MORE8_WIDTH_ADJ_DOWN:
+                dir = -dir;
+            case I_MORE8_WIDTH_ADJ_UP:
+                numeric (win, I_MORE8_WIDTH, dir, 0, BIG);
+                break;
+            case I_MORE8_HEIGHT_ADJ_DOWN:
+                dir = -dir;
+            case I_MORE8_HEIGHT_ADJ_UP:
+                numeric (win, I_MORE8_HEIGHT, dir, 0, BIG);
+                break;
+            case I_MORE8_FONTSIZE_ADJ_DOWN:
+                dir = -dir;
+            case I_MORE8_FONTSIZE_ADJ_UP:
+                numeric (win, I_MORE8_FONTSIZE, dir, 1, BIG);
+                break;
+            case I_MORE8_ESG_ADJ_DOWN:
+                dir = -dir;
+            case I_MORE8_ESG_ADJ_UP:
+                numeric (win, I_MORE8_ESG, dir, 0, 31);
+                break;
+            case I_MORE8_FONTMENU:
+                post_font_menu (win, I_MORE8_FONT, I_MORE8_FONTSIZE,
+                                I_MORE8_FONTSIZE_ADJ_DOWN, I_MORE8_FONTSIZE_ADJ_UP,
+                                dispres->icons + dispitem->u.master, &mouse->position,
+                                NULL);
+                break;
+            case I_MORE8_CLOSE:
+                close_more ();
+                break;
+            }
+        }
+    }
+}
+
+
+static Bool RADIO_apply (WindowPtr main, WindowPtr more, int *width, int *height)
+{
+    IconInfoPtr master = dispres->icons + dispitem->u.master;
+    char *text = dbox_getstring (main, I_PROPS8_TEXT);
+    int esg = atoi (dbox_getstring (more, I_MORE8_ESG));
+
+    sprintf (dispitem->name, "%.*s", ITEMNAMELEN - 1, dbox_getstring (main, I_PROPS8_NAME));
+
+    if (dbox_getbutton (main, I_PROPS8_SELECTED))
+        master->icon.flags |= IF_SELECTED;
+    else
+        master->icon.flags &= ~IF_SELECTED;
+
+    if (esg < 0 || esg > 31)
+        error_box (error_lookup ("BadESG", esg));
+    else
+        IF_SET_FIELD (ESG, master->icon.flags, esg);
+
+    template_write_text (&master->icon, text, -1);
+    change_font (dbox_getstring (more, I_MORE8_FONT),
+                 dbox_getstring (more, I_MORE8_FONTSIZE), &master->icon, validation);
+    template_write_validation (&master->icon, validation);
+
+    *width = atoi(dbox_getstring(more, I_MORE8_WIDTH));
+    *height = atoi(dbox_getstring(more, I_MORE8_HEIGHT));
+
+    /* Renumbering */
+
+    ED ( template_renumber_icon (dispres, dispitem, dispitem->u.master,
+                                 atoi(dbox_getstring(more, I_MORE8_ICON))) );
+    return FALSE;
+}
+
+
+
+/*
+ * TYPE 9 - GROUP BOX
+ */
+
+static void GROUP_fill_in (WindowPtr main, WindowPtr more, RectPtr bbox)
+{
+/*    IconInfoPtr master = dispres->icons + dispitem->u.master;*/
+    IconInfoPtr label = dispres->icons + dispitem->u.groupbox.label;
+
+    template_read_validation (&label->icon, validation);
+    get_icon_colours (&label->icon, validation);
+
+    dbox_setstring (main, I_PROPS9_NAME, dispitem->name);
+    dbox_setstring (main, I_PROPS9_TEXT, (char *) label->icon.data[0]);
+
+    fill_in_dimensions (more, I_MORE9_WIDTH, I_MORE9_HEIGHT, bbox);
+    fill_in_font (more, I_MORE9_FONT, I_MORE9_FONTSIZE,
+                  I_MORE9_FONTSIZE_ADJ_DOWN, I_MORE9_FONTSIZE_ADJ_UP, &label->icon);
+
+    dbox_setint (more, I_MORE9_FRAME_ICON, dispitem->u.master);
+    dbox_setint (more, I_MORE9_LABEL_ICON, dispitem->u.groupbox.label);
+}
+
+
+static void GROUP_mouse_click (WindowPtr win, MouseClickPtr mouse)
+{
+    int dir = mouse->buttons == MB_CLICK(MB_ADJUST) ? -1 : 1;
+
+    if (mouse->buttons == MB_CLICK(MB_MENU) && win == info[type].main
+        && mouse->iconhandle == I_MORE9_FONTMENU)
+    {
+        post_font_menu (win, I_MORE9_FONT, I_MORE9_FONTSIZE,
+                        I_MORE9_FONTSIZE_ADJ_DOWN, I_MORE9_FONTSIZE_ADJ_UP,
+                        dispres->icons + dispitem->u.groupbox.label, &mouse->position,
+                        NULL);
+    }
+    else if (mouse->buttons == MB_CLICK(MB_SELECT) ||
+             mouse->buttons == MB_CLICK(MB_ADJUST))
+    {
+        if (win == info[type].main)
+        {
+            switch (mouse->iconhandle)
+            {
+            case I_PROPS9_MORE:
+                show_more_window ();
+                break;
+            case I_PROPS9_CANCEL:
+                close_more ();
+                close_main ();
+                break;
+            case I_PROPS9_OK:
+                apply (dir == -1);
+                break;
+            }
+        }
+        else if (win == info[type].more)
+        {
+            switch (mouse->iconhandle)
+            {
+            case I_MORE9_WIDTH_ADJ_DOWN:
+                dir = -dir;
+            case I_MORE9_WIDTH_ADJ_UP:
+                numeric (win, I_MORE9_WIDTH, dir, 0, BIG);
+                break;
+            case I_MORE9_HEIGHT_ADJ_DOWN:
+                dir = -dir;
+            case I_MORE9_HEIGHT_ADJ_UP:
+                numeric (win, I_MORE9_HEIGHT, dir, 0, BIG);
+                break;
+            case I_MORE9_FONTSIZE_ADJ_DOWN:
+                dir = -dir;
+            case I_MORE9_FONTSIZE_ADJ_UP:
+                numeric (win, I_MORE9_FONTSIZE, dir, 1, BIG);
+                break;
+            case I_MORE9_FONTMENU:
+                post_font_menu (win, I_MORE9_FONT, I_MORE9_FONTSIZE,
+                                I_MORE9_FONTSIZE_ADJ_DOWN, I_MORE9_FONTSIZE_ADJ_UP,
+                                dispres->icons + dispitem->u.groupbox.label, &mouse->position,
+                                NULL);
+                break;
+            case I_MORE9_CLOSE:
+                close_more ();
+                break;
+            }
+        }
+    }
+}
+
+
+static Bool GROUP_apply (WindowPtr main, WindowPtr more, int *width, int *height)
+{
+    IconInfoPtr label = dispres->icons + dispitem->u.groupbox.label;
+    char *text = dbox_getstring (main, I_PROPS9_TEXT);
+
+    sprintf (dispitem->name, "%.*s", ITEMNAMELEN - 1, dbox_getstring (main, I_PROPS9_NAME));
+
+    template_write_text (&label->icon, text, -1);
+
+    change_font (dbox_getstring (more, I_MORE9_FONT),
+                 dbox_getstring (more, I_MORE9_FONTSIZE), &label->icon, validation);
+    template_write_validation (&label->icon, validation);
+
+    *width = atoi(dbox_getstring(more, I_MORE9_WIDTH));
+    *height = atoi(dbox_getstring(more, I_MORE9_HEIGHT));
+
+    /* Renumbering */
+
+    ED ( template_renumber_icon (dispres, dispitem, dispitem->u.master,
+                                 atoi(dbox_getstring(more, I_MORE9_FRAME_ICON))) );
+    ED ( template_renumber_icon (dispres, dispitem, dispitem->u.groupbox.label,
+                                 atoi(dbox_getstring(more, I_MORE9_LABEL_ICON))) );
+    return TRUE;
+}
+
+
+/*
+ * TYPE 10 - MENU BUTTON
+ */
+
+static void MENU_fill_in (WindowPtr main, WindowPtr more, RectPtr bbox)
+{
+    dbox_setstring (main, I_PROPS10_NAME, dispitem->name);
+    dbox_setint (more, I_MORE10_ICON, dispitem->u.master);
+}
+
+
+static void MENU_mouse_click (WindowPtr win, MouseClickPtr mouse)
+{
+    int dir = mouse->buttons == MB_CLICK(MB_ADJUST) ? -1 : 1;
+
+    if (mouse->buttons == MB_CLICK(MB_SELECT) ||
+        mouse->buttons == MB_CLICK(MB_ADJUST))
+    {
+        if (win == info[type].main)
+        {
+            switch (mouse->iconhandle)
+            {
+            case I_PROPS10_MORE:
+                show_more_window ();
+                break;
+            case I_PROPS10_CANCEL:
+                close_more ();
+                close_main ();
+                break;
+            case I_PROPS10_OK:
+                apply (dir == -1);
+                break;
+            }
+        }
+        else if (win == info[type].more)
+        {
+            switch (mouse->iconhandle)
+            {
+            case I_MORE10_CLOSE:
+                close_more ();
+                break;
+            }
+        }
+    }
+}
+
+
+static Bool MENU_apply (WindowPtr main, WindowPtr more, int *width, int *height)
+{
+    sprintf (dispitem->name, "%.*s", ITEMNAMELEN - 1, dbox_getstring (main, I_PROPS10_NAME));
+
+    /* Renumbering */
+
+    ED ( template_renumber_icon (dispres, dispitem, dispitem->u.master,
+                                 atoi(dbox_getstring(more, I_MORE10_ICON))) );
+    return TRUE;
+}
+
+
+/*
+ * TYPE 11 - ADJUSTER BUTTON
+ */
+
+static void ADJUSTER_fill_in (WindowPtr main, WindowPtr more, RectPtr bbox)
+{
+    dbox_setstring (main, I_PROPS11_NAME, dispitem->name);
+    dbox_setint (more, I_MORE11_DOWN_ICON, dispitem->u.adjusterbutton.down);
+    dbox_setint (more, I_MORE11_UP_ICON, dispitem->u.adjusterbutton.up);
+}
+
+
+static void ADJUSTER_mouse_click (WindowPtr win, MouseClickPtr mouse)
+{
+    int dir = mouse->buttons == MB_CLICK(MB_ADJUST) ? -1 : 1;
+
+    if (mouse->buttons == MB_CLICK(MB_SELECT) ||
+        mouse->buttons == MB_CLICK(MB_ADJUST))
+    {
+        if (win == info[type].main)
+        {
+            switch (mouse->iconhandle)
+            {
+            case I_PROPS11_MORE:
+                show_more_window ();
+                break;
+            case I_PROPS11_CANCEL:
+                close_more ();
+                close_main ();
+                break;
+            case I_PROPS11_OK:
+                apply (dir == -1);
+                break;
+            }
+        }
+        else if (win == info[type].more)
+        {
+            switch (mouse->iconhandle)
+            {
+            case I_MORE11_CLOSE:
+                close_more ();
+                break;
+            }
+        }
+    }
+}
+
+
+static Bool ADJUSTER_apply (WindowPtr main, WindowPtr more, int *width, int *height)
+{
+    sprintf (dispitem->name, "%.*s", ITEMNAMELEN - 1, dbox_getstring (main, I_PROPS11_NAME));
+
+    /* Renumbering */
+
+    ED ( template_renumber_icon (dispres, dispitem, dispitem->u.adjusterbutton.down,
+                                 atoi(dbox_getstring(more, I_MORE11_DOWN_ICON))) );
+    ED ( template_renumber_icon (dispres, dispitem, dispitem->u.adjusterbutton.up,
+                                 atoi(dbox_getstring(more, I_MORE11_UP_ICON))) );
+    return TRUE;
+}
+
+
+/*
+ * TYPE 12 - NONE
+ */
+
+static void NONE_mouse_click (WindowPtr win, MouseClickPtr mouse)
+{
+    if (mouse->buttons == MB_CLICK(MB_SELECT) ||
+        mouse->buttons == MB_CLICK(MB_ADJUST))
+    {
+        if (win == info[type].main)
+        {
+            switch (mouse->iconhandle)
+            {
+            case I_PROPS12_MORE:
+                show_more_window ();
+                break;
+            case I_PROPS12_CANCEL:
+                close_more ();
+                close_main ();
+                break;
+            }
+        }
+        else if (win == info[type].more)
+        {
+            switch (mouse->iconhandle)
+            {
+            case I_MORE12_CLOSE:
+                close_more ();
+                break;
+            }
+        }
+    }
+}
+
+
+
+/*
+ * This tabulates all the characteristics of the different
+ * item type editors.  The props window template names are
+ * not explicitly mentioned because they are generated from
+ * the type number.
+ */
+
+static PropsInfoRec info [13] =
+{
+ /* SimpleIcon */
+    NULL, NULL, ICON_fill_in, ICON_mouse_click, ICON_apply,
+ /* CommandButton */
+    NULL, NULL, BUTTON_fill_in, BUTTON_mouse_click, BUTTON_apply,
+ /* Label */
+    NULL, NULL, LABEL_fill_in, LABEL_mouse_click, LABEL_apply,
+ /* DisplayField */
+    NULL, NULL, DISPLAY_fill_in, DISPLAY_mouse_click, DISPLAY_apply,
+ /* WriteableField */
+    NULL, NULL, WRITEABLE_fill_in, WRITEABLE_mouse_click, WRITEABLE_apply,
+ /* HSlider */
+    NULL, NULL, SLIDER_fill_in, SLIDER_mouse_click, SLIDER_apply,
+ /* VSlider */
+    NULL, NULL, SLIDER_fill_in, SLIDER_mouse_click, SLIDER_apply,
+ /* OptionButton */
+    NULL, NULL, OPTION_fill_in, OPTION_mouse_click, OPTION_apply,
+ /* RadioButton */
+    NULL, NULL, RADIO_fill_in, RADIO_mouse_click, RADIO_apply,
+ /* GroupBox */
+    NULL, NULL, GROUP_fill_in, GROUP_mouse_click, GROUP_apply,
+ /* MenuButton */
+    NULL, NULL, MENU_fill_in, MENU_mouse_click, MENU_apply,
+ /* AdjusterButton */
+    NULL, NULL, ADJUSTER_fill_in, ADJUSTER_mouse_click, ADJUSTER_apply,
+ /* None; a blank used when no item selected */
+    NULL, NULL, NULL, NONE_mouse_click, NULL,
+};

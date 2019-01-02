@@ -1,0 +1,568 @@
+/* Copyright 2016 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+// c.GPT
+//
+// various routines to understand and analyse GPT partitioning
+
+#include        "PMInclude.h"
+#include        "FormatDef.h"
+#include        "Diagnostic.h"
+#include        "GPThdr.h"
+#include        "crc32.h"
+#include        "GPT.h"
+
+static ProtectiveMBR* mbrp=NULL;
+GPTHeader * gpth=NULL;
+static GPTHeader * altgpth=NULL;
+static PartitionRecord* partn;
+static _kernel_oserror *err;
+GUIDPartn *  gpt=NULL;
+static GUIDPartn *  altgpt=NULL;
+static _kernel_swi_regs rg;
+
+static int DiscMaxLBA=0, DiscSectorSize=0;
+
+bool GUIDValid(char * p)
+{
+  bool ans=false;
+  for(int i=0; i<16;i++)
+  {
+    if(*p++) {ans=true;}
+  }
+  return (ans);
+}
+
+void printGUIDpart(GUIDPartn *  gp)
+{
+  testprint("type:    ");testprintGUID((char*)(gp->PTypeGUID));
+  testprint("\nuniq:    ");testprintGUID((char*)(gp->PUniqGUID));
+  testprint("\nStartLBA: %08x%08x\n",gp->StartLBA[1],gp->StartLBA[0]);
+  testprint("EndLBA:   %08x%08x\n",gp->EndLBA[1],gp->EndLBA[0]);
+  testprint("Attrib:   %08x%08x\n",gp->Attributes[1],gp->Attributes[0]);
+  char *ch = gp->Name;
+  testprint("Name:     ");
+  while (*ch)
+  {
+    testprint(ch);
+    ch+=2;
+  }
+  testprint("\n\n");
+}
+void printUTF16LEname(char* name, char* buffer, int maxchars)
+{
+  for (int i=0; i<maxchars;i++)
+  {
+    *(name++)=buffer[i];
+    *(name++)=0;
+    if (!buffer[i]) break;
+  }
+}
+void printLegacyPartition(PartitionRecord *  partn)
+{
+      testprint("buffer addr %x, p1 addr %x\n",(int)mbrp,(int)partn);
+      testprint("boot        %02x\n",partn->boot);
+      testprint("StartCHS    %06x\n",partn->StartC+(partn->StartH<<8)+(partn->StartS<<16));
+      testprint("OStype      %02x\n",partn->OSType);
+      testprint("EndCHS      %06x\n",partn->EndC+(partn->EndH<<8)+(partn->EndS<<16));
+      testprint("StartLBA    %08x\n",partn->StartLBA[0]+(partn->StartLBA[1]<<8)+(partn->StartLBA[2]<<16)+(partn->StartLBA[3]<<24));
+      testprint("SizeLBA     %08x\n\n",partn->SizeLBA[0]+(partn->SizeLBA[1]<<8)+(partn->SizeLBA[2]<<16)+(partn->SizeLBA[03]<<24));
+}
+
+void printPartitionHeader(GPTHeader* altg)
+{
+      int tmp1 = altg->HeaderCRC32;
+      altg->HeaderCRC32=0;
+      if (tmp1!=crc32((unsigned char*)altg,altg->HeaderSize))
+      {
+        testprint("CRC32 of  partition header is bad\n");
+      }
+      altg->HeaderCRC32=tmp1;
+      testprint("buffer addr %x\n",(int)altg);
+      testprint("Sign        %08s\n",(int)(altg->Sign));
+      testprint("Revisn      %08x\n",altg->Revisn);
+      testprint("HeaderSize  %08x\n",altg->HeaderSize);
+      testprint("HeaderCRC   %08x\n",altg->HeaderCRC32);
+      testprint("MyLBA       %08x%08x\n",altg->MyLBA[1],altg->MyLBA[0]);
+      testprint("AltLBA      %08x%08x\n",altg->AltLBA[1],altg->AltLBA[0]);
+      testprint("OkLBAstrt   %08x%08x\n",altg->FirstOKLBA[1],altg->FirstOKLBA[0]);
+      testprint("OkLBAend    %08x%08x\n",altg->LastOKLBA[1],altg->LastOKLBA[0]);
+      testprint("DiscGUID   ");
+      testprintGUID((char*)(altg->DiscGUID));
+      testprint("\nGUIDPstrt   %08x%08x\n",altg->GUIDPArray[1],altg->GUIDPArray[0]);
+      testprint("GUIDPcount  %08x\n",altg->GUIDPnum);
+      testprint("GUIDPsize   %08x\n",altg->GUIDPsize);
+      testprint("GUIDPCRC    %08x\n\n",altg->GUIDPArrayCRC);
+}
+
+// free the pointers set up by CheckGPTValid()
+void freepointers(void)
+{
+  if(altgpt)free(altgpt); altgpt=0;
+  if(gpt)free(gpt); gpt=0;
+  if(altgpth)free(altgpth); altgpth=0;
+  if(gpth)free(gpth); gpth=0;
+  if(mbrp)free(mbrp); mbrp=0;
+}
+
+// verify GPT integrity to see if we can use this partition table
+// device ID given on entry
+// returns true if Usable, else false
+// sets up structure pointers if Usable
+// mbrp -> protective mbr
+// gpth -> gpt primary table
+// altgpth -> duplicate from end of disc
+// gpt  -> GUID partition table
+// altgpt -> duplicate from end of disc
+//
+bool CheckGPTValid(int device)
+{
+  int timer;
+  static _kernel_oserror ee;
+  err=&ee;
+  testprint("Start cgptv id:%d\n",device);
+  _kernel_swi(OS_ReadMonotonicTime,&rg,&rg);
+  timer=rg.r[0]+75;  // allow 75cs to get ready
+  err->errnum=ErrorNumber_SCSI_CC_NotReady;
+  err->errmess[0]=0;
+  while(err && err->errnum==ErrorNumber_SCSI_CC_NotReady)
+  {
+    err=ReadDiscCapacity(device,OverrideKey,&DiscMaxLBA,&DiscSectorSize);
+    testprint("cgptv rdc done1 err:%s\n",err?err->errmess:"");
+    _kernel_swi(OS_ReadMonotonicTime,&rg,&rg);
+    if(rg.r[0]>timer)
+    {
+       testprint("cgptv rdc done err:%s\n",err?err->errmess:"");
+       freepointers();return false;
+    } 
+  }
+  testprint("cgptv rdc done err:%s\n",err?err->errmess:"");
+  if(DiscSectorSize==0){testprint(" dss=0 dev %d\n",device);return(false);}
+  testprint(" dss=%x dev %d\n",DiscSectorSize,device);
+  if(mbrp=calloc(1,sizeof(struct ProtectiveMBR)),mbrp)
+  {
+#ifdef Debug
+  _kernel_swi(OS_ReadMonotonicTime,&rg,&rg);
+  testprint("before cgptv secrd time stamp %dcs\n", rg.r[0]);
+#endif                  
+    err=SecRead(device,OverrideKey,mbrp,sizeof(struct ProtectiveMBR),0,DiscSectorSize);
+#ifdef Debug
+  _kernel_swi(OS_ReadMonotonicTime,&rg,&rg);
+  testprint("time stamp %dcs\n", rg.r[0]);
+#endif                  
+    if (!err)
+    {
+      partn=(PartitionRecord *)&mbrp->Partition1;
+      if ((mbrp->Sign[0]+((mbrp->Sign[1]<<8)))!=0xaa55){testprint("0xaa55 missing");return false;}
+      if(partn->OSType!=0xee)
+      {
+        partn++;
+        if(partn->OSType!=0xee)
+        {
+          partn++;
+          if(partn->OSType!=0xee)
+          {
+            partn++;
+            if(partn->OSType!=0xee)
+              {
+              testprint("no protective mbr\n");
+              return(false); // cannot find relevant protective header
+            }
+          }
+        }
+      }
+      // now get and check the gpt header block
+      if(gpth=calloc(1,GPTHdrSize(DiscSectorSize)),gpth)
+      {
+        err=SecRead(device,OverrideKey,gpth,GPTHdrSize(DiscSectorSize),1,DiscSectorSize);
+        if (err)
+        {
+          freepointers();return false;
+        }
+        else
+        {
+          int tmp = gpth->HeaderCRC32;
+          gpth->HeaderCRC32=0;
+ //         testprint(" gpth %x hs %x\n",(int)gpth,gpth->HeaderSize);
+          if (tmp!=crc32((unsigned char*)gpth,(gpth->HeaderSize)))
+          {
+            freepointers(); return false;
+          }
+          gpth->HeaderCRC32=tmp;
+          if(altgpth=calloc(1,GPTHdrSize(DiscSectorSize)),altgpth)
+          {
+            err=SecRead(device,OverrideKey,altgpth,GPTHdrSize(DiscSectorSize),gpth->AltLBA[0],DiscSectorSize);
+            if (!err)
+            {
+              int tmp = altgpth->HeaderCRC32;
+              altgpth->HeaderCRC32=0;
+              if (tmp!=crc32((unsigned char*)altgpth,altgpth->HeaderSize))
+              {
+                freepointers(); return false;
+              }
+              altgpth->HeaderCRC32=tmp;
+              int gpthhdrsize=(((gpth->GUIDPnum*gpth->GUIDPsize)/DiscSectorSize)*DiscSectorSize)+(((gpth->GUIDPnum*gpth->GUIDPsize)%DiscSectorSize)>0?DiscSectorSize:0);
+              if(gpt=calloc(1,gpthhdrsize),gpt)
+              {
+                // assume lba address in bottom 8bits of LBA
+                err=SecRead(device,OverrideKey,gpt,gpthhdrsize,(int)(gpth->GUIDPArray[0]),DiscSectorSize);
+                if (err)
+                {
+                   freepointers(); return false;
+                }
+                else
+                {
+                  GUIDPartn * myGP;
+                  myGP=gpt;
+                  // check the crc32
+                  if (gpth->GUIDPArrayCRC!=crc32((unsigned char*)gpt,gpth->GUIDPnum*gpth->GUIDPsize))
+                  {
+                    freepointers(); return false;
+                  }
+                }
+              }
+              if(altgpt=calloc(1,gpthhdrsize),altgpt)
+              {
+                // assume lba address in bottom 8bits of LBA
+                err=SecRead(device,OverrideKey,altgpt,gpthhdrsize,(int)(DiscMaxLBA-((gpth->GUIDPnum*gpth->GUIDPsize)/DiscSectorSize)),DiscSectorSize);
+                if (err)
+                {
+                   freepointers(); return false;
+                }
+                else
+                {
+                  GUIDPartn * myGP;
+                  myGP=gpt;
+                  // check the crc32
+                  if (gpth->GUIDPArrayCRC!=crc32((unsigned char*)gpt,gpth->GUIDPnum*gpth->GUIDPsize))
+                  {
+                    freepointers(); return false;
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+#ifdef Debug
+  _kernel_swi(OS_ReadMonotonicTime,&rg,&rg);
+  testprint("exit cgptv time stamp %dcs\n", rg.r[0]);
+#endif                  
+  // return leaving all pointers in place
+  return true;
+}
+// convert GUID in string format to binary
+#define HtoN(t) (t>0x39?t-7:t)
+#define HtoB(s) ( ((HtoN(((s)[0]))&0xf)<<4) + (HtoN(((s)[1]))&0xf) )
+void EncodeGUID(char G[GUIDLen], char* GUID)
+{
+  G[3] =HtoB(GUID);
+  G[2] =HtoB(GUID+2);
+  G[1] =HtoB(GUID+4);
+  G[0] =HtoB(GUID+6);
+
+  G[5] =HtoB(GUID+9);
+  G[4] =HtoB(GUID+11);
+
+  G[7] =HtoB(GUID+14);
+  G[6] =HtoB(GUID+16);
+
+  G[8] =HtoB(GUID+19);
+  G[9] =HtoB(GUID+21);
+
+  G[10]=HtoB(GUID+24);
+  G[11]=HtoB(GUID+26);
+  G[12]=HtoB(GUID+27);
+  G[13]=HtoB(GUID+30);
+  G[14]=HtoB(GUID+32);
+  G[15]=HtoB(GUID+34);
+}
+
+// return relevant GUID string in buffer
+// inventing GUID if called with GUIDNew
+// or identify GUID type from buffer content if called with GUIDUnknon
+// return GUID for known disk type, or invent GUID
+GUIDtype GetSetGUID(GUIDtype type, char guidbuf[GUIDLen])
+{
+  int idlo, idhi;
+  switch (type)
+  {
+  case GUIDUnused:
+  EncodeGUID(guidbuf,GUID_unused);
+  return type;
+  case GUIDEfi:
+  EncodeGUID(guidbuf,GUID_EFISysPartn);
+  return type;
+  case GUIDMbr:
+  EncodeGUID(guidbuf,GUID_LegacyMBR);
+  return type;
+  case GUIDWinNorm:
+  EncodeGUID(guidbuf,GUID_WinNormal);
+  return type;
+  case GUIDFilecore:
+  EncodeGUID(guidbuf,GUID_Filecore);
+  return type;
+  case GUIDNew:
+// we need to invent a GUID.. conflate time and mac address/system ID
+  _swix(OS_ReadSysInfo, _IN(0)|_OUTR(0,1),5,&idlo, &idhi);
+  guidbuf[0]=(char)(idlo>>24);
+  guidbuf[1]=(char)(idlo>>16);
+  guidbuf[2]=(char)(idlo>>8);
+  guidbuf[3]=(char)(idlo>>0);
+  guidbuf[4]=(char)(idhi>>24);
+  guidbuf[5]=(char)(idhi>>16);
+  guidbuf[6]=(char)(idhi>>8);
+  guidbuf[7]=(char)(idhi>>0);
+  idlo=rand();
+  guidbuf[11]=(char)(idlo>>24);
+  guidbuf[10]=(char)(idlo>>16);
+  guidbuf[9] =(char)(idlo>>8);
+  guidbuf[8] =(char)(idlo>>0);
+  guidbuf[12]=(char)(idlo>>24);
+  guidbuf[13]=(char)(idlo>>16);
+  guidbuf[14]=(char)(idlo>>8);
+  guidbuf[15]=(char)(idlo>>0);
+  return type;
+case GUIDUnknown:
+  // see if we know aboout it
+  if(!memcmp(guidbuf,GUID_unused,GUIDLen))return GUIDUnused;
+  if(!memcmp(guidbuf,GUID_EFISysPartn,GUIDLen))return GUIDEfi;
+  if(!memcmp(guidbuf,GUID_LegacyMBR,GUIDLen))return GUIDMbr;
+  if(!memcmp(guidbuf,GUID_Filecore,GUIDLen))return GUIDFilecore;
+  break;
+  }
+  return GUIDUnknown;
+}
+
+// create a new gpt structure and write to disk
+// on entry  device =  scsi device to write to
+//           numpart = total number of partition slots to create
+//           partcount = partitions to create
+//           partn[]   = array of partcount partition sizes (LBA)
+int PartitionDisc(int device, int numpart, int partcount, int partn[])
+{
+//  testprint("creating dev:%d maxpart:%d with %d used\n",device,numpart,partcount);
+//  ProtectiveMBR* sec0=0;
+  GPTHeader* sec1=0;
+//  PartitionRecord* pn=0;
+  GUIDPartn *  gpt;
+  int capacity=0;
+  int sectorsize;
+  int gptseccount,tmp;
+  // discover the device sector size and device size
+  err=ReadDiscCapacity(device, OverrideKey ,&capacity, &sectorsize);
+  if(capacity==0) {testprint("no disk there\n");return(-1);}  // no disk there
+  // first claim space to work in
+  // use calloc() a we need to clear unused space
+  sec1=calloc(1,GPTHdrSize(sectorsize));
+  tmp =(sizeof(struct GUIDPartn)*numpart);
+  testprint("partn table size %x gp %x\n",tmp,sizeof(struct GPTHeader));
+  gptseccount=(tmp/sectorsize);
+  if(tmp%sectorsize) gptseccount++;
+  testprint("claiming %d secs for partn table\n",gptseccount);
+  gpt =calloc(tmp,sizeof(struct GUIDPartn));
+  if(!(gpt||sec1/*||sec0*/))
+  {
+//    if (sec0) free(sec0);
+    if (sec1) free(sec1);
+    if (gpt)  free(gpt);
+    return (-1);  // mem claim failed
+  }
+  // dumbly remove any previous boot sectors
+  NukeBootSectors(device);
+
+  // write a dos boot sector with protective mbr
+  WriteDosBootSector(device, 0, NULL, capacity, sectorsize);
+
+  // lay out GPTHeader
+  *(int*)(&sec1->Sign[0])=0x20494645;
+  *(int*)(&sec1->Sign[4])=0x54524150;
+  sec1->Revisn =0x00010000;
+  sec1->HeaderSize=sizeof(GPTHeader);
+  sec1->MyLBA[0] = 1;
+  sec1->AltLBA[0] = capacity-1;
+  sec1->FirstOKLBA[0] = gptseccount+1+1;
+  sec1->LastOKLBA[0] = capacity-1-1-gptseccount;
+  GetSetGUID(GUIDNew,sec1->DiscGUID);
+  sec1->GUIDPArray[0] = 2;
+  sec1->GUIDPnum = numpart;
+  sec1->GUIDPsize= 128;  // we're hard coding
+
+  // lay out partition table
+  GUIDPartn * myGP;
+  myGP=gpt;
+  int lbabase = sec1->FirstOKLBA[0];
+  char discname[16];
+  for (int i=0; i<partcount;i++)
+  {
+    GetSetGUID(GUIDFilecore,myGP->PTypeGUID);
+    GetSetGUID(GUIDNew,myGP->PUniqGUID);
+    myGP->StartLBA[0]=lbabase;
+    myGP->EndLBA[0] = lbabase+partn[i]-1;
+    snprintf(discname,15,"Partition %d",i);
+    printUTF16LEname(myGP->Name,discname,GPTPartNameCount);
+    lbabase+=partn[i];
+    myGP++;
+  }
+  myGP=gpt;
+  for (int i=0; i<numpart;i++)
+  {
+    if(GUIDValid((char*)(myGP->PTypeGUID)))
+    {
+       testprint("Partn:    %d\n",i);
+       printGUIDpart(myGP);
+    }
+    myGP++;
+  }
+
+
+  // compute the partition table crc32
+  sec1->GUIDPArrayCRC=crc32((unsigned char*)gpt,(sizeof(struct GUIDPartn)*numpart));
+  // compute the header crc
+  sec1->HeaderCRC32=crc32((unsigned char*)sec1,sizeof(struct GPTHeader));
+
+// lets just dump out for diagnostics
+  printPartitionHeader(sec1);
+  testsave("GPTHeader",(char*)sec1,sectorsize);
+//  // write rubbish where the non partition filecore boot will be (lba 6)
+//  wimp_error( SecWrite(device, OverrideKey, sec1, 0x200, 6,  sectorsize));
+  wimp_error( SecWrite(device, OverrideKey, sec1, 0x200, 1,  sectorsize));
+  wimp_error( SecWrite(device, OverrideKey, sec1, 0x200, capacity-1,  sectorsize));
+
+
+  testsave("Partition Table",(char*)gpt,(sizeof(struct GUIDPartn)*numpart));
+  wimp_error( SecWrite(device, OverrideKey, gpt, gptseccount*sectorsize, 2,  sectorsize));
+  wimp_error( SecWrite(device, OverrideKey, gpt, gptseccount*sectorsize, capacity-1-gptseccount,  sectorsize));
+
+
+  return 1;
+}
+
+// uses pointers set up by CheckGPTValid()
+void ReadGPTInfo(int device)
+{
+  testprint("ReadGPTInfo devid:%d\n",device);
+  testprint("Device Max LBA %08x - SectorSize %08x \n\n",DiscMaxLBA,DiscSectorSize);
+  printLegacyPartition((PartitionRecord *)&mbrp->Partition1);
+  printLegacyPartition((PartitionRecord *)&mbrp->Partition2);
+  printLegacyPartition((PartitionRecord *)&mbrp->Partition3);
+  printLegacyPartition((PartitionRecord *)&mbrp->Partition4);
+  printPartitionHeader(gpth);
+  printPartitionHeader(altgpth);
+
+
+  GUIDPartn * myGP;
+  myGP=gpt;
+  // check the crc32
+  if (gpth->GUIDPArrayCRC!=crc32((unsigned char*)gpt,gpth->GUIDPnum*gpth->GUIDPsize))
+  {
+    testprint("CRC32 of partition table is bad\n");
+  }
+  for (int i=0; i<gpth->GUIDPnum;i++)
+  {
+    if(GUIDValid((char*)(myGP->PTypeGUID)))
+    {
+       testprint("Partn:    %d\n",i);
+       printGUIDpart(myGP);
+    }
+    myGP++;
+  }
+
+}
+
+// returns partition pointer, or NULL if partition not there
+GUIDPartn* ReturnGPTPartionInfo ( int ID, int partition)
+{
+  static GUIDPartn * gp;
+  if(CheckGPTValid(ID))
+  {
+    gp=calloc(1,sizeof(struct GUIDPartn));
+    if(gp)
+      {
+        GUIDPartn* myGP;
+        myGP=gpt;
+        myGP+=partition;
+        memcpy(gp,myGP, sizeof(struct GUIDPartn));
+        freepointers();
+        return (gp);
+      }
+    freepointers();
+  }
+  return NULL;
+}
+
+// create and write out legacy boot sector to scsi device 'device'
+// If numpart = 0 then just write protective MBR
+// if numpart = 1,2, or 3 insert up to 3 additional MPR partitions
+// from newpr
+// if numpart > 3 then write all partition entries null
+void WriteDosBootSector(int device, int numpart, PartitionRecord *newpr, int disccapacity, int sectorsize)
+{
+  PartitionRecord* pn=0;
+  ProtectiveMBR* sec0=0;
+  if(sec0=calloc(1,sizeof(struct ProtectiveMBR) + GPTHdrSize(sectorsize)),sec0)
+  {
+    if (numpart < 4)
+    {
+   // lay out ProtectiveMBR
+    pn=(PartitionRecord *)&sec0->Partition1;
+    pn->boot = 0;
+    pn->OSType=0xee;
+    pn->StartLBA[0]=1;
+    pn->SizeLBA[0]=(disccapacity-1);    // space following protectiveMBR
+    pn->SizeLBA[1]=(disccapacity-1)>>8;
+    pn->SizeLBA[2]=(disccapacity-1)>>16;
+    pn->SizeLBA[3]=(disccapacity-1)>>24;
+    if ((numpart>0) && (numpart<4))
+    {
+      for (int i=1; i<numpart; i++)
+      {
+        testprint(" copy in partn %d from %x\n",i ,(int)newpr);
+        newpr++;
+      }
+    }
+  }
+  sec0->Sign[0]=0x55;
+  sec0->Sign[1]=0xaa;
+  testprint(" Writing Disc sector 0 -MBR\n");
+  pn=(PartitionRecord *)&sec0->Partition1;
+  for( int i=0; i<4; i++)
+  {
+    printLegacyPartition(pn++);
+  }
+  testsave("savedos mbr:\n",(char*)sec0,sectorsize);
+  wimp_error( SecWrite(device, OverrideKey, sec0, 0x200, 0,  sizeof(struct ProtectiveMBR) + GPTHdrSize(sectorsize)));
+  free(sec0);
+  }
+}
+
+// dumbly nuke the boot sectors for MBR, GPTH, and filecore non partitioned
+// currently assumes 0x200 sector size)
+_kernel_oserror * NukeBootSectors(int device)
+{
+  int* buf;
+  _kernel_oserror * e= NULL;
+  buf=calloc(1,0x200);
+  if(buf)
+  {
+    e=SecWrite(device, OverrideKey, buf, 0x200, 0,  0x200);
+    if(!e)SecWrite(device, OverrideKey, buf, 0x200, 1,  0x200);
+    if(!e)SecWrite(device, OverrideKey, buf, 0x200, 2,  0x200);
+    if(!e)SecWrite(device, OverrideKey, buf, 0x200, 3,  0x200);
+    if(!e)SecWrite(device, OverrideKey, buf, 0x200, 6,  0x200);
+  }
+  return e;
+}

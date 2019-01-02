@@ -1,0 +1,809 @@
+; Copyright 2012 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:Machine.<Machine>
+        GET     Hdr:ImageSize.<ImageSize>
+        $GetIO
+
+        GET     Hdr:OSEntries
+        GET     Hdr:HALEntries
+        GET     Hdr:Proc
+        GET     Hdr:Portable
+
+        GET     hdr.omap3530
+        GET     hdr.StaticWS
+        GET     hdr.PRCM
+
+        AREA    |Asm$$Code|, CODE, READONLY, PIC
+
+        EXPORT  Enable_main_battery_charging
+        EXPORT  BMU_InitDevice
+        EXPORT  BMUParams_TPS65950_TouchBook
+        EXPORT  BMUParams_BQ27200_TouchBook
+        EXPORT  BMUParams_BQ27500_Pandora
+
+        IMPORT  TPSRead
+        IMPORT  TPSWrite
+        IMPORT  IIC_DoOp_Poll
+        IMPORT  HAL_CounterDelay
+
+; TPS module IIC addresses (some of them, at least)
+MADC_IIC           * &4a
+BCI_IIC            * &4a
+PM_MASTER_IIC      * &4b
+
+; TPS registers
+TPS_BOOT_BCI            * &3d
+TPS_STS_HW_CONDITIONS   * &45
+
+TPS_GPBR1               * &91
+
+TPS_MADC_CTRL1          * &00
+TPS_MADC_SW1SELECT_LSB  * &06
+TPS_MADC_SW1AVERAGE_LSB * &08
+TPS_MADC_BCI_USBAVERAGE * &0E
+TPS_MADC_CTRL_SW1       * &12
+TPS_MADC_GPCH12_LSB     * &4F
+
+TPS_BCIMDKEY            * &75
+TPS_BCIMSTATEC          * &76
+TPS_BCIMFSTS2           * &82
+TPS_BCIMFSTS3           * &83
+TPS_BCIMFKEY            * &85
+TPS_BCIMFEN1            * &86
+TPS_BCICTL1             * &97
+TPS_BCIIREF1            * &9B
+
+Enable_main_battery_charging ROUT
+        ; In: a1 = charge current
+        Entry   "a1", 4
+ [ Debug
+        DebugTX "Enabling battery charging"
+ ]
+        MOV     a2, sp
+        MOV     a3, #1
+        ADRL    v1, IIC_DoOp_Poll
+        ; Make sure MADC clocks are enabled
+        MOV     a1, #&49*2
+        MOV     a4, #TPS_GPBR1
+        BL      TPSRead
+        CMP     a1, #0
+        BNE     %FT9 ; Fail, just skip it
+        LDRB    ip, [a2]
+        ORR     ip, ip, #&90 ; DEFAULT_MADC_CLK_EN, MADC_HFCLK_EN
+        STRB    ip, [a2]
+        MOV     a1, #&49*2
+        BL      TPSWrite
+        CMP     a1, #0
+        BNE     %FT9
+        ; Disable the automatic battery charging so we can tweak the settings
+        MOV     a1, #PM_MASTER_IIC*2
+        MOV     a4, #TPS_BOOT_BCI
+        BL      TPSRead
+        CMP     a1, #0
+        BNE     %FT9
+        LDRB    v3, [a2]
+        BIC     v3, v3, #&7 ; BCIAUTOAC, BCIAUTOUSB, CVENAC
+        STRB    v3, [a2]
+        MOV     a1, #PM_MASTER_IIC*2
+        BL      TPSWrite
+        CMP     a1, #0
+        BNE     %FT9
+        ; Now stop the current charging session, if any
+        MOV     a1, #BCI_IIC*2
+        MOV     a4, #TPS_BCIMDKEY
+        MOV     ip, #&2A ; EKEY6
+        STRB    ip, [a2]
+        BL      TPSWrite
+        CMP     a1, #0
+        BNE     %FT9
+        ; Wait until it's really stopped
+        MOV     v2, #1000
+7
+        MOV     a1, #BCI_IIC*2
+        MOV     a4, #TPS_BCIMSTATEC
+        BL      TPSRead
+        CMP     a1, #0
+        BNE     %FT9
+        LDREQB  ip, [a2]
+        TSTEQ   ip, #&30 ; Accept any non-charging, non-overvoltage state
+        BEQ     %FT8
+        SUBS    v2, v2, #1
+        BGT     %BT7
+ [ Debug
+        DebugTX "Timeout waiting for charging to stop"
+ ]
+        B       %FT9 ; Timeout
+8
+        ; Now set CGAIN to double the charging current
+        MOV     a1, #BCI_IIC*2
+        MOV     a4, #TPS_BCICTL1
+        BL      TPSRead
+        CMP     a1, #0
+        BNE     %FT9
+        LDRB    ip, [a2]
+        ORR     ip, ip, #&20 ; CGAIN
+        STRB    ip, [a2]
+        MOV     a1, #&4a*2
+        BL      TPSWrite
+        CMP     a1, #0
+        BNE     %FT9
+        ; Unlock BCIIREF1
+        MOV     a1, #BCI_IIC*2
+        MOV     a4, #TPS_BCIMFKEY
+        MOV     ip, #&E7 ; MFKEY13
+        STRB    ip, [a2]
+        BL      TPSWrite
+        CMP     a1, #0
+        BNE     %FT9
+        ; Set desired charging current (a1 on entry)
+        MOV     a1, #BCI_IIC*2
+        ADD     a2, sp, #4
+        MOV     a3, #2
+        MOV     a4, #TPS_BCIIREF1
+        BL      TPSWrite
+        CMP     a1, #0
+        BNE     %FT9
+        MOV     a2, sp
+        MOV     a3, #1
+        ; Wait for any current BCI conversion to finish
+7
+        MOV     a1, #MADC_IIC*2
+        MOV     a4, #TPS_MADC_CTRL_SW1
+        BL      TPSRead
+        CMP     a1, #0
+        BNE     %FT9
+        LDRB    ip, [a2]
+        TST     ip, #&18 ; Check both BCI and USB, since we also set the USB average bit
+        BEQ     %BT7
+        ; Enable BCI_USBAVERAGE to increase accuracy of BCI measurements
+        MOV     a1, #BCI_IIC*2
+        MOV     a4, #TPS_MADC_BCI_USBAVERAGE
+        MOV     ip, #&3f
+        STRB    ip, [a2]
+        BL      TPSWrite
+        CMP     a1, #0
+        BNE     %FT9
+        ; Unlock BCIMFEN1
+        MOV     a1, #BCI_IIC*2
+        MOV     a4, #TPS_BCIMFKEY
+        MOV     ip, #&57 ; MFKEY1
+        STRB    ip, [a2]
+        BL      TPSWrite
+        CMP     a1, #0
+        BNE     %FT8
+        ; Enable battery voltage level monitoring (needed for when charge isn't active)
+        MOV     a1, #BCI_IIC*2
+        MOV     a4, #TPS_BCIMFEN1
+        MOV     ip, #&AA
+        STRB    ip, [a2]
+        BL      TPSWrite
+8
+        ; Enable automatic charging again
+        ORR     v3, v3, #&5 ; BCIAUTOAC, CVENAC
+        STRB    v3, [a2]
+        MOV     a1, #PM_MASTER_IIC*2
+        MOV     a4, #TPS_BOOT_BCI
+        BL      TPSWrite
+9
+ [ Debug
+        CMP     a1, #0
+        BEQ     %FT10
+        DebugRegByte a4, "Failed on register "
+        DebugRegByte a1, ", err="
+ ] 
+10
+        EXIT
+
+; Device parameters
+                            ^ 0
+BMUParams_TypeID            # 4
+BMUParams_Location          # 4
+BMUParams_Version           # 4
+BMUParams_DevDesc           # 4
+BMUParams_Activate          # 4
+BMUParams_DesignCapacity    # 4
+BMUParams_Flags             # 4
+BMUParams_ReadVariables     # 4
+BMUParams_StatusFlagsMask   # 4
+BMUParams_Size              # 0
+
+BMU_InitDevice  ROUT
+        ; In: a1 = workspace
+        ;     a2 = device params
+        Entry   "v1-v4"
+        ; Fill in the device struct
+        ASSERT  (BMUParams_TypeID = 0) :LAND: (HALDevice_Type = 0)
+        ASSERT  (BMUParams_Location = 4) :LAND: (HALDevice_Location = 4)
+        ASSERT  (BMUParams_Version = 8) :LAND: (HALDevice_Version = 8)
+        ASSERT  (BMUParams_DevDesc = 12) :LAND: (HALDevice_Description = 12)
+        LDMIA   a2, {v1-v4}
+        STMIA   a1, {v1-v4}
+        LDR     a3, [a2, #BMUParams_Activate]
+        STR     a3, [a1, #HALDevice_Activate]
+        ADR     a3, BMU_Deactivate
+        STR     a3, [a1, #HALDevice_Deactivate]
+        ADR     a3, BMU_Reset
+        STR     a3, [a1, #HALDevice_Reset]
+        ADR     a3, BMU_Sleep
+        STR     a3, [a1, #HALDevice_Sleep]
+        MVN     a3, #0
+        STR     a3, [a1, #HALDevice_Device]
+        ; Fill in the BMU device bits
+        LDR     a3, [a2, #BMUParams_Flags]
+        STR     a3, [a1, #HALDevice_BMUFlags]
+        LDR     a3, [a2, #BMUParams_ReadVariables]
+        STR     a3, [a1, #HALDevice_BMUReadVariables]
+        LDR     a3, [a2, #BMUParams_StatusFlagsMask]
+        STR     a3, [a1, #HALDevice_BMUStatusFlagsMask]
+        ; Fill in our bits
+        STR     sb, [a1, #BMUWS]
+        STR     a2, [a1, #BMUParams]
+        ; Register with OS
+        MOV     a2, a1
+        MOV     a1, #0
+        CallOS  OS_AddDevice
+        EXIT
+
+BMUParams_TPS65950_TouchBook
+        DCD       HALDeviceType_SysPeri + HALDeviceSysPeri_BMU + (HALDeviceID_BMU_TPS65950<<16)
+        DCD       HALDeviceBus_Ser + HALDeviceSerBus_IIC
+        DCD       0
+        DCD       DevDesc_TPS65950
+        DCD       BMU_TPS65950_Activate
+        DCD       6000
+        DCD       PortableBMUDF_System
+        DCD       BMU_TPS65950_ReadVariables
+        DCD       PortableBMUF_BatteryPresent+PortableBMUF_ChargerPresent+PortableBMUF_Charging+PortableBMUF_BatteryLow+PortableBMUF_BatteryFlat+PortableBMUF_BatteryFull
+        ASSERT    . - BMUParams_TPS65950_TouchBook = BMUParams_Size
+
+BMUParams_BQ27200_TouchBook
+        DCD       HALDeviceType_SysPeri + HALDeviceSysPeri_BMU + (HALDeviceID_BMU_BQ27200<<16)
+        DCD       HALDeviceBus_Ser + HALDeviceSerBus_IIC + (2<<16)
+        DCD       0
+        DCD       DevDesc_BQ27200
+        DCD       BMU_Activate
+        DCD       12000
+        DCD       PortableBMUDF_System + PortableBMUDF_Removable
+        DCD       BMU_BQ27200_ReadVariables
+        DCD       PortableBMUF_BatteryPresent+PortableBMUF_Charging+PortableBMUF_BatteryLow+PortableBMUF_BatteryFlat
+        ASSERT    . - BMUParams_BQ27200_TouchBook = BMUParams_Size
+        
+BMUParams_BQ27500_Pandora
+        DCD       HALDeviceType_SysPeri + HALDeviceSysPeri_BMU + (HALDeviceID_BMU_BQ27500<<16)
+        DCD       HALDeviceBus_Ser + HALDeviceSerBus_IIC + (2<<16)
+        DCD       0
+        DCD       DevDesc_BQ27500
+        DCD       BMU_Activate
+        DCD       4000
+        DCD       PortableBMUDF_System
+        DCD       BMU_BQ27500_TPS65950_ReadVariables
+        DCD       PortableBMUF_BatteryPresent+PortableBMUF_ChargerPresent+PortableBMUF_Charging+PortableBMUF_BatteryLow+PortableBMUF_BatteryFlat+PortableBMUF_BatteryFull
+        ASSERT    . - BMUParams_BQ27500_Pandora = BMUParams_Size
+
+DevDesc_TPS65950
+        = "TPS65950 battery management unit", 0
+DevDesc_BQ27200
+        = "BQ27200 battery management unit", 0
+DevDesc_BQ27500
+        = "BQ27500 battery management unit", 0
+MADC_Enable_byte
+        = 1        
+
+        ALIGN
+
+BMU_Activate
+        MOV     a1, #1
+BMU_Deactivate
+BMU_Reset
+        MOV     pc, lr
+
+BMU_Sleep
+        MOV     a1, #0
+        MOV     pc, lr
+
+
+;
+; TPS65950 code
+;
+
+
+BMU_TPS65950_Activate
+        ; Turn on MADC
+        ; This assumes clocks are already enabled (done in Enable_main_battery_charging)
+        Entry   "v1,sb"
+        LDR     sb, [a1, #BMUWS]
+        LDR     v1, OSentries+4*OS_IICOpV
+        MOV     a1, #MADC_IIC*2
+        ADR     a2, MADC_Enable_byte
+        MOV     a3, #1
+        MOV     a4, #TPS_MADC_CTRL1
+        BL      TPSWrite
+        CMP     a1, #0
+        MOVNE   a1, #0
+        MOVEQ   a1, #1
+        EXIT
+
+BMU_TPS65950_ReadVariables ROUT
+        ; TPS65950 is somewhat limited compared to the other devices, the only information we can effectively return is:
+        ; * Status flags (from BCI)
+        ; * Instantenous voltage (from MADC, as BCI regs don't update unless charging)
+        ; * Nominal capacity (as useless as it is to know that without knowing everything else)
+        ; Technically we can return the temperature too, but that'll need a calibration table, which I don't have (plus there's no thermistor connected to either of the touch books battery packs!)
+        Entry   "v1-v5,sb"
+        LDR     sb, [a1, #BMUWS]
+        LDR     v1, OSentries+4*OS_IICOpV
+        MOVS    v2, a2
+        EXIT    EQ
+        MOV     v3, a3
+        MOV     v5, a1
+10
+        LDR     a1, [v3, #PortableReadBMUVars_VarNo]
+        CMP     a1, #PortableBMUV_NominalCapacity
+        LDREQ   a1, [v5, #BMUParams]
+        LDREQ   a1, [a1, #BMUParams_DesignCapacity]
+        STREQ   a1, [v3, #PortableReadBMUVars_Value]
+        BEQ     %FT30
+        CMP     a1, #PortableBMUV_Flags
+        ADREQ   lr, %FT40
+        BEQ     ReadFlags_TPS65950
+        CMP     a1, #PortableBMUV_Voltage
+        MOVNE   a1, #PortableBMUR_Unsupported
+        BNE     %FT40
+        ; Read voltage from MADC channel 12
+        ; First wait for any current conversion to finish
+        BL      WaitForMADC
+        CMP     a1, #PortableBMUR_Success
+        BNE     %FT40
+        ; Now request conversion
+        ADR     a1, MADC_Voltage_Request
+        MOV     a2, #2
+        BLX     v1
+        CMP     a1, #0
+        MOVNE   a1, #PortableBMUR_Error
+        BNE     %FT40
+        ; Wait for result
+        BL      WaitForMADC
+        CMP     a1, #PortableBMUR_Success
+        BNE     %FT40
+        ; Grab it
+        ADD     a2, v3, #PortableReadBMUVars_Value
+        MOV     a1, #MADC_IIC*2
+        MOV     a3, #2
+        MOV     a4, #TPS_MADC_GPCH12_LSB
+        BL      TPSRead
+        CMP     a1, #0
+        MOVNE   a1, #PortableBMUR_Error
+        BNE     %FT40
+        LDRH    a1, [a2]
+        MOV     a1, a1, LSR #6
+        ; Convert:
+        ; mV = a1*((1.5/1023)/0.25)*1000
+        LDR     a2, =384375 ; ((1.5/1023)/0.25)*1000*65536
+        MUL     a1, a2, a1
+        MOV     a1, a1, LSR #16
+        STR     a1, [v3, #PortableReadBMUVars_Value]
+30
+        MOV     a1, #PortableBMUR_Success
+40
+        STR     a1, [v3, #PortableReadBMUVars_Result]
+        ADD     v3, v3, #PortableReadBMUVars_Size
+        SUBS    v2, v2, #1
+        BNE     %BT10
+        EXIT
+
+WaitForMADC     ROUT
+        ; Wait for MADC user conversion to finish
+        ; In:
+        ;  v1 = OS_IICOpV
+        ; Out:
+        ;  a1 = BMU result code
+        ;  a2-a4, ip corrupt
+        Entry   "v2,v4", 4
+        LDR     v2, L4_32KTIMER_Log
+        LDR     v4, [v2, #REG_32KSYNCNT_CR]
+        ADD     v4, v4, #2048 ; 64ms should be an adequate timeout
+        MOV     a2, sp
+        MOV     a3, #1
+10
+        MOV     a1, #MADC_IIC*2
+        MOV     a4, #TPS_MADC_CTRL_SW1
+        BL      TPSRead
+        CMP     a1, #0
+        BNE     %FT20
+        LDRB    ip, [a2]
+        TST     ip, #&2
+        MOVNE   a1, #PortableBMUR_Success
+        BNE     %FT30
+20
+        LDR     ip, [v2, #REG_32KSYNCNT_CR]
+        SUBS    ip, ip, v4
+        BLT     %BT10
+        MOV     a1, #PortableBMUR_Error
+30
+        EXIT
+
+ReadFlags_TPS65950 ROUT
+        ; Read status flags from TPS65950
+        ; In:
+        ;   v1 = OS_IICOpV
+        ;   v3 = BMU vars to store result in
+        ; Out:
+        ;   a1 = BMU result
+        ;   a2-a4, ip corrupt
+        Entry   "v2", 4
+        MOV     v2, #0     
+        ; ChargerPresent can be fetched from STS_HW_CONDITIONS
+        MOV     a1, #PM_MASTER_IIC*2
+        MOV     a2, sp
+        MOV     a3, #1
+        MOV     a4, #TPS_STS_HW_CONDITIONS
+        BL      TPSRead
+        CMP     a1, #0
+        MOVNE   a1, #PortableBMUR_Error
+        BNE     %FT10
+        LDRB    a1, [a2]
+        EOR     a1, a1, #&80
+        TST     a1, #&84 ; STS_VBUS set & STS_USB clear = USB connected
+        ORREQ   v2, v2, #PortableBMUF_ChargerPresent
+        TST     a1, #&2 ; STS_CHG?
+        ORRNE   v2, v2, #PortableBMUF_ChargerPresent
+        ; BatteryPresent can be fetched from BCIMFSTS3
+        ; BatteryLow can be fetched from BCIMFSTS2
+        ; BatteryFlat can be fetched from BCIMFSTS2
+        ; BatteryFull can be fetched from BCIMFSTS2
+        MOV     a1, #BCI_IIC*2
+        MOV     a3, #2
+        MOV     a4, #TPS_BCIMFSTS2
+        BL      TPSRead
+        CMP     a1, #0
+        MOVNE   a1, #PortableBMUR_Error
+        BNE     %FT10
+        LDR     a1, [a2]
+        TST     a1, #1<<(6+8)
+        ORRNE   v2, v2, #PortableBMUF_BatteryPresent
+        BEQ     %FT05
+        ; Must test from highest level downwards
+        TST     a1, #8<<2
+        ORRNE   v2, v2, #PortableBMUF_BatteryFull
+        TSTEQ   a1, #6<<2 ; ignore middle two flags
+        BNE     %FT04
+        TST     a1, #1<<2
+        ORRNE   v2, v2, #PortableBMUF_BatteryLow
+        BICEQ   v2, v2, #PortableBMUF_BatteryFlat
+04
+        ; Charging can be fetched from BCIMSTATEC
+        TST     v2, #PortableBMUF_ChargerPresent
+        BEQ     %FT05
+        MOV     a1, #BCI_IIC*2
+        MOV     a3, #1
+        MOV     a4, #TPS_BCIMSTATEC
+        BL      TPSRead
+        CMP     a1, #0
+        MOVNE   a1, #PortableBMUR_Error
+        BNE     %FT10
+        LDRB    a1, [a2]
+        TST     a1, #&30 ; Charging?
+        BEQ     %FT05
+        AND     a1, a1, #&F
+        CMP     a1, #&b ; Not complete?
+        ORRLT   v2, v2, #PortableBMUF_Charging
+05
+        STR     v2, [v3, #PortableReadBMUVars_Value]
+        MOV     a1, #PortableBMUR_Success
+10
+        EXIT
+
+
+MADC_Voltage_Request
+        DCD     MADC_IIC*2
+        DCD     MADC_Voltage_data1
+        DCD     5
+        DCD     MADC_IIC*2
+        DCD     MADC_Voltage_data2
+        DCD     2
+MADC_Voltage_data1
+        DCB     TPS_MADC_SW1SELECT_LSB
+        DCB     0
+        DCB     &10 ; ADCIN12
+        DCB     0
+        DCB     &10 ; ADCIN12
+MADC_Voltage_data2
+        DCB     TPS_MADC_CTRL_SW1
+        DCB     &20 ; Perform conversion
+        ALIGN        
+
+
+;
+; BQ27200 code
+;
+
+
+        MACRO
+        BQ27200Var  $name, $cmd, $size, $mult
+        ASSERT  . - BQ27200_RegTable = PortableBMUV_$name * 8
+        DCW     $cmd
+        DCW     $size
+      [ "$mult"=""
+        DCD     65536
+      |
+        DCD     $mult
+      ]
+        MEND
+
+        MACRO
+        BQ27200NoVar  $name
+        ASSERT  . - BQ27200_RegTable = PortableBMUV_$name * 8
+        DCD     -1
+        DCD     -1
+        MEND
+
+; Assume TouchBook uses suggested Rs value of 0.02 ohms
+Rs      * 20 ; Rs in milliohms
+
+BQ27200_RegTable
+        BQ27200NoVar VersionNumber
+        BQ27200NoVar NominalCapacity ; special case
+        BQ27200NoVar MeasuredCapacity
+        BQ27200NoVar UsedCapacity
+        BQ27200NoVar UsableCapacity
+        BQ27200NoVar Reserved
+        BQ27200NoVar ChargeEstimate
+        BQ27200Var Voltage, &08, 2
+        BQ27200NoVar Current
+        BQ27200Var Temperature, &06, 2, (65536*10)/4 ; units of 0.25K
+        BQ27200NoVar Flags ; special case
+        BQ27200NoVar ChargeRate
+        FILL 8*9,255 ; Stork block
+        BQ27200Var BatteryTimeRemaining, &16, 2, 60*65536 ; minutes -> seconds. TODO - may cause issues - overflow once we hit 18h!
+        BQ27200NoVar MaxBatteryTime
+        BQ27200Var BatteryPercentRemaining, &0b, 1
+        BQ27200Var ChargeTimeRemaining, &18, 2, 60*65536
+        BQ27200Var ChargeCycles, &2a, 2
+        BQ27200NoVar SmoothedVoltage
+        BQ27200Var SmoothedCurrent, &14, 2, (65536*357)/(100*Rs) ; units of 3.57uV, divided by Rs in milliohms, to give current in mA
+        BQ27200Var NominalAvailableCapacity, &0c, 2, (65536*357)/(100*Rs) ; units of 3.57uVh, divided by Rs in milliohms, to give charge in mAh
+        BQ27200Var CompensatedAvailableCapacity, &10, 2, (65536*357)/(100*Rs) 
+BQ27200_RegTableEnd
+
+BMU_BQ27200_ReadVariables ROUT
+        Entry   "v1-v5,sb", 4
+        LDR     sb, [a1, #BMUWS]
+        LDR     v1, OSentries+4*OS_IICOpV
+        MOVS    v2, a2
+        EXIT    EQ
+        MOV     v3, a3
+        ADR     v4, BQ27200_RegTable
+        MOV     v5, a1
+        ; Check that BQ is connected & responding
+        ; To do this we'll just read the status flags
+        MOV     a1, #&55*2
+        MOV     a2, sp
+        MOV     a3, #1
+        MOV     a4, #&0a
+        BL      BQRead
+        CMP     a1, #0
+        MOVNE   a2, #0
+        BNE     %FT05
+        ; Translate result
+        LDR     a1, [sp]
+        MOV     a2, #PortableBMUF_BatteryPresent ; Assume battery is present if BQ responds
+        TST     a1, #&80
+        ORRNE   a2, a2, #PortableBMUF_Charging
+        TST     a1, #&02
+        ORRNE   a2, a2, #PortableBMUF_BatteryLow
+        TST     a1, #&01
+        ORRNE   a2, a2, #PortableBMUF_BatteryFlat
+05
+        STR     a2, [sp]
+        ; Now fall into main loop
+10
+        LDR     a1, [v3, #PortableReadBMUVars_VarNo]
+        CMP     a1, #PortableBMUV_NominalCapacity
+        LDREQ   a1, [v5, #BMUParams]
+        LDREQ   a1, [a1, #BMUParams_DesignCapacity]
+        STREQ   a1, [v3, #PortableReadBMUVars_Value]
+        BEQ     %FT30
+        CMP     a1, #PortableBMUV_Flags
+        LDREQ   a4, [sp]
+        MOVEQ   a1, #0
+        BEQ     %FT20
+        CMP     a1, #(BQ27200_RegTableEnd-BQ27200_RegTable)/8
+        MOVHS   a1, #PortableBMUR_Unsupported
+        BHS     %FT40
+        LDR     a4, [v4, a1, LSL #3]
+        CMP     a4, #-1
+        MOVEQ   a1, #PortableBMUR_Unsupported
+        BEQ     %FT40
+        ; Did status flags read work?
+        LDR     a2, [sp]
+        CMP     a2, #0
+        MOVEQ   a1, #PortableBMUR_Unknown
+        BEQ     %FT40
+        ; Read the register
+        MOV     a3, a4, LSR #16
+        AND     a4, a4, #255
+        MOV     a1, #&55*2
+        ADD     a2, v3, #PortableReadBMUVars_Value
+        STR     a1, [a2] ; Zero the top bytes of the value
+        BL      BQRead
+        CMP     a1, #0
+        MOVNE   a1, #PortableBMUR_Error
+        BNE     %FT40
+        LDR     ip, [a2]
+        ; &ffff is used for invalid results
+        LDR     a3, =&ffff
+        CMP     ip, a3
+        MOVEQ   a1, #PortableBMUR_Unknown
+        BEQ     %FT40
+        ; Scale result
+        LDR     a3, [v3, #PortableReadBMUVars_VarNo]
+        ADD     a3, v4, a3, LSL #3
+        LDR     a3, [a3, #4]
+        MUL     ip, a3, ip
+        CMP     a4, #&14
+        MOV     a4, ip, LSR #16
+        ; Current needs inverting if charge state flag is set
+        BNE     %FT20
+        LDR     a3, [sp]
+        TST     a3, #PortableBMUF_Charging
+        RSBNE   a4, a4, #0
+20
+        STR     a4, [v3, #PortableReadBMUVars_Value]
+        ; Handle error
+        CMP     a1, #0
+30
+        MOVEQ   a1, #PortableBMUR_Success
+        MOVNE   a1, #PortableBMUR_Error
+40
+        STR     a1, [v3, #PortableReadBMUVars_Result]
+        ADD     v3, v3, #PortableReadBMUVars_Size
+        SUBS    v2, v2, #1
+        BNE     %BT10
+        EXIT
+
+;
+; BQ27500 code
+;
+
+
+        MACRO
+        BQ27500Var  $name, $cmd
+        ASSERT  . - BQ27500_RegTable = PortableBMUV_$name
+        DCB     $cmd
+        MEND
+
+        MACRO
+        BQ27500NoVar  $name
+        ASSERT  . - BQ27500_RegTable = PortableBMUV_$name
+        DCB     &ff
+        MEND
+
+BQ27500_RegTable
+        BQ27500NoVar VersionNumber
+        BQ27500NoVar NominalCapacity ; special case
+        BQ27500NoVar MeasuredCapacity
+        BQ27500NoVar UsedCapacity
+        BQ27500Var UsableCapacity, &0e
+        BQ27500NoVar Reserved
+        BQ27500NoVar ChargeEstimate
+        BQ27500Var Voltage, &08
+        BQ27500NoVar Current
+        BQ27500Var Temperature, &06
+        BQ27500NoVar Flags ; special case
+        BQ27500NoVar ChargeRate
+        FILL 9,255 ; Stork block
+        BQ27500Var BatteryTimeRemaining, &16
+        BQ27500NoVar MaxBatteryTime
+        BQ27500Var BatteryPercentRemaining, &2c
+        BQ27500Var ChargeTimeRemaining, &18
+        BQ27500Var ChargeCycles, &2a
+        BQ27500NoVar SmoothedVoltage
+        BQ27500Var SmoothedCurrent, &14
+        BQ27500Var NominalAvailableCapacity, &0c
+        BQ27500Var CompensatedAvailableCapacity, &10
+BQ27500_RegTableEnd
+        
+
+BMU_BQ27500_TPS65950_ReadVariables ROUT
+        Entry   "v1-v5,sb"
+        LDR     sb, [a1, #BMUWS]
+        LDR     v1, OSentries+4*OS_IICOpV
+        MOVS    v2, a2
+        EXIT    EQ
+        MOV     v3, a3
+        ADR     v4, BQ27500_RegTable
+        MOV     v5, a1
+10
+        LDR     a1, [v3, #PortableReadBMUVars_VarNo]
+        CMP     a1, #PortableBMUV_NominalCapacity
+        LDREQ   a1, [v5, #BMUParams]
+        LDREQ   a1, [a1, #BMUParams_DesignCapacity]
+        STREQ   a1, [v3, #PortableReadBMUVars_Value]
+        BEQ     %FT30
+        CMP     a1, #PortableBMUV_Flags
+        ADREQ   lr, %FT40
+        ; TPS65950 status flags provide more info than BQ27500 status flags
+        BEQ     ReadFlags_TPS65950
+        CMP     a1, #BQ27500_RegTableEnd-BQ27500_RegTable
+        MOVHS   a1, #PortableBMUR_Unsupported
+        BHS     %FT40
+        LDRB    a4, [v4, a1]
+        TEQ     a4, #255
+        MOVEQ   a1, #PortableBMUR_Unsupported
+        BEQ     %FT40
+        MOV     a1, #&55*2
+        ADD     a2, v3, #PortableReadBMUVars_Value
+        STR     a1, [a2] ; Zero the top two bytes of the value
+        MOV     a3, #2
+        BL      BQRead
+        CMP     a1, #0
+        MOVNE   a1, #PortableBMUR_Error
+        BNE     %FT40
+        ; Current value can be negative, sign extend it
+        CMP     a4, #&14
+        LDRSH   ip, [a2]
+        RSBEQ   ip, ip, #0 ; Sign needs inverting too
+        STREQ   ip, [a2]
+        ; Other values appear to be returned as &ffff if unknown
+        BEQ     %FT30
+        CMP     ip, #-1
+        MOVEQ   a1, #PortableBMUR_Unknown
+        BEQ     %FT40
+        ; Scale up time estimates
+        CMP     a4, #&16
+        CMPNE   a4, #&18
+        BNE     %FT30
+        MOV     a4, #60
+        MUL     ip, a4, ip
+        STRH    ip, [a2]
+30
+        MOV     a1, #PortableBMUR_Success
+40
+        STR     a1, [v3, #PortableReadBMUVars_Result]
+        ADD     v3, v3, #PortableReadBMUVars_Size
+        SUBS    v2, v2, #1
+        BNE     %BT10
+        EXIT
+
+; Like TPSRead, but reads from I2C3
+BQRead  ROUT
+        ; a1 = IIC address(*2)
+        ; a2 = buffer
+        ; a3 = count
+        ; a4 = start register
+        ; v1 = IIC func
+        ; v2 = IIC param
+        ; out:
+        ; a1 = return code
+        ; ip corrupted
+        ; buffer updated
+        ORR     a1, a1, #1 ; read
+        Push    "a1-a4,lr" ; Push regs and second iic_transfer block
+        EOR     a1, a1, #1+(1:SHL:29) ; write with retry
+        ADD     a2, sp, #12
+        MOV     a3, #1
+        Push    "a1-a3" ; push first iic_transfer block
+        MOV     a1, sp
+        LDR     a2, =&02000002
+        MOV     a3, v2
+        BLX     v1
+        ADD     sp, sp, #16
+        Pull    "a2-a4,pc"
+
+        END

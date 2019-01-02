@@ -1,0 +1,328 @@
+;
+; CDDL HEADER START
+;
+; The contents of this file are subject to the terms of the
+; Common Development and Distribution License (the "Licence").
+; You may not use this file except in compliance with the Licence.
+;
+; You can obtain a copy of the licence at
+; cddl/RiscOS/Sources/HAL/Titanium/LICENCE.
+; See the Licence for the specific language governing permissions
+; and limitations under the Licence.
+;
+; When distributing Covered Code, include this CDDL HEADER in each
+; file and include the Licence file. If applicable, add the
+; following below this CDDL HEADER, with the fields enclosed by
+; brackets "[]" replaced with your own identifying information:
+; Portions Copyright [yyyy] [name of copyright owner]
+;
+; CDDL HEADER END
+;
+;
+; Copyright 2014 Elesar Ltd.  All rights reserved.
+; Use is subject to license terms.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:OSEntries
+        GET     Hdr:HALEntries
+        GET     Hdr:Podule
+        
+        GET     hdr.RegMap
+        GET     hdr.StaticWS
+                
+        AREA    |Miscellaneous$$Code|, CODE, READONLY, PIC
+
+        EXPORT  HAL_Reset
+        EXPORT  HAL_PhysInfo
+        EXPORT  HAL_MachineID
+        EXPORT  HAL_HardwareInfo
+        EXPORT  HAL_SuperIOInfo
+        EXPORT  HAL_ControllerAddress
+        EXPORT  HAL_PlatformInfo
+        EXPORT  HAL_PlatformName
+        IMPORT  HAL_CounterDelay
+        IMPORT  memset
+        IMPORT  PMICPowerOff
+        IMPORT  GPIOMakeInput
+        IMPORT  GPIOMakeOutput
+        IMPORT  GPIOReadPin
+        IMPORT  GPIOSetPinHigh
+        IMPORT  GPIOSetPinLow
+        
+; HAL physical info call definitions
+HPITypeNotPresent   * &00
+HPITypeDRAM         * &11
+HPITypeVRAM         * &22
+HPITypeROM          * &33
+HPITypeIO           * &44
+HPITypeUnused5      * &55
+HPITypeUnused6      * &66
+HPITypeUnused7      * &77
+HPIFlagNotAvailable * &88
+HPILog2PageSize     * 12  ; 4k
+HPILog2BitsPerPage  * 2   ; 3 type bits + 1 flag
+HPILog2PagesPerByte * 1   ; 8 bit bytes, so 2
+
+; HAL_Reset
+; => a1 = 0 - switch off the power too
+;         1 - do a hard reset
+HAL_Reset ROUT
+        CMP     a1, #1
+        MOVHI   pc, lr
+
+        ; Hard reset
+        LDREQ   a1, PRMDevice_LogBase
+        MOVEQ   a2, #PRM_RSTCTRL_RST_GLOBAL_WARM_SW
+        STREQ   a2, [a1, #PRM_RSTCTRL]
+        BEQ     .                       ; Should be reset now
+
+        ; Power off
+        B       PMICPowerOff
+
+; HAL_PhysInfo
+; => a1 = 0 - request size of physical arrangement table
+;         1 - fill in physical arrangement table
+;         2 - return range of hard ROM
+;    a2 = pointer to word for size, or pointer to table to fill
+;    a3 = pointer to range structure
+; <= a1 = TRUE if subreason is supported
+HAL_PhysInfo ROUT
+        TEQ     a1, #PhysInfo_GetTableSize
+        BEQ     %FT10
+        TEQ     a1, #PhysInfo_HardROM
+        BEQ     %FT20
+        TEQ     a1, #PhysInfo_WriteTable
+        BEQ     %FT30
+
+        MOV     a1, #0                  ; Subreason not supported
+        MOV     pc, lr
+10
+        ; 4G address space expressed with 4 bits per page
+        MOV     a1, #1:SHL:(32 - HPILog2PageSize - HPILog2PagesPerByte)
+        STR     a1, [a2]
+        MOV     a1, #-1                 ; Supported
+        MOV     pc, lr
+20
+        ; The QSPI boot flash isn't in the physical address map
+        MOV     a1, #0                  
+        STR     a1, [a3, #0]
+        STR     a1, [a3, #4]
+        MOV     a1, #-1                 ; Supported
+        MOV     pc, lr
+30
+        ; Fill the table from the compact form held here
+        Push    "v1-v2, lr"
+
+        MOV     a1, #DRAM_PhysBase
+        ADD     a4, a1, #DRAM_PhysSize
+        SUB     a4, a4, #1
+        STMIA   a3, {a1,a4}             ; Inclusive RAM window hint
+        MOV     v2, a2
+        ADR     v1, %FT50
+40
+        LDMIA   v1!, {a1,a2}
+        LDR     a3, [v1]                ; Start of next region
+        SUB     a3, a3, a1              ; Size of this region in bytes
+        MOV     a3, a3, LSR #HPILog2PageSize + HPILog2PagesPerByte
+        MOV     a1, v2
+        ADD     v2, v2, a3
+        BL      memset
+
+        LDR     a3, [v1]                
+        TEQ     a3, #0                  ; Reached table terminator?
+        BNE     %BT40
+
+        MOV     a1, #-1                 ; Supported
+        Pull    "v1-v2, pc"
+50
+        ; Coarse grain summary of Table 2-1 from the TRM
+        ; Must describe the entire 4G address space, in 2*4k granularity
+        ; so the table can be filled using memset()
+        DCD     &00000000, HPITypeNotPresent :OR: HPIFlagNotAvailable ; 512MB GPMC
+        DCD     &20000000, HPITypeIO                                  ; 512MB PCI
+        DCD     &40000000, HPITypeIO                                  ; 512MB registers
+        DCD     &60000000, HPITypeNotPresent :OR: HPIFlagNotAvailable ; 512MB tiler
+        DCD     &80000000, HPITypeNotPresent :OR: HPIFlagNotAvailable ; 1GB DRAM
+        DCD     &C0000000, HPITypeNotPresent :OR: HPIFlagNotAvailable ; 1GB DRAM
+        DCD     0
+
+; HAL_MachineID
+; <= a1 = low word of Dallas machine id
+;    a2 = high word of Dallas machine id
+HAL_MachineID ROUT
+      [ Vayu
+        ADR     a1, %FT10
+        LDMIA   a1, {a1,a2}
+        MOV     pc, lr
+10
+        DCB     &81                     ; Custom Dallas range
+        DCB     &00, &FF, &00, &32, &31, &30
+        DCB     &A5                     ; CRC
+      |
+BitClkSync      * 230
+BitClkHigh      * 15
+BitClkLow       * 15
+        Push    "v1, lr"
+        LDRB    a1, UniquePROMRead
+        TEQ     a1, #0
+        BNE     %FT20
+
+        ; One time cache of the slow PROM
+        LDR     a1, =&0106
+        BL      GPIOSetPinHigh
+        LDR     a1, =&0106              ; Clock on GPIO1.6
+        BL      GPIOMakeOutput
+        LDR     a1, =&0107              ; Data on GPIO1.7
+        BL      GPIOMakeInput
+        MOV     a1, #BitClkSync
+        BL      HAL_CounterDelay        ; Ensure sync
+        MOV     v1, #0
+10
+        LDR     a1, =&0106
+        BL      GPIOSetPinLow
+        MOV     a1, #BitClkLow
+        BL      HAL_CounterDelay
+        LDR     a1, =&0106
+        BL      GPIOSetPinHigh          ; Capture on rising edge
+
+        LDR     a1, =&0107
+        BL      GPIOReadPin
+        TEQ     a1, #0
+        MOV     a1, #&80                ; MSB first
+        ADR     a2, UniquePROM
+        LDRB    a3, [a2, v1, LSR #3]
+        AND     a4, v1, #7
+        MOV     a4, a1, LSR a4          ; Make a mask
+        ORRNE   a3, a3, a4
+        BICEQ   a3, a3, a4
+        STRB    a3, [a2, v1, LSR #3]
+
+        MOV     a1, #BitClkHigh
+        BL      HAL_CounterDelay
+
+        ADD     v1, v1, #1
+        TEQ     v1, #?UniquePROM * 8
+        BNE     %BT10
+
+        MOV     a1, #1
+        STRB    a1, UniquePROMRead
+20
+        ; Scan the PROM for an EUI48 and CRC
+        MOV     a1, #-1
+        MOV     a2, #-1
+        Push    "a1-a2"                 ; Default response
+        MOV     ip, #0
+        ADR     v1, UniquePROM
+        MOV     lr, v1
+30
+        SUB     a2, v1, lr
+        CMP     a2, #?UniquePROM        ; Buffer's end?
+        MOVCS   a2, #0
+        LDRCC   a2, [v1], #4
+        TEQ     a2, #0
+        BEQ     %FT50                   ; End of directory
+
+        AND     a4, a2, #&FF            ; Chunk type
+        MOV     a3, a2, LSR #16
+        UBFX    a2, a2, #8, #8          ; Length
+        ADD     a1, lr, a3              ; Absolute address
+        CMP     a2, #?UniquePROM        ; Junk length?
+        CMPCC   a3, #?UniquePROM        ; Junk offset?
+        BCS     %FT50
+
+        TEQ     a4, #DeviceType_EthernetID
+        BEQ     %FT60
+
+        TEQ     a4, #DeviceType_ROMCRC
+        BEQ     %FT80
+40
+        TEQ     ip, #2_11
+        BNE     %BT30                   ; Keep looking for a pair
+50
+        Pull    "a1-a2, v1, pc"
+60
+        ; An EUI48 chunk
+        TST     ip, #2_01               ; Only want the first
+        CMPEQ   a2, #6
+        BNE     %BT40
+70
+        RSB     a4, a2, #6
+        LDRB    a3, [a1, a4]
+        STRB    a3, [sp, a2]
+        SUBS    a2, a2, #1
+        BNE     %BT70
+
+        MOV     a2, #6
+        ORR     ip, ip, #2_01
+        B       %BT40
+80
+        ; A CRC chunk
+        TST     ip, #2_10               ; Only want the first
+        CMPEQ   a2, #1
+        BNE     %BT40
+
+        LDRB    a3, [a1]                ; CRC byte
+        STRB    a3, [sp, #7]
+        MOV     a3, #&81                ; Dallas custom id range
+        STRB    a3, [sp, #0]
+        ORR     ip, ip, #2_10
+        B       %BT40
+      ]
+
+; HAL_HardwareInfo
+; => a1 = word to receive IOEB ASIC flags
+;    a2 = word to receive super IO flags
+;    a3 = word to receive LCD ASIC and IOEB version flags
+HAL_HardwareInfo ROUT
+        LDR     ip, =&FFFFFF00          
+        STR     ip, [a1]                ; No VIDC/MEMC/IOC/IOEB
+        MOV     ip, #0                  
+        STR     ip, [a2]                ; No super IO
+        STR     ip, [a3]                ; No LCD ASIC
+        MOV     pc, lr
+
+; HAL_SuperIOInfo
+; => a1 = word to receive super IO chip basic features
+;    a2 = word to receive super IO chip extra features
+HAL_SuperIOInfo ROUT
+        MOV     ip, #0
+        STR     ip, [a1]
+        STR     ip, [a2]                ; No super IO, no features
+        MOV     pc, lr
+
+; HAL_ControllerAddress
+; => a1 = unused
+;    a2 = controller number
+; <= a1 = base address, or 0 if not present, of -1 if invalid controller number
+HAL_ControllerAddress ROUT
+        MOV     a1, #0                  ; All controllers valid but not present
+        MOV     pc, lr
+        
+; HAL_PlatformInfo
+; => a1 = 5 as it's HAL class
+;    a2 = address of flags
+;    a3 = address of mask of defined flags
+HAL_PlatformInfo ROUT
+      [ Vayu
+        MOV     a1, #2_10110            ; Soft ROM, multi CPU, PCI
+      |
+        MOV     a1, #2_11110            ; Soft ROM, soft off, multi CPU, PCI
+      ]
+        STR     a1, [a2]
+        MOV     a1, #2_11111
+        STR     a1, [a3]
+        MOV     pc, lr
+
+; HAL_PlatformName
+; <= a1 = pointer to description
+HAL_PlatformName ROUT
+        ADR     a1, %FT10
+        MOV     pc, lr
+10
+        DCB     "Titanium", 0
+        ALIGN
+
+        END

@@ -1,0 +1,441 @@
+/*
+ * CDDL HEADER START
+ *
+ * The contents of this file are subject to the terms of the
+ * Common Development and Distribution License (the "Licence").
+ * You may not use this file except in compliance with the Licence.
+ *
+ * You can obtain a copy of the licence at
+ * cddl/RiscOS/Sources/FileSys/ADFS/ADFS/LICENCE.
+ * See the Licence for the specific language governing permissions
+ * and limitations under the Licence.
+ *
+ * When distributing Covered Code, include this CDDL HEADER in each
+ * file and include the Licence file. If applicable, add the
+ * following below this CDDL HEADER, with the fields enclosed by
+ * brackets "[]" replaced with your own identifying information:
+ * Portions Copyright [yyyy] [name of copyright owner]
+ *
+ * CDDL HEADER END
+ */
+/*
+ * Copyright 2015 Ben Avison.  All rights reserved.
+ * Use is subject to license terms.
+ */
+
+/** \file swi.c
+ * Implementation of SWI handlers for FS-specific SWIs.
+ */
+
+#include <stddef.h>
+#include "kernel.h"
+
+#include "Global/NewErrors.h"
+#include "Interface/ADFS.h"
+#include "Interface/ADFSErr.h"
+#include "Interface/ATA.h"
+
+#include "SyncLib/spinrw.h"
+
+#include "ata.h"
+#include "discop.h"
+#include "globals.h"
+#include "message.h"
+#include "swi.h"
+
+#define DEFAULT_OP_TIMEOUT           (1000)
+#define DEVICE_CONTROL_OP_TIMEOUT    (50)
+#define SOFTWARE_RESET_ASSERT_TIME   (1) /* really only needs 50us (PATA, or 5us SATA) */
+#define SOFTWARE_RESET_RECOVERY_TIME (50)
+
+_kernel_oserror *swi_retries(uint32_t bic, uint32_t *eor, uint32_t *old, uint32_t *new)
+{
+  uint32_t retries;
+  *eor &= bic;
+  spin_lock(&g_retries_lock);
+  *old = retries = g_retries.word;
+  *new = g_retries.word = (retries &~ bic) ^ *eor;
+  spin_unlock(&g_retries_lock);
+  return NULL;
+}
+
+_kernel_oserror *swi_controller_type(uint32_t drive, uint32_t *type)
+{
+  if (drive > 7)
+    return MESSAGE_ERRORLOOKUP(true, BadDrive, 0);
+  if (drive < 4 || g_drive[drive - 4 + NUM_FLOPPIES] == NULL)
+    *type = ADFSControllerType_None;
+  else
+    *type = ADFSControllerType_WinnieIDE;
+  return NULL;
+}
+
+_kernel_oserror *swi_power_control_read_spin_state(uint32_t drive, uint32_t *state)
+{
+  _kernel_oserror *e = NULL;
+  spinrw_read_lock(&g_drive_lock);
+  drive_t *dr = g_drive[drive - 4 + NUM_FLOPPIES];
+
+  if (drive < 4 || dr == NULL)
+  {
+    e = MESSAGE_ERRORLOOKUP(true, BadDrive, 0);
+  }
+  if (!e)
+  {
+    uint32_t status, remain;
+    ataop_param_lba28_t params = {
+        .device = DEVICE_MAGIC,
+        .command = ATACOMMAND_CHECK_POWER_MODE
+    };
+    e = swi_ide_user_op(ADFSIDEUserOp_NoDRDY |
+                        (dr->cpid << ADFSIDEUserOp_CPIDShift) | (dr->deviceid << ADFSIDEUserOp_DeviceIDShift) |
+                        ADFSIDEUserOp_TransNone,
+                        (uint8_t *) &params,
+                        NULL, 0, 0, /* No data, default timeout */
+                        &status, &remain);
+    if (!e && (status == 0))
+    {
+      /* There was no attempt to interpret this value is old ADFS, so don't try here
+       * either, even though there are some non zero values that mean 'spun down'. */
+      *state = params.sector_count;
+    }
+  }
+  spinrw_read_unlock(&g_drive_lock);
+  return e;
+}
+
+_kernel_oserror *swi_power_control_set_autospindown(uint32_t drive, uint32_t new, uint32_t *old)
+{
+  _kernel_oserror *e = NULL;
+  spinrw_write_lock(&g_drive_lock);
+  drive_t *dr = g_drive[drive - 4 + NUM_FLOPPIES];
+
+  if (drive < 4 || dr == NULL)
+  {
+    e = MESSAGE_ERRORLOOKUP(true, BadDrive, 0);
+  }
+  if (!e)
+  {
+    uint32_t status, remain;
+    ataop_param_lba28_t params = {
+        .device = DEVICE_MAGIC,
+        .sector_count = (uint8_t) new,
+        .command = ATACOMMAND_IDLE
+    };
+    e = swi_ide_user_op(ADFSIDEUserOp_NoDRDY |
+                        (dr->cpid << ADFSIDEUserOp_CPIDShift) | (dr->deviceid << ADFSIDEUserOp_DeviceIDShift) |
+                        ADFSIDEUserOp_TransNone,
+                        (uint8_t *) &params,
+                        NULL, 0, 0, /* No data, default timeout */
+                        &status, &remain);
+    if (!e)
+    {
+      /* Update soft copy of the autospindown time */
+      *old = dr->standby_timer;
+      dr->standby_timer = (uint8_t) new;
+    }
+  }
+  spinrw_write_unlock(&g_drive_lock);
+  return e;
+}
+
+_kernel_oserror *swi_power_control_control_spin(uint32_t drive, bool spindown)
+{
+  _kernel_oserror *e = NULL;
+  spinrw_read_lock(&g_drive_lock);
+  drive_t *dr = g_drive[drive - 4 + NUM_FLOPPIES];
+
+  if (drive < 4 || dr == NULL)
+  {
+    e = MESSAGE_ERRORLOOKUP(true, BadDrive, 0);
+  }
+  if (!e)
+  {
+    uint32_t status, remain;
+    ataop_param_lba28_t params = {
+        .device = DEVICE_MAGIC,
+        .sector_count = dr->standby_timer,
+        .command = spindown ? ATACOMMAND_STANDBY : ATACOMMAND_IDLE
+    };
+    e = swi_ide_user_op(ADFSIDEUserOp_NoDRDY |
+                        (dr->cpid << ADFSIDEUserOp_CPIDShift) | (dr->deviceid << ADFSIDEUserOp_DeviceIDShift) |
+                        ADFSIDEUserOp_TransNone,
+                        (uint8_t *) &params,
+                        NULL, 0, 0, /* No data, default timeout */
+                        &status, &remain);
+  }
+  spinrw_read_unlock(&g_drive_lock);
+  return e;
+}
+
+static void delay(uint32_t howlong)
+{
+  int32_t now, timeout;
+  _swix(OS_ReadMonotonicTime, _OUT(0), &now);
+  timeout = now + howlong + 1;
+  do
+  {
+    _swix(OS_ReadMonotonicTime, _OUT(0), &now);
+  }
+  while (timeout - now >= 0);
+}
+
+static _kernel_oserror *validate_address(void *base, size_t size, bool read, bool write)
+{
+  uint8_t *low = base;
+  uint8_t *high = low + size;
+  uint32_t flags;
+  _kernel_oserror *e = _swix(OS_Memory, _INR(0,2)|_OUT(1), 24, low, high, &flags);
+  if (e == NULL)
+  {
+    if ((read && (flags & 4) == 0) ||
+        (write && (flags & 8) == 0))
+      return message_error_lookup(false, ErrorNumber_BadAddress, "BadAddress");
+    else
+      return NULL;
+  }
+  else
+  {
+    /* Fallback method for older kernels */
+    if (!write && (uintptr_t)low > 0xFC000000ul)
+      return NULL; /* Assume read from ROM is OK.
+                    * ROM was already at a high address by the time of the first
+                    * version of CDFSSoftATAPI that used ADFS_ATAPIOp. */
+    _swix(OS_ValidateAddress, _INR(0,1)|_OUT(_FLAGS), low, high, &flags);
+    if (flags & _C)
+      return message_error_lookup(false, ErrorNumber_BadAddress, "BadAddress");
+    else
+      return NULL;
+  }
+}
+
+_kernel_oserror *swi_ide_user_op(uint32_t flags, uint8_t *param, uint8_t *buffer, size_t length, uint32_t timeout, uint32_t *status, size_t *remain)
+{
+  _kernel_oserror *e;
+  *status = 0;
+  e = _swix(ATA_Control, _INR(0,1), ATAControl_TryLock,
+            (flags & (ADFSIDEUserOp_DeviceIDMask | ADFSIDEUserOp_CPIDMask)) >> (ADFSIDEUserOp_DeviceIDShift - ATAControl_DeviceIDShift));
+  if (e)
+  {
+    dprintf("Lock failed (%X)\n", (flags & (ADFSIDEUserOp_DeviceIDMask | ADFSIDEUserOp_CPIDMask)) >> (ADFSIDEUserOp_DeviceIDShift - ATAControl_DeviceIDShift));
+    return e;
+  }
+
+  if (flags & ADFSIDEUserOp_Reset)
+  {
+    /* Reset - achieved by issuing a software reset */
+    ataop_param_device_control_t params = CONTROL_SRST;
+    e = ata_op_fg_nodata(ATAOp_NoDRDY | (flags & (ADFSIDEUserOp_DeviceIDMask | ADFSIDEUserOp_CPIDMask)),
+                         1, &params, DEVICE_CONTROL_OP_TIMEOUT);
+    if (e)
+      goto exit;
+    delay(SOFTWARE_RESET_ASSERT_TIME);
+    params = 0;
+    e = ata_op_fg_nodata(ATAOp_NoDRDY | (flags & (ADFSIDEUserOp_DeviceIDMask | ADFSIDEUserOp_CPIDMask)),
+                         1, &params, DEVICE_CONTROL_OP_TIMEOUT);
+    if (e)
+      goto exit;
+    delay(SOFTWARE_RESET_RECOVERY_TIME);
+  }
+  else
+  {
+    /* Issue a command */
+    uint8_t *device_param = param + (flags & ADFSIDEUserOp_LBA48 ? 9 : 5);
+    bool slave = *device_param & DEVICE_DEV;
+    uint32_t plength = flags & ADFSIDEUserOp_LBA48 ? 11 : 7;
+    e = validate_address(param, plength, true, true);
+    if (!e && (flags & (ADFSIDEUserOp_TransRead | ADFSIDEUserOp_TransWrite)) != 0)
+      e = validate_address(buffer, length, flags & ADFSIDEUserOp_TransWrite, flags & ADFSIDEUserOp_TransRead);
+    if (e)
+      goto exit;
+
+    if (timeout == 0)
+      timeout = DEFAULT_OP_TIMEOUT;
+    flags = (flags & (ADFSIDEUserOp_NoDRDY | ADFSIDEUserOp_DeviceIDMask | ADFSIDEUserOp_CPIDMask | ADFSIDEUserOp_TransMask))
+        | ((flags & ADFSIDEUserOp_DMA) / (ADFSIDEUserOp_DMA / ATAOp_DMA)) |
+        ATAOp_DisableEscape;
+    if (slave)
+    {
+      /* Backwards compatibility fudge */
+      *device_param &= ~DEVICE_DEV;
+      flags |= 8 << ATAOp_DeviceIDShift;
+    }
+    void *data = buffer;
+    scatter_t scatter[2];
+    uint32_t space;
+    if ((length & 3) && (flags & ATAOp_TransRead))
+    {
+      /* Data block is not a whole number of words long. There's not a whole lot
+       * we can do for writes (we're not in control of the parameter block so
+       * can't convert into a read-modify-write) so let ATA_Op generate the
+       * error for us in that case. But for reads, round up the transfer to a
+       * whole number of words and throw away the excess bytes. */
+      scatter[0].address = buffer;
+      scatter[0].length = length;
+      scatter[1].address = (uint8_t *) &space;
+      scatter[1].length = 4 - (length & 3);
+      data = &scatter;
+      length += scatter[1].length;
+      flags |= ATAOp_Scatter;
+    }
+    e = ata_op_fg_data(flags, plength, param, data, length, timeout, remain);
+    if (slave)
+      *device_param |= DEVICE_DEV;
+
+    if (e)
+    {
+      dprintf("ATA_Op(%X) failed\n", flags);
+      *status = discop_decode_disc_error(e);
+      if (*status != 0)
+        e = NULL;
+    }
+  }
+
+exit:
+  _swix(ATA_Control, _INR(0,1), ATAControl_Unlock,
+        (flags & (ADFSIDEUserOp_DeviceIDMask | ADFSIDEUserOp_CPIDMask)) >> (ADFSIDEUserOp_DeviceIDShift - ATAControl_DeviceIDShift));
+  return e;
+}
+
+_kernel_oserror *swi_lock_ide(bool lock)
+{
+  _kernel_oserror *e = NULL;
+  drive_t *lock_dr, *unlock_dr;
+  spinrw_read_lock(&g_drive_lock);
+  if (lock)
+  {
+    for (lock_dr = g_drive_list_head; lock_dr != NULL; lock_dr = lock_dr->next)
+    {
+      e = _swix(ATA_Control, _INR(0,1), ATAControl_TryLock,
+                (lock_dr->deviceid << ATAControl_DeviceIDShift) | (lock_dr->cpid << ATAControl_CPIDShift));
+      if (e)
+        break;
+    }
+    if (e)
+    {
+      for (unlock_dr = g_drive_list_head; unlock_dr != lock_dr; unlock_dr = unlock_dr->next)
+      {
+        _swix(ATA_Control, _INR(0,1), ATAControl_Unlock,
+              (unlock_dr->deviceid << ATAControl_DeviceIDShift) | (unlock_dr->cpid << ATAControl_CPIDShift));
+      }
+      e = MESSAGE_ERRORLOOKUP(true, DriverInUse, 0);
+    }
+  }
+  else
+  {
+    for (unlock_dr = g_drive_list_head; unlock_dr != NULL; unlock_dr = unlock_dr->next)
+    {
+      _swix(ATA_Control, _INR(0,1), ATAControl_Unlock,
+            (unlock_dr->deviceid << ATAControl_DeviceIDShift) | (unlock_dr->cpid << ATAControl_CPIDShift));
+    }
+  }
+  spinrw_read_unlock(&g_drive_lock);
+  return e;
+}
+
+_kernel_oserror *swi_ide_device_info_by_id(uint32_t deviceid, uint32_t cpid, uint32_t *type, uint32_t *drive, void **identify_block)
+{
+  *type = ADFSIDEDeviceInfo_None;
+  *drive = -1u;
+  *identify_block = NULL;
+  spinrw_read_lock(&g_drive_lock);
+  for (drive_t *dr = g_drive_list_head; dr != NULL; dr = dr->next)
+  {
+    if (dr->deviceid == deviceid && dr->cpid == cpid)
+    {
+      *type = dr->packet_device ? ADFSIDEDeviceInfo_Packet : ADFSIDEDeviceInfo_NonPacket;
+      *drive = dr->drive;
+      *identify_block = &dr->identify_info;
+      break;
+    }
+  }
+  spinrw_read_unlock(&g_drive_lock);
+  return NULL;
+}
+
+_kernel_oserror *swi_ide_device_info_by_drive(uint32_t drive, uint32_t *type, uint32_t *id, void **identify_block)
+{
+  if (drive > 7)
+    return MESSAGE_ERRORLOOKUP(true, BadDrive, 0);
+  spinrw_read_lock(&g_drive_lock);
+  if (drive < 4 || g_drive[drive - 4 + NUM_FLOPPIES] == NULL)
+  {
+    *type = ADFSIDEDeviceInfo_None;
+    *id = -1u;
+    *identify_block = NULL;
+  }
+  else
+  {
+    *type = ADFSIDEDeviceInfo_NonPacket;
+    *id = (g_drive[drive - 4 + NUM_FLOPPIES]->deviceid << ADFSIDEDeviceInfo_DeviceIDShift) |
+          (g_drive[drive - 4 + NUM_FLOPPIES]->cpid << ADFSIDEDeviceInfo_CPIDShift);
+    *identify_block = g_drive[drive - 4 + NUM_FLOPPIES]->identify_info;
+  }
+  spinrw_read_unlock(&g_drive_lock);
+  return NULL;
+}
+
+_kernel_oserror *swi_atapi_op(uint32_t flags, size_t control_len, uint8_t *control, uint8_t *buffer, size_t length, uint32_t timeout, uint32_t *status, uint8_t **buffer_end, size_t *remain)
+{
+  _kernel_oserror *e;
+  *status = 0;
+  e = _swix(ATA_Control, _INR(0,1), ATAControl_TryLock,
+            (flags & (ADFSATAPIOp_DeviceIDMask | ADFSATAPIOp_CPIDMask)) >> (ADFSATAPIOp_DeviceIDShift - ATAControl_DeviceIDShift));
+  if (e)
+    return e;
+
+  if (timeout == 0)
+    timeout = DEFAULT_OP_TIMEOUT;
+  if (flags & ADFSIDEUserOp_Reset)
+  {
+    ataop_param_lba28_t params = {
+        .device = DEVICE_MAGIC,
+        .command = ATACOMMAND_RESET_DEVICE
+    };
+    e = ata_op_fg_nodata(ATAOp_NoDRDY | (flags & (ADFSATAPIOp_DeviceIDMask | ADFSATAPIOp_CPIDMask)) | ATAOp_DisableEscape,
+                         7, &params, timeout);
+  }
+  else
+  {
+    /* Issue a command */
+    e = validate_address(control, control_len, true, false);
+    if (!e && (flags & (ADFSATAPIOp_TransRead | ADFSATAPIOp_TransWrite)) != 0)
+      e = validate_address(buffer, length, flags & ADFSATAPIOp_TransWrite, flags & ADFSATAPIOp_TransRead);
+    if (e)
+      goto exit;
+    flags = (flags & (ADFSATAPIOp_DeviceIDMask | ADFSATAPIOp_CPIDMask | ADFSATAPIOp_TransMask))
+        | ((flags & (ADFSATAPIOp_DMA | ADFSATAPIOp_DMADIR)) / (ADFSATAPIOp_DMA / ATAPacketOp_DMA)) |
+        ATAPacketOp_DisableEscape;
+    void *data = buffer;
+    scatter_t scatter[2];
+    uint32_t space;
+    if ((length & 3) && (flags & ATAPacketOp_TransRead))
+    {
+      /* Data block is not a whole number of words long. There's not a whole lot
+       * we can do for writes (we're not in control of the control block so
+       * can't convert into a read-modify-write) so let ATA_PacketOp generate the
+       * error for us in that case. But for reads, round up the transfer to a
+       * whole number of words and throw away the excess bytes. */
+      scatter[0].address = buffer;
+      scatter[0].length = length;
+      scatter[1].address = (uint8_t *) &space;
+      scatter[1].length = 4 - (length & 3);
+      data = &scatter;
+      length += scatter[1].length;
+      flags |= ATAPacketOp_Scatter;
+    }
+    e = ata_packet_op_fg(flags, control_len, control, data, length, timeout, remain);
+    *buffer_end = buffer + length - *remain;
+  }
+
+exit:
+  if (e)
+  {
+    *status = discop_decode_disc_error(e);
+    if (*status != 0)
+      e = NULL;
+  }
+  _swix(ATA_Control, _INR(0,1), ATAControl_Unlock,
+        (flags & (ADFSATAPIOp_DeviceIDMask | ADFSATAPIOp_CPIDMask)) >> (ADFSATAPIOp_DeviceIDShift - ATAControl_DeviceIDShift));
+  return e;
+}

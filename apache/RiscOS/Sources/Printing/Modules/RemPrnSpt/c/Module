@@ -1,0 +1,954 @@
+/* Copyright 1996 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*
+ * module.c - the module wrapper and guts of RemotePrinterSupport
+ */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <kernel.h>
+
+#include <swis.h>
+
+#include "Global/Services.h"
+#include "Global/UpCall.h"
+#include "Global/RISCOS.h"
+#include "USB/USBDevFS.h"
+
+#include "Freeway.h"
+#include "Pollword.h"
+
+#include "Module.h"
+#include "Debug.h"
+#include "Msgs.h"
+#include "StrExtra.h"
+#include "EventQueue.h"
+#include "RemPrnSptHdr.h"
+
+/***********************************************************************\
+**                                                                     **
+** Nasty old global variables                                          **
+**                                                                     **
+\***********************************************************************/
+
+/*
+ * The string that gets stored in PrinterType$n
+ */
+
+static char printer_type[256] ;
+
+/*
+ * Somewhere to hold the name of the remote printer we're dealing with
+ */
+
+static char printer_name[15] ;
+
+/*
+ * The current job number
+ */
+
+static int job_no = 0 ;
+
+/*
+ * A temporary array used for forming rename pathnames.
+ * Could allocate it on the fly, but the less chances
+ * for things to go wrong the better.
+ */
+
+static char tmp[256] ;
+
+/*
+ * A structure used for creating a collection of USB
+ * device information on receipt of Service_USB. This
+ * includes the VendorID, ProductID, USB device name and
+ * the name of the PDF file to use (if found).
+ *
+ * If you change this structure, you will have to change
+ * the supporting code in !Printers (sources.Sparrow) to
+ * reflect your changes.
+ */
+
+typedef struct usb_object
+{
+  uint16_t vendor ;
+  uint16_t product ;
+  uint8_t  devclass ;
+  uint8_t  devsubclass ;
+  uint8_t  protocol ;
+  uint8_t  alternate_setting ;
+  uint8_t  interface_setting ;
+  uint8_t  spare[3];           // align to word offset
+  char     devname[20] ;
+  char     pdfname[40] ;
+} usb_object ;
+static usb_object usb_obj ;
+
+/*
+ * A USB object list (returned by enumerate SWI)
+ */
+typedef struct usb_object_list usb_object_list ;
+struct usb_object_list
+{
+  usb_object_list *next ;
+  usb_object       obj ;
+} ;
+
+/*
+ * The string that represents the unique hardware address
+ * of the ethernet hardware in this machine
+ */
+
+static char unique_address[11] ;
+
+/*
+ * The IP address of the remote printer we're dealing with,
+ * used if !Printers is quitting to allow the module to
+ * function on its own
+ */
+
+static int ip_address ;
+
+/*
+ * The pollword used by !Printers
+ */
+
+static int poll_word = 0 ;
+
+/*
+ * An often used structre
+ */
+
+static struct _Event event ;
+
+/*
+ * Keep a record of what printer: was pointing to before we
+ * mangled it.
+ */
+
+static int old_printer_type = -1 ;
+
+/*
+ * Are we meant to be doing anything now?
+ */
+
+static int rps_enabled = FALSE ;
+
+/*
+ * Is printers there? No? Then do file renaming.
+ */
+
+static int do_rename = FALSE ;
+
+/*
+ * Has printers started yet? If so, return object changed/added/removed
+ * queue entries.
+ */
+
+static int printers_started = FALSE ;
+
+/*
+ * Global set of registers to use.
+ * Less coming and going off stack each function entry
+ */
+
+_kernel_swi_regs r ;
+
+/*
+ * Global error block for constructing our own errors.
+ */
+
+_kernel_oserror err ;
+
+/*
+ * Global error block pointer for _kernel_* returns
+ */
+
+_kernel_oserror *e ;
+
+/*
+ * Trap upcall media not present
+ */
+
+static int trap_upcalls = FALSE ;
+
+/*
+ * Backend filetype for direct printing
+ */
+
+static int filetype ;
+
+/***********************************************************************\
+**                                                                     **
+** Functions                                                           **
+**                                                                     **
+\***********************************************************************/
+
+/*
+ * Finalisation handler
+ */
+
+_kernel_oserror *rps_modfinal(int fatal, int podule, void *pw)
+{
+    msgs_closefile (msgs_handle) ;
+    msgs_closefile (map_handle) ;
+
+#ifndef ROM
+    r.r[0] = (int) remprn_messages(); 
+    _kernel_swi (ResourceFS_DeregisterFiles, &r, &r);
+#endif
+
+    r.r[0] = UpCallV ;
+    r.r[1] = (int) rps_entry ;
+    r.r[2] = (int) pw ;
+    _kernel_swi (OS_Release, &r, &r) ;
+
+debug dprintf ("rps: Dying\n\r") ;
+debug debug_stop () ;
+
+    UNUSED(podule);
+    UNUSED(fatal);
+    
+    return NULL;
+}
+
+/*
+ * Initialisation handler
+ */
+
+_kernel_oserror *rps_modinit (const char *cmd_tail, int podule_base, void *pw)
+{
+    const char *local;
+
+#ifndef ROM
+    /*
+     * Register the messages for RAM based modules
+     */
+    r.r[0] = (int) remprn_messages();
+    if ((e = _kernel_swi (ResourceFS_RegisterFiles, &r, &r)) != NULL)
+        return (e) ;
+#endif
+    /*
+     * Open our messages file
+     */
+    if ((e = msgs_openfile (msgs_handle, Module_MessagesFile)) != NULL)
+        goto fail ;
+
+    /*
+     * Open our printer to PDF mappings file
+     */
+    if ((e = msgs_openfile (map_handle, MAPPINGS_FILE)) != NULL)
+        goto fail_msgs ;
+
+    /*
+     * Hurray! It all worked, get local address from Freeway
+     */
+    local = getenv ("Inet$LocalAddr");
+    if (local != NULL)
+        strncpy (unique_address, local, 10) ;
+
+    /*
+     * Stuff a routine on UpCallV
+     */
+
+    r.r[0] = UpCallV ;
+    r.r[1] = (int) rps_entry ;
+    r.r[2] = (int) pw ;
+    if ((e = _kernel_swi (OS_Claim, &r, &r)) != NULL)
+        goto fail_map_msgs ;
+
+    debug debug_start () ;
+    debug dprintf ("rps: Initialising\n\r") ;
+
+    UNUSED(cmd_tail);
+    UNUSED(podule_base);
+    
+    return NULL;
+
+fail_map_msgs:
+    msgs_closefile (map_handle) ;
+fail_msgs:
+    msgs_closefile (msgs_handle) ;
+fail:
+#ifndef ROM
+    r.r[0] = (int) remprn_messages();
+    _kernel_swi (ResourceFS_DeregisterFiles, &r, &r);
+#endif
+    return (e);
+}
+
+static void write_information_file (int ip_address, char *unique_address, int job_no)
+{
+  FILE *f ;
+
+  sprintf (tmp, "Share::_S%x.RemQueue.%s.R%dI",ip_address, unique_address, job_no) ;
+
+  debug dprintf ("Trying to open information file %s\n\r", tmp) ;
+
+  f = fopen (tmp, "ab+") ;
+  if (f == NULL)
+  {
+    /*
+     * Failed to write info file, delete spool file
+     */
+    sprintf (tmp, "Share::_S%x.RemQueue.%s.R%d",ip_address, unique_address, job_no) ;
+
+    debug dprintf ("Failed, deleting %s\n\r", tmp) ;
+
+    r.r[0] = 6 ; /* Delete object */
+    r.r[1] = (int) tmp ;
+    _kernel_swi (OS_File, &r, &r) ;
+
+    /*
+     * We don't particularly care if this goes wrong, difficult to
+     * do anything about it...
+     */
+  }
+  else
+  {
+    fprintf (f, "%s%c%s%c%s%c%s\n", printer_name, 0, unique_address, 0, msgs_lookup (msgs_handle, "UNKN", 0), 0, msgs_lookup (msgs_handle, "UNKN", 0)) ;
+
+    debug dprintf ("Succeeded, writing %s %s %s\n\r", printer_name, unique_address, msgs_lookup (msgs_handle, "UNKN", 0)) ;
+
+    fclose (f) ;
+  }
+}
+
+/*
+ * Rename callback handler
+ */
+
+int rename_handler (_kernel_swi_regs *lr, void *pw)
+{
+    _kernel_oserror *e ;
+    /*
+     * FIXME: Delete destination file just in case it exists?
+     */
+
+    write_information_file (ip_address, unique_address, job_no) ;
+
+    sprintf (tmp, "Share::_S%x.RemQueue.%s.R%d",ip_address, unique_address, job_no) ;
+
+    debug dprintf ("Rename from %s to %s\n\r", printer_type, tmp) ;
+
+    r.r[0] = 25 ; /* rename */
+    r.r[1] = (int) printer_type ;
+    r.r[2] = (int) tmp ;
+    e = _kernel_swi (OS_FSControl, &r, &r) ;
+
+    if (e)
+    {
+      debug dprintf ("Error is %d %s\n\r", (int *) e, (char *)e+4) ;
+    }
+    else
+    {
+      r.r[0] = 18 ; /* Settype */
+      r.r[1] = (int) tmp ;
+      r.r[2] = filetype ;
+      _kernel_swi (OS_File, &r, &r) ;
+    }
+
+    if (++job_no > 255)
+      job_no = 0 ;
+
+    UNUSED(pw);
+    UNUSED(lr);
+
+    return (1) ;
+}
+
+/*
+ * Queue handling thingy
+ */
+
+static _kernel_oserror *add_to_queue (int type, char *string_object)
+{
+        event.type     = type ;
+        event.obj_size = strlen (string_object) + 1 ;
+        event.object   = (char *) malloc (event.obj_size) ;
+        memcpy (event.object, string_object, event.obj_size) ;
+
+        debug dprintf ("About to add to queue\n\r") ;
+
+        if ((e = Queue_Add (&event)) != NULL)
+                return (e)  ;
+
+        debug dprintf ("Added to queue\n\r") ;
+
+        poll_word = POLLWORD_SOMETHING_HAPPENED ;
+
+        return ((_kernel_oserror *) NULL) ;
+}
+
+/*
+ * Another queue handling thingy
+ */
+
+static _kernel_oserror *add_usb_to_queue (int type, usb_object *object)
+{
+        event.type     = type ;
+        event.obj_size = sizeof (usb_object) ;
+        event.object   = (char *) malloc (event.obj_size) ;
+        memcpy (event.object, (char *) object, event.obj_size) ;
+
+        debug dprintf ("About to add USB object to queue\n\r") ;
+
+        if ((e = Queue_Add (&event)) != NULL)
+                return (e)  ;
+
+        debug dprintf ("Added USB object to queue\n\r") ;
+
+        poll_word = POLLWORD_SOMETHING_HAPPENED ;
+
+        return ((_kernel_oserror *) NULL) ;
+}
+
+
+/*
+ * Returns 1 if this USB device mapped onto a printer in our USBMap file.
+ *
+ * As a side-effect, the global 'usb_obj' is filled-in with the details of
+ * the printer.
+ */
+static int is_it_a_USB_printer (USBServiceCall *service)
+{
+    char               *pdf ;
+    char               *ptr, *ptr_end ;
+
+    debug dprintf (" dev_name '%s' dev_class %d\n\r", service->devname, (service->ddesc).bDeviceClass) ;
+    debug dprintf (" vendor %04X, product %04X\n\r", (service->ddesc).idVendor, (service->ddesc).idProduct) ;
+    debug dprintf (" subclass %X, spec %X\n\r",    (service->ddesc).bDeviceSubClass, (service->ddesc).bcdUSB) ;
+
+    usb_obj.vendor  = (service->ddesc).idVendor ;
+    usb_obj.product = (service->ddesc).idProduct ;
+    strcpy (usb_obj.devname, service->devname) ;
+
+    /* Walk through the descriptors until an interface one is found */
+    ptr     = (char *) &service->ddesc;
+    ptr_end = ((char *) service) + service->sclen;
+
+    while ((ptr < ptr_end) && (*ptr != 0))
+          {
+          debug dprintf (" look at type %d length %d\n\r",(int)ptr[1],(int)ptr[0]);
+          if (ptr[1] == UDESC_INTERFACE)
+             {
+             /* An interface type */
+             usb_interface_descriptor_t *interface;
+             interface = (usb_interface_descriptor_t *)ptr;
+             debug dprintf(" interface descriptor for %d.%d:%d\n\r",interface->bInterfaceClass,
+                                                                  interface->bInterfaceSubClass,
+                                                                  interface->bInterfaceProtocol);
+             if ((interface->bInterfaceClass == 7) &&
+                 (interface->bInterfaceSubClass == 1) &&
+                 (interface->bInterfaceProtocol == 2))
+                {
+                /* A bulk interface of type printer */
+                usb_obj.alternate_setting = interface->bAlternateSetting;
+                usb_obj.interface_setting = interface->bInterfaceNumber;
+                usb_obj.devclass          = 7; /* Printer */
+                usb_obj.devsubclass       = 1;
+                usb_obj.protocol          = 2; /* Bulk */
+                sprintf (tmp, "%04X%04X\0", (service->ddesc).idVendor, (service->ddesc).idProduct) ;
+
+                debug dprintf (" -> USB device token '%s'\n\r", tmp) ;
+                debug dprintf (" if:%d alt:%d \n\r",usb_obj.interface_setting,usb_obj.alternate_setting);
+                pdf = msgs_quick_lookup(map_handle, tmp) ;
+                if (pdf)
+                   {
+                   /* Success ! */
+                   debug dprintf (" -> USB maps to PDF '%s'\n\r", pdf) ;
+                   strcpy (usb_obj.pdfname, pdf) ;
+                   }
+                else
+                   {
+                   /* It's not in the mapping file,but we're pretty sure it's a printer so return
+                      it anyway incase !Printers wants to have a go at guessing the printer type */
+                   *usb_obj.pdfname = '\0' ;
+                   debug dprintf (" -> USB printer not in mappings but reported anyway\n\r") ;
+                   }
+                return (1) ;
+                }
+             }
+          ptr += *ptr;
+          }
+
+    /* Something went wrong or it simply didn't look like a printer */
+    return (0) ;
+}
+
+
+/*
+ * Enumerate all USB devices and do a look-up on each to find out
+ * if it is a printer. Return a linked-list of usb_objects containing
+ * information about each printer. It is the caller's responsibility
+ * to free the (RMA) blocks in the linked list.
+ */
+static usb_object_list *swi_enumerate_USB_printers (int flags)
+{
+    USBServiceAnswer *device, *next ;
+    usb_object_list  *head, *node ;
+
+    r.r[0] = 1 ;
+    r.r[1] = Service_USB ;
+    r.r[2] = 0 ;
+    if (_kernel_swi (OS_ServiceCall, &r, &r)) return (NULL) ;
+
+    device = (USBServiceAnswer *) r.r[2] ;
+    head   = NULL ;
+    while (device)
+    {
+        next = device->link ;
+        if ( is_it_a_USB_printer (&(device->svc)) )
+        {
+            node = (usb_object_list *) malloc (sizeof(usb_object_list)) ;
+            if (node)
+            {
+                node->next = head ;
+                head       = node ;
+                memcpy (&(node->obj), &usb_obj, sizeof(usb_object)) ;
+            }
+        }
+
+        free (device) ;
+        device = next ;
+    }
+
+    UNUSED(flags);
+    
+    return (head) ;
+}
+
+
+/*
+ * UpcallV handler
+ */
+
+int rps_handler (_kernel_swi_regs *lr, void *pw)
+{
+    char *s ;
+    char *sp ;
+    char *wscrap ;
+
+    /*
+     * return 1 else it'll blow up
+     */
+
+    switch (lr->r[0])
+    {
+        case UpCall_MediaNotKnown:
+        case UpCall_MediaNotPresent:
+
+             if (trap_upcalls)
+             {
+                  lr->r[0] = -1;
+                  return 0; /* CLAIM! */
+             }
+             break ;
+
+        case UpCall_ModifyingFile:
+
+            if (lr->r[9] == 520)  /* Renaming file */
+            {
+                sp = getenv ("Wimp$ScrapDir") ;
+                /*
+                 * Get to $.blah
+                 */
+                wscrap = strchr (sp, ':') + 1 ;
+                debug dprintf ("Wimp Scrap path = %s\n\r", wscrap) ;
+
+                if (strlen(wscrap) < strlen((char *)(lr->r[2])))
+                {
+                    s = (char *)(lr->r[2]) + strlen (wscrap) + 1 ;
+
+                    debug dprintf ("$.path = %s\n\r", s) ;
+                    /*
+                     * Get to blah
+                     */
+                    debug dprintf ("path = %s\n\r", s) ;
+                    s = strchr (s, '.') + 1;
+
+                    if ((unsigned int) s > 1)
+                    {
+                        debug dprintf ("match = %s\n\r", s) ;
+
+                        /*
+                         * TESTME! Seems to work
+                         */
+                        if (strincmp (s, "RemQueue", 8) == 0)
+                        {
+                            debug dprintf ("About to add file renamed to queue\n\r") ;
+                            (void) add_to_queue (RPS_FILE_RENAMED, s) ;
+                        }
+                    }
+                }
+            }
+
+            if (lr->r[9] == 259)  /* Closing file */
+            {
+                int temp;
+                r.r[0] = 7 ;
+                r.r[1] = lr->r[1] ;
+                r.r[2] = (int) tmp ;
+                r.r[5] = 257 ;
+                _kernel_swi (OS_Args, &r, &r) ;
+
+#ifdef OldPrinters
+                if (strncmp (tmp, "printer:", 8) == 0)
+#else
+                temp = trap_upcalls;
+                trap_upcalls = TRUE;
+                s = canon (getenv ("Printer$Path")) ;
+                trap_upcalls = temp;
+                debug dprintf ("Comparing %s with %s\n\r", tmp, s) ;
+                if (stricmp (tmp, s) == 0)
+#endif
+                {
+                    debug dprintf ("printer: is about to be closed\n\r") ;
+
+                    if (rps_enabled)
+                    {
+                        if (do_rename)
+                        {
+                            r.r[0] = 50 ; /* 2 seconds */
+                            r.r[1] = (int) rename_entry ;
+                            r.r[2] = (int) pw ;
+                            _kernel_swi (OS_CallAfter, &r, &r) ;
+                        }
+                        else
+                        {
+                            debug dprintf ("Adding printer closed event to the queue\n\r") ;
+                            if (rps_enabled)
+                                (void) add_to_queue (RPS_PRINTER_CLOSED, "") ;
+                        }
+                    }
+                }
+                free (s) ;
+            }
+            break ;
+
+        case UpCall_Freeway:
+
+        debug dprintf ("UpCall_Freeway received object type %d reason %d object %s\n\r",
+        lr->r[2], lr->r[1], lr->r[3]) ;
+
+            if ((lr->r[2] == FreewayType_Printers) && (printers_started))
+            {
+                switch (lr->r[1])
+                {
+                    case Freeway_ObjectAdded:
+                        (void) add_to_queue (RPS_PRINTER_ADDED, (char *)(lr->r[3])) ;
+                        break ;
+
+                    case Freeway_ObjectRemoved:
+                        (void) add_to_queue (RPS_PRINTER_DELETED, (char *)(lr->r[3])) ;
+                        break ;
+
+                    case Freeway_ObjectChanged:
+                        (void) add_to_queue (RPS_PRINTER_CHANGED, (char *)(lr->r[3])) ;
+                        break ;
+
+                    case Freeway_ObjectDeleted:
+                        (void) add_to_queue (RPS_LOCALPRINTER_DELETED, (char *)(lr->r[3])) ;
+                        break ;
+                    /*
+                     * Don't complain about unknown freeway reasons
+                     * else it'll go bang in the future
+                     */
+                }
+            }
+            break ;
+    }
+
+    return (1) ;
+}
+
+/*
+ * Service call handler
+ */
+
+void sc_handler (int service_number, _kernel_swi_regs *lr, void *pw)
+{
+    switch (service_number)
+    {
+        /* Service_DeviceDead
+         *
+         * Was it a USB device? If so, add the device name to our queue
+         * for !Printers to see if it was a known printer.
+         */
+        case Service_DeviceDead:
+        {
+            debug dprintf ("Service_DeviceDead received\n\r") ;
+
+            if (lr->r[3] == 0)
+               {
+               debug dprintf (" -> string was empty, ignored\n\r") ;
+               break ;
+               }
+
+            if (strstr ((char *) (lr->r[3]), "USB") != (char *) (lr->r[3]))
+               {
+               debug dprintf (" -> not a USB device, ignored\n\r") ;
+               break ;
+               }
+
+            debug dprintf (" -> USB device removed\n\r") ;
+            (void) add_to_queue (USB_DEVICE_REMOVED, (char *) (lr->r[3])) ;
+            break ;
+        }
+#ifndef ROM
+        /* Service_ResourceFSStarting
+         * Reregister our messages
+         */
+        case Service_ResourceFSStarting:
+            (*(void (*)(void *, void *, void *, void *)) lr->r[2])(remprn_messages(), 0, 0, (void *) lr->r[3]);
+            break;
+#endif                    
+        /* Service calls from Freeway module.
+         */
+        case Service_FreewayTerminating:
+        {
+            (void) add_to_queue (RPS_FREEWAY_TERMINATING, "") ;
+            rps_enabled = FALSE ;
+            debug dprintf ("Service_FreewayTerminating received\n\r") ;
+            break ;
+        }
+        case Service_FreewayStarting:
+        {
+            (void) add_to_queue (RPS_FREEWAY_STARTING, "") ;
+            rps_enabled = FALSE ;
+            debug dprintf ("Service_FreewayStarting received\n\r") ;
+            break ;
+        }
+        /* Service_USB
+         *
+         * Was it a device being added? Was the class 'printer'? If it was,
+         * add some pertinent info to our queue.
+         */
+        case Service_USB:
+        {
+            debug dprintf ("Service_USB received R0=%d\n\r", lr->r[0]) ;
+            if (lr->r[0] == Service_USB_Attach)
+            {
+                if ( is_it_a_USB_printer ((USBServiceCall *) (lr->r[2])) )
+                   add_usb_to_queue (USB_PRINTER_ADDED, &usb_obj) ;
+            }
+            break ;
+        }
+    }
+
+    UNUSED(pw);
+}
+
+/*
+ * SWI Handler: 0 = ReadPollwordLocation
+ *              1 = GetNextEvent
+ *              2 = ReadUniqueAddress
+ *              3 = Enable
+ *              4 = Disable
+ *              5 = EnableUpcalls
+ *              6 = DisableUpcalls
+ *              7 = EnumerateUSBPrinters
+ */
+
+_kernel_oserror *rps_swi (int swi_number, _kernel_swi_regs *r, void *pw)
+{
+    _kernel_swi_regs rr ;
+    Event ev = NULL ;
+
+    switch (swi_number)
+    {
+        case 0:
+            r->r[0] = (int) &poll_word ;
+            return ((_kernel_oserror *) 0) ;
+            break ;
+
+        case 1: /* FIXME */
+            e = Queue_Read (&ev) ;
+            debug dprintf ("rps_swi: Just done queue_read, ev r = %d, obj = %d\n\r", ev->type, ev->object) ;
+            debug dprintf ("rps_swi: Registers are r0 %d r1 %X r2 %d\n\r", r->r[0], r->r[1], r->r[2]) ;
+
+            if (e)
+                return (e) ;
+
+            if (ev == NULL) /* Then there's nothing in the queue */
+            {
+                debug dprintf ("rps_swi: Empty event queue - returning all -1\n\r") ;
+                r->r[0] = -1 ;
+                r->r[1] = -1 ;
+                r->r[2] = -1 ;
+            }
+            else
+            {
+              if (r->r[2] == -1) /* Read reqd buffer size */
+              {
+                debug dprintf ("rps_swi: asked to return buffer size, %d\n\r", ev->obj_size) ;
+                r->r[0] = ev->type ;
+                r->r[2] = ev->obj_size ;
+              }
+              else
+              {
+                debug dprintf ("rps_swi: returning real data into buffer, r %d b %d l %d\n\r", ev->type, r->r[1], r->r[2]) ;
+                r->r[0] = ev->type ;
+                if (r->r[2])
+                  {
+                  debug dprintf ("rps_swi: memcpy %d from %08X to %08X\n\r", r->r[2], ev->object, (char *)(r->r[1]));
+                  memcpy((char *)(r->r[1]), ev->object, r->r[2]) ;
+                  }
+                Queue_Remove () ; /* Frees string too if necessary */
+              }
+            }
+            return ((_kernel_oserror *) 0) ;
+
+            break ;
+
+        case 2:
+            r->r[0] = (int) unique_address ;
+            return ((_kernel_oserror *) 0) ;
+            break ;
+
+        case 3:
+            /*
+             * Enable: R0 = flags
+             *         R1 = IP address of printer
+             *         R2 = printer name
+             *         R3 = significant backend filetype
+             */
+            rps_enabled = TRUE ;
+
+            if (r->r[0] & 1) /* Printers is present */
+                do_rename = FALSE ;
+            else /* Printers is quitting */
+            {
+                do_rename = TRUE ;
+                printers_started = FALSE ;
+            }
+
+            if (r->r[0] & 2) /* Printers has started & is ready for messages */
+            {
+                debug dprintf ("Setting printers started flag\n\r") ;
+                printers_started = TRUE ;
+                break ;
+            }
+
+            ip_address = r->r[1] ;
+            strncpy (printer_name, (char *)(r->r[2]), 14) ;
+
+            debug dprintf ("Setting up printer:\n\r") ;
+
+            /*
+             * Make our directories, assumes it all exists up to
+             *   Share::_S<IPaddr>.RemSpool
+             */
+            if (!(r->r[0])) /* If printers is quitting */
+            {
+              /*
+               * Set up the appropriate PrinterType$ variable
+               */
+
+              printers_started = FALSE ;
+
+              filetype = r->r[3] ;
+
+              sprintf (printer_type, "Share::_S%x.RemSpool.%s.Rspool",
+                  r->r[1], unique_address) ;
+
+              rr.r[0] = (int) "PrinterType$9" ;
+              rr.r[1] = (int) printer_type ;
+              rr.r[2] = strlen (printer_type) ;
+              rr.r[3] = 0 ;
+              rr.r[4] = 4 ; /* Literal String */
+              e = _kernel_swi (OS_SetVarVal, &rr, &rr) ;
+              if (e)
+                  return (e) ;
+
+              /*
+               * Write current printer type to be xx
+               */
+
+              rr.r[0] = 5 ;
+              rr.r[1] = 9 ; /* FIXME! Might not be right */
+              e = _kernel_swi (OS_Byte, &rr, &rr) ;
+              if (e)
+                  return (e) ;
+
+              /*
+               * Remember what it used to be
+               */
+
+              old_printer_type = rr.r[1] ;
+            }
+
+            return ((_kernel_oserror *) 0) ;
+            break ;
+
+        case 4:
+            /*
+             * Change back to old printer driver
+             */
+
+            debug dprintf ("Reverting to old printer:\n\r") ;
+
+            rps_enabled = FALSE ;
+
+            if ((do_rename) && (old_printer_type != -1))
+            {
+                rr.r[0] = 5 ;
+                rr.r[1] = old_printer_type ;
+                _kernel_swi (OS_Byte, &rr, &rr) ;
+                old_printer_type = -1 ;
+            }
+
+            return ((_kernel_oserror *) 0) ;
+            break ;
+
+        case 5:
+            /*
+             * Enable Upcalls again
+             */
+             trap_upcalls = FALSE ;
+             break ;
+
+        case 6:
+            /*
+             * Disable (claim) UpCall_MediaNotPresent
+             */
+             trap_upcalls = TRUE ;
+             break ;
+
+        case 7:
+            /*
+             * Enumerate USB printers
+             *
+             * On entry:
+             *   R0 = flags (undefined)
+             * On exit:
+             *   R0 = preserved
+             *   R2 = pointer to linked list of usb_objects (or NULL for none)
+             */
+            r->r[2] = (int) swi_enumerate_USB_printers(r->r[0]) ;
+            break ;
+
+        default:
+            /*
+             * Unknown SWI
+             */
+            return error_BAD_SWI;
+    }
+
+    UNUSED(pw);
+    
+    /* NOTREACHED */
+    return ((_kernel_oserror *) 0) ;
+}

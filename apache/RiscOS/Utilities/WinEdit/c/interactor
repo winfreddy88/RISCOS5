@@ -1,0 +1,252 @@
+/* Copyright 2003 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*-*-C-*-
+ *
+ * Interactor
+ *
+ * To simplify the event handling code, there can be an interactor
+ * function that gets first crack at every event.  If it consumes
+ * the event, then it returns TRUE, in which case the event is not
+ * passed onto the rest of the event handling code.
+ *
+ * Interactors must remove and reset themselves if they receive a NULL
+ * pointer instead of an event.
+ *
+ * Interactors which return an error code will be called again (with NULL)
+ * so they can reset themselves.
+ */
+
+#include "resed.h"
+
+#define MAX_INTERACTORS 10
+
+typedef struct
+{
+    Interactor function;
+    void *closure;
+    unsigned int eventmask;
+    unsigned int timeout;
+} InteractorRec, *InteractorPtr;
+
+static InteractorRec stack[MAX_INTERACTORS];    /* full ascending */
+static int stackp = -1;                         /* -1 means empty */
+unsigned int eventmask = EF_VALID;
+unsigned int timeout = 0;
+
+
+/*
+ * Determine current eventmask and timeout
+ */
+
+static void fix_eventmask ()
+{
+    int j;
+    eventmask = EF_VALID;
+    timeout = 0;
+    for (j = 0; j <= stackp; j++)
+    {
+        InteractorPtr i = stack + j;
+        eventmask &= i->eventmask;
+        if (i->timeout < timeout)
+            timeout = i->timeout;
+    }
+}
+
+
+/*
+ * Remove topmost interactor, without asking it to clear up.
+ * Should probably only be used by the interactor itself.
+ */
+
+void interactor_remove ()
+{
+    if (stackp >= 0)
+        stackp--;
+    fix_eventmask ();
+    dprintf("Removed top interactor; stack now %d deep\n" _ stackp);
+
+}
+
+
+/*
+ * Cancel all current interactors.  They get called with a NULL parameter so that they
+ * can clear up after themselves.
+ */
+
+void interactor_cancel ()
+{
+    int junk;
+    dprintf ("Cancel  ");
+    for (; stackp >= 0; stackp--)
+    {
+        InteractorPtr i = stack + stackp;
+        dprintf("Clean %d\n" _ stackp);
+        (void) (*(i->function)) (0, NULL, i->closure, &junk);
+    }
+    /* stackp now -1 */
+    fix_eventmask ();
+    dprintf("Popped all interactors; stack now %d deep\n" _ stackp);
+
+}
+
+
+/*
+ * Push an interactor, unless there is already an instance of it
+ * on the stack.  If there is such an instance, just update
+ * the closure.
+ */
+
+void interactor_push (Interactor it, void *cls)
+{
+    int j;
+    InteractorPtr i;
+    for (j = 0; j <= stackp; j++)
+    {
+        i = stack + j;
+        if (i->function == it)
+        {
+            i->closure = cls;
+            return;                             /* no duplicates */
+        }
+    }
+
+    if (stackp < MAX_INTERACTORS - 1)
+    {
+        i = stack + (++stackp);
+        i->function = it;
+        i->closure = cls;
+        i->eventmask = EF_VALID;
+        i->timeout = 0;
+        fix_eventmask ();
+    }
+    dprintf("Pushed interactor %x closure %x; stack now %d deep\n" _ (int) it _ (int) cls _ stackp);
+}
+
+
+/*
+ * Pop down to and including the specified interactor
+ */
+
+void interactor_pop (Interactor it)
+{
+    Bool junk;
+    while (stackp >= 0)
+    {
+        InteractorPtr i = stack + (stackp--);
+        (void) (*(i->function)) (0, NULL, i->closure, &junk);
+        dprintf("Popped interactor %x closure %x; stack now %d deep\n" _ (int) i->function _ (int) i->closure _ stackp);
+
+        if (i->function == it)
+            break;
+    }
+    fix_eventmask ();
+}
+
+
+
+/*
+ * Cancel all current interactors, and then install a new interactor.
+ */
+
+void interactor_install (Interactor it, void *cls)
+{
+    interactor_cancel ();
+    interactor_push (it, cls);
+}
+
+
+/*
+ * Give topmost interactor a chance to ask for extra WIMP events.
+ */
+
+void interactor_enable_events (unsigned int mask)
+{
+    if (stackp >= 0)
+    {
+        InteractorPtr i = stack + stackp;
+        i->eventmask = EF_VALID & ~mask;
+    }
+    fix_eventmask ();
+}
+
+
+/*
+ * Event look should AND this into Wimp_Poll mask.
+ */
+
+unsigned int interactor_event_mask ()
+{
+    return eventmask;
+}
+
+
+/*
+ * Allow topmost interactor to specify PollIdle timeout in cs.  Only
+ * used if null events enabled.
+ */
+
+void interactor_set_timeout (unsigned int time)
+{
+    if (stackp >= 0)
+    {
+        InteractorPtr i = stack + stackp;
+        i->timeout = time;
+    }
+    fix_eventmask ();
+}
+
+
+/*
+ * Read same
+ */
+
+unsigned int interactor_timeout ()
+{
+    return timeout;
+}
+
+
+/*
+ * Offer event to the current interactors, if any.  If an
+ * interactor wants to consume the event, it sets
+ * 'consumed' to TRUE.  Otherwise it gets passed down the
+ * chain until it is finally handed back to the app.
+ */
+
+error * interactor_event (unsigned int event, int *buf, Bool *consumed)
+{
+    int j;
+    error *err = NULL;
+    *consumed = FALSE;
+    dprintf("interactor_event in %d... " _ event);
+    for (j = stackp; j >= 0; j--)
+    {
+        InteractorPtr i = stack + j;
+        dprintf("calling int. %x with cls %x... " _ (int) i->function _ (int) i->closure);
+        
+        err = (*(i->function)) (event, buf, i->closure, consumed);
+
+        if (err)
+        {
+            interactor_cancel();
+            *consumed = TRUE;
+        }
+
+        if (*consumed)
+            break;
+    }
+    dprintf("interactor_event out\n" _ event);
+    return err;                         /* pass to app */
+}

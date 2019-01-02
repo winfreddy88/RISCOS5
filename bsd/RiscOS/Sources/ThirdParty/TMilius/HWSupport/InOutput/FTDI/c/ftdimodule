@@ -1,0 +1,1464 @@
+/** @file
+
+  Implements a FTDI driver for DeviceFS under RISC OS.
+
+  */
+/* Created 09.03.2010 T. Milius
+   Changed 10.05.2012 T. Milius adapted to work with USB stack versions newer than V0.49 */
+/* Copyright (c) 2010-2012 by Thomas Milius Stade, Germany
+* All rights reserved.
+*
+* Redistribution and use in source and binary forms, with or without
+* modification, are permitted provided that the following conditions are met:
+*     * Redistributions of source code must retain the above copyright
+*       notice, this list of conditions and the following disclaimer.
+*     * Redistributions in binary form must reproduce the above copyright
+*       notice, this list of conditions and the following disclaimer in the
+*       documentation and/or other materials provided with the distribution.
+*     * Neither the name of Thomas Milius Stade, Germany nor the
+*       names of its contributors may be used to endorse or promote products
+*       derived from this software without specific prior written permission.
+*
+* THIS SOFTWARE IS PROVIDED BY Thomas Milius Stade, Germany ``AS IS'' AND ANY
+* EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+* WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+* DISCLAIMED. IN NO EVENT SHALL Thomas Milius Stade, Germany BE LIABLE FOR ANY
+* DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+* (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+* LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+* ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+* (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+* SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE. */
+/** @mainpage
+    @author Thomas Milius Stade, Germany
+    @version 0.03
+    @date 03.10.2010
+
+    Implements a FTDI driver for DeviceFS under RISC OS.
+
+    */
+/* RISC OS */
+
+/* !!!!!!!!!! libraries !!!!!!!!!! */
+/* ---------- ANSI-C ---------- */
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+
+/* ------------ RISC OS ------------ */
+#include "kernel.h"
+#include "swis.h"
+#include "USBDevFS.h"
+
+/* ------------ Own ------------ */
+#include "error.h"
+#include "configuration.h"
+#include "serial.h"
+#include "callback.h"
+#include "driver.h"
+#include "ftdimodhead.h"
+#include "ftdimodule.h"
+#ifdef DEBUG
+#include "debug.h"
+#endif
+
+/* !!!!!!!!!!! definitions !!!!!!!!!! */
+/*@{*/
+/* From DeviceFS Hdr */
+#define ParentFlag_BlockDevice      0x00000001 // bit 0  set => block device
+#define ParentFlag_FullDuplex       0x00000002 // bit 1  set => device is full duplex
+#define ParentFlag_MonitorTransfers 0x00000004 // bit 2  set => MonitorTX/RX available
+#define ParentFlag_MonitorEOF       0x00000008 // bit 3  set => Monitor EOF on reading
+#define ParentFlag_DeviceUpcalls    0x00000010 // bit 4  set => Issue device upcalls
+/*@}*/
+
+/* !!!!!!!!!! data structures !!!!!!!!!! */
+struct common_structure common;
+
+/* Required here because of usage of common.
+   Therefore no separate compilation allowed. */
+#include "callback.h"
+
+/* !!!!!!!!!! support functions !!!!!!!!!! */
+
+/* ---------- DeviceFS ---------- */
+/** Deregisters the USB side of a given ftdi device.
+
+    All related buffer translations will be removed.
+    All realted file streams to the USB side will be closed.
+    All realted memory will be freed. */
+_kernel_oserror *deregister_usb_device(struct risc_os_ftdi_structure *risc_os_ftdi)
+{
+_kernel_swi_regs regs;
+
+#ifdef DEBUG
+debug_writef(DEBUG_LEVEL_REGISTRATION,
+             "Deregister usb device %x\n",
+             risc_os_ftdi);
+#endif
+/* Remove buffers from upcall translation.
+   With Check for not all buffers may be set up at all times. */
+if (risc_os_ftdi->input.risc_os_buffer_info.handle != FTDI_NO_BUFFER_HANDLE) {
+  upcall_translation_remove(&common.upcall_translation,
+                            risc_os_ftdi->input.risc_os_buffer_info.handle);
+  }
+if (risc_os_ftdi->output.risc_os_buffer_info.handle != FTDI_NO_BUFFER_HANDLE) {
+  upcall_translation_remove(&common.upcall_translation,
+                            risc_os_ftdi->output.risc_os_buffer_info.handle);
+  }
+/* Close related DeviceFS streams */
+if (risc_os_ftdi->input.file_handle != FTDI_NO_FILE_HANDLE) {
+  regs.r[0]=0;
+  regs.r[1]=risc_os_ftdi->input.file_handle;
+  _kernel_swi(OS_Find, &regs, &regs);
+  }
+if (risc_os_ftdi->output.file_handle != FTDI_NO_FILE_HANDLE) {
+  regs.r[0]=0;
+  regs.r[1]=risc_os_ftdi->output.file_handle;
+  _kernel_swi(OS_Find, &regs, &regs);
+  }
+if (risc_os_ftdi->input.buffer) {
+  free(risc_os_ftdi->input.buffer);
+  risc_os_ftdi->input.buffer=NULL;
+  }
+if (risc_os_ftdi->output.buffer) {
+  free(risc_os_ftdi->output.buffer);
+  risc_os_ftdi->output.buffer=NULL;
+  }
+free(risc_os_ftdi);
+return NULL;
+}
+
+_kernel_oserror *deregister_device(struct ftdi_device_structure *ftdi_device)
+{
+int irq_state;
+_kernel_swi_regs regs;
+_kernel_oserror *error_os;
+
+#ifdef DEBUG
+debug_writef(DEBUG_LEVEL_REGISTRATION,
+             "Deregister device %x\n",
+             ftdi_device);
+#endif
+/* Delink from device chain */
+if ((irq_state=_kernel_irqs_disabled()) == 0) _kernel_irqs_off;
+if (ftdi_device->previous_device) {
+  ftdi_device->previous_device->next_device=ftdi_device->next_device;
+  }
+else {
+  common.first_device=ftdi_device->next_device;
+  }
+if (ftdi_device->next_device) {
+  ftdi_device->next_device->previous_device=ftdi_device->previous_device;
+  }
+if (irq_state == 0) _kernel_irqs_on;
+/* Block possible asynchron transfers. */
+ftdi_device->input.stream_valid=false;
+ftdi_device->input.bytes_requested=0;
+ftdi_device->output.stream_valid=false;
+/* Purge reference at USB structure level. */
+ftdi_device->risc_os_ftdi->devices[ftdi_device->ftdi_port_number]=NULL;
+/* Remove Device from DeviceFS */
+regs.r[0]=ftdi_device->device_driver_handle;
+if ((error_os=_kernel_swi(DeviceFS_Deregister, &regs, &regs)) != NULL) {
+  /* Tolerate lack of memory etc but keep structure to avoid system crashes. */
+  return error_os;
+  }
+/* Release USB connections only for port 0. */
+if (ftdi_device->ftdi_port_number == 0) {
+  deregister_usb_device(ftdi_device->risc_os_ftdi);
+  }
+free(ftdi_device);
+return NULL;
+}
+
+/* Registers a port of an FTDI device as a bidrectional device to DeviceFS.
+   No connections are opened. This is done later by DevicesFS and the
+   driver. */
+_kernel_oserror *register_device_to_fs(struct ftdi_device_structure *ftdi_device)
+{
+_kernel_swi_regs regs;
+_kernel_oserror *error_os;
+
+#ifdef DEBUG
+debug_writef(DEBUG_LEVEL_REGISTRATION,
+             "Register device %x to FS\n",
+             ftdi_device);
+#endif
+/* Offset field is base for offset. */
+ftdi_device->device_list.device.name_offset=(int) ((unsigned long) ftdi_device->device_name) - ((unsigned long) &ftdi_device->device_list.device.name_offset);
+/* Buffered and path creation */
+ftdi_device->device_list.device.flags=0x00000003;
+/* Wakeup */
+ftdi_device->device_list.device.rx_flags=0x0000000A;
+/* Size is optimized for FTDI which is a multiple 64 Bytes and sometimes 2 Bytes at beginning.
+   However DeviceFS requires definition of block size 1 Byte larger as really requried size. */
+ftdi_device->device_list.device.rx_buffer_size=ftdi_device->risc_os_ftdi->input.usb_buffer_size + 1;
+ftdi_device->device_list.device.tx_flags=0x00000004;
+/* See input remarks */
+ftdi_device->device_list.device.tx_buffer_size=ftdi_device->risc_os_ftdi->output.usb_buffer_size + 1;
+ftdi_device->device_list.device.reserved=0;
+ftdi_device->device_list.list_terminator=NULL;
+/* Important: Without ParentFlag_MonitorEOF no check inside DeviceFS at OS_BGet.
+   Only with ParentFlag_MonitorEOF OS_BGet acts as described. */
+regs.r[0]=ParentFlag_FullDuplex|ParentFlag_MonitorEOF;
+regs.r[1]=(int) &ftdi_device->device_list;
+regs.r[2]=(int) driver_entry;
+/* Marks hardware for driver is used for various devices. */
+regs.r[3]=(int) ftdi_device;
+regs.r[4]=(int) common.ws;
+regs.r[5]=(int) FTDI_VALIDATION;
+regs.r[6]=1;
+regs.r[7]=1;
+if ((error_os=_kernel_swi(DeviceFS_Register, &regs, &regs)) != NULL) return error_os;
+ftdi_device->device_driver_handle=regs.r[0];
+#ifdef DEBUG
+debug_writef(DEBUG_LEVEL_REGISTRATION,
+             "Device registered to FS with handle %x\n",
+             regs.r[0]);
+#endif
+return NULL;
+}
+
+/* Prepares the internal driver structures for an FTDI device and
+   registers the device to DeviceFS by calling register_device_to_fs. */
+_kernel_oserror *register_device(char *device_name,
+                                 struct risc_os_ftdi_structure *risc_os_ftdi,
+                                 unsigned long ftdi_port_number)
+{
+int irq_state;
+struct ftdi_device_structure *new_ftdi_device;
+_kernel_oserror *error_os;
+
+#ifdef DEBUG
+debug_write(DEBUG_LEVEL_REGISTRATION,
+            "Register device\n");
+#endif
+if ((new_ftdi_device=malloc(sizeof(struct ftdi_device_structure))) == NULL) {
+  return generate_error(FTDI_ERROR_NO_MEMORY);
+  }
+new_ftdi_device->risc_os_ftdi=risc_os_ftdi;
+new_ftdi_device->ftdi_port_number=ftdi_port_number;
+strcpy(new_ftdi_device->device_name, device_name);
+new_ftdi_device->risc_os_ftdi->devices[new_ftdi_device->ftdi_port_number]=new_ftdi_device;
+/* The other fields are remaining uninitialized.
+   One value is enough to indicate that there is no connection
+   to DeviceFS side. However the buffer pointers must be initialized
+   to ensure correct handling under all circumstances. */
+new_ftdi_device->input.stream_valid=false;
+new_ftdi_device->output.stream_valid=false;
+new_ftdi_device->input.bytes_requested=0;
+if (error_os=register_device_to_fs(new_ftdi_device)) {
+  new_ftdi_device->risc_os_ftdi->devices[new_ftdi_device->ftdi_port_number]=NULL;
+  free(new_ftdi_device);
+  return error_os;
+  }
+/* Put new device into the device chain. */
+if ((irq_state=_kernel_irqs_disabled()) == 0) _kernel_irqs_off;
+new_ftdi_device->previous_device=NULL;
+new_ftdi_device->next_device=common.first_device;
+if (new_ftdi_device->next_device) {
+  new_ftdi_device->next_device->previous_device=new_ftdi_device;
+  }
+common.first_device=new_ftdi_device;
+if (irq_state == 0) _kernel_irqs_on;
+return NULL;
+}
+
+_kernel_oserror *register_usb_device(unsigned int usb_device_number,
+                                     unsigned int idVendor,
+                                     unsigned int idProduct,
+                                     char *pendant_extension,
+                                     char *own_config_extension)
+{
+char path_name[100];
+unsigned char device_info;
+char *parameter;
+char *config_file_line;
+int parameter_value;
+int port_number;
+int ftdi_chip_type;
+int ioctl_block[2];
+char default_devicefs_name[FTDI_MAX_PORTS][20];
+int default_baudrate[FTDI_MAX_PORTS];
+unsigned long default_data_bits[FTDI_MAX_PORTS];
+unsigned long default_stopbits[FTDI_MAX_PORTS];
+unsigned long default_parity[FTDI_MAX_PORTS];
+unsigned long default_flowcontrol[FTDI_MAX_PORTS];
+unsigned long default_timer[FTDI_MAX_PORTS];
+unsigned long default_event_char[FTDI_MAX_PORTS];
+unsigned long default_error_char[FTDI_MAX_PORTS];
+bool first_parameter_value;
+struct risc_os_ftdi_structure *new_risc_os_ftdi;
+_kernel_swi_regs regs;
+_kernel_oserror *error_os;
+FILE *config_file;
+
+/* Identification by using Vendor/Product ID and Pendant extension. */
+sprintf(path_name,
+        "<FTDI$Dir>.Devices.%04x_%04x",
+        idVendor,
+        idProduct);
+if (pendant_extension != NULL) {
+  strcat(path_name, "P");
+  strcat(path_name, pendant_extension);
+  }
+#ifdef DEBUG
+debug_writef(DEBUG_LEVEL_REGISTRATION,
+             "Register USB device. Check for %s\n",
+             path_name);
+#endif
+if ((config_file=fopen(path_name, "r")) != NULL) {
+  /* Generate new FTDI USB connection. */
+  if ((new_risc_os_ftdi=malloc(sizeof(struct risc_os_ftdi_structure))) == NULL) {
+    fclose(config_file);
+    return generate_error(FTDI_ERROR_NO_MEMORY);
+    }
+  sprintf(new_risc_os_ftdi->device_name,
+          "USB%d",
+          usb_device_number);
+#ifdef DEBUG
+  debug_writef(DEBUG_LEVEL_REGISTRATION,
+               "Driver responsibility with Device Name %s. USB device %x\n",
+               new_risc_os_ftdi->device_name,
+               new_risc_os_ftdi);
+#endif
+  new_risc_os_ftdi->input.usb_buffer_size=64;
+  new_risc_os_ftdi->input.buffer=NULL;
+  new_risc_os_ftdi->output.usb_buffer_size=64;
+  new_risc_os_ftdi->output.buffer=NULL;
+  /* To allow one procedure for closing in error case. */
+  new_risc_os_ftdi->input.file_handle=FTDI_NO_FILE_HANDLE;
+  new_risc_os_ftdi->input.risc_os_buffer_info.handle=FTDI_NO_BUFFER_HANDLE;
+  new_risc_os_ftdi->input.callback_requested=false;
+  new_risc_os_ftdi->output.file_handle=FTDI_NO_FILE_HANDLE;
+  new_risc_os_ftdi->output.risc_os_buffer_info.handle=FTDI_NO_BUFFER_HANDLE;
+  new_risc_os_ftdi->output.callback_requested=false;
+  /* First pass scans for the chip type in configuration file */
+  ftdi_chip_type=-1;
+  while(!feof(config_file)) {
+    if ((config_file_line=get_file_line(config_file)) != NULL) {
+      if ((parameter=determine_config_parameter(&config_file_line,
+                                                &port_number)) != NULL) {
+        if (strcmp(parameter, "chip") == 0) {
+          ftdi_chip_type=determine_parameter_value_number(&config_file_line);
+          }
+        }
+      }
+    }
+  fclose(config_file);
+#ifdef DEBUG
+  debug_writef(DEBUG_LEVEL_REGISTRATION,
+               "Chip Type is %d\n",
+               ftdi_chip_type);
+#endif
+  /* Prepare USB connection structure. */
+  if (!ftdi_init(&new_risc_os_ftdi->ftdi,
+                 ftdi_chip_type,
+                 new_risc_os_ftdi->device_name)) {
+    deregister_usb_device(new_risc_os_ftdi);
+    return generate_error(FTDI_ERROR_FTDI_INIT);
+    }
+  /* No devices open at DeviceFS side for this FTDI device so far. */
+  for (port_number=0; port_number < new_risc_os_ftdi->ftdi.number_of_ports; port_number++) {
+    new_risc_os_ftdi->devices[port_number]=NULL;
+    }
+#ifdef DEBUG
+  debug_write(DEBUG_LEVEL_REGISTRATION,
+              "FTDI-Device initialized.\n");
+#endif
+  /* Second pass: Fetch configuration.
+     All settings are written directly into the ftdi structures.
+     Default coniguration value is noted separately. May be it
+     is overwritten later by a personal configuration file
+     or used to generate this file. */
+  for (port_number=0; port_number < new_risc_os_ftdi->ftdi.number_of_ports; port_number++) {
+    default_devicefs_name[port_number][0]='\0';
+    default_baudrate[port_number]=0;
+    default_data_bits[port_number]=0;
+    default_stopbits[port_number]=0;
+    default_parity[port_number]=0;
+    default_flowcontrol[port_number]=0;
+    if (ftdi_usb_get_latency_timer(&new_risc_os_ftdi->ftdi,
+                                   &device_info,
+                                   (unsigned char) port_number)) {
+      default_timer[port_number]=device_info;
+      }
+    else {
+      default_timer[port_number]=16;
+      }
+    default_event_char[port_number]=0xFFFFFFFF;
+    default_error_char[port_number]=0xFFFFFFFF;
+    }
+  /* File name preserved from above. */
+  config_file=fopen(path_name, "r");
+  while(!feof(config_file)) {
+    if ((config_file_line=get_file_line(config_file)) != NULL) {
+      if ((parameter=determine_config_parameter(&config_file_line,
+                                                &port_number)) != NULL) {
+        /* May be used or not, depends on parameter. */
+        first_parameter_value=true;
+        if (strcmp(parameter, "chip") == 0) {
+          if (config_file_line) {
+            ftdi_chip_type=determine_parameter_value_number(&config_file_line);
+            }
+          }
+        else if (strcmp(parameter, "eeprom") == 0) {
+          if (config_file_line) {
+            if (determine_parameter_value_number(&config_file_line) == 1) {
+              new_risc_os_ftdi->ftdi.allowed_configurations.eeprom_writeable=true;
+              }
+            }
+          }
+        else if (strcmp(parameter, "mode") == 0) {
+          if (port_number < new_risc_os_ftdi->ftdi.number_of_ports) {
+            if (config_file_line) {
+              new_risc_os_ftdi->ftdi.actual_bitmode[port_number]=determine_parameter_value_number(&config_file_line);
+              }
+            }
+          }
+        else if (strcmp(parameter, "bufsiz_in") == 0) {
+          if (config_file_line) {
+            parameter_value=determine_parameter_value_number(&config_file_line);
+            if (parameter_value > 0) {
+              if ((parameter_value%64) == 0) {
+                new_risc_os_ftdi->input.usb_buffer_size=parameter_value;
+                }
+              else {
+                new_risc_os_ftdi->input.usb_buffer_size=((parameter_value/64) + 1)*64;
+                }
+              }
+            }
+          }
+        else if (strcmp(parameter, "bufsiz_out") == 0) {
+          if (config_file_line) {
+            parameter_value=determine_parameter_value_number(&config_file_line);
+            if (parameter_value > 0) {
+              if ((parameter_value%64) == 0) {
+                new_risc_os_ftdi->output.usb_buffer_size=parameter_value;
+                }
+              else {
+                new_risc_os_ftdi->output.usb_buffer_size=((parameter_value/64) + 1)*64;
+                }
+              }
+            }
+          }
+        else if (strcmp(parameter, "devicefs_name") == 0) {
+          if (port_number < new_risc_os_ftdi->ftdi.number_of_ports) {
+            if (config_file_line) {
+              strcpy(default_devicefs_name[port_number], config_file_line);
+              }
+            }
+          }
+        else if (strcmp(parameter, "baud") == 0) {
+          if (port_number < new_risc_os_ftdi->ftdi.number_of_ports) {
+            while(config_file_line) {
+              parameter_value=determine_parameter_value_number(&config_file_line);
+              if (first_parameter_value) {
+                default_baudrate[port_number]=parameter_value;
+                first_parameter_value=false;
+                }
+              new_risc_os_ftdi->ftdi.allowed_configurations.serial[port_number].baudrate[new_risc_os_ftdi->ftdi.allowed_configurations.serial[port_number].number_of_baudrates]=parameter_value;
+              new_risc_os_ftdi->ftdi.allowed_configurations.serial[port_number].number_of_baudrates++;
+              }
+            }
+          }
+        else if (strcmp(parameter, "data_bits") == 0) {
+          if (port_number < new_risc_os_ftdi->ftdi.number_of_ports) {
+            while(config_file_line) {
+              parameter_value=determine_parameter_value_number(&config_file_line);
+              if (first_parameter_value) {
+                default_data_bits[port_number]=parameter_value;
+                first_parameter_value=false;
+                }
+              new_risc_os_ftdi->ftdi.allowed_configurations.serial[port_number].data_bits|=get_data_bits_permission(parameter_value);
+              }
+            }
+          }
+        else if (strcmp(parameter, "parity") == 0) {
+          if (port_number < new_risc_os_ftdi->ftdi.number_of_ports) {
+            while(config_file_line) {
+              parameter_value=determine_parameter_value_number(&config_file_line);
+              if (first_parameter_value) {
+                default_parity[port_number]=parameter_value;
+                first_parameter_value=false;
+                }
+              new_risc_os_ftdi->ftdi.allowed_configurations.serial[port_number].parity|=get_parity_permission(parameter_value);
+              }
+            }
+          }
+        else if (strcmp(parameter, "stop") == 0) {
+          if (port_number < new_risc_os_ftdi->ftdi.number_of_ports) {
+            while(config_file_line) {
+              parameter_value=determine_parameter_value_number(&config_file_line);
+              if (first_parameter_value) {
+                default_stopbits[port_number]=parameter_value;
+                first_parameter_value=false;
+                }
+              new_risc_os_ftdi->ftdi.allowed_configurations.serial[port_number].stopbits|=get_stopbits_permission(parameter_value);
+              }
+            }
+          }
+        else if (strcmp(parameter, "flow") == 0) {
+          if (port_number < new_risc_os_ftdi->ftdi.number_of_ports) {
+            while(config_file_line) {
+              parameter_value=determine_parameter_value_number(&config_file_line);
+              if (first_parameter_value) {
+                default_flowcontrol[port_number]=parameter_value;
+                first_parameter_value=false;
+                }
+              new_risc_os_ftdi->ftdi.allowed_configurations.serial[port_number].flowcontrol|=get_flowcontrol_permission(parameter_value);
+              }
+            }
+          }
+        else if (strcmp(parameter, "flow_xon_char") == 0) {
+          if (port_number < new_risc_os_ftdi->ftdi.number_of_ports) {
+            if (config_file_line) {
+              new_risc_os_ftdi->ftdi.allowed_configurations.serial[port_number].flow_xon_char=determine_parameter_value_number(&config_file_line);
+              }
+            }
+          }
+        else if (strcmp(parameter, "flow_xoff_char") == 0) {
+          if (port_number < new_risc_os_ftdi->ftdi.number_of_ports) {
+            if (config_file_line) {
+              new_risc_os_ftdi->ftdi.allowed_configurations.serial[port_number].flow_xoff_char=determine_parameter_value_number(&config_file_line);
+              }
+            }
+          }
+        else if (strcmp(parameter, "timer") == 0) {
+          if (port_number < new_risc_os_ftdi->ftdi.number_of_ports) {
+            if (config_file_line) {
+              default_timer[port_number]=determine_parameter_value_number(&config_file_line);
+              }
+            }
+          }
+        else if (strcmp(parameter, "event_char") == 0) {
+          if (port_number < new_risc_os_ftdi->ftdi.number_of_ports) {
+            if (config_file_line) {
+              default_event_char[port_number]=determine_parameter_value_number(&config_file_line);
+              }
+            }
+          }
+        else if (strcmp(parameter, "error_char") == 0) {
+          if (port_number < new_risc_os_ftdi->ftdi.number_of_ports) {
+            if (config_file_line) {
+              default_error_char[port_number]=determine_parameter_value_number(&config_file_line);
+              }
+            }
+          }
+        }
+      }
+    }
+  fclose(config_file);
+#ifdef DEBUG
+  debug_write(DEBUG_LEVEL_CONFIGURATION,
+              "Base Configuration fetched\n");
+#endif
+  /* Open input channel */
+  new_risc_os_ftdi->input.bytes_buffered=0;
+  new_risc_os_ftdi->input.bytes_requested=0;
+  if ((new_risc_os_ftdi->input.buffer=malloc(new_risc_os_ftdi->input.usb_buffer_size)) == NULL) {
+#ifdef DEBUG
+    debug_write(DEBUG_LEVEL_REGISTRATION,
+                "Memory Problem\n");
+#endif
+    deregister_usb_device(new_risc_os_ftdi);
+    return generate_error(FTDI_ERROR_NO_MEMORY);
+    }
+#ifdef DEBUG
+    debug_write(DEBUG_LEVEL_REGISTRATION,
+                "Memory ok\n");
+#endif
+  sprintf(path_name,
+          "Devices#nopad;noblock;endpoint1;size%d:%s",
+          new_risc_os_ftdi->input.usb_buffer_size + 1,
+          new_risc_os_ftdi->device_name);
+  regs.r[0]=0x47;
+  regs.r[1]=(int) path_name;
+  regs.r[2]=NULL;
+  if ((error_os=_kernel_swi(OS_Find, &regs, &regs)) != NULL) {
+#ifdef DEBUG
+    debug_write(DEBUG_LEVEL_REGISTRATION,
+                "Open Problem\n");
+#endif
+    deregister_usb_device(new_risc_os_ftdi);
+    return error_os;
+    }
+#ifdef DEBUG
+  debug_write(DEBUG_LEVEL_REGISTRATION,
+              "Open ok\n");
+#endif
+  new_risc_os_ftdi->input.file_handle=regs.r[0];
+  /* Non Blocking */
+  ioctl_block[0]=0x80FF0001;
+  ioctl_block[1]=0x00000001;
+  regs.r[0]=9;
+  regs.r[1]=new_risc_os_ftdi->input.file_handle;
+  regs.r[2]=(int) ioctl_block;
+  if ((error_os=_kernel_swi(OS_Args, &regs, &regs)) != NULL) {
+#ifdef DEBUG
+    debug_write(DEBUG_LEVEL_REGISTRATION,
+                "OS_Args 9 Problem\n");
+#endif
+    deregister_usb_device(new_risc_os_ftdi);
+    return error_os;
+    }
+#ifdef DEBUG
+  debug_write(DEBUG_LEVEL_REGISTRATION,
+              "Non Blocking ok\n");
+#endif
+  /* Note various additional information */
+  regs.r[0]=(int) 0x80000007; /* DeviceFSCallDevice_GetHandles2 */
+  regs.r[1]=(int) new_risc_os_ftdi->device_name;
+  regs.r[2]=new_risc_os_ftdi->input.file_handle;
+  if ((error_os=_kernel_swi(DeviceFS_CallDevice, &regs, &regs)) != NULL) {
+#ifdef DEBUG
+    debug_write(DEBUG_LEVEL_REGISTRATION,
+                "Call Device 7 Problem\n");
+#endif
+    deregister_usb_device(new_risc_os_ftdi);
+    return error_os;
+    }
+#ifdef DEBUG
+  debug_write(DEBUG_LEVEL_REGISTRATION,
+              "Call Device 7 ok\n");
+#endif
+  if ((error_os=get_buffer_info(regs.r[3],
+                                &new_risc_os_ftdi->input.risc_os_buffer_info)) != NULL) {
+#ifdef DEBUG
+    debug_write(DEBUG_LEVEL_REGISTRATION,
+                "Buffer info Problem\n");
+#endif
+    deregister_usb_device(new_risc_os_ftdi);
+    return error_os;
+    }
+#ifdef DEBUG
+  debug_write(DEBUG_LEVEL_REGISTRATION,
+              "Buffer info ok\n");
+#endif
+  new_risc_os_ftdi->input.devicefs_stream_handle=regs.r[4];
+  new_risc_os_ftdi->input.usb_stream_handle=regs.r[5];
+  new_risc_os_ftdi->input.devdriver_handle=regs.r[6];
+  /* Nopad */
+  regs.r[0]=(int) 0x80000008; /* DeviceFSCallDevice_GetSetOptions */
+  regs.r[1]=(int) new_risc_os_ftdi->device_name;
+  regs.r[2]=new_risc_os_ftdi->input.usb_stream_handle;
+  regs.r[3]=0x00000001;
+  regs.r[4]=0xFFFFFFFE;
+  if ((error_os=_kernel_swi(DeviceFS_CallDevice, &regs, &regs)) != NULL) {
+#ifdef DEBUG
+    debug_write(DEBUG_LEVEL_REGISTRATION,
+                "Call Device 8 Problem\n");
+#endif
+    deregister_usb_device(new_risc_os_ftdi);
+    return error_os;
+    }
+#ifdef DEBUG
+  debug_write(DEBUG_LEVEL_REGISTRATION,
+              "No Pad ok\n");
+#endif
+  /* Clear stall at host side */
+  regs.r[0]=(int) 0x80000005; /* DeviceFSCallDevice_ClearStall */
+  regs.r[1]=(int) new_risc_os_ftdi->device_name;
+  regs.r[2]=new_risc_os_ftdi->input.file_handle;
+  if ((error_os=_kernel_swi(DeviceFS_CallDevice, &regs, &regs)) != NULL) {
+#ifdef DEBUG
+    debug_write(DEBUG_LEVEL_REGISTRATION,
+                "Call Device 5 Problem\n");
+#endif
+    deregister_usb_device(new_risc_os_ftdi);
+    return error_os;
+    }
+#ifdef DEBUG
+  debug_write(DEBUG_LEVEL_REGISTRATION,
+              "Call Device 5 ok\n");
+#endif
+  /* Setup the upcall handling */
+  if ((error_os=upcall_translation_add(&common.upcall_translation,
+                                       new_risc_os_ftdi->input.risc_os_buffer_info.handle,
+                                       FTDI_UPCALL_IO_I,
+                                       new_risc_os_ftdi)) != NULL) {
+#ifdef DEBUG
+    debug_write(DEBUG_LEVEL_REGISTRATION,
+                "Upcall translation Problem\n");
+#endif
+    deregister_usb_device(new_risc_os_ftdi);
+    return error_os;
+    }
+#ifdef DEBUG
+  debug_write(DEBUG_LEVEL_REGISTRATION,
+              "Upcall translation ok\n");
+#endif
+  /* Threshold must be Buffersize to be informed by Upcall 8 when any
+     data available. */
+  regs.r[0]=new_risc_os_ftdi->input.risc_os_buffer_info.handle;
+  regs.r[1]=new_risc_os_ftdi->input.usb_buffer_size;
+  if ((error_os=_kernel_swi(Buffer_Threshold, &regs, &regs)) != NULL) {
+#ifdef DEBUG
+    debug_write(DEBUG_LEVEL_REGISTRATION,
+                "Buffer Threshold Problem\n");
+#endif
+    deregister_usb_device(new_risc_os_ftdi);
+    return error_os;
+    }
+#ifdef DEBUG
+  debug_write(DEBUG_LEVEL_REGISTRATION,
+              "Buffer Threshold ok\n");
+#endif
+#ifdef DEBUG
+  debug_writef(DEBUG_LEVEL_REGISTRATION,
+               "Input stream initialized. USB Buffer %x\n",
+               new_risc_os_ftdi->input.risc_os_buffer_info.handle);
+#endif
+  /* Open output channel */
+  new_risc_os_ftdi->output.bytes_buffered=0;
+  new_risc_os_ftdi->output.bytes_processed=0;
+  if ((new_risc_os_ftdi->output.buffer=malloc(new_risc_os_ftdi->output.usb_buffer_size)) == NULL) {
+    deregister_usb_device(new_risc_os_ftdi);
+    return generate_error(FTDI_ERROR_NO_MEMORY);
+    }
+  sprintf(path_name,
+          "Devices#noblock;endpoint2;size%d:%s",
+          new_risc_os_ftdi->output.usb_buffer_size + 1,
+          new_risc_os_ftdi->device_name);
+  regs.r[0]=0xC7;
+  regs.r[1]=(int) path_name;
+  regs.r[2]=NULL;
+  if ((error_os=_kernel_swi(OS_Find, &regs, &regs)) != NULL) {
+#ifdef DEBUG
+    debug_write(DEBUG_LEVEL_REGISTRATION,
+                "Open Problem\n");
+#endif
+    deregister_usb_device(new_risc_os_ftdi);
+    return error_os;
+    }
+#ifdef DEBUG
+    debug_write(DEBUG_LEVEL_REGISTRATION,
+                "Open ok\n");
+#endif
+  new_risc_os_ftdi->output.file_handle=regs.r[0];
+  /* Non Blocking */
+  ioctl_block[0]=0x80FF0001;
+  ioctl_block[1]=0x00000001;
+  regs.r[0]=9;
+  regs.r[1]=new_risc_os_ftdi->output.file_handle;
+  regs.r[2]=(int) ioctl_block;
+  if ((error_os=_kernel_swi(OS_Args, &regs, &regs)) != NULL) {
+#ifdef DEBUG
+    debug_write(DEBUG_LEVEL_REGISTRATION,
+                "OS_Args 9 Problem\n");
+#endif
+    deregister_usb_device(new_risc_os_ftdi);
+    return error_os;
+    }
+#ifdef DEBUG
+  debug_write(DEBUG_LEVEL_REGISTRATION,
+              "Non Blocking ok\n");
+#endif
+  /* Note various additional information */
+  regs.r[0]=(int) 0x80000007; /* DeviceFSCallDevice_GetHandles2 */
+  regs.r[1]=(int) new_risc_os_ftdi->device_name;
+  regs.r[2]=new_risc_os_ftdi->output.file_handle;
+  if ((error_os=_kernel_swi(DeviceFS_CallDevice, &regs, &regs)) != NULL) {
+    deregister_usb_device(new_risc_os_ftdi);
+    return error_os;
+    }
+  if ((error_os=get_buffer_info(regs.r[3],
+                                &new_risc_os_ftdi->output.risc_os_buffer_info)) != NULL) {
+    deregister_usb_device(new_risc_os_ftdi);
+    return error_os;
+    }
+  new_risc_os_ftdi->output.devicefs_stream_handle=regs.r[4];
+  /* Setup the upcall handling */
+  if ((error_os=upcall_translation_add(&common.upcall_translation,
+                                       new_risc_os_ftdi->output.risc_os_buffer_info.handle,
+                                       FTDI_UPCALL_IO_O,
+                                       new_risc_os_ftdi)) != NULL) {
+    deregister_usb_device(new_risc_os_ftdi);
+    return error_os;
+    }
+  /* Threshold must be buffer size to be informed by Upcall 9 if
+     all data sent. */
+  regs.r[0]=new_risc_os_ftdi->output.risc_os_buffer_info.handle;
+  regs.r[1]=new_risc_os_ftdi->output.usb_buffer_size;
+  if ((error_os=_kernel_swi(Buffer_Threshold, &regs, &regs)) != NULL) {
+    deregister_usb_device(new_risc_os_ftdi);
+    return error_os;
+    }
+#ifdef DEBUG
+  debug_writef(DEBUG_LEVEL_REGISTRATION,
+               "Output stream initialized. USB Buffer %x\n",
+               new_risc_os_ftdi->output.risc_os_buffer_info.handle);
+#endif
+  /* Check whether personal configuration file is present */
+  sprintf(path_name,
+          "Choices:FTDI.Devices.%04x_%04x",
+          idVendor,
+          idProduct);
+  if (pendant_extension != NULL) {
+    strcat(path_name, "P"),
+    strcat(path_name, pendant_extension);
+    }
+  /* Now take individual configuration into account if given */
+  if (own_config_extension != NULL) {
+    strcat(path_name, "_"),
+    strcat(path_name, own_config_extension);
+    }
+  if ((config_file=fopen(path_name, "r")) == NULL) {
+    sprintf(path_name,
+            "<Choices$Write>.FTDI.Devices.%04x_%04x",
+            idVendor,
+            idProduct);
+    if (pendant_extension != NULL) {
+      strcat(path_name, "P"),
+      strcat(path_name, pendant_extension);
+      }
+    if (own_config_extension != NULL) {
+      strcat(path_name, "_"),
+      strcat(path_name, own_config_extension);
+      }
+    if ((config_file=fopen(path_name, "w")) == NULL) {
+      deregister_usb_device(new_risc_os_ftdi);
+      return generate_error(FTDI_ERROR_WRITE_CHOICES);
+      }
+    /* Generate personal configuration file with default settings. */
+    for (port_number=0; port_number < new_risc_os_ftdi->ftdi.number_of_ports; port_number++) {
+      fprintf(config_file, "devicefs_name%d: %s\n", port_number, default_devicefs_name[port_number]);
+      if (new_risc_os_ftdi->ftdi.actual_bitmode[port_number] == 0) {
+        fprintf(config_file, "baud%d: %d\n", port_number, default_baudrate[port_number]);
+        fprintf(config_file, "data_bits%d: %ld\n", port_number, default_data_bits[port_number]);
+        fprintf(config_file, "stop%d: %ld\n", port_number, default_stopbits[port_number]);
+        fprintf(config_file, "parity%d: %ld\n", port_number, default_parity[port_number]);
+        fprintf(config_file, "flow%d: %ld\n", port_number, default_flowcontrol[port_number]);
+        fprintf(config_file, "flow_xon_char%d: %ld\n", port_number, new_risc_os_ftdi->ftdi.allowed_configurations.serial[port_number].flow_xon_char);
+        fprintf(config_file, "flow_xoff_char%d: %ld\n", port_number, new_risc_os_ftdi->ftdi.allowed_configurations.serial[port_number].flow_xoff_char);
+        }
+      fprintf(config_file, "timer%d: %ld\n", port_number, default_timer[port_number]);
+      if (default_event_char[port_number] != 0xFFFFFFFF) {
+        fprintf(config_file, "event_char%d: %ld\n", port_number, default_event_char[port_number]);
+        }
+      if (default_error_char[port_number] != 0xFFFFFFFF) {
+        fprintf(config_file, "error_char%d: %ld\n", port_number, default_error_char[port_number]);
+        }
+      }
+#ifdef DEBUG
+    debug_writef(DEBUG_LEVEL_CONFIGURATION,
+                 "Individual configuration file %s written\n",
+                 path_name);
+#endif
+    }
+  else {
+    /* Read personal configuration file. */
+    while(!feof(config_file)) {
+      if ((config_file_line=get_file_line(config_file)) != NULL) {
+        if ((parameter=determine_config_parameter(&config_file_line,
+                                                  &port_number)) != NULL) {
+          if (strcmp(parameter, "devicefs_name") == 0) {
+            if (port_number < new_risc_os_ftdi->ftdi.number_of_ports) {
+              if (config_file_line) {
+                strcpy(default_devicefs_name[port_number], config_file_line);
+                }
+              }
+            }
+          else if (strcmp(parameter, "baud") == 0) {
+            if (port_number < new_risc_os_ftdi->ftdi.number_of_ports) {
+              int i;
+
+              parameter_value=determine_parameter_value_number(&config_file_line);
+              i=0;
+              while(i < new_risc_os_ftdi->ftdi.allowed_configurations.serial[port_number].number_of_baudrates) {
+                if (parameter_value == new_risc_os_ftdi->ftdi.allowed_configurations.serial[port_number].baudrate[i]) {
+                  default_baudrate[port_number]=parameter_value;
+                  break;
+                  }
+                i++;
+                }
+              }
+            }
+          else if (strcmp(parameter, "data_bits") == 0) {
+            if (port_number < new_risc_os_ftdi->ftdi.number_of_ports) {
+              parameter_value=determine_parameter_value_number(&config_file_line);
+              if ((get_data_bits_permission(parameter_value)&new_risc_os_ftdi->ftdi.allowed_configurations.serial[port_number].data_bits) != 0) {
+                default_data_bits[port_number]=parameter_value;
+                }
+              }
+            }
+          else if (strcmp(parameter, "parity") == 0) {
+            if (port_number < new_risc_os_ftdi->ftdi.number_of_ports) {
+              parameter_value=determine_parameter_value_number(&config_file_line);
+              if ((get_parity_permission(parameter_value)&new_risc_os_ftdi->ftdi.allowed_configurations.serial[port_number].parity) != 0) {
+                default_parity[port_number]=parameter_value;
+                }
+              }
+            }
+          else if (strcmp(parameter, "stop") == 0) {
+            if (port_number < new_risc_os_ftdi->ftdi.number_of_ports) {
+              parameter_value=determine_parameter_value_number(&config_file_line);
+              if ((get_stopbits_permission(parameter_value)&new_risc_os_ftdi->ftdi.allowed_configurations.serial[port_number].stopbits) != 0) {
+                default_stopbits[port_number]=parameter_value;
+                }
+              }
+            }
+          else if (strcmp(parameter, "flow") == 0) {
+            if (port_number < new_risc_os_ftdi->ftdi.number_of_ports) {
+              parameter_value=determine_parameter_value_number(&config_file_line);
+              if ((get_flowcontrol_permission(parameter_value)&new_risc_os_ftdi->ftdi.allowed_configurations.serial[port_number].flowcontrol) != 0) {
+                default_flowcontrol[port_number]=parameter_value;
+                }
+              }
+            }
+          else if (strcmp(parameter, "flow_xon_char") == 0) {
+            if (port_number < new_risc_os_ftdi->ftdi.number_of_ports) {
+              new_risc_os_ftdi->ftdi.allowed_configurations.serial[port_number].flow_xon_char=determine_parameter_value_number(&config_file_line);
+              }
+            }
+          else if (strcmp(parameter, "flow_xoff_char") == 0) {
+            if (port_number < new_risc_os_ftdi->ftdi.number_of_ports) {
+              new_risc_os_ftdi->ftdi.allowed_configurations.serial[port_number].flow_xoff_char=determine_parameter_value_number(&config_file_line);
+              }
+            }
+          else if (strcmp(parameter, "timer") == 0) {
+            if (port_number < new_risc_os_ftdi->ftdi.number_of_ports) {
+              default_timer[port_number]=determine_parameter_value_number(&config_file_line);
+              }
+            }
+          else if (strcmp(parameter, "event_char") == 0) {
+            if (port_number < new_risc_os_ftdi->ftdi.number_of_ports) {
+              default_event_char[port_number]=determine_parameter_value_number(&config_file_line);
+              }
+            }
+          else if (strcmp(parameter, "error_char") == 0) {
+            if (port_number < new_risc_os_ftdi->ftdi.number_of_ports) {
+              default_error_char[port_number]=determine_parameter_value_number(&config_file_line);
+              }
+            }
+          }
+        }
+      }
+#ifdef DEBUG
+    debug_writef(DEBUG_LEVEL_CONFIGURATION,
+                 "Individual configuration file %s fetched\n",
+                 path_name);
+#endif
+    }
+  fclose(config_file);
+  /* Perform configuration */
+  /* Errors are ignored at the moment.
+     I didn't find a better concept. */
+  for (port_number=0; port_number < new_risc_os_ftdi->ftdi.number_of_ports; port_number++) {
+    if (new_risc_os_ftdi->ftdi.actual_bitmode[port_number] == 0) {
+      /* Adapt flowcontrol for it is Bit ORed and not used after the following
+         statements in another way. */
+      if (default_flowcontrol[port_number] == FTDI_FLOWCONTROL_DTR_DSR) {
+        default_flowcontrol[port_number]|=FTDI_FLOWCONTROL_RTS_CTS;
+        }
+      if (default_baudrate[port_number] != 0) {
+        if (!ftdi_usb_set_baudrate(&new_risc_os_ftdi->ftdi,
+                                   default_baudrate[port_number],
+                                   (unsigned char) port_number)) {
+#ifdef DEBUG
+          debug_writef(DEBUG_LEVEL_CONFIGURATION,
+                       "Problems to set baudrate %d port %d\n",
+                       default_baudrate[port_number],
+                       port_number);
+#endif
+          }
+        }
+      if (!ftdi_set_data_property(&new_risc_os_ftdi->ftdi,
+                                  (unsigned char) default_data_bits[port_number],
+                                  (unsigned char) default_stopbits[port_number],
+                                  (unsigned char) default_parity[port_number],
+                                  false,
+                                  (unsigned char) port_number)) {
+#ifdef DEBUG
+         debug_writef(DEBUG_LEVEL_CONFIGURATION,
+                      "Problems to set data property db %d sb %d p %d port %d\n",
+                      default_data_bits[port_number],
+                      default_stopbits[port_number],
+                      default_parity[port_number],
+                      port_number);
+#endif
+        }
+      if (!ftdi_usb_set_flow_control(&new_risc_os_ftdi->ftdi,
+                                     default_flowcontrol[port_number],
+                                     new_risc_os_ftdi->ftdi.allowed_configurations.serial[port_number].flow_xon_char,
+                                     new_risc_os_ftdi->ftdi.allowed_configurations.serial[port_number].flow_xoff_char,
+                                     (unsigned char) port_number)) {
+#ifdef DEBUG
+         debug_writef(DEBUG_LEVEL_CONFIGURATION,
+                      "Problems to set flowcontrol %d xon %x xoff %x port %d\n",
+                      default_flowcontrol[port_number],
+                      new_risc_os_ftdi->ftdi.allowed_configurations.serial[port_number].flow_xon_char,
+                      new_risc_os_ftdi->ftdi.allowed_configurations.serial[port_number].flow_xoff_char,
+                      port_number);
+#endif
+        }
+      }
+    if (!ftdi_usb_set_latency_timer(&new_risc_os_ftdi->ftdi,
+                                   (unsigned char) default_timer[port_number],
+                                   (unsigned char) port_number)) {
+#ifdef DEBUG
+      debug_writef(DEBUG_LEVEL_CONFIGURATION,
+                   "Problems to set latency timer %d port %d\n",
+                   default_timer[port_number],
+                   port_number);
+#endif
+      }
+    if (default_event_char[port_number] != 0xFFFFFFFF) {
+      if (!ftdi_usb_set_event_char(&new_risc_os_ftdi->ftdi,
+                                   default_event_char[port_number],
+                                   true,
+                                   (unsigned char) port_number)) {
+#ifdef DEBUG
+        debug_writef(DEBUG_LEVEL_CONFIGURATION,
+                     "Problems to set event char %x port %d\n",
+                     default_event_char[port_number],
+                     port_number);
+#endif
+        }
+      }
+    if (default_error_char[port_number] != 0xFFFFFFFF) {
+      if (!ftdi_usb_set_error_char(&new_risc_os_ftdi->ftdi,
+                                   default_error_char[port_number],
+                                   true,
+                                   (unsigned char) port_number)) {
+#ifdef DEBUG
+        debug_writef(DEBUG_LEVEL_CONFIGURATION,
+                     "Problems to set error char %x port %d\n",
+                     default_error_char[port_number],
+                     port_number);
+#endif
+        }
+      }
+    }
+#ifdef DEBUG
+  debug_write(DEBUG_LEVEL_CONFIGURATION,
+              "Device configured\n");
+#endif
+  /* Prepare FTDI devices */
+  for (port_number=0; port_number < new_risc_os_ftdi->ftdi.number_of_ports; port_number++) {
+    if ((error_os=register_device(default_devicefs_name[port_number],
+                                  new_risc_os_ftdi,
+                                  port_number)) != NULL) {
+      if (port_number == 0) {
+        /* Clean up USB connection directly because no other
+           devices has been already set up. */
+        deregister_usb_device(new_risc_os_ftdi);
+        }
+      else {
+        /* Scan for all devices belonging to actual usb structure */
+        struct ftdi_device_structure *ftdi_device;
+
+        ftdi_device=common.first_device;
+        while(ftdi_device) {
+          if (ftdi_device->risc_os_ftdi == new_risc_os_ftdi) {
+            deregister_device(ftdi_device);
+            /* Restart from beginning for you don't now
+               how devices are arranged. */
+            ftdi_device=common.first_device;
+            }
+          else {
+            ftdi_device=ftdi_device->next_device;
+            }
+          }
+        }
+      return error_os;
+      }
+    }
+  }
+else {
+  #ifdef DEBUG
+      debug_write(DEBUG_LEVEL_CONFIGURATION,
+                  "Can't open configuration file.\n");
+  #endif
+  }
+/* No errors. Either it is FTDI or not. If not errors
+   would disturb others drivers. */
+return NULL;
+}
+
+/* !!!!!!!!!! functions !!!!!!!!!! */
+int upcall_handler(_kernel_swi_regs *regs,
+                   void *pw)
+{
+int io_info;
+int irq_state;
+/* Required often therefore located here. */
+struct upcall_translation_element_structure *translation_element;
+_kernel_oserror *error_os;
+
+switch(regs->r[0]) {
+  case 8:
+  case 9: {
+    /* Evaluate buffer threshold information. */
+    /* Check whether an own buffer is affected. */
+    if (common.upcall_translation.no_of_elements > 0) {
+#ifdef DEBUG
+      debug_writef(DEBUG_LEVEL_TRANSMISSION,
+                   "Upcall handler %d %x PW %x\n",
+                   regs->r[0],
+                   regs->r[1],
+                   pw);
+#endif
+      if ((irq_state=_kernel_irqs_disabled()) == 0) _kernel_irqs_off;
+      if ((translation_element=upcall_find_translation(&common.upcall_translation,
+                                                       regs->r[1])) != NULL) {
+#ifdef DEBUG
+        debug_writef(DEBUG_LEVEL_TRANSMISSION,
+                     "Element found is Buffer %x %d RISC OS FTDI %x\n",
+                     translation_element->buffer_handle,
+                     translation_element->io_info,
+                     translation_element->risc_os_ftdi);
+#endif
+        if (((regs->r[0] == 8) && (translation_element->io_info == FTDI_UPCALL_IO_I)) ||
+            ((regs->r[0] == 9) && (translation_element->io_info == FTDI_UPCALL_IO_I_DFS)) ||
+            ((regs->r[0] == 9) && (translation_element->io_info == FTDI_UPCALL_IO_O))) {
+          /* One of the FTDI controlled buffers. */
+          if (translation_element->io_info == FTDI_UPCALL_IO_I_DFS) {
+            io_info=FTDI_UPCALL_IO_I;
+            }
+          else {
+            io_info=translation_element->io_info;
+            }
+          if ((error_os=callback_generate(translation_element->risc_os_ftdi,
+                                          io_info,
+                                          common.ws)) != NULL) {
+            if (irq_state == 0) _kernel_irqs_on;
+            return 1;
+            }
+          }
+        }
+      if (irq_state == 0) _kernel_irqs_on;
+      }
+    }
+  break;
+  case 10: {
+    /* Note file handles belonging to our streams. */
+    /* Required seldom therefore located here. */
+    struct ftdi_device_structure *ftdi_device;
+
+#ifdef DEBUG
+      debug_writef(DEBUG_LEVEL_STREAM,
+                   "Upcall handler stream created %x %x %x PW %x\n",
+                   regs->r[1],
+                   regs->r[3],
+                   regs->r[4],
+                   pw);
+#endif
+    /* Reference runs over R4 (io_info in lowest 2 Bits with device structure pointer).
+       However this might not be our stream. Therefore loop over all streams is required. */
+    ftdi_device=common.first_device;
+    while(ftdi_device) {
+      /* Check address without channel info (top 30 Bits). */
+      if ((int) ftdi_device == (regs->r[4] & 0xFFFFFFFC)) {
+        /* determine channel (lower 2 Bits) */
+        if ((regs->r[4] & 0x00000003) == 1) {
+          /* I channel */
+          ftdi_device->input.file_handle=regs->r[3];
+#ifdef DEBUG
+          debug_writef(DEBUG_LEVEL_STREAM,
+                       "File handle %x bound for device %x for input\n",
+                       ftdi_device->input.file_handle,
+                       ftdi_device);
+#endif
+          }
+        else {
+          /* O channel */
+          ftdi_device->output.file_handle=regs->r[3];
+#ifdef DEBUG
+          debug_writef(DEBUG_LEVEL_STREAM,
+                       "File handle %x bound for device %x for output\n",
+                       ftdi_device->output.file_handle,
+                       ftdi_device);
+#endif
+          }
+        return 1;
+        }
+      ftdi_device=ftdi_device->next_device;
+      }
+    }
+  break;
+  }
+return 1;
+}
+
+_kernel_oserror *driver(_kernel_swi_regs *regs,
+                        void *pw)
+{
+/* Adapter required to split code and to obtain common. */
+return driver_internal(&common,
+                       regs,
+                       pw);
+}
+
+_kernel_oserror *module_init(const char *cmd_tail,
+                             int podule_base,
+                             void *pw)
+{
+_kernel_swi_regs regs;
+_kernel_oserror *error_os;
+
+#ifdef DEBUG
+debug_initialize();
+debug_writef(DEBUG_LEVEL_INITIALIZATION,
+             "Module Init. PW %x\n",
+             pw);
+#endif
+common.ws=pw;
+common.first_device=NULL;
+ if ((error_os=initialize_error()) != NULL) {
+#ifdef DEBUG
+  debug_finalize();
+#endif
+  return error_os;
+  }
+upcall_translation_initialize(&common.upcall_translation);
+/* Examine Upcalls */
+regs.r[0]=0x0000001D;
+regs.r[1]=(int) upcall_handler_entry;
+regs.r[2]=(int) common.ws;
+if ((error_os=_kernel_swi(OS_Claim, &regs, &regs)) != NULL) {
+#ifdef DEBUG
+  debug_finalize();
+#endif
+  return error_os;
+  }
+return NULL;
+}
+
+_kernel_oserror *module_final(int fatal,
+                              int podule,
+                              void *pw)
+{
+struct ftdi_device_structure *ftdi_device;
+_kernel_swi_regs regs;
+_kernel_oserror *error_os;
+
+#ifdef DEBUG
+debug_writef(DEBUG_LEVEL_INITIALIZATION,
+             "Module final. PW %x\n",
+             pw);
+#endif
+/* No longer examine Upcalls */
+regs.r[0]=0x0000001D;
+regs.r[1]=(int) upcall_handler_entry;
+regs.r[2]=(int) common.ws;
+/* Don't worry about errors */
+_kernel_swi(OS_Release, &regs, &regs);
+/* Remove all devices. */
+ftdi_device=common.first_device;
+while(ftdi_device) {
+  if ((error_os=deregister_device(ftdi_device)) != NULL) {
+    return error_os;
+    }
+  /* Restart from beginning until all devices removed. */
+  ftdi_device=common.first_device;
+  }
+upcall_translation_release(&common.upcall_translation);
+close_error();
+#ifdef DEBUG
+debug_finalize();
+#endif
+return NULL;
+}
+
+void module_services(int service_number,
+                     _kernel_swi_regs *regs,
+                     void *pw)
+{
+
+#ifdef DEBUG
+debug_writef(DEBUG_LEVEL_TRANSMISSION,
+             "Service %x PW %x\n",
+             service_number,
+             pw);
+#endif
+switch(service_number) {
+  /* DeviceFS side */
+  case Service_DeviceFSStarting: {
+    /* Ignore. USB must inform us after its up again, without it we can't do anything. */
+    }
+  break;
+  case Service_DeviceFSDying: {
+    struct ftdi_device_structure *ftdi_device;
+
+    /* Remove of DevicesFS includes removal of all FTDI devices. */
+    ftdi_device=common.first_device;
+    while(ftdi_device) {
+      deregister_device(ftdi_device);
+      /* Restart from beginning until all devices removed. */
+      ftdi_device=common.first_device;
+      }
+    }
+  break;
+  case Service_DeviceDead: {
+    struct ftdi_device_structure *ftdi_device;
+
+    /* Parse all devices whether they are affected.
+       A bit inefficient because always starting from
+       beginning in case that a device is found but number
+       of devices is small and the event will occur
+       really seldom. */
+    ftdi_device=common.first_device;
+    while(ftdi_device) {
+      if (/* Own driver */
+          (regs->r[2] == ftdi_device->device_driver_handle) ||
+          /* Remove of USB driver includes removal of all FTDI devices. */
+          (regs->r[2] == ftdi_device->risc_os_ftdi->input.devdriver_handle)) {
+        deregister_device(ftdi_device);
+        /* Restart from beginning. */
+        ftdi_device=common.first_device;
+        }
+      else {
+        ftdi_device=ftdi_device->next_device;
+        }
+      }
+    break;
+    }
+  case Service_USB: {
+    /* USB side */
+#ifdef DEBUG
+    debug_writef(DEBUG_LEVEL_REGISTRATION,
+                 "Service USB %x\n",
+                 regs->r[0]);
+#endif
+    switch(regs->r[0]) {
+      case Service_USB_Attach: {
+        /* USB device attached */
+        char name[100];
+        char alias[50];
+        char alias_value[200];
+        FILE *file;
+        _kernel_swi_regs local_regs;
+        _kernel_oserror *error_os;
+        USBServiceCall *usb_service_info;
+
+        /* If looking into the USB driver source it seems that Alias checking is done
+           but not performed however. */
+        usb_service_info=(USBServiceCall *) regs->r[2];
+        /* No or uncertain descriptors, so it is nothing to handle at here.
+           May be USB-Alias copes better with it. */
+        if (!usb_service_info) return;
+#ifdef DEBUG
+        debug_write(DEBUG_LEVEL_REGISTRATION,
+                    "Attach device.\n");
+#endif
+        sprintf(alias,
+                "Alias$@USBDevice____%04x_%04x____",
+                usb_service_info->ddesc.idVendor,
+                usb_service_info->ddesc.idProduct);
+#ifdef DEBUG
+        debug_writef(DEBUG_LEVEL_REGISTRATION,
+                     "Checking for Alias %s\n",
+                     alias);
+#endif
+        /* Check for alias */
+        local_regs.r[0]=(int) alias;
+        local_regs.r[1]=NULL;
+        local_regs.r[2]=0x80000000;
+        local_regs.r[3]=0;
+        local_regs.r[4]=0;
+        _kernel_swi(XOS_ReadVarVal, &local_regs, &local_regs);
+        if (local_regs.r[2] != 0) {
+#ifdef DEBUG
+          debug_writef(DEBUG_LEVEL_REGISTRATION,
+                      "Alias %s exists. Not necassary an FTDI device.\n",
+                      alias);
+#endif
+          /* Nothing to do here. According things will be done by other parts. */
+          }
+        else {
+          /* Check whether it is an FTDI device which could be handled by this driver.
+             This is the case if an according config file exists. */
+          sprintf(name,
+                  "<FTDI$Dir>.Devices.%04x_%04x",
+                  usb_service_info->ddesc.idVendor,
+                  usb_service_info->ddesc.idProduct);
+#ifdef DEBUG
+          debug_writef(DEBUG_LEVEL_REGISTRATION,
+                       "Check for configuration file %s\n",
+                       name);
+#endif
+          local_regs.r[0]=17;
+          local_regs.r[1]=(int) name;
+          if ((error_os=_kernel_swi(OS_File, &local_regs, &local_regs)) != NULL) return;
+          if (local_regs.r[0] != 1) {
+            /* No device that the driver can handle. */
+            return;
+            }
+#ifdef DEBUG
+          debug_write(DEBUG_LEVEL_REGISTRATION,
+                      "FTDI device configuration available\n");
+#endif
+          /* Create Alias. */
+          sprintf(alias,
+                  "@USBDevice____%04x_%04x____",
+                  usb_service_info->ddesc.idVendor,
+                  usb_service_info->ddesc.idProduct);
+          sprintf(name,
+                  "Alias$%s",
+                  alias);
+          sprintf(alias_value,
+                  "FTDIDriver_DeviceAlias %%0 \"Do FTDIDriver_Claim\"");
+          /* Set alias */
+          local_regs.r[0]=(int) name;
+          local_regs.r[1]=(int) alias_value;
+          local_regs.r[2]=strlen(alias_value);
+          local_regs.r[3]=0;
+          local_regs.r[4]=0;
+          if ((error_os=_kernel_swi(OS_SetVarVal, &local_regs, &local_regs)) != NULL) return;
+          /* Note alias */
+          if ((file=fopen("<Choices$Write>.FTDI.SetAlias", "a")) != NULL) {
+            sprintf(alias_value,
+                    "FTDIDriver_DeviceAlias %%%%0 \"Do FTDIDriver_Claim\"");
+            fprintf(file,
+                    "Alias %s %s\n",
+                    alias,
+                    alias_value);
+            fprintf(file,
+                    "|No need to modify the following line (used at driver start only)\n");
+            fprintf(file,
+                    "If <USB$Device_00_00_00_%04x_%04x_-1_-1_*><>0 Then <FTDI$Dir>.StrtSmDevs %04x %04x %s\n",
+                    usb_service_info->ddesc.idVendor,
+                    usb_service_info->ddesc.idProduct,
+                    usb_service_info->ddesc.idVendor,
+                    usb_service_info->ddesc.idProduct,
+                    alias);
+            fclose(file);
+            }
+#ifdef DEBUG
+          debug_writef(DEBUG_LEVEL_REGISTRATION,
+                       "USB Alias for device %s created.\n",
+                       usb_service_info->devname);
+#endif
+          /* Seems that we must register the device ourself because Alias is checked
+             before this service is called. Use direct call. */
+          register_usb_device(atoi(usb_service_info->devname + strlen("USB")),
+                              usb_service_info->ddesc.idVendor,
+                              usb_service_info->ddesc.idProduct,
+                              NULL,
+                              NULL);
+          }
+        }
+      break;
+      case Service_USB_Connected: {
+        /* Ignore. USB driver will do the task */
+        }
+      break;
+      case Service_USB_USBDriverDying: {
+        struct ftdi_device_structure *ftdi_device;
+
+        /* Remove of USB driver includes removal of all FTDI devices. */
+        ftdi_device=common.first_device;
+        while(ftdi_device) {
+          deregister_device(ftdi_device);
+          /* Restart from beginning until all devices removed. */
+          ftdi_device=common.first_device;
+          }
+        }
+      break;
+      }
+    }
+  break;
+  }
+}

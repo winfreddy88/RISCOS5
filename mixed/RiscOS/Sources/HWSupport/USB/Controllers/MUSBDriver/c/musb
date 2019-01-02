@@ -1,0 +1,1159 @@
+/*
+ * Copyright (c) 2004, 2009 The NetBSD Foundation, Inc.
+ * All rights reserved.
+ *
+ * This code is derived from software contributed to The NetBSD Foundation
+ * by Lennart Augustsson (lennart@augustsson.net), Charles M. Hannum, and
+ * Jeffrey Lee (me@phlamethrower.co.uk)
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. All advertising materials mentioning features or use of this software
+ *    must display the following acknowledgement:
+ *        This product includes software developed by the NetBSD
+ *        Foundation, Inc. and its contributors.
+ * 4. Neither the name of The NetBSD Foundation nor the names of its
+ *    contributors may be used to endorse or promote products derived
+ *    from this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE NETBSD FOUNDATION, INC. AND CONTRIBUTORS
+ * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE FOUNDATION OR CONTRIBUTORS
+ * BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
+#include "modhead.h"
+#include "swis.h"
+#include "callx/callx.h"
+#include <limits.h>
+#include <machine/bus.h>
+
+#include <sys/malloc.h>
+#include <sys/queue.h>
+#include <sys/types.h>
+#include <sys/systm.h>
+
+#include <dev/usb/usb.h>
+#include <dev/usb/usbdi.h>
+#include <dev/usb/usbdivar.h>
+
+#include "Global/RISCOS.h"
+#include "Global/HALEntries.h"
+#include "cmodule.h"
+
+/* Have to avoid including stdio as there's a clash with the BSD stuff */
+#define __stdio_h
+
+#include "musb.h"
+#include "musb_util.h"
+#include "musb_usb.h"
+
+extern void musb_ep0_peri(musb_softc_t *sc);
+static void musb_mp_schedule(struct musb_pipe *epipe);
+static void musb_mp_stop(struct musb_pipe *epipe);
+static void musb_pipe_run(struct musb_pipe *epipe,int ep);
+static void musb_mp_completed(musb_softc_t *sc,struct musb_xfer *ex,int ep);
+
+/*
+
+			MISC FUNCTIONS
+
+*/
+
+static void musb_timeout(void *addr)
+{
+	DPRINTFN(10,("musb_timeout: %p\n",addr));
+	DASSERT(_kernel_irqs_disabled());
+	riscos_abort_pipe(addr);
+}
+
+static void musb_pcd(usbd_xfer_handle xfer)
+{
+	usbd_pipe_handle pipe;
+	u_char *p;
+	if(xfer == NULL)
+		return;
+	pipe = xfer->pipe;
+	p = KERNADDR(&xfer->dmabuf,0);
+	memset(p,0,xfer->length);
+	*p = 2; /* we only have one port */
+	DPRINTF(("musb_pcd: Notfifying USB driver of port change\n"));
+	xfer->actlen = xfer->length;
+	xfer->status = USBD_NORMAL_COMPLETION;
+	usb_transfer_complete(xfer);
+}
+
+void musb_abort_xfer(usbd_xfer_handle xfer,usbd_status status)
+{
+	/* Interrupts should already be disabled, otherwise it's unpredictable whether this function will work or not */
+	DASSERT(_kernel_irqs_disabled());
+	struct musb_pipe *epipe = (struct musb_pipe *) xfer->pipe;
+	DPRINTFN(10,("musb_abort_xfer: xfer %p status %d\n",xfer,status));
+	DASSERT(xfer);
+
+	if(xfer == SIMPLEQ_FIRST(&xfer->pipe->queue))
+	{
+		/* Stop the pipe */
+		musb_mp_stop(epipe);
+	}
+	else
+	{
+		/* Does this xfer actually exist? */
+#ifdef MUSB_DEBUG
+		DASSERT(SIMPLEQ_FIRST(&xfer->pipe->queue));
+		bool in = false;
+		usbd_xfer_handle xfer2;
+		SIMPLEQ_FOREACH(xfer2,&epipe->pipe.queue,next)
+		{
+			if(xfer2 == xfer)
+			{
+				in = true;
+				break;
+			}
+		}
+		DASSERT(in);
+#endif
+	}
+
+	/* Set status */
+	xfer->status = status;
+
+	/* Cancel any timeout */
+	callout_stop(&(xfer->timeout_handle));
+	/* And cancel the associated callback */
+	riscos_cancel_abort_pipe(xfer);
+
+	/* Tell USBDriver */
+	usb_transfer_complete(xfer);
+}
+
+/*
+
+			USBDRIVER INTERFACE
+
+*/
+
+usbd_status musb_device_transfer(usbd_xfer_handle xfer)
+{
+	usbd_status err;
+
+	DPRINTFN(10,("musb_device_transfer: xfer=%p pipe=%p\n",xfer,xfer->pipe));
+
+	/* Insert last in queue. */
+	err = usb_insert_transfer(xfer);
+	if (err)
+		return (err);
+
+	/* If we're still here, the pipe shouldn't be running */
+	/* TODO - drop musb_pipe.running and just use usbd_pipe.running? */
+	DASSERT(!((struct musb_pipe *)xfer->pipe)->running);
+
+	/* Pipe isn't running, start first xfer */
+	return (musb_device_start(SIMPLEQ_FIRST(&xfer->pipe->queue)));
+}
+
+
+usbd_status musb_device_start(usbd_xfer_handle xfer)
+{
+	struct musb_xfer *ex = (struct musb_xfer *) xfer;
+	struct musb_pipe *epipe = (struct musb_pipe *)xfer->pipe;
+	usb_endpoint_descriptor_t *ed = epipe->pipe.endpoint->edesc;
+
+	DPRINTFN(10,("musb_device_start: xfer=%p pipe=%p\n",xfer,xfer->pipe));
+
+	/* Pipe shouldn't be running */
+	DASSERT(!epipe->running);
+	DASSERT(xfer == SIMPLEQ_FIRST(&xfer->pipe->queue));
+
+	/* Prepare this pipe for the new xfer */
+	if((ed->bmAttributes & UE_XFERTYPE) == UE_CONTROL)
+	{
+		epipe->remain = UGETW(ex->xfer.request.wLength);
+	}
+	else
+	{
+		epipe->null_packet = (ex->xfer.flags & USBD_FORCE_SHORT_XFER) && !(ex->xfer.length % UGETW(ed->wMaxPacketSize));
+		epipe->remain = ex->xfer.length;
+	}
+	epipe->buf = KERNADDR(&ex->xfer.dmabuf,0);
+
+	/* Schedule the pipe with the multiplexer */
+	musb_mp_schedule(epipe);
+
+	return USBD_IN_PROGRESS;
+}
+
+
+void musb_device_abort(usbd_xfer_handle xfer)
+{
+	DPRINTF(("musb_device_abort: xfer=%p\n",xfer));
+	musb_abort_xfer(xfer,USBD_CANCELLED);
+}
+
+
+void musb_device_close(usbd_pipe_handle pipe)
+{
+	DPRINTF(("musb_device_close: pipe=%p\n",pipe));
+
+	/* Pipe shouldn't be running */
+	DASSERT(!((struct musb_pipe *)pipe)->running);
+	NOTUSED(pipe);
+}
+
+
+void musb_device_clear_toggle(usbd_pipe_handle pipe)
+{
+	struct musb_pipe *epipe = (struct musb_pipe *)pipe;
+
+	DPRINTF(("musb_device_clear_toggle: epipe=%p\n",
+		 epipe));
+
+	epipe->toggle = false;
+}
+
+
+void musb_device_done(usbd_xfer_handle xfer)
+{
+	DPRINTFN(10,("musb_device_done: xfer=%p, length=%d\n", xfer,xfer->actlen));
+	/* This pipe is no longer running */
+	musb_mp_stop((struct musb_pipe *) xfer->pipe);
+	/* If it's a repeating one, we put it back on the list */
+	if(xfer->pipe->repeat)
+		musb_device_start(xfer);
+}
+
+/*
+
+			MULTIPLEXER CODE
+
+*/
+
+void musb_mp_schedule(struct musb_pipe *epipe)
+{
+	struct musb_multiplexer *mp = epipe->multiplexer;
+	DPRINTFN(10,("musb_mp_schedule: mp=%p pipe=%p\n",mp,epipe));
+	DASSERT(mp);
+	DASSERT(!epipe->running);
+	/* IRQs off for atomic mp update */
+	int s = splusb();
+	DASSERT(!SIMPLEQ_FIRST(&mp->waitq) || !mp->idle_mask); /* If idle mask is nonzero, wait queue must be empty */
+	epipe->running = true;
+	if(!mp->idle_mask)
+	{
+		/* Queue it */
+		SIMPLEQ_INSERT_TAIL(&mp->waitq,epipe,multiq);
+		splx(s);
+		DPRINTFN(10,("-> queued\n"));
+	}
+	else
+	{
+		/* Run it */
+		int ep;
+		u32 mask = mp->idle_mask;
+		__asm
+		{
+		CLZ	ep,mask;
+		}
+		ep = 31-ep;
+		mp->idle_mask = mask-(1<<ep);
+		splx(s);
+		musb_softc_t *sc = (musb_softc_t *)epipe->pipe.device->bus;
+		DASSERT(!(mp->tx?sc->host_tx[ep]:sc->host_rx[ep]));
+		NOTUSED(sc);
+		DPRINTFN(10,("-> assigned ep %d\n",ep));
+		musb_pipe_run(epipe,ep);
+	}
+}
+
+void musb_mp_stop(struct musb_pipe *epipe)
+{
+	struct musb_multiplexer *mp = epipe->multiplexer;
+	musb_softc_t *sc = (musb_softc_t *)epipe->pipe.device->bus;
+	volatile musb_regs *musb_base = sc->musb_base;
+	DPRINTFN(10,("musb_mp_stop: mp=%p pipe=%p\n",mp,epipe));
+	DASSERT(mp);
+	/* Make sure this pipe isn't running */
+	if(!epipe->running)
+		return;
+	int s = splusb();
+	epipe->running = false;
+	int ep = epipe->ep;
+	if(ep == -1)
+	{
+		/* Not active; just unqueue it */
+		DASSERT(SIMPLEQ_FIRST(&mp->waitq));
+		SIMPLEQ_REMOVE(&mp->waitq,epipe,musb_pipe,multiq);
+		splx(s);
+		DPRINTFN(10,("-> unqeued\n"));
+	}
+	else
+	{
+		/* Active; teardown the endpoint */
+		DASSERT((mp->tx?sc->host_tx[ep]:sc->host_rx[ep]) == epipe);
+		if(!ep)
+		{
+			DPRINTFN(10,("-> teardown ep0 state %d\n",sc->host_ep0_state));
+			/* Mark ep0 state machine as idle */
+			sc->host_ep0_state = HOST_EP0_STATE_IDLE;
+			/* Also try a teardown procedure */
+			musb_base->csr.host_ep0.host_csr0 = (musb_base->csr.host_ep0.host_csr0 | HOST_CSR0_FLUSHFIFO) & ~HOST_CSR0_REQPKT;
+			WAITON(musb_base->csr.host_ep0.host_csr0 & (HOST_CSR0_RXPKTRDY | HOST_CSR0_TXPKTRDY));
+			musb_base->csr.host_ep0.host_csr0 &= ~(HOST_CSR0_FLUSHFIFO | HOST_CSR0_SETUPPKT);
+			sc->host_tx[0] = NULL;
+		}
+		else if(mp->tx)
+		{
+			DPRINTFN(10,("-> teardown tx ep%d\n",ep));
+			musb_base->csr.host_ep[ep].host_txcsr = (musb_base->csr.host_ep[ep].host_txcsr | HOST_TXCSR_FLUSHFIFO) & ~HOST_TXCSR_TXPKTRDY;
+			WAITON(musb_base->csr.host_ep[ep].host_txcsr & HOST_TXCSR_FIFONOTEMPTY);
+			musb_base->csr.host_ep[ep].host_txcsr &= ~HOST_TXCSR_FLUSHFIFO;
+			sc->host_tx[ep] = NULL;
+		}
+		else
+		{
+			DPRINTFN(10,("-> teardown rx ep%d\n",ep));
+			musb_base->csr.host_ep[ep].host_rxcsr = (musb_base->csr.host_ep[ep].host_rxcsr | HOST_RXCSR_FLUSHFIFO) & ~HOST_RXCSR_REQPKT;
+			WAITON(musb_base->csr.host_ep[ep].host_rxcsr & HOST_RXCSR_RXPKTRDY);
+			musb_base->csr.host_ep[ep].host_rxcsr &= ~HOST_RXCSR_FLUSHFIFO;
+			sc->host_rx[ep] = NULL;
+		}
+		
+		epipe->ep = -1;
+		/* Run next pipe if necessary */
+		struct musb_pipe *next = SIMPLEQ_FIRST(&mp->waitq);
+		if(next)
+		{
+			SIMPLEQ_REMOVE_HEAD(&mp->waitq,multiq);
+			splx(s);
+			DPRINTFN(10,("-> start next pipe %p\n",next));
+			musb_pipe_run(next,ep);
+		}
+		else
+		{
+			mp->idle_mask |= 1<<ep;
+			splx(s);
+		}
+	}
+}
+
+void musb_pipe_run(struct musb_pipe *epipe,int ep)
+{
+	struct musb_multiplexer *mp = epipe->multiplexer;
+	struct usbd_device *dev = epipe->pipe.device;
+	musb_softc_t *sc = (musb_softc_t *)dev->bus;
+	volatile musb_regs *musb_base = sc->musb_base;
+	struct musb_xfer *ex = (struct musb_xfer *) SIMPLEQ_FIRST(&epipe->pipe.queue);
+	usb_endpoint_descriptor_t *ed = epipe->pipe.endpoint->edesc;
+	DPRINTFN(10,("musb_pipe_run: mp=%p pipe=%p xfer=%p ep=%d tx=%d\n",mp,epipe,ex,ep,mp->tx));
+	/* Should be running */
+	DASSERT(epipe->running);
+	DASSERT(ex);
+	epipe->ep = ep;
+	SIMPLEQ_NEXT(epipe,multiq) = NULL;
+	/* Program the address registers */
+	int addr = dev->address & TXFUNCADDR_FUNCADDR;
+	int hubaddr = 0;
+	int hubport = 0;
+	struct usbd_port *hsport = dev->myhsport;
+	if(hsport && (dev->speed != USB_SPEED_HIGH))
+	{
+		hubaddr = hsport->parent->address & TXHUBADDR_HUBADDR;
+		hubport = hsport->portno & TXHUBPORT_HUBPORT;
+		if(hsport->tt && hsport->parent->ddesc.bDeviceProtocol == UDPROTO_HSHUBMTT)
+			hubaddr |= TXHUBADDR_MULT_TRANS;
+	}
+	if(mp->tx)
+	{
+		musb_base->ep_host[ep].txfuncaddr = addr;
+		musb_base->ep_host[ep].txhubaddr = hubaddr;
+		musb_base->ep_host[ep].txhubport = hubport;
+	}
+	else
+	{
+		musb_base->ep_host[ep].rxfuncaddr = addr;
+		musb_base->ep_host[ep].rxhubaddr = hubaddr;
+		musb_base->ep_host[ep].rxhubport = hubport;
+	}
+	/* Other endpoint registers */
+	/* HOST_TYPE0/HOST_TXTYPE/HOST_RXTYPE */
+	int i;
+	i = UE_GET_ADDR(ed->bEndpointAddress) & HOST_TXTYPE_TENDPN;
+	switch(dev->speed)
+	{
+	case USB_SPEED_LOW: i |= HOST_TXTYPE_SPEED_LOW; break;
+	case USB_SPEED_FULL: i |= HOST_TXTYPE_SPEED_FULL; break;
+	case USB_SPEED_HIGH: i |= HOST_TXTYPE_SPEED_HIGH; break;
+	}
+	int s;
+	if(!ep)
+	{
+		sc->host_ep0_state = HOST_EP0_STATE_SETUP;
+		/* HOST_TYPE0 */
+		musb_base->csr.host_ep0.host_type0 = i;
+		/* Flush any stale data */
+		musb_base->csr.host_ep0.host_csr0 |= HOST_CSR0_FLUSHFIFO;
+		WAITON(musb_base->csr.host_ep0.host_csr0 & (HOST_CSR0_RXPKTRDY | HOST_CSR0_TXPKTRDY));
+		musb_base->csr.host_ep0.host_csr0 &= ~HOST_CSR0_FLUSHFIFO;
+		/* Load setup packet */
+		musb_fifowrite(musb_base,0,&ex->xfer.request,8);
+		/* Start endpoint */
+		s = splusb();
+		sc->host_tx[ep] = epipe;
+		musb_base->csr.host_ep0.host_csr0 = HOST_CSR0_SETUPPKT | HOST_CSR0_TXPKTRDY;
+	}
+	else if(mp->tx)
+	{
+		/* HOST_TXTYPE */
+		if((ed->bmAttributes & UE_XFERTYPE) == UE_INTERRUPT)
+			i |= HOST_TXTYPE_PROT_INTERRUPT;
+		else
+			i |= HOST_TXTYPE_PROT_BULK;
+		musb_base->csr.host_ep[ep].host_txtype = i;
+		DPRINTFN(15,("musb_pipe_run: TXTYPE %02x wMaxPacketSize %d interval %d xfer.length %d toggle %d\n",i,UGETW(ed->wMaxPacketSize),ed->bInterval,ex->xfer.length,epipe->toggle));
+		/* TXMAXP */
+		musb_base->csr.host_ep[ep].txmaxp = UGETW(ed->wMaxPacketSize) & TXMAXP_MAXPAYLOAD; /* TODO - M field */
+		/* HOST_TXINTERVAL */
+#ifdef MUSB_USE_NAKTIMEOUT
+		musb_base->csr.host_ep[ep].host_txinterval = ed->bInterval;
+#else
+		musb_base->csr.host_ep[ep].host_txinterval = 0;
+#endif
+		/* Flush FIFO */
+		if(musb_base->csr.host_ep[ep].host_txcsr & HOST_TXCSR_TXPKTRDY)
+		{
+			musb_base->csr.host_ep[ep].host_txcsr |= HOST_TXCSR_FLUSHFIFO;
+			WAITON(musb_base->csr.host_ep[ep].host_txcsr & HOST_TXCSR_TXPKTRDY);
+		}
+		/* HOST_TXCSR */
+		musb_base->csr.host_ep[ep].host_txcsr = (epipe->toggle?HOST_TXCSR_DATATOG:0) | HOST_TXCSR_DATATOGWREN;
+		/* Load first packet */
+		int count = min(epipe->remain,UGETW(ed->wMaxPacketSize));
+		epipe->remain -= count;
+		epipe->buf = musb_fifowrite(musb_base,ep,epipe->buf,count);
+		epipe->last_write = count;
+		epipe->toggle = !epipe->toggle;
+		/* Start endpoint */
+		s = splusb();
+		sc->host_tx[ep] = epipe;
+		musb_base->csr.host_ep[ep].host_txcsr = HOST_TXCSR_TXPKTRDY;
+	}
+	else
+	{
+		/* HOST_RXTYPE */
+		if((ed->bmAttributes & UE_XFERTYPE) == UE_INTERRUPT)
+			i |= HOST_RXTYPE_PROT_INTERRUPT;
+		else
+			i |= HOST_RXTYPE_PROT_BULK;
+		musb_base->csr.host_ep[ep].host_rxtype = i;
+		DPRINTFN(15,("musb_pipe_run: RXTYPE %02x wMaxPacketSize %d interval %d xfer.length %d toggle %d\n",i,UGETW(ed->wMaxPacketSize),ed->bInterval,ex->xfer.length,epipe->toggle));
+		/* RXMAXP */
+		musb_base->csr.host_ep[ep].rxmaxp = UGETW(ed->wMaxPacketSize) & RXMAXP_MAXPAYLOAD; /* TODO - set 'M' according to the bit on page 271 of the USB spec */
+		/* HOST_RXINTERVAL */
+#ifdef MUSB_USE_NAKTIMEOUT
+		musb_base->csr.host_ep[ep].host_rxinterval = ed->bInterval;
+#else
+		musb_base->csr.host_ep[ep].host_rxinterval = 0;
+#endif
+		/* Flush FIFO */
+		if(musb_base->csr.host_ep[ep].host_rxcsr & HOST_RXCSR_RXPKTRDY)
+		{
+			musb_base->csr.host_ep[ep].host_rxcsr |= HOST_RXCSR_FLUSHFIFO;
+			WAITON(musb_base->csr.host_ep[ep].host_rxcsr & HOST_RXCSR_RXPKTRDY);
+		}
+		/* HOST_RXCSR */
+		musb_base->csr.host_ep[ep].host_rxcsr = (epipe->toggle?HOST_RXCSR_DATATOG:0) | HOST_RXCSR_DATATOGWREN; 
+		/* Start endpoint */
+		s = splusb();
+		sc->host_rx[ep] = epipe;
+		musb_base->csr.host_ep[ep].host_rxcsr = HOST_RXCSR_REQPKT;
+	}
+	/* Register timeout */
+	if(ex->xfer.timeout && !sc->sc_bus.use_polling) {
+		DPRINTFN(10,("-> set timeout %d on %x\n",ex->xfer.timeout,ex));
+		callout_reset(&(ex->xfer.timeout_handle), (MS_TO_TICKS(ex->xfer.timeout)), (musb_timeout), (ex));
+	}
+	splx(s);
+}
+
+void musb_mp_completed(musb_softc_t *sc,struct musb_xfer *ex,int ep)
+{
+	int s = splusb();
+	DASSERT(ex);
+	struct musb_pipe *epipe = (struct musb_pipe *) ex->xfer.pipe;
+	DASSERT(epipe && epipe->running);
+	DASSERT(epipe->ep == ep);
+	struct musb_multiplexer *mp = epipe->multiplexer;
+	DPRINTFN(10,("musb_mp_completed: xfer %p is complete on ep %d pipe %p mp %p\n",ex,ep,epipe,mp));
+
+	/* Cancel any timeout */
+	callout_stop(&(ex->xfer.timeout_handle));
+	/* And cancel the associated callback */
+	riscos_cancel_abort_pipe(ex);
+
+	/* Stop pipe */
+	epipe->running = false;
+	epipe->ep = -1;
+	if(mp->tx)
+		sc->host_tx[ep] = NULL;
+	else
+		sc->host_rx[ep] = NULL;
+
+	/* Start next xfer for this multiplexer */
+	struct musb_pipe *next = SIMPLEQ_FIRST(&mp->waitq);
+	if(next)
+	{
+		DPRINTFN(10,("-> start next pipe %p\n",next));
+		DASSERT(!mp->idle_mask);
+		SIMPLEQ_REMOVE_HEAD(&mp->waitq,multiq);
+		splx(s);
+		musb_pipe_run(next,ep);
+	}
+	else
+	{
+		mp->idle_mask |= 1<<ep;
+		splx(s);
+	}
+
+	/* Tell USBDriver */
+	usb_transfer_complete(&ex->xfer);
+}
+
+/*
+
+			HOST INTERRUPT ROUTINES
+
+*/
+
+#define CSR_SET(X) csro = csro | (X)
+#define CSR_CLEAR(X) csro = csro & ~(X)
+
+static void musb_ep0_host(musb_softc_t *sc)
+{
+	/* Process ep0 related interrupt when acting as a host */
+	volatile musb_regs *musb_base = sc->musb_base;
+	int csr = musb_base->csr.host_ep0.host_csr0;
+	int updated=0;
+	int csro=csr;
+	int complete=0;
+	struct musb_pipe *epipe = sc->host_tx[0];
+	struct musb_xfer *ex = (struct musb_xfer *) (epipe?SIMPLEQ_FIRST(&epipe->pipe.queue):0);
+	DPRINTFN(15,("musb_ep0_host: csr %04x count0 %2x state %d pipe %08x\n",csr,musb_base->csr.host_ep0.count0,sc->host_ep0_state,epipe));
+	if(!ex)
+	{
+		DPRINTFN(10,("musb_ep0_host: Panic! interrupt received while no pipe/xfer assigned\n"));
+		switch(sc->host_ep0_state)
+		{
+		case HOST_EP0_STATE_SETUP:
+		case HOST_EP0_STATE_OUT_DATA:
+		case HOST_EP0_STATE_OUT_STATUS:
+			/* Abort by flushing the FIFO */
+			csro = csr | HOST_CSR0_FLUSHFIFO;
+			/* Wait for completion (should complete immediately for IN_DATA, etc.) */
+			musb_base->csr.host_ep0.host_csr0 = csro;
+			WAITON(musb_base->csr.host_ep0.host_csr0 & HOST_CSR0_TXPKTRDY);
+			csro = 0;
+			updated=1;
+			break;
+		default:
+		case HOST_EP0_STATE_IN_DATA:
+		case HOST_EP0_STATE_IN_STATUS:
+			/* Abort by clearing REQPKT (and STATUSPKT for IN_STATUS) */
+			csro = 0;
+			musb_base->csr.host_ep0.host_csr0 = csro;
+			WAITON(musb_base->csr.host_ep0.host_csr0 & (HOST_CSR0_REQPKT | HOST_CSR0_STATUSPKT));
+			updated=1;
+			break;
+		}
+		updated=1;
+		goto end;
+	}
+	/* NAK_TIMEOUT just needs us to clear the bit and try again. We could use this for yielding to other transfers, but FIFO flushing seems to be broken? */
+	if(csr & HOST_CSR0_NAK_TIMEOUT)
+	{
+		csro &= ~HOST_CSR0_NAK_TIMEOUT;
+		updated = 1;
+		goto end;
+	}
+	/* RXSTALL and ERROR are terminal error conditons that are handled the same for each host_ep[0].state */
+	if(csr & (HOST_CSR0_RXSTALL | HOST_CSR0_ERROR))
+	{
+		if(csr & HOST_CSR0_RXSTALL)
+			ex->xfer.status = USBD_STALLED;
+		else /* HOST_CSR0_ERROR */
+			ex->xfer.status = USBD_IOERROR;
+
+		/* Ensure we correctly report any partial transfer */
+		ex->xfer.actlen = ex->xfer.length-epipe->remain;
+
+		complete=1;
+		csro = 0;
+		updated=1;
+		goto end;
+	}
+	/* Else whatever we did completed successfully
+	   So work out what to do next */
+	switch(sc->host_ep0_state)
+	{
+	case HOST_EP0_STATE_SETUP:
+	{
+		/* Setup phase completed; move to next */
+		if(UGETW(ex->xfer.request.wLength))
+		{
+			if(ex->xfer.request.bmRequestType & UT_READ)
+			{
+				/* Transition to IN_DATA */
+				sc->host_ep0_state = HOST_EP0_STATE_IN_DATA;
+				/* Fall through... */
+				goto state_in_data;
+			}
+			else
+			{
+				/* Transition to OUT_DATA */
+				sc->host_ep0_state = HOST_EP0_STATE_OUT_DATA;
+				/* Fall through... */
+				goto state_out_data;
+			}
+		}
+		else
+		{
+			/* Transition to IN_STATUS */
+			sc->host_ep0_state = HOST_EP0_STATE_IN_STATUS;
+			CSR_SET(HOST_CSR0_STATUSPKT | HOST_CSR0_REQPKT);
+			updated=1;
+			goto end;
+		}
+	}
+	case HOST_EP0_STATE_IN_DATA: state_in_data:
+	{
+		/* If RXPKTRDY is set, we have a packet to read */
+		if(csr & HOST_CSR0_RXPKTRDY)
+		{
+			int count = musb_base->csr.host_ep0.count0 & COUNT0_EP0RXCOUNT;
+			if(count > epipe->remain)
+			{
+				DPRINTFN(10,("musb_ep0_host: Panic! Device sent too much data\n"));
+				ex->xfer.status = USBD_IOERROR;
+				/* Flush FIFO */
+				musb_base->csr.host_ep0.host_csr0 = csro | HOST_CSR0_FLUSHFIFO;
+				WAITON(musb_base->csr.host_ep0.host_csr0 & HOST_CSR0_RXPKTRDY);
+				csro = musb_base->csr.host_ep0.host_csr0;
+				updated=0;
+				complete=1;
+				goto end;
+			}
+			else
+			{
+				/* Grab the data */
+				epipe->remain -= count;
+				epipe->buf = musb_fiforead(musb_base,0,epipe->buf,count);
+				CSR_CLEAR(HOST_CSR0_RXPKTRDY);
+				updated=1;
+
+				/* If it was a short packet (not max packet size) then we're done. */
+				usb_endpoint_descriptor_t *ed = epipe->pipe.endpoint->edesc;
+				if(count != UGETW(ed->wMaxPacketSize))
+				{
+					/* Transition to OUT_STATUS */
+					sc->host_ep0_state = HOST_EP0_STATE_OUT_STATUS;
+					CSR_SET(HOST_CSR0_STATUSPKT | HOST_CSR0_TXPKTRDY);
+					updated=1;
+					goto end;
+				}
+			}
+		}
+		/* Do we need more data? */
+		if(epipe->remain)
+		{
+			CSR_SET(HOST_CSR0_REQPKT);
+			updated=1;
+			goto end;
+		}
+		else
+		{
+			/* Transition to OUT_STATUS */
+			sc->host_ep0_state = HOST_EP0_STATE_OUT_STATUS;
+			CSR_SET(HOST_CSR0_STATUSPKT | HOST_CSR0_TXPKTRDY);
+			updated=1;
+			goto end;
+		}
+	}
+	case HOST_EP0_STATE_OUT_DATA: state_out_data:
+	{
+		/* No error flags were set, so we should send data */
+		if(epipe->remain)
+		{
+			int count = min(epipe->remain,HOST_EP0_MAXP);
+			epipe->remain -= count;
+			epipe->buf = musb_fifowrite(musb_base,0,epipe->buf,count);
+			epipe->last_write = count;
+			CSR_SET(HOST_CSR0_TXPKTRDY);
+			updated=1;
+			goto end;
+		}
+		else
+		{
+			/* Transition to IN_STATUS */
+			sc->host_ep0_state = HOST_EP0_STATE_IN_STATUS;
+			CSR_SET(HOST_CSR0_STATUSPKT | HOST_CSR0_REQPKT);
+			updated=1;
+			goto end;
+		}
+	}
+	case HOST_EP0_STATE_IN_STATUS:
+	{
+		/* If RXPKTRDY set, clear it
+		   And irregardless of RXPKTRDY, if we've reached this point the transfer was successful? */
+		if(csr & HOST_CSR0_RXPKTRDY)
+		{
+			CSR_CLEAR(HOST_CSR0_RXPKTRDY);
+			updated=1;
+		}
+		/* Also clear STATUSPKT so we don't request another? */
+		if(updated && (csro & HOST_CSR0_STATUSPKT))
+			CSR_CLEAR(HOST_CSR0_STATUSPKT);
+		/* Fall through... */
+	}
+	case HOST_EP0_STATE_OUT_STATUS:
+	{
+		/* We're good! */
+		ex->xfer.status = USBD_NORMAL_COMPLETION;
+		ex->xfer.actlen = ex->xfer.length-epipe->remain;
+		complete=1;
+		goto end;
+	}
+	default:
+	case HOST_EP0_STATE_IDLE:
+	{
+		DPRINTFN(10,("musb_ep0_host: Panic! interrupt received while in state %d\n",sc->host_ep0_state));
+		/* Attempt to flush FIFO */
+		csro = csr | HOST_CSR0_FLUSHFIFO;
+		musb_base->csr.host_ep0.host_csr0 = csro;
+		WAITON(musb_base->csr.host_ep0.host_csr0 & HOST_CSR0_TXPKTRDY);
+		csro = 0;
+		updated=1;
+		sc->host_ep0_state = HOST_EP0_STATE_IDLE;
+		goto end;
+	}
+	}
+end:
+	DPRINTFN(15,("musb_ep0_host: new csr %04x(%d) new state %d\n",csro,updated,(complete?HOST_EP0_STATE_IDLE:sc->host_ep0_state)));
+	if(updated)
+		musb_base->csr.host_ep0.host_csr0 = csro;
+	if(complete)
+	{
+		sc->host_ep0_state = HOST_EP0_STATE_IDLE;
+		musb_mp_completed(sc,ex,0);
+	}
+}
+
+static void musb_receive_host(musb_softc_t *sc,int ep)
+{
+	/* Process endpoint receive interrupt when acting as a host */
+	volatile musb_regs *musb_base = sc->musb_base;
+	int csr = musb_base->csr.host_ep[ep].host_rxcsr;
+	int updated=0;
+	int csro=csr;
+	int complete=0;
+	struct musb_pipe *epipe = sc->host_rx[ep];
+	struct musb_xfer *ex = (struct musb_xfer *) (epipe?SIMPLEQ_FIRST(&epipe->pipe.queue):0);
+	DPRINTFN(15,("musb_receive_host: ep %d csr %04x rxcount %2x pipe %08x\n",ep,csr,musb_base->csr.host_ep[ep].rxcount,epipe));
+	/* Pretty much the same error handling as for control transfers... */
+	if(!ex)
+	{
+		DPRINTFN(10,("musb_receive_host: Panic! interrupt received while no pipe/xfer assigned\n"));
+		CSR_CLEAR(csr);
+		updated=1;
+		goto end;
+	}
+	/* RXSTALL and ERROR are terminal error conditons */
+	if(csr & (HOST_RXCSR_RXSTALL | HOST_RXCSR_ERROR))
+	{
+		if(csr & HOST_RXCSR_RXSTALL)
+			ex->xfer.status = USBD_STALLED;
+		else /* HOST_RXCSR_ERROR */
+			ex->xfer.status = USBD_IOERROR;
+
+		/* Ensure we correctly report any partial transfer */
+		ex->xfer.actlen = ex->xfer.length-epipe->remain;
+
+		complete=1;
+		csro = 0; /* Clear all of RXCSR so any offending flags (e.g. REQPKT) don't cause another error when the transfer fails for the second time */
+		updated=1;
+		goto end;
+	}
+	/* Else we should have some data to read */
+	if(csr & HOST_RXCSR_RXPKTRDY)
+	{
+		epipe->toggle = !epipe->toggle;
+		int count = musb_base->csr.host_ep[ep].rxcount & RXCOUNT_EPRXCOUNT;
+		if(count > epipe->remain)
+		{
+			DPRINTFN(10,("musb_receive_host: Panic! Device sent too much data\n"));
+			ex->xfer.status = USBD_IOERROR;
+			/* Flush FIFO */
+			musb_base->csr.host_ep[ep].host_rxcsr = csro | HOST_RXCSR_FLUSHFIFO;
+			WAITON(musb_base->csr.host_ep[ep].host_rxcsr & HOST_RXCSR_RXPKTRDY);
+			csro = musb_base->csr.host_ep[ep].host_rxcsr;
+			updated=0;
+			complete=1;
+			goto end;
+		}
+		else
+		{
+			/* Grab the data */
+			epipe->remain -= count;
+			epipe->buf = musb_fiforead(musb_base,ep,epipe->buf,count);
+			CSR_CLEAR(HOST_RXCSR_RXPKTRDY);
+			updated=1;
+			/* If it was a short packet (not max packet size) then we're done. Else we assume that more data is coming (unless we've received all we're interested in, which we check for below) */
+			usb_endpoint_descriptor_t *ed = epipe->pipe.endpoint->edesc;
+			if(count != UGETW(ed->wMaxPacketSize))
+			{
+				ex->xfer.status = USBD_NORMAL_COMPLETION;
+				ex->xfer.actlen = ex->xfer.length-epipe->remain;
+				complete=1;
+				goto end;
+			}
+			/* Fall through... */
+		}
+	}
+	else
+	{
+#ifdef MUSB_USE_NAKTIMEOUT
+		/* Receive NAK timeouts seem to be more broken than host timeouts. The only time the bit will clear is by (a) clearing the RXPKTRDY bit (or emptying the fifo?) after data has been received, or (b) flushing the FIFO (after data has been received)
+		   So for now, treat NAKTIMEOUT as the lowest priority (instead of the highest priority, like the manual suggests it should be?)
+		   This will allow us to deal with the initial timeout (by clearing RXINTERVAL and allowing the controller to resume), making the next interrupt we receive a regular one (even though the DATAERR_NAKTIMEOUT bit will still be set) */
+		if(csr & HOST_RXCSR_DATAERR_NAKTIMEOUT)
+		{
+#if 1
+			csro &= ~HOST_RXCSR_DATAERR_NAKTIMEOUT;
+			updated = 1;
+			musb_base->csr.host_ep[ep].host_rxinterval = 0;
+			goto end;
+#else
+			DPRINTFN(10,("*** timeout for ep %d @ %08x (%08x) ***\n",ep,&musb_base->csr.host_ep[ep].host_rxcsr,((int)&musb_base->csr.host_ep[ep].host_rxcsr)-(int)musb_base));
+			musb_base->common.intrrxe &= ~(1<<ep);
+			*((char *)-1) = 0;
+#endif
+		}
+		else
+#endif
+		{
+			DPRINTFN(10,("musb_receive_host: Interrupt with no cause?\n"));
+		}
+	}
+	/* Do we need more data? */
+	if(epipe->remain)
+	{
+		CSR_SET(HOST_RXCSR_REQPKT);
+		updated=1;
+		goto end;
+	}
+	else
+	{
+		/* We're done! */
+		ex->xfer.status = USBD_NORMAL_COMPLETION;
+		ex->xfer.actlen = ex->xfer.length;
+		complete=1;
+		goto end;
+	}
+end:
+	DPRINTFN(15,("musb_receive_host: new csr %04x(%d) complete %d\n",csro,updated,complete));
+	if(updated)
+		musb_base->csr.host_ep[ep].host_rxcsr = csro;
+	if(complete)
+		musb_mp_completed(sc,ex,ep);
+}
+
+static void musb_transmit_host(musb_softc_t *sc,int ep)
+{
+	/* Process endpoint transmit interrupt when acting as a host */
+	volatile musb_regs *musb_base = sc->musb_base;
+	int csr = musb_base->csr.host_ep[ep].host_txcsr;
+	int updated=0;
+	int csro=csr;
+	int complete=0;
+	struct musb_pipe *epipe = sc->host_tx[ep];
+	struct musb_xfer *ex = (struct musb_xfer *) (epipe?SIMPLEQ_FIRST(&epipe->pipe.queue):0);
+	DPRINTFN(15,("musb_transmit_host: ep %d csr %04x pipe %08x\n",ep,csr,epipe));
+	/* Pretty much the same error handling as for control transfers... */
+	if(!ex)
+	{
+		DPRINTFN(10,("musb_transmit_host: Panic! interrupt received while no pipe/xfer assigned\n"));
+		/* Abort by flushing the FIFO */
+		csro = csr | HOST_TXCSR_FLUSHFIFO;
+		musb_base->csr.host_ep[ep].host_txcsr = csro;
+		WAITON(musb_base->csr.host_ep[ep].host_txcsr & HOST_TXCSR_TXPKTRDY);
+		csro = 0;
+		updated=1;
+		goto end;
+	}
+#ifdef MUSB_USE_NAKTIMEOUT
+	/* NAK_TIMEOUT handling seems to be a bit broken compared to what the manual (and what the Linux sources!) say.
+	   It looks like the only way to clear the condition is to set the txinterval register to 0, which will then cause the controller to immediately start retrying the transfer. However we don't really want this, because we want to set the timeout value back to its original value before the transfer starts up again.
+	   Also, we want to use nak timeouts as a method of yielding to other transfers. So what we'll do is flush the fifo, reset txinterval, clear the nak timeout flag, and then look for another transfer to queue */
+	if(csr & HOST_TXCSR_NAK_TIMEOUT)
+	{
+#if 1
+		/* Blah */
+		csro &= ~HOST_TXCSR_NAK_TIMEOUT;
+		updated = 1;
+		musb_base->csr.host_ep[ep].host_txinterval = 0;
+		goto end;
+#elif 1
+		/* Flush FIFO */
+		csro = csr | HOST_TXCSR_FLUSHFIFO;
+		musb_base->csr.host_ep[ep].host_txcsr = csro;
+		WAITON(musb_base->csr.host_ep[ep].host_txcsr & HOST_TXCSR_TXPKTRDY);
+		/* Clear txinterval */
+		musb_base->csr.host_ep[ep].host_txinterval = 0;
+		/* Clear NAK_TIMEOUT error */
+		csro = 0;
+		musb_base->csr.host_ep[ep].host_txcsr = csro;
+		/* Rewind the buffer pointers */
+		DPRINTFN(10,("Rewinding buffer by %d bytes\n",epipe->last_write));
+		epipe->remain += epipe->last_write;
+		epipe->buf -= epipe->last_write;
+		epipe->toggle = !epipe->toggle;
+		epipe->last_write = 0;
+		/* Look for another transfer */
+		struct musb_multiplexer *mp = epipe->multiplexer;
+		struct musb_pipe *next = SIMPLEQ_FIRST(&mp->waitq);
+		if(next)
+		{
+			DPRINTFN(10,("-> yield to next pipe %p\n",next));
+
+			/* Finish pausing this one: */
+			/* Cancel any timeout */
+			callout_stop(&(ex->xfer.timeout_handle));
+			/* And cancel the associated callback */
+			riscos_cancel_abort_pipe(ex);
+			/* Stop pipe */
+			epipe->running = false;
+			epipe->ep = -1;
+			if(mp->tx)
+				sc->host_tx[ep] = NULL;
+			else
+				sc->host_rx[ep] = NULL;
+			/* Insert at back of queue */
+			SIMPLEQ_INSERT_TAIL(&mp->waitq,epipe,multiq);
+			/* Now run the new entry */
+			SIMPLEQ_REMOVE_HEAD(&mp->waitq,multiq);
+			musb_pipe_run(next,ep);
+		}
+		else
+		{
+			DPRINTFN(10,("-> retrying\n"));
+			musb_pipe_run(epipe,ep);
+		}
+		goto end;
+#else
+		DPRINTFN(10,("*** timeout for ep %d @ %08x (%08x) ***\n",ep,&musb_base->csr.host_ep[ep].host_txcsr,((int)&musb_base->csr.host_ep[ep].host_txcsr)-(int)musb_base));
+		musb_base->common.intrtxe &= ~(1<<ep);
+		*((char *)-1) = 0;
+#endif
+		goto end;
+	}
+#endif
+	/* RXSTALL and ERROR are terminal error conditons */
+	if(csr & (HOST_TXCSR_RXSTALL | HOST_TXCSR_ERROR))
+	{
+		if(csr & HOST_TXCSR_RXSTALL)
+			ex->xfer.status = USBD_STALLED;
+		else /* HOST_TXCSR_ERROR */
+			ex->xfer.status = USBD_IOERROR;
+
+		/* Ensure we correctly report any partial transfer */
+		ex->xfer.actlen = ex->xfer.length-epipe->remain;
+
+		complete=1;
+		/* Abort by flushing the FIFO */
+		csro = csr | HOST_TXCSR_FLUSHFIFO;
+		musb_base->csr.host_ep[ep].host_txcsr = csro;
+		WAITON(musb_base->csr.host_ep[ep].host_txcsr & HOST_TXCSR_TXPKTRDY);
+		/* Also need to clear txinterval? */
+		musb_base->csr.host_ep[ep].host_txinterval = 0;
+		csro = 0;
+		updated=1;
+		goto end;
+	}
+	/* Else we should be able to send some more data */
+	if(epipe->remain)
+	{
+		usb_endpoint_descriptor_t *ed = epipe->pipe.endpoint->edesc;
+		int count = min(epipe->remain,UGETW(ed->wMaxPacketSize));
+		epipe->remain -= count;
+		epipe->buf = musb_fifowrite(musb_base,ep,epipe->buf,count);
+		epipe->last_write = count;
+		epipe->toggle = !epipe->toggle;
+		CSR_SET(HOST_TXCSR_TXPKTRDY);
+		updated=1;
+		goto end;
+	}
+	else if(epipe->null_packet)
+	{
+		/* End of data, but we need to send a null packet */
+		epipe->null_packet = false;
+		epipe->toggle = !epipe->toggle;
+		CSR_SET(HOST_TXCSR_TXPKTRDY);
+		updated=1;
+		goto end;
+	}
+	else
+	{
+		/* We're done! */
+		ex->xfer.status = USBD_NORMAL_COMPLETION;
+		ex->xfer.actlen = ex->xfer.length;
+		complete=1;
+		goto end;
+	}
+end:
+	DPRINTFN(15,("musb_transmit_host: new csr %04x(%d) complete %d\n",csro,updated,complete));
+	if(updated)
+		musb_base->csr.host_ep[ep].host_txcsr = csro;
+	if(complete)
+		musb_mp_completed(sc,ex,ep);
+}
+
+/*
+
+			MAIN INTERRUPT ROUTINE
+
+*/
+
+
+int musb_intr(musb_softc_t *sc)
+{
+	/* return 0 for success, 1 for failure */
+
+	/* Read IRQ state and process according to flowchart (figure 23-5 spruf98b, page 3078) */
+	volatile musb_regs *musb_base = sc->musb_base;
+	int intrusb = musb_base->common.intrusb;
+	int devctl = musb_base->devctl;
+	int isbdevice = devctl & DEVCTL_BDEVICE;
+	int ishost = devctl & DEVCTL_HOSTMODE;
+	unsigned int ep_tx = musb_base->common.intrtx;
+	unsigned int ep_rx = musb_base->common.intrrx;
+	riscos_irqclear(sc->devno);
+	DPRINTFN(10,("irq %02x devctl %02x (%c %s) rx %04x tx %04x\n",intrusb,devctl,(isbdevice?'B':'A'),(ishost?"Host":"Peripheral"),ep_rx,ep_tx));
+	if(intrusb & INTRUSB_RESUME)
+	{
+		DPRINTFN(11,("INTRUSB_RESUME\n"));
+	}
+	if(!isbdevice)
+	{
+		if(intrusb & INTRUSB_SESSREQ)
+		{
+			DPRINTFN(11,("INTRUSB_SESSREQ\n"));
+		}
+	}
+	if(intrusb & INTRUSB_VBUSERR)
+	{
+		DPRINTFN(11,("INTRUSB_VBUSERR\n"));
+		if(sc->tps.retry_counter)
+		{
+			sc->tps.retry_counter--;
+			DPRINTFN(10,("%d VBUS retries left\n",sc->tps.retry_counter));
+			musb_base->devctl = musb_base->devctl | DEVCTL_SESSION;
+		} 
+	}
+	if(ishost)
+	{
+		if(intrusb & INTRUSB_CONN)
+		{
+			DPRINTFN(11,("INTRUSB_CONN\n"));
+		}
+		if(intrusb & INTRUSB_RESET_BABBLE)
+		{
+			DPRINTFN(11,("INTRUSB_RESET_BABBLE\n"));
+		}
+		if(ep_tx & 1)
+		{
+			musb_ep0_host(sc);
+		}
+		ep_rx &= ~1;
+		while(ep_rx)
+		{
+			int i;
+			__asm {
+			CLZ	i,ep_rx;
+			}
+			i=31-i;
+			musb_receive_host(sc,i);
+			ep_rx &= ~(1<<i);
+		}
+		ep_tx &= ~1;
+		while(ep_tx)
+		{
+			int i;
+			__asm {
+			CLZ	i,ep_tx;
+			}
+			i=31-i;
+			musb_transmit_host(sc,i);
+			ep_tx &= ~(1<<i);
+		}
+	}
+	else
+	{
+		/* todo - surely we need to monitor INTRUSB_RESET_BABBLE here, to detect resets? */
+		if(ep_tx & 1)
+		{
+			musb_ep0_peri(sc);
+		}
+#if 0
+		int i=0;
+		ep_rx = ep_rx>>1;
+		do {
+			i++;
+			if(ep_rx & 1)
+				DPRINTFN(12,("EP%d peri RX\n",i));
+			ep_rx = ep_rx>>1;
+		} while(ep_rx);
+		ep_tx = ep_tx>>1;
+		i=0;
+		do {
+			i++;
+			if(ep_tx & 1)
+				DPRINTFN(12,("EP%d peri TX\n",i));
+			ep_tx = ep_tx>>1;
+		} while(ep_tx);
+#endif
+	}
+	if(intrusb & INTRUSB_SOF)
+	{
+		DPRINTFN(11,("INTRUSB_SOF\n"));
+	}
+	if(intrusb & INTRUSB_DISCON)
+	{
+		DPRINTFN(11,("INTRUSB_DISCON\n"));
+		/* todo - this is probably a pretty good indicator that we should reset all our state vars, and cancel any pending xfers... */
+	}
+	if(intrusb & INTRUSB_SUSPEND)
+	{
+		DPRINTFN(11,("INTRUSB_SUSPEND\n"));
+	}
+	/* Check if the interrupt caused a port status change */
+	u32 port_status = musb_calc_port_status(musb_base->devctl,musb_base->common.power,sc->port_status);
+	if(port_status != sc->port_status)
+	{
+		DPRINTFN(10,("intr detected PCD, new status %04x change %04x\n",port_status&0xffff,port_status>>16));
+		sc->port_status = port_status;
+		musb_pcd(sc->sc_intrxfer);
+	}
+	/* Just claim we've done it all */
+	return 0;
+}

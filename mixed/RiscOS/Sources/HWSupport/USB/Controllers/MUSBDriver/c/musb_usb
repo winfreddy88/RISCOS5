@@ -1,0 +1,386 @@
+/*
+ * Copyright (c) 2004, 2009 The NetBSD Foundation, Inc.
+ * All rights reserved.
+ *
+ * This code is derived from software contributed to The NetBSD Foundation
+ * by Lennart Augustsson (lennart@augustsson.net), Charles M. Hannum, and
+ * Jeffrey Lee (me@phlamethrower.co.uk)
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. All advertising materials mentioning features or use of this software
+ *    must display the following acknowledgement:
+ *        This product includes software developed by the NetBSD
+ *        Foundation, Inc. and its contributors.
+ * 4. Neither the name of The NetBSD Foundation nor the names of its
+ *    contributors may be used to endorse or promote products derived
+ *    from this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE NETBSD FOUNDATION, INC. AND CONTRIBUTORS
+ * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE FOUNDATION OR CONTRIBUTORS
+ * BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
+#include "modhead.h"
+#include "swis.h"
+#include "callx/callx.h"
+#include <limits.h>
+#include <machine/bus.h>
+
+#include <sys/malloc.h>
+#include <sys/queue.h>
+#include <sys/types.h>
+#include <sys/systm.h>
+
+#include <dev/usb/usb.h>
+#include <dev/usb/usbdi.h>
+#include <dev/usb/usbdivar.h>
+
+#include "Global/RISCOS.h"
+#include "Global/HALEntries.h"
+#include "cmodule.h"
+
+/* Have to avoid including stdio as there's a clash with the BSD stuff */
+#define __stdio_h
+
+#include "musb.h"
+#include "musb_usb.h"
+#include "musb_util.h"
+
+static usbd_status	musb_allocm(struct usbd_bus *, usb_dma_t *, u_int32_t);
+static void		musb_freem(struct usbd_bus *, usb_dma_t *);
+
+static usbd_xfer_handle	musb_allocx(struct usbd_bus *);
+static void		musb_freex(struct usbd_bus *, usbd_xfer_handle);
+
+static usbd_status	musb_open(usbd_pipe_handle);
+static void		musb_poll(struct usbd_bus *);
+static void		musb_softintr(void *);
+
+static void		musb_noop(usbd_pipe_handle pipe);
+
+static struct usbd_bus_methods musb_bus_methods = {
+	musb_open,
+	/* Open pipe to pipe->device->address:pipe->endpoint->edesc->bEndpointAddress.
+	   If dest addr == hub address (pipe->device->bus->sc_addr), bEndpointAddress will be USB_CTRONOL_ENDPOINT or UE_DIR_IN|EHCI_INTR_ENDPOINT.
+	   pipe->endpoint->edesc->bmAttributes & UE_XFERTYPE gives pipe type
+	   pipe->device->speed gives pipe speed
+	   On exit:
+	   - pipe->methods should be set to function ptrs
+	   - private members of 'pipe' can be set appropriately
+	     - musb_init() must set musb_softc.sc_bus.pipe_size to size of private pipe struct!!
+	     - and must set all other appropriate members of sc_bus (e.g. pointer to these funcs)
+	*/
+	musb_softintr,
+	/* Check for any interrupts and handle them? */
+	musb_poll,
+	/* Check for any interrupts and handle them? */
+	musb_allocm,
+	/* Alloc memory */
+	musb_freem,
+	/* Free memory */
+	musb_allocx,
+	/* Alloc usbd_xfer for the given bus struct; alloc size would be that requires for internal usbd_xfer struct */
+	musb_freex,
+	/* Free usbd_xfer (just add to free list?) */
+	NULL, NULL, NULL, NULL,
+	/* 4x unused HC overrides */
+};
+
+static struct usbd_pipe_methods musb_root_ctrl_methods = {
+	musb_root_ctrl_transfer,
+	musb_root_ctrl_start,
+	musb_root_ctrl_abort,
+	musb_root_ctrl_close,
+	musb_noop,
+	musb_root_ctrl_done,
+};
+
+/* Root hub interrupt transfers are used to flag port status changes - see sc_intrxfer */
+static struct usbd_pipe_methods musb_root_intr_methods = {
+	musb_root_intr_transfer,
+	musb_root_intr_start,
+	musb_root_intr_abort,
+	musb_root_intr_close,
+	musb_noop,
+	musb_root_intr_done,
+};
+
+static struct usbd_pipe_methods musb_device_methods = {
+	musb_device_transfer,
+	musb_device_start,
+	musb_device_abort,
+	musb_device_close,
+	musb_device_clear_toggle,
+	musb_device_done,
+};
+
+#ifdef __riscos
+static int veneers_built = 0;
+static struct {
+    struct usbd_bus_methods methods;
+    struct {
+        int load;
+        int branch;
+    } veneer[sizeof (struct usbd_bus_methods) / sizeof (void*)];
+} musb_bus_methods_entry;
+
+static struct {
+    struct usbd_pipe_methods methods;
+    struct {
+        int load;
+        int branch;
+    } veneer[sizeof (struct usbd_pipe_methods) / sizeof (void*)];
+} musb_root_ctrl_methods_entry,
+  musb_root_intr_methods_entry,
+  musb_device_methods_entry;
+#endif
+
+usbd_status
+musb_init(musb_softc_t *sc)
+{
+	u_int i;
+	volatile musb_regs *musb_base = sc->musb_base;
+	
+	DPRINTF(("musb_init: start\n"));
+#ifdef __riscos
+        if (!veneers_built)
+        {
+            build_veneer((int*)&musb_bus_methods_entry,
+                (int*)&musb_bus_methods,
+                sizeof musb_bus_methods);
+            build_veneer((int*)&musb_root_ctrl_methods_entry,
+                (int*)&musb_root_ctrl_methods,
+                sizeof musb_root_ctrl_methods);
+            build_veneer((int*)&musb_root_intr_methods_entry,
+                (int*)&musb_root_intr_methods,
+                sizeof musb_root_intr_methods);
+            build_veneer((int*)&musb_device_methods_entry,
+                (int*)&musb_device_methods,
+                sizeof musb_device_methods);
+            veneers_built = 1;
+        }
+#endif
+
+	/* Set up the bus struct. */
+	sc->sc_bus.usbrev = USBREV_2_0;
+	sc->sc_bus.methods = &musb_bus_methods;
+	sc->sc_bus.pipe_size = sizeof(struct musb_pipe);
+
+	SIMPLEQ_INIT(&sc->sc_free_xfers);
+
+	sc->peri_ep0_state = PERI_EP0_STATE_IDLE;
+
+	sc->host_ep0_state = HOST_EP0_STATE_IDLE;
+	/* Only one endpoint is needed for control transfers */
+	sc->mp_ep0.tx = true;
+	sc->mp_ep0.idle_mask = 1;
+	SIMPLEQ_INIT(&sc->mp_ep0.waitq);
+	/* Dedicate several endpoints for bulk transfers, to cope with devices which NAK for long periods of time (e.g. ethernet adaptors) */
+	sc->mp_bulktx.tx = true;
+	sc->mp_bulktx.idle_mask = 0x1e;
+	SIMPLEQ_INIT(&sc->mp_bulktx.waitq);
+	sc->mp_bulkrx.tx = false;
+	sc->mp_bulkrx.idle_mask = 0x1e;
+	SIMPLEQ_INIT(&sc->mp_bulkrx.waitq);
+	/* Allocate everything else to interrupt/isoc xfers */
+	sc->mp_iitx.tx = true;
+	sc->mp_iitx.idle_mask = 0xffe0;
+	SIMPLEQ_INIT(&sc->mp_iitx.waitq);
+	sc->mp_iirx.tx = false;
+	sc->mp_iirx.idle_mask = 0xffe0;
+	SIMPLEQ_INIT(&sc->mp_iirx.waitq);
+
+	/* Set up the controller */
+	/* First, reset */
+	musb_base->otg_sysconfig = OTG_SYSCONFIG_SOFTRESET;
+	for(i=0;i<100;i++)
+	{
+		delay(1000);
+		if(musb_base->otg_sysstatus & OTG_SYSSTATUS_RESETDONE)
+			break;
+	}
+	if(!(musb_base->otg_sysstatus & OTG_SYSSTATUS_RESETDONE))
+	{
+		DPRINTF(("musb_init: timeout in hardware reset\n"));
+		return (USBD_IOERROR);
+	}
+	/* Set power settings */
+	musb_base->otg_forcestdby = 0;
+	musb_base->otg_sysconfig = OTG_SYSCONFIG_SIDLEMODE_SMART | OTG_SYSCONFIG_MIDLEMODE_SMART;
+	musb_base->otg_sysconfig = OTG_SYSCONFIG_AUTOIDLE | OTG_SYSCONFIG_SIDLEMODE_SMART | OTG_SYSCONFIG_MIDLEMODE_SMART;
+	musb_base->otg_interfsel = OTG_INTERFSEL_PHYSEL;
+	/* FIFO setup - very simplistic for the moment, give each endpoint individual RX & TX FIFOs, assuming 16K of FIFO RAM is available, and ep0 has a fixed FIFO that occupies the lowest 64 bytes. */
+	int fifoaddr = 64;
+	for(i=1;i<16;i++)
+	{
+		musb_base->common.index = i;
+		musb_base->txfifosz = 6; /* (2^(6+3))*30+64 = 15424 bytes used total */
+		musb_base->rxfifosz = 6;
+		musb_base->txfifoaddr = fifoaddr/8;
+		fifoaddr += 512;
+		musb_base->rxfifoaddr = fifoaddr/8;
+		fifoaddr += 512;
+	}
+	/* Set a default NAK limit */
+	musb_base->csr.host_ep0.host_naklimit0 = 10; /* 2^(10-1) */
+	/* Enable interrupts */
+	musb_base->common.intrtxe = 0xffff;
+	musb_base->common.intrrxe = 0xfffe;
+	musb_base->common.intrusbe = 0xf7;
+	/* Set basic config */
+	musb_base->common.testmode = 0;
+	musb_base->common.power = POWER_ISOUPDATE | POWER_SOFTCONN | POWER_HSEN;
+	/* Host mode session start */
+	musb_base->devctl = DEVCTL_SESSION; 
+
+	return (USBD_NORMAL_COMPLETION);
+}
+
+usbd_status
+musb_allocm(struct usbd_bus *bus, usb_dma_t *dma, u_int32_t size)
+{
+	usbd_status err;
+#if 1
+	/* We aren't using DMA yet, so we can just use malloc() here and avoid the speed penalties associated with noncacheable memory */
+	NOTUSED(bus);
+	*dma = malloc(size,M_DEVBUF,M_NOWAIT);
+	if(*dma)
+		err = USBD_NORMAL_COMPLETION;
+	else
+		err = USBD_NOMEM;
+#else
+	struct musb_softc *sc = (struct musb_softc *)bus;
+	err = usb_allocmem(&sc->sc_bus, size, 0, dma);
+#endif
+	return (err);
+}
+
+void
+musb_freem(struct usbd_bus *bus, usb_dma_t *dma)
+{
+#if 1
+	NOTUSED(bus);
+	free(*dma,M_DEVBUF);
+	*dma = 0;
+#else
+	struct musb_softc *sc = (struct musb_softc *)bus;
+	usb_freemem(&sc->sc_bus, dma);
+#endif
+}
+
+usbd_xfer_handle
+musb_allocx(struct usbd_bus *bus)
+{
+	struct musb_softc *sc = (struct musb_softc *)bus;
+	usbd_xfer_handle xfer;
+
+	xfer = SIMPLEQ_FIRST(&sc->sc_free_xfers);
+	if (xfer != NULL) {
+		SIMPLEQ_REMOVE_HEAD(&sc->sc_free_xfers, next);
+	} else {
+		xfer = malloc(sizeof(struct musb_xfer), M_USB, M_NOWAIT);
+	}
+	if (xfer != NULL) {
+		memset(xfer, 0, sizeof (struct musb_xfer));
+	}
+	return (xfer);
+}
+
+void
+musb_freex(struct usbd_bus *bus, usbd_xfer_handle xfer)
+{
+	struct musb_softc *sc = (struct musb_softc *)bus;
+
+	SIMPLEQ_INSERT_HEAD(&sc->sc_free_xfers, xfer, next);
+}
+
+usbd_status
+musb_open(usbd_pipe_handle pipe)
+{
+	usbd_device_handle dev = pipe->device;
+	musb_softc_t *sc = (musb_softc_t *)dev->bus;
+	usb_endpoint_descriptor_t *ed = pipe->endpoint->edesc;
+	u_int8_t addr = dev->address;
+	u_int8_t xfertype = ed->bmAttributes & UE_XFERTYPE;
+	struct musb_pipe *epipe = (struct musb_pipe *)pipe;
+
+	DPRINTFN(1, ("musb_open: pipe=%p, addr=%d, endpt=%d (%d) type=%d\n",
+		     pipe, addr, ed->bEndpointAddress, sc->sc_addr, xfertype));
+
+	epipe->multiplexer = NULL;
+	SIMPLEQ_NEXT(epipe,multiq) = NULL;
+	epipe->running = false;
+	epipe->ep = -1;
+	epipe->toggle = false;
+
+	if (addr == sc->sc_addr) {
+		switch (ed->bEndpointAddress) {
+		case USB_CONTROL_ENDPOINT:
+			pipe->methods = &musb_root_ctrl_methods;
+			break;
+		case UE_DIR_IN | MUSB_INTR_ENDPT:
+			pipe->methods = &musb_root_intr_methods;
+			break;
+		default:
+			return (USBD_INVAL);
+		}
+		return (USBD_NORMAL_COMPLETION);
+	}
+
+	/* Check that the max packet size isn't larger than our FIFO sizes... */
+	if(UGETW(ed->wMaxPacketSize) > 512)
+		return (USBD_INVAL);
+
+	pipe->methods = &musb_device_methods;
+	bool rx = (ed->bEndpointAddress & UE_DIR_IN);
+	switch(xfertype) {
+	case UE_CONTROL:
+		epipe->multiplexer = &sc->mp_ep0;
+		break;
+	case UE_INTERRUPT:
+		epipe->multiplexer = (rx?&sc->mp_iirx:&sc->mp_iitx);
+		break;
+	case UE_BULK:
+		epipe->multiplexer = (rx?&sc->mp_bulkrx:&sc->mp_bulktx);
+		break;
+	case UE_ISOCHRONOUS:
+		return (USBD_INVAL);
+	default:
+		return (USBD_INVAL);
+	}
+	DPRINTFN(1, ("-> using mp %p\n",epipe->multiplexer));
+	return (USBD_NORMAL_COMPLETION);
+}
+
+void
+musb_softintr(void *v)
+{
+	NOTUSED(v);
+}
+
+void
+musb_poll(struct usbd_bus *bus)
+{
+	NOTUSED(bus);
+}
+
+static void
+musb_noop(usbd_pipe_handle pipe)
+{
+	NOTUSED(pipe);
+}

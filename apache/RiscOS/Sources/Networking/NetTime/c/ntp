@@ -1,0 +1,553 @@
+/* Copyright 2000 Pace Micro Technology plc
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stddef.h>
+#include <stdbool.h>
+#include <inttypes.h>
+
+#include <swis.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/ioctl.h>
+#include <netinet/in.h>
+
+#include <socklib.h>
+#include <inetlib.h>
+#include <unixlib.h>
+
+#include <Global/HALEntries.h>
+
+#include "nettime.h"
+#include "ntp.h"
+#include "rtcadjust.h"
+
+static int precise_bits;          /* All possible values of these bits are used */
+static int significant_bits;      /* All possible times can be set using these bits */
+static int insignificant_bits;    /* These bits are not required */
+static int randomise_bits;        /* These bits can be randomised */
+static int has_sync = 0;          /* Note when a server gains primary sync */
+#define PRECISE_MASK       (UINT_MAX << (32-precise_bits))
+#define SIGNIFICANT_MASK   (UINT_MAX << (32-significant_bits))
+#define INSIGNIFICANT_MASK ((1 << insignificant_bits) - 1)
+#define RANDOMISE_MASK     ((1 << randomise_bits) - 1)
+
+extern struct ntp_time ntp_add(struct ntp_time, struct ntp_time);
+extern struct ntp_time ntp_sub(struct ntp_time, struct ntp_time);
+
+static int32_t rand32(void)
+{
+    return (int32_t) rand() ^ ((int32_t) rand() << 16);
+}
+
+const char *riscos_to_text(struct riscos_time t)
+{
+    static char buffer[64];
+    char *p;
+
+    /* Null NTP value 00000000.00000000 maps to RISC OS time 6400000000 */
+    if (t.cs == 0x6400000000 && t.extrans == 0)
+        return "<none>";
+
+    _swix(Territory_ConvertDateAndTime, _INR(0,4)|_OUT(1), -1, &t, buffer, sizeof buffer,
+                                        "%we, %zdy %mo %ce%yr %24:%mi:%se.%cs", &p);
+    return buffer;
+}
+
+#if 0
+static const char *riscos8_to_text(riscos_time8 t)
+{
+    static char buffer[64];
+    char *p;
+
+    /* Null NTP value 00000000.00000000 maps to RISC OS time 6400000000 */
+    if (t == 0x6400000000000000)
+        return "<none>";
+
+    _swix(Territory_ConvertDateAndTime, _INR(0,4)|_OUT(1), -1, (char *) &t + 3, buffer, sizeof buffer,
+                                        "%we, %zdy %mo %ce%yr %24:%mi:%se.%cs", &p);
+
+    t = (t & 0xFFFFFF) * UINT64_C(10000000);
+    sprintf(p, "%07"PRId64, t >> 24);
+
+    return buffer;
+}
+
+static struct riscos_time ntp_to_riscos(struct ntp_time n)
+{
+    struct riscos_time t;
+    uint64_t micro2;
+    uint32_t cs;
+    t.cs = n.secs * UINT64_C(100);
+
+    /* Add in fudge for timestamp wrap in 2036 (RFC 2030 section 3).
+     * This gives us a representable range of dates from 20 Jan 1968 to 26 Feb 2104.
+     * (RISC OS allows 1 Jan 1900 to 3 Jun 2248).
+     */
+    if ((n.secs & 0x80000000) == 0)
+        t.cs += 0x100000000 * UINT64_C(100);
+
+    /* micro2 >> 32 := fraction of second in ns units */
+    micro2 = n.frac * UINT64_C(1000000000);
+
+    /* Round to nearest */
+    if (micro2 & 0x80000000)
+        micro2 += 0x100000000;
+
+    cs = (uint32_t) (micro2 >> 32) / 10000000;
+    t.extrans = (uint32_t) (micro2 >> 32) % 10000000;
+
+    t.cs += cs;
+
+    return t;
+}
+#endif
+
+static riscos_time8 ntp_to_riscos8(struct ntp_time n)
+{
+    riscos_time8 t;
+
+    /* Move fixed point down 8 bits - ignore 8 bottom bits - only 0.1µs */
+    t = ((uint64_t) n.secs << 24) | (n.frac >> 8);
+
+    /* Add in fudge for timestamp wrap in 2036 (RFC 2030 section 3).
+     * This gives us a representable range of dates from 20 Jan 1968 to 26 Feb 2104.
+     * (RISC OS allows 1 Jan 1900 to 3 Jun 2248).
+     */
+    if ((t & 0x0080000000000000) == 0)
+        t += 0x0100000000000000;
+
+    /* Convert to centiseconds */
+    t = t * 100;
+
+    return t;
+}
+
+static struct ntp_time riscos8_to_ntp(riscos_time8 t)
+{
+    struct ntp_time n;
+
+    /* Range check: NTP allows times from 0x80000000.00000000 to 0x7FFFFFFF.FFFFFFFF.
+     * (20 Jan 1968 04:14:08 to 26 Feb 2104 10:42:23).
+     * This corresponds to the set of RISC OS times 0x3200000000.000000-0x95FFFFFFFF.FFFFFF.
+     */
+    if (t < 0x3200000000000000 || t >= 0x9600000000000000)
+    {
+        /* Return null time for out of range */
+        n.secs = n.frac = 0;
+        return n;
+    }
+
+    /* Times 0x6400000000-0x95FFFFFFFF map to 00000000.00000000-7FFFFFFF.FFFFFFFF.
+     * Handle this by mapping down to 0x0000000000-0x31FFFFFFFF before dividing.
+     */
+    if (t >= 0x6400000000000000)
+        t -= 0x6400000000000000;
+
+    /* Only have signed divide, but doesn't matter because we know the top byte's in the range 00-63 */
+    t = t / 100;
+
+    n.secs = (uint32_t) (t >> 24);
+    n.frac = (uint32_t) t << 8;
+
+    return n;
+}
+
+/* r[1,0] := a[1,0] / b; a being a 64-bit number, and r being 32.32 fixed point
+ * least-significant word first.
+ */
+static void divfrac(uint32_t *a, uint32_t b, uint32_t *r)
+{
+    uint32_t n, f;
+    int i, j;
+
+    n = a[1];
+    f = a[0];
+
+    n -= (n/b) * b; /* Remove overflow */
+
+    for (j=1; j >=0; j--)
+    {
+        r[j] = 0;
+        for (i=31; i >= 0; i--)
+        {
+            n = (n << 1) + ((f & 0x80000000) ? 1 : 0);
+            f <<= 1;
+            if (n >= b)
+            {
+                n -= b;
+                r[j] |= (UINT32_C(1) << i);
+            }
+        }
+    }
+}
+
+struct ntp_time riscos_to_ntp(struct riscos_time t)
+{
+    struct ntp_time n;
+    uint32_t c[2], r[2];
+
+    /* Range check: NTP allows times from 0x80000000.00000000 to 0x7FFFFFFF.FFFFFFFF.
+     * (20 Jan 1968 04:14:08 to 26 Feb 2104 10:42:23).
+     * This corresponds to the set of RISC OS times 0x3200000000-0x95FFFFFFFF.
+     */
+    if (t.cs < 0x3200000000 || t.cs >= 0x9600000000)
+    {
+        /* Return null time for out of range */
+        n.secs = n.frac = 0;
+        return n;
+    }
+
+    /* Times 0x6400000000-0x95FFFFFFFF map to 00000000.00000000-7FFFFFFF.FFFFFFFF.
+     * Handle this by mapping down to 0x0000000000-0x31FFFFFFFF before dividing.
+     */
+    if (t.cs >= 0x6400000000)
+        t.cs -= 0x6400000000;
+
+    c[1] = (uint32_t) (t.cs >> 32);
+    c[0] = (uint32_t) t.cs;
+
+    divfrac(c, 100, r);
+    n.secs = r[1];
+    n.frac = r[0];
+
+    if (t.extrans)
+    {
+        struct ntp_time x;
+        c[1] = t.extrans;
+        c[0] = 0;
+        divfrac(c, 1000000000, r);
+
+        x.secs = 0;
+        x.frac = r[1];
+        if (r[0] & 0x80000000) x.frac++; /* Round to nearest */
+        n = ntp_add(n, x);
+    }
+
+    return n;
+}
+
+static inline bool ntp_is_null(struct ntp_time n)
+{
+    return n.secs == 0 && n.frac == 0;
+}
+
+static void randomise_ntp(struct ntp_time *n)
+{
+    if (!ntp_is_null(*n))
+    {
+        struct ntp_time r;
+        r.frac = rand32() >> (32 - randomise_bits);      /* Arithmetic shift (ta Norcroft) */
+        r.secs = (r.frac & 0x80000000) ? 0xFFFFFFFF : 0; /* Sign extend upwards */
+        *n = ntp_add(*n, r);
+    }
+}
+
+struct riscos_time current_time(void)
+{
+    struct riscos_time t;
+
+    t.extrans = 0;
+    t.cs = 3;
+    if (_swix(OS_Word, _INR(0,1), 14, &t.cs))
+        t.cs = 0;
+
+    return t;
+}
+
+static unsigned int t0_divisor; /* Divisor to convert ticks to usecs */
+static unsigned int t0_period;  /* Timer 0 period */
+static void       * HAL_TimerReadCountdown_Ptr;
+static uint32_t     HAL_TimerReadCountdown_SB;
+
+typedef enum
+{
+    timer_NOT_CHECKED,
+    timer_IOMD,
+    timer_HAL,
+    timer_NONE
+} timer_type;
+
+/*
+ * Return the type of hardware timer this platform has, and perform
+ * any necessary initialisation.
+ */
+static timer_type hw_check(void)
+{
+    _kernel_oserror * e;
+    unsigned int      granularity;
+    timer_type        type = timer_NONE;
+
+    /* Try to get Timer 0 granularity from HAL */
+    e = _swix(OS_Hardware,
+              _IN(0) | _INR(8,9) | _OUT(0),
+              0,
+              OSHW_CallHAL,
+              EntryNo_HAL_TimerGranularity,
+              &granularity);
+
+    /*
+     * Can only use HAL if this succeeded and granularity is an even
+     * number of MHz.
+     */
+    if (e == NULL && (granularity % 1000000) == 0)
+    {
+        t0_divisor = granularity / 1000000;
+
+        /* Try to get Timer 0 period from HAL */
+        e = _swix(OS_Hardware,
+                  _IN(0) | _INR(8,9) | _OUT(0),
+                  0,
+                  OSHW_CallHAL,
+                  EntryNo_HAL_TimerPeriod,
+                  &t0_period);
+
+        if (e == NULL && t0_divisor != 0 && t0_period != 0)
+        {
+            /* HAL_TimerReadCountdown counts from (period-1) to 0 */
+            t0_period--;
+
+            /* Try to get HAL_TimerReadCountdown pointer from HAL */
+            e = _swix(OS_Hardware,
+                      _INR(8,9) | _OUTR(0,1),
+                      OSHW_LookupRoutine,
+                      EntryNo_HAL_TimerReadCountdown,
+                      &HAL_TimerReadCountdown_Ptr,
+                      &HAL_TimerReadCountdown_SB);
+
+            if (e == NULL)
+            {
+                /*
+                 * OK so far, now make sure HAL_TimerReadCountdown doesn't
+                 * always return 0.
+                 */
+
+                unsigned long count1, count2;
+
+                count1 = get_hal_t0_count(HAL_TimerReadCountdown_SB, HAL_TimerReadCountdown_Ptr);
+                _swix(OS_Hardware, _IN(0)|_INR(8,9), 2, OSHW_CallHAL, EntryNo_HAL_CounterDelay);
+                count2 = get_hal_t0_count(HAL_TimerReadCountdown_SB, HAL_TimerReadCountdown_Ptr);
+
+                if (count1 != 0 || count2 != 0)
+                {
+                    /* Everything worked - use HAL */
+                    type = timer_HAL;
+                }
+            }
+        }
+    }
+
+    if (type != timer_HAL)
+    {
+        /* Couldn't use HAL, look for IOMD instead */
+
+        /* (OS_ReadSysInfo 2 bits 8-15 is I/O chip = 0 or 1 - IOC or IOMD) */
+        unsigned int hardware;
+        if (_swix(OS_ReadSysInfo, _IN(0)|_OUT(0), 2, &hardware))
+            type = timer_NONE;
+        else
+            type = (hardware & 0xFF00) <= 0x0100 ? timer_IOMD : timer_NONE;
+    }
+
+    switch (type)
+    {
+        case timer_IOMD:
+            precise_bits = 20;
+            significant_bits = 21;
+            break;
+        case timer_HAL:
+        {
+            unsigned int g;
+            precise_bits = 0;
+            for (g = granularity; g != 1; g >>= 1)
+                precise_bits++;
+            if (granularity == 1 << precise_bits)
+                significant_bits = precise_bits;
+            else
+                significant_bits = precise_bits+1;
+            break;
+        }
+        default:
+            precise_bits = 6;
+            significant_bits = 7;
+            break;
+    }
+    if (precise_bits > 32) precise_bits = 32;
+    if (significant_bits > 32) significant_bits = 32;
+    insignificant_bits = 32 - significant_bits;
+    randomise_bits = insignificant_bits - 1;
+    if (randomise_bits < 0) randomise_bits = 0;
+
+    return type;
+}
+
+static riscos_time8 precise_current_time(void)
+{
+    riscos_time8 t1, t2;
+    unsigned int timer_count;
+    static timer_type timer_check = timer_NOT_CHECKED;
+    /* Only poke the hardware if we're sure it's there :) */
+    if (timer_check == timer_NOT_CHECKED)
+        timer_check = hw_check();
+
+    t1 = 3 << 24;
+    t2 = 3 << 24;
+
+    if (timer_check != timer_NONE)
+    {
+        /* Check initial time */
+        _kernel_osword(14, (int *) ((char *) &t1 + 3));
+
+        if (timer_check == timer_IOMD)
+            timer_count = get_t0_count();
+        else
+            timer_count = get_hal_t0_count(HAL_TimerReadCountdown_SB, HAL_TimerReadCountdown_Ptr);
+    }
+    else
+    {
+        timer_count = 0;
+    }
+
+    /* Check new time */
+    _kernel_osword(14, (int *) ((char *) &t2 + 3));
+
+    if (timer_check != timer_NONE && t1 == t2)
+    {
+        unsigned int latch = rtcadjust_latch();
+        uint32_t tmp;
+        int64_t tmp2;
+
+        /* Clock didn't tick.
+         * Need to add a fraction of a centisecond. Fraction is ((latch-1)-(timer_count))/latch.
+         */
+        if (timer_count < latch)
+        {
+            tmp = latch - UINT32_C(1) - timer_count;
+            tmp2 = ((int64_t) tmp << 24) / latch;
+            t2 += tmp2;
+        }
+        else
+        {
+            /* Who knows what's going on. Leave the fraction out. */
+        }
+    }
+    else
+    {
+        /* Clock ticked - let it rest at the 1cs boundary */
+    }
+
+    dprintf(("ntp_4", "precise_current_time returning %016"PRIX64"\n", t2));
+
+    return t2;
+}
+
+static struct ntp_time ntp_ntoh(struct ntp_time t)
+{
+    t.secs = (uint32_t) ntohl(t.secs);
+    t.frac = (uint32_t) ntohl(t.frac);
+    return t;
+}
+
+#define ntp_hton ntp_ntoh
+#if 0
+static const char *ntp_to_text(struct ntp_time t)
+{
+    return riscos8_to_text(ntp_to_riscos8(t));
+}
+
+static struct riscos_time round_riscos_time(struct riscos_time t)
+{
+    if (t.extrans >= 5000000)
+        ++t.cs;
+    t.extrans = 0;
+
+    return t;
+}
+
+static _kernel_oserror *ntp_set_time(struct riscos_time t)
+{
+    t = round_riscos_time(t);
+
+    return module_set_time(&t);
+}
+#endif
+
+static struct ntp_time last_request;
+
+size_t ntp_construct_request(struct ntp *n, size_t len)
+{
+      memset(n, 0, len);
+      n->flags = (3 << 3) | 3; /* Version 3, mode 3 (client) */
+      n->transmit_timestamp = riscos8_to_ntp(precise_current_time());
+      randomise_ntp(&n->transmit_timestamp);
+      n->transmit_timestamp = last_request = ntp_hton(n->transmit_timestamp);
+
+      return sizeof(struct ntp);
+}
+
+int ntp_process_reply(const struct ntp *n, size_t len, riscos_timediff8 *offset_out)
+{
+    riscos_time8 recv, orig, xmit, dest;
+    int VN, LI, mode;
+
+    dest = precise_current_time();
+
+    LI = n->flags >> 6;
+    VN = (n->flags >> 3) & 7;
+    mode = n->flags & 7;
+
+    /* Record when we spot the server has primary sync */
+    if (LI != 3) has_sync = 1;
+    if ((n->stratum > 0) && (n->stratum < 15)) has_sync = 1;
+
+    /* Basic validity checks, as per RFC 2030 */
+    if (len < sizeof(struct ntp) ||
+        VN != 3 || mode != 4 ||
+        ntp_is_null(n->transmit_timestamp) ||
+        n->originate_timestamp.secs != last_request.secs ||
+        n->originate_timestamp.frac != last_request.frac)
+        return 0;
+
+    /* Only reject these packets after we've seen the server with primary sync */
+    if (has_sync)
+    {
+      if (LI == 3) return 0;
+      if ((n->stratum < 1) || (n->stratum > 14)) return 0;
+    }
+
+    orig = ntp_to_riscos8(ntp_ntoh(n->originate_timestamp));
+    xmit = ntp_to_riscos8(ntp_ntoh(n->transmit_timestamp));
+    recv = ntp_to_riscos8(ntp_ntoh(n->receive_timestamp));
+
+    dprintf(("ntp_1", "orig = %s\n", riscos8_to_text(orig)));
+    dprintf(("ntp_1", "recv = %s\n", riscos8_to_text(recv)));
+    dprintf(("ntp_1", "xmit = %s\n", riscos8_to_text(xmit)));
+    dprintf(("ntp_1", "dest = %s\n", riscos8_to_text(dest)));
+
+    if (ntp_is_null(n->originate_timestamp))
+    {
+        *offset_out = dest - xmit;
+    }
+    else
+    {
+        *offset_out = ((int64_t) (orig - recv) >> 1) + ((int64_t) (dest - xmit) >> 1);
+    }
+
+    dprintf(("ntp_1", "offset = %010"PRIX64".%06"PRIX64"cs\n",
+                      (*offset_out >> 24), *offset_out & 0xFFFFFF));
+
+    return -1;
+}

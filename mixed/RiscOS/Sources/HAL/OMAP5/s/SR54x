@@ -1,0 +1,1253 @@
+; Copyright 2015 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:Machine.<Machine>
+        GET     Hdr:ImageSize.<ImageSize>
+        $GetIO
+
+        GET     Hdr:OSEntries
+        GET     Hdr:HALEntries
+        GET     Hdr:Proc
+
+        GET     hdr.omap543x
+        GET     hdr.StaticWS
+        GET     hdr.PRCM
+        GET     hdr.SR54x
+
+        AREA    |Asm$$Code|, CODE, READONLY, PIC
+
+        EXPORT  SR54x_Init
+        EXPORT  SR54x_Exit
+
+        IMPORT  memcpy
+        IMPORT  TPSWrite
+        IMPORT  IIC_DoOp_Poll
+
+; some definitions for TWL6037 PMIC
+TWL6037_ADDR_ID0        *       (0x12)          ; ID0 group (SmartReflex only)
+TWL6037_ADDR_ID1        *       (0x48 << 1)     ; ID1 group
+TWL6037_ADDR_ID2        *       (0x49 << 1)     ; ID2 group
+TWL6037_ADDR_ID3        *       (0x4A << 1)     ; ID3 group
+
+; PMC Slave SMPS Register Map
+SMPS12_FORCE            *       0x22
+SMPS12_VOLTAGE          *       0x23
+SMPS45_FORCE            *       0x2A
+SMPS45_VOLTAGE          *       0x2B
+SMPS8_FORCE             *       0x36
+SMPS8_VOLTAGE           *       0x37
+
+; voltage connections PMIC <--> OMAP543x
+;  TWL_SMPS12 <--> VDD_MPU, TWL_SMPS45 <--> VDD_MM, TWL_SMPS8 <--> VDD_CORE
+;
+VDD_MPU_SR_CMD_REG      *       SMPS12_FORCE
+VDD_MPU_SR_VOLT_REG     *       SMPS12_VOLTAGE
+VDD_MM_SR_CMD_REG       *       SMPS45_FORCE
+VDD_MM_SR_VOLT_REG      *       SMPS45_VOLTAGE
+VDD_CORE_SR_CMD_REG     *       SMPS8_FORCE
+VDD_CORE_SR_VOLT_REG    *       SMPS8_VOLTAGE
+
+
+; PMC PMU_CONTROL Register Map (ID1 group)
+DEV_CTRL                *       0xA0
+
+; bits in DEV_CTRL
+DEV_CTRL_DEV_ON         *       (1 << 0)
+DEV_CTRL_SW_RST         *       (1 << 1)
+DEV_CTRL_DEV_STATUS     *       (3 << 2)
+
+
+; general OMAP5 voltage processor parameters
+OMAP5_VP_ERROROFFSET            * 0
+OMAP5_VP_VSTEPMIN               * 1
+OMAP5_VP_VSTEPMAX               * 4
+OMAP5_VP_VLIMITTO_TIMEOUT       * 200   ; us
+
+; TWL6037 related voltage processor parameters
+TWL_VP_MPU_VLIMITTO_VDDMIN      * 21    ;  650 mV
+TWL_VP_MPU_VLIMITTO_VDDMAX      * 81    ; 1250 mV
+TWL_VP_MM_VLIMITTO_VDDMIN       * 21    ;  650 mV
+TWL_VP_MM_VLIMITTO_VDDMAX       * 68    ; 1120 mV
+TWL_VP_CORE_VLIMITTO_VDDMIN     * 37    ;  810 mV
+TWL_VP_CORE_VLIMITTO_VDDMAX     * 60    ; 1040 mV
+TWL_VP_STEPSIZE                 * 10000 ; uV
+TWL_VP_SLEWRATE                 * 220   ; uV/us
+
+ABB_SETTLING_TIME               * 50    ; uS
+
+
+; bit fields in DPLL_MPU registers
+; bits in CM_CLKMODE_DPLL_MPU
+CLKMODE_DPLL_EN                 *       (7 << 0)
+CLKMODE_DPLL_EN_BLPM            *       (5 << 0)        ; Bypass Low Power Mode
+CLKMODE_DPLL_EN_BFRM            *       (6 << 0)        ; Bypass Fast Relock Mode
+CLKMODE_DPLL_EN_LM              *       (7 << 0)        ; Enable DPLL in Lock Mode
+CLKMODE_DPLL_DRIFTGUARD_EN      *       (1 << 8)
+CLKMODE_DPLL_LPMODE_EN          *       (1 << 10)       ; Low Power mode
+CLKMODE_DPLL_REGM4XEN           *       (1 << 11)
+
+; bits in CM_IDLEST_DPLL_MPU
+IDLEST_ST_DPLL_CLK              *       (1 << 0)        ; DPLL lock status
+IDLEST_ST_DPLL_MODE             *       (7 << 1)        ; DPLL mode status
+IDLEST_ST_DPLL_MODE_TS          *       (0 << 1)        ; Transient State
+IDLEST_ST_DPLL_MODE_LPSM        *       (1 << 1)        ; Low Power Stop Mode
+IDLEST_ST_DPLL_MODE_FRSM        *       (2 << 1)        ; Fast Relock Stop Mode
+IDLEST_ST_DPLL_MODE_BLPM        *       (5 << 1)        ; Bypass Low Power Mode
+IDLEST_ST_DPLL_MODE_BFRM        *       (6 << 1)        ; Bypass Fast Relock Mode
+IDLEST_ST_DPLL_INIT             *       (1 << 4)        ; DPLL init status
+
+; bits in CM_AUTOIDLE_DPLL_MPU
+AUTOIDLE_AUTO_DPLL_MODE         *       (7 << 0)        ; DPLL automatic control
+AUTOIDLE_AUTO_DPLL_MODE_DIS     *       (0 << 0)        ; Disabled
+AUTOIDLE_AUTO_DPLL_MODE_LPSM    *       (1 << 0)        ; Low Power Stop Mode
+AUTOIDLE_AUTO_DPLL_MODE_FRSM    *       (2 << 0)        ; Fast Relock Stop Mode
+AUTOIDLE_AUTO_DPLL_MODE_BLPM    *       (5 << 0)        ; Bypass Low Power Mode
+AUTOIDLE_AUTO_DPLL_MODE_BFRM    *       (6 << 0)        ; Bypass Fast Relock Mode
+
+; bits in CM_CLKSEL_DPLL_MPU
+CLKSEL_DPLL_DIV                 *       ( 127 << 0)     ; DPLL divider factor [N value]
+CLKSEL_DPLL_DIV_SHIFT           *       0
+CLKSEL_DPLL_MULT                *       (2047 << 8)     ; DPLL multiplier factor [M value]
+CLKSEL_DPLL_MULT_SHIFT          *       8
+CLKSEL_DCC_EN                   *       (1 << 22)       ; Duty-Cycle Corrector
+CLKSEL_DPLL_BYP_CLKSEL          *       (1 << 23)       ; (fixed to 1) [RO]
+
+; bits in CM_DIV_M2_DPLL_MPU
+DIV_M2_DIVHS                    *       (31 << 0)       ; M2 post divider factor
+DIV_M2_DIVHS_OPP_NOM            *       ( 1 << 0)       ; OPP_NOM, OPP_HIGH, OPP_SPEEDBIN
+DIV_M2_DIVHS_OPP_LOW            *       ( 2 << 0)       ; used for OPP_LOW
+DIV_M2_CLKST                    *       ( 1 << 9)       ; DPLL CLKOUT status [RO]
+
+; bits in CM_MPU_MPU_CLKCTRL
+CLKSEL_EMIF_DIV_MODE            *       ( 3 << 24)      ; [0,1 == /4; 2,3 == /8]
+CLKSEL_ABE_DIV_MODE             *       ( 1 << 26)      ; [0 == /8; 1 == /16]
+CM_MPU_CLKSEL_DIV_MODE          *       ((2 << 24) + (1 << 26))
+
+
+
+
+                GBLL    DebugSR54x
+DebugSR54x      SETL    {FALSE}
+
+; flag for disabling interrupts during PLL change
+                GBLL    NoIRQforPLL
+NoIRQforPLL     SETL    {FALSE}
+;NoIRQforPLL    SETL    {TRUE}
+
+
+  [ DebugSR54x
+        MACRO
+        DumpReg $base, $reg
+        DebugTX "$reg"
+        LDR     a1, =$reg
+        LDR     a1, [$base, #$reg]
+        DebugReg a1
+        MEND
+
+DoDumpRegs
+        Entry
+        DumpReg v1, SR54x_SRCONFIG
+        DumpReg v1, SR54x_SRSTATUS
+        DumpReg v1, SR54x_SENVAL
+        DumpReg v1, SR54x_SENMIN
+        DumpReg v1, SR54x_SENMAX
+        DumpReg v1, SR54x_SENAVG
+        DumpReg v1, SR54x_AVGWEIGHT
+        DumpReg v1, SR54x_NVALUERECIPROCAL
+        DumpReg v1, SR54x_IRQSTATUS_RAW
+        DumpReg v1, SR54x_IRQSTATUS
+        DumpReg v1, SR54x_SENERROR
+        DumpReg v1, SR54x_ERRCONFIG
+        DumpReg v2, SR54x_SRCONFIG
+        DumpReg v2, SR54x_SRSTATUS
+        DumpReg v2, SR54x_SENVAL
+        DumpReg v2, SR54x_SENMIN
+        DumpReg v2, SR54x_SENMAX
+        DumpReg v2, SR54x_SENAVG
+        DumpReg v2, SR54x_AVGWEIGHT
+        DumpReg v2, SR54x_NVALUERECIPROCAL
+        DumpReg v2, SR54x_IRQSTATUS_RAW
+        DumpReg v2, SR54x_IRQSTATUS
+        DumpReg v2, SR54x_SENERROR
+        DumpReg v2, SR54x_ERRCONFIG
+        DumpReg v3, PRM_VP_CORE_CONFIG
+        DumpReg v3, PRM_VP_CORE_STATUS
+        DumpReg v3, PRM_VP_CORE_VLIMITTO
+        DumpReg v3, PRM_VP_CORE_VOLTAGE
+        DumpReg v3, PRM_VP_CORE_VSTEPMAX
+        DumpReg v3, PRM_VP_CORE_VSTEPMIN
+        DumpReg v3, PRM_VP_MPU_CONFIG
+        DumpReg v3, PRM_VP_MPU_STATUS
+        DumpReg v3, PRM_VP_MPU_VLIMITTO
+        DumpReg v3, PRM_VP_MPU_VOLTAGE
+        DumpReg v3, PRM_VP_MPU_VSTEPMAX
+        DumpReg v3, PRM_VP_MPU_VSTEPMIN
+        DumpReg v3, PRM_VC_SMPS_CORE_CONFIG
+        DumpReg v3, PRM_VC_SMPS_MM_CONFIG
+        DumpReg v3, PRM_VC_SMPS_MPU_CONFIG
+        DumpReg v3, PRM_VC_VAL_CMD_VDD_CORE_L
+        DumpReg v3, PRM_VC_VAL_CMD_VDD_MPU_L
+        DumpReg v3, PRM_VC_VAL_BYPASS
+        DumpReg v3, PRM_VC_CFG_I2C_MODE
+        DumpReg v3, PRM_VC_CFG_I2C_CLK
+        DumpReg v3, PRM_ABBLDO_MPU_CTRL
+        DumpReg v3, PRM_ABBLDO_MPU_SETUP
+        LDR     a1, L4_PRM_Log
+        DebugReg a1, PRM_IRQSTATUS_MPU_2
+        EXIT
+  ]
+
+SR54x_Exit ROUT
+        Entry   "v1-v3"
+        ; If SmartReflex is used then we need to force a SW_RESET in TWL6037
+        ; otherwise MLO (x-loader) gets stuck in init sequence
+        MOV     a1, #TWL6037_ADDR_ID1
+        SUB     sp, sp, #4
+        MOV     a2, sp
+        MOV     a3, #DEV_CTRL_SW_RST
+        STRB    a3, [a2]
+        MOV     a3, #1
+        MOV     a4, #DEV_CTRL
+        ; check if we are called with interrupts disabled - do a polling transfer
+        MRS     v1, CPSR
+        TST     v1, #I32_bit
+        ADRNEL  v1, IIC_DoOp_Poll
+        LDREQ   v1, OSentries+4*OS_IICOpV
+        BL      TPSWrite
+        EXIT
+
+
+SR54x_Init ROUT
+        ; Identify the OMAP type, set up the HAL device descriptor
+        Entry   "v1-v5,ip"
+        LDR     a1, L4_Core_Log
+        ADD     a1, a1, #(L4_CTRL_MODULE_CORE - L4_Core)
+
+        ; Init die temperature conversion at a rate of ~250 ms
+        LDR     a4, =0xA0000000         ; COUNTER_DELAY[29:27] = 4 ==> 250 ms
+        STR     a4, [a1, #CONTROL_BANDGAP_MASK]
+
+        ; First identify the OMAP type
+        LDR     a2, [a1, #CONTROL_ID_CODE]
+        LDR     a3, [a1, #CONTROL_STD_FUSE_PROD_ID]
+        UBFX    a1, a2, #12, #16        ; RAMP_SYSTEM field (OMAP family)
+        UBFX    a2, a3, #30, #2         ; SPEED_GRADE field
+  [ DebugSR54x
+        DebugReg a1, "RAMP_SYSTEM="
+        DebugReg a2, "SPEED_GRADE="
+  ]
+        ADRL    a3, CPUList
+10
+        LDMIA   a3!, {a4,v1,v2,v4,v5}
+        CMP     a4,#0
+        EXIT    EQ      ; Unrecognised CPU!
+        CMP     a1, a4
+        BNE     %BT10
+
+        ; We support SmartReflex on this device
+  [ DebugSR54x
+        DebugTX "SmartReflex supported"
+  ]
+
+        ; adjust table size according to performance type
+        ; value type            OMAP543x
+        ; 0     standard        1500 MHz
+        ; 1     standard        1500 MHz
+        ; 2     high            1700 MHz
+        CMP     a2, #2
+        SUBLT   v1, v1, #1      ; standard performance
+
+        ; v1 = OPPTbl size VDD_MPU
+        ; v2 = OPPTbl ptr  VDD_MPU
+        ; v4 = OPPTbl size VDD_CORE
+        ; v5 = OPPTbl ptr  VDD_CORE
+
+        ; save VDD_CORE table ptr for later reuse
+        Push    "v5"
+
+        ; Now set up the HAL device
+        ADRL    v3, CPUClkWS
+        MOV     a1, v3
+        ADRL    a2, SR54xDevTemplate
+        MOV     a3, #HALDevice_CPUClk_Size_0_2
+        BL      memcpy
+        STR     sb, [v3, #:INDEX: SR54xWorkspace]
+        STR     v1, [v3, #:INDEX: SR54xOPPTblSize]
+
+        ; determine actual used settings
+        LDR     ip, L4_CM_CORE_AON_Log
+        LDR     lr, [ip, #(CM_CLKSEL_DPLL_MPU + CKGEN_CM_CORE_AON)]
+        UBFX    a1, lr, #0, #19 ; extract DPLL_DIV + DPLL_MULT
+        LDR     lr, [ip, #(CM_DIV_M2_DPLL_MPU + CKGEN_CM_CORE_AON)]
+        UBFX    a2, lr, #0 ,#5  ; extract DPLL_CLKOUT_DIV
+        CMP     a2, #2          ; 1: >= OPPNOM, 2: OPPLOW
+        MOVEQ   a2, #0          ; start from OPPLOW
+        MOV     ip, v2
+        SUB     v1, v1, #1      ; highest allowed index (only for table lookup)
+11
+        LDR     lr, [ip, #SR54x_OPPTbl_DPLL_VAL]
+        CMP     lr, a1
+        BEQ     %FT12
+        CMP     a2, v1
+        ADDLT   ip, ip, #SR54x_OPPTbl_Size
+        ADDLT   a2, a2, #1
+        BLT     %BT11
+12
+        ADD     v1, v1, #1      ; back to previous index
+        STR     a2, [v3, #:INDEX: SR54xCurSpeed]
+        MVN     a1, #0
+        STR     a1, [v3, #:INDEX: SR54xNewSpeed]
+        ADD     a1, v3, #:INDEX: SR54xOPPTbl
+        MOV     a2, v2
+        ASSERT  SR54x_OPPTbl_Size = 20
+        LDR     v2, L4_Core_Log
+        ADD     v2, v2, #(L4_CTRL_MODULE_CORE - L4_Core)
+        ADRL    v5, SRDefaultTabMPU     ; point to a default calibration table
+14
+        LDMIA   a2!, {a3-a4,v4,ip,lr}
+        ; Translate NVALUERECIPROCAL + NVALUERECIPROCAL2 ptr to value
+        ASSERT  SR54x_OPPTbl_NVALUERECIPROCAL = 4
+        ASSERT  SR54x_OPPTbl_NVALUERECIPROCAL2 = 8
+        LDR     a4, [v2, a4]
+        LDR     v4, [v2, v4]
+        CMP     a4, #0          ; check for valid calibration data
+        LDREQ   a4, [v5], #4
+        LDREQ   v4, [v5], #4
+        STMIA   a1!, {a3-a4,v4,ip,lr}
+        SUBS    v1, v1, #1
+        BNE     %BT14
+
+        ; Register device with OS
+        MOV     a2, v3
+        MOV     a1, #0
+        CallOS  OS_AddDevice
+
+        ; Set v1, v2 to point to the SmartReflex instances
+        LDR     a1, L4_Core_Log
+        ADD     v1, a1, #(L4_SR_MPU - L4_Core)
+        ADD     v2, a1, #(L4_SR_CORE - L4_Core)
+        ; Set v4, v5 to point to initial OPP table entries
+        ; for v4 we use the actual entry from our workspace
+        LDR     v5, [v3, #:INDEX: SR54xCurSpeed]
+        ADD     a1, v3, #:INDEX: SR54xOPPTbl
+        ADD     v4, a1, v5, LSL #4
+        ADD     v4, v4, v5, LSL #2
+        ; for v5 there is no copy in our workspace --> use OPPNOM entry
+        Pull    "v5"            ; restore VDD_CORE table ptr
+        ; Set v3 to point to the PRM registers
+        LDR     v3, L4_PRM_Log
+        ADD     v3, v3, #DEVICE_PRM
+
+  [ DebugSR54x
+        BL      DoDumpRegs
+  ]
+
+        ; This follows TRM ch. 3.10.4 Voltage Management Low-Level Programming Guide
+        ; OMAP543x Rev. Y (p. 570 ff)
+
+        ; Set up the SmartRefex modules (OMAP5 TRM, section 3.10.4.1.3)
+  [ DebugSR54x
+        DebugTX "Setup SmartReflex"
+  ]
+
+        ; we must first enable the clocks; otherwise the module cannot be accessed
+        ; for getting clocks enabled we must do a forced wakeup in the ALWAYS_ON clock domain
+        ; Enable clocks
+        LDR     a1, L4_CM_CORE_Log
+        ADD     a1, a1, #COREAON_CM_CORE
+        MOV     a4, #2
+        STR     a4, [a1, #CM_COREAON_SMARTREFLEX_MPU_CLKCTRL]
+        STR     a4, [a1, #CM_COREAON_SMARTREFLEX_CORE_CLKCTRL]
+        STR     a4, [a1, #CM_COREAON_CLKSTCTRL] ; forced wakeup
+15      ; wait until SR modules are accessible
+        LDR     a4, [a1, #CM_COREAON_CLKSTCTRL]
+        AND     a4, a4, #((1 << 11) + (1 << 9)) ; SR_CORE_SYS_GFCLK + SR_MPU_SYS_GFCLK
+        CMP     a4, #((1 << 11) + (1 << 9))
+        BNE     %BT15
+
+        ; 1. Clock Configuration [chap. 3.10.4.1.3.1]
+        ; First, calculate SRCLKLENGTH setting
+        ; This is SR_ALWON_FCLK/(2*SR_CLK), where SR_ALWON_FCLK=sys_clk and SR_CLK=100kHz
+        ; i.e. Timer_DelayMul/2
+        LDR     a1, Timer_DelayMul
+        MOV     a1, a1, LSR #1
+        LDR     a2, [v1, #SR54x_SRCONFIG]
+        BFI     a2, a1, #SRCONFIG_SRCLKLENGTH_SHIFT, #SRCONFIG_SRCLKLENGTH_WIDTH
+        STR     a2, [v1, #SR54x_SRCONFIG]
+        LDR     a3, [v2, #SR54x_SRCONFIG]
+        BFI     a3, a1, #SRCONFIG_SRCLKLENGTH_SHIFT, #SRCONFIG_SRCLKLENGTH_WIDTH
+        STR     a3, [v2, #SR54x_SRCONFIG]
+        ; Configure desired idle mode, enable wake-up feature
+        MOV     a1, #(ERRCONFIG_IDLEMODE_SMART_WKUP >> ERRCONFIG_IDLEMODE_SHIFT)
+        LDR     a2, [v1, #SR54x_ERRCONFIG]
+        BFI     a2, a1, #ERRCONFIG_IDLEMODE_SHIFT, #ERRCONFIG_IDLEMODE_WIDTH
+        ORR     a2, a2, #ERRCONFIG_WAKEUPENABLE
+        STR     a2, [v1, #SR54x_ERRCONFIG]
+        LDR     a3, [v2, #SR54x_ERRCONFIG]
+        BFI     a3, a1, #ERRCONFIG_IDLEMODE_SHIFT, #ERRCONFIG_IDLEMODE_WIDTH
+        ORR     a3, a3, #ERRCONFIG_WAKEUPENABLE
+        STR     a3, [v2, #SR54x_ERRCONFIG]
+
+        ; 2. Sensor Configuration [chap. 3.10.4.1.3.2]
+        ; Set SENNENABLE, SENPENABLE and SENENABLE to 1
+        LDR     a2, [v1, #SR54x_SRCONFIG]
+        ORR     a2, a2, #(SRCONFIG_SENPENABLE + SRCONFIG_SENNENABLE + SRCONFIG_LVTSENPENABLE + SRCONFIG_LVTSENNENABLE)
+        ORR     a2, a2, #(SRCONFIG_SENENABLE + SRCONFIG_LVTSENENABLE)
+        STR     a2, [v1, #SR54x_SRCONFIG]
+        LDR     a3, [v2, #SR54x_SRCONFIG]
+        ORR     a3, a3, #(SRCONFIG_SENPENABLE + SRCONFIG_SENNENABLE)
+        ORR     a3, a3, #SRCONFIG_SENENABLE
+        STR     a3, [v2, #SR54x_SRCONFIG]
+
+        ; 3. Accumulator and Min/Max/Avg Configuration [chap. 3.10.4.1.3.3]
+        MOV     a1, #SR54x_SENNAVGWEIGHT + (SR54x_SENPAVGWEIGHT << 2)
+        LDR     a4, [v1, #SR54x_AVGWEIGHT]
+        BFI     a4, a1, #0, #4
+  [ DebugSR54x
+        DebugReg a4, "SR_MPU.AVGWEIGHT="
+  ]
+        STR     a4, [v1, #SR54x_AVGWEIGHT]
+        LDR     a4, [v2, #SR54x_AVGWEIGHT]
+        BFI     a4, a1, #0, #4
+        STR     a4, [v2, #SR54x_AVGWEIGHT]
+        LDR     a1, =SR54x_ACCUMDATA
+        BFI     a2, a1, #SRCONFIG_ACCUMDATA_SHIFT, #SRCONFIG_ACCUMDATA_WIDTH
+        ORR     a2, a2, #SRCONFIG_MINMAXAVGENABLE
+        STR     a2, [v1, #SR54x_SRCONFIG]
+        BFI     a3, a1, #SRCONFIG_ACCUMDATA_SHIFT, #SRCONFIG_ACCUMDATA_WIDTH
+        ORR     a3, a3, #SRCONFIG_MINMAXAVGENABLE
+        STR     a3, [v2, #SR54x_SRCONFIG]
+
+        ; 4. Error Generator Configuration [chap. 3.10.4.1.3.4]
+        ; NVALUERECIPROCAL comes straight from the relevant eFuse OPP register
+        ; v4 points to our workspace table (value is already prepared)
+        LDR     a4, [v4, #SR54x_OPPTbl_NVALUERECIPROCAL]
+  [ DebugSR54x
+        DebugReg a4, "SR_MPU.NVALUERECIPROCAL="
+  ]
+        STR     a4, [v1, #SR54x_NVALUERECIPROCAL]
+        LDR     a4, [v4, #SR54x_OPPTbl_NVALUERECIPROCAL2]
+  [ DebugSR54x
+        DebugReg a4, "SR_MPU.NVALUERECIPROCAL2="
+  ]
+        STR     a4, [v1, #SR54x_LVTNVALUERECIPROCAL]
+        ; for v5 we must load from CONTROL_MODULE
+        LDR     a1, L4_Core_Log
+        ADD     a1, a1, #(L4_CTRL_MODULE_CORE - L4_Core)
+        LDR     a4, [v5, #SR54x_OPPTbl_NVALUERECIPROCAL]
+        LDR     a4, [a1, a4]
+        CMP     a4, #0          ; check for valid calibration data
+        ADREQL  a1, SRDefaultTabCORE
+        LDREQ   a4, [a1]
+        STR     a4, [v2, #SR54x_NVALUERECIPROCAL]
+        ; enable the error generator
+        LDR     a2, [v1, #SR54x_SRCONFIG]
+        ORR     a2, a2, #SRCONFIG_ERRORGENERATORENABLE
+        STR     a2, [v1, #SR54x_SRCONFIG]
+        LDR     a3, [v2, #SR54x_SRCONFIG]
+        ORR     a3, a3, #SRCONFIG_ERRORGENERATORENABLE
+        STR     a3, [v2, #SR54x_SRCONFIG]
+
+        ; 5. Interrupt Generator Configuration [chap. 3.10.4.1.3.5]
+        ; We want automatic control, so enable VPBOUNDSINTENABLE, and don't bother
+        ; touching IRQENABLE reg
+        LDR     a1, [v4, #SR54x_OPPTbl_ERRCONFIG]
+        LDR     a4, [v1, #SR54x_ERRCONFIG]
+        BFI     a4, a1, #0, #19
+        ; Enable interrupt, clear any existing interrupt
+        ORR     a4, a4, #(ERRCONFIG_VPBOUNDSINTENABLE + ERRCONFIG_VPBOUNDSINTSTATENA)
+  [ DebugSR54x
+        DebugReg a4, "SR_MPU.ERRCONFIG="
+  ]
+        STR     a4, [v1, #SR54x_ERRCONFIG]
+
+        LDR     a1, [v5, #SR54x_OPPTbl_ERRCONFIG]
+        LDR     a4, [v2, #SR54x_ERRCONFIG]
+        BFI     a4, a1, #0, #19
+        ORR     a4, a4, #(ERRCONFIG_VPBOUNDSINTENABLE + ERRCONFIG_VPBOUNDSINTSTATENA)
+        STR     a4, [v2, #SR54x_ERRCONFIG]
+
+
+        ; Set up the voltage processor (OMAP543x TRM, section 3.10.4.1.4)
+  [ DebugSR54x
+        DebugTX "Programming voltage processor"
+  ]
+
+        ; 1. Error-to-Voltage Converter [chap. 3.10.4.1.4.1]
+        LDR     a2, [v3, #PRM_VP_MPU_CONFIG]
+        LDRB    a4, [v4, #SR54x_OPPTbl_ERRGAIN]
+        ORR     a4, a4, #(OMAP5_VP_ERROROFFSET << 8)
+        BFI     a2, a4, #16, #16
+        STR     a2, [v3, #PRM_VP_MPU_CONFIG]
+        LDR     a3, [v3, #PRM_VP_CORE_CONFIG]
+        LDRB    a4, [v5, #SR54x_OPPTbl_ERRGAIN]
+        ORR     a4, a4, #(OMAP5_VP_ERROROFFSET << 8)
+        BFI     a3, a4, #16, #16
+        STR     a3, [v3, #PRM_VP_CORE_CONFIG]
+        ; Note VSTEPMIN/VSTEPMAX settings get handled in step 2 below
+
+        ; 2. FSM Configuration [chap. 3.10.4.1.4.2]
+        ; VLIMITTO.TIMEOUT is sys_clk (in MHz) * OMAP5_VP_VLIMITTO_TIMEOUT (in uS)
+        ; i.e. Timer_DelayMul*OMAP5_VP_VLIMITTO_TIMEOUT/10
+        LDR     a1, Timer_DelayMul
+        ASSERT  (OMAP5_VP_VLIMITTO_TIMEOUT :MOD: 10) = 0
+        MOV     a4, #(OMAP5_VP_VLIMITTO_TIMEOUT / 10)
+        MUL     a1, a1, a4
+        MOVT    a1, #(TWL_VP_MPU_VLIMITTO_VDDMIN + (TWL_VP_MPU_VLIMITTO_VDDMAX << 8))
+  [ DebugSR54x
+        DebugReg a1, "PRM_VP_MPU_VLIMITTO="
+  ]
+        STR     a1, [v3, #PRM_VP_MPU_VLIMITTO]
+        MOVT    a1, #(TWL_VP_CORE_VLIMITTO_VDDMIN + (TWL_VP_CORE_VLIMITTO_VDDMAX << 8))
+        STR     a1, [v3, #PRM_VP_CORE_VLIMITTO]
+        LDRB    a1, [v4, #SR54x_OPPTbl_VDD]
+        BFI     a2, a1, #8, #8
+        ORR     a1, a2, #(1 << 2)       ; INITVDD
+        STR     a1, [v3, #PRM_VP_MPU_CONFIG]
+        LDRB    a1, [v5, #SR54x_OPPTbl_VDD]
+        BFI     a3, a1, #8, #8
+        ORR     a1, a3, #(1 << 2)       ; INITVDD
+        STR     a1, [v3, #PRM_VP_CORE_CONFIG]
+
+        ; VSTEPMIN/VSTEPMAX wait times are (TWL_VP_STEPSIZE/TWL_VP_SLEWRATE) * sys_clk (in MHz)
+        ; i.e. Timer_DelayMul*(TWL_VP_STEPSIZE/(TWL_VP_SLEWRATE*10))
+        LDR     a1, Timer_DelayMul
+;       ASSERT  ((TWL_VP_STEPSIZE*256) :MOD: (TWL_VP_SLEWRATE*10)) = 0
+        LDR     a4, =((TWL_VP_STEPSIZE * 256) / (TWL_VP_SLEWRATE * 10))
+        MUL     a4, a1, a4
+        BIC     a4, a4, #255
+        ORR     a1, a4, #OMAP5_VP_VSTEPMIN
+  [ DebugSR54x
+        DebugReg a1, "PRM_VP_MPU_VSTEPMIN="
+  ]
+        STRNE   a1, [v3, #PRM_VP_MPU_VSTEPMIN]
+        STR     a1, [v3, #PRM_VP_CORE_VSTEPMIN]
+        ORR     a1, a4, #OMAP5_VP_VSTEPMAX
+  [ DebugSR54x
+        DebugReg a1, "PRM_VP_MPU_VSTEPMAX="
+  ]
+        STRNE   a1, [v3, #PRM_VP_MPU_VSTEPMAX]
+        STR     a1, [v3, #PRM_VP_CORE_VSTEPMAX]
+
+        ; 3. Enable interrupts
+        ; (do nothing, since we want automatic H/W control)
+
+  [ DebugSR54x
+        DebugTX "Enabling voltage processor"
+  ]
+
+        ; 4. Enable the module
+        ORR     a2, a2, #((1 << 0) + (1 << 3))  ; VPENABLE + TIMEOUTEN
+        STR     a2, [v3, #PRM_VP_MPU_CONFIG]
+        ORR     a3, a3, #((1 << 0) + (1 << 3))  ; VPENABLE + TIMEOUTEN
+        STR     a3, [v3, #PRM_VP_CORE_CONFIG]
+
+
+        ; remark: ABB == Adaptive Body Bias
+        ; Set up ABB LDO for FBB
+
+        ; Calculate SR2_WTCNT_VALUE as 1/16th the number of system clock cycles to wait
+        LDR     a1, Timer_DelayMul
+        ASSERT  ((ABB_SETTLING_TIME << 4) :MOD: 10) = 0
+        MOV     a2, #(ABB_SETTLING_TIME << 4) / 10      ; << 4 so result is in bits 8-15
+        MUL     a1, a2, a1
+        AND     a1, a1, #&FF00
+        ORR     a1, a1, #(1 + (1 << 2)) ; SR2EN + ACTIVE_FBB_SEL
+        STR     a1, [v3, #PRM_ABBLDO_MPU_SETUP]
+        ; Go to fast mode
+        MOV     a1, #(1 + (1 << 2))     ; OPP_SEL_FastOPP + OPP_CHANGE
+        STR     a1, [v3, #PRM_ABBLDO_MPU_CTRL]
+        ; Wait for completion
+15
+        LDR     a1, [v3, #PRM_ABBLDO_MPU_CTRL]
+        TST     a1, #(1 << 6)           ; SR2_IN_TRANSITION
+        BNE     %BT15
+
+        ; Program the voltage controller with the IIC details of TWL6037
+        ; (OMAP543x TRM, section 3.10.4.1.5)
+  [ DebugSR54x
+        DebugTX "Programming voltage controller"
+  ]
+
+        ; 1. Set Slave address, Voltage and Command register address (VDD_CORE)
+        MOV     a1, #TWL6037_ADDR_ID0
+        ORR     a1, a1, #(VDD_CORE_SR_VOLT_REG << 8)
+        ORR     a1, a1, #(VDD_CORE_SR_CMD_REG << 16)
+        ORR     a1, a1, #((1 << 28) + (1 << 26) + (1 << 25) + (1 << 24))
+        STR     a1, [v3, #PRM_VC_SMPS_CORE_CONFIG]
+        ; 2. Set Slave address, Voltage and Command register address (VDD_MM)
+        MOV     a1, #TWL6037_ADDR_ID0
+        ORR     a1, a1, #(VDD_MM_SR_VOLT_REG << 8)
+        ORR     a1, a1, #(VDD_MM_SR_CMD_REG << 16)
+        ORR     a1, a1, #((1 << 28) + (1 << 26) + (1 << 25) + (1 << 24))
+        STR     a1, [v3, #PRM_VC_SMPS_MM_CONFIG]
+        ; 3. Set Slave address, Voltage and Command register address (VDD_MPU)
+        MOV     a1, #TWL6037_ADDR_ID0
+        ORR     a1, a1, #(VDD_MPU_SR_VOLT_REG << 8)
+        ORR     a1, a1, #(VDD_MPU_SR_CMD_REG << 16)
+        ORR     a1, a1, #((1 << 28) + (1 << 26) + (1 << 25) + (1 << 24))
+        STR     a1, [v3, #PRM_VC_SMPS_MPU_CONFIG]
+        ; 4. Configure voltage domain command values: on/off/retention voltages
+        LDR     a1, =&3E3E1A00          ; OFF=0V, RET=700mV, ONLP=1060mV, ON=1060mV
+        STR     a1, [v3, #PRM_VC_VAL_CMD_VDD_MPU_L]
+        STR     a1, [v3, #PRM_VC_VAL_CMD_VDD_CORE_L]
+        ; 5. Configure IIC
+        ; Enable high-speed mode, but don't program a master code?
+        LDR     a1, [v3, #PRM_VC_CFG_I2C_MODE]
+        ORR     a1, a1, #(1 << 3)       ; HSMODEEN
+        STR     a1, [v3, #PRM_VC_CFG_I2C_MODE]
+        ; value taken from android-3.4 sources
+        LDR     a1, =&0b00150e
+        STR     a1, [v3, #PRM_VC_CFG_I2C_CLK]
+
+        ; 7. Enable the module
+        LDR     a2, [v1, #SR54x_SRCONFIG]
+        ORR     a2, a2, #SRCONFIG_SRENABLE
+        STR     a2, [v1, #SR54x_SRCONFIG]
+        LDR     a3, [v2, #SR54x_SRCONFIG]
+        ORR     a3, a3, #SRCONFIG_SRENABLE
+        STR     a3, [v2, #SR54x_SRCONFIG]
+  [ DebugSR54x
+        DebugTX "Enable SmartReflex"
+        DebugReg a2,"SR_MPU.SRCONFIG="
+        DebugReg a3,"SR_CORE.SRCONFIG="
+  ]
+
+  [ DebugSR54x
+        ; Set v1, v2 to point to the SmartReflex instances
+        LDR     a1, L4_Core_Log
+        ADD     v1, a1, #(L4_SR_MPU - L4_Core)
+        ADD     v2, a1, #(L4_SR_CORE - L4_Core)
+        ; Set v3 to point to the PRM registers
+        LDR     v3, L4_PRM_Log
+        ADD     v3, v3, #DEVICE_PRM
+        ; Set v4, v5 to point to initial OPP table entries
+        ADRL    v4, (End_OPPTbl_OMAP4430_MPU  - SR54x_OPPTbl_Size)
+        ADRL    v5, (End_OPPTbl_OMAP4430_CORE - SR54x_OPPTbl_Size)
+        BL      DoDumpRegs
+  ]
+
+        ; Finished
+        MOV     a1, #0
+        EXIT
+
+
+; OPP table entry macro for TWL6037 PMIC
+        MACRO
+        OPPTwlEntry $mhz,$vdd,$abb_opp,$clkout_m2,$clk_m,$clk_n,$clk_dcc,$nvalreg,$nvalreg2,$errmin,$errgain
+        ; VDD specified in mV
+        DCW     $mhz
+        ; voltage range (500 mV - 1650 mV)
+        DCB     (((($vdd - 500) + 9) / 10) + 6) ; VSEL = (V - 500) / 10 + 6
+        DCB     ($abb_opp << 7) + $clkout_m2
+        DCD     $nvalreg
+        DCD     $nvalreg2
+        DCB     $errmin
+        DCB     SR54x_ERRMAXLIMIT
+        DCB     SR54x_ERRWEIGHT
+        DCB     $errgain
+        DCD     ($clk_m << 8) + $clk_n + ($clk_dcc << 22)
+        MEND
+
+; recommended frequency settings
+; OMAP5432 (Data Manual Rev. J, Chap. 5.2.3.4)
+; OPP           fMPU    M       N       M2      DCC     fDPLL
+; OPPLOW         500    625     11      2       0       2000
+; OPPNOM        1000    625     11      1       0       2000
+; OPPHIGH       1500    625     7       1       1       1500
+; OPPSB         1700    625     23      1       1       1700
+;
+
+
+; OPP values taken from Android (v3.4) [arm/arch/opp5xxx_data.c]
+; OPP tables for OMAP543x
+OPPTbl_OMAP543x_MPU
+        OPPTwlEntry  500,  880, 0, 2, 625, 11, 0, OMAP54XX_CONTROL_FUSE_MPU_OPPLOW,  OMAP54XX_CONTROL_FUSE_MPU_LVT_OPPLOW,  &f4, &0c
+        OPPTwlEntry 1000, 1060, 1, 1, 625, 11, 0, OMAP54XX_CONTROL_FUSE_MPU_OPPNOM,  OMAP54XX_CONTROL_FUSE_MPU_LVT_OPPNOM,  &f9, &16
+        OPPTwlEntry 1500, 1250, 1, 1, 625,  7, 1, OMAP54XX_CONTROL_FUSE_MPU_OPPHIGH, OMAP54XX_CONTROL_FUSE_MPU_LVT_OPPHIGH, &fa, &23
+        OPPTwlEntry 1700, 1260, 1, 1, 974, 11, 1, OMAP54XX_CONTROL_FUSE_MPU_OPPSB,   OMAP54XX_CONTROL_FUSE_MPU_LVT_OPPSB,   &fa, &27
+End_OPPTbl_OMAP543x_MPU
+
+; SmartReflex CORE has no LVT parameter
+OPPTbl_OMAP543x_CORE
+        OPPTwlEntry  266, 1040, 0, 2, 277,  4, 0, OMAP54XX_CONTROL_FUSE_CORE_OPPNOM, 0, &f9, &16
+End_OPPTbl_OMAP543x_CORE
+
+        MACRO
+        CPUListEntry $ramp_system, $list1, $list2
+        DCD     $ramp_system
+        ASSERT  (End_$list1 - $list1) / SR54x_OPPTbl_Size <= SR54x_OPPTbl_Max
+        DCD     (End_$list1 - $list1) / SR54x_OPPTbl_Size
+        DCD     $list1
+        ASSERT  (End_$list2 - $list2) / SR54x_OPPTbl_Size <= SR54x_OPPTbl_Max
+        DCD     (End_$list2 - $list2) / SR54x_OPPTbl_Size
+        DCD     $list2
+        MEND
+
+CPUList
+        CPUListEntry RAMP_SYSTEM_OMAP5430, OPPTbl_OMAP543x_MPU, OPPTbl_OMAP543x_CORE
+        CPUListEntry RAMP_SYSTEM_OMAP5432, OPPTbl_OMAP543x_MPU, OPPTbl_OMAP543x_CORE
+        DCD     0
+
+; table with "default calibration data" for devices which don't provide this information
+; table contains value pairs for normal and LVT sensors
+SRDefaultTabMPU
+        DCD     &0099A4BB, &00AACAF2    ; OPP_LOW
+        DCD     &00AAC1D6, &00AA8699    ; OPP_NOM
+        DCD     &00AA818D, &00BBC4DA    ; OPP_HIGH
+        DCD     &00000000, &00000000    ; OPP_SB
+
+SRDefaultTabCORE
+        DCD     &00AACEE5, &00000000    ; OPP_NOM
+
+
+SR54xDevTemplate
+        DCW     HALDeviceType_SysPeri + HALDeviceSysPeri_CPUClk
+        DCW     HALDeviceID_CPUClk_OMAP5
+        DCD     HALDeviceBus_Peri + HALDevicePeriBus_Sonics3220
+        DCD     2                       ; API version (v0.2)
+        DCD     SR54x_Desc              ; Description
+        DCD     0                       ; Address - unused
+        %       12                      ; Unused
+        DCD     SR54x_Activate
+        DCD     SR54x_Deactivate
+        DCD     SR54x_Reset
+        DCD     SR54x_Sleep
+        DCD     -1                      ; Device - unused
+        DCD     0                       ; TestIRQ
+        DCD     0                       ; ClearIRQ
+        %       4
+        ASSERT  (.-SR54xDevTemplate) = HALDeviceSize
+        DCD     SR54x_NumSpeeds
+        DCD     SR54x_Info
+        DCD     SR54x_Get
+        DCD     SR54x_Set
+        DCD     SR54x_Override
+        DCD     SR54x_GetOverride
+        DCD     SR54x_GetDieTemp
+        ASSERT  (.-SR54xDevTemplate) = HALDevice_CPUClk_Size_0_2
+
+SR54x_Desc
+        =       "OMAP54x SmartReflex CPU clock controller",0
+        ALIGN
+
+SR54x_Activate
+        ; Do nothing
+        MOV     a1, #1
+SR54x_Deactivate
+SR54x_Reset
+        MOV     pc, lr
+
+SR54x_Sleep
+        MOV     a1, #0
+        MOV     pc, lr
+
+SR54x_NumSpeeds
+        ; Out: a1 = num entries in table
+        LDR     a1, SR54xOPPTblSize
+        MOV     pc, lr
+
+SR54x_Info
+        ; In: a2 = table index
+        ; Out: a1 = MHz
+        ADR     a3, SR54xOPPTbl
+        ASSERT  SR54x_OPPTbl_Size = 20
+        ASSERT  SR54x_OPPTbl_MHz = 0
+        ADD     a3, a3, a2, LSL #4
+        ADD     a3, a3, a2, LSL #2
+        LDRH    a1, [a3, #SR54x_OPPTbl_MHz]
+        MOV     pc, lr
+
+        ; On OMAP5 it is critical to have interrupts disabled for long times; it affects at
+        ; first the audio system [OMAP5 does only support high sample rates (88200 and 96000)
+        ; and therefore the sound buffer is emptied in relative short times (e.g. the default
+        ; size of audio samples (208) results in a time of 2.36 ms for 88200 or 2.16 ms for
+        ; 96000).
+        ; Having interrupts disabled for the complete sequence of clock and OPP switching
+        ; results in an audible click/pop noise when RISC OS restarts the sound DMA process.
+        ;
+        ; To avoid this situation we try to keep the time where interrupts are disabled as
+        ; short as possible; in fact we also must reenable interrupts because PortableHAL
+        ; does call the device Set entry with interrupts disabled!
+        ;
+        ; For avoiding reentrancy problems we will use the workspace variable SR54xNewSpeed
+        ; as a semaphore; it is only written inside the Reprogram function, and this function
+        ; checks it for avoiding reentrancy problems
+
+SR54x_Get
+        ; Return current table index
+  [ {FALSE} ; {TRUE}
+        EntryS  "sb"
+        CPSID   i       ; Prevent speed changing while we're reading it
+        LDR     a2, SR54xNewSpeed
+        LDR     sb, SR54xWorkspace
+        CMP     a2, #-1 ; Are we changing speed?
+        BLNE    SR54x_Set ; Yes, complete the change so that the returned value is accurate
+        ADRL    a2, CPUClkWS
+        LDR     a1, SR54xCurSpeed
+        EXITS
+  |
+        LDR     a2, SR54xNewSpeed
+        CMP     a2, #-1                 ; a value other than -1 will indicate the new speed
+        LDREQ   a1, SR54xCurSpeed
+        MOVNE   a1, a2
+        MOV     pc, lr
+  ]
+
+SR54x_Set ROUT
+        ; a2 = new table index
+        ; Return 0 on success, -1 on failure
+        EntryS  "v1-v5,sb"
+        ; We want to avoid interrupt latency problems (with the audio system); since this
+        ; routine gets called from the PortableHAL module with interrupts disabled we have
+        ; to reenable them again.
+
+  [ {TRUE} ; {FALSE}
+        CPSIE   i
+  ]
+        ; Clamp a2, get table entry
+        LDR     sb, SR54xWorkspace
+        CMP     a2, #0
+        LDR     v3, SR54xOPPTblSize
+        MOVLT   a2, #0
+        ADR     v2, SR54xOPPTbl
+        CMP     a2, v3
+        SUBGE   a2, v3, #1
+        ASSERT  SR54x_OPPTbl_Size = 20
+        ASSERT  SR54x_OPPTbl_MHz = 0
+        ADD     v2, v2, a2, LSL #4
+        ADD     v2, v2, a2, LSL #2
+  [ {FALSE} ; DebugSR54x
+        LDRH    v3, [v2, #SR54x_OPPTbl_MHz]
+        ; a2 = new idx
+        ; v2 = OPP table entry ptr
+        ; v3 = new clock rate setting
+        DebugReg a2,"SR54x_Set: Idx="
+        DebugReg v2,"OPPTbl ptr="
+        DebugReg v3,"New rate="
+        LDR     a3, SR54xNewSpeed
+        DebugReg a3,"Re-entrancy flag="
+  ]
+
+        ; Set the re-entrancy flag (using exclusive access mechanism of ARMv7)
+        ADR     v1, SR54xNewSpeed
+        LDREX   v4, [v1]
+        CMP     v4, #-1
+        BNE     %FT10           ; value other than -1 means it is a reentrant call
+        STREX   v5, a2, [v1]
+        CMP     v5, #0          ; check if update was successful
+        B       %FT15
+10
+        CLREX                   ; reset exclusive access action (unconditionally)
+15
+        MOVNE   a1, #-1
+        BNE     %FT50
+
+        ; Set up v4 = VP regs, v5 = SR regs
+        LDR     v4, L4_PRM_Log
+        ADD     v4, v4, #DEVICE_PRM
+        LDR     v5, L4_Core_Log
+        ADD     v5, v5, #(L4_SR_MPU - L4_Core)
+
+        ; TRM: chapter 3.10.4.2 (OMAP543x TRM Rev Y)
+        ; When switching from the current OPP to a target OPP, if the clock frequency of the
+        ; target OPP is less than that of the current OPP, the clock frequency is first
+        ; switched to the lower frequency of target OPP, and only then is the voltage scaling
+        ; initiated. However, if the clock frequency of the target OPP is greater than that of
+        ; the current OPP, voltage scaling is initiated before frequency scaling.
+        ;
+        ; The OPP tables are in ascending order (clock frequency), so we can directly use the
+        ; table index for comparison.
+        LDR     ip, SR54xCurSpeed
+        ; prepare ABB OPP_SEL value
+        ; get it from OPP table
+        LDRB    a1, [v2, #SR54x_OPPTbl_CLKOUT_M2]
+        UBFX    v1, a1, #7, #1
+        CMP     a2, ip
+        BEQ     %FT40
+        BLT     %FT20
+
+        ; go to higher frequency
+        ; 1. voltage scaling
+        BL      SR54x_Reprogram
+        ; 2. adjust DPLL registers
+        LDRB    a1, [v2, #SR54x_OPPTbl_CLKOUT_M2]
+        BIC     a1, a1, #(1 << 7)       ; remove ABB_OPP flag
+        LDR     v3, [v2, #SR54x_OPPTbl_DPLL_VAL]
+        BL      CPUClk_AdjustDPLL       ; v3-v5, ip corrupt
+        B       %FT40
+
+20
+        ; go to lower frequency
+        ; 1. adjust DPLL registers
+        Push    "v4-v5"
+        LDRB    a1, [v2, #SR54x_OPPTbl_CLKOUT_M2]
+        BIC     a1, a1, #(1 << 7)       ; remove ABB_OPP flag
+        LDR     v3, [v2, #SR54x_OPPTbl_DPLL_VAL]
+        BL      CPUClk_AdjustDPLL       ; v3-v5, ip corrupt
+        Pull    "v4-v5"
+        ; 2. voltage scaling
+        ORR     v1, v1, #(1 << 7)       ; flag: ABB OPP change before voltage change
+        BL      SR54x_Reprogram
+
+40
+
+  [ {FALSE} ; DebugSR54x
+        DebugTX "SR54x_Set done"
+  ]
+        ; All done
+        ; However it's still possible we were re-entered;
+        ; only set SR54xCurSpeed if SR54xNewSpeed != -1
+        ADRL    a1, CPUClkWS
+        LDR     a2, SR54xNewSpeed
+        CMP     a2, #-1
+        STRNE   a2, SR54xCurSpeed
+        MVN     a3, #0
+        STR     a3, SR54xNewSpeed
+        MOV     a1, #0
+50
+        EXITS   ,c
+
+
+SR54x_Override ROUT
+        EntryS  "v1,v2"
+        CPSID   i
+        ; a2 = table ptr
+        ; a3 = num entries
+        ; a4 = format no.
+        CMP     a4, #SR54x_OPPTbl_Format
+        BNE     %FT20
+        CMP     a3, #SR54x_OPPTbl_Max
+        BGT     %FT20
+        ; Check we aren't in the middle of setting the speed
+        LDR     ip, SR54xNewSpeed
+        CMP     ip, #-1
+        MVNNE   a1, #0 ; -1 for try again later
+        EXITS   NE,c
+        ; Update table
+        ASSERT  SR54x_OPPTbl_Size = 20
+        STR     a3, SR54xOPPTblSize
+        ADR     ip, SR54xOPPTbl
+10
+        LDMIA   a2!, {a1,a4,v1,v2,lr}
+        SUBS    a3, a3, #1
+        STMIA   ip!, {a1,a4,v1,v2,lr}
+        BNE     %BT10
+20
+        MOV     a1, #SR54x_OPPTbl_Format ; Return expected table format
+        EXITS   ,c
+
+
+SR54x_GetOverride ROUT
+        Entry   "v1,v2"
+        ; a2 = table ptr
+        ; a3 = num entries
+        ; a4 = format no.
+        CMP     a4, #SR54x_OPPTbl_Format
+        BNE     %FT20
+        CMP     a3, #SR54x_OPPTbl_Max
+        BGT     %FT20
+        ; copy table into supplied buffer
+        ASSERT  SR54x_OPPTbl_Size = 20
+        ADR     ip, SR54xOPPTbl
+10
+        LDMIA   ip!, {a1,a4,v1,v2,lr}
+        SUBS    a3, a3, #1
+        STMIA   a2!, {a1,a4,v1,v2,lr}
+        BNE     %BT10
+20
+        MOV     a1, #SR54x_OPPTbl_Format ; Return expected table format
+        EXIT
+
+
+SR54x_Reprogram ROUT
+        Entry   "a1-a4,ip"
+        ; Reprogram the SR instance & voltage processor with new values
+        ; In:
+        ;   v1 = ABB OPP_SEL value + flag
+        ;   v2 = OPPTbl entry
+        ;   v4 = voltage processor
+        ;   v5 = smartreflex instance
+        ;   sb = HAL workspace
+        ;   IRQs enabled
+        ; Out:
+        ;   all regs preserved
+        ; This follows section 3.10.4.2 (OMAP543x Rev Y)
+        ; plus any extra steps that are necessary (e.g. to wait
+        ; for the SR module disable acknowledgement)
+
+        ; 1. Disable smartreflex
+        LDR     a1, [v5, #SR54x_SRCONFIG]
+        TST     a1, #SRCONFIG_SRENABLE
+        BEQ     %FT20
+        BIC     a1, a1, #SRCONFIG_SRENABLE
+        ; Clear any current disable ack IRQ before disabling the module
+        MVN     a2, #0
+        STR     a2, [v5, #SR54x_IRQSTATUS]
+        STR     a1, [v5, #SR54x_SRCONFIG]
+        ; Wait for acknowledge
+10
+        LDR     a1, [v5, #SR54x_IRQSTATUS_RAW]
+        TST     a1, #1
+        BEQ     %BT10
+20
+
+        ; 2. Disable voltage processor, and make sure INITVDD+FORCEUPDATE clear
+        LDR     a1, [v4, #PRM_VP_MPU_CONFIG]
+        BIC     a1, a1, #((1 << 0) + (1 << 1) + (1 << 2))
+        STR     a1, [v4, #PRM_VP_MPU_CONFIG]
+        ; Wait for idle
+30
+        LDR     a2, [v4, #PRM_VP_MPU_STATUS]
+        TST     a2, #1                  ; VPINIDLE
+        BEQ     %BT30
+
+        ; check whether we need first to change ABB conditions
+        CMP     v1, #127
+        BLT     %FT40
+        UBFX    a1, v1, #0, #2
+        LDR     a2, [v4, #PRM_ABBLDO_MPU_CTRL]
+        UBFX    a3, a2, #0, #2
+        CMP     a1, a3
+        BEQ     %FT40
+        ; Put ABBLDO in new mode
+        ORR     a1, a1, #(1 << 2)       ; OPP_CHANGE
+        STR     a1, [v4, #PRM_ABBLDO_MPU_CTRL]
+        ; Wait for completion
+35
+        LDR     a1, [v4, #PRM_ABBLDO_MPU_CTRL]
+        TST     a1, #(1 << 6)           ; SR2_IN_TRANSITION
+        BNE     %BT35
+
+40
+        ; 3. Reprogram smartreflex instance
+        LDR     a1, [v2, #SR54x_OPPTbl_NVALUERECIPROCAL]
+        STR     a1, [v5, #SR54x_NVALUERECIPROCAL]
+        LDR     a1, [v2, #SR54x_OPPTbl_NVALUERECIPROCAL2]
+        STR     a1, [v5, #SR54x_LVTNVALUERECIPROCAL]
+        LDR     a1, [v2, #SR54x_OPPTbl_ERRCONFIG]
+        LDR     a2, [v5, #SR54x_ERRCONFIG]
+        BFI     a2, a1, #0, #19
+        ; Enable interrupt, clear any existing interrupt
+        ORR     a2, a2, #(ERRCONFIG_VPBOUNDSINTENABLE + ERRCONFIG_VPBOUNDSINTSTATENA)
+        STR     a2, [v5, #SR54x_ERRCONFIG]
+
+        ; 4. Set voltage processor error gain value and program new INITVOLTAGE
+        LDRB    a1, [v2, #SR54x_OPPTbl_ERRGAIN]
+        LDR     a2, [v4, #PRM_VP_MPU_CONFIG]
+        BFI     a2, a1, #16, #8
+        LDRB    a4, [v2, #SR54x_OPPTbl_VDD]
+        UBFX    a3, a2, #8, #8
+        BFI     a2, a4, #8, #8
+        ORR     a1, a2, #(1 << 2)       ; INITVDD
+        STR     a1, [v4, #PRM_VP_MPU_CONFIG]
+
+        ; 6. Use FORCEUPDATE to send the update to the SMPS (TWL)
+        ; First clear any pending transaction done interrupts
+        LDR     lr, L4_PRM_Log
+        MVN     a1, #0
+        STR     a1, [lr, #PRM_IRQSTATUS_MPU_2]
+        ; Force update
+        ORR     a1, a2, #(1 << 1)       ; FORCEUPDATE
+        STR     a1, [v4, #PRM_VP_MPU_CONFIG]
+        ; Wait for completion
+45
+        ; Check if IRQ happened yet
+        LDR     ip, [lr, #PRM_IRQSTATUS_MPU_2]
+        TST     ip, #(1 << 5)           ; VP_MPU_TRANXDONE_ST
+        BEQ     %BT45
+
+        ; check whether we need to change ABB conditions after the voltage scaling
+        CMP     v1, #127
+        BGT     %FT60
+        UBFX    a1, v1, #0, #2
+        LDR     a2, [v4, #PRM_ABBLDO_MPU_CTRL]
+        UBFX    a3, a2, #0, #2
+        CMP     a1, a3
+        BEQ     %FT60
+        ; Put ABBLDO in new mode
+        ORR     a1, a1, #(1 << 2)       ; OPP_CHANGE
+        STR     a1, [v4, #PRM_ABBLDO_MPU_CTRL]
+        ; Wait for completion
+55
+        LDR     a1, [v4, #PRM_ABBLDO_MPU_CTRL]
+        TST     a1, #(1 << 6)           ; SR2_IN_TRANSITION
+        BNE     %BT55
+
+60
+        ; 9. Re-enable modules
+        LDR     a1, [v4, #PRM_VP_MPU_CONFIG]
+        ORR     a1, a1, #1              ; VPENABLE
+        STR     a1, [v4, #PRM_VP_MPU_CONFIG]
+        LDR     a1, [v5, #SR54x_SRCONFIG]
+        ORR     a1, a1, #SRCONFIG_SRENABLE
+        STR     a1, [v5, #SR54x_SRCONFIG]
+
+        ; Done
+        EXIT
+
+
+CPUClk_AdjustDPLL ROUT
+        ; Routine for adjusting MPU DPLL
+        ; In:
+        ;       a1 = new CLKOUT_M2 setting
+        ;       v3 = new CM_CLKSEL_DPLL_MPU value
+        ;       sb = HAL workspace
+        ;       IRQs enabled
+        ; Out:
+        ;       v3-v5, ip corrupt
+  [ NoIRQforPLL
+        EntryS
+  |
+        Entry
+  ]
+        LDR     ip, L4_CM_CORE_AON_Log
+        LDR     lr, [ip, #(CM_CLKSEL_DPLL_MPU + CKGEN_CM_CORE_AON)]
+        MOV     v4, lr
+        BFI     v4, v3, #0, #23 ; Update DPLL_DIV + DPLL_MULT + DCC_EN
+        LDR     v5, [ip, #(CM_DIV_M2_DPLL_MPU + CKGEN_CM_CORE_AON)]
+        LDR     v3, [ip, #(CM_CLKMODE_DPLL_MPU + CKGEN_CM_CORE_AON)]
+        ; v4 = new CM_CLKSEL_DPLL_MPU
+        ; a1 = new CM_DIV_M2_DPLL_MPU
+        ; lr = old CM_CLKSEL_DPLL_MPU
+        ; v5 = old CM_DIV_M2_DPLL_MPU
+  [ DebugSR54x
+        Push    "lr"
+        DebugReg v4, "New CM_CLKSEL_DPLL_MPU="
+        DebugReg a1, "New CM_DIV_M2_DPLL_MPU="
+        LDR     lr, [sp]
+        DebugReg lr, "Old CM_CLKSEL_DPLL_MPU="
+        DebugReg v5, "Old CM_DIV_M2_DPLL_MPU="
+        Pull    "lr"
+  ]
+        CMP     v4, lr
+        CMPEQ   a1, v5
+        ANDEQ   lr, v3, #7
+        CMPEQ   lr, #7
+        BEQ     %FT60 ; No parameters need updating, skip the update
+  [ DebugSR54x
+        DebugTX "Going to bypass mode"
+  ]
+
+        ; Check for adjusting CM_MPU_MPU_CLKCTRL DIV_MODE flags before frequency change
+        TST     v4, #CLKSEL_DCC_EN
+        LDRNE   v3, [ip, #(CM_MPU_MPU_CLKCTRL + MPU_CM_CORE_AON)]
+        ORRNE   v3, v3, #CM_MPU_CLKSEL_DIV_MODE
+        STRNE   v3, [ip, #(CM_MPU_MPU_CLKCTRL + MPU_CM_CORE_AON)]
+
+  [ NoIRQforPLL
+        ; disable interrupts during PLL change
+        CPSID   i
+  ]
+        ; Go to bypass fast relock mode
+        MOV     lr, #CLKMODE_DPLL_EN_BFRM
+        BFI     v3, lr, #0, #3
+        STR     v3, [ip, #(CM_CLKMODE_DPLL_MPU + CKGEN_CM_CORE_AON)]
+        ; Wait for completion
+40
+        LDR     lr, [ip, #(CM_IDLEST_DPLL_MPU + CKGEN_CM_CORE_AON)]
+        TST     lr, #IDLEST_ST_DPLL_CLK
+        BNE     %BT40
+  [ DebugSR54x
+        DebugTX "Setting new clock rate"
+  ]
+        ; Set new frequency
+        STR     v4, [ip, #(CM_CLKSEL_DPLL_MPU + CKGEN_CM_CORE_AON)]
+        STR     a1, [ip, #(CM_DIV_M2_DPLL_MPU + CKGEN_CM_CORE_AON)]
+  [ DebugSR54x
+        DebugTX "Requesting lock"
+  ]
+        ; Request lock mode
+        ORR     v3, v3, #CLKMODE_DPLL_EN_LM
+        STR     v3, [ip, #(CM_CLKMODE_DPLL_MPU + CKGEN_CM_CORE_AON)]
+        ; Wait for completion
+50
+        LDR     lr, [ip, #(CM_IDLEST_DPLL_MPU + CKGEN_CM_CORE_AON)]
+        TST     lr, #IDLEST_ST_DPLL_CLK
+        BEQ     %BT50
+  [ DebugSR54x
+        DebugTX "Lock complete"
+  ]
+
+        ; Check for adjusting CM_MPU_MPU_CLKCTRL DIV_MODE flags after frequency change
+        TST     v4, #CLKSEL_DCC_EN
+        LDREQ   v3, [ip, #(CM_MPU_MPU_CLKCTRL + MPU_CM_CORE_AON)]
+        BICEQ   v3, v3, #CM_MPU_CLKSEL_DIV_MODE
+        STREQ   v3, [ip, #(CM_MPU_MPU_CLKCTRL + MPU_CM_CORE_AON)]
+
+60
+  [ NoIRQforPLL
+        EXITS   ,c
+  |
+        EXIT
+  ]
+
+
+; Temperature calculation constants (in units of 2^-18)
+TEMP_SCALE              *       18
+TEMP_KELVIN_OFFS        *       2732            ; in 0.1 K
+TEMP_CONST_A0           *       -736240806
+TEMP_CONST_A1           *       1205350
+TEMP_CONST_A2           *       -81
+
+; bits in CONTROL_TEMP_SENSOR_MPU
+TEMP_SENSOR_EOCZ        *       (1 << 10)       ; End Of Conversion
+TEMP_SENSOR_MASK        *       0x3FF
+
+
+SR54x_GetDieTemp
+        ; Out: a1 = CPU die temperature in units of 0.1 K
+        ;
+        ; Remark:
+        ; Reading temperature sensor register is covered by errata ID i814
+        ; Choose workaround for ES1.0 devices (even for ES2.0)
+        ; For ES2.0 workaround registers CONTROL_TEMP_SENSOR_MPU and
+        ; CONTROL_DTEMP_MPU_n (n = 0 to 4) MUST not be used.
+        ; But how should we read then a temperature??
+        ; The only allowed register is CONTROL_BANDGAP_CUMUL_DTEMP_MPU;
+        ; but for getting at the correct temperature we would also need a counter value
+        ; from CONTROL_DTEMP_MPU_n[31:10] so that we can calculate an average value
+        ; out of the cummulative value.
+        ;
+        Entry   "sb"
+        LDR     sb, SR54xWorkspace
+        LDR     a4, L4_Core_Log
+        ADD     a4, a4, #(L4_CTRL_MODULE_CORE - L4_Core)
+10
+        LDR     a2, [a4, #CONTROL_TEMP_SENSOR_MPU]      ; read actual value
+        TST     a2, #TEMP_SENSOR_EOCZ                   ; check for a running conversion
+        BNE     %BT10                                   ; wait until finished
+        LDR     a3, [a4, #CONTROL_TEMP_SENSOR_MPU]      ; read it twice (errata ID i814)
+        CMP     a2, a3
+        LDRNE   a3, [a4, #CONTROL_TEMP_SENSOR_MPU]      ; and (maybe) a 3rd read
+        UBFX    a2, a3, #0 ,#10                         ; extract temperature ADC value
+        ; now convert the ADC value to a temperature
+        ; instead of using a large table (OMAP543x TRM Rev. AC, page 3818 - 3820)
+        ; we are calculating a polynom of second order derived from above table
+        ; y := temp; x := ADC value
+        ; y = ((A2 * x + A1) * x + A0) >> TEMP_SCALE
+        LDR     a3, =TEMP_CONST_A2
+        LDR     a4, =TEMP_CONST_A1
+        MLA     a1, a3, a2, a4
+        LDR     a4, =TEMP_CONST_A0
+        MLA     a3, a1, a2, a4
+        LDR     a4, =TEMP_KELVIN_OFFS
+        ADD     a1, a4, a3, ASR #TEMP_SCALE
+        EXIT
+
+        END

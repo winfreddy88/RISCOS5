@@ -1,0 +1,1190 @@
+;
+; CDDL HEADER START
+;
+; The contents of this file are subject to the terms of the
+; Common Development and Distribution License (the "Licence").
+; You may not use this file except in compliance with the Licence.
+;
+; You can obtain a copy of the licence at
+; cddl/RiscOS/Sources/HAL/Titanium/LICENCE.
+; See the Licence for the specific language governing permissions
+; and limitations under the Licence.
+;
+; When distributing Covered Code, include this CDDL HEADER in each
+; file and include the Licence file. If applicable, add the
+; following below this CDDL HEADER, with the fields enclosed by
+; brackets "[]" replaced with your own identifying information:
+; Portions Copyright [yyyy] [name of copyright owner]
+;
+; CDDL HEADER END
+;
+;
+; Copyright 2015 Elesar Ltd.  All rights reserved.
+; Use is subject to license terms.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:OSEntries
+        GET     Hdr:HALEntries
+        GET     Hdr:HALDevice
+        GET     Hdr:AudioDevice
+        GET     Hdr:MixerDevice
+        GET     Hdr:DMA
+
+        GET     hdr.RegMap
+        GET     hdr.RegTLV320AIC310x
+        GET     hdr.StaticWS
+                
+        AREA    |Audio$$Code|, CODE, READONLY, PIC
+
+        EXPORT  AudioInit
+        EXPORT  AudioDeviceInit
+        IMPORT  memcpy
+        IMPORT  HAL_CounterDelay
+        IMPORT  HAL_DebugTXInlineString
+        IMPORT  HAL_DebugTXWord
+
+; The codec supports 8kHz to 96kHz output, but its PLL only locks within a relatively
+; narrow window. We provide the 19.2MHz reference clock for the PLL from DPLL_ABE
+; and pick audio rates that allow the PLL to lock with minimum jitter.
+        GBLA    AudioRateCount
+AudioRateCount SETA 0        
+        MACRO
+        AudioRate $frequency
+        DCD     $frequency * 1024
+        DCB     (1000000 + ($frequency:SHL:1))/$frequency
+        DCB     0, 0, 0                 ; Pad to 8
+        ASSERT  AudioRateTableSize = 8
+AudioRateCount SETA AudioRateCount + 1        
+        MEND
+
+; The physical addresses of registers where DMA data should be poured
+DMAPA_Sound1    * MCASP3_PhysBase + MCASP_TXBUF + (AudioTxPortNum * 4)
+DMAPA_Sound0    * MCASP3_PhysBase + MCASP_RXBUF + (AudioRxPortNum * 4)
+
+; The codec also includes a mixer of which 3 input paths and 3 output paths are used
+MixerChCount    * 6
+
+; AudioInit
+AudioInit ROUT
+        Push    "lr"
+
+        ; Turn on the MCASP controller clock
+        LDR     a1, CMCoreL4PER_LogBase
+        LDR     a2, =CM_L4PER2_MCASP3_CLKCTRL_CLKSEL_AHCLKX_FUNC_24M_GFCLK :OR: \
+                     CM_L4PER2_MCASP3_CLKCTRL_CLKSEL_AUX_CLK_PER_ABE_X1_GFCLK :OR: \
+                     CM_CLKCTRL_MODULEMODE_ENABLED
+        STR     a2, [a1, #CM_L4PER2_MCASP3_CLKCTRL]
+10        
+        LDR     a2, [a1, #CM_L4PER2_MCASP3_CLKCTRL]
+        ASSERT  CM_CLKCTRL_IDLEST_FULL = 0
+        TST     a2, #CM_CLKCTRL_IDLEST_MASK
+        BNE     %BT10                   ; Wait for it so the IO setup sticks
+
+        ; Map in the MCASP controller
+        MOV     a1, #0
+        LDR     a2, =MCASP3_PhysBase
+        MOV     a3, #MCASP_PhysSize
+        CallOS  OS_MapInIO
+        STR     a1, MCASP3_LogBase
+
+        ; Halt the state machines
+        LDR     a2, =MCASP_GBLCTL_XFRST :OR: MCASP_GBLCTL_XSMRST :OR: \
+                     MCASP_GBLCTL_XSRCLR :OR: MCASP_GBLCTL_XHCLKRST :OR: \
+                     MCASP_GBLCTL_XCLKRST :OR: MCASP_GBLCTL_RFRST :OR: \
+                     MCASP_GBLCTL_RSMRST :OR: MCASP_GBLCTL_RSRCLR :OR: \
+                     MCASP_GBLCTL_RHCLKRST :OR: MCASP_GBLCTL_RCLKRST
+        LDR     a3, [a1, #MCASP_GBLCTL]
+        BIC     a3, a3, a2
+        STR     a3, [a1, #MCASP_GBLCTL]
+
+        ; Make sure the IO lines don't float 
+        LDR     a3, [a1, #MCASP_PDIR]
+        ORR     a3, a3, #MCASP_PD_AFSX :OR: MCASP_PD_AHCLKX
+        BIC     a3, a3, #MCASP_PD_ACLKX
+        ORR     a3, a3, #1:SHL:AudioTxPortNum
+        BIC     a3, a3, #1:SHL:AudioRxPortNum
+        STR     a3, [a1, #MCASP_PDIR]
+
+        ; Leave the clock as GPIO until the activate step later
+        MOV     a2, #MCASP_PD_AHCLKX
+        STR     a2, [a1, #MCASP_PDCLR]
+        LDR     a3, [a1, #MCASP_PFUNC]
+        ORR     a3, a3, a2
+        BIC     a3, a3, #MCASP_PD_AFSX :OR: MCASP_PD_ACLKX
+        BIC     a3, a3, #1:SHL:AudioTxPortNum
+        BIC     a3, a3, #1:SHL:AudioRxPortNum
+        STR     a3, [a1, #MCASP_PFUNC]
+
+        Pull    "pc"
+
+; AudioDeviceInit
+AudioDeviceInit ROUT
+        Push    "lr"
+
+        ADR     a1, AudioDevice
+        ADR     a2, AudioDeviceTemplate
+        MOV     a3, #HALDevice_Audio_Size_1
+        BL      memcpy
+        
+        MOV     a2, a1
+        MOV     a1, #0                  ; No flags
+        CallOS  OS_AddDevice
+
+        ADR     a1, MixerDevice
+        ADRL    a2, MixerDeviceTemplate
+        MOV     a3, #HALDevice_Mixer_Size_0_1
+        BL      memcpy
+        
+        MOV     a2, a1
+        MOV     a1, #0                  ; No flags
+        CallOS  OS_AddDevice
+
+        ; Do cross references
+        ADR     a1, MixerDevice
+        ADR     a2, AudioDevice
+        STR     a1, [a2, #HALDevice_AudioMixer]
+        STR     a2, [a1, #HALDevice_MixerCtrlr]
+
+        Pull    "pc"
+
+; AudioCodecRead
+; => a1 = start register
+;    a2 = run length
+;    a3 = data buffer
+; <= a1 = iic status value
+AudioCodecRead ROUT
+        Push    "a1, lr"
+
+        MOV     a1, #TLVCodecAddress :OR: 1 ; read op
+        MOV     a4, a3                  ; -> data block
+        MOV     ip, a2                  ; data block size
+        Push    "a1, a4, ip"
+
+        MOV     a1, #TLVCodecAddress    ; write op
+        ADD     a4, sp, #12             ; -> data block
+        MOV     ip, #1                  ; data block size
+        Push    "a1, a4, ip"
+
+        MOV     a1, sp
+        MOV     a2, #2                  ; 2 transfers on bus 0
+        CallOS  OS_IICOpV
+
+        ADD     sp, sp, #12*2
+        
+        Pull    "ip, pc"
+
+; AudioCodecWrite
+; => a1 = start register
+;    a2 = run length
+;    a3 = data buffer
+; <= a1 = iic status value
+AudioCodecWrite ROUT
+        Push    "a1, lr"
+
+        MOV     a1, #TLVCodecAddress    ; write op continuation
+        ORR     a1, a1, #1:SHL:31
+        MOV     a4, a3                  ; -> data block
+        MOV     ip, a2                  ; data block size
+        Push    "a1, a4, ip"
+
+        MOV     a1, #TLVCodecAddress    ; write op
+        ADD     a4, sp, #12             ; -> data block
+        MOV     ip, #1                  ; data block size
+        Push    "a1, a4, ip"
+
+        MOV     a1, sp
+        MOV     a2, #2                  ; 2 transfers on bus 0
+        CallOS  OS_IICOpV
+
+        ADD     sp, sp, #12*2
+        
+        Pull    "a2, pc"
+
+; AudioCodecWriteRun
+; => a1 = pointer to table of run/data pairs
+; <= a1 = iic status value
+AudioCodecWriteRun ROUT
+        Push    "v1, lr"
+
+        MOV     v1, a1
+        MOV     a1, #IICStatus_Completed
+10
+        LDRSB   a2, [v1], #1            ; Run length
+        CMP     a2, #-1
+        BEQ     %FT20
+
+        LDRB    a1, [v1], #1            ; Start register for auto increment
+        MOV     a3, v1
+        ADD     v1, v1, a2
+        BL      AudioCodecWrite
+
+        CMP     a1, #IICStatus_Completed
+        BEQ     %BT10
+20
+        Pull    "v1, pc"
+
+AudioRateTable
+        ; Half rates
+        AudioRate 20833
+        AudioRate 22050
+        AudioRate 24000
+        ; Two thirds rates
+        AudioRate 27777
+        AudioRate 29400
+        AudioRate 32000
+        ; Base definition
+        AudioRate 41666                 ; VIDC 10.6666MHz
+        AudioRate 44100                 ; CD   11.2896MHz
+        AudioRate 48000                 ; DVD  12.2880MHz
+
+AudioDeviceTemplate
+        DCW     HALDeviceType_Audio + HALDeviceAudio_AudC
+        DCW     HALDeviceID_AudC_TLV320AIC310x
+        DCD     HALDeviceBus_Ser + HALDeviceSerBus_IIS
+        DCD     &10000                  ; API version - 1.0
+        DCD     AudioDevice_Desc
+        DCD     0                       ; Address - N/A
+        %       12                      ; Reserved
+        DCD     AudioDevice_Activate
+        DCD     AudioDevice_Deactivate
+        DCD     AudioDevice_Reset
+        DCD     AudioDevice_Sleep
+        DCD     DevNoMCASP3Tx           ; Device
+        DCD     0
+        %       8
+        DCD     0                       ; Mixer - filled later
+        DCD     1                       ; Outputs supported
+        DCD     0                       ; Inputs supported
+        ASSERT  (.-AudioDeviceTemplate) = HALDevice_Audio_Size
+        DCD     0                       ; DMA_RegisterChannel R0 flags
+        DCD     DMALC_Sound1            ; DMA_RegisterChannel R1 logical channel
+        DCD     0                       ; DMA_RegisterChannel R2 cycle speed
+        DCD     2                       ; DMA_RegisterChannel R3 transfer unit byte size
+        DCD     DMAPA_Sound1            ; DMA_RegisterChannel R7 peripheral write address
+        DCD     AudioDevice_PreEnable
+        DCD     AudioDevice_PostEnable
+        DCD     AudioDevice_PreDisable
+        DCD     AudioDevice_PostDisable
+        DCD     AudioDevice_IRQHandle
+        DCD     AudioRateCount
+        DCD     AudioRateTable
+        DCD     AudioDevice_SetRate
+        ASSERT  (.-AudioDeviceTemplate) = HALDevice_Audio_Size_1
+
+AudioDevice_Desc
+        DCB     "TLV320AIC310x audio codec", 0
+        ALIGN
+
+AudioPLLTable
+        ;       J,    D, P, R=1
+        DCW     4, 4444, 2
+        DCW     4, 7040, 2
+        DCW     5, 1200, 2
+        DCW     5, 9259, 2
+        DCW     6, 2720, 2
+        DCW     6, 8266, 2
+        DCW     4, 4444, 1              ; 10.6666 from 19.2
+        DCW     4, 7040, 1              ; 11.2896 from 19.2
+        DCW     5, 1200, 1              ; 12.2880 from 19.2
+        ALIGN
+        
+; AudioDevice_Activate
+; => a1 = audio device
+; <= a1 = success when TRUE
+AudioDevice_Activate ROUT
+        Push    "v1, sb, lr"
+
+        SUB     sb, a1, #:INDEX:AudioDevice
+        LDR     v1, MCASP3_LogBase
+
+        ; Get the codec in a known state, and muted (more to the point)
+        ADR     a1, %FT30
+        BL      AudioCodecWriteRun
+        ADRL    a1, MixerNormaliseAndMuteAll
+        BL      AudioCodecWriteRun
+
+        ; Put a default state in the soft copy. This should probably be
+        ; in MixerDevice_Activate but that would never be called if SoundControl is
+        ; unplugged so when DMA is enabled there'd be no sound output - disappointing.
+        ADR     a1, MixerSoftCopy
+        MOV     a2, #0                  ; Not muted
+        MOV     a3, #0                  ; 0dB
+        ASSERT  MixerChCount = 6
+        STMIA   a1!, {a2-a3}            ; Outputs
+        STMIA   a1!, {a2-a3}
+        STMIA   a1!, {a2-a3}
+        ORR     a2, a2, #MixerMixFlag_Mute
+        STMIA   a1!, {a2-a3}            ; Inputs
+        STMIA   a1!, {a2-a3}
+        STMIA   a1!, {a2-a3}
+
+        ; 24.6.5.1.2.2 set the idle mode
+        MOV     a2, #MCASP_SYSCONFIG_IDLE_MODE_NOIDLE
+        STR     a2, [v1, #MCASP_SYSCONFIG]
+
+        ; Not currently supporting receive
+        MOV     a2, #0
+        STR     a2, [v1, #MCASP_RXTDM]
+        MOV     a2, #MCASP_XRSRCTL_SRMOD_INACTIVE
+        STR     a2, [v1, #MCASP_XRSRCTL + (AudioRxPortNum * 4)]
+
+        ; 24.6.5.1.2.3.1 transmit format for 16b I2S, MSB first, 1 clock delay
+        LDR     a2, =(1:SHL:MCASP_TXFMT_XDATDLY_SHIFT) :OR: MCASP_TXFMT_XRVRS :OR: \
+                     (0:SHL:MCASP_TXFMT_XPAD_SHIFT) :OR: MCASP_TXFMT_XSSZ_16B :OR: \
+                     MCASP_TXFMT_XBUSEL :OR: MCASP_TXFMT_XROT_16B
+        STR     a2, [v1, #MCASP_TXFMT]
+        MOV     a2, #&FFFF
+        STR     a2, [v1, #MCASP_TXMASK]
+
+        ; 24.6.5.1.2.3.2 left right clock, falling edge, every 2 slots, 50/50 duty
+        LDR     a2, =(2:SHL:MCASP_TXFMCTL_XMOD_SHIFT) :OR: MCASP_TXFMCTL_FXWID :OR: \
+                     MCASP_TXFMCTL_FSXM :OR: MCASP_TXFMCTL_FSXP
+        STR     a2, [v1, #MCASP_TXFMCTL]
+
+        ; 24.6.5.1.2.3.3 bit clock, externally sourced, falling edge
+        LDR     a2, =(((256 / 32) - 1):SHL:MCASP_ACLKXCTL_CLKXDIV_SHIFT) :OR: \
+                     MCASP_ACLKXCTL_CLKXP
+        STR     a2, [v1, #MCASP_ACLKXCTL]
+
+        ; Give the clock pins to the MCASP, they might not be aligned to
+        ; a whole left right clock, but we're muted so it doesn't matter.
+        LDR     a3, [v1, #MCASP_PFUNC]
+        BIC     a3, a3, #MCASP_PD_AHCLKX
+        STR     a3, [v1, #MCASP_PFUNC]
+
+        ; I2S is 2 slot TDM
+        MOV     a2, #2_11
+        STR     a2, [v1, #MCASP_TXTDM]
+
+        ; No loopback and no DIT
+        LDR     a2, [v1, #MCASP_TXDITCTL]
+        BIC     a2, a2, #MCASP_TXDITCTL_DITEN
+        STR     a2, [v1, #MCASP_TXDITCTL]
+        LDR     a2, [v1, #MCASP_LBCTL]
+        BIC     a2, a2, #MCASP_LBCTL_IOLBEN
+        STR     a2, [v1, #MCASP_LBCTL]
+
+        ; Shifter is a transmitter
+        MOV     a2, #MCASP_XRSRCTL_SRMOD_TRANSMIT
+        STR     a2, [v1, #MCASP_XRSRCTL + (AudioTxPortNum * 4)]
+
+        ; Release the clock state machines from reset (but not the serialiser)
+        LDR     a2, [v1, #MCASP_GBLCTL]
+        ORR     a2, a2, #MCASP_GBLCTL_XCLKRST :OR: MCASP_GBLCTL_XHCLKRST
+        STR     a2, [v1, #MCASP_GBLCTL]
+10
+        LDR     a3, [v1, #MCASP_GBLCTL]
+        AND     a2, a3, #MCASP_GBLCTL_XCLKRST :OR: MCASP_GBLCTL_XHCLKRST
+        TEQ     a2, #MCASP_GBLCTL_XCLKRST :OR: MCASP_GBLCTL_XHCLKRST
+        BNE     %BT10
+
+        ORR     a2, a3, #MCASP_GBLCTL_XFRST
+        STR     a2, [v1, #MCASP_GBLCTL]
+20
+        LDR     a3, [v1, #MCASP_GBLCTL]
+        TST     a3, #MCASP_GBLCTL_XFRST
+        BEQ     %BT20
+
+        MOV     a1, #1
+
+        Pull    "v1, sb, pc"
+30
+        ; Initial safe set of codec settings
+        DCB     2, TLV_PAGE_SELECT
+        DCB        2_00000000           ; Page 0 (not using effects in page 1 at all)
+        DCB        2_00000000           ; No reset
+        DCB     2, TLV_LEFT_DAC_DIGITAL_VOLUME_CONTROL
+        DCB        2_10000000           ; DAC mute left
+        DCB        2_10000000           ; DAC mute right
+        DCB     11, TLV_SAMPLE_RATE_SELECT
+        DCB        2_00000000           ; ADC @ Fsref/1, DAC @ Fsref/1
+        DCB        2_00000010           ; PLL off, Q=16, P=2
+        DCB        2_00010000           ; J=4
+        DCB        2_01000101           ; D=4444 (high half)
+        DCB        2_01110000           ;        (low half)
+        DCB        2_10001010           ; AGC period, no dual rate mode, DAC data path enabled, L=L, R=R
+        DCB        2_10000000           ; BCLK output, WCLK input, no tristate, halt when PD, no 3D
+        DCB        2_00000001           ; 16b I2S, no resync, soft mute on resync
+        DCB        2_00000000           ; No data offset
+        DCB        2_00000001           ; R=1
+        DCB        2_00000000           ; No high pass, filters, effects or deemphasis
+        DCB     2, TLV_DAC_POWER_AND_OUTPUT_DRIVER_CONTROL
+        DCB        2_11010000           ; Power up DACs, HPCOM=VCM
+        DCB        2_00000100           ; Short circuit protect the HP outputs
+        DCB     1, TLV_GPIO1_CONTROL
+        DCB        2_11000000           ; GPIO output low
+        DCB     2, TLV_CODEC_CLKIN_SOURCE_SELECTION
+        DCB        2_00000000           ; Codec clock from PLLDIV_OUT
+        DCB        2_00000000           ; CLKDIV don't care, PLL from MCLK, N=16
+        DCB     2, TLV_DAC_OUTPUT_SWITCHING_CONTROL
+        DCB        2_00000000           ; DAC_L1 and DAC_R1 paths, independent volumes
+        DCB        2_01100100           ; 100ms anti pop ramp in 1ms steps
+        DCB     1, TLV_PASSIVE_ANALOG_SIGNAL_BYPASS_SELECTION_DURING_POWERDOWN
+        DCB        2_00000000           ; No passive bypassing
+        DCB     1, TLV_LEFT_LOP_OUTPUT_LEVEL_CONTROL
+        DCB        2_00001001           ; Unmute & power up LEFT LOP pin which is used for the speaker
+        ; Class D init raindance
+        DCB     1, TLV_PAGE_SELECT
+        DCB        &0D
+        DCB     1, TLV_HEADSET_BUTTON_PRESS_DETECTION_A
+        DCB        &0D
+        DCB     1, TLV_AUDIO_SDIF_CONTROL_A            
+        DCB        &5C
+        DCB     1, TLV_AUDIO_SDIF_CONTROL_A            
+        DCB        &5D
+        DCB     1, TLV_AUDIO_SDIF_CONTROL_A            
+        DCB        &5C
+        DCB     1, TLV_PAGE_SELECT
+        DCB        &00
+        DCB     1, TLV_CLASSD_BYPASS_SWITCH_CONTROL
+        DCB        2_00001100           ; Enable class D 0dB
+        ; Go back and turn on the PLL
+        DCB     1, TLV_PLL_PROG_A
+        DCB        2_10000010           ; PLL on, Q=16, P=2
+        DCB     -1
+        ALIGN
+
+; AudioDevice_Deactivate
+; => a1 = audio device
+AudioDevice_Deactivate ROUT
+        MOV     pc, lr
+
+; AudioDevice_Reset
+; => a1 = audio device
+AudioDevice_Reset ROUT
+        SUB     a4, a1, #:INDEX:AudioDevice
+        LDR     a1, [a4, #:INDEX:MCASP3_LogBase]
+        LDR     a2, =MCASP_GBLCTL_XFRST :OR: MCASP_GBLCTL_XSMRST :OR: \
+                     MCASP_GBLCTL_XSRCLR :OR: MCASP_GBLCTL_XHCLKRST :OR: \
+                     MCASP_GBLCTL_XCLKRST :OR: MCASP_GBLCTL_RFRST :OR: \
+                     MCASP_GBLCTL_RSMRST :OR: MCASP_GBLCTL_RSRCLR :OR: \
+                     MCASP_GBLCTL_RHCLKRST :OR: MCASP_GBLCTL_RCLKRST
+        LDR     a3, [a1, #MCASP_GBLCTL]
+        BIC     a3, a3, a2
+        STR     a3, [a1, #MCASP_GBLCTL]
+10
+        LDR     a3, [a1, #MCASP_GBLCTL]
+        TST     a3, a2                  ; Wait for all blocks to clock to reset
+        BNE     %BT10
+
+        ; Stop the serialisers
+        MOV     a2, #MCASP_XRSRCTL_SRMOD_INACTIVE
+        STR     a2, [a1, #MCASP_XRSRCTL + (AudioRxPortNum * 4)]
+        STR     a2, [a1, #MCASP_XRSRCTL + (AudioTxPortNum * 4)]
+
+        ; Stop sending clocks
+        LDR     a3, [a1, #MCASP_PFUNC]
+        ORR     a3, a3, #MCASP_PD_ACLKX :OR: MCASP_PD_AHCLKX
+        STR     a3, [a1, #MCASP_PFUNC]
+
+        MOV     pc, lr
+
+; AudioDevice_Sleep
+; => a1 = audio device
+;    a2 = state
+; <= a1 = new state
+AudioDevice_Sleep ROUT
+        MOV     a1, #0
+        MOV     pc, lr
+
+; AudioDevice_PreEnable
+; => a1 = audio device
+;    a2 = DMA buffer byte size
+;    Audio DMA not running, IRQs enabled
+AudioDevice_PreEnable
+        Push    "v1, sb, lr"
+
+        SUB     sb, a1, #:INDEX:AudioDevice
+        LDR     v1, MCASP3_LogBase
+
+        DebugTX "PreEnable audio"
+
+        ; 24.6.5.2.1.3 enable DMA requests and error interrupts
+        MOV     a1, #0
+        STR     a1, [v1, #MCASP_XEVTCTL]
+
+        LDR     a1, =MCASP_EVTCTLX_XUNDRN :OR: MCASP_EVTCTLX_XSYNCERR :OR: MCASP_EVTCTLX_XUNDRN
+        STR     a1, [v1, #MCASP_EVTCTLX]
+
+        ; Stop state machine & framer & reset transmit holding register
+        LDR     a1, [v1, #MCASP_GBLCTLX]
+        BIC     a1, a1, #MCASP_GBLCTLX_XSMRST :OR: MCASP_GBLCTLX_XSRCLR :OR: MCASP_GBLCTLX_XFRST
+        STR     a1, [v1, #MCASP_GBLCTLX]
+        MVN     a2, #0
+        STR     a2, [v1, #MCASP_TXSTAT]
+        ORR     a1, a1, #MCASP_GBLCTLX_XSRCLR
+        STR     a1, [v1, #MCASP_GBLCTLX]
+20
+        ; Wait for clear to clock through
+        LDR     a2, [v1, #MCASP_TXSTAT]
+        TST     a2, #MCASP_TXSTAT_XDATA
+        BEQ     %BT20
+
+        Pull    "v1, sb, pc"
+
+; AudioDevice_PostEnable
+; => a1 = audio device
+;    a2 = DMA buffer byte size
+;    Audio DMA is running, IRQs enabled
+AudioDevice_PostEnable
+        Push    "v1-v2, sb, lr"
+
+        SUB     sb, a1, #:INDEX:AudioDevice
+        LDR     v1, MCASP3_LogBase
+
+        DebugTX "PostEnable audio"
+
+        MOV     v2, #100
+10
+        ; Figure 24-131 check the DMA has stuffed at least 1 sample in
+        LDR     a1, [v1, #MCASP_TXSTAT]
+        TST     a1, #MCASP_TXSTAT_XDATA
+        BEQ     %FT20                   ; XBUF is full
+
+        MOV     a1, #10
+        BL      HAL_CounterDelay
+
+        SUBS    v2, v2, #1
+        BPL     %BT10
+
+        DebugTX "PostEnable timeout"
+
+        Pull    "v1-v2, sb, pc"         ; Timed out wait for DMA fill
+20
+        ; Enable state machine
+        LDR     a1, [v1, #MCASP_GBLCTLX]
+        ORR     a1, a1, #MCASP_GBLCTLX_XSMRST
+        STR     a1, [v1, #MCASP_GBLCTLX]
+30
+        LDR     a3, [v1, #MCASP_GBLCTLX]
+        TST     a3, #MCASP_GBLCTLR_XSMRST
+        BEQ     %BT30
+
+        ; Enable framer
+        ORR     a1, a1, #MCASP_GBLCTLX_XFRST
+        STR     a1, [v1, #MCASP_GBLCTLX]
+40
+        LDR     a3, [v1, #MCASP_GBLCTLX]
+        TST     a3, #MCASP_GBLCTLR_XFRST
+        BEQ     %BT40
+
+        DebugTX "PostEnable running"
+
+        ; Put back the last written mixer gains. This ensures the gains don't
+        ; jump while the sampling rate is being changed, or *AUDIO Off/On used.
+        MOV     v1, #0
+        ADR     v2, MixerSoftCopy
+50
+        ADR     a1, MixerDevice
+        MOV     a2, v1
+        LDMIA   v2!, {a3-a4}
+        BL      MixerDevice_SetMix
+
+        ADD     v1, v1, #1
+        TEQ     v1, #MixerChCount
+        BNE     %BT50
+
+        DebugTX "PostEnable unmuted"
+
+        Pull    "v1-v2, sb, pc"
+
+; AudioDevice_PreDisable
+; => a1 = audio device
+;    Audio DMA is running, IRQs enabled
+AudioDevice_PreDisable
+        Push    "v1, sb, lr"
+
+        SUB     sb, a1, #:INDEX:AudioDevice
+        LDR     v1, MCASP3_LogBase
+
+        ; Mute the DAC before the data dries up
+        ADRL    a1, MixerNormaliseAndMuteAll
+        BL      AudioCodecWriteRun
+
+        DebugTX "PreDisable muted"
+
+        ; Stop any spurious error interrupts
+        MOV     a1, #0
+        STR     a1, [v1, #MCASP_EVTCTLX]
+
+        ; Stop DMA requests
+        MOV     a1, #MCASP_XEVTCTL_XDATDMA
+        STR     a1, [v1, #MCASP_XEVTCTL]
+
+        ; Stop state machine & framer & reset transmit holding register
+        LDR     a1, [v1, #MCASP_GBLCTLX]
+        BIC     a1, a1, #MCASP_GBLCTLX_XSMRST :OR: MCASP_GBLCTLX_XSRCLR :OR: MCASP_GBLCTLX_XFRST
+        STR     a1, [v1, #MCASP_GBLCTLX]
+
+        DebugTX "PreDisable audio"
+
+        Pull    "v1, sb, pc"
+
+; AudioDevice_PostDisable
+; => a1 = audio device
+;    Audio DMA now stopped, IRQs enabled
+AudioDevice_PostDisable
+        MOV     pc, lr
+
+; AudioDevice_IRQHandle
+; => a1 = audio device
+; <= a1 = audio status value
+AudioDevice_IRQHandle
+        Push    "sb, lr"
+
+        SUB     sb, a1, #:INDEX:AudioDevice
+        LDR     a4, MCASP3_LogBase
+
+        MOV     a1, #0                  ; Disable first to avoid conflict on clearing
+        STR     a1, [a4, #MCASP_EVTCTLX]
+        MVN     a1, #0
+        STR     a1, [a4, #MCASP_TXSTAT]
+
+        ; All transmitter interrupts that get here are errors, either
+        ; an underrun, frame sync, or DMA. Just panic and restart everything. 
+        MOV     a1, #AudioIRQHandle_RequestReset
+
+        Pull    "sb, pc"
+
+; AudioDevice_SetRate
+; => a1 = audio device
+;    a2 = rate table index
+AudioDevice_SetRate
+        CMP     a2, #AudioRateCount
+        MOVCS   pc, lr
+
+        Push    "sb, lr"
+
+        SUB     sb, a1, #:INDEX:AudioDevice
+
+        MOV     a3, #6
+        ADRL    a4, AudioPLLTable
+        MLA     a2, a2, a3, a4
+        LDRH    a3, [a2, #2]            ; D
+        LDRH    a4, [a2, #4]            ; P
+        LDRH    a2, [a2, #0]            ; J
+
+        ; Build the PLL settings
+        ASSERT  TLV_PLL_PROG_A + 1 = TLV_PLL_PROG_B
+        ASSERT  TLV_PLL_PROG_B + 1 = TLV_PLL_PROG_C
+        ASSERT  TLV_PLL_PROG_C + 1 = TLV_PLL_PROG_D
+        AND     a4, a4, #7              ; P rebased 12345678 -> 12345670
+        ORR     a4, a4, #128            ; PLL enable, don't care about Q
+        ORR     a4, a4, a2, LSL #8+2    ; J plus 2 reserved bits
+        MOV     a3, a3, LSL #2
+        REV16   a3, a3
+        ORR     a4, a4, a3, LSL #16     ; D plus 2 reserved bits, big endian
+        Push    "a4"
+
+        DebugTXWord a4
+        DebugTX " = codec PLL prog D-C-B-A"
+
+        MOV     a1, #TLV_PLL_PROG_A
+        MOV     a2, #4
+        MOV     a3, sp
+        BL      AudioCodecWrite
+
+        ADD     sp, sp, #4
+
+        Pull    "sb, pc"
+
+MixerNormaliseAndMuteAll
+        ; Put the 3 outputs and 3 inputs back to their nominal gains, muted
+        DCB     2, TLV_LEFT_DAC_DIGITAL_VOLUME_CONTROL
+        DCB        2_10000000           ; Left DAC mute, 0dB
+        DCB        2_10000000           ; Right DAC mute, 0dB
+        DCB     1, TLV_DAC_L1_TO_HPLOUT_VOLUME_CONTROL
+        DCB        2_10000000           ; DAC_L1 to HPLOUT, 0dB
+        DCB     1, TLV_DAC_R1_TO_HPROUT_VOLUME_CONTROL
+        DCB        2_10000000           ; DAC_R1 to HPROUT, 0dB
+        DCB     1, TLV_HPLOUT_OUTPUT_LEVEL_CONTROL
+        DCB        2_00000000           ; Mute and power down HPLOUT, 0dB
+        DCB     1, TLV_HPROUT_OUTPUT_LEVEL_CONTROL
+        DCB        2_00000000           ; Mute and power down HPROUT, 0dB
+        DCB     1, TLV_DAC_L1_TO_LEFT_LOP_VOLUME_CONTROL
+        DCB        2_11111111           ; DAC_L1 to LEFT LOP, mute
+        DCB     1, TLV_DAC_R1_TO_LEFT_LOP_VOLUME_CONTROL
+        DCB        2_11111111           ; DAC_R1 to LEFT LOP, mute
+        DCB     2, TLV_LEFT_ADC_PGA_GAIN_CONTROL
+        DCB        2_10000000           ; Left ADC PGA mute, 0dB
+        DCB        2_10000000           ; Right ADC PGA mute, 0dB
+        DCB     8, TLV_MIC3LR_TO_LEFT_ADC_CONTROL
+        DCB        2_11111111           ; MIC3LR no contribution to L
+        DCB        2_11111111           ; MIC3LR no contribution to R
+        DCB        2_01111100           ; LINE1L no contribution to L
+        DCB        2_01111100           ; LINE2L no contribution to L
+        DCB        2_01111100           ; LINE1R no contribution to L
+        DCB        2_01111100           ; LINE1R no contribution to R
+        DCB        2_01111100           ; LINE2R no contribution to R
+        DCB        2_01111100           ; LINE1L no contribution to R
+        DCB     -1
+        ALIGN
+
+MixerFeatureTable
+        ; Main DAC output mix, stereo
+        DCD     (MixerCategory_System :SHL: MixerFeaturesShift_Category)
+        ; Headphone out mix, stereo
+        DCD     (MixerCategory_Headphones :SHL: MixerFeaturesShift_Category)
+        ; Speaker out mix, mono
+        DCD     (MixerCategory_Speaker :SHL: MixerFeaturesShift_Category) :OR: \
+                MixerFeaturesFlag_Mono
+        ; Line in mix, stereo, mute to reduce hum
+        DCD     (MixerCategory_LineIn :SHL: MixerFeaturesShift_Category) :OR: \
+                MixerFeaturesFlag_DefaultMute
+        ; Mic in mix, stereo, mute to reduce hum
+        DCD     (MixerCategory_Mic :SHL: MixerFeaturesShift_Category) :OR: \
+                MixerFeaturesFlag_DefaultMute
+        ; Aux in mix, stereo, mute to reduce hum
+        DCD     (MixerCategory_AuxIn :SHL: MixerFeaturesShift_Category) :OR: \
+                MixerFeaturesFlag_DefaultMute
+        ASSERT  (.-MixerFeatureTable) = MixerChCount * 4
+        ASSERT  ?MixerSoftCopy = MixerChCount * 8 
+
+MixerLimitTable
+        ; Main DAC output, R43 and R44, -63.5 to 0 step 0.5
+        DCD     -1016
+        DCD     0
+        DCD     8
+        ; Headphone out, R47+R51 and R64+R65, -63.5 to 0 step 0.5, 0 to +9 step 1
+        DCD     -1016                   ; Simplification of uneven steps below -55ish
+        DCD     144
+        DCD     16                      ; Homogenise on 1dB
+        ; Speaker out, R82 and R85, -63.5 to 0 step 0.5, +6 fixed
+        DCD     -1016 + 96              ; Simplification of uneven steps below -55ish
+        DCD     0 + 96                  ; Leaving the +18 step 6 as a fixed 0
+        DCD     16                      ; Homogenise on 1dB
+        ; Line in, R20 and R23, -12 to 0 step 6
+        DCD     -192
+        DCD     0
+        DCD     96
+        ; Mic in, R17 and R18, -12 to 0 step 1.5
+        DCD     -192
+        DCD     0
+        DCD     24
+        ; Aux in, R21 and R22, -12 to 0 step 1.5
+        DCD     -192
+        DCD     0
+        DCD     24
+
+MixerDeviceTemplate
+        DCW     HALDeviceType_Audio + HALDeviceAudio_Mixer
+        DCW     HALDeviceID_Mixer_TLV320AIC310x
+        DCD     HALDeviceBus_Ser + HALDeviceSerBus_IIC
+        DCD     &0001                   ; API version - 0.1
+        DCD     MixerDevice_Desc
+        DCD     0                       ; Address - N/A
+        %       12                      ; Reserved
+        DCD     MixerDevice_Activate
+        DCD     MixerDevice_Deactivate
+        DCD     MixerDevice_Reset
+        DCD     MixerDevice_Sleep
+        DCD     -1                      ; Interrupt N/A
+        DCD     0
+        %       8
+        DCD     0                       ; AudC - filled later
+        DCD     MixerChCount            ; Channels supported
+        DCD     MixerDevice_GetFeatures
+        DCD     MixerDevice_SetMix
+        DCD     MixerDevice_GetMix
+        ASSERT  (.-MixerDeviceTemplate) = HALDevice_Mixer_Size
+        DCD     MixerDevice_GetMixLimits
+        ASSERT  (.-MixerDeviceTemplate) = HALDevice_Mixer_Size_0_1
+
+MixerDevice_Desc
+        DCB     "TLV320AIC310x audio mixer", 0
+        ALIGN
+
+; MixerDevice_Activate
+; => a1 = mixer device
+; <= a1 = success when TRUE
+MixerDevice_Activate ROUT
+        Push    "sb, lr"
+
+        SUB     sb, a1, #:INDEX:MixerDevice
+
+        ; Get the mixer in a known state
+        ADR     a1, %FT10
+        BL      AudioCodecWriteRun
+
+        MOV     a1, #1
+
+        Pull    "sb, pc"
+10
+        ; Initial safe set of mixer settings
+        DCB     2, TLV_LEFT_DAC_DIGITAL_VOLUME_CONTROL
+        DCB        2_00000000           ; Left DAC unmute, 0dB
+        DCB        2_00000000           ; Right DAC unmute, 0dB
+        DCB     1, TLV_DAC_L1_TO_HPLOUT_VOLUME_CONTROL
+        DCB        2_10000000           ; DAC_L1 to HPLOUT, 0dB
+        DCB     1, TLV_DAC_R1_TO_HPROUT_VOLUME_CONTROL
+        DCB        2_10000000           ; DAC_R1 to HPROUT, 0dB
+        DCB     1, TLV_HPLOUT_OUTPUT_LEVEL_CONTROL
+        DCB        2_00001001           ; Unmute and power up HPLOUT, 0dB
+        DCB     1, TLV_HPROUT_OUTPUT_LEVEL_CONTROL
+        DCB        2_00001001           ; Unmute and power up HPROUT, 0dB
+        DCB     1, TLV_DAC_L1_TO_LEFT_LOP_VOLUME_CONTROL
+        DCB        2_10000110           ; DAC_L1 to LEFT LOP, -3dB
+        DCB     1, TLV_DAC_R1_TO_LEFT_LOP_VOLUME_CONTROL
+        DCB        2_10000110           ; DAC_R1 to LEFT LOP, -3dB
+        DCB     2, TLV_LEFT_ADC_PGA_GAIN_CONTROL
+        DCB        2_00000000           ; Left ADC PGA unmute, 0dB
+        DCB        2_00000000           ; Right ADC PGA unmute, 0dB
+        DCB     8, TLV_MIC3LR_TO_LEFT_ADC_CONTROL
+        DCB        2_11111111           ; MIC3LR no contribution to L
+        DCB        2_11111111           ; MIC3LR no contribution to R
+        DCB        2_01111100           ; LINE1L no contribution to L
+        DCB        2_01111100           ; LINE2L no contribution to L
+        DCB        2_01111100           ; LINE1R no contribution to L
+        DCB        2_01111100           ; LINE1R no contribution to R
+        DCB        2_01111100           ; LINE2R no contribution to R
+        DCB        2_01111100           ; LINE1L no contribution to R
+        DCB     -1
+        ALIGN
+
+; MixerDevice_Deactivate
+; => a1 = mixer device
+MixerDevice_Deactivate ROUT
+        Push    "sb, lr"
+
+        SUB     sb, a1, #:INDEX:MixerDevice
+
+        ; Digital mute the DACs
+        ASSERT  TLV_RIGHT_DAC_DIGITAL_VOLUME_CONTROL = TLV_LEFT_DAC_DIGITAL_VOLUME_CONTROL + 1
+        MOV     a1, #TLV_LEFT_DAC_DIGITAL_VOLUME_CONTROL
+        MOV     a2, #2
+        ADR     a3, %FT10
+        BL      AudioCodecWrite
+
+        ; Digital mute the ADCs
+        ASSERT  TLV_RIGHT_ADC_PGA_GAIN_CONTROL = TLV_LEFT_ADC_PGA_GAIN_CONTROL + 1
+        MOV     a1, #TLV_LEFT_ADC_PGA_GAIN_CONTROL
+        MOV     a2, #2
+        ADR     a3, %FT10
+        BL      AudioCodecWrite
+
+        Pull    "sb, pc"
+10
+        DCB     2_10000000, 2_10000000
+        ALIGN        
+
+; MixerDevice_Reset
+; => a1 = mixer device
+MixerDevice_Reset ROUT
+        MOV     pc, lr
+
+; MixerDevice_Sleep
+; => a1 = mixer device
+;    a2 = state
+; <= a1 = new state
+MixerDevice_Sleep ROUT
+        MOV     a1, #0
+        MOV     pc, lr
+
+; Mixer_GetFeatures
+; => a1 = mixer device
+;    a2 = channel
+; <= a1 = channel features word
+MixerDevice_GetFeatures ROUT
+        CMP     a2, #MixerChCount
+        LDRCS   a1, =(MixerCategory_AuxIn :SHL: MixerFeaturesShift_Category) :OR: \
+                     MixerFeaturesFlag_DefaultMute :OR: MixerFeaturesFlag_Fixed
+        ADRCC   a3, MixerFeatureTable
+        LDRCC   a1, [a3, a2, LSL #2]
+        MOV     pc, lr
+
+; MixerDevice_GetMixLimits
+; => a1 = mixer device
+;    a2 = channel
+;    a3 = pointer to mixer limit structure
+MixerDevice_GetMixLimits ROUT
+        CMP     a2, #MixerChCount
+        MOVCS   a1, #-1                 ; -1/16th dB to 0dB in 1/16 dB step
+        MOVCS   a4, #0
+        MOVCS   ip, #1
+        ADRCC   a1, MixerLimitTable
+        ADDCC   a2, a2, a2, LSL #1      ; 3x
+        ADDCC   a1, a1, a2, LSL #2      ; 12x
+        LDMCCIA a1, {a1,a4,ip}
+        STMIA   a3, {a1,a4,ip}
+        MOV     pc, lr
+
+; MixerDevice_SetMix
+; => a1 = mixer device
+;    a2 = channel
+;    a3 = flags word
+;    a4 = signed gain in 1/16th's dB
+MixerDevice_SetMix ROUT
+        Push    "a3, sb, lr"            ; Dummy push is for IIC buffer
+
+        SUB     sb, a1, #:INDEX:MixerDevice
+        CMP     a2, #MixerChCount
+        ADRCC   ip, MixerSoftCopy
+        ADDCC   ip, ip, a2, LSL #3
+        STMCCIA ip, {a3-a4}             ; Update soft copy
+        ADDCC   pc, pc, a2, LSL #2
+        Pull    "a3, sb, pc"
+        B       SetMixSystem
+        B       SetMixHeadphones
+        B       SetMixSpeaker
+        B       SetMixLineIn
+        B       SetMixMic
+        B       SetMixAuxIn
+
+SetMixSystem
+        ; Main DAC output, R43 and R44, -63.5 to 0 step 0.5
+        TST     a3, #MixerMixFlag_Mute
+        MOVEQ   a3, #0
+        MOVNE   a3, #1:SHL:7
+        RSB     a4, a4, #0              ; Negate
+        MOV     a4, a4, LSR #3          ; Scale 0.0625 to 0.5 steps
+        BFI     a3, a4, #0, #7
+        STRB    a3, [sp, #0]            ; Do LEFT
+        STRB    a3, [sp, #1]            ; Do RIGHT
+        ASSERT  TLV_RIGHT_DAC_DIGITAL_VOLUME_CONTROL = TLV_LEFT_DAC_DIGITAL_VOLUME_CONTROL + 1
+        MOV     a1, #TLV_LEFT_DAC_DIGITAL_VOLUME_CONTROL
+        MOV     a2, #2
+        MOV     a3, sp
+        BL      AudioCodecWrite
+
+        Pull    "a3, sb, pc"
+
+SetMixHeadphones
+        ; Headphone out, R47+R51 and R64+R65, -63.5 to 0 step 0.5, 0 to +9 step 1
+        TST     a3, #MixerMixFlag_Mute
+        MOV     a2, #2_10000000         ; Attenuation = 0dB
+        MOV     a3, #2_00001101         ; Gain = 0dB
+        BICNE   a3, a3, #1:SHL:3
+        CMP     a4, #9*16
+        MOVGT   a4, #9*16
+        MOVS    a4, a4
+        MOVPL   a4, a4, LSR #4          ; Scale 0.0625 to 1 steps
+        ORRPL   a3, a3, a4, LSL #4
+        RSBMI   a4, a4, #0              ; Negate
+        MOVMI   a4, a4, LSR #3          ; Scale 0.0625 to 0.5 steps
+        BFIMI   a2, a4, #0, #7
+        STRB    a2, [sp, #0]            ; Attenuation in volume control
+        STRB    a3, [sp, #1]            ; Gain goes in output level
+
+        MOV     a1, #TLV_DAC_L1_TO_HPLOUT_VOLUME_CONTROL
+        MOV     a2, #1
+        MOV     a3, sp
+        BL      AudioCodecWrite
+
+        MOV     a1, #TLV_HPLOUT_OUTPUT_LEVEL_CONTROL
+        MOV     a2, #1
+        ADD     a3, sp, #1
+        BL      AudioCodecWrite
+
+        ASSERT  TLV_HPROUT_OUTPUT_LEVEL_CONTROL = TLV_DAC_R1_TO_HPROUT_VOLUME_CONTROL + 1
+        MOV     a1, #TLV_DAC_R1_TO_HPROUT_VOLUME_CONTROL
+        MOV     a2, #2
+        MOV     a3, sp
+        BL      AudioCodecWrite
+
+        Pull    "a3, sb, pc"
+
+SetMixSpeaker
+        ; Speaker out, R82 and R85, -63.5 to 0 step 0.5, +6 fixed
+        TST     a3, #MixerMixFlag_Mute
+        MOV     a2, #2_10000000         ; Attenuation = 0dB
+        ORRNE   a2, a2, #&7F
+        SUBEQ   a4, a4, #6*16           ; Amp
+        RSBEQ   a4, a4, #0              ; Negate
+        MOVEQ   a4, a4, LSR #3          ; Scale 0.0625 to 0.5 steps
+        BFIEQ   a2, a4, #0, #7
+        STRB    a2, [sp]
+
+        MOV     a1, #TLV_DAC_L1_TO_LEFT_LOP_VOLUME_CONTROL
+        MOV     a2, #1
+        MOV     a3, sp
+        BL      AudioCodecWrite
+
+        MOV     a1, #TLV_DAC_R1_TO_LEFT_LOP_VOLUME_CONTROL
+        MOV     a2, #1
+        MOV     a3, sp
+        BL      AudioCodecWrite
+
+        Pull    "a3, sb, pc"
+
+SetMixLineIn
+        ; Line in, R20 and R23, -12 to 0 step 6
+        TST     a3, #MixerMixFlag_Mute
+        MOVNE   a2, #2_1111
+        RSBEQ   a4, a4, #0              ; Negate
+        MOVEQ   a1, #24
+        UDIVEQ  a2, a4, a1              ; Scale 0.0625 to 1.5 steps
+        BICEQ   a2, a2, #2_11           ; Round to lowest 6
+        MOV     a2, a2, LSL #3          ; b3-6
+        ORR     a2, a2, #2_100          ; Weak bias, single ended
+        STRB    a2, [sp]
+
+        MOV     a1, #TLV_LINE2L_TO_LEFT_ADC_CONTROL
+        MOV     a2, #1
+        MOV     a3, sp
+        BL      AudioCodecWrite
+
+        MOV     a1, #TLV_LINE2R_TO_RIGHT_ADC_CONTROL
+        MOV     a2, #1
+        MOV     a3, sp
+        BL      AudioCodecWrite
+
+        Pull    "a3, sb, pc"
+
+SetMixMic
+        ; Mic in, R17 and R18, -12 to 0 step 1.5
+        TST     a3, #MixerMixFlag_Mute
+        MOVNE   a2, #2_1111
+        RSBEQ   a4, a4, #0              ; Negate
+        MOVEQ   a1, #24
+        UDIVEQ  a2, a4, a1              ; Scale 0.0625 to 1.5 steps
+        MOV     a2, a2, LSL #4          ; b4-7
+        ORR     a2, a2, #2_1111         ; Not cross wired
+        STRB    a2, [sp, #0]
+        MOV     a2, a2, LSL #4
+        ORR     a2, a2, a2, LSR #8      ; Same but nybbles swapped
+        STRB    a2, [sp, #1]
+
+        ASSERT  TLV_MIC3LR_TO_RIGHT_ADC_CONTROL = TLV_MIC3LR_TO_LEFT_ADC_CONTROL + 1 
+        MOV     a1, #TLV_MIC3LR_TO_LEFT_ADC_CONTROL
+        MOV     a2, #2
+        MOV     a3, sp
+        BL      AudioCodecWrite
+
+        Pull    "a3, sb, pc"
+
+SetMixAuxIn
+        ; Aux in, R21 and R22, -12 to 0 step 1.5
+        TST     a3, #MixerMixFlag_Mute
+        MOVNE   a2, #2_1111
+        RSBEQ   a4, a4, #0              ; Negate
+        MOVEQ   a1, #24
+        UDIVEQ  a2, a4, a1              ; Scale 0.0625 to 1.5 steps
+        MOV     a2, a2, LSL #3          ; b3-6
+        STRB    a2, [sp, #0]
+        STRB    a2, [sp, #1]
+
+        ASSERT  TLV_LINE1R_TO_RIGHT_ADC_CONTROL = TLV_LINE1R_TO_LEFT_ADC_CONTROL + 1
+        MOV     a1, #TLV_LINE1R_TO_LEFT_ADC_CONTROL
+        MOV     a2, #2
+        MOV     a3, sp
+        BL      AudioCodecWrite
+
+        Pull    "a3, sb, pc"
+
+; MixerDevice_GetMix
+; => a1 = mixer device
+;    a2 = channel
+; <= a1 = flags word
+;    a2 = signed gain in 1/16th's dB
+MixerDevice_GetMix ROUT
+        Push    "a3, sb, lr"            ; Dummy push is for IIC buffer
+
+        SUB     sb, a1, #:INDEX:MixerDevice
+        CMP     a2, #MixerChCount
+        MOVCS   a1, #MixerMixFlag_Mute
+        MOVCS   a2, #0                  ; Unknown devices are 0dB mute
+        ADDCC   pc, pc, a2, LSL #2
+        Pull    "a3, sb, pc"
+        B       GetMixSystem
+        B       GetMixHeadphones
+        B       GetMixSpeaker
+        B       GetMixLineIn
+        B       GetMixMic
+        B       GetMixAuxIn
+
+GetMixSystem
+        ; Main DAC output, R43 and R44, -63.5 to 0 step 0.5
+        MOV     a1, #TLV_LEFT_DAC_DIGITAL_VOLUME_CONTROL
+        MOV     a2, #1
+        MOV     a3, sp
+        BL      AudioCodecRead
+
+        LDRB    a3, [sp]                ; Assume LEFT and RIGHT in sync
+        TST     a3, #1:SHL:7
+        MOVEQ   a1, #0
+        MOVNE   a1, #MixerMixFlag_Mute
+        AND     a2, a3, #&7F
+        MOV     a2, a2, LSL #3          ; Scale 0.5 to 0.0625 steps
+        RSB     a2, a2, #0              ; Negate
+
+        Pull    "a3, sb, pc"
+
+GetMixHeadphones
+        ; Headphone out, R47+R51 and R64+R65, -63.5 to 0 step 0.5, 0 to +9 step 1
+        ASSERT  TLV_HPROUT_OUTPUT_LEVEL_CONTROL = TLV_DAC_R1_TO_HPROUT_VOLUME_CONTROL + 1
+        MOV     a1, #TLV_DAC_R1_TO_HPROUT_VOLUME_CONTROL
+        MOV     a2, #2
+        MOV     a3, sp
+        BL      AudioCodecRead
+
+        LDRB    a3, [sp, #0]            ; Assume RIGHT and LEFT in sync
+        AND     a2, a3, #&7F
+        MOV     a2, a2, LSL #3          ; Scale 0.5 to 0.0625 steps
+        RSB     a2, a2, #0              ; Negate
+        LDRB    a3, [sp, #1]
+        TST     a3, #1:SHL:3
+        MOVEQ   a1, #MixerMixFlag_Mute
+        MOVNE   a1, #0
+        AND     a3, a3, #&F0            ; Scale 1 to 0.0625 steps
+        ADD     a2, a2, a3              ; Attenuation + gain
+
+        Pull    "a3, sb, pc"
+
+GetMixSpeaker
+        ; Speaker out, R82 and R85, -63.5 to 0 step 0.5, +6 fixed
+        MOV     a1, #TLV_DAC_R1_TO_LEFT_LOP_VOLUME_CONTROL
+        MOV     a2, #1
+        MOV     a3, sp
+        BL      AudioCodecRead
+
+        LDRB    a3, [sp]                ; Assume RIGHT and LEFT in sync
+        AND     a2, a3, #&7F
+        TEQ     a2, #&7F
+        MOV     a2, a2, LSL #3          ; Scale 0.5 to 0.0625 steps
+        RSB     a2, a2, #0              ; Negate
+        MOVNE   a1, #0
+        MOVEQ   a1, #MixerMixFlag_Mute
+        ADD     a2, a2, #6*16           ; Amp
+
+        Pull    "a3, sb, pc"
+
+GetMixLineIn
+        ; Line in, R20 and R23, -12 to 0 step 6
+        MOV     a1, #TLV_LINE2L_TO_LEFT_ADC_CONTROL
+        MOV     a4, #3                  ; b3-6
+        B       %FT10
+
+GetMixMic
+        ; Mic in, R17 and R18, -12 to 0 step 1.5
+        MOV     a1, #TLV_MIC3LR_TO_LEFT_ADC_CONTROL
+        MOV     a4, #4                  ; b4-7
+        B       %FT10
+
+GetMixAuxIn
+        ; Aux in, R21 and R22, -12 to 0 step 1.5
+        MOV     a1, #TLV_LINE1R_TO_LEFT_ADC_CONTROL
+        MOV     a4, #3                  ; b3-6
+10
+        MOV     a2, #1
+        MOV     a3, sp
+        Push    "a4"
+        BL      AudioCodecRead
+        Pull    "a4"
+
+        LDRB    a3, [sp]                ; Assume LEFT and RIGHT in sync
+        MOV     a3, a3, LSR a4
+        AND     a3, a3, #&F
+        TEQ     a3, #2_1111
+        MOVEQ   a1, #MixerMixFlag_Mute
+        MOVEQ   a2, #0
+        MOVNE   a1, #0
+        MOVNE   a2, a3, LSL #4
+        ADDNE   a2, a2, a3, LSL #3      ; Scale 1.5 to 0.0625 steps
+        RSBNE   a2, a2, #0              ; Negate
+
+        Pull    "a3, sb, pc"
+
+        END

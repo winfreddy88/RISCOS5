@@ -1,0 +1,968 @@
+; Copyright 2012 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:Machine.<Machine>
+        GET     Hdr:ImageSize.<ImageSize>
+        $GetIO
+
+        GET     Hdr:OSEntries
+        GET     Hdr:HALEntries
+        GET     Hdr:Proc
+
+        GET     hdr.omap3530
+        GET     hdr.StaticWS
+        GET     hdr.PRCM
+        GET     hdr.SR37x
+        GET     hdr.GPIO
+
+        AREA    |Asm$$Code|, CODE, READONLY, PIC
+
+        EXPORT  SR37x_PreInit
+
+        IMPORT  TPSRead
+        IMPORT  TPSWrite
+        IMPORT  memcpy
+        IMPORT  __rt_udiv
+        IMPORT  IIC_DoOp_Poll
+        IMPORT  CPUClk_AdjustDPLL
+        IMPORT  HAL_CounterDelay
+
+        GBLL    DebugSR37x
+DebugSR37x SETL {FALSE}
+
+        GBLL    AlwaysFBB
+AlwaysFBB  SETL {FALSE} ; Whether to keep FBB mode on all the time or toggle it on/off as required. Setting to TRUE also enables a couple of other tweaks that may increase stability.
+
+ [ DebugSR37x
+        MACRO
+        DumpReg $base, $reg
+        DebugTX "$reg"
+        LDR     a1, =$reg
+        LDR     a1, [$base, #$reg]
+        DebugReg a1
+        MEND
+
+DoDumpRegs
+        Entry
+        DumpReg v1, SR37x_SRCONFIG
+        DumpReg v1, SR37x_SRSTATUS
+        DumpReg v1, SR37x_SENVAL           
+        DumpReg v1, SR37x_SENMIN           
+        DumpReg v1, SR37x_SENMAX           
+        DumpReg v1, SR37x_SENAVG           
+        DumpReg v1, SR37x_AVGWEIGHT        
+        DumpReg v1, SR37x_NVALUERECIPROCAL 
+        DumpReg v1, SR37x_IRQSTATUS_RAW    
+        DumpReg v1, SR37x_IRQSTATUS        
+        DumpReg v1, SR37x_SENERROR_REG     
+        DumpReg v1, SR37x_ERRCONFIG        
+        DumpReg v2, SR37x_SRCONFIG
+        DumpReg v2, SR37x_SRSTATUS
+        DumpReg v2, SR37x_SENVAL           
+        DumpReg v2, SR37x_SENMIN           
+        DumpReg v2, SR37x_SENMAX           
+        DumpReg v2, SR37x_SENAVG           
+        DumpReg v2, SR37x_AVGWEIGHT        
+        DumpReg v2, SR37x_NVALUERECIPROCAL 
+        DumpReg v2, SR37x_IRQSTATUS_RAW    
+        DumpReg v2, SR37x_IRQSTATUS        
+        DumpReg v2, SR37x_SENERROR_REG     
+        DumpReg v2, SR37x_ERRCONFIG
+        DumpReg v3, PRM_VC_SMPS_SA    
+        DumpReg v3, PRM_VC_SMPS_VOL_RA
+        DumpReg v3, PRM_VC_SMPS_CMD_RA
+        DumpReg v3, PRM_VC_CMD_VAL_0  
+        DumpReg v3, PRM_VC_CMD_VAL_1  
+        DumpReg v3, PRM_VC_CH_CONF    
+        DumpReg v3, PRM_VC_I2C_CFG    
+        DumpReg v3, PRM_VC_BYPASS_VAL 
+        DumpReg v3, PRM_VP1_CONFIG    
+        DumpReg v3, PRM_VP1_VSTEPMIN  
+        DumpReg v3, PRM_VP1_VSTEPMAX  
+        DumpReg v3, PRM_VP1_VLIMITTO  
+        DumpReg v3, PRM_VP1_VOLTAGE   
+        DumpReg v3, PRM_VP1_STATUS    
+        DumpReg v3, PRM_VP2_CONFIG    
+        DumpReg v3, PRM_VP2_VSTEPMIN  
+        DumpReg v3, PRM_VP2_VSTEPMAX  
+        DumpReg v3, PRM_VP2_VLIMITTO  
+        DumpReg v3, PRM_VP2_VOLTAGE   
+        DumpReg v3, PRM_VP2_STATUS    
+        DumpReg v3, PRM_LDO_ABB_SETUP 
+        DumpReg v3, PRM_LDO_ABB_CTRL
+        LDR     a1, L4_PowerMan_Log
+        DebugReg a1, OCP_System_Reg_PRM+PRM_IRQSTATUS_MPU
+        EXIT
+ ]
+
+
+SR37x_PreInit ROUT
+        ; Identify the OMAP type, set up the HAL device descriptor, then put the CPU speed to max to help cut down our boot time
+        Entry   "v1-v5"
+        ; First identify the OMAP type
+        LDR     a1, L4_Wakeup_Log
+        LDR     a2, =L4_CONTROL_IDCODE-L4_Wakeup
+        LDR     a1, [a2, a1]
+        UBFX    a1, a1, #12, #16
+     [ DebugSR37x
+        DebugReg a1, "Hawkeye="
+     ]
+        LDR     a2, =HAWKEYE_AMDM37x
+        EORS    a1, a1, a2
+        EXIT    NE ; Not AM/DM37x; Exit with a1 nonzero for failure
+    [ {FALSE} ; Don't do this - the chips in the BBxM don't have the bit set, despite having valid eFuse data for OPP1G. Maybe check OPP1G eFuse reg instead?
+        ; check if this is a 1GHz part (we don't bother supporting SmartReflex on 800MHz parts)
+        LDR     a1, L4_Core_Log
+        LDR     a2, =L4_CtrlDevStatus-L4_Core
+        LDR     a2, [a2, a1]
+     [ DebugSR37x
+        DebugReg a2, "CtrlDevStatus="
+     ]
+        TST     a2, #1<<9
+        EXIT    EQ
+    ]
+
+        ; We support SmartReflex on this device
+     [ DebugSR37x
+        DebugTX "SmartReflex supported"
+     ]
+
+        SUB     sp, sp, #4
+        MOV     a2, sp
+        MOV     a3, #1
+        ADRL    v1, IIC_DoOp_Poll
+      [ {TRUE}
+        ; Disable I2C1/I2C4 pullups? (spotted in Linux sources, drivers/mfd/twl-core.c)
+        ; This should probably be moved elseswhere?
+        MOV     a1, #0
+        STRB    a1, [a2]
+        MOV     a1, #TPSGPIO_IIC*2
+        MOV     a4, #TPS_GPPUPDCTR1
+        BL      TPSWrite
+        CMP     a1, #0
+        BNE     %FT10
+      ]
+        ; Enable smartreflex in the TPS
+        MOV     a1, #TPSPM_IIC*2
+        MOV     a4, #DCDC_GLOBAL_CFG
+        BL      TPSRead
+        CMP     a1, #0
+        BNE     %FT10
+        LDRB    v2, [a2]
+        TST     v2, #1<<3
+        BNE     %FT10
+        ORR     v2, v2, #1<<3
+        STRB    v2, [a2]
+        MOV     a1, #TPSPM_IIC*2
+        BL      TPSWrite
+10
+        ADD     sp, sp, #4
+        CMP     a1, #0
+        EXIT    NE ; IIC failed, abort
+
+        ; Set v1, v2 to point to the SmartReflex instances
+        LDR     a1, L4_Core_Log
+        ADD     v1, a1, #L4_SR1-L4_Core
+        ADD     v2, a1, #L4_SR2-L4_Core
+        ; Set v3 to point to the PRM registers
+        LDR     v3, L4_PowerMan_Log
+        ADD     v3, v3, #Global_Reg_PRM
+        ; Set v4, v5 to point to initial OPP table entries
+        ADRL    v4, End_SR37x_OPPTbl_AMDM37x_VDD1-SR37x_OPPTbl_Size
+        ADRL    v5, End_SR37x_OPPTbl_AMDM37x_VDD2-SR37x_OPPTbl_Size
+
+      [ DebugSR37x
+        BL      DoDumpRegs
+      ]  
+
+        ; TODO - Make sure smartreflex is disabled before we start reprogramming it!
+
+        ; Set up ABB LDO for FBB
+
+        ; Calculate SR2_WTCNT_VALUE as 1/8th the number of system clock cycles to wait
+        LDR     a1, Timer_DelayMul
+        ASSERT  ((ABB_SETTLING_TIME<<5) :MOD: 10) = 0
+        MOV     a2, #(ABB_SETTLING_TIME<<5)/10 ; <<5 so result is in bits 8-15
+        MUL     a1, a2, a1
+        AND     a1, a1, #&FF00
+        ORR     a1, a1, #5 ; Set ACTIVE_FBB_SEL and SR2EN
+        STR     a1, [v3, #PRM_LDO_ABB_CTRL]
+        ; Go to fast mode
+        MOV     a1, #1+4
+        STR     a1, [v3, #PRM_LDO_ABB_SETUP]
+        ; Wait for completion
+15
+        LDR     a1, [v3, #PRM_LDO_ABB_SETUP]
+        TST     a1, #4
+        BNE     %BT15        
+
+        ; Program the voltage controller with the IIC details of the TPS
+        ; (sprugn4o, section 3.6.6.6, page 439)
+      [ DebugSR37x
+        DebugTX "Programming voltage controller"
+      ]
+
+        ; 1. Slave address (&12)
+        MOV     a1, #&12
+        STR     a1, [v3, #PRM_VC_SMPS_SA]
+        ; 2. Voltage register addresses (&00, &01)
+        MOV     a1, #1<<16
+        STR     a1, [v3, #PRM_VC_SMPS_VOL_RA]
+        ; 3. Command register addresses (none)
+        ; However, we do want to program the on/off/retention voltages
+        LDR     a1, =&30201e00 ; OFF=0.6V, RET=0.975V, ONLP=1V, ON=1.25V
+        STR     a1, [v3, #PRM_VC_CMD_VAL_0]
+        STR     a1, [v3, #PRM_VC_CMD_VAL_1]
+        ; And voltage setup times?
+        LDR     a1, =&0fff0fff
+        STR     a1, [v3, #PRM_VOLTSETUP1]        
+        ; 4. Main configuration
+        LDR     a1, =&120000 ; RAV1, CMD1?
+        STR     a1, [v3, #PRM_VC_CH_CONF]
+        ; 5. Configure IIC
+        ; Enable high-speed mode, but don't program a master code?
+        LDR     a1, [v3, #PRM_VC_I2C_CFG]
+        ORR     a1, a1, #1<<3
+        STR     a1, [v3, #PRM_VC_I2C_CFG]
+
+        ; Set up the voltage processor (sprugn4, section 3.6.6.5, page 435)
+      [ DebugSR37x
+        DebugTX "Programming voltage processor"
+      ]
+
+        ; 1. Error-to-voltage converter
+        LDR     a2, [v3, #PRM_VP1_CONFIG]
+        LDRB    a4, [v4, #SR37x_OPPTbl_ERRGAIN]
+        ORR     a4, a4, #TPS_VP_ERROROFFSET<<8
+        BFI     a2, a4, #16, #16
+        STR     a2, [v3, #PRM_VP1_CONFIG]
+        LDR     a3, [v3, #PRM_VP2_CONFIG]
+        LDRB    a4, [v5, #SR37x_OPPTbl_ERRGAIN]
+        ORR     a4, a4, #TPS_VP_ERROROFFSET<<8
+        BFI     a3, a4, #16, #16
+        STR     a3, [v3, #PRM_VP2_CONFIG]
+        ; Note VSTEPMIN/VSTEPMAX settings get handled in step 2 below
+
+        ; 2. FSM register setting
+        ; VLIMITTO.TIMEOUT is sys_clk (in MHz) * TPS_VP_VLIMITTO_TIMEOUT (in uS)
+        ; i.e. Timer_DelayMul*TPS_VP_VLIMITTO_TIMEOUT/10
+        LDR     a1, Timer_DelayMul
+        ASSERT  (TPS_VP_VLIMITTO_TIMEOUT :MOD: 10) = 0
+        MOV     a4, #TPS_VP_VLIMITTO_TIMEOUT/10
+        MUL     a1, a1, a4
+        MOVT    a1, #TPS_VP1_VLIMITTO_VDDMIN+(TPS_VP1_VLIMITTO_VDDMAX<<8)
+      [ DebugSR37x
+        DebugReg a1, "PRM_VP1_VLIMITTO="
+      ]
+        STR     a1, [v3, #PRM_VP1_VLIMITTO]
+        MOVT    a1, #TPS_VP2_VLIMITTO_VDDMIN+(TPS_VP2_VLIMITTO_VDDMAX<<8)
+        STR     a1, [v3, #PRM_VP2_VLIMITTO]
+        LDRB    a1, [v4, #SR37x_OPPTbl_VDD]
+        BFI     a2, a1, #8, #8
+        ORR     a1, a2, #1<<2
+        STR     a1, [v3, #PRM_VP1_CONFIG]
+        LDRB    a1, [v5, #SR37x_OPPTbl_VDD]
+        BFI     a3, a1, #8, #8
+        ORR     a1, a3, #1<<2
+        STR     a1, [v3, #PRM_VP2_CONFIG]
+        ; VSTEPMIN/VSTEPMAX wait times are (TPS_VP_STEPSIZE/TPS_VP_SLEWRATE) * sys_clk (in MHz)
+        ; i.e. Timer_DelayMul*(TPS_VP_STEPSIZE/(TPS_VP_SLEWRATE*10))
+        LDR     a1, Timer_DelayMul
+        ASSERT  ((TPS_VP_STEPSIZE*256) :MOD: (TPS_VP_SLEWRATE*10)) = 0
+        LDR     a4, =(TPS_VP_STEPSIZE*256)/(TPS_VP_SLEWRATE*10)
+        MUL     a4, a1, a4
+        BIC     a4, a4, #255
+        ORR     a1, a4, #TPS_VP_VSTEPMIN
+      [ DebugSR37x
+        DebugReg a1, "PRM_VP1_VSTEPMIN="
+      ]
+        STR     a1, [v3, #PRM_VP1_VSTEPMIN]
+        STR     a1, [v3, #PRM_VP2_VSTEPMIN]
+        ORR     a1, a4, #TPS_VP_VSTEPMAX
+      [ DebugSR37x
+        DebugReg a1, "PRM_VP1_VSTEPMAX="
+      ]
+        STR     a1, [v3, #PRM_VP1_VSTEPMAX]
+        STR     a1, [v3, #PRM_VP2_VSTEPMAX]
+
+        ; 3. Enable interrupts
+        ; (do nothing, since we want automatic H/W control)
+
+        ; Extra step: Program the initial VDD1 voltage to the TPS before we enable the VP
+        ; For VDD2 we don't really care that much (we should already be running at OPP100, and at the correct frequency for the fitted RAM)
+      [ DebugSR37x
+        DebugTX "Forcing voltage update"
+        DebugReg a2, "PRM_VP1_CONFIG="
+        DebugReg a3, "PRM_VP2_CONFIG="
+      ]
+        ; Clear any current transaction done interrupts
+        LDR     a4, L4_PowerMan_Log
+        MVN     a1, #0
+        STR     a1, [a4, #OCP_System_Reg_PRM+PRM_IRQSTATUS_MPU]
+        ; Force the update
+        ORR     a1, a2, #1<<1
+        STR     a1, [v3, #PRM_VP1_CONFIG]
+        ORR     a1, a3, #1<<1
+        STR     a1, [v3, #PRM_VP2_CONFIG]
+        ; Wait for completion
+20
+        LDR     a1, [a4, #OCP_System_Reg_PRM+PRM_IRQSTATUS_MPU]
+      [ DebugSR37x
+        DebugReg a1, "PRM_IRQSTATUS_MPU="
+      ]
+        AND     a1, a1, #(1<<21)+(1<<15)
+        CMP     a1, #(1<<21)+(1<<15)
+        BNE     %BT20
+
+        ; Handle errata 1.46
+        ; Use 104us timeout (equivalent to OPP50->OPP1G step)
+        MOV     a1, #104
+        Push    "a2-a4"
+        BL      HAL_CounterDelay
+        Pull    "a2-a4"
+
+      [ DebugSR37x
+        DebugTX "Enabling voltage processor"
+      ]
+
+        ; 4. Enable the module
+        ORR     a2, a2, #1+(1<<3)
+        STR     a2, [v3, #PRM_VP1_CONFIG]
+        ORR     a3, a3, #1+(1<<3)
+        STR     a3, [v3, #PRM_VP2_CONFIG]
+
+        ; Set up the SmartRefex modules (sprugn4o, section 3.6.6.4, page 432)
+      [ DebugSR37x
+        DebugTX "Setup SmartReflex"
+      ]
+
+        ; 1. Setup clocks
+        ; First, calculate SRCLKLENGTH setting
+        ; This is SR_ALWON_FCLK/(2*SR_CLK), where SR_ALWON_FCLK=sys_clk and SR_CLK=100kHz
+        ; i.e. Timer_DelayMul/2
+        LDR     a1, Timer_DelayMul
+        MOV     a1, a1, LSR #1
+        LDR     a2, [v1, #SR37x_SRCONFIG]
+        BFI     a2, a1, #12, #10
+        STR     a2, [v1, #SR37x_SRCONFIG]
+        LDR     a3, [v2, #SR37x_SRCONFIG]
+        BFI     a3, a1, #12, #10
+        STR     a3, [v2, #SR37x_SRCONFIG]
+        ; Enable clocks
+        LDR     a1, L4_ClockMan_Log
+        LDR     a4, [a1, #CM_FCLKEN_WKUP]
+        ORR     a4, a4, #3<<6
+        STR     a4, [a1, #CM_FCLKEN_WKUP]
+
+        ; 2. Sensor core setting
+        ; Supposedly SENNENABLE and SENPENABLE are meant to come from CONTROL_FUSE_SR, but the Linux smartreflex driver just sets them to 1?
+        ORR     a2, a2, #3 ; SENNENABLE, SENPENABLE
+        ORR     a2, a2, #1<<10 ; SENENABLE
+        STR     a2, [v1, #SR37x_SRCONFIG]
+        ORR     a3, a3, #3 ; SENNENABLE, SENPENABLE
+        ORR     a3, a3, #1<<10 ; SENENABLE
+        STR     a3, [v2, #SR37x_SRCONFIG]
+
+        ; 3. Accumulator min/max/avg
+        MOV     a1, #SR37x_SENNAVGWEIGHT + (SR37x_SENPAVGWEIGHT<<2)
+        LDR     a4, [v1, #SR37x_AVGWEIGHT]
+        BFI     a4, a1, #0, #4
+      [ DebugSR37x
+        DebugReg a4, "SR1.AVGWEIGHT="
+      ]
+        STR     a4, [v1, #SR37x_AVGWEIGHT]
+        LDR     a4, [v2, #SR37x_AVGWEIGHT]
+        BFI     a4, a1, #0, #4
+        STR     a4, [v2, #SR37x_AVGWEIGHT]
+        LDR     a1, =SR37x_ACCUMDATA
+        BFI     a2, a1, #22, #10
+        ORR     a2, a2, #1<<8
+        STR     a2, [v1, #SR37x_SRCONFIG]
+        BFI     a3, a1, #22, #10
+        ORR     a3, a3, #1<<8
+        STR     a3, [v2, #SR37x_SRCONFIG]
+
+        ; 4. Error generator setting
+        ; NVALUERECIPROCAL comes straight from the relevant eFuse OPP register
+        LDR     a1, L4_Core_Log
+        LDR     a4, [v4, #SR37x_OPPTbl_NVALUERECIPROCAL]
+        LDR     a4, [a1, a4]
+      [ DebugSR37x
+        DebugReg a4, "SR1.NVALUERECIPROCAL="
+      ]
+        STR     a4, [v1, #SR37x_NVALUERECIPROCAL]
+        LDR     a4, [v5, #SR37x_OPPTbl_NVALUERECIPROCAL]
+        LDR     a4, [a1, a4]
+        STR     a4, [v2, #SR37x_NVALUERECIPROCAL]
+        ORR     a2, a2, #1<<9
+        STR     a2, [v1, #SR37x_SRCONFIG]
+        ORR     a3, a3, #1<<9
+        STR     a3, [v2, #SR37x_SRCONFIG]
+        
+        ; 5. Interrupts
+        ; We want automatic control, so enable VPBOUNDSINTENABLE, and don't bother touching IRQENABLE reg
+        LDR     a1, [v4, #SR37x_OPPTbl_ERRCONFIG]
+        LDR     a4, [v1, #SR37x_ERRCONFIG]
+        BFI     a4, a1, #0, #19
+        ORR     a4, a4, #3<<22 ; Enable interrupt, clear any existing interrupt
+      [ DebugSR37x
+        DebugReg a4, "SR1.ERRCONFIG="
+      ]
+        STR     a4, [v1, #SR37x_ERRCONFIG]
+        LDR     a1, [v5, #SR37x_OPPTbl_ERRCONFIG]
+        LDR     a4, [v2, #SR37x_ERRCONFIG]
+        BFI     a4, a1, #0, #19
+        ORR     a4, a4, #3<<22
+        STR     a4, [v2, #SR37x_ERRCONFIG]
+
+        MVN     a4, #0
+        STR     a4, [v1, #SR37x_IRQSTATUS]
+
+        ; 6. Enable the module
+      [ DebugSR37x
+        DebugTX "Enable SmartReflex"
+        DebugReg a2,"SR1.SRCONFIG="
+        DebugReg a3,"SR2.SRCONFIG="
+      ]
+        ORR     a2, a2, #1<<11
+        STR     a2, [v1, #SR37x_SRCONFIG]
+        ORR     a3, a3, #1<<11
+        STR     a3, [v2, #SR37x_SRCONFIG]
+
+        ; Finally, switch to the new MPU frequency
+        LDRH    v3, [v4, #SR37x_OPPTbl_MHz]
+        LDRB    a1, [v4, #SR37x_OPPTbl_CLKOUT_M2]
+        BL      CPUClk_AdjustDPLL ; v3-v5, ip corrupt
+
+        ; Now set up the HAL device
+        ADRL    v3, CPUClkWS
+        MOV     a1, v3
+        ADR     a2, SR37xDevTemplate
+        MOV     a3, #HALDevice_CPUClk_Size_0_2
+        BL      memcpy
+        ADRL    v1, SR37x_Shutdown
+        STR     v1, [v3, #:INDEX: SR37xShutdown]
+        STR     sb, [v3, #:INDEX: SR37xWorkspace]
+        MOV     v1, #(End_SR37x_OPPTbl_AMDM37x_VDD1-SR37x_OPPTbl_AMDM37x_VDD1)/SR37x_OPPTbl_Size
+        STR     v1, [v3, #:INDEX: SR37xOPPTblSize]
+        SUB     a1, v1, #1
+        STR     a1, [v3, #:INDEX: SR37xCurSpeed]
+        MVN     a1, #0
+        STR     a1, [v3, #:INDEX: SR37xNewSpeed]
+        ADD     a1, v3, #:INDEX: SR37xOPPTbl
+        ADR     a2, SR37x_OPPTbl_AMDM37x_VDD1
+        ASSERT  SR37x_OPPTbl_Size = 12
+        LDR     v2, L4_Core_Log
+40
+        LDMIA   a2!,{a3-a4,lr}
+        ; Translate NVALUERECIPROCAL ptr to value
+        ASSERT  SR37x_OPPTbl_NVALUERECIPROCAL = 4
+        LDR     a4, [v2, a4]
+        STMIA   a1!,{a3-a4,lr}
+        SUBS    v1, v1, #1
+        BNE     %BT40
+
+      [ DebugSR37x
+        ; Set v1, v2 to point to the SmartReflex instances
+        LDR     a1, L4_Core_Log
+        ADD     v1, a1, #L4_SR1-L4_Core
+        ADD     v2, a1, #L4_SR2-L4_Core
+        ; Set v3 to point to the PRM registers
+        LDR     v3, L4_PowerMan_Log
+        ADD     v3, v3, #Global_Reg_PRM
+        ; Set v4, v5 to point to initial OPP table entries
+        ADRL    v4, End_SR37x_OPPTbl_AMDM37x_VDD1-SR37x_OPPTbl_Size
+        ADRL    v5, End_SR37x_OPPTbl_AMDM37x_VDD2-SR37x_OPPTbl_Size
+        BL      DoDumpRegs
+      ]  
+
+        ; Finished
+        MOV     a1, #0
+        EXIT        
+
+        MACRO
+        SR37x_OPPTblEntry $mhz,$vdd1,$clkout_m2,$nvalreg,$errmin,$errgain
+        ; VDD1 specified in mV
+        DCW $mhz
+        DCB ((($vdd1-600)*10)+124)/125 ; VDD1_VSEL = ((V-0.6)+0.0124)/0.0125
+        DCB $clkout_m2
+        DCD $nvalreg
+        DCB $errmin
+        DCB SR37x_ERRMAXLIMIT
+        DCB SR37x_ERRWEIGHT
+        DCB $errgain
+        MEND
+
+SR37x_OPPTbl_AMDM37x_VDD1
+        SR37x_OPPTblEntry  300, 0970, 2, CONTROL_FUSE_OPP50_VDD1, &f4, &0c ; OPP50
+        SR37x_OPPTblEntry  600, 1140, 1, CONTROL_FUSE_OPP100_VDD1, &f9, &16 ; OPP100
+        SR37x_OPPTblEntry  800, 1270, 1, CONTROL_FUSE_OPP130_VDD1, &fa, &23 ; OPP130
+        SR37x_OPPTblEntry 1000, 1380, 1, CONTROL_FUSE_OPP1G_VDD1, &fa, &27 ; OPP1G. Note datasheet lists 1.35V as typical voltage, but recommends to use 1.38V instead, to cope with power supply inefficiencies.
+End_SR37x_OPPTbl_AMDM37x_VDD1
+
+SR37x_OPPTbl_AMDM37x_VDD1_Default
+        SR37x_OPPTblEntry  600, 1200, 1, CONTROL_FUSE_OPP100_VDD1, &f9, &16 ; OPP100 @ 1.2V
+
+SR37x_OPPTbl_AMDM37x_VDD2
+        SR37x_OPPTblEntry  200, 0950, 2, CONTROL_FUSE_OPP50_VDD2, &f4, &0c ; OPP50
+        SR37x_OPPTblEntry  400, 1140, 1, CONTROL_FUSE_OPP100_VDD2, &f9, &16 ; OPP100
+End_SR37x_OPPTbl_AMDM37x_VDD2
+
+SR37xDevTemplate
+        DCW     HALDeviceType_SysPeri + HALDeviceSysPeri_CPUClk
+        DCW     HALDeviceID_CPUClk_AMDM37x_SR
+        DCD     HALDeviceBus_Peri + HALDevicePeriBus_Sonics3220
+        DCD     2                     ; API version (v0.2)
+        DCD     SR37x_Desc            ; Description
+        DCD     0                     ; Address - unused
+        %       12                    ; Unused
+        DCD     SR37x_Activate
+        DCD     SR37x_Deactivate
+        DCD     SR37x_Reset
+        DCD     SR37x_Sleep
+        DCD     -1                    ; Device - unused
+        DCD     0                     ; TestIRQ
+        DCD     0                     ; ClearIRQ
+        %       4
+        ASSERT  (.-SR37xDevTemplate) = HALDeviceSize
+        DCD     SR37x_NumSpeeds
+        DCD     SR37x_Info
+        DCD     SR37x_Get
+        DCD     SR37x_Set
+        DCD     SR37x_Override
+        DCD     SR37x_GetOverride
+        DCD     SR37x_GetDieTemp
+        ASSERT  (.-SR37xDevTemplate) = HALDevice_CPUClk_Size_0_2
+
+SR37x_Desc
+        =       "AM/DM37x SmartReflex CPU clock controller",0
+        ALIGN
+
+SR37x_Activate
+        ; Do nothing
+        MOV     a1, #1
+SR37x_Deactivate
+SR37x_Reset
+        MOV     pc, lr
+
+SR37x_Sleep
+        MOV     a1, #0
+        MOV     pc, lr
+
+SR37x_NumSpeeds
+        ; Out: a1 = num entries in table
+        LDR     a1, SR37xOPPTblSize
+        MOV     pc, lr
+
+SR37x_Info
+        ; In: a2 = table index
+        ; Out: a1 = MHz
+        ADR     a3, SR37xOPPTbl
+        ASSERT  SR37x_OPPTbl_Size = 12
+        ASSERT  SR37x_OPPTbl_MHz = 0
+        ADD     a3, a3, a2, LSL #2
+        ADD     a3, a3, a2, LSL #3
+        LDRH    a1, [a3]
+        MOV     pc, lr
+
+SR37x_Get
+        ; Return current table index
+        EntryS  "sb"
+        CPSID   i ; Prevent speed changing while we're reading it
+        LDR     a2, SR37xNewSpeed
+        LDR     sb, SR37xWorkspace
+        CMP     a2, #-1 ; Are we changing speed?
+        BLNE    SR37x_Set ; Yes, complete the change so that the returned value is accurate
+        ADRL    a2, CPUClkWS
+        LDR     a1, SR37xCurSpeed
+        EXITS
+
+SR37x_Set ROUT
+        ; a2 = new table index
+        ; Return 0 on success, -1 on failure
+        EntryS  "v1-v5,sb"
+        MOV     v1, #0
+        ; Keep IRQs off for the entireity of the function
+        ; This avoids us having to worry about re-entrancy (which is more complicated than with the CPUClk driver)
+        ; The slowest operation (switching from OPP50 to OPP1G) only takes ~0.343ms, so with the exception of unforseen circumstances (lots of IIC failures in the VC?) we shouldn't have to worry about this hurting our interrupt latency
+        CPSID   i
+        ; Clamp a2, get table entry
+        LDR     sb, SR37xWorkspace
+        CMP     a2, #0
+        LDR     v3, SR37xOPPTblSize
+        MOVLT   a2, #0
+        ADR     v2, SR37xOPPTbl
+        CMP     a2, v3
+        SUBGE   a2, v3, #1
+        ASSERT  SR37x_OPPTbl_Size = 12
+        ASSERT  SR37x_OPPTbl_MHz = 0
+        ADD     v2, v2, a2, LSL #2
+        ADD     v2, v2, a2, LSL #3
+10
+        LDRH    v3, [v2, #OPPTbl_MHz]
+        ; a2 = new idx
+        ; v2 = OPP table entry ptr
+        ; v3 = new clock rate
+ [ {FALSE} ; DebugSR37x
+        DebugReg a2,"SR37x_Set: Idx="
+        DebugReg v2,"OPPTbl ptr="
+        DebugReg v3,"New rate="
+        LDR     a3, SR37xNewSpeed
+        DebugReg a3,"Re-entrancy flag="
+ ]
+        ; Set the re-entrancy flag
+        STR     a2, SR37xNewSpeed
+        ; Set up v4 = VP regs, v5 = SR regs
+        LDR     v4, L4_PowerMan_Log
+        ADD     v4, v4, #Global_Reg_PRM
+        LDR     v5, L4_Core_Log
+        ADD     v5, v5, #L4_SR1-L4_Core
+        ; Get current VDD1
+        ; We can get this from INITVOLTAGE in PRM_VP1_CONFIG
+        LDR     a1, [v4, #PRM_VP1_CONFIG]
+        UBFX    a1, a1, #8, #8
+        LDRB    ip, [v2, #SR37x_OPPTbl_VDD]
+ [ {FALSE} ; DebugSR37x
+        DebugReg a1,"VDD1 currently "
+        DebugReg ip,"VDD1 needed "
+ ]
+        CMP     a1, ip
+        BLLO    SR37x_Reprogram ; Pre-increment VDD1
+        ; Adjust DPLL registers
+        Push    "v4-v5,ip"
+        LDRB    a1, [v2, #SR37x_OPPTbl_CLKOUT_M2]
+        BL      CPUClk_AdjustDPLL ; v3-v5, ip corrupt
+        Pull    "v4-v5,ip"
+        ; Now check if we need to reduce VDD1
+        LDR     a1, [v4, #PRM_VP1_CONFIG]
+        UBFX    a1, a1, #8, #8
+        CMP     a1, ip
+        BLNE    SR37x_Reprogram
+        ; Re-entrancy check not needed here, since we're done
+90
+      [ {FALSE} ; DebugSR37x
+        DebugTX "SR37x_Set done"
+      ]                
+        ; All done
+        ; However it's still possible we were re-entered; only set SR37xSpeed if SR37xNewSpeed != -1
+        ADRL    a1, CPUClkWS
+        LDR     a2, SR37xNewSpeed
+        CMP     a2, #-1
+        STRNE   a2, SR37xCurSpeed
+        MVN     a3, #0
+        STR     a3, SR37xNewSpeed
+        MOV     a1, #0
+        EXITS   ,c
+
+SR37x_Shutdown ALTENTRY
+        ; Reset to default speed & voltage prior to reset/power off
+        ; This avoids Pandora Linux often hanging on boot after RISC OS has been run
+        ADR     v2, SR37x_OPPTbl_AMDM37x_VDD1_Default
+        MOV     v1, #1 ; Exit with smartreflex disabled
+        CPSID   i
+        B       %BT10
+
+SR37x_Override ROUT
+        EntryS
+        CPSID   i
+        ; a2 = table ptr
+        ; a3 = num entries
+        ; a4 = format no.
+        CMP     a4, #SR37x_OPPTbl_Format
+        BNE     %FT20
+        CMP     a3, #SR37x_OPPTbl_Max
+        BGT     %FT20
+        ; Check we aren't in the middle of setting the speed
+        LDR     ip, SR37xNewSpeed
+        CMP     ip, #-1
+        MVNNE   a1, #0 ; -1 for try again later
+        EXITS   NE,c
+        ; Update table
+        ASSERT  SR37x_OPPTbl_Size = 12
+        STR     a3, SR37xOPPTblSize
+        ADR     ip, SR37xOPPTbl
+10
+        LDMIA   a2!, {a1,a4,lr}
+        SUBS    a3, a3, #1
+        STMIA   ip!, {a1,a4,lr}
+        BNE     %BT10
+20
+        MOV     a1, #SR37x_OPPTbl_Format ; Return expected table format
+        EXITS   ,c
+
+SR37x_GetOverride ROUT
+        Entry
+        ; a2 = table ptr
+        ; a3 = num entries
+        ; a4 = format no.
+        CMP     a4, #SR37x_OPPTbl_Format
+        BNE     %FT20
+        CMP     a3, #SR37x_OPPTbl_Max
+        BGT     %FT20
+        ; copy table into supplied buffer
+        ASSERT  SR37x_OPPTbl_Size = 12
+        ADR     ip, SR37xOPPTbl
+10
+        LDMIA   ip!, {a1,a4,lr}
+        SUBS    a3, a3, #1
+        STMIA   a2!, {a1,a4,lr}
+        BNE     %BT10
+20
+        MOV     a1, #SR37x_OPPTbl_Format ; Return expected table format
+        EXIT
+
+SR37x_Reprogram ROUT
+        Entry   "a1-a4,ip"
+        ; Reprogram the SR instance & voltage processor with new values
+        ; In:
+        ;   v1 = nonzero to exit with SR disabled
+        ;   v2 = OPPTbl entry
+        ;   v4 = voltage processor
+        ;   v5 = smartreflex instance
+        ;   sb = HAL workspace
+        ;   IRQs disabled
+        ; Out:
+        ;   all regs preserved
+        ; This is a mix of the steps laid out in sprugn4o section 3.6.6.7 (p442) and 3.6.6.8 (p445), plus any extra steps that are necessary (e.g. to wait for the SR module disable acknowledgement)
+
+        ; 1. Disable smartreflex
+        LDR     a1, [v5, #SR37x_SRCONFIG]
+        TST     a1, #1<<11
+        BEQ     %FT20
+        BIC     a1, a1, #1<<11
+        ; Clear any current disable ack IRQ before disabling the module
+        MVN     a2, #0
+        STR     a2, [v5, #SR37x_IRQSTATUS]
+        STR     a1, [v5, #SR37x_SRCONFIG]
+        ; Wait for acknowledge
+10
+        LDR     a1, [v5, #SR37x_IRQSTATUS_RAW]
+        TST     a1, #1
+        BEQ     %BT10
+20
+
+        ; 2. Disable voltage processor, and make sure INITVDD+FORCEUPDATE clear
+        LDR     a1, [v4, #PRM_VP1_CONFIG]
+        BIC     a1, a1, #1+2+4
+        STR     a1, [v4, #PRM_VP1_CONFIG]
+        ; Wait for idle
+30
+        LDR     a2, [v4, #PRM_VP1_STATUS]
+        TST     a2, #1
+        BEQ     %BT30
+
+      [ AlwaysFBB
+        ; Make a note of the current voltage so we can more accurately handle errata 1.46 (see step 7 below)
+        LDR     a1, [v4, #PRM_VP1_VOLTAGE]
+        Push    "a1"
+      ]
+
+        ; 3. Reprogram smartreflex instance
+        LDR     a1, [v2, #SR37x_OPPTbl_NVALUERECIPROCAL]
+        STR     a1, [v5, #SR37x_NVALUERECIPROCAL]
+        LDR     a1, [v2, #SR37x_OPPTbl_ERRCONFIG]
+        LDR     a2, [v5, #SR37x_ERRCONFIG]
+        BFI     a2, a1, #0, #19
+        ORR     a2, a2, #3<<22 ; Enable interrupt, clear any existing interrupt
+        STR     a2, [v5, #SR37x_ERRCONFIG]
+
+        ; 4. Set voltage processor error gain value and program new INITVOLTAGE
+        LDRB    a1, [v2, #SR37x_OPPTbl_ERRGAIN]
+        LDR     a2, [v4, #PRM_VP1_CONFIG]
+        BFI     a2, a1, #16, #8
+        LDRB    a4, [v2, #SR37x_OPPTbl_VDD]
+        UBFX    a3, a2, #8, #8
+        BFI     a2, a4, #8, #8
+        ORR     a1, a2, #4
+        STR     a1, [v4, #PRM_VP1_CONFIG]
+
+      [ :LNOT: AlwaysFBB
+        ; 5. Tell ABB LDO if we're going to fast mode
+        ; Work this out by looking at the voltage rather than CPU speed
+        ; Assume anything over the stock 800MHz voltage will want it
+        MOV     a1, #ABB_FBB_VOLTAGE
+        CMP     a3, a1 ; old VDD <= 1.27?
+        CMPLE   a1, a4 ; and 1.27 < new VDD?
+        BGE     %FT39
+        ; Put LDO in fast mode
+        MOV     a1, #1+4
+        STR     a1, [v4, #PRM_LDO_ABB_SETUP]
+        ; Wait for completion
+35
+        LDR     a1, [v4, #PRM_LDO_ABB_SETUP]
+        TST     a1, #4
+        BNE     %BT35        
+      ]
+      
+39
+        ; 6. Use FORCEUPDATE to send the update to the TWL
+        ; First clear any pending transaction done interrupts
+        LDR     lr, L4_PowerMan_Log
+        MVN     a1, #0
+        STR     a1, [lr, #OCP_System_Reg_PRM+PRM_IRQSTATUS_MPU]
+        ; Force update
+        ORR     a1, a2, #2
+        STR     a1, [v4, #PRM_VP1_CONFIG]
+        ; Wait for completion
+40        
+        ; Check if IRQ happened yet
+        LDR     ip, [lr, #OCP_System_Reg_PRM+PRM_IRQSTATUS_MPU]
+        TST     ip, #1<<15
+        BNE     %BT40        
+                      
+        ; 7. Errata advisory 1.46 (sprz319e, page 66)
+        ; a3 = old VDD
+        ; a4 = new VDD
+      [ :LNOT: AlwaysFBB
+        SUBS    a1,a4,a3
+        BLE     %FT50 ; VDD going down? delay not required
+        BL      SR37x_Errata146
+        B       %FT60
+
+50
+        ; VDD going down; check if we can disable FBB
+        ; (Running with FBB enabled when we don't need it is safe, but turning
+        ; it off should save some power?)
+        MOV     ip, #ABB_FBB_VOLTAGE
+        CMP     a4, ip ; new VDD <= 1.27?
+        CMPLE   ip, a3 ; and 1.27 < old VDD?
+        BGE     %FT60
+        ; If we're disabling FBB, for safety reasons we need to deal with
+        ; errata 146, to make sure the voltage has dropped to a safe level.
+        SUB     a1, a3, #ABB_FBB_VOLTAGE ; Only need to wait for the voltage to drop to below ABB_FBB_VOLTAGE
+        BL      SR37x_Errata146
+        ; Put LDO in nominal mode
+        MOV     a1, #2+4
+        STR     a1, [v4, #PRM_LDO_ABB_SETUP]
+        ; Wait for completion
+55
+        LDR     a1, [v4, #PRM_LDO_ABB_SETUP]
+        TST     a1, #4
+        BNE     %BT55        
+60
+      |
+        ; Grab stashed actual voltage from earlier
+        Pull    "lr"
+        AND     lr, lr, #255
+        CMP     a3, lr
+        MOVLT   lr, a3 ; Use the lower of the previous voltage and the actual previous voltage
+        SUBS    a1, a4, lr
+        BLGT    SR37x_Errata146 ; ... and handle errata 1.46 if we've increased voltage
+      ]
+        ; 9. Re-enable modules
+        CMP     v1, #0
+        EXIT    NE
+        ORR     a1, a2, #1
+        STR     a1, [v4, #PRM_VP1_CONFIG]
+        LDR     a1, [v5, #SR37x_SRCONFIG]
+        ORR     a1, a1, #1<<11
+        STR     a1, [v5, #SR37x_SRCONFIG]
+
+        ; Done
+        EXIT
+
+SR37x_Errata146
+        ; Deal with errata advisory 1.46 (sprz319e, page 66)
+        ; Basically we need to have a manual delay loop to ensure the voltage
+        ; update has fully completed
+        ; TODO - Surely we need a similar system in s.CPUClk, since we don't
+        ; use any delay at all when switching OPP?
+        ; In:
+        ;    a1 = number of VDD steps to wait
+        ;    sb = HAL workspace
+        ; Out:
+        ;    a1,a3-4,ip corrupt
+        Entry   "a2" ; a2 preserved since SR37x_Reprogram uses it for PRM_VP1_CONFIG
+        ; Convert voltage change to delay value
+        ; TPS_VP_STEPSIZE is uV per step
+        ; TPS_VP_SLEWRATE is uV/uS
+        ; So required delay is a4*TPS_VP_STEPSIZE/TPS_VP_SLEWRATE microseconds
+        ; Max delay (from OPP50 to OPP1G) would be 103.125 microseconds (which we'll round up to 104 for safety)
+        ASSERT  ((TPS_VP_STEPSIZE*256) :MOD: TPS_VP_SLEWRATE) = 0
+        LDR     ip, =(TPS_VP_STEPSIZE*256)/TPS_VP_SLEWRATE
+        MUL     a1, ip, a1
+        MOV     a1, a1, LSR #8
+        ADDS    a1, a1, #1 ; round up
+        BLGT    HAL_CounterDelay ; Paranoia; only delay if >0
+        EXIT
+
+
+; support for die temperature measurement
+
+; CPU die temperature related register - relative to L4_Core
+CONTROL_COMMON_OFFSET   *       &2000
+CONTROL_TEMP_SENSOR     *       &0524
+
+; bits in CONTROL_TEMP_SENSOR
+TEMP_SENSOR_EOCZ        *       (1 << 8)        ; End Of Conversion
+TEMP_SENSOR_SOC         *       (1 << 9)        ; Start Of Conversion
+TEMP_SENSOR_MASK        *       0xFF
+
+; Temperature calculation constants (in units of 2^-18)
+; derived from table 13-11 ADC Code Versus Temperature (AM/DM37xx TRM)
+; remark: the conversion table is identical to that one used on OMAP4430
+TEMP_SCALE              *       18
+TEMP_KELVIN_OFFS        *       2732            ; in 0.1 K
+TEMP_CONST_A0           *       -158373902
+TEMP_CONST_A1           *       4609309
+TEMP_CONST_A2           *       -489
+
+SR37x_GetDieTemp
+        ; Out: a1 = CPU die temperature in units of 0.1 K
+        Entry   "sb"
+        LDR     sb, SR37xWorkspace
+        LDR     ip, L4_ClockMan_Log
+        LDR     lr, [ip, #CM_FCLKEN3_CORE]
+        ORR     lr, lr, #(1 << 1)               ; enable ADC clock for temperature conversion
+        STR     lr, [ip, #CM_FCLKEN3_CORE]
+        LDR     a4, L4_Core_Log
+        ADD     a4, a4, #CONTROL_COMMON_OFFSET
+        LDR     a2, [a4, #CONTROL_TEMP_SENSOR]
+        ORR     a2, a2, #TEMP_SENSOR_SOC
+        STR     a2, [a4, #CONTROL_TEMP_SENSOR]
+        ; Wait until conversion starts
+10
+        LDR     a2, [a4, #CONTROL_TEMP_SENSOR]
+        TST     a2, #TEMP_SENSOR_EOCZ
+        BEQ     %BT10
+        ; Reset SOC bit
+        BIC     a2, a2, #TEMP_SENSOR_SOC
+        STR     a2, [a4, #CONTROL_TEMP_SENSOR]
+        ; Wait until conversion is finished
+20
+        LDR     a2, [a4, #CONTROL_TEMP_SENSOR]
+        TST     a2, #TEMP_SENSOR_EOCZ
+        BNE     %BT20
+        UBFX    a2, a2, #0, #8                  ; extract temperature ADC value
+        BIC     lr, lr, #(1 << 1)               ; disable ADC clock
+        STR     lr, [ip, #CM_FCLKEN3_CORE]
+        ; now convert the ADC value to a temperature
+        ; instead of using a table (AM/DM37xx TRM, page 2474 - 2475)
+        ; we are calculating a polynom of second order derived from above table
+        ; y := temp; x := ADC value
+        ; y = ((A2 * x + A1) * x + A0) >> TEMP_SCALE
+        LDR     a3, =TEMP_CONST_A2
+        LDR     a4, =TEMP_CONST_A1
+        MLA     a1, a3, a2, a4
+        LDR     a4, =TEMP_CONST_A0
+        MLA     a3, a1, a2, a4
+        LDR     a4, =TEMP_KELVIN_OFFS
+        ADD     a1, a4, a3, ASR #TEMP_SCALE
+        EXIT
+
+        END

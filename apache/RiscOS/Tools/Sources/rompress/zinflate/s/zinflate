@@ -1,0 +1,162 @@
+; Copyright 2012 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+
+        GET     OSEntries
+
+        AREA    |!!!!init$code|, CODE, READONLY
+
+        EXPORT  __main
+        EXPORT  memcpy
+        EXPORT  malloc
+        EXPORT  free
+        IMPORT  __RelocCode
+        IMPORT  uncompress
+
+        ENTRY
+
+rompress_zlibcode
+        ASSERT  OSDecompHdr_WSSize = . - rompress_zlibcode
+        DCD     0 ; Workspace size - poked by rompress
+        ASSERT  OSDecompHdr_Code = . - rompress_zlibcode
+        DCD     __main - rompress_zlibcode
+        ASSERT  OSDecompHdr_size = . - rompress_zlibcode
+
+sourceLen
+        DCD     0 ; Source length - poked by rompress
+
+relocateLen
+        DCD     0 ; Source length plus this stub size - poked by rompress
+
+__main
+        ; Called with:
+        ; a1 = OSHdr ptr
+        ; a2 = IMB func ptr
+        ; a3 = WS ptr
+        ; sp = stack
+        STMFD   sp!, {a1-a3,fp,lr}
+        ; First off, relocate ourselves and the compressed data to the workspace
+        LDR     ip, [a1, #OSHdr_CompressOffset]
+        LDR     fp, relocateLen
+        ADD     a4, ip, a1 ; Start of compressed area
+        STMFD   sp!, {a4,ip}
+        ADR     lr, continue
+        SUB     lr, lr, a4
+        ADD     lr, lr, a3 ; Relocated address to jump to
+10
+        LDR     a1, [a4], #4
+        SUBS    fp, fp, #4
+        STR     a1, [a3], #4
+        BNE     %BT10
+        ; Initialise mallocptr to the end of the used workspace region
+        STR     a3, [lr, #mallocptr-continue]
+        ; IMB the relocated code
+        MOV     a1, #1
+        MOV     a2, lr
+        LDR     pc, [sp, #12] ; Tail-call IMB func
+
+continue
+        ; We arrive here after being relocated to the decompression workspace
+        BL      __RelocCode ; Corrupts fp!
+        ; Use the uncompress function to do the uncompression
+        LDMFD   sp!, {a1-a2,fp,ip,lr} ; Get dest ptr, compression offset, OS hdr, IMB func, WS ptr
+        MOV     a3, lr ; Source ptr is WS ptr
+        LDR     a4, sourceLen ; Get length of zlib stream
+        LDR     ip, [fp, #OSHdr_ImageSize]
+        SUB     a2, ip, a2 ; Dest len is (image size)-(compression offset)
+        STR     a2, [sp, #-4]!
+        MOV     a2, sp
+        ; Fixup OS header
+        STR     ip, [fp, #OSHdr_CompressedSize]
+        MOV     ip, #0
+        STR     ip, [fp, #OSHdr_DecompressHdr]
+        ; Call decompression code
+        BL      uncompress
+        LDMFD   sp!, {a2,fp,pc}
+
+mallocptr
+        DCD     0 ; Tracks next malloc addr
+
+malloc
+        ADD     a2, a1, #3
+        LDR     a1, mallocptr
+        BIC     a2, a2, #3
+        ADD     a2, a2, a1
+        STR     a2, mallocptr
+free
+        MOV     pc, lr
+
+memcpy
+        ; Ordinarily memcpy doesn't get used, so it doesn't matter that this is just a simple bytewise copy
+        SUBS    a3, a3, #1
+        LDRGEB  a4, [a2, a3]
+        STRGEB  a4, [a1, a3]
+        BGT     memcpy
+        MOV     pc, lr
+
+        EXPORT  |__rt_udiv|
+|__rt_udiv|
+; Unsigned divide of a2 by a1: returns quotient in a1, remainder in a2
+; Destroys a3 and ip
+
+        MOV     a3, #0
+        RSBS    ip, a1, a2, LSR #3
+        BCC     u_sh2
+        RSBS    ip, a1, a2, LSR #8
+        BCC     u_sh7
+        MOV     a1, a1, LSL #8
+        ORR     a3, a3, #&FF000000
+        RSBS    ip, a1, a2, LSR #4
+        BCC     u_sh3
+        RSBS    ip, a1, a2, LSR #8
+        BCC     u_sh7
+        MOV     a1, a1, LSL #8
+        ORR     a3, a3, #&00FF0000
+        RSBS    ip, a1, a2, LSR #8
+        MOVCS   a1, a1, LSL #8
+        ORRCS   a3, a3, #&0000FF00
+        RSBS    ip, a1, a2, LSR #4
+        BCC     u_sh3
+        RSBS    ip, a1, #0
+    ;    BCS     dividebyzero
+u_loop  MOVCS   a1, a1, LSR #8
+u_sh7   RSBS    ip, a1, a2, LSR #7
+        SUBCS   a2, a2, a1, LSL #7
+        ADC     a3, a3, a3
+u_sh6   RSBS    ip, a1, a2, LSR #6
+        SUBCS   a2, a2, a1, LSL #6
+        ADC     a3, a3, a3
+u_sh5   RSBS    ip, a1, a2, LSR #5
+        SUBCS   a2, a2, a1, LSL #5
+        ADC     a3, a3, a3
+u_sh4   RSBS    ip, a1, a2, LSR #4
+        SUBCS   a2, a2, a1, LSL #4
+        ADC     a3, a3, a3
+u_sh3   RSBS    ip, a1, a2, LSR #3
+        SUBCS   a2, a2, a1, LSL #3
+        ADC     a3, a3, a3
+u_sh2   RSBS    ip, a1, a2, LSR #2
+        SUBCS   a2, a2, a1, LSL #2
+        ADC     a3, a3, a3
+u_sh1   RSBS    ip, a1, a2, LSR #1
+        SUBCS   a2, a2, a1, LSL #1
+        ADC     a3, a3, a3
+u_sh0   RSBS    ip, a1, a2
+        SUBCS   a2, a2, a1
+        ADCS    a3, a3, a3
+        BCS     u_loop
+        MOV     a1, a3
+        MOV     pc, lr
+
+        END

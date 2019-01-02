@@ -1,0 +1,370 @@
+; Copyright 2008 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+FifoFree        *       &010
+
+                ^       &300
+Blt_TopLeftSrc  #       4
+Blt_TopLeftDst  #       4
+Blt_WidthHeight #       4
+
+                ^       &300
+Rop_Rop3        #       4
+
+                ^       &300
+                #       8
+Patt_Shape      #       4
+                #       4
+Patt_Colour0    #       4
+Patt_Colour1    #       4
+Patt_Monochrome #       8
+
+                ^       0
+UnclipRect_TopLeft #    4
+UnclipRect_WidthHeight # 4
+UnclipRect_sz   #       0
+
+                ^       &3FC
+Bitmap_Color1A  #       4
+Bitmap_UnclippedRectangles # 64*UnclipRect_sz
+
+                ^       &300
+Clip_TopLeft    #       4
+Clip_WidthHeight #      4
+
+                ^       0
+Lin_point0      #       4
+Lin_point1      #       4
+Lin_sz          #       0
+
+                ^       &304
+Line_Color      #       4
+                ^       &400
+Line_Lin        #       16*Lin_sz
+Line_Lin32      #       8*16
+Line_PolyLin    #       32*4
+Line_PolyLin32  #       16*8
+Line_ColorPolyLin #     16*8
+
+                ^       &300
+                #       12
+Surface_Offset  #       4
+
+
+
+        MACRO
+        RivaFifoFree $op, $cnt
+        mov     lr, #&1B000          ; approx 4ms = &1000 => &1B000 approx 100ms
+        str     lr, RFFTimeout
+04      LDR     lr, FifoFreeCount
+05      SUBS    lr, lr, #$cnt
+        BHS     %FT10
+        LDRH    lr, [$op, #FifoFree]
+        MOV     lr, lr, LSR #2
+        STR     lr, FifoFreeCount
+        ldr     lr, RFFTimeout
+        subs    lr, lr, #1
+        str     lr, RFFTimeout
+;        B       %BT05
+        bne     %bt04
+10      STR     lr, FifoFreeCount
+        MEND
+
+SetRenderAddress
+        Push    "r3, lr"
+        LDR     r3, RenderAdd       
+        RivaFifoFree r3, 2
+        MOV     lr, #&80000003          ; destination surface
+        STR     lr, [r3]
+        STR     r0, [r3, #Surface_Offset]
+        MOV     lr, #&80000004          ; source surface
+        STR     lr, [r3]
+        STR     r0, [r3, #Surface_Offset]
+        MOV     lr, #&80000014
+        STR     lr, [r3]
+        Pull    "r3, pc"
+
+GV_Render
+        LDR     r4, OurMode
+        TEQ     r4, #0
+        MOV     r4, #GraphicsV_Render
+        Pull    "pc", EQ
+        CMP     r1, #(Render_TableEnd - Render_Table) / 4
+        ADDLO   pc, pc, r1, LSL #2
+        B       Render_ExitNotDone
+Render_Table
+        B       Render_ExitDone
+        B       Render_CopyRectangle
+        B       Render_FillRectangle
+Render_TableEnd
+
+Render_Exit
+        TEQ     r4, #GraphicsV_Complete
+        BEQ     Render_ExitDone2
+Render_ExitNotDone
+        TST     r0, #GVRender_SyncIfNotComplete
+        Pull    "pc", EQ
+        B       Synchronise
+
+Render_ExitDone
+        MOV     r4, #GraphicsV_Complete
+Render_ExitDone2
+        TST     r0, #GVRender_SyncIfComplete
+        Pull    "pc", EQ
+        ASSERT  . = Synchronise         ; fall through
+
+Synchronise
+        Push    "r0,r3"
+        LDR     r3, Rop
+        LDR     lr, FifoEmptyCount
+10      LDRH    r0, [r3, #FifoFree]
+        CMP     r0, lr
+        BLO     %BT10
+        MOV     r0, r0, LSR #2
+        STR     r0, FifoFreeCount
+        LDR     r3, PGRAPH
+20      LDR     r0, [r3, #NVACC_STATUS - &400000]
+        TST     r0, #1
+        BNE     %BT20
+        Pull    "r0,r3,pc"
+
+
+SetPattern
+        Push    "r6,lr"
+        LDR     r6, Patt
+        RivaFifoFree r6, 5
+        MOV     lr, #0
+        STR     lr, [r6, #Patt_Shape]
+        STR     r0, [r6, #Patt_Colour0]
+        STR     r1, [r6, #Patt_Colour1]
+        STR     r2, [r6, #Patt_Monochrome+0]
+        STR     r3, [r6, #Patt_Monochrome+4]
+        Pull    "r6,pc"
+
+SetRopSolid
+        Push    "r3,lr"
+        LDR     lr, IsSolid
+        TEQ     lr, #0
+        BNE     %FT10
+        Push    "r0-r2"
+        MOV     r0, #&FFFFFFFF
+        MOV     r1, #&FFFFFFFF
+        MOV     r2, #&FFFFFFFF
+        MOV     r3, #&FFFFFFFF
+        BL      SetPattern
+        Pull    "r0-r2"
+        STR     pc, IsSolid
+10      LDR     r3, Rop
+        RivaFifoFree r3, 1
+        MOV     lr, #&CC
+        STR     lr, currentRop
+        STR     lr, [r3, #Rop_Rop3]
+        Pull    "r3,pc"
+
+; in: r0,r1 = src left, bot
+;     r2,r3 = dst left, bot
+;     r4,r5 = w-1,h-1
+Render_CopyRectangle
+        Push    "r0-r3,r5-r7,lr"
+        LDMIA   r2, {r0-r6}
+        BL      SetRopSolid
+        LDR     r6, Blt
+        LDR     r7, VWindLimit
+        RivaFifoFree r6, 3
+        SUB     r1, r7, r1      ; Y-flip coordinate system
+        SUB     r3, r7, r3
+        SUB     r1, r1, r5      ; get top left
+        SUB     r3, r3, r5
+        ADD     r4, r4, #1
+        ADD     r5, r5, #1
+
+        MOV     r0, r0, LSL #16
+        MOV     r1, r1, LSL #16
+        MOV     r2, r2, LSL #16
+        MOV     r3, r3, LSL #16
+        MOV     r4, r4, LSL #16
+        MOV     r5, r5, LSL #16
+        ORR     r0, r1, r0, LSR #16
+        ORR     r2, r3, r2, LSR #16
+        ORR     r4, r5, r4, LSR #16
+        STR     r0, [r6, #Blt_TopLeftSrc]
+        STR     r2, [r6, #Blt_TopLeftDst]
+        STR     r4, [r6, #Blt_WidthHeight]
+        Pull    "r0-r3,r5-r7,lr"
+        B       Render_ExitDone
+
+; in: r0 -> colour block (64-byte aligned)
+; out: pattern set up in card for line/rect operation
+; VS if not possible
+;
+; currently only do solid colour overwrites :(
+SetUpOraEorForRectangle
+        Entry   "r0-r4,r6"
+        PLD     [r0, #0]
+        PLD     [r0, #32]
+        LDR     lr, bpp
+        LDMIA   r0!, {r1, r2}           ; check all 8 rows
+01      LDMIA   r0!, {r3, r4}           ; identical
+        TEQ     r3, r1
+        TEQEQ   r4, r2
+        BNE     %FT99
+        TST     r0, #63
+        BNE     %BT01
+        CMP     r1, #&FFFFFFFF
+        MOVEQ   r1, #&CC                ; overwrite
+        MVNEQ   r2, r2
+ [ {FALSE}
+        BEQ     %FT40
+        CMP     r1, #0
+        MOVEQ   r1, #&66                ; eor
+        BEQ     %FT40
+        CMP     r2, #0
+        MOVEQ   r2, r1
+        MOVEQ   r1, #&EE                ; or
+        BEQ     %FT40
+        CMP     r1, r1
+        MOVEQ   r1, #&88                ; and
+        MVNEQ   r2, r2
+ ]
+        BNE     %FT99
+
+40
+        TEQ     r2, r2, ROR lr          ; check all pixels
+        BNE     %FT99                   ; the same colour
+        BL      SetRopSolid
+ [ {FALSE}
+        LDR     r6, Rop
+        RivaFifoFree r6, 1
+        STR     r1, currentRop
+        STR     r1, [r3, #Rop_Rop3]
+        MOV     lr, #&80
+        STR     r1, [lr]
+ ]
+        LDR     r6, Bitmap
+        RivaFifoFree r6, 1
+        STR     r2, [r6, #Bitmap_Color1A]
+        CLRV
+        EXIT
+99
+        SETV
+        EXIT
+
+; in: r0,r1 = left, top
+;     r2,r3 = right, bot
+;     r4    -> colour block
+Render_FillRectangle
+        Push    "r0-r3,r5-r7,lr"
+        LDR     r0, [r2, #16]
+        BL      SetUpOraEorForRectangle
+        BVS     %FT99
+        LDMIA   r2, {r0-r3}
+        LDR     r6, Bitmap
+        LDR     r7, VWindLimit
+        RivaFifoFree r6, 2
+        SUB     r2, r2, r0      ; width
+        SUB     r3, r1, r3      ; height
+        SUB     r1, r7, r1      ; Y-flip coordinate system
+        ADD     r2, r2, #1
+        ADD     r3, r3, #1
+        MOV     r0, r0, LSL #16
+        MOV     r1, r1, LSL #16
+        MOV     r2, r2, LSL #16
+        MOV     r3, r3, LSL #16
+        ORR     r0, r0, r1, LSR #16
+        ORR     r2, r2, r3, LSR #16
+        ADD     r1, r6, #Bitmap_UnclippedRectangles
+        STR     r0, [r1, #UnclipRect_TopLeft]
+        STR     r2, [r1, #UnclipRect_WidthHeight]
+        MOV     r4, #GraphicsV_Complete
+99
+        Pull    "r0-r3,r5-r7,lr"
+        B       Render_Exit
+
+; in: r0,r1 = x1,y1
+;     r2,r3 = w,h
+;     r4 = colour
+RectangleFill
+        Push    "r0-r6,lr"
+        BL      SetRopSolid
+        LDR     r6, Bitmap
+        RivaFifoFree r6, 3
+        STR     r4, [r6, #Bitmap_Color1A]
+        MOV     r0, r0, LSL #16
+        MOV     r1, r1, LSL #16
+        MOV     r2, r2, LSL #16
+        MOV     r3, r3, LSL #16
+        ORR     r0, r1, r0, LSR #16
+        ORR     r2, r3, r2, LSR #16
+        ADD     r1, r6, #Bitmap_UnclippedRectangles
+        STR     r0, [r1, #UnclipRect_TopLeft]
+        STR     r2, [r1, #UnclipRect_WidthHeight]
+        LDRH    lr, [r6, #FifoFree]
+
+        Pull    "r0-r6,pc"
+
+; in: r0,r1 = x1,y1
+;     r2,r3 = x2,y2
+SetClipping
+        Push    "r0-r6,lr"
+        LDR     r6, Clip
+        RivaFifoFree r6, 2
+        SUB     r2, r2, r0
+        SUB     r3, r3, r0
+        MOV     r0, r0, LSL #16
+        MOV     r1, r1, LSL #16
+        MOV     r2, r2, LSL #16
+        MOV     r3, r3, LSL #16
+        ORR     r0, r1, r0, LSR #16
+        ORR     r2, r3, r2, LSR #16
+        STR     r0, [r6, #Clip_TopLeft]
+        STR     r2, [r6, #Clip_WidthHeight]
+        Pull    "r0-r6,pc"
+
+SyncAccel
+        Push    "r0,lr"
+        LDR     r0, Rop
+        LDR     r1, FifoEmptyCount
+10      LDRH    lr, [r0, #FifoFree]
+        TEQ     lr, r1
+        BNE     %BT10
+        MOV     r1, r1, LSR #2
+        STR     r1, FifoFreeCount
+        Pull    "r0,pc"
+
+; in: r0,r1 = x1,y1
+;     r2,r3 = w,h
+;     r4 = colour
+DrawSolidLine
+        Push    "r0-r6,lr"
+        BL      SetRopSolid
+        LDR     r6, Line
+        RivaFifoFree r6, 5
+        STR     r4, [r6, #Line_Color]
+        MOV     r0, r0, LSL #16
+        MOV     r1, r1, LSL #16
+        MOV     r2, r2, LSL #16
+        MOV     r3, r3, LSL #16
+        ORR     r0, r1, r0, LSR #16
+        ORR     r2, r3, r2, LSR #16
+        ADD     r1, r6, #Line_Lin
+        STR     r0, [r1, #Lin_point0]
+        STR     r2, [r1, #Lin_point1]
+        STR     r2, [r1, #8+Lin_point0]
+        ADD     r2, r2, #1:SHL:16
+        STR     r2, [r1, #8+Lin_point1]
+        Pull    "r0-r6,pc"
+
+        END
+
+

@@ -1,0 +1,1809 @@
+; Copyright 1996 Acorn Computers Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:Services
+        GET     Hdr:ModHand
+        GET     Hdr:FSNumbers
+        GET     Hdr:HighFSI
+        GET     Hdr:NewErrors
+        GET     Hdr:EnvNumbers
+        GET     Hdr:MsgTrans
+        GET     Hdr:Proc
+        GET     Hdr:OSMisc
+        GET     Hdr:OsBytes
+        GET     Hdr:Territory
+
+        GET     VersionASM
+
+                         ^       0,R12
+Old_CallASWI             #       4
+Old_CallASWIR12          #       4
+Old_PlatformFeatures     #       4
+Old_SynchroniseCodeAreas #       4
+Old_HeapSort32           #       4
+Old_ReadLine32           #       4
+Old_SubstituteArgs32     #       4
+Old_LeaveOS              #       4
+Old_ConvertVariform      #       4
+Old_FSControl            #       4
+Old_ReadUnsigned         #       4
+
+WorkSpaceSize            *       :INDEX: @
+
+CallASWIReEntryPoint     *       &01F033D4
+SWIDispatcherTable       *       &01F033FC
+SWIReturnAddress         *       &01F037FC
+
+                   GBLL International
+International      SETL {TRUE}
+                   GBLL NoARMv4
+NoARMv4            SETL {TRUE}
+                   
+space                    *       32
+ScratchSpace             *       &4000
+ScratchSpaceSize         *       &4000
+
+; Pointers for SubstituteArgs: no external calls.
+                         ^       ScratchSpace
+GSTransSpace             #       &100+&200+4
+MacExStartPtrs           #       44
+MacExEndPtrs             #       44
+
+        MACRO
+        LocalExitSWIHandler $cond
+        B$cond  SLVK_TestV
+        MEND
+
+        MACRO
+        GrabSWI $Name
+        LDR     R1,[R0,#OS_$Name * 4]
+        STR     R1,Old_$Name
+        ADRL    R1,Our_$Name
+        STR     R1,[R0,#OS_$Name * 4]
+        MEND
+
+        MACRO
+        FreeSWI $Name
+        LDR     R1,Old_$Name
+        STR     R1,[R0,#OS_$Name * 4]
+        MEND
+
+        AREA    |CallASWI$$Code|, CODE, READONLY, PIC
+
+ModuleBase
+
+        &       0                       ; Start
+        &       Initialise - ModuleBase
+        &       Finalise - ModuleBase
+        &       Service - ModuleBase    ; Service
+        &       Title - ModuleBase
+        &       Help - ModuleBase
+        &       0                       ; Help and commands
+
+Title
+        =       "CallASWI"
+        =       0
+Help
+        =       "CallASWI", 9, "$Module_HelpVersion"
+        =       0
+
+        ALIGN
+
+Service
+        TEQ     R1,#Service_Reset
+        MOVNE   PC,R14
+
+        Push    "R0-R2,R5,LR"
+        MOV     R0,#OsByte_OSVersionIdentifier  
+        MOV     R1,#0           ; If we're running at all then the version is neither too high
+        MOV     R2,#255         ; nor too low as that's checked in the Initialise entry point
+        SWI     XOS_Byte
+        Pull    "R0-R2,R5,PC",VS
+        
+        LDR     R12,[R12]
+        MOV     R5,R1
+        Push    "PC"
+        B       %FT10           ; Reregister with existing workspace
+        NOP
+        Pull    "R0-R2,R5,PC",,^
+
+Initialise
+        Push    "LR"
+        MOV     R0,#OsByte_OSVersionIdentifier
+        MOV     R1,#0
+        MOV     R2,#255
+        SWI     XOS_Byte
+        Pull    "PC",VS
+
+        CMP     R1,#&A4         ; RISC OS 3.10
+        BCC     LowOSVersion
+
+        CMP     R1,#&AA         ; RISC OS 5.00
+        BCS     HighOSVersion   ; Keep an eye out for any 26 bit OSs which make it past OS 5.00
+
+        STR     R1,osversionid
+
+        MOV     R5,R1
+        MOV     R0,#ModHandReason_Claim
+        MOV     R3,#WorkSpaceSize
+        SWI     XOS_Module
+        Pull    "PC",VS
+
+        STR     R2,[R12]
+        MOV     R12,R2
+10
+        CMP     R5,#&A7         ; For OS 3.70 and later you get the first 3 built in
+        BCS     %FT20
+        LDR     R0,=SWIDispatcherTable
+        GrabSWI CallASWI
+        GrabSWI CallASWIR12
+        GrabSWI SynchroniseCodeAreas
+        CMP     R5,#&A5         ; For OS 3.50 & 3.60 there is SWP
+        CMPNE   R5,#&A6
+        BLNE    DetectSWPNotAvailable
+        LDR     R0, noswp
+        CMP     R0, #0
+        MOVNE   R0, #CPUFlag_NoSWP      ; Pre ARM2as fossil
+                                        ; Else 0 for ARM2as and later
+        MOV     R1, #0                  ; No IRQ delay routine
+        B       %FT30
+20
+        MOV     r0, #OSPlatformFeatures_ReadCodeFeatures
+        SWI     XOS_PlatformFeatures    ; Capture original feature flags
+30
+        ORR     R0, R0, #CPUFlag_ExtraReasonCodesFixed
+        ADRL    R2, platfeat0
+        STMIA   R2, {R0,R1}
+        BL      ReadCPUFeatures ; Relies on SWP test having run (if < ARMv3)
+        LDR     R0,=SWIDispatcherTable
+        GrabSWI PlatformFeatures
+        LDR     r2, Old_PlatformFeatures
+        ADRL    r1, Our_PlatformFeatures
+        TEQ     r2, r1          ; Ensure we're not already the vector owner
+        ADRNE   r1, platfeatnext; Keep a copy of the old address in non R12 relative memory too
+        STRNE   r2, [r1]
+        GrabSWI HeapSort32
+        GrabSWI SubstituteArgs32
+        GrabSWI ReadLine32
+        GrabSWI LeaveOS
+        GrabSWI ConvertVariform
+        GrabSWI FSControl
+        GrabSWI ReadUnsigned
+
+        LDR     r0, Old_FSControl
+        ADRL    r1, Our_FSControl
+        TEQ     r0, r1          ; Ensure we're not already the vector owner
+        ADRNE   r1, fscvnext    ; Keep a copy of the old address in non R12 relative memory too
+        STRNE   r0, [r1]
+
+        Pull    "PC",,^
+
+HighOSVersion
+        ADR     R0,HighOSVersionError
+        Pull    "LR"
+        ORRS    PC,LR,#V_bit
+
+LowOSVersion
+        ADR     R0,LowOSVersionError
+        Pull    "LR"
+        ORRS    PC,LR,#V_bit
+
+LowOSVersionError
+        &       0
+        =       "The CallASWI module will not work on RISC OS versions less than 3.10"
+        =       0
+        ALIGN
+
+HighOSVersionError
+        &       0
+        =       "The CallASWI module is not required on RISC OS 5.00 or later"
+        =       0
+        ALIGN
+
+Finalise
+        Push    "LR"
+        LDR     R12,[R12]
+        MOV     R0,#OsByte_OSVersionIdentifier
+        MOV     R1,#0
+        MOV     R2,#255
+        SWI     XOS_Byte
+        Pull    "PC",VS
+        LDR     R0,=SWIDispatcherTable
+        CMP     R1,#&A7                 ; For OS3.70 and later don't release the first 3
+        BCS     %FT10
+        FreeSWI CallASWI
+        FreeSWI CallASWIR12
+        FreeSWI SynchroniseCodeAreas
+10
+        FreeSWI PlatformFeatures
+        FreeSWI HeapSort32
+        FreeSWI SubstituteArgs32
+        FreeSWI ReadLine32
+        FreeSWI LeaveOS
+        FreeSWI ConvertVariform
+        FreeSWI FSControl
+        FreeSWI ReadUnsigned
+        MOV     R0,#ModHandReason_Free
+        MOV     R2,R12
+        SWI     XOS_Module
+        Pull    "PC",,^
+
+DetectSWPNotAvailable
+        Push    "r0, r7-r12, lr"
+
+        ; When SWP was added for ARMv2a it was allocated from previously
+        ; undefined instruction space, so to see if SWP is available just
+        ; try the instruction and see if it aborts.
+        ; As this module is flagged as 26 bit only, and all later 26 bit CPUs
+        ; had SWP too, no need to worry about it being removed in ARMv8 here.
+        MOV     r0, #1
+        STR     r0, noswp               ; Assume it'll error
+
+        ; Temporarily poke the undefined instruction vector so that we can
+        ; install our own handler. Using OS_ChangeEnvironment to claim the
+        ; undef handler would also work, except there's a nasty bug in
+        ; FPEmulator versions 4.12-4.31 that prevents passing on exceptions
+        ; properly (can't be certain the user is using a fixed version of FPE)
+        PHPSEI  r4                      ; IRQs off for safety
+        MOV     r0, #0
+        LDR     r1, [r0, #4]            ; Get old undef vector handler
+        LDR     r2, UndefHandler
+        STR     r2, [r0, #4]            ; Store new handler. Assuming not StrongARM, so no cache worries
+        ADR     r2, noswp
+        SWP     r3, r0, [r2]            ; Try a SWP. If it succeeds, noswp will be cleared (r0 == 0)
+        MOV     r2, #-1
+        MRC     p15,0,r2,c0,c0,0        ; Try reading main ID register (ARM3 detection for CPU features code)
+        CMP     r2, #-1
+        MOVNE   r2, #0
+        STR     r2, nomrc
+        STR     r1, [r0, #4]            ; Restore old handler
+        PLP     r4                      ; Restore IRQs
+        NOP                             ; (not necessary, but keeps objasm happy)
+        Pull    "r0, r7-r12, pc"
+
+UndefHandler
+        MOVS    pc, lr                  ; Return from undef vector and skip the aborting instruction
+
+TranslateError
+        Push    "r1-r2, lr"             ; Helper function 
+        MOV     r1, #0
+        MOV     r2, #0
+        SWI     XMessageTrans_ErrorLookup
+        Pull    "r1-r2, pc"
+
+SLVK_SetV
+        ORR     lr, lr, #V_bit          ; Return points using same names as kernel
+SLVK_TestV                              ; to allow liberal copy & paste
+        ORRVS   lr, lr, #V_bit
+SLVK        
+        LDR     PC, =SWIReturnAddress
+SVC_CallASWI
+        LDR     PC, =CallASWIReEntryPoint
+        
+Our_CallASWI
+        LDR     R11,[SP,#4]             ; pick-up target SWI code (stored R10)
+        BIC     R11,R11,#&FF000000      ; just in case
+        STR     R11,[SP,#0]             ; CallASWI now incognito as target SWI
+        B       SVC_CallASWI            ; re-dispatch
+
+Our_CallASWIR12
+        LDR     R11,[SP,#12]            ; pick-up target SWI code (stored R12)
+        BIC     R11,R11,#&FF000000      ; just in case
+        STR     R11,[SP,#0]             ; CallASWI now incognito as target SWI
+        B       SVC_CallASWI            ; re-dispatch
+
+Our_SynchroniseCodeAreas
+        BIC     LR,LR,#V_bit
+        B       SLVK
+
+Our_PlatformFeatures ROUT
+        Push    "LR"
+        CMP     R0, #OSPlatformFeatures_ReadCPUFeatures
+        BEQ     PlatFeatSWI_ReadCPUFeatures
+        CMP     R0, #OSPlatformFeatures_ReadClearExclusive
+        BEQ     %FT40
+        CMP     R0, #OSPlatformFeatures_ReadCodeFeatures ; Is it a known reason code?
+        BNE     %FT50                   ; No, so error
+
+        ; OK, it's the 'code_features' reason code.
+        ADR     LR, platfeat0
+        LDMIA   LR, {R0,R1}
+        Pull    "LR"
+        B       SLVK                    ; Return
+40
+        MOV     R1, #0                  ; 26 bit world, definitely no exclusive monitor
+        Pull    "LR"
+        B       SLVK
+50
+        ; If running on RISC OS 3.8+, pass unknown reason codes on to the kernel
+        ; If 3.7X or older, there's either no kernel OS_PlatformFeatures
+        ; present, or it contains a bug where it will always raise an error
+        ; (even when the X form of the SWI is called)
+        ASSERT  No32bitCode             ; Beware - Some versions of RISC OS 5 suffer from the bug too
+        LDR     LR, osversionid
+        CMP     LR, #&A8
+        Pull    "LR", HS
+        LDRHS   PC, platfeatnext
+         
+        ; Would issue Service_UnknownPlatformFeatures here, but the official
+        ; OS team position is "don't bother"
+        ADR     R0, ErrorBlock_BadPlatReas
+    [ International
+        BL      TranslateError
+    ]
+        Pull    "lr"
+        B       SLVK_SetV
+
+        MakeErrorBlock BadPlatReas
+
+osversionid
+        DCD     0
+
+platfeat0
+        DCD     0
+        DCD     0
+
+platfeatnext
+        DCD     0
+
+noswp
+        DCD     0
+nomrc
+        DCD     0
+
+fscvnext
+        DCD     0
+
+        GBLL    InKernel
+InKernel SETL   {FALSE}
+
+        GET     CPUFeatures.s
+        
+Our_LeaveOS
+        BIC     lr, lr, #2_11
+        B       SLVK
+
+Our_FSControl
+        ; Only interested in one subreason
+        TEQ     r0, #FSControl_EnumerateHandles
+        LDRNE   PC, fscvnext
+        Push    "r0, r2, lr"
+10
+        ; It's a 26 bit OS with a FileSwitch with 8 bit handles
+        ADD     r1, r1, #1
+        CMP     r1, #256
+        MOVCS   r1, #-1
+        Pull    "r0, r2, lr", CS
+        BCS     SLVK
+
+        MOV     r0, #254
+        SWI     XOS_Args
+        MOVVS   r0, #1:SHL:11
+        TST     r0, #1:SHL:11
+        BNE     %BT10
+
+        ; Found one that's allocated
+        ADD     sp, sp, #2 * 4
+        Pull    "lr"
+        B       SLVK
+
+Our_ReadLine32
+        ; Fault requests above 64M,this is tough since ReadLineV claimers might
+        ; get upset otherwise.
+        Push    "R4,LR"
+        TST     R0,#&FC000000
+        BNE     %FT90
+        AND     R4,R4,#&FC000000
+        ORR     R0,R4,R0
+        LDRB    R4,[R13,#0]             ; the password echo character
+        SWI     XOS_ReadLine
+        Pull    "R4,LR"
+        BICCC   LR,LR,#C_bit            ; propagate C for Escape pressed
+        ORRCS   LR,LR,#C_bit
+        B       SLVK_TestV
+
+90      ADR     r0, ErrorBlock_BadAddress
+      [ International
+        Push    "lr"
+        BL      TranslateError
+        Pull    "lr"
+      ]
+        B       SLVK_SetV
+
+        MakeErrorBlock BadAddress
+
+Our_SubstituteArgs32
+        ; Tricky this one,since we want to handle addresses way up high
+        ; Just nick the code from s.MoreSWIs in the Kernel
+
+;+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;  SubstituteArgs32
+;    in:  R0 -> arglist (space delimited args, terminated by 10,13,0)
+;         R1 -> buffer
+;         R2 =  bufflen
+;         R3 -> string to mangle
+;         R4 =  no of chars in $R3
+;         R5 = flags
+;               top bit set => don't append unused part of line
+;    out: R2 =  no of chars in buffer
+
+XOS_SubstituteArgs32_code ROUT
+
+      WritePSRc SVC_mode, R12   ; enable IRQs
+      Push   "R0-R8, lr"
+      ADD     R8, R4, R3
+
+; try and get parameter positions.
+; Items starting with " can have spaces in
+
+      MOV   R6, #0       ; parameter number
+      LDR   R12, =MacExStartPtrs
+      LDR   R4, =MacExEndPtrs
+35    LDRB  R5, [R0], #1
+      CMP   R5, #" "
+      BEQ   %BT35
+      MOV   R2, #" "
+      CMP   R5, #""""
+      MOVEQ R2, #""""       ; quoted param
+      CMP   r6, #10         ; "rest of line" item?
+      MOVEQ r2, #-1         ; terminate on EOL only
+      SUB   R0, R0, #1
+      STR   R0, [R12, R6, LSL #2]
+      CMP   r5, #""""
+      ADDEQ R0, R0, #1
+36    LDRB  R5, [R0], #1
+      BL    suba_chktrm
+      CMPNE R5, R2
+      BNE   %BT36
+      CMP   R5, #""""
+      LDREQB R5, [R0]
+      CMPEQ R5, #""""   ; check for "" in string
+      ADDEQ R0, R0, #1
+      BEQ   %BT36
+      CMP   R2, #""""
+      SUBNE R0, R0, #1
+      STR   R0, [R4, R6, LSL #2]
+      ADD   R6, R6, #1
+      CMP   R6, #11           ; Parameters 0-9 and a "rest" set.
+      BNE   %BT35
+
+; Keep track of highest param used, so can tack any unused stuff on end.
+; R3 points at string to get chars from
+; R12 at start ptrs
+; R4 at end ptrs
+
+      MOV    R6, #0          ; count.
+      MOV    R7, #0          ; highest param used.
+      LDR    R2, [stack, #4*2]
+37    BL     suba_getchar
+      BEQ    %FT41
+      CMP    R5, #"%"
+      BEQ    %FT44
+38    BL     suba_addchar
+      B      %BT37
+
+PCnotparm
+      ADD    R5, R5, #"0"
+      MOV    R11, R5
+      MOV    R5, #"%"
+      BL     suba_addchar
+      MOV    R5, R11
+      B      %BT38
+
+44    BL     suba_getchar
+      MOVEQ  R5, #"%"
+      BEQ    %FT40
+      CMP    R5, #"%"
+      BEQ    %BT38
+      CMP    R5, #"*"
+      BEQ    DoStarParams
+      SUBS   R5, R5, #"0"
+      BMI    PCnotparm
+      CMP    R5, #9
+      BGT    PCnotparm
+
+; itsa parameter! Get ptrs from R12, R4
+      CMP    R5, R7
+      ADDGE  R7, R5, #1
+      LDR    R11, [R4, R5, LSL #2]
+CopyToR11FromParamR5
+      LDR    R10, [R12, R5, LSL #2]  ; start ptr
+39    LDRB   R5, [R10], #1
+      CMP    R10, R11
+      BGT    %BT37
+      BL     suba_addchar
+      B      %BT39
+
+DoStarParams ; had %* : find limits to copy between
+      BL     suba_getchar
+      BEQ    PCStarTerminates
+      SUBS   R5, R5, #"0"
+      BMI    PCStarNoDigit
+      CMP    R5, #9
+      MOVLE  R7, #11                  ; flag * used
+      LDRLE  R11, [R4, #10*4]         ; always to EOL
+      BLE    CopyToR11FromParamR5
+PCStarNoDigit
+      ADD    R5, R5, #"0"
+      MOV    R11, R5
+      MOV    R5, #"%"
+      BL     suba_addchar
+      MOV    R5, #"*"
+      BL     suba_addchar
+      MOV    R5, R11
+      B      %BT38
+
+PCStarTerminates
+      MOV    R5, #"%"
+      BL     suba_addchar
+      MOV    R5, #"*"
+40    BL     suba_addchar
+41    CMP    r7, #11
+      LDREQ  r12, [r4, #10*4]        ; no more to copy
+      BEQ    %FT42
+      LDR    r0, [stack, #4*5]
+      CMP    r0, #0
+      LDRPL  R12, [R12, R7, LSL #2]  ; ptr to rest of command line : copy
+      LDRMI  r12, [r4, #10*4]        ; caller wants no appending.
+42    LDRB   R5, [R12], #1
+      BL     suba_addchar
+      BL     suba_chktrm
+      BNE    %BT42
+
+      STR    R6, [stack, #4*2]
+      Pull  "R0-R8, lr"
+      LocalExitSWIHandler
+
+suba_addchar
+      EntryS
+      ADD    R6, R6, #1
+      CMP    R6, R2
+      STRNEB R5, [R1], #1
+      EXITS  NE
+
+      PullEnv
+
+      ADR    R0, ErrorBlock_BuffOverflow
+    [ International
+      BL     TranslateError
+    ]
+      STR    R0, [stack]
+      Pull  "R0-R8, lr"
+      B     SLVK_SetV
+
+suba_getchar
+      CMP    R3, R8
+      LDRNEB R5, [R3], #1
+      MOV    PC, lr
+
+suba_chktrm
+      CMP   R5, #13
+      CMPNE R5, #10
+      CMPNE R5, #0
+      MOV   PC, lr
+
+      LTORG
+
+      MakeErrorBlock BuffOverflow
+
+Our_HeapSort32
+        ; Tricky this one,since we need to fix the bit 31 bug
+        ; Just nick the code from s.HeapSort in the Kernel
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; HeapSort routine. Borrowed from Knuth by Tutu. Labels h(i) correspond to
+; steps in the algorithm.
+
+; In    r0 = n
+;       r1 = array(n) of word size objects (r2 determines type)
+;       r2 = address of comparison procedure
+;              Special cases:
+;                0 -> treat r(n) as array of cardinal
+;                1 -> treat r(n) as array of integer
+;                2 -> treat r(n) as array of cardinal*
+;                3 -> treat r(n) as array of integer*
+;                4 -> treat r(n) as array of char* (case insensitive)
+;                5 -> treat r(n) as array of char* (case sensitive)
+;       r3 = wsptr for comparison procedure (only needed if r2 > 5)
+;       r4 = array(n) of things (only needed if r7 & &C0000000)
+;       r5 = sizeof(element)    ( ---------  ditto  ---------- )
+;       r6 = address of temp slot (only needed if r5 > 16K or r7 & &20000000)
+;       r7 = flags
+;              bit 31 set -> use r4,r5 on postpass
+;              bit 30 set -> build (r1) from r4,r5 in prepass
+;              bit 29 set -> use r6 as temp slot
+
+; r10-r12 trashable
+
+hs_array RN     r4
+hs_procadr RN   r5
+hs_i    RN      r6
+hs_j    RN      r7
+hs_K    RN      r8
+hs_R    RN      r9
+hs_l    RN      r10
+hs_r    RN      r11
+;wp     RN      r12
+
+; User sort procedure entered in SVC mode, interrupts enabled
+; r0 = contents of array(1)
+; r1 = contents of array(2)
+; r0-r3 may be trashed
+; wp = value requested (trash at your peril; you'll get the bad one next time)
+
+; User sort procedure returns:
+;       LT: if f(r0)  < f(r1)
+;       GE: if f(r0) => f(r1)
+; (ie. N_bit and V_bit only considered)
+
+HeapSortRoutine32 ROUT
+
+        CMP     r0, #2                  ; 0 or 1 elements? No data moved either
+        LocalExitSWIHandler LO          ; VClear in lr and psr
+
+        Push    "r0-r3, hs_array, hs_procadr, hs_i, hs_j, hs_K, hs_R, lr"
+
+        CLRPSR  I_bit, r14              ; Enable interrupts (may take ages)
+
+ [ False
+        STR     r0, ndump               ; For debugging porpoises
+ ]
+        TST     r7, #1 :SHL: 30         ; Are we to build the pointer array?
+        BEQ     %FT01
+
+; Build array of pointers to data blocks for the punter if he desires this
+; (lazy slobs abound ...)
+
+; for (i=0; i<n; i++) r(i) = &block + i*sizeof(element);
+
+        MOV     r10, r0                 ; n
+        MOV     r14, r1                 ; r14 -> base of pointer array
+00      STR     r4, [r14], #4
+        ADD     r4, r4, r5              ; r4 += sizeof(element)
+        SUBS    r10, r10, #1
+        BNE     %BT00
+
+
+01      SUB     hs_array, r1, #4        ; HeapSort assumes r(1..n) not (0..n-1)
+
+        MOV     hs_procadr, r2          ; Put proc address where we need it
+
+        CMP     hs_procadr, #6          ; Special procedure ?
+        ADRLO   r14, hs_Procedures
+        LDRLO   hs_procadr, [r14, hs_procadr, LSL #2]
+        ADDLO   hs_procadr, hs_procadr, r14
+
+        MOV     wp, r3                  ; Can now use r3 temp. Keep set up
+                                        ; for speed during execution
+
+        MOV     hs_l, r0, LSR #1        ; l = floor(n/2) + 1
+        ADD     hs_l, hs_l, #1
+        MOV     hs_r, r0                ; r = n
+
+
+h2      CMP     hs_l, #1
+        BEQ     %FT10
+
+        SUB     hs_l, hs_l, #1
+        LDR     hs_R, [hs_array, hs_l, LSL #2] ; R = R(l)
+        MOV     hs_K, hs_R
+        B       %FT20
+
+10      LDR     hs_R, [hs_array, hs_r, LSL #2] ; R = R(r)
+        MOV     hs_K, hs_R
+        LDR     r14, [hs_array, #4]     ; R(r) = R(1)
+        STR     r14, [hs_array, hs_r, LSL #2]
+        SUB     hs_r, hs_r, #1
+        CMP     hs_r, #1                ; IF r=1 THEN R(1) = R
+        STREQ   hs_R, [hs_array, #4]
+20
+ [ False
+ BL DoDebug
+ ]
+
+        CMP     hs_r, #1
+        BEQ     %FT90                   ; [finished sorting the array]
+
+
+h3      MOV     hs_j, hs_l
+
+
+h4      MOV     hs_i, hs_j
+        MOV     hs_j, hs_j, LSL #1
+
+ [ False
+ DREG hs_i," i ",cc
+ DREG hs_j," j "
+ ]
+        CMP     hs_j, hs_r
+        BEQ     h6
+        BHI     h8
+
+
+h5      LDR     r0, [hs_array, hs_j, LSL #2]
+                                        ; IF K(R(j)) < K(R(j+1)) THEN j +:= 1
+        ADD     r14, hs_j, #1
+        LDR     r1, [hs_array, r14, LSL #2]
+
+        MOV     lr, pc                  ; r0, r1 for comparison
+        MOV     pc, hs_procadr
+
+        ADDLT   hs_j, hs_j, #1          ; Assumes signed comparison done <<<<<<
+
+
+h6      MOV     r0, hs_K                ; IF K >= K(R(j)) THEN h8
+        LDR     r1, [hs_array, hs_j, LSL #2]
+
+        MOV     lr, pc                  ; r0, r1 for comparison
+        MOV     pc, hs_procadr
+
+        LDRLT   r14, [hs_array, hs_j, LSL #2] ; R(i) = R(j)
+        STRLT   r14, [hs_array, hs_i, LSL #2]
+        BLT     h4
+
+
+h8      STR     hs_R, [hs_array, hs_i, LSL #2] ; R(i) = R
+        B       h2
+
+
+; Array now sorted into order
+
+90      LDR     r14, [sp, #4*7]         ; r7in
+        TST     r14, #1 :SHL: 31
+        BEQ     %FA99                   ; [no shuffle required, exit]
+
+; Reorder the blocks according to the sorted array of pointers
+
+        LDR     r2, [sp, #4*1]          ; r2 -> list of pointers (r1in)
+
+        ADD     r1, sp, #4*4
+        LDMIA   r1, {r1, r8, r9}        ; r4,r5,r6in
+                                        ; r1 -> list of blocks
+ [ False
+ DREG r2, "pointer array   "
+ DREG r1, "base of blocks  "
+ DREG r8, "sizeof(element) "
+ ]
+        MOV     r3, r2                  ; r3 -> first item of current cycle
+        LDR     r0, [sp, #0*4]          ; r0 = n
+        ADD     r6, r2, r0, LSL #2      ; r6 -> end of array of pointers
+        TST     r14, #1 :SHL: 29        ; punter forcing use of his temp slot?
+        BNE     %FT94                   ; fine by me!
+        CMP     r8, #ScratchSpaceSize
+        LDRLS   r9, =ScratchSpace       ; r9 -> temp slot (normally ScratchSpc)
+94
+ [ False
+ DREG r9, "temp slot       "
+ ]
+
+91      SUB     r14, r3, r2
+        MOV     r14, r14, LSR #2        ; r14 = index (0..n-1) of current item
+        MLA     r4, r14, r8, r1         ; r4 -> current block
+
+        MOV     r5, r3                  ; r5 -> current item
+        BL      MoveToTempSlot          ; save first block in temp slot
+
+92      LDR     r7, [r5]                ; r7 -> next block
+        MOV     r14, #0
+        STR     r14, [r5]               ; mark item 'done'
+
+        SUB     r5, r7, r1              ; r14 := index of next item (r8 pres.)
+        DivRem  r14, r5, r8, r0         ; r5,r0 corrupt
+        ADD     r5, r2, r14, LSL #2     ; r5 -> next item
+ [ False
+ DREG r7, "  next block "
+ DREG r5, "   next item "
+ ]
+
+        CMP     r5, r3                  ; reached start of cycle?
+        MOVEQ   r7, r9                  ; get back from temp slot if last one
+        BL      MoveFromGivenSlot       ; corrupts flags, but preserves r5, r3...
+
+        CMP     r5, r3
+        MOVNE   r4, r7                  ; update r4 (current block)
+        BNE     %BT92
+
+93      LDR     r14, [r3, #4]!          ; skip already-copied items
+        CMP     r3, r6
+        BCS     %FA99                   ; [reached end]
+        CMP     r14, #0
+        BEQ     %BT93
+
+        B       %BT91                   ; [found one that hasn't been copied]
+
+
+; No error return from HeapSort
+
+99      Pull    "r0-r3, hs_array, hs_procadr, hs_i, hs_j, hs_K, hs_R, lr"
+
+; SWIHandler exit takes flags + mode from lr, not psr !!!
+
+        LocalExitSWIHandler
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; In    r4 -> element to be copied
+;       r8 = sizeof(element)
+;       r9 -> temp slot
+
+; Out   all preserved
+
+MoveToTempSlot Entry "r4, r8, r9"
+
+        TST     r4, #3                  ; If base and element size wordy
+        TSTEQ   r8, #3                  ; then do faster copy. Also temp wordy
+        BNE     %FT01
+
+00      SUBS    r8, r8, #4
+        LDRPL   r14, [r4], #4
+        STRPL   r14, [r9], #4
+        BPL     %BT00
+        EXIT
+
+01      SUBS    r8, r8, #1
+        LDRPLB  r14, [r4], #1
+        STRPLB  r14, [r9], #1
+        BPL     %BT01
+        EXIT
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; In    r4 -> where element is to be copied
+;       r7 -> element to be copied
+;       r8 = sizeof(element)
+
+; Out   all preserved
+
+MoveFromGivenSlot Entry "r4, r7, r8"
+
+        TST     r4, #3                  ; If dest and element size wordy
+        TSTEQ   r8, #3                  ; then do faster copy. Also src wordy
+        BNE     %FT01
+
+00      SUBS    r8, r8, #4
+        LDRPL   r14, [r7], #4
+        STRPL   r14, [r4], #4
+        BPL     %BT00
+        EXIT
+
+01      SUBS    r8, r8, #1
+        LDRPLB  r14, [r7], #1
+        STRPLB  r14, [r4], #1
+        BPL     %BT01
+        EXIT
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Built-in sorting procedures
+
+hs_Procedures
+
+        DCD     hs_CardinalCMP    - hs_Procedures
+        DCD     hs_IntegerCMP     - hs_Procedures
+        DCD     hs_CardinalPtrCMP - hs_Procedures
+        DCD     hs_IntegerPtrCMP  - hs_Procedures
+        DCD     hs_StringCMP      - hs_Procedures
+        DCD     hs_StringSensCMP  - hs_Procedures
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; In    r0, r1 -> cardinals
+
+; Out   flags set on (*r0) - (*r1)
+
+hs_CardinalPtrCMP
+
+        LDR     r0, [r0]
+        LDR     r1, [r1]
+
+; .............................................................................
+; In    r0, r1 = cardinals
+
+; Out   flags set on r0 - r1
+
+hs_CardinalCMP
+
+        CMP     r0, r1
+        BICCSS  pc, lr, #N_bit :OR: V_bit       ; CS -> GE (nv)
+        BIC     lr, lr, #V_bit
+        ORRS    pc, lr, #N_bit                  ; CC -> LT (Nv)
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; In    r0, r1 -> integers
+
+; Out   flags set on (*r0) - (*r1)
+
+hs_IntegerPtrCMP
+
+        LDR     r0, [r0]
+        LDR     r1, [r1]
+
+; .............................................................................
+; In    r0, r1 = integers
+
+; Out   flags set on r0 - r1
+
+hs_IntegerCMP
+
+        CMP     r0, r1
+        MOV     pc, lr
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Case-insensitive string comparison
+
+; In    r0, r1 -> strings - CtrlChar terminated (NB. Must be same CtrlChar !)
+
+; Out   flags set on (char *)(r0) - (char *)(r1) compare
+
+hs_StringCMP ROUT
+
+10      LDRB    r2, [r0], #1
+        LowerCase r2, r12
+        LDRB    r3, [r1], #1
+        LowerCase r3, r12
+        CMP     r2, r3                  ; Differ ?
+        MOVNE   pc, lr                  ; GE or LT
+        CMP     r2, #space-1            ; Finished ?
+        BHI     %BT10
+
+        CMP     r2, r2                  ; return EQ (also GE)
+        MOV     pc, lr
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Case-sensitive string comparison
+
+; In    r0, r1 -> strings - CtrlChar terminated (NB. Must be same CtrlChar !)
+
+; Out   flags set on (char *)(r0) - (char *)(r1)
+
+hs_StringSensCMP ROUT
+
+10      LDRB    r2, [r0], #1
+        LDRB    r3, [r1], #1
+        CMP     r2, r3                  ; Differ ?
+        MOVNE   pc, lr                  ; GE or LT
+        CMP     r2, #space-1            ; Finished ?
+        BHI     %BT10
+
+        CMP     r2, r2                  ; return EQ (also GE)
+        MOV     pc, lr
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        LTORG
+
+Our_ConvertVariform
+        Push    "lr"
+        BL      VariformInternal
+        Pull    "lr"
+        B       SLVK_TestV
+        
+TenTimesTable
+        DCD     1                       ; 10^0
+        DCD     10
+        DCD     100
+        DCD     1000
+        DCD     10000
+        DCD     100000
+        DCD     1000000
+        DCD     10000000
+        DCD     100000000
+        DCD     1000000000              ; 10^9
+TenTimesBigTable
+        DCQ     10000000000             ; 10^10
+        DCQ     100000000000
+        DCQ     1000000000000
+        DCQ     10000000000000
+        DCQ     100000000000000
+        DCQ     1000000000000000
+        DCQ     10000000000000000
+        DCQ     100000000000000000
+        DCQ     1000000000000000000     ; 10^18
+
+CommaPositions
+        DCD     2_01001001001001001001001001001000
+
+SuffixSI
+        DCB     "byte"        
+PrefixSI
+        DCB     " kMGTPE"               ; units/kilo/mega/giga/tera/peta/exa
+        ALIGN
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; VariformInternal
+; ----------------
+; The guts behind OS_ConvertVariform but callable as a subroutine
+; In  : R0 pointer to input value (word alignment)
+;       R1 pointer to buffer
+;       R2 max buffer length, or -ve to read space required
+;       R3 bytes to use from input value (or nybbles if hex output reqd)
+;       R4 type to convert to
+; Out : R0 pointer to buffer
+;       R1 pointer to terminator
+;       R2 free bytes in buffer, or NOT space required if R2 -ve on entry
+;       V Set if buffer overflow
+
+VariformInternal
+        ; Check if it's a read space operation
+        MOVS    r2, r2
+        BPL     VariformOutput
+
+VariformCount
+        ; Some of them are calculable
+        TEQ     r4, #ConvertToBinary
+        MOVEQ   r2, r3, LSL #3          ; 8 output chars for every 1 input byte
+        BEQ     %FT30
+        TEQ     r4, #ConvertToHex
+        TEQNE   r4, #ConvertToHexLowercase
+        MOVEQ   r2, r3, LSL #1          ; 2 output chars for every 1 input nybble
+        BEQ     %FT30
+        TEQ     r4, #ConvertToFixedFileSize
+        MOVEQ   r2, #4 + 1 + 1 + 5      ; Always '1234 kbytes'
+        BEQ     %FT30
+        TEQ     r4, #ConvertToEUI
+        ADDEQ   r2, r3, r3, LSL #1      ; 3 output chars for every 1 input byte (inc term)
+        SUBEQ   r2, r2, #1              ; Don't count the terminator
+        BEQ     %FT30
+        TEQ     r4, #ConvertToUUID
+        MOVEQ   r2, #(16 * 2) + 4       ; 128b in hex with 4 hyphens
+        BEQ     %FT30
+10
+        ; A hard length to know, just do it
+        Push    "r1, lr"
+        SUB     sp, sp, #44             ; Longest is currently IPv6 output
+        MOV     r1, sp
+        MOV     r2, #44
+        BL      VariformOutput
+        SUB     r2, r1, r0              ; Length = term - start
+        ADD     sp, sp, #44
+        Pull    "r1, lr"
+        ; Fall through
+30
+        MVN     r2, r2
+40
+        ADRL    r0, ErrorBlock_BuffOverflow
+      [ International
+        Push    "lr"
+        BL      TranslateError
+        Pull    "pc"
+      |
+        SETV
+        MOV     pc, lr
+      ]
+
+VariformOutputChar
+        TEQ     r2, #0
+        BEQ     %BT40
+        CMP     r0, #0                  ; Clears V too
+        STREQB  r0, [r1]
+        STRNEB  r0, [r1], #1            ; Adjust pointers except for terminating null
+        SUBNE   r2, r2, #1
+        MOV     pc, lr
+
+VariformOutput ROUT
+        Push    "lr"
+        TEQ     r3, #0                  ; Ask for nothing, get a null string
+        BNE     %FT10
+        MOV     r0, #0
+        BL      VariformOutputChar
+        MOVVC   r0, r1
+        Pull    "pc"
+10
+        ASSERT  ConvertToHex = 0
+        CMP     r4, #(VariformHighest - VariformLowest) / 4
+        ADDCC   pc, pc, r4, LSL #2
+        BCS     VariBadConv
+VariformLowest
+        B       VariformOutputBinHex    ; ConvertToHex           
+        B       VariformOutputDec       ; ConvertToCardinal      
+        B       VariformOutputDec       ; ConvertToInteger       
+        B       VariformOutputBinHex    ; ConvertToBinary        
+        B       VariformOutputDecSpaced ; ConvertToSpacedCardinal
+        B       VariformOutputDecSpaced ; ConvertToSpacedInteger
+        B       VariformOutputDecPunct  ; ConvertToPunctCardinal
+        B       VariformOutputDecPunct  ; ConvertToPunctInteger
+        B       VariformOutputFileSize  ; ConvertToFixedFileSize
+        B       VariformOutputFileSize  ; ConvertToFileSize
+        B       VariformOutputDotColon  ; ConvertToIPv4          
+        B       VariformOutputDotColon  ; ConvertToEUI           
+        B       VariformOutputIPv6      ; ConvertToIPv6
+        B       VariformOutputShortIPv6 ; ConvertToShortestIPv6  
+        B       VariformOutputBinHex    ; ConvertToHexLowercase  
+        B       VariformOutputUUID      ; ConvertToUUID  
+VariformHighest
+
+VariBadConv
+        ADR     r0, ErrorBlock_UnConv   ; Unsupported conversion
+        B       %FT20
+
+        MakeErrorBlock UnConv
+
+VariBadNumb
+        ADRL    r0, ErrorBlock_BadNumb  ; Bad number
+20
+      [ International
+        BL      TranslateError
+      |
+        SETV
+      ]
+        Pull    "pc"
+
+VariformOutputDecPunct ROUT
+        Push    "r0-r1"
+        MOV     r0, #-1
+        MOV     r1, #1
+        SWI     XTerritory_ReadSymbols
+        STRVS   r0, [sp]
+        Pull    "r0-r1, pc", VS
+        LDRB    r10, [r0]               ; Thousands separator
+        Pull    "r0-r1"
+        B       %FT10
+
+VariformOutputDecSpaced
+        MOV     r10, #' '               ; Spaces between 1000's
+        B       %FT10
+        
+VariformOutputDec
+        MOV     r10, #0                 ; No gaps between 1000's
+10
+        CMP     r3, #8                  ; Deal with up to 2^(8*8) or 64 bit
+        BHI     VariBadNumb
+
+        Push    "r1, r5-r9"
+        ADD     r12, r0, r3             ; Input block
+        MOV     r14, r3
+        MOV     r5, #0
+        MOV     r6, #0
+20
+        LDRB    r0, [r12, #-1]!
+        CMP     r14, #4
+        ORRHI   r6, r0, r6, LSL #8      ; Hi input word
+        ORRLS   r5, r0, r5, LSL #8      ; Lo input word
+        SUBS    r14, r14, #1
+        BNE     %BT20
+
+        TEQ     r4, #ConvertToInteger
+        TEQNE   r4, #ConvertToSpacedInteger
+        TEQNE   r4, #ConvertToPunctInteger
+        BNE     %FT40                   ; Treat unsigned
+
+        TEQ     r3, #4
+        MOVEQ   r6, r5, ASR #31         ; Extend lo to hi
+        ANDS    r11, r3, #3
+        BEQ     %FT30                   ; For 4 & 8, no further action
+        RSB     r11, r11, #4
+        MOV     r11, r11, LSL #3        ; Sign extend shift of (4 - (length MOD 4)) * 8 bit
+        CMP     r3, #4
+        MOVHI   r6, r6, LSL r11
+        MOVHI   r6, r6, ASR r11
+        MOVLS   r5, r5, LSL r11
+        MOVLS   r5, r5, ASR r11
+        MOVLS   r6, r5, ASR #31         ; Extend lo to hi too
+30
+        CMP     r6, #0                  ; Is it overall negative?
+        BPL     %FT50
+        MOV     r0, #'-'
+        BL      VariformOutputChar
+        Pull    "r1, r5-r9, pc", VS
+        MVN     r5, r5
+        MVN     r6, r6
+        ADDS    r5, r5, #1
+        ADC     r6, r6, #0              ; Take ABS(r5,r6)
+40
+        TEQ     r6, #0
+50
+        MOVEQ   r11, #9                 ; Maximum power of 10 to consider
+        MOVNE   r11, #18
+        MOV     r9, #0                  ; Supress leading zeros
+60
+        MOV     r0, #'0'                ; This digit
+        CMP     r11, #10
+        ADRCC   r12, TenTimesTable
+        LDRCC   r7, [r12, r11, LSL #2]
+        MOVCC   r8, #0
+        ADRCS   r12, TenTimesBigTable - (10 * 8)
+        LDRCS   r7, [r12, r11, LSL #3]!
+        LDRCS   r8, [r12, #4]
+70
+        SUBS    r5, r5, r7
+        SBCS    r6, r6, r8
+        ADDPL   r0, r0, #1              ; Subtracted OK
+        BPL     %BT70
+
+        ADDS    r5, r5, r7
+        ADC     r6, r6, r8              ; Correct the undershoot
+        TEQ     r9, #0
+        SUBEQS  r9, r0, #'0'            ; Reevaluate supression if supressing
+        BEQ     %FT80
+        BL      VariformOutputChar
+        Pull    "r1, r5-r9, pc", VS
+        MOV     r14, #1
+        MOV     r14, r14, LSL r11
+        LDR     r0, CommaPositions
+        TST     r14, r0                 ; V still clear
+        MOVNE   r0, r10
+        BLNE    VariformOutputChar
+        Pull    "r1, r5-r9, pc", VS
+80
+        SUBS    r11, r11, #1
+        BNE     %BT60
+
+        ADD     r0, r5, #'0'            ; Units column is simple
+        BL      VariformOutputChar
+        MOVVC   r0, #0
+        BLVC    VariformOutputChar 
+        Pull    "r1, r5-r9, pc", VS
+        Pull    "r0, r5-r9, pc"
+
+VariformOutputFileSize ROUT
+        CMP     r3, #8                  ; Deal with up to 2^(8*8) or 64 bit
+        BHI     VariBadNumb
+        
+        Push    "r1, r5-r6"
+        ADD     r12, r0, r3             ; Input block
+        MOV     r14, r3
+        MOV     r5, #0
+        MOV     r6, #0
+10
+        LDRB    r0, [r12, #-1]!
+        CMP     r14, #4
+        ORRHI   r6, r0, r6, LSL #8      ; Hi input word
+        ORRLS   r5, r0, r5, LSL #8      ; Lo input word
+        SUBS    r14, r14, #1
+        BNE     %BT10
+
+        MOV     r10, #0                 ; SI unit index
+20
+        CMP     r6, #1
+        CMPCC   r5, #4096               ; Keep dividing until < 4096
+        BCC     %FT30
+        MOV     r14, r6, LSL #22
+        MOV     r6, r6, LSR #10
+        MOVS    r5, r5, LSR #10
+        ORR     r5, r14, r5
+        ADCS    r5, r5, #0              ; Round up lost bit
+        ADC     r6, r6, #0
+        ADD     r10, r10, #1            ; Next 10^3 up
+        B       %BT20
+30
+        TEQ     r4, #ConvertToFileSize
+        BEQ     %FT50                   ; Don't do leading spaces
+
+        MOV     r0, #' '                ; Do leading spaces
+        CMP     r5, #1000
+        BLCC    VariformOutputChar
+        CMP     r5, #100
+        BLCC    VariformOutputChar
+        CMP     r5, #10
+        BLCC    VariformOutputChar
+        Pull    "r1, r5-r6, pc", VS
+50
+        Push    "r3-r5, r10"
+        ADD     r0, sp, #8              ; Use R5
+        MOV     r3, #2
+        MOV     r4, #ConvertToCardinal
+        BL      VariformOutput
+        Pull    "r3-r5, r10"
+
+        MOVVC   r0, #' '                ; Always need that space
+        BLVC    VariformOutputChar
+        Pull    "r1, r5-r6, pc", VS
+
+        ADR     r14, PrefixSI
+        LDRB    r0, [r14, r10]
+        TEQ     r4, #ConvertToFileSize
+        MOVNE   r10, #' '
+        MOVEQ   r10, #0
+        TEQEQ   r0, #' '
+        MOVEQ   r0, #0                  ; Supress padding SI unit too
+        BL      VariformOutputChar      ; Catch overflows when doing the suffix
+
+        LDR     r0, SuffixSI
+60
+        BL      VariformOutputChar
+        Pull    "r1, r5-r6, pc", VS
+        MOVS    r0, r0, LSR #8
+        BNE     %BT60
+
+        CMP     r5, #1                  ; I am the one and only
+        MOVNE   r0, #'s'
+        MOVEQ   r0, r10
+        BL      VariformOutputChar
+
+        MOVVC   r0, #0                  ; Terminate
+        BLVC    VariformOutputChar
+        Pull    "r1, r5-r6, pc", VS
+        Pull    "r0, r5-r6, pc"
+
+VariformOutputShortIPv6 ROUT
+        TST     r3, #1                  ; Must be a halfword multiple
+        BNE     VariBadNumb
+
+        Push    "r1, r3-r9"
+        MOV     r12, r0                 ; Input block
+        MOV     r10, #0                 ; Index loop
+        MOV     r5, #0                  ; Set thisstart = 0
+        MOV     r6, #0                  ;     thisrun = 0
+        MOV     r7, #0                  ; Set maxstart = length
+        MOV     r8, #0                  ;     maxrun = 0
+        MOV     r9, #2_10               ; Set last != 0, current = 0
+10
+        LDRB    r11, [r12], #1          ; Hi
+        LDRB    r14, [r12], #1          ; Lo
+        ORRS    r14, r14, r11, LSL #8
+
+        ORRNE   r9, r9, #2_01
+        ANDS    r9, r9, #3              
+        ADDEQ   r6, r6, #1              ; Case 2_00 : last & current zero -> in a run
+                                        ; Case 2_01 : last is zero, current is not -> end of a run
+        CMP     r9, #2_10               ; Case 2_10 : last is nonzero, current is -> start of a run
+        MOVEQ   r6, #1                  ; Case 2_11 : not interesting
+        MOVEQ   r5, r10
+
+        CMP     r6, r8                  ; max = MAX(max, this)
+        MOVCS   r8, r6
+        MOVCS   r7, r5                  
+
+        MOV     r9, r9, LSL #1          ; last = current
+        ADD     r10, r10, #2
+        TEQ     r10, r3
+        BNE     %BT10
+
+        MOV     r4, #ConvertToIPv6
+        MOV     r5, r0                  ; Keep original start
+        CMP     r8, #1                  ; Longest run was only 1, don't compact this
+        MOVLS   r7, r3                  ; Make maxstart = length
+        BLS     %FT30
+
+        ADD     r8, r7, r8, LSL #1      ; maxstart + maxcount
+        
+        SUB     r3, r3, r8              ; Do length - (maxstart + maxcount) to the end
+        ADD     r0, r0, r8              ; At original start + (maxstart + maxcount)
+        BL      VariformOutput
+
+        MOVVC   r0, #':'                ; Skip maxcount, abbreviate to '::'
+        BLVC    VariformOutputChar
+        BLVC    VariformOutputChar
+30
+        MOVVC   r3, r7                  ; Lowest maxstart bytes
+        MOVVC   r0, r5                  ; From original start
+        BLVC    VariformOutput
+
+        Pull    "r1, r3-r9, pc", VS
+        Pull    "r0, r3-r9, pc"
+
+VariformOutputIPv6
+        TST     r3, #1                  ; Must be a halfword multiple
+        BNE     VariBadNumb
+
+        Push    "r1, r3"
+        ADD     r12, r0, r3             ; Input block
+10
+        LDRB    r11, [r12, #-1]!        ; Hi
+        LDRB    r0, [r12, #-1]!         ; Lo
+        ORR     r0, r0, r11, LSL #8
+
+        Push    "r3-r4, r12"
+        MOV     r3, #1                  ; Must output at least 1 digit
+        MOVS    r0, r0, LSR #4
+        ADDNE   r3, r3, #1
+        MOVS    r0, r0, LSR #4
+        ADDNE   r3, r3, #1
+        MOVS    r0, r0, LSR #4
+        ADDNE   r3, r3, #1
+        MOV     r4, #ConvertToHexLowercase
+        MOV     r0, r12
+        BL      VariformOutput          ; Up to 4 nybbles please
+        Pull    "r3-r4, r12"
+        Pull    "r1, r3, pc", VS
+
+        SUBS    r3, r3, #2
+        MOVNE   r0, #':'                ; Separator
+20
+        MOVEQ   r0, #0                  ; Terminator
+        BL      VariformOutputChar
+        Pull    "r1, r3, pc", VS
+
+        TEQ     r3, #0
+        Pull    "r0, r3, pc", EQ        ; Done
+        B       %BT10                   ; More
+
+VariformOutputUUID
+        TEQ     r3, #16                 ; Must be exactly 128b
+        BNE     VariBadNumb
+
+        Push    "r1, r3"
+        MOV     r12, r0                 ; Input block
+10
+        Push    "r3-r4, r12"
+        MOV     r3, #2
+        MOV     r4, #ConvertToHexLowercase
+        MOV     r0, r12
+        BL      VariformOutput          ; 2 lowercase nybbles please
+        Pull    "r3-r4, r12"
+        Pull    "r1, r3, pc", VS
+
+        TEQ     r3, #17 - 4
+        TEQNE   r3, #17 - 6
+        TEQNE   r3, #17 - 8
+        TEQNE   r3, #17 - 10
+        MOVEQ   r0, #"-"                ; Separator
+        BLEQ    VariformOutputChar
+20
+        SUBS    r3, r3, #1
+        ADDNE   r12, r12, #1
+        BNE     %BT10                   ; More
+
+        MOV     r0, #0                  ; Terminator
+        BL      VariformOutputChar
+        Pull    "r1, r3, pc", VS
+        Pull    "r0, r3, pc"            ; Done
+
+VariformOutputDotColon ROUT
+        Push    "r1, r3-r4"
+        ADD     r12, r0, r3             ; Input block
+        TEQ     r4, #ConvertToIPv4
+        MOVEQ   r4, #ConvertToCardinal
+        MOVEQ   r10, #'.'
+        MOVNE   r4, #ConvertToHex
+        MOVNE   r10, #':'
+10
+        LDRB    r11, [r12, #-1]!        ; Not actually used
+
+        Push    "r3, r10, r12"
+        TEQ     r4, #ConvertToHex
+        MOVEQ   r3, #2                  ; Two nybbles please
+        MOVNE   r3, #1                  ; One octet please
+        MOV     r0, r12
+        BL      VariformOutput
+        Pull    "r3, r10, r12"
+        Pull    "r1, r3-r4, pc", VS
+
+        SUBS    r3, r3, #1
+        MOVNE   r0, r10                 ; Separator
+        MOVEQ   r0, #0                  ; Terminator
+        BL      VariformOutputChar
+        Pull    "r1, r3-r4, pc", VS
+
+        TEQ     r3, #0
+        Pull    "r0, r3-r4, pc", EQ     ; Done
+        B       %BT10                   ; More
+
+VariformOutputBinHex ROUT
+        Push    "r1, r5"
+        TEQ     r4, #ConvertToBinary
+        MOVEQ   r5, #1                  ; Step size in bits
+        MOVNE   r5, #4
+        ADDEQ   r12, r0, r3             ; Input block
+        ADDNE   r12, r3, #1
+        ADDNE   r12, r0, r12, LSR #1    ; Input block adjusted for nybbles and bytes
+        MOVEQ   r10, r3, LSL #3
+        MOVNE   r10, r3, LSL #2         ; Total bit count
+10
+        TEQ     r10, #0
+        BNE     %FT20
+        MOV     r0, #0
+        BL      VariformOutputChar      ; Terminate even if nothing
+        Pull    "r1, r5, pc", VS
+        Pull    "r0, r5, pc"
+20
+        LDRB    r11, [r12, #-1]!        ; Current byte
+        TST     r10, #7
+        MOVEQ   r11, r11, LSL #24       ; Work at top for LSL and LSR
+        MOVNE   r11, r11, LSL #28       ; Partial nybble
+30
+        RSB     r0, r5, #32             ; Shift of 8 - step + 24
+        MOV     r0, r11, LSR r0
+        CMP     r0, #10
+        ADDCC   r0, r0, #'0'
+        ADDCS   r0, r0, #'A' - 10
+        TEQ     r4, #ConvertToHexLowercase
+        ORREQ   r0, r0, #&20            ; Lowercasify (0-9 unaffected)
+        BL      VariformOutputChar
+        Pull    "r1, r5, pc", VS
+
+        MOV     r11, r11, LSL r5
+        SUB     r10, r10, r5
+        TST     r10, #7
+        BNE     %BT30
+        B       %BT10                   ; Either the end or need a new byte
+
+Our_ReadUnsigned
+        ; Tricky this one,we want to inspect the value of R4 as 'WIDE'
+        ; Just nick the code from s.ArthurSWIs in the Kernel
+
+;+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; ReadUnsigned.
+; ============
+;
+; Read an unsigned number from a string in decimal (no prefix), hex (&)
+; or given base (nn_). Leading spaces are stripped.
+; 'Bad base for number' is given if a base is not in 02..10_36
+; 'Bad number' is given if
+;      (i) No valid number was
+;  or (ii) a '<base>_' or '&' has no following valid number
+; 'Number too big' is given if the result overflowed a 32-bit word
+
+; In    r1 -> string
+;       r0 =     bits 0-7: base to read number in (0 means any based number allowed)
+;                bit 31 set -> check term chars for ok-ness
+;                bit 30 set -> restrict range to 00..FF
+;                bit 29 set -> restrict range to 0..R2 (inclusive)
+;                               (overrides bit 30)
+;                bit 28 set -> read 64-bit value to R2,R3 and
+;                               if applicable, range is in R2,R3
+;       r4 != &45444957 ("WIDE") -> legacy mode: bits 8-28 are considered part of the base
+
+; Out   VC : r1 -> first unused char, r2 = number
+;       VS : r1 unchanged, r2 = 0, current error block set
+;       either way, R4 = mask of flag bits supported
+
+ReadUnsigned_Routine Entry "r0-r1, r3-r6, r9"
+
+        WritePSRc SVC_mode, r9
+
+        LDR     lr, =&45444957
+        CMP     r4, lr
+        MOVEQ   r4, #(2_1111 :SHL: 28)
+        MOVNE   r4, #(2_111 :SHL: 29)
+        STREQ   r4, [stack, #3*4]
+        
+        AND     r11, r0, r4       ; Remember the input flags
+        ANDEQ   r12, r0, #255     ; r12 := base
+        BICNE   r12, r0, r4
+
+; first set range limit
+        MOV     r9, r2            ; limit value lo word
+        TST     r11, #1 :SHL: 28
+        MOVEQ   r6, #0            ; limit value hi word
+        MOVNE   r6, r3
+        TST     r11, #3 :SHL: 29
+        MOVEQ   r9, #-1           ; used unsigned; allows anything
+        MOVEQ   r6, #-1
+        TST     r11, #1 :SHL: 30
+        MOVNE   r9, #&FF
+        MOVNE   r6, #0
+
+        CMP     r12, #2          ; If base nonsensical, default to 10
+        RSBGES  r14, r12, #36    ; ie. try to match most generally
+        MOVLT   r12, #10
+
+01      LDRB    r0, [r1], #1    ; Skip spaces for Bruce
+        TEQ     r0, #" "
+        BEQ     %BT01
+        SUB     r10, r1, #1      ; Keep ptr to start of string after spaces
+
+        TEQ     r0, #"&"        ; '&' always forces hex read
+        BNE     %FT20
+        MOV     r4, #16
+        TST     r11, #1 :SHL: 28
+        ADR     lr, %FT09
+        BEQ     ReadNumberInBase
+        BNE     Read64BitNumberInBase
+09      BVS     %FT95
+
+10      STR     r1, [sp, #4]       ; Update string^
+        TST     r11, #(1 :SHL: 31) ; Was the termcheck flag set ?
+        BEQ     %FT15
+        LDRB    r0, [r1]           ; What was the term char ?
+        CMP     r0, #" "           ; CtrlChar + space all ok
+        BGT     %FT85              ; For bad term errors
+
+15      CMP     r9, r2
+        SBCS    lr, r6, r5
+        BCC     %FT80
+        TST     r11, #1 :SHL: 28
+        STRNE   r5, [stack, #4*2]
+        PullEnv
+        LocalExitSWIHandler     ; VClear already in lr
+
+
+20      SUB     r1, r1, #1      ; Skip back to first char of string
+        MOV     r4, #10         ; Try reading a decimal number
+        BL      ReadNumberInBase
+        MOVVS   r4, r12          ; If we failed to read a decimal number
+        BVS     %FT30           ; then use the one supplied (r12). r1 ok
+        LDRB    r0, [r1], #1    ; Is it base_number ?
+        CMP     r0, #"_"        ; If not based, use supplied base
+        MOVNE   r1, r10         ; to read from given start of string (spaces !)
+        MOVNE   r4, r12         ; restore supplied base!
+        MOVEQ   r4, r2          ; Use this as new base
+
+; Reading number in base r4
+
+30      CMP     r4, #2          ; Is base valid (2..36) ?
+        RSBGES  r0, r4, #36     ; LT -> invalid
+        BLT     %FT90
+        TST     r11, #1 :SHL: 28
+        ADR     lr, %FT39
+        BEQ     ReadNumberInBase ; Read rest of number
+        BNE     Read64BitNumberInBase
+39      BVS     %FT95
+        B       %BT10
+
+
+80      ADR     r2, ErrorBlock_NumbTooBig
+      [ International
+        B       %FT94
+      |
+        B       %FT95
+      ]
+
+85      ADR     r2, ErrorBlock_BadNumb
+      [ International
+        B       %FT94
+      |
+        B       %FT95
+      ]
+
+90      ADR     r2, ErrorBlock_BadBase
+
+      [ International
+94
+        Push    "r0,lr"
+        MOV     r0,r2
+        BL      TranslateError
+        MOV     r2,r0
+        Pull    "r0,lr"
+      ]
+
+95
+        STR     r2, [stack]     ; Go set the current error
+        MOV     r2, #0          ; Defined to return 0 on error
+        TST     r11, #1 :SHL: 28
+        STRNE   r2, [stack, #4*2] ; return MSB=0 on error too, if 64-bit read reqd
+        PullEnv
+        B       SLVK_SetV
+
+        MakeErrorBlock BadBase
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; ReadNumberInBase
+; ================
+
+; In    r1 -> string, r4 = base (valid)
+
+; Out   VC : Number read in r2, r1 updated. r3 = number of chars used, r5 = 0
+;       VS : r1 preserved, r2 -> error block
+
+ReadNumberInBase Entry "r0, r1, r12"
+
+        MOV     r2, #0          ; Result
+        MOV     r3, #0          ; Number of valid digits read
+        MOV     r5, #0
+
+10      BL      GetCharForReadNumber
+        BNE     %FT50           ; Finished ?
+
+        TST     r2, #&F8000000  ; If EQ, can't possibly overflow in any base up to 26
+        MLAEQ   r2, r4, r2, r0
+        BEQ     %BT10
+        
+        MOV     r12, r4
+        MOV     r14, #0         ; Multiply by repeated addition. Base <> 0 !
+20      ADDS    r14, r14, r2
+        BCS     %FT90           ; Now checks for overflow !
+        SUBS    r12, r12, #1    ; result *:= base
+        BNE     %BT20
+        ADDS    r2, r14, r0     ; result +:= digit
+        BCC     %BT10
+        B       %FT90           ; Now checks for overflow here too!
+
+50      CMP     r3, #0          ; Read any chars at all ? VClear
+        STRNE   r1, [sp, #4]    ; Update string^
+        EXIT    NE              ; Resultis r2
+
+      [ International
+        Push    "r0"
+        ADR     r0, ErrorBlock_BadNumb
+        BL      TranslateError
+        MOV     r2,r0
+        Pull    "r0"
+      |
+        ADR     r2, ErrorBlock_BadNumb
+        SETV
+      ]
+        EXIT
+        MakeErrorBlock BadNumb
+
+90
+      [ International
+        Push    "r0"
+        ADR     r0, ErrorBlock_NumbTooBig
+        BL      TranslateError
+        MOV     r2,r0
+        Pull    "r0"
+      |
+        ADR     r2, ErrorBlock_NumbTooBig
+        SETV
+      ]
+        EXIT
+        MakeErrorBlock NumbTooBig
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; Read64BitNumberInBase
+; =====================
+
+; In    r1 -> string, r4 = base (valid)
+
+; Out   VC : Number read in r2 (lo) and r5 (hi), r1 updated. r3 = number of chars used
+;       VS : r1 preserved, r2 -> error block, r5 corrupted
+
+Read64BitNumberInBase ALTENTRY
+
+        MOV     r2, #0          ; Result lo
+        MOV     r3, #0          ; Number of valid digits read
+        MOV     r5, #0          ; Result hi
+
+10      BL      GetCharForReadNumber
+        BNE     %BT50           ; Finished ?
+
+      [ :LNOT: NoARMv4
+        TST     r5, #&F8000000  ; If EQ, can't possibly overflow in any base up to 26
+        MULEQ   r5, r4, r5      ; r0,r5 = new_digit + (old_msw * base)<<32
+        UMLALEQ r0, r5, r4, r2  ; r0,r5 += old_lsw * base
+        MOVEQ   r2, r0
+        BEQ     %BT10
+      ]
+                                ; Multiply by repeated addition. Base <> 0 !
+        SUBS    r12, r4, #1     ; Final iteration has r2,r5 as dest, so one fewer main iterations
+        MOV     r14, #0         ; r0,r14 is accumulator, initialised to new_digit,0
+20      ADDS    r0, r0, r2
+        ADCS    r14, r14, r5
+        BCS     %BT90
+        SUBS    r12, r12, #1
+        BNE     %BT20
+        ADDS    r2, r0, r2
+        ADCS    r5, r14, r5
+        BCC     %BT10
+        B       %BT90           ; Checks for overflow here too!
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; GetCharForReadNumber
+; ====================
+;
+; Read a digit and validate for reading in current base. Bases 2..36 are valid
+
+; In    r1 -> string, r4 = base for number input
+
+; Out   EQ -> r0 = valid number in [0..base-1], r1++
+;       NE -> r0 invalid, r1 same
+
+GetCharForReadNumber Entry
+
+        LDRB    r0, [r1]
+        CMP     r0, #"0"
+        BLO     %FT95
+        CMP     r0, #"9"
+        BLS     %FT50
+        UpperCase r0, r14
+        CMP     r0, #"A"        ; Always hex it, even if reading in decimal
+        RSBGES  r14, r0, #"Z"   ; Inverse compare as nicked from UpperCase
+        BLT     %FT95           ; GE -> in range A..Z
+        SUB     r0, r0, #"A"-("0"+10)
+50      SUB     r0, r0, #"0"
+        CMP     r0, r4          ; digit in [0..base-1] ?
+        BHS     %FT95
+        ADD     r1, r1, #1      ; r1++
+        ADD     r3, r3, #1      ; Valid digit has been read
+        CMP     r0, r0          ; EQ
+        EXIT
+
+95      CMP     r0, #-1         ; NE
+        EXIT
+
+        END

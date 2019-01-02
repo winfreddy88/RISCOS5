@@ -1,0 +1,360 @@
+; Copyright 2018 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+
+              GBLL   DispmanxDebug
+DispmanxDebug SETL   Debug :LAND: {FALSE}
+
+; Message IDs
+EDispmanNoFunction              * 0
+EDispmanGetDevices              * 1
+EDispmanGetModes                * 2
+EDispmanResourceCreate          * 3
+EDispmanResourceCreateFromImage * 4
+EDispmanResourceDelete          * 5
+EDispmanResourceGetData         * 6
+EDispmanResourceGetImage        * 7
+EDispmanDisplayOpen             * 8
+EDispmanDisplayOpenMode         * 9
+EDispmanDisplayOpenOffscreen    * 10
+EDispmanDisplayReconfigure      * 11
+EDispmanDisplaySetDestination   * 12
+EDispmanDisplaySetBackground    * 13
+EDispmanDisplayGetInfo          * 14
+EDispmanDisplayClose            * 15
+EDispmanUpdateStart             * 16
+EDispmanUpdateSubmit            * 17
+EDispmanUpdateSubmitSync        * 18
+EDispmanElementAdd              * 19
+EDispmanElementModified         * 20
+EDispmanElementRemove           * 21
+EDispmanElementChangeSource     * 22
+EDispmanElementChangeLayer      * 23
+EDispmanElementChangeAttributes * 24
+EDispmanResourceFill            * 25
+EDispmanQueryImageFormats       * 26
+EDispmanBulkWrite               * 27
+EDispmanBulkRead                * 28
+EDispmanDisplayOrientation      * 29
+EDispmanSnapshot                * 30
+NoReply                         * (1<<31)
+
+; VC image formats
+Format_RGB565   * 1
+Format_YV12     * 3
+Format_ABGR8888 * 15
+Format_ARGB8888 * 43
+Format_TRGB8888 * 44
+Format_YV16     * 42
+Format_TBGR8888 * 49
+Format_NV12     * 52
+
+Dispmanx_Init   ROUT
+        Entry   "r0-r7", VCHIQ_Service_Size
+        LDR     r0, DispManServiceC
+        CMP     r0, #0
+        ; The GPU can struggle with rotated displays. Apart from the extra load
+        ; that the rotation places on it, there are also some problems with how
+        ; dispmanx overlays are mapped.
+        ; E.g. with 90 degree rotation if we use a standard hardware pointer
+        ; then there'll often be screen corruption when moving the mouse to the
+        ; bottom of the screen.
+        ; If we pre-rotate the hardware pointer then it appears to display OK,
+        ; but there appears to be an odd clipping rectangle which will cause
+        ; the pointer to vanish near the top of the screen.
+        ; So if we've got any rotation at all, play it safe and fall back to a
+        ; software pointer.
+        LDREQ   r0, DisplayRotate
+        CMPEQ   r0, #0
+        EXIT    NE
+      [ DispmanxDebug
+        bl DebugTXStrInline
+        DCB "Dispmanx_Init",10,13,0
+        ALIGN
+      ]
+        ; Register with VCHIQ
+        BL      VCHIQInit
+        MOVVS   r7, r0
+        BVS     %FT90
+        ; Create services
+        MOV     r0, #1
+        STR     r0, [sp, #VCHIQ_Service_Version]
+        STR     r0, [sp, #VCHIQ_Service_Version_Min]
+        LDR     r0, =&44495350 ; 'DISP'
+        STR     r0, [sp, #VCHIQ_Service_Id]
+        MOV     r0, #0
+        STR     r0, [sp, #VCHIQ_Service_Reserved]
+        STR     r0, [sp, #VCHIQ_Service_RxFifoSize]
+        STR     r0, [sp, #VCHIQ_Service_TxFifoSize]
+        ADR     r1, Dispmanx_ClientCallback
+        STR     r1, [sp, #VCHIQ_Service_Callback]
+        STR     r0, [sp, #VCHIQ_Service_CallbackParam]
+        STR     r0, [sp, #VCHIQ_Service_WantUnalignedBulkRx]
+        STR     r0, [sp, #VCHIQ_Service_WantUnalignedBulkTx]
+        STR     r0, [sp, #VCHIQ_Service_WantCRC]
+        LDR     r0, VCHIQInstance
+        MOV     r1, sp
+        SWI     XVCHIQ_ServiceOpen
+        MOVVS   r7, r0
+        BVS     %FT89
+        STR     r0, DispManServiceC
+        LDR     r0, =&55504448 ; 'UPDH'
+        STR     r0, [sp, #VCHIQ_Service_Id]
+        ADR     r0, Dispmanx_NotifyCallback
+        STR     r0, [sp, #VCHIQ_Service_Callback]
+        LDR     r0, VCHIQInstance
+        SWI     XVCHIQ_ServiceOpen
+        MOVVS   r7, r0
+        BVS     %FT88
+        STR     r0, DispManServiceN
+        ; Release services (message functions will 'use' them again)
+        SWI     XVCHIQ_ServiceRelease
+        LDR     r0, DispManServiceC
+        SWI     XVCHIQ_ServiceRelease
+        STR     pc, DispManFree ; Unlock Dispmanx_Send
+        ; Open display
+        MOV     r0, #EDispmanDisplayOpen
+        MOV     r1, #0
+        STMIA   sp, {r0-r1}
+        MOV     r0, #8
+        BL      Dispmanx_Send
+        MOVVS   r7, r0
+        BVS     %FT87
+        STR     r0, DispHandle
+        ; Read width/height
+        MOV     r0, #EDispmanDisplayGetInfo
+        LDR     r1, DispHandle
+        STMIA   sp, {r0-r1}
+        MOV     r0, #8
+        BL      Dispmanx_Send
+        MOVVS   r7, r0
+        BVS     %FT86
+        ; Recalc display width/height
+        LDR     r0, mbxres ; Initial mode set yet?
+        CMP     r0, #0
+        BLNE    Dispmanx_CalcDisplayScaleOffset
+      [ DispmanxDebug
+        bl DebugTXStrInline
+        DCB "Dispmanx_Init OK",10,13,0
+        ALIGN
+      ]  
+        CLRV
+        EXIT
+86
+        MOV     r0, #EDispmanDisplayClose + NoReply
+        LDR     r1, DispHandle
+        STMIA   sp, {r0-r1}
+        MOV     r0, #8
+        BL      Dispmanx_Send
+87
+        LDR     r0, DispManServiceN
+        SWI     XVCHIQ_ServiceUse
+        LDR     r0, DispManServiceN
+        SWI     XVCHIQ_ServiceClose
+88
+        LDR     r0, DispManServiceC
+        SWI     XVCHIQ_ServiceUse
+        LDR     r0, DispManServiceC
+        SWI     XVCHIQ_ServiceClose
+89
+        MOV     r0, #0
+        STR     r0, DispManServiceC        
+        STR     r0, DispManServiceN        
+90
+        FRAMSTR r7,,r0
+        SETV
+        EXIT
+
+Dispmanx_ClientCallback
+        ; Did we receive a message?
+        CMP     r1, #VCHI_CALLBACK_MSG_AVAILABLE
+        STREQ   r1, DispManResponded
+        MOV     pc, lr
+
+Dispmanx_NotifyCallback
+        ; Not needed
+        MOV     pc, lr
+
+Dispmanx_Finalise ROUT
+        Entry   "r0-r7", 8
+        LDR     r0, DispManServiceC
+        CMP     r0, #0
+        EXIT    EQ
+      [ DispmanxDebug
+        bl DebugTXStrInline
+        DCB "Dispmanx_Finalise",10,13,0
+        ALIGN
+      ]
+        ; Release resources
+        MOV     r0, #EDispmanDisplayClose + NoReply
+        LDR     r1, DispHandle
+        STMIA   sp, {r0-r1}
+        MOV     r0, #8
+        BL      Dispmanx_Send        
+        ; Release services
+        LDR     r0, DispManServiceN
+        SWI     XVCHIQ_ServiceUse
+        LDR     r0, DispManServiceC
+        SWI     XVCHIQ_ServiceUse
+        LDR     r0, DispManServiceN
+        SWI     XVCHIQ_ServiceClose
+        LDR     r0, DispManServiceC
+        SWI     XVCHIQ_ServiceClose
+        MOV     r0, #0
+        STR     r0, DispManServiceN
+        STR     r0, DispManServiceC
+        ; Done
+      [ DispmanxDebug
+        bl DebugTXStrInline
+        DCB "Dispmanx_Finalise OK",10,13,0
+        ALIGN
+      ]  
+        EXIT
+
+; in:
+; r0 = length
+; sp -> input buffer
+; out:
+; r0 = 1st word of response (corrupt if no response requested)
+Dispmanx_Send ROUT
+        Entry   "r1-r5"
+      [ DispmanxDebug
+        bl      DebugHexTX4
+        Push    "r0"
+        LDR     r0, [sp, #7*4]
+        bl      DebugHexTX4
+        Pull    "r0"
+        bl      DebugTXStrInline
+        DCB "Dispmanx_Send",10,13,0
+        ALIGN
+      ]
+        ADR     r1, DispManFree
+        BL      WaitForR1
+        MOV     r1, #0
+        STR     r1, DispManFree
+        MOV     r1, r0
+        ADD     r0, sp, #6*4
+        LDR     r2, [r0]
+        TST     r2, #NoReply
+        MOVNE   r2, #0
+        BNE     %FT50
+        ; Read response into DispManResponded
+        ; Ordinarily response is 4 bytes, except for DisplayGetInfo
+        ; WS vars arranged so that we can use same buffer address
+        ASSERT  DisplayWidth = DispManResponded+4
+        ASSERT  DisplayHeight = DispManResponded+8
+        ASSERT  DisplayTrans = DispManResponded+12
+        ASSERT  DisplayFormat = DispManResponded+16
+        TEQ     r2, #EDispmanDisplayGetInfo
+        MOVNE   r3, #4
+        MOVEQ   r3, #20
+        ADR     r2, DispManResponded
+50
+        LDR     r4, DispManServiceC
+        ADR     r5, DispManResponded
+        BL      VCHIQSend
+        BVS     %FT80
+        CMP     r0, #0
+        BEQ     %FT90
+        LDR     r0, DispManResponded
+        STR     pc, DispManFree
+      [ DispmanxDebug
+        bl DebugHexTX4
+        bl DebugTXStrInline
+        DCB "result",10,13,0
+        ALIGN
+        CLRV
+      ]
+        EXIT
+80
+        STR     pc, DispManFree
+      [ DispmanxDebug
+        bl DebugHexTX4
+        bl DebugTXStrInline
+        DCB "err",10,13,0
+        ALIGN
+        SETV
+      ]
+        EXIT
+90
+        STR     pc, DispManFree
+      [ DispmanxDebug
+        bl DebugTXStrInline
+        DCB "no result",10,13,0
+        ALIGN
+        CLRV
+      ]
+        EXIT
+
+Dispmanx_CalcDisplayScaleOffset ROUT
+        Entry   "r0-r9"
+        ; Calculate the scale & offset values that translate from RISC OS desktop pixels to physical display pixels, and vice-versa
+        ; This assumes that the videocore won't alter the aspect ratio of the desktop, and scales it up without cropping
+        ; It also assumes no transform is in use
+        LDR     r0, DisplayWidth
+        LDR     r1, DisplayHeight
+        LDR     r2, mbxres
+        LDR     r3, mbyres
+        LDR     r4, mboverleft
+        LDR     r5, mboverright
+        LDR     r6, mbovertop
+        LDR     r7, mboverbottom
+        ADD     r8, r4, r5
+        ADD     r9, r6, r7
+        ; Overscan is nominally measured in display pixels, so subtract the overscan amount from the display size
+        SUB     r8, r0, r8
+        SUB     r9, r1, r9
+        ; Which has the higher aspect ratio?
+        MUL     r4, r8, r3
+        MUL     r5, r9, r2
+        CMP     r4, r5 ; GT: physical screen wider, so Y scale will be limiting factor. LT: RISC OS screen wider, so X scale will be limiting factor.
+        ; Scaling is calculated as follows:
+        ; scale = (displaysize-overscan)/fbsize
+        MOVGT   r4, r9
+        MOVGT   r5, r3
+        MOVLE   r4, r8
+        MOVLE   r5, r2
+        MOV     r4, r4, LSL #16
+        DivRem  r7, r4, r5, lr
+        STR     r7, XScale
+        STR     r7, YScale
+        MOV     r5, r7
+        ; Calculate inverse scale required for clipping in Y axis
+        ; Just take the easy route and calculate the reciprocal of r7
+        MOV     r8, #&80000000
+        MOV     r4, r7, LSR #1
+        DivRem  r6, r8, r4, lr
+        STR     r6, YInvScale
+        ; Now calculate offsets
+        MUL     r2, r5, r2
+        MUL     r3, r7, r3
+        LDR     r4, mboverleft
+        LDR     r5, mboverright
+        LDR     r6, mbovertop
+        LDR     r7, mboverbottom
+        SUB     r0, r0, r2, LSR #16
+        SUB     r1, r1, r3, LSR #16
+        ADD     r5, r4, r5
+        ADD     r7, r6, r7
+        SUB     r0, r0, r5
+        SUB     r1, r1, r7
+        ADD     r0, r4, r0, ASR #1
+        ADD     r1, r6, r1, ASR #1
+        STR     r0, XOffset
+        STR     r1, YOffset
+        EXIT
+
+        LTORG
+
+        END

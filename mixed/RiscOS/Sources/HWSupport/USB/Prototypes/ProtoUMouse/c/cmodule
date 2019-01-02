@@ -1,0 +1,800 @@
+/* Copyright 2001 Pace Micro Technology plc
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#include "modhead.h"
+#include "OHCI.h"
+#include "swis.h"
+#include <string.h>
+#include <stdio.h>
+#include <time.h>
+#include "debuglib/debuglib.h"
+#include <stdlib.h>
+#include "Global/RISCOS.h"
+#include "Global/Keyboard.h"
+#include "Global/Pointer.h"
+#include "Global/Services.h"
+#include "Global/HALEntries.h"
+#include "Interface/PCI.h"
+#include "callx/callx.h"
+
+#define USE_SECOND_PORT
+
+#ifdef TUNGSTEN
+#define PCI
+#endif
+
+#ifndef PCI_ReadID
+#define PCI_ReadID 0x50380
+#define PCI_HardwareAddress 0x5038A
+#define PCI_ReadInfo 0x5038B
+#define PCI_FindByClass 0x5038F
+#define PCI_RAMAlloc 0x50390
+#define PCI_RAMFree 0x50391
+#endif
+
+#define NOTUSED(V) ((V)=(V))
+
+#ifndef PointerDevice_USB
+#define PointerDevice_USB 7
+#endif
+
+#define USB_DELAY_RESET   20
+#define USB_DELAY_ADDRESS 1
+#define USB_DELAY_CONFIG  1
+
+
+#ifdef EMULATE
+#define OHCIEmulator_GetBus             0x054a80
+#define OHCIEmulator_ClaimDeviceVector  0x054a81
+#define OHCIEmulator_ReleaseDeviceVector  0x054a82
+#define OHCIEmulator_ReadWord           0x054a83
+#define OHCIEmulator_WriteWord          0x054a84
+#define OREAD(ADDRESS,VALUE) \
+_swix (OHCIEmulator_ReadWord, _IN(0) | _OUT(1), ADDRESS, VALUE)
+
+#define OWRITE(ADDRESS,VALUE) \
+_swix (OHCIEmulator_WriteWord, _INR(0,1), ADDRESS, VALUE)
+
+#define CLAIM(FUNCTION,WS) \
+_swix (OHCIEmulator_ClaimDeviceVector, _INR(1,2), FUNCTION, WS)
+
+#define RELEASE(FUNCTION,WS) \
+_swix (OHCIEmulator_ReleaseDeviceVector, _INR(1,2), FUNCTION, WS)
+
+#else
+#ifdef PCI
+static int DevNo_USB;
+#define CDevNo_USB (DevNo_USB | (1u<<31))
+static volatile int*ohci_base;
+#else
+#define DevNo_USB 34 /* L7205 */
+#define CDevNo_USB DevNo_USB
+static volatile int*ohci_base = (int*) 0xf99f6000;
+#endif
+#define OREAD(ADDRESS) (ohci_base[(ADDRESS) / 4])
+#define OWRITE(ADDRESS,VALUE) (ohci_base[(ADDRESS) / 4] = (int) VALUE)
+
+#define CLAIM(FUNCTION,WS) \
+_swix (OS_ClaimDeviceVector, _INR(0,4), CDevNo_USB, FUNCTION, WS, 0, 0); \
+_swix (OS_Hardware, _IN(0) | _INR(8,9), DevNo_USB, 0, EntryNo_HAL_IRQEnable)
+
+#define RELEASE(FUNCTION,WS) \
+_swix (OS_ReleaseDeviceVector, _INR(0,4), CDevNo_USB, FUNCTION, WS, 0, 0)
+#endif
+
+/* host controller communications area must be 256 byte aligned */
+static OHCI_Hcca* hccap;
+
+/* we'll need 3 endpoints and transfer descriptors */
+static OHCI_ED* edp;
+static OHCI_TD* tdp;
+static void* tda[4]; /* physical addresses */
+
+static volatile int sofs = 0;
+static volatile int wdh = 0;
+static volatile int rhsc = 0;
+static volatile int resets = 0;
+static volatile int data_received = 0;
+static volatile int request_complete = 0;
+static volatile int state = 0;
+static int prev_pointer = 0;
+
+static int relx = 0, rely = 0;
+static uint8_t buttons;
+
+static int portno;
+
+_kernel_oserror* reset_cb (_kernel_swi_regs* r, void* pw, void* data);
+_kernel_oserror* pointer_cb (_kernel_swi_regs* r, void* pw, void* data);
+_kernel_oserror* set_address_cb (_kernel_swi_regs* r, void* pw, void* data);
+_kernel_oserror* set_config_cb (_kernel_swi_regs* r, void* pw, void* data);
+static void read_mouse_data (void);
+
+/* transfer descriptor data */
+
+static struct {
+    uint8_t  buttons;
+    int8_t   relx;
+    int8_t   rely;
+    int8_t   relwheel;
+} mouse_data;
+
+static struct {
+    uint8_t     requestType;
+    uint8_t     request;
+    uint16_t    value;
+    uint16_t    index;
+    uint16_t    length;
+} setAddress = { 0, 5, 1, 0, 0 },
+  setConfig = { 0, 9, 1, 0, 0 };
+
+static enum state {
+    port_detached,
+    port_attached,
+    port_powered,
+    port_default,
+    port_address,
+    port_configured,
+    port_MAX_STATE
+} port_state = port_detached;
+
+
+static const char * const port_state_str[port_MAX_STATE] =
+{
+    "Port Detached",
+    "Port Attached",
+    "Port Powered",
+    "Port Default",
+    "Port Address",
+    "Port Configured",
+};
+
+static const char * const completion_codes[16] =
+{
+    "NoError (0)",
+    "CRC (1)",
+    "BitStuffing (2)",
+    "DataToggleMismatch (3)",
+    "Stall (4)",
+    "DeviceNotResponding (5)",
+    "PIDCheckFailure (6)",
+    "UnexpectedPID (7)",
+    "DataOverRun (8)",
+    "DataUnderrun (9)",
+    "Reserved (10)",
+    "Reserved (11)",
+    "BufferOverrun (12)",
+    "BufferUnderrun (13)",
+    "Not Accessed (14)",
+    "Not Accessed (15)"
+};
+
+static void* vtophys (void* v)
+{
+    struct {
+        uint32_t    page;
+        void*       logical;
+        void*       physical;
+    } block;
+    block.logical = v;
+
+    _swix (OS_Memory,
+
+        _INR (0, 2),
+
+        (1<<9) | (1<<13) | (2<<14),
+        &block,
+        1
+        );
+
+
+    return block.physical;
+}
+
+static void* phystov (volatile void* p)
+{
+    struct {
+        uint32_t    page;
+        void*       logical;
+        void*       physical;
+    } block;
+    block.physical = (void *) p;
+
+    _swix (OS_Memory,
+
+        _INR (0, 2),
+
+        (1<<10) | (1<<12),
+        &block,
+        1
+        );
+
+
+    return block.logical;
+}
+
+static void *alloc_contig(size_t len, int alignment)
+{
+    void *p;
+
+    if (_swix(PCI_RAMAlloc, _INR(0,2)|_OUT(0), len, alignment, 0, &p))
+        return NULL;
+
+    return memset(p, 0, len);
+}
+
+static void free_contig(void *p)
+{
+    _swix(PCI_RAMFree, _IN(0), p);
+}
+
+_kernel_oserror *module_init(const char *cmd_tail, int podule_base, void *pw)
+{
+    int w;
+    _kernel_oserror* e = 0;
+    NOTUSED(cmd_tail);
+    NOTUSED(podule_base);
+
+    /* set up debugging */
+    debug_initialise (Module_Title, "", "");
+    debug_set_device(FILE_OUTPUT);
+    debug_set_unbuffered_files (TRUE);
+
+    dprintf (("Module", "Starting Module\n"));
+
+    callx_init (pw);
+
+#ifdef PCI
+    int h = 0;
+    do
+    {
+        e = _swix(PCI_FindByClass, _INR(0,1)|_IN(3)|_OUT(3), 0x0C0310, 0xFFFFFF, h, &h);
+        if (e) return e;
+        if (h)
+        {
+            unsigned id;
+            e = _swix(PCI_ReadID, _IN(3)|_OUT(0), h, &id);
+            if (e) return e;
+            if (id == 0x523710B9) continue;
+            e = _swix(PCI_ReadInfo, _INR(0,3), 1<<11, &DevNo_USB, 4, h);
+            if (e) return e;
+            e = _swix(PCI_HardwareAddress, _INR(0,1)|_IN(3)|_OUT(4), 0, 0, h, &ohci_base);
+            if (e) return e;
+            break;
+        }
+    } while (h);
+    if (h == 0) return 0;
+#else
+    e = _swix(OS_Memory, _INR(0,2)|_OUT(3), 13, ohci_base, 256, &ohci_base);
+    if (e) return e;
+#endif
+
+    /* HCCA must be 256 byte aligned */
+    hccap = alloc_contig(sizeof *hccap, 256);
+    edp = alloc_contig(3 * sizeof *edp, 16);
+    tdp = alloc_contig(4 * sizeof *tdp, 16);
+
+    for (w = 0; w < 32; w += 10)
+        hccap->interruptTable[w] = vtophys (edp);
+
+    /* endpoint[0] is for the mouse data */
+    edp[0].functionAddress = 1;
+    edp[0].endpointNumber = 1;
+    edp[0].direction = 2;
+    edp[0].speed = 1;
+    edp[0].skip = 1;
+    edp[0].format = 0;
+    edp[0].maxPacketSize = 8;
+    edp[0].tailPointer = 0;
+    edp[0].head.pointer.normal = tda[0] = vtophys (&tdp[0]);
+    edp[0].nextED = 0;
+
+    tdp[0].bufferRounding = 1;
+    tdp[0].direction = 2;
+    tdp[0].conditionCode = OHCI_CC_NOT_ACCESSED;
+    tdp[0].nextTD = 0;
+    tdp[0].currentBuffer = vtophys (&mouse_data);
+    tdp[0].bufferEnd = (char*) tdp[0].currentBuffer + sizeof mouse_data - 1;
+
+    /* endpoint[1] is for the setting of address */
+    edp[1].functionAddress = 0;
+    edp[1].endpointNumber = 0;
+    edp[1].direction = 0;
+    edp[1].speed = 1;
+    edp[1].skip = 1;
+    edp[1].format = 0;
+    edp[1].maxPacketSize = 64;
+    edp[1].tailPointer = 0;
+    edp[1].head.pointer.normal = tda[1] = vtophys (&tdp[1]);
+    edp[1].nextED = vtophys (&edp[2]);
+
+    tdp[1].direction = 0;
+    tdp[1].dataToggle = 2; /* force DATA0 */
+    tdp[1].conditionCode = OHCI_CC_NOT_ACCESSED;
+    tdp[1].nextTD = vtophys (&tdp[3]);
+    tdp[1].currentBuffer = vtophys (&setAddress);
+    tdp[1].bufferEnd = (char*) tdp[1].currentBuffer + sizeof setAddress - 1;
+
+    /* endpoint[2] is for the setting of configuration */
+    edp[2].functionAddress = 1;
+    edp[2].endpointNumber = 0;
+    edp[2].direction = 0;
+    edp[2].speed = 1;
+    edp[2].skip = 1;
+    edp[2].format = 0;
+    edp[2].maxPacketSize = 64;
+    edp[2].tailPointer = 0;
+    edp[2].head.pointer.normal = tda[2] = vtophys (&tdp[2]);
+    edp[2].nextED = 0;
+
+    tdp[2].direction = 0;
+    tdp[2].dataToggle = 2; /* force DATA0 */
+    tdp[2].conditionCode = OHCI_CC_NOT_ACCESSED;
+    tdp[2].nextTD = tda[3] = vtophys (&tdp[3]);
+    tdp[2].currentBuffer = vtophys (&setConfig);
+    tdp[2].bufferEnd = (char*) tdp[2].currentBuffer + sizeof setConfig - 1;
+
+    /* termination for request transfers */
+    tdp[3].direction = 2;
+    tdp[3].dataToggle = 3; /* force DATA1 */
+    tdp[3].conditionCode = OHCI_CC_NOT_ACCESSED;
+    tdp[3].nextTD = 0;
+    tdp[3].currentBuffer = 0;
+    tdp[3].bufferEnd = 0;
+
+    buttons = 0;
+
+    CLAIM(usb_irq_entry, pw);
+
+    _swix (OS_Claim, _INR(0,2), PointerV, pointerv_entry, pw);
+
+    _swix (OS_Pointer, _IN(0) | _OUT(0), 0, &prev_pointer);
+
+    /* To ensure <1ms start-up */
+    _kernel_irqs_off();
+
+    /* Reset the controller, and turn on global power */
+    OWRITE(OHCI_COMMAND_STATUS, OHCI_HCR);
+    do {
+        w = OREAD(OHCI_COMMAND_STATUS);
+    } while (w & OHCI_HCR);
+    /* Now in SUSPEND state */
+    OWRITE(OHCI_HCCA, vtophys (hccap));
+
+    OWRITE(OHCI_CONTROL_HEAD_ED, vtophys (&edp[1]));
+    OWRITE(OHCI_FM_INTERVAL, OHCI_FSMPS(11999) | 11999);
+    OWRITE(OHCI_PERIODIC_START, OHCI_PERIODIC(11999));
+
+    /* enable hc interrupts */
+    OWRITE(OHCI_INTERRUPT_DISABLE, OHCI_ALL_INTRS);
+    OWRITE(OHCI_INTERRUPT_ENABLE, OHCI_MIE |  OHCI_WDH | OHCI_RHSC /*| OHCI_SF*/);
+
+    /* put the controller into operational mode */
+    OWRITE(OHCI_CONTROL, OHCI_HCFS_OPERATIONAL | OHCI_PLE | OHCI_CLE);
+
+    _kernel_irqs_on();
+
+#ifdef USE_SECOND_PORT
+    portno = OHCI_GET_NDP(OREAD(OHCI_RH_DESCRIPTOR_A));
+    if (portno > 2) portno = 2;
+#else
+    portno = 1;
+#endif
+
+    OWRITE(OHCI_RH_STATUS, OHCI_LPSC);
+    OWRITE(OHCI_RH_PORT_STATUS(portno), UPS_PORT_POWER);
+
+    return 0;
+}
+
+static void hardware_shutdown(int wait, void *pw)
+{
+    int w = 0;
+
+    w = OREAD(OHCI_CONTROL);
+    OWRITE(OHCI_CONTROL, w & ~(OHCI_PLE | OHCI_CLE | OHCI_BLE));
+
+
+    if (wait)
+    {
+    clock_t t = clock ();
+    OWRITE(OHCI_INTERRUPT_ENABLE, OHCI_SF);
+    /* wait until the next frame, and time out after a centisecond */
+    w = sofs;
+    while (sofs == w && clock () - t < 1);
+    OWRITE(OHCI_INTERRUPT_DISABLE, OHCI_MIE);
+    RELEASE(usb_irq_entry, pw);
+    }
+
+    /* turn off the controller when we exit */
+    int d = _kernel_irqs_disabled();
+    if (!d) _kernel_irqs_off();
+    OWRITE(OHCI_COMMAND_STATUS, OHCI_HCR);
+    do {
+        w = OREAD(OHCI_COMMAND_STATUS);
+    } while (w & OHCI_HCR);
+    OWRITE(OHCI_CONTROL, OHCI_HCFS_RESET);
+    if (!d) _kernel_irqs_on();
+}
+
+_kernel_oserror *module_final(int fatal, int podule, void *pw)
+{
+    NOTUSED(fatal);
+    NOTUSED(podule);
+    _swix (OS_Release, _INR(0,2), PointerV, pointerv_entry, pw);
+
+    hardware_shutdown(1, pw);
+
+    callx_remove_all_callbacks ();
+
+    memset (&mouse_data, 0, sizeof mouse_data);
+    read_mouse_data ();
+    _swix (OS_Pointer, _INR(0,1), 1, prev_pointer);
+
+    free_contig(hccap);
+    free_contig(edp);
+    free_contig(tdp);
+
+    return 0;
+}
+
+void module_service(int service_number, _kernel_swi_regs *r, void *pw)
+{
+    NOTUSED(r);
+    switch (service_number)
+    {
+        case Service_PreReset: hardware_shutdown(0, pw); break;
+    }
+}
+
+int pointerv(_kernel_swi_regs* r, void* pw)
+{
+    _kernel_oserror* e;
+    NOTUSED(pw);
+
+    switch (r->r[0]) {
+    case PointerReason_Request:
+        if (r->r[1] == PointerDevice_USB) {
+            /* Turn off interrupts while updating */
+            _kernel_irqs_off ();
+            r->r[2] = relx;
+            r->r[3] = rely;
+            relx = rely = 0;
+            _kernel_irqs_on ();
+            }
+        break;
+
+
+    case PointerReason_Identify:
+    {
+        struct pointer_device {
+            struct pointer_device *next;
+            uint32_t               flags;
+            char                   typenname[32];
+        } *p;
+        e = _swix (OS_Module, _IN(0) | _IN(3) | _OUT(2), 6,
+            sizeof *p, &p);
+
+        if (!e) {
+            p->next = (struct pointer_device *) r->r[1];
+            p->flags = 0;
+            p->typenname[0] = PointerDevice_USB;
+            strcpy(&p->typenname[1], "USB mouse");
+            r->r[1] = (int) p;
+        }
+        break;
+    }
+
+    case PointerReason_Selected:
+        if (r->r[1] == PointerDevice_USB) {
+            relx = rely = 0;
+            edp[0].skip = 0;
+            edp[0].head.flags.halted = 0;
+            tdp[0].conditionCode = OHCI_CC_NOT_ACCESSED;
+            state = 1;
+            dprintf (("", "USB mouse enabled\n"));
+        } else {
+            edp[0].skip = 1;
+            state = 0;
+            dprintf (("", "USB mouse disabled\n"));
+        }
+        break;
+    }
+
+    return 1;
+}
+
+_kernel_oserror *module_commands(const char *arg_string, int argc, int cmd_no, void *pw)
+{
+    NOTUSED(arg_string);
+    NOTUSED(argc);
+    NOTUSED(pw);
+
+    switch (cmd_no) {
+    case CMD_USBStatus:
+        printf ("Using port             : %d\n", portno);
+        printf ("Write back done head   : %d\n", wdh);
+        printf ("Start of frames        : %d\n", sofs);
+        printf ("Root hub status change : %d\n", rhsc);
+        printf ("Interrupt condition    : %s\n", completion_codes[tdp[0].conditionCode]);
+        printf ("Address condition      : %s\n", completion_codes[tdp[1].conditionCode]);
+        printf ("Config  condition      : %s\n", completion_codes[tdp[2].conditionCode]);
+        printf ("Status condition       : %s\n", completion_codes[tdp[3].conditionCode]);
+        printf ("Data received          : %d\n", data_received);
+        printf ("Transfers              : %8p\n", tdp);
+        printf ("Port status            : %s\n", port_state_str[port_state]);
+        break;
+    case CMD_USBStart:
+        CLAIM(usb_irq_entry, pw);
+
+        _swix (OS_Claim, _INR(0,2), PointerV, pointerv_entry, pw);
+
+        _swix (OS_Pointer, _IN(0) | _OUT(0), 0, &prev_pointer);
+
+        /* enable periodic list processing */
+        argc = OREAD(OHCI_CONTROL);
+        OWRITE(OHCI_CONTROL,argc | OHCI_PLE | OHCI_CLE);
+        break;
+    }
+
+    return 0;
+}
+
+/* Callback function to set the pointer type */
+_kernel_oserror* pointer_cb (_kernel_swi_regs* r, void* pw, void* cur_pointer)
+{
+    NOTUSED(r);
+    NOTUSED(pw);
+    return _swix (OS_Pointer, _INR(0,1), 1, cur_pointer);
+}
+
+_kernel_oserror* reset_cb (_kernel_swi_regs* r, void* pw, void* data)
+{
+    NOTUSED(r);
+    NOTUSED(pw);
+    NOTUSED(data);
+
+    OWRITE(OHCI_RH_PORT_STATUS(portno), UPS_RESET);
+    return 0;
+}
+
+_kernel_oserror* set_config_cb (_kernel_swi_regs* r, void* pw, void* data)
+{
+    int w;
+    NOTUSED(r);
+    NOTUSED(pw);
+    NOTUSED(data);
+
+    edp[2].skip = 1;
+
+    tdp[2].dataToggle = 2; /* force DATA0 */
+    tdp[2].errorCount = 0;
+    tdp[2].conditionCode = OHCI_CC_NOT_ACCESSED;
+    tdp[2].currentBuffer = vtophys (&setConfig);
+    tdp[2].nextTD = tda[3];
+    tdp[2].bufferEnd = tdp[2].currentBuffer + 7;
+
+    tdp[3].nextTD = 0;
+    tdp[3].direction = 2;
+    tdp[3].dataToggle = 3; /* force DATA1 */
+    tdp[3].conditionCode = OHCI_CC_NOT_ACCESSED;
+    tdp[3].errorCount = 0;
+
+    edp[2].head.pointer.normal = tda[2];
+    edp[2].skip = 0;
+
+    w = OREAD(OHCI_COMMAND_STATUS);
+    OWRITE(OHCI_COMMAND_STATUS, w | OHCI_CLF);
+
+    return 0;
+}
+
+_kernel_oserror* set_address_cb (_kernel_swi_regs* r, void* pw, void* data)
+{
+    int w;
+    NOTUSED(r);
+    NOTUSED(pw);
+    NOTUSED(data);
+
+    edp[1].skip = 1;
+
+    tdp[1].nextTD = tda[3];
+    tdp[1].currentBuffer = vtophys (&setAddress);
+    tdp[1].bufferEnd = tdp[1].currentBuffer + 7;
+    tdp[1].dataToggle = 2; /* force DATA0 */
+    tdp[1].conditionCode = OHCI_CC_NOT_ACCESSED;
+    tdp[1].errorCount = 0;
+
+    tdp[3].nextTD = 0;
+    tdp[3].direction = 2;
+    tdp[3].dataToggle = 3; /* force DATA1 */
+    tdp[3].conditionCode = OHCI_CC_NOT_ACCESSED;
+    tdp[3].errorCount = 0;
+
+    edp[1].head.pointer.normal = tda[1];
+    edp[1].skip = 0;
+
+    w = OREAD(OHCI_COMMAND_STATUS);
+    OWRITE(OHCI_COMMAND_STATUS, w | OHCI_CLF);
+    return 0;
+}
+
+static void read_mouse_data (void) {
+    uint8_t change;
+    relx += mouse_data.relx;
+    rely -= mouse_data.rely;
+    _swix(OS_CallAVector, _INR(0,3) | _IN(9),
+                          PointerReason_Report, PointerDevice_USB,
+                          mouse_data.relx, -mouse_data.rely,
+                          PointerV);
+    dprintf(("",
+    "data.relx = %d, data.rely = %d, relx = %d, rely = %d, buttons = %x\n",
+        data.relx, data.rely, relx, rely, data.buttons));
+    if ((change = buttons ^ mouse_data.buttons) != 0) {
+        buttons = mouse_data.buttons;
+        dprintf (("", "change = %x, state = %d\n", change.byte,
+            state));
+        if (state == 1) {
+            if (change & 1) _swix (OS_CallAVector, _INR(0,1) | _IN(9),
+                1 + ((buttons & 1) == 1), KeyNo_LeftMouse, KEYV);
+
+            if (change & 2) _swix (OS_CallAVector, _INR(0,1) | _IN(9),
+                1 + ((buttons & 2) == 2), KeyNo_RightMouse, KEYV);
+
+            if (change & 4) _swix (OS_CallAVector, _INR(0,1) | _IN(9),
+                1 + ((buttons & 4) == 4), KeyNo_CentreMouse, KEYV);
+        }
+    }
+    data_received++;
+}
+
+int usb_irq_handler(_kernel_swi_regs *r, void *pw)
+{
+    int w, intr;
+    OHCI_TD *dh;
+    NOTUSED(r);
+    NOTUSED(pw);
+
+    dh = hccap->donehead.pointer;
+    if (dh) {
+        //w = (unsigned int) dh & 1;
+        dh = (OHCI_TD*) ((unsigned int) dh & ~1);
+        /*if (w) {
+            intr = OHCI_WDH | (OREAD(OHCI_INTERRUPT_STATUS) &
+                               OREAD(OHCI_INTERRUPT_ENABLE));
+        }
+        else
+            intr = OHCI_WDH;*/
+    }
+    /*else*/ {
+        intr = OREAD(OHCI_INTERRUPT_STATUS);
+        int enable = OREAD(OHCI_INTERRUPT_ENABLE);
+        if (enable & OHCI_MIE)
+            intr &= enable;
+        else
+            intr = 0;
+    }
+
+    if (intr & OHCI_WDH) {
+        wdh++;
+        hccap->donehead.pointer = 0;
+        OWRITE(OHCI_INTERRUPT_STATUS, OHCI_WDH);
+        dprintf(("", "writeback done, condition = %d\n",
+            tdp[0].conditionCode));
+        while (dh)
+        {
+            /* transfer 0 is for the report interrupt */
+            if (dh == tda[0]) {
+                if (tdp[0].conditionCode == OHCI_CC_NO_ERROR)
+                    read_mouse_data ();
+                tdp[0].conditionCode = OHCI_CC_NOT_ACCESSED;
+                tdp[0].currentBuffer = (char*) vtophys (&mouse_data);
+                edp[0].skip = 1;
+                edp[0].tailPointer = 0;
+                edp[0].head.pointer.normal = tda[0];
+                if (port_state == port_configured)
+                    edp[0].skip = 0;
+            }
+
+            /* transfer 2 is for the *usbrequest */
+            else if (dh == tda[2]) {
+                if (tdp[2].conditionCode == OHCI_CC_NO_ERROR)
+                    request_complete = 1;
+            }
+            /* transfer 3 is for address or configuration setup */
+            else if (dh == tda[3]) {
+                switch (port_state) {
+                case port_default:
+                    if (tdp[3].conditionCode == OHCI_CC_NO_ERROR) {
+                        port_state = port_address;
+                        /* configure device */
+                        callx_add_callafter (USB_DELAY_CONFIG, set_config_cb, 0);
+                    }
+                    break;
+                case port_address:
+                    if (tdp[3].conditionCode == OHCI_CC_NO_ERROR) {
+                        port_state = port_configured;
+                        /* activate mouse operation */
+                        tdp[0].conditionCode = OHCI_CC_NOT_ACCESSED;
+                        edp[0].head.flags.halted = 0;
+                        edp[0].skip = 0;
+
+                        /* select ourselves as a pointer */
+                        callx_add_callback (pointer_cb, (void*) PointerDevice_USB);
+                    }
+                    break;
+                }
+            }
+
+            dh = phystov(dh);
+            dh = dh->nextTD;
+        }
+    }
+
+    if (intr & OHCI_RHSC) {
+        int w;
+
+        /* turn off the interrupt in case we cause any more */
+        OWRITE(OHCI_INTERRUPT_STATUS, OHCI_RHSC);
+
+        /* find out what's happened (and flush the posted write above) */
+        w = OREAD(OHCI_RH_PORT_STATUS(portno));
+
+        /* Reset port (to enable it) if we've connected */
+        if (w & UPS_C_CONNECT_STATUS) {
+            if (w & UPS_CURRENT_CONNECT_STATUS) {
+                port_state = port_powered;
+                callx_add_callafter (USB_DELAY_RESET, reset_cb, 0);
+            } else {
+                memset (&mouse_data, 0, sizeof mouse_data);
+                read_mouse_data ();
+
+                port_state = port_detached;
+                edp[0].skip = 1;
+            }
+
+            OWRITE(OHCI_RH_PORT_STATUS(portno), w & UPS_C_CONNECT_STATUS);
+        }
+
+        /* Once we've finished resetting, address it */
+        if (w & UPS_C_PORT_RESET) {// && (w & UPS_RESET == 0)) {
+            resets++;
+            tdp[0].conditionCode = OHCI_CC_NOT_ACCESSED;
+            tdp[1].conditionCode = OHCI_CC_NOT_ACCESSED;
+            tdp[2].conditionCode = OHCI_CC_NOT_ACCESSED;
+            tdp[3].conditionCode = OHCI_CC_NOT_ACCESSED;
+            port_state = port_default;
+            callx_add_callafter (USB_DELAY_ADDRESS, set_address_cb, 0);
+
+            OWRITE(OHCI_RH_PORT_STATUS(portno), w & UPS_C_PORT_RESET);
+        }
+
+        rhsc++;
+    }
+
+    if (intr & OHCI_SF) {
+        OWRITE(OHCI_INTERRUPT_STATUS, OHCI_SF);
+        sofs++;
+    }
+
+    OREAD(OHCI_INTERRUPT_STATUS); /* Flushes any writes */
+
+#ifdef PCI
+    return !intr;
+#else
+    return 0;
+#endif
+}
+
+

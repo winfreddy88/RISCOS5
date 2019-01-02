@@ -1,0 +1,327 @@
+; Copyright 2005 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:Machine.<Machine>
+        GET     Hdr:ImageSize.<ImageSize>
+        GET     Hdr:PCI
+
+        GET     Hdr:MEMM.ARM600
+
+        GET     Hdr:Proc
+        GET     Hdr:OSEntries
+        GET     Hdr:HALEntries
+
+        GET     hdr.StaticWS
+        GET     hdr.pxa255
+        GET     hdr.RAM
+        GET     hdr.UART
+        GET     hdr.Post
+
+        AREA    |!!!ROMStart|, CODE, READONLY, PIC
+
+        ; Note: there must be only one fixed link from "Top" to "Boot" at +&2000
+        IMPORT  rom_checkedout_ok
+        EXPORT  HAL_Base
+        ; With Debug on,the flash recovery is off anyway so it's safe to export this
+        EXPORT  ConfigureDebugUART
+
+HAL_Base
+
+        B       start
+        B       .
+        B       .
+        B       .
+        B       .
+        B       .
+        B       .
+        B       .
+        DCD     1024*1024       ; image size (temp hack)
+
+        ASSERT  . - HAL_Base < 0x60
+        %       0x60 - (. - HAL_Base)
+ROMsize
+        DCD     0                               ; patched in by build system
+RMA_Boot_Base
+        DCD     Boot_Base                       ; where the loader puts our image
+        ENTRY
+start   
+        B       restart
+
+        LTORG
+
+        MACRO
+        CallOSM $entry, $reg
+        LDR     ip, [v8, #$entry*4]
+        MOV     lr, pc
+        ADD     pc, v8, ip
+        MEND
+
+; ------------------------------------------------------------------------------
+; Start of ROM,do some ARM core set up then see if
+; there's any RAM plugged in
+restart 
+        MSR     CPSR_c, #F32_bit+I32_bit+SVC32_mode
+        
+        MOV     a1, #&70
+        MCR     p15, 0, a1, c1, c0              ; MMU, caches etc off
+        MOV     a1, #0
+        MCR     p15, 0, a1, c7, c7              ; invalidate caches
+        MCR     p15, 0, a1, c8, c7              ; invalidate TLBs
+
+        ADRL    v1, HAL_Base + 64*1024          ; v1 -> RISC OS image
+
+        LDR     v8, [v1, #OSHdr_Entries]
+        ADD     v8, v8, v1                      ; v8 -> RISC OS entry table
+
+; [ :LNOT: FlashCheck
+;        ; Can't do this,as the OS might be corrupt
+;        MOV     a1, #0
+;        CallOSM OS_InitARM
+; |
+        ; Take a local copy from the Kernel,knowing we're on an XScale
+        GET     hdr.Copro15ops
+
+        [ {FALSE}
+        MOV     a4, lr
+        ; Check if we're architecture 3. If so, don't read the control register.
+        BL      Init_ARMarch
+        |
+        MOVS    a1, #4                          ; XScale is ARM V5T
+        ]
+        MOVEQ   a1, #0
+        ARM_read_control a1, NE
+        ; Late abort (ARM6 only), 32-bit Data and Program space. No Write buffer (ARM920T
+        ; spec says W bit should be set, but I reckon they're bluffing).
+        ;
+        ; The F bit's tricky. (1 => CPCLK=FCLK, 0=>CPCLK=FCLK/2). The only chip using it was the
+        ; ARM700, it never really reached the customer, and it's always been programmed with
+        ; CPCLK=FCLK. Therefore we'll keep it that way, and ignore the layering violation.
+        ORR     a1, a1, #MMUC_F+MMUC_L+MMUC_D+MMUC_P
+        ; All of these bits should be off already, but just in case...
+        BIC     a1, a1, #MMUC_B+MMUC_W+MMUC_C+MMUC_A+MMUC_M
+        BIC     a1, a1, #MMUC_RR+MMUC_V+MMUC_I+MMUC_Z+MMUC_R+MMUC_S
+
+        ; Off we go.
+        ARM_write_control a1
+
+        ; In case it wasn't a hard reset
+        MOV     a2, #0
+        MCR     ARM_config_cp,0,a2,ARMv4_cache_reg,C7           ; invalidate I+D caches
+        MCREQ   ARM_config_cp,0,a2,ARMv3_TLBflush_reg,C0        ; flush TLBs
+        MCRNE   ARM_config_cp,0,a2,ARMv4_TLB_reg,C7             ; flush TLBs
+
+        ; We assume that ARMs with an I cache can have it enabled while the MMU is off.
+        [ :LNOT:CacheOff
+        ORRNE   a1, a1, #MMUC_I
+        ARM_write_control a1, NE                                ; whoosh
+        ]
+
+        ; Check if we are in a 26-bit mode.
+        MRS     a2, CPSR
+        ; Keep a soft copy of the CR in a banked register (R13_und)
+        MSR     CPSR_c, #F32_bit+I32_bit+UND32_mode
+        MOV     sp, a1
+        ; Switch into SVC32 mode (we may have been in SVC26 before).
+        MSR     CPSR_c, #F32_bit+I32_bit+SVC32_mode
+
+        [ {FALSE}
+        ; If we were in a 26-bit mode, the lr value given to us would have had PSR flags in.
+        TST     a2, #2_11100
+        MOVNE   pc, a4
+        BICEQ   pc, a4, #ARM_CC_Mask
+        ]
+; ]
+
+        MRC     p15, 0, a1, c15, c1             ; Ensure access to CP0,6,7 enabled
+        ORR     a1, a1, #2_11000001
+        MCR     p15, 0, a1, c15, c1
+
+        MOV     a1, #0
+        MCR     p15, 0, a1, c7, c10, 4          ; drain buffers (just in case)
+
+        MOV     sb, #0
+
+        BL      initialise_iic
+
+;        BL      initialise_ram
+
+;        BL      clear_ram
+
+        LDR     sp, =Boot_RAM_Base + &1000      ; Wahey! A stack!
+
+; ------------------------------------------------------------------------------
+; Hand copy down the ROM into it's new RAM location
+; total up the checksum on the way
+copy_rom_to_ram
+        STMFD   sp!, {v1-v3}
+ [ {FALSE}      ;FlashCheck
+        ADRL    v1, HAL_Base
+        LDR     v2, =OSROM_ImageSize * 1024
+ |
+        ADRL    v1, HAL_Base + 64*1024
+        LDR     v2, [v1, #OSHdr_ImageSize]
+        SUB     v1, v1, #64*1024                ; start of ROM
+        ADD     v2, v2, #64*1024                ; size of ROM
+ ]
+        BL      get_end_of_ram
+        SUB     a2, a1, v2                      ; a2 -> start of RAM copy
+
+ [ {FALSE}
+        ; We'll use the AAU (it can do it faster than we can with the MMU off)
+        MOV     a3, sp
+        SUB     sp, sp, #32
+        BIC     sp, sp, #31                     ; align to 8-word boundary
+
+        STR     a2, [sp, #AAUDesc_DAR]
+        STR     v1, [sp, #AAUDesc_SAR1]
+        STR     v2, [sp, #AAUDesc_BC]
+        MOV     a1, #0
+        STR     a1, [sp, #AAUDesc_NDA]
+
+        MOV     a1, #ADCR_WriteEnable + ADCR_DirectCmd:SHL:ADCR_1
+        STR     a1, [sp, #AAUDesc_DC]
+
+        ; Write buffer is off, so no need to synchronise
+
+        LDR     ip, =PMMR
+        STR     sp, [ip, #AAU_ANDAR]
+        MOV     a1, #0
+        STR     a1, [ip, #AAU_ASR]
+        MOV     a1, #ACR_Enable
+        STR     a1, [ip, #AAU_ACR]
+
+        ; Not using interrupts, and we don't have anything better to do
+        ; while it's running. Put a delay in so we're not constantly
+        ; accessing the bus. It will take something of the order of 0.25s.
+wait_for_aau
+        Delay   10
+        LDR     a1, [ip, #AAU_ASR]
+        TST     a1, #ASR_Active
+        BNE     wait_for_aau
+
+ |
+        ADD     v3, v1, v2
+        ADD     v2, a2, v2
+
+        LDMDB   v3, {a1,a3}
+        RSB     v4, a1, #0
+        SUB     v4, v4, a3      ; don't include the checksum itself
+
+10      LDMDB   v3!, {a1,a3,a4,lr}
+        CMP     v3, v1
+        STMDB   v2!, {a1,a3,a4,lr}
+        ADD     a3, a3, a1
+        ADD     a4, a4, lr
+        ADD     v4, v4, a3
+        ADD     v4, v4, a4      ; accumulate checksum
+        BHI     %BT10
+ ]
+
+        ; Now we trampoline into the RAM copy. Invalidate the instruction cache
+        ; before (just in case) and after.
+
+        MOV     a1, #0
+        MCR     p15, 0, a1, c7, c5
+
+        SUB     a4, a2, v1
+        ADD     pc, pc, a4
+        NOP
+
+; re-entry point (now in RAM). invalidate the I-cache as we're about to move the ROM.
+        MCR     p15, 0, a1, c7, c5
+
+        ADD     v8, v8, a4      ; Also update OS entry pointer
+
+; now re-program ROM location back out of the way of the PCI direct-addressing window
+; this means the processor vectors aren't there any longer, but we don't need them.
+;        LDR     a2, [ip, #PBI_PBBAR0]
+;        ADD     a2, a2, #ROM_Base1
+;        ADD     a2, a2, #ROM_Base2
+;        ADD     a2, a2, #ROM_Base3
+;        STR     a2, [ip, #PBI_PBBAR0]
+
+; now back up to ROM
+
+ [ {FALSE}         ;FlashCheck :LAND: :LNOT: Debug
+        ; Is the ROM valid?
+        TEQ     v4, #0
+        ; if not signal the failure on the floppy drive light and
+        ; request a new ROM image down the serial port
+        BNE     recover_flash
+ ]
+        ; relative branch as ROM moved
+        B       rom_checkedout_ok
+
+; ------------------------------------------------------------------------------
+; Set bits 4-7 of GPIO data register to 0 as specified in the manual
+; actually sets up both IIC busses
+initialise_iic
+;        LDR     a4, =PMMR
+;        LDRB    a1, [a4, #GPOD]
+;        BIC     a1, a1, #2_11110000
+;        STRB    a1, [a4, #GPOD]
+;        MOV     a1, #ICR_Reset
+;        STR     a1, [a4, #IIC_ICR0]
+;        STR     a1, [a4, #IIC_ICR1]
+;        MOV     a1, #ISR_AllInts
+;        STR     a1, [a4, #IIC_ISR0]
+;        STR     a1, [a4, #IIC_ISR1]
+;        MOV     a1, #ICR_Enable
+;        STR     a1, [a4, #IIC_ICR0]
+;        STR     a1, [a4, #IIC_ICR1]
+        MOV     pc, lr
+
+; ------------------------------------------------------------------------------
+; The ROM is a 16-bit flash device on the PBI bus. We set up the rest of the PBI
+; bus here too.
+initialise_rom
+;        LDR     a4, =PMMR
+;        ; Need to figure out a good speed setting for the flash here
+;        ; Dev manual section 8.6.3 says we can't do this while executing from flash.
+;        ; Let's risk it, as we're not changing the address, or moving the limit.
+;        ASSERT  PBICLK=66666667
+;        ; 90ns ROM - 8 address-data wait states, 4 recovery wait states, 16-bit
+;        MOV     a3, #&00000244
+;        ORR     a3, a3, #2_01
+;        STR     a3, [a4, #PBI_PBBAR0]
+;        MOV     a3, #&FF000000                  ; 16MB of memory space
+;        STR     a3, [a4, #PBI_PBLR0]
+;
+;        MOV     a3, #IO_Base
+;        ORR     a3, a3, #2_10                   ; 32-bit, handshaking (not timed)
+;        STR     a3, [a4, #PBI_PBBAR1]
+;        LDR     a3, =-IO_Size
+;        STR     a3, [a4, #PBI_PBLR1]
+
+;        MOV     a3, #EASI_Base
+;        ORR     a3, a3, #2_10                   ; 32-bit, handshaking (not timed)
+;        STR     a3, [a4, #PBI_PBBAR2]
+;        LDR     a3, =-EASI_Size
+;        STR     a3, [a4, #PBI_PBLR2]
+
+        MOV     pc, lr
+
+; ------------------------------------------------------------------------------
+; The RAM setup is locked in the first 8k of ROM
+; as is the flash recovery code
+        GET     s.RAM
+        GET     s.FlashProg
+        LTORG
+        ALIGN   sizeofRecoveryArea
+
+        END

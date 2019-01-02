@@ -1,0 +1,921 @@
+/*
+ * Copyright (c) 1995, Andreas Zieringer
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include "Desk/Sound.h"
+
+#include "global.h"
+#include "misc.h"
+#include "text.h"
+#include "console.h"
+#include "hterm.h"
+#include "spool.h"
+#include "script.h"
+
+
+static void atnrm(int);
+static void atescf( unsigned char );
+static void AnsiParse( unsigned char );
+static void ExtParse( unsigned char );
+static void AnsiModeSet( char, int );
+static void ExtModeSet( char, int );
+static void TransmitId( void );
+
+extern int bottomline;
+
+static unsigned int oldattrib;
+static int mapping=0;
+
+
+void VTInit(void)
+{
+
+  /*if (GetVTSetup() == 0) */
+                                  /* If there are no saved values for */
+   screenwid = 80;           /* VT emulation parameters then provid'em */
+   newline = 0;
+   //autowrap = wrap;
+   insertmode = 0;
+   cursorvisible = 1;
+   cursor_on=1;
+   reversebackground = 0;
+   originmode=0;
+   screentop=1;
+   screenbottom=24;
+   cursorkeys_mode=0;
+   ClearAllTabs();
+   InitTabs(8);
+}
+
+void move_cursor(int x,int y,Desk_bool scroll)
+{
+  int oldy;
+
+  //remove_cursor();
+  if(cursorX>79)
+  {
+    if(autowrap)
+    {
+      cursorX=0;
+      cursorY++;
+    }
+    else
+    {
+      cursorX=79;
+    }
+  }
+
+  cursorX+=x;
+  cursorY+=y;
+  if(cursorX<0)
+    cursorX=0;
+
+  oldy=cursorY;
+
+  if(cursorY<(screentop-1))
+  {
+    cursorY=screentop-1;
+    if(scroll)
+      scrolldown((screentop-1)-oldy);
+  }
+  if(cursorY>(screenbottom-1))
+  {
+    cursorY=screenbottom-1;
+    if(scroll)
+      scrollup(oldy-(screenbottom-1));
+
+  }
+}
+
+void set_cursor(int x,int y)
+{
+  //remove_cursor();
+  cursorX=x;
+  cursorY=y;
+  if(originmode)
+  {
+    cursorY+=(screentop-1);
+    if(cursorY>screenbottom-1)
+      cursorY=screenbottom-1;
+  }
+  //show_cursor();
+}
+
+void ConOut(int c)
+{
+   switch (ttstate)
+   {
+       case ATNRM:
+         atnrm(c);
+       break;
+       case ATESCF:
+         if (c>=0)
+           atescf(c);
+       break;
+       case ANSIPARSE:
+         if (c>=0)
+           AnsiParse(c);
+       break;
+       case EXTPARSE:
+         if (c>=0)
+           ExtParse(c);
+       break;
+   }
+}
+
+void mapchar(int *c)
+{
+  if(*c>=105 && *c<=114)
+    *c-=99;
+  if(*c==115)
+    *c=95;
+  if(*c>=116)
+    *c-=100;
+}
+
+/*  A T N R M  --  local routine to process an arbitrary character */
+
+static void atnrm(int c)
+{
+  int i;
+
+   if ( c >= 32 ) /* && c < 0x80) */
+   {
+
+     if(cursorY>screenbottom-1)
+     {
+       cursorY=screenbottom-1;
+       move_cursor(0,1,TRUE);
+     }
+
+     if(cursorX>79)
+     {
+           if(autowrap)
+           {
+             cursorX=0;
+             move_cursor(0,1,TRUE);
+           }
+           else
+           {
+             cursorX=79;
+           }
+     }
+
+     if (cursorX<0)
+       cursorX=0;
+     if(cursorY<0)
+       cursorY=0;
+
+     if(spool_action==REC && export_data_text)
+     {
+       /*
+       if(german_keyb && !isofont)
+         spool_rec(keyb_table2[c]);
+       else
+       */
+         spool_rec(c);
+     }
+
+     
+     if(mapping)
+       mapchar(&c);
+       
+     if(insertmode)
+     {
+       insert_char(cursorX,cursorY,c,attrib);
+       update_text(0,cursorY,MAX_COLUMN,cursorY+1);
+     }
+     else
+     {
+       putcharattr(cursorX,cursorY,c,attrib);
+/*
+       if(fast)
+         plotchar(cursorX,cursorY);
+*/
+       //plotchar(cursorX,cursorY,(attrib&0xffffff00)|(char)c);
+       //update_text(cursorX,cursorY,cursorX+1,cursorY+1);
+     }
+
+     if(logon>0 /*&& online*/)
+     {
+       for(i=0;i<19;i++)
+         wsl[i]=wsl[i+1];
+       wsl[19]=c;
+       check_wait();
+     }
+
+     cursorX++;
+
+/*
+     if(cursorX>79)
+     {
+           if(autowrap)
+           {
+             cursorX=0;
+             cursorY++;
+           }
+           else
+           {
+             cursorX=79;
+           }
+     }
+*/
+   }
+   else
+   {
+    if (c!=-1)
+    {
+       switch (c)
+       {
+
+          case 27:                    /* Escape */
+              ttstate = ATESCF;       /* next state parser is esc follower */
+          break;
+
+          case '\r':                  /* Carriage return */
+              //if(get_char(cursorX,cursorY)==0)
+              //putcharattr(cursorX,cursorY,c,attrib|EOL);
+              //text_buffer[tb_above+cursorX+cursorY*80]=0x080f0f41;
+              //move_cursor(-cursorX,0,FALSE);
+
+              //Error_Report(0,"%d,%d",cursorX,cursorY);
+              text_buffer[tb_above+cursorX+cursorY*80]|=EOL;
+              set_cursor(0,cursorY);
+              if(crtocrlf)
+                move_cursor(0,1,TRUE);
+          break;
+
+          case '\n':                  /* Line feed */
+              //if(get_char(cursorX,cursorY)==0)
+              //putcharattr(cursorX,cursorY,c,attrib|EOL);
+              //text_buffer[tb_above+cursorX+cursorY*80]|=EOL;
+              move_cursor(0,1,TRUE);
+              if (newline || lftocrlf)
+                move_cursor(-cursorX,0,FALSE);
+              if(spool_action==REC && export_data_text)
+              {
+                /*
+                if(german_keyb && !isofont)
+                  spool_rec(keyb_table2[c]);
+                else
+                */
+                  spool_rec(c);
+              }
+          case 11:                    /* Vertical tab */
+          case 12:                    /* Form feed */
+              /*scrollup(screentop,screenbottom);*/
+          break;
+
+          case '\a':                  /* Ring terminal bell */
+              Desk_Sound_SysBeep();
+          break;
+
+          case 8:                     /* back space */
+              /*delete(attr);*/
+              move_cursor(-1,0,FALSE);
+              if(dial_terminal_nr==2  && chat_special)
+                deleteChar(1);
+          break;
+
+          case '\t':                  /* Horizontal tab */
+              DoTab();
+              if(spool_action==REC && export_data_text)
+              {
+                /*
+                if(german_keyb && !isofont)
+                  spool_rec(keyb_table2[c]);
+                else
+                */
+                  spool_rec(c);
+              }
+          break;
+
+
+          case 14:                    /* Map G1 to current */
+                /*MapCharSet(1);*/
+                mapping=1;
+          break;
+
+          case 15:                    /* Map G0 to current */
+               /*MapCharSet(0);*/
+               mapping=0;
+          break;
+
+          case 5:                     /* transmit answer back */
+          break;
+          case 0:
+            /* do nothing */
+          break;
+          default:
+            if(cursorX>79)
+            {
+              if(autowrap)
+                move_cursor(-cursorX,1,TRUE);
+              else
+                  cursorX=79;
+            }
+
+            if (cursorX<0)
+              cursorX=0;
+            if(cursorY<0)
+              cursorY=0;
+
+            if(mapping)
+              mapchar(&c);
+       
+            if(insertmode)
+            {
+              insert_char(cursorX,cursorY,c,attrib);
+              update_text(0,cursorY,MAX_COLUMN,cursorY+1);
+            }
+            else
+            {
+              //Desk_Error_Report(0,"hier: %d",c);
+              putcharattr(cursorX,cursorY,c,attrib);
+            }
+            cursorX+=1;
+       }
+    }
+   }
+}
+
+
+
+
+/*  A T E S C F  --  escape sequence follower */
+
+static void atescf(unsigned char c)
+{
+   int i;
+
+   switch (c)
+   {
+
+        case  '[':                /* Parse ansi args */
+           for(i=0;i<10;i++)
+             ansargs[i]=0;
+           nansarg = 0;
+           ttstate = ANSIPARSE;
+           break;
+
+        case  'D':                /* Index */
+           move_cursor(0,1,TRUE);
+           ttstate = ATNRM;
+           break;
+
+        case  'E':                /* Carriage return/line feed combination */
+           move_cursor(-cursorX,1,TRUE);
+           ttstate = ATNRM;
+           break;
+
+        case  'M':                /* Reverse Index */
+           move_cursor(0,-1,TRUE);
+           ttstate = ATNRM;
+           break;
+
+        case  'H':                /* Set a tab stop */
+           SetTabStop();
+           ttstate = ATNRM;
+           break;
+
+        case  '7':                /* Save cursor description */
+           saveCursor();
+           ttstate = ATNRM;
+           break;
+
+        case  '8':                /* Restore cursor description */
+           restCursor();
+           ttstate = ATNRM;
+           break;
+
+        case  '=':                /* Enable application keypad */
+           /*SetKeyPad(1);*/
+           ttstate = ATNRM;
+           break;
+
+        case  '>':                /* Enable numeric keypad */
+           /*SetKeyPad(0);*/
+           ttstate = ATNRM;
+           break;
+
+        case  'c':                /* Reset terminal to power on values */
+           VTInit();
+           ttstate = ATNRM;
+           break;
+
+        case  '(':                /* Select character set G0 */
+           /*ttstate = SetChar0;*/
+           break;
+
+        case  ')':                /* Select character set G1 */
+           /*ttstate = SetChar1;*/
+           break;
+
+        case  '#':                /* Set double high/wide characters */
+           /*ttstate = SetDouble; */
+           break;
+
+        case 24:
+        case 26:                  /* Cancel escape sequence */
+           ttstate = ATNRM;
+           break;
+
+
+        case  'Z':                /* Transmit the terminal ID */
+           TransmitId();
+           ttstate = ATNRM;
+           break;
+
+        case  '\\':
+           ttstate = ATNRM;
+           break;
+
+        case  '<':
+           ttstate = ATNRM;
+           break;
+
+        case  'P':
+           ttstate = ATNRM;
+           break;
+
+        case  '*':
+           ttstate = ATNRM;
+           break;
+
+        default:                  /* unrecognized so ignore */
+           ttstate = ATNRM;
+           break;
+        }
+
+}
+
+
+/*  A N S I P A R S E  --  parse ansi arguments */
+
+static void AnsiParse(unsigned char c) {
+   register int i;
+   register int j;
+
+   c &= 0x7F;
+
+   switch(c) {
+
+        case '0':
+        case '1':
+        case '2':
+        case '3':
+        case '4':
+        case '5':
+        case '6':
+        case '7':
+        case '8':
+        case '9':
+           ansargs[nansarg] = (ansargs[nansarg] * 10) + ( c - '0');
+           break;
+
+        case ';':                 /* Argument separator */
+           if ( ++nansarg > lansarg)
+              ttstate = ATNRM;
+           break;
+
+        case 'h':                 /* Set ANSI mode */
+           for( i = 0, ++nansarg; i < nansarg && i <= lansarg; i++)
+              AnsiModeSet(ansargs[i],1);
+           ttstate = ATNRM;
+           break;
+        case 'n':
+          if(ansargs[0] == 5)
+            out_ESC("[0n");
+          if(ansargs[0] == 6)
+            out_ESC("[%d;%dR", cursorY+1, cursorX+1);
+        break;
+
+        case 'l':                 /* Reset ANSI mode */
+           for( i = 0, ++nansarg; i < nansarg && i <= lansarg; i++)
+              AnsiModeSet(ansargs[i],0);
+           ttstate = ATNRM;
+           break;
+
+
+        case 'H':                 /* Address cursor to line and column */
+        case 'f':
+           i = ansargs[0];
+           j = ansargs[1];
+           if (i <= 0)
+              i = 1;
+           else if (i > 24)
+                     i=24;
+
+           if (j <= 0)
+              j = 1;
+           else if(j>80)
+                  j=80;
+
+           set_cursor(j-1,i-1);
+
+           ttstate = ATNRM;
+           break;
+
+        case 'J':                 /* Erase screen */
+           oldattrib=attrib;
+           attrib=normal_attr;
+           if (ansargs[0] == 0)
+           {      /* from cursur to end of the screen */
+             clearColumn(cursorX, MAX_COLUMN);
+             if (cursorY < bottomLine)
+               clearLine(cursorY+1, bottomLine);
+           }
+           else if (ansargs[0] == 1)
+           { /* from home position to cursur */
+             if (cursorY > 0)
+               clearLine(0, cursorY-1);
+             clearColumn(0, cursorX);
+           }
+           else if (ansargs[0] == 2)
+           { /* whole screen */
+             if(spool_action==PLAY && spool_frame)
+             {
+               clear_screen=1;
+             }
+             else
+             {
+               clear_screen=0;
+               clearLine(0, bottomLine);
+               set_cursor(0,0);
+             }
+           }
+           attrib=oldattrib;
+           ttstate = ATNRM;
+           break;
+
+
+        case 'K':                 /* Erase Line */
+           oldattrib=attrib;
+           attrib=normal_attr;
+           if (ansargs[0] == 0)
+           {
+             clearColumn(cursorX, MAX_COLUMN);
+           }
+           else if (ansargs[0] == 1)
+           {
+             clearColumn(0, cursorX);
+           }
+           else if (ansargs[0] == 2)
+           {
+             clearColumn(0, MAX_COLUMN);
+           }
+           attrib=oldattrib;
+           ttstate = ATNRM;
+           break;
+
+
+        case 'm':                 /* Select screen attribute */
+           ttstate = ATNRM;
+           if ( ++nansarg <= lansarg) {
+              for ( i = 0; i < nansarg; i++) {
+                 switch (ansargs[i]) {
+                    case 0:
+                       if (i == 0)
+                          attrib=(attrib&0x40ffffff);
+                       else
+                          attrib=(attrib&0x40ffffff);
+                       break;
+                    case 1:
+                       if (i == 0)
+                         attrib=(attrib&0x40ffffff)|BOLD; // set
+                       else
+                         attrib|=BOLD; // add
+                       break;
+
+                    case 4:
+                       if (i == 0)
+                         attrib=(attrib&0x40ffffff)|UNDERLINED; // set
+                       else
+                         attrib|=UNDERLINED; // add
+                    break;
+                    case 5:
+                       if (i == 0)
+                         attrib=(attrib&0x40ffffff)|BLINK; // set
+                       else
+                         attrib|=BLINK; // add
+                    break;
+                    case 7:
+                       if (i == 0)
+                         attrib=(attrib&0x40ffffff)|INVERT;
+                       else
+                         attrib|=INVERT;
+                    break;
+                    case 22:
+                      attrib=(attrib&0x40ffffff)|((attrib&0xff000000)-BOLD); // sub
+                    break;
+                    case 24:
+                      attrib=(attrib&0x40ffffff)|((attrib&0xff000000)-UNDERLINED); // sub
+                    break;
+                    case 25:
+                      attrib=(attrib&0x40ffffff)|((attrib&0xff000000)-BLINK); // sub
+                    break;
+                    case 27:
+                      attrib=(attrib&0x40ffffff)|((attrib&0xff000000)-INVERT); // sub
+                    break;
+                 }
+              }
+           }
+           break;
+
+       case '?':                  /* Extended mode set/reset */
+       /*    if (lastc == '[')  */
+              ttstate = EXTPARSE;
+        /*   else
+              ttstate = ATNRM; */
+           break;
+
+        case 'r':            /* Define scrolling region */
+           if(ansargs[0]==0)
+             screentop=1;
+           if(ansargs[1]==0)
+             screenbottom=24;
+           if(ansargs[0]>0 && ansargs[0]<=24 &&
+              ansargs[1]>=ansargs[0] && ansargs[1]<=24 )
+           {
+             screentop=ansargs[0];
+             screenbottom=ansargs[1];
+           }
+           if(originmode)
+             set_cursor(screentop-1,0);
+           else
+             set_cursor(0,0);
+           ttstate = ATNRM;
+        break;
+
+        case '@': // insert char
+          if (ansargs[0] == 0) ansargs[0] = 1;
+            insertChar(ansargs[0]);
+          ttstate = ATNRM;
+        break;
+
+        case 'P': // delete char
+          if (ansargs[0] == 0) ansargs[0] = 1;
+            deleteChar(ansargs[0]);
+          ttstate = ATNRM;
+        break;
+
+
+        case 'M': // delete line
+          if (cursorY < (screentop-1) || cursorY > (screenbottom-1))
+            break;
+          if (ansargs[0] == 0) ansargs[0] = 1;
+          else if (ansargs[0] > screenbottom - cursorY + 1)
+                 ansargs[0] = screenbottom - cursorY + 1;
+          deleteLine(ansargs[0],screenbottom);
+          set_cursor(0, cursorY);
+          ttstate = ATNRM;
+        break;
+
+        case 'L': // insert line
+          if (cursorY < (screentop-1) || cursorY > (screenbottom-1))
+            break;
+          if (ansargs[0] == 0) ansargs[0]++;
+          else if (ansargs[0] > screenbottom - cursorY + 1)
+                 ansargs[0] = screenbottom - cursorY + 1;
+          insertLine(ansargs[0],screenbottom);
+          set_cursor(0, cursorY);
+          ttstate = ATNRM;
+        break;
+
+        case 'A':                 /* Move cursor up */
+           if (ansargs[0] == 0)
+                move_cursor(0,-1,FALSE);
+           else
+                move_cursor(0,-ansargs[0],FALSE);
+
+           ttstate = ATNRM;
+           break;
+
+        case 'B':                 /* Move cursor down */
+           if (ansargs[0] == 0)
+                move_cursor(0,1,FALSE);
+           else
+                move_cursor(0,ansargs[0],FALSE);
+
+           ttstate = ATNRM;
+           break;
+
+        case 'C':                 /* Move cursor right */
+           if (ansargs[0] == 0)
+                move_cursor(1,0,FALSE);
+           else
+                move_cursor(ansargs[0],0,FALSE);
+
+           ttstate = ATNRM;
+           break;
+
+        case 'D':                 /* Move cursor left */
+           if (ansargs[0] == 0)
+                move_cursor(-1,0,FALSE);
+           else
+                move_cursor(-ansargs[0],0,FALSE);
+
+           ttstate = ATNRM;
+           break;
+
+        case 'g':                 /* Tab stop set/reset */
+           if (ansargs[0] == 0)
+             ClearTabStop();
+           else if (ansargs[0] == 3)
+                  ClearAllTabs();
+
+           ttstate = ATNRM;
+           break;
+
+
+        case 'c':                 /* Transmit the terminal ID */
+           TransmitId();
+           break;
+
+        case 24:
+        case 26:                  /* Cancel escape sequence */
+           ttstate = ATNRM;
+           break;
+
+
+        default:                  /* unrecognized so ignore */
+           ttstate = ATNRM;
+           break;
+   }
+}
+
+
+/* E X T P A R S E  -- Parse extended mode Set/Reset */
+
+static void ExtParse(unsigned char c) {
+    register int i;
+
+    switch (c) {
+
+        case '0':
+        case '1':
+        case '2':
+        case '3':
+        case '4':
+        case '5':
+        case '6':
+        case '7':
+        case '8':
+        case '9':
+           ansargs[nansarg] = (ansargs[nansarg] * 10) + ( c - '0');
+           break;
+
+        case ';':                 /* Argument separator */
+           if ( ++nansarg > lansarg)
+              ttstate = ATNRM;
+           break;
+
+        case 'h':
+           for( i = 0, ++nansarg; i < nansarg && i <= lansarg; i++)
+              ExtModeSet(ansargs[i],1);
+           ttstate = ATNRM;
+           break;
+
+        case 'l':
+           for( i = 0, ++nansarg; i < nansarg && i <= lansarg; i++)
+              ExtModeSet(ansargs[i],0);
+           ttstate = ATNRM;
+           break;
+
+        case 24:
+        case 26:                  /* Cancel escape sequence */
+           ttstate = ATNRM;
+           break;
+
+        default:
+           ttstate = ATNRM;
+           break;
+    }
+}
+
+
+/* A N S I M O D E S E T  -- Set/Reset ANSI mode   ,  ESC [ P1,,, Pn h/l */
+
+static void AnsiModeSet( char c, register int mode) {
+
+    switch (c ) {
+        case 2:                   /* Lock/unlock keyboard */
+            break;
+
+
+        case 4:                   /* Insert/Replace setting */
+            insertmode = mode;
+            break;
+
+        case 12:                  /* Echo */
+            break;
+
+        case 20:                  /* New Line mode */
+            newline = mode;
+            break;
+
+        default:
+           break;
+    }
+}
+
+
+/* E X T M O D E S E T  --  Set/Reset extended mode after ESC [ ? */
+
+static void ExtModeSet(char c, int mode) {
+
+    switch (c) {
+        case 1:
+            /*SetCursorKey(mode);*/
+            cursorkeys_mode=mode;
+            break;
+
+        case 3:     /* Set the screen width */
+           /*
+            if (mode)
+               SetScreenWidth(132);
+            else
+               SetScreenWidth(80);
+            */
+
+            break;
+
+        case 4:                   /* Jump/smooth scroll (not supported) */
+            break;
+
+        case 5:                   /* Set the background attribute */
+            /*SetBackGround(mode);*/
+            break;
+
+
+        case 6:                   /* Set the scrolling origin */
+            originmode = mode;
+            break;
+
+        case 7:                   /* set the autoautowrap mode */
+            autowrap = mode;
+            break;
+
+        case 8:                   /* Auto repeat on/off */
+            break;
+
+        case 18:                  /* Page print terminator */
+            break;
+
+        case 19:                  /* Print region */
+            break;
+
+        case 25:                  /* Display/Hide cursor */
+            /*SetCursorVisibility(mode);*/
+            if(mode)
+              cursorOn();
+            else
+              cursorOff();
+            break;
+
+        default:
+            break;
+    }
+}
+
+
+
+/* T R A N S M I T I D -- Transmit the terminal id to the host */
+
+static void TransmitId()
+{
+   register char *termid = term_id_str;
+
+   //Error_Report(0,"ID !!");
+   (*driver)(DRIVER_PUTBYTE,portnumber,ESC,0);
+   while(*termid != '\0')         /* Do until end of id string */
+     (*driver)(DRIVER_PUTBYTE,portnumber,*termid++,0);
+}
+
+void send_mouse_position(int x,int y)
+{
+  out_ESC("[2;4;%d;%d;1&w",y,x);
+}

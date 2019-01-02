@@ -1,0 +1,208 @@
+//
+//
+// Binary Tree Predictive Coding.
+// John Robinson, 1994, 1995.
+//
+// Header file for static huffman coder.
+//
+
+#include <stdio.h>
+
+const int TABLEBITS = 12;
+const int MASK = (1<<TABLEBITS)-1;
+const int TABLESIZE = (1<<TABLEBITS);
+
+class compactor {
+private:
+	class cfileio *pfio;
+	int longest;
+	int longmask;
+	unsigned char num_symbols_of_length[32];
+	unsigned char ordered_symbols[256];
+// The shared data area:
+	union {
+		struct {
+			long f[256];
+			unsigned short enc[256];
+			unsigned char len[256];
+			} enctables;
+		struct {
+			unsigned char dec[TABLESIZE];
+			unsigned char len[TABLESIZE];
+			} dectables;
+		} shared;
+// Next the stuff for encoding
+	long *freq;
+	unsigned short *encode;
+	unsigned char *enclength;
+// Then the stuff for decoding
+	unsigned char *decode;
+	unsigned char *declength;
+
+public:
+	compactor(){
+		freq = shared.enctables.f;
+		encode = shared.enctables.enc;
+		enclength = shared.enctables.len;
+		decode = shared.dectables.dec;
+		declength = shared.dectables.len;
+		pfio = 0; 
+		longest = 0;
+		reset();
+		}
+	~compactor() {}
+	void putbit(int val);
+	int getbit();
+	void reset();
+	void attach(class cfileio *f) { pfio = f; }
+	void inc(int symbol) {freq[symbol]++;};
+	void dec(int symbol) {freq[symbol]--;};
+	void buildtree(void);
+	void writetree(void);
+	void maketable_encode(void);
+	void put(int inbyte);
+	void readtree(void);
+	void maketable_decode(void);
+	int get();
+	};
+
+class cfileio {
+private:
+	FILE	*cfp;
+// Output works a byte at a time and is therefore simple
+	int	outbyte;
+	int	outbits; // Number of output bits
+// Input is double buffered: first get a chunk into buf, then get bits into
+// bitbuf
+	int charsleft;
+	unsigned long	bitbuf;
+	int valid;	// bits left in bitbuf
+	unsigned char *pbuf;
+	unsigned char buf[2048];
+	int fillbuf() {
+		return(charsleft = fread((pbuf = buf),1,2048,cfp));
+		}
+	void loadforlook() {
+		bitbuf = (bitbuf<<8) + (charsleft-- ? *pbuf++ : 
+			(fillbuf() && charsleft--) ? *pbuf++ : 0);
+		}
+	int lookbits(const int& bits, const int& mask) {
+		if (valid < bits)
+			{
+			loadforlook();
+			valid += 8;
+			}
+		if (valid < bits)
+			{
+			loadforlook();
+			valid += 8;
+			}
+		return (int) ((bitbuf >> (valid-bits)) & mask);
+		}
+	void skipbits(const int bits) {
+		valid -= bits;
+		}
+	int get(unsigned char *declength, unsigned char *decode, 
+	    register int bits, const int mask) {
+		register int v = valid;
+		if (v < bits) {
+			loadforlook();
+			if ((v += 8) < bits) {
+				loadforlook();
+				v += 8;
+				}
+			}
+		bits = (int) ((bitbuf >> (v-bits)) & mask);
+		valid = v - declength[bits];
+		return decode[bits];
+		}
+public:
+	cfileio(FILE *file) { 
+		cfp = file; outbyte = 0; outbits = 0;
+		bitbuf = 0; charsleft = 0; valid = 0; }
+	void putbit(int val) {
+		outbyte <<= 1;
+		if (val)
+			outbyte++;
+		outbits++;
+		if ((outbits &= 0x7) == 0)
+			putc(outbyte, cfp);
+		}
+	void putbits(int val, int numbits) {
+		int space = 8-outbits;
+		if (numbits > space) {
+			outbyte <<= space;
+			outbyte |= val>>(numbits = numbits-space);
+			putc(outbyte, cfp);
+			outbits = 0;
+			space = 8;
+			val &= (1<<numbits) - 1;
+			if (numbits > space) { 
+			// Now space = 8 and outbyte is empty
+			    outbyte = val>>(numbits = numbits-space);
+			    putc(outbyte, cfp);
+			    val &= (1<<numbits) - 1;
+			    }
+			}
+		// Now guaranteed that numbits <= space
+		outbyte <<= numbits;
+		outbyte |= val;
+		outbits += numbits;
+		if ((outbits &= 0x7) == 0)
+			putc(outbyte, cfp);
+		}
+	void putbyte(unsigned char val) {
+		int thisbyte = 8 - outbits;
+		outbyte <<= thisbyte;
+		outbyte |= (val >> outbits);
+		putc(outbyte, cfp);
+		outbyte = val;
+		}
+	void flush() {
+		if (outbits) {
+			outbyte <<= 8 - outbits;
+			putc(outbyte ,cfp);
+			outbits = 0;
+			}
+		fflush(cfp);
+		}
+	int getbit() {
+		if (!valid) {
+			bitbuf = (charsleft-- ? *pbuf++ : 
+				(fillbuf() && charsleft--) ? *pbuf++ : 0);
+			valid = 8;
+			}
+		return (int) ((bitbuf >> --valid) & 1);
+		}
+	~cfileio() {}
+friend class compactor;
+	};
+
+inline void compactor::putbit(int val) {
+	pfio->putbit(val);
+	}
+/*
+inline void compactor::put(int symbol)
+{
+	int cnt = enclength[symbol];
+	int code = encode[symbol];
+	//if (longest && !cnt)
+	//	fprintf(stderr,"Tried to code untrained symbol %d\n",symbol);
+	//printf("unenc = %d, coded %d bits\n",symbol,cnt);
+	pfio->putbits(code,cnt);
+}
+*/
+inline int compactor::getbit() {
+	return pfio->getbit();
+	}
+inline int compactor::get ()
+{
+/*
+	int code = pfio->lookbits(longest, longmask);
+	pfio->skipbits((int) declength[code]);
+	//printf("read %d bits: %d\n",declength[code], decode[code]);
+	return(decode[code]);
+*/
+	return pfio->get(declength, decode, longest, longmask);
+}
+const int numcoders = 4;

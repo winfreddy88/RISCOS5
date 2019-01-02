@@ -1,0 +1,359 @@
+; Copyright 1998 Acorn Computers Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+;
+;  s.SWIs - SWI handlers
+;
+
+
+SWIHandler ROUT
+        Push    "R14"
+        LDR     R12, [R12]
+        LDR     R14, mytaskhandle
+        CMP     R14, #0
+        BLE     ClipboardNotActive
+        Push    "R0, R1"
+        MOV     R0, #WimpSysInfo_CurrentTask
+        SWI     XWimp_ReadSysInfo
+        CMP     R0, #0
+        Pull    "R0, R1"
+        BEQ     TaskNotActive
+        CMP     R11, #(EndOfJumpTable - JumpTable)/4
+        ADDLO   PC, PC, R11, LSL #2
+        B       UnknownSWIError
+JumpTable
+        B       SWIClipboard_Put
+        B       SWIClipboard_Get
+        B       SWIClipboard_GetDataType
+      [ DragNDrop
+        B       SWIClipboard_StartDrag
+        B       SWIClipboard_CatchDrop
+      ]
+EndOfJumpTable
+
+UnknownSWIError
+        Push    "R1-R4"
+        ADR     R0, ErrorBlock_BadSWI
+        MOV     R1, #0
+01      ADR     R2, PollBlock
+        MOV     R3, #?PollBlock
+        addr    R4, Title
+        SWI     XMessageTrans_ErrorLookup       ; set up error block (sets V!)
+        Pull    "R1-R4, LR"                     ; get our registers back
+        TEQ     PC,PC                           ; are we in 32-bit mode?
+        MOVEQ   PC,LR                           ; if so, don't restore flags
+        ORRNES  PC,LR,#V_bit                    ; if not, restore flags, set V
+
+ClipboardNotActive
+        Push    "R1-R4"
+        ADR     R0, ErrorBlock_NotActive
+        ADR     R1, MessagesBlock
+        B       %BT01
+
+TaskNotActive
+        Push    "R1-R4"
+        ADR     R0, ErrorBlock_NoTask
+        ADR     R1, MessagesBlock
+        B       %BT01
+
+        MakeErrorBlock BadSWI
+        MakeErrorBlock NotActive
+        MakeErrorBlock NoTask
+
+;-----------------------------------------------------------------
+; Clipboard_Put - put data on clipboard
+;
+; On entry: R0 = flags
+;                  bit 0 => clear clipboard
+;                  bit 1 => data is translatable, so needs a PutRequest
+;                  bit 2 => data type *list* is provided
+;                  bit 31 => Wimp flag
+;           R1 = data type, or data type list pointer
+;           R2 -> data
+;           R3 = data length
+;           R4 -> proposed leafname
+;           R5 = my_ref of Message_PutRequest, or 0 if this isn't a reply
+;-----------------------------------------------------------------
+SWIClipboard_Put ROUT
+        Push    "R0-R9"
+        TEQ     R5, #0
+        BEQ     %FT01
+
+        Debug   tmp, "response to Message_Put"
+
+        ; SWI is part of a data transfer transaction
+        MOV     R11, R5
+        BL      GetActionHandle
+        CMP     R11, #0         ; did we find it?
+        BEQ     %FT99
+        ; Acknowledge our message on behalf of the caller
+        Push    "R0-R2"
+        ADR     R1, PollBlock
+        MOV     R0, #ms_data
+        STR     R0, [R1, #ms_size]
+        STR     R5, [R1, #ms_yourref]
+        MOV     R0, #User_Message_Acknowledge
+        LDR     R2, mytaskhandle
+        SWI     XWimp_SendMessage
+        Pull    "R0-R2"
+        ; Jump into the transaction state handler
+        MOV     R5, #-1
+        BL      StateHandler
+        B       %FT99
+
+01      TST     R0, #ClipboardPut_Clear
+        BLNE    FreeClipboard   ; preserves flags
+        BNE     %FT99
+
+        ; SWI is to claim the clipboard
+        ; We have to be careful here so that we don't trash
+        ; the existing clipboard if an error is generated!
+
+        ; If they've been a wally and specified a list but can't translate
+        ; the data, just work from the first data type in the list instead
+        AND     R14, R0, #ClipboardPut_SendPutRequest :OR: ClipboardPut_DataTypeList
+        TEQ     R14, #ClipboardPut_DataTypeList
+        LDREQ   R1, [R1]
+        BICEQ   R0, R0, #ClipboardPut_SendPutRequest :OR: ClipboardPut_DataTypeList
+
+        ; Hold pointer arguments on the stack while we validate and relocate them
+        MOV     R14, #0
+        Push    "R14"           ; leafname
+        Push    "R14"           ; data
+        Push    "R14"           ; data type list
+
+        MOV     R5, R0          ; we need R0 for parameter passing
+
+        ; Copy the leafname
+        MOV     R0, R4
+        BL      CopyLeaf
+        BVS     %FT90
+        STR     R0, [SP, #4*2]
+
+        Debug   tmp,"Leaf copied"
+
+        ; Copy the data
+        TST     R5, #ClipboardPut_SendPutRequest
+        MOVNE   R0, #0
+        MOVEQ   R0, R2
+        BLEQ    CopyData
+        BVS     %FT90
+        STR     R0, [SP, #4*1]
+
+        Debug   tmp,"Data copied"
+
+        ; Deal with type list last (so the stack copy is 0 if an error occurs above)
+        MOV     R0, R1
+        TST     R5, #ClipboardPut_DataTypeList
+        BLNE    CopyTypes
+        BVS     %FT90
+        STR     R0, [SP, #4*0]
+
+        Debug   tmp,"File type",r0
+
+        ; If claiming the clipboard from someone else, broadcast Message_ClaimEntity
+        LDR     R0, ClipboardTask
+        TEQ     R0, #0
+        BNE     %FT11
+        Push    "R0-R4"
+        MOV     R0, #User_Message
+        ADR     R1, PollBlock
+        MOV     R2, #0                 	; broadcast
+        MOV     R4, #0                  ; don't return my_ref
+        MOV     R14, #msClaimEntity_size
+        STR     R14, [R1, #ms_size]
+        MOV     R14, #0
+        STR     R14, [R1, #ms_yourref]
+        MOV     R14, #Message_ClaimEntity
+        STR     R14, [R1, #ms_action]
+        MOV     R14, #msClaimEntity_ClaimClipboard
+        STR     R14, [R1, #msClaimEntity_flags]
+        BL      MySendMessage
+        Pull    "R0-R4"
+11
+        ; Free the old clipboard
+        BL      FreeClipboard
+
+        ; Update clipboard information
+        MOV     R0, R5                  ; get flags back into R0
+        Pull    "R1, R2, R4"            ; these are now the RMA pointers
+        ADR     R14, ClipboardFlags
+        STMIA   R14, {R0-R4}
+        MOV     R0, #WimpSysInfo_CurrentTask
+        SWI     XWimp_ReadSysInfo
+        STR     R0, ClipboardTask
+
+        B       %FT99
+
+
+90      ; An error has occurred
+        ; R0 -> error block
+        ; stack holds pointers to RMA blocks that need freeing
+        MOV     R11, R0
+        MOV     R0, #ModHandReason_Free
+        Pull    "R2"
+        TEQ     R2, #0
+        SWINE   XOS_Module
+        MOV     R0, #ModHandReason_Free
+        Pull    "R2"
+        TEQ     R2, #0
+        SWINE   XOS_Module
+        MOV     R0, #ModHandReason_Free
+        Pull    "R2"
+        TEQ     R2, #0
+        SWINE   XOS_Module
+        MOV     R0, R11
+        SETV
+        ; drop through...
+
+99      ; Exit SWI Clipboard_Put
+        STRVS   R0, [SP, #4*0]          ; if error, overwrite stacked r0
+        Pull    "R0-R9, LR"             ; get our registers back
+        TEQ     PC,PC                   ; are we in 32-bit mode?
+        MOVEQ   PC,LR                   ; if so, exit without restoring flags
+        MOVVCS  PC,LR                   ; if not and V clear, restore flags
+        ORRVSS  PC,LR,#V_bit            ; if not and V set, restore flags, set V
+
+
+;-----------------------------------------------------------------
+; Clipboard_Get - get the clipboard's content
+;
+; On entry: R0 = flags
+;                  bit 31 => Wimp flag
+;           R1 = destination window handle
+;           R2 = destination icon handle
+;           R3 = destination x coordinate
+;           R4 = destination y coordinate
+;           R5 -> list of acceptable data types, terminated by -1
+;-----------------------------------------------------------------
+SWIClipboard_Get ROUT
+        Push    "R0-R5"
+
+        LDR     R14, ClipboardTask
+        TEQ     R14, #0
+        BEQ     %FT10
+        LDR     R14, ClipboardFlags
+        TST     R14, #ClipboardPut_SendPutRequest
+        BNE     %FT10
+
+        ; We're managing the clipboard - reply immediately.
+        LDR     R5, ClipboardType
+        MOV     R6, #-1
+        BL      SendMsg_Paste
+        B       %FT99
+
+10      ; Gather information from SWI parameters.
+        BL      NewAction
+        BVS     %FT99
+        ADD     R14, R11, #Act_Flags
+        STMIA   R14, {R0-R4}
+        MOV     R0, R5
+        BL      CopyTypes
+        BVS     %FT90
+        STR     R0, [R11, #Act_List]
+
+        ; Branch according to clipboard state
+        LDR     R0, ClipboardTask
+        ADR     R14, %FT90              ; set up return address
+        TEQ     R0, #0
+
+        ; We're proxying for the clipboard owner - enter State_PutRequest3.
+        MOVNE   R0, #State_PutRequest3
+        STRNE   R0, [R11, #Act_State]
+        BNE     SendMsg_PutRequest      ; NB returns to R14 set up above
+
+        ; We know nothing about the clipboard - enter State_DataRequest1.
+        MOVEQ   R0, #State_DataRequest1
+        STREQ   R0, [R11, #Act_State]
+        BEQ     SendMsg_DataRequest     ; NB returns to R14 set up above
+
+90      ; If an error has occurred delete action block
+        ; R11 -> action block
+        BLVS    DeleteAction            ; preserves flags
+        ; drop through...
+
+99      ; Exit SWI Clipboard_Get
+        STRVS   R0, [SP, #4*0]          ; if error, overwrite stacked r0
+        Pull    "R0-R5, LR"             ; get our registers back
+        TEQ     PC,PC                   ; are we in 32-bit mode?
+        MOVEQ   PC,LR                   ; if so, exit without restoring flags
+        MOVVCS  PC,LR                   ; if not and V clear, restore flags
+        ORRVSS  PC,LR,#V_bit            ; if not and V set, restore flags, set V
+
+
+;-----------------------------------------------------------------
+; Clipboard_GetDataType - get the clipboard's data type
+;
+; On entry: R0 = flags
+;                  bit 31 => Wimp flag
+;           R1 = destination window handle
+;           R2 = destination icon handle
+;           R3 = destination x coordinate
+;           R4 = destination y coordinate
+;           R5 -> list of acceptable data types, terminated by -1
+;-----------------------------------------------------------------
+SWIClipboard_GetDataType ROUT
+        Push    "R0-R5"
+
+        LDR     R14, ClipboardTask
+        TEQ     R14, #0
+        BEQ     %FT10
+        LDR     R14, ClipboardFlags
+        TST     R14, #ClipboardPut_SendPutRequest
+        BNE     %FT10
+
+        ; We're managing the clipboard - reply immediately.
+        LDR     R5, ClipboardType
+        BL      SendMsg_DataTypeIs
+        B       %FT99
+
+10      ; Gather information from SWI parameters.
+        BL      NewAction
+        BVS     %FT99
+        ADD     R14, R11, #Act_Flags
+        STMIA   R14, {R0-R4}
+        MOV     R0, R5
+        BL      CopyTypes
+        BVS     %FT90
+        STR     R0, [R11, #Act_List]
+
+        ; Branch according to clipboard state
+        LDR     R0, ClipboardTask
+        ADR     R14, %FT90              ; set up return address
+        TEQ     R0, #0
+
+        ; We're proxying for the clipboard owner - enter State_PutRequest2.
+        MOVNE   R0, #State_PutRequest2
+        STRNE   R0, [R11, #Act_State]
+        BNE     SendMsg_PutRequest      ; NB returns to R14 set up above
+
+        ; We know nothing about the clipboard - enter State_DataRequest2.
+        MOVEQ   R0, #State_DataRequest2
+        STREQ   R0, [R11, #Act_State]
+        BEQ     SendMsg_DataRequest     ; NB returns to R14 set up above
+
+90      ; If an error has occurred delete action block
+        ; R11 -> action block
+        BLVS    DeleteAction            ; preserves flags
+        ; drop through...
+
+99      ; Exit SWI Clipboard_GetDataType
+        STRVS   R0, [SP, #4*0]          ; if error, overwrite stacked r0
+        Pull    "R0-R5, LR"             ; get our registers back
+        TEQ     PC,PC                   ; are we in 32-bit mode?
+        MOVEQ   PC,LR                   ; if so, exit without restoring flags
+        MOVVCS  PC,LR                   ; if not and V clear, restore flags
+        ORRVSS  PC,LR,#V_bit            ; if not and V set, restore flags, set V
+
+        END

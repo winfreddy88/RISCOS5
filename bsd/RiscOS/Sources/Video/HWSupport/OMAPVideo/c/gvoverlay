@@ -1,0 +1,585 @@
+/*
+ * Copyright (c) 2017, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include <stdlib.h>
+#include <string.h>
+#include <limits.h>
+#include "kernel.h"
+#include "swis.h"
+
+#include "Global/OSMem.h"
+#include "Global/GraphicsV.h"
+#include "Global/VduExt.h"
+
+#include "gvoverlay.h"
+#include "graphicsv.h"
+#include "dispc.h"
+#include "pmp.h"
+#include "consts.h"
+#include "vars.h"
+#include "utils.h"
+#include "globals.h"
+
+gvoverlay_t gvoverlays[GVOVERLAY_MAX];
+int current_gvoverlay_mode = GVOverlayType_ZOrder;
+
+void gvoverlay_init(void)
+{
+	for(int i=0;i<GVOVERLAY_MAX;i++)
+	{
+		gvoverlays[i].overlay = OVERLAY_MAX;
+	}
+}
+
+void gvoverlay_shutdown(void)
+{
+	const modelocked_t *modelocked = modelocked_read_lock();
+	for (int i=0;i<GVOVERLAY_MAX;i++)
+	{
+		if (gvoverlays[i].overlay != OVERLAY_MAX)
+		{
+			gvoverlay_destroy(i,modelocked);
+		}
+	}
+	modelocked_read_unlock();
+}
+
+static void processselector(const modeselector_t *params,gvoverlay_create_vet_result_t *result)
+{
+	pixelformat_t format;
+	format.log2bpp = params->log2bpp;
+	format.ncolour = (1<<(1<<params->log2bpp))-1;
+	format.modeflags = (params->log2bpp==3?ModeFlag_FullPalette:0);
+	const modevarpair_t *v = params->modevars;
+	result->banks = 1;
+	while(v->var != -1)
+	{
+		if(v->var == VduExt_NColour)
+			format.ncolour = v->val;
+		else if(v->var == VduExt_ModeFlags)
+			format.modeflags = v->val;
+		else if((v->var == VduExt_MinScreenBanks) && (v->val > 0))
+			result->banks = v->val;
+		v++;
+	}
+	/* Merge transform flags into the other flags */
+	result->overlay_flags |= (format.modeflags & ModeFlag_Transform_Mask);
+	/* ... and ignore them when looking up the pixel format */
+	format.modeflags &= ~ModeFlag_Transform_Mask;
+	result->format = findformat(format);
+}
+
+static _kernel_oserror *create_vet_common(const modeselector_t *desc,uint32_t aspect,uint32_t flags,uint32_t heads,const modelocked_t *modelocked,gvoverlay_create_vet_result_t *result,int *out_idx,overlayidx *out_phys)
+{
+	if (flags & ~GVOverlayFlag_Scalable)
+	{
+		return (_kernel_oserror *)"\0\0\0\0Unsupported flags";
+	}
+	result->overlay_flags = flags;
+	processselector(desc,result);
+	if (result->format == PIXELFORMAT_MAX)
+	{
+		return (_kernel_oserror *)"\0\0\0\0Unsupported pixel format";
+	}
+	/* Only support single-head overlays for now */
+	if (heads != 1)
+	{
+		return (_kernel_oserror *)"\0\0\0\0Unsupported head mask";
+	}
+	/* Must be at least 8bpp for rotation */
+	if ((result->overlay_flags & (ModeFlag_Transform_Rotate90 | ModeFlag_Transform_Rotate180)) && (pixel_format_bpp[result->format] < 8))
+	{
+		return (_kernel_oserror *)"\0\0\0\0Rotation not supported for this pixel format";
+	}
+	/* The max width/height & alignment restrictions are perhaps a bit over-zealous. Width/height limits only really apply to scaling, and alignment could be countered by internally padding the image. */
+	if ((desc->xres < 1) || (desc->yres < 1) || (desc->xres > 2048) || (desc->yres > 2048) || (desc->xres & buffer_alignment_pixels[result->format]))
+	{
+		return (_kernel_oserror *)"\0\0\0\0Bad parameter";
+	}
+	if (FORMAT_IS_NV12(result->format) && (desc->yres & 1))
+	{
+		return (_kernel_oserror *)"\0\0\0\0Bad parameter";
+	}
+	/* TODO: Vertical flip support */
+	if (result->overlay_flags & ModeFlag_Transform_VFlip)
+	{
+		return (_kernel_oserror *)"\0\0\0\0Vertical flip not supported yet";
+	}
+#if OMAP==3
+	/* The alpha channel is ignored when the scaling unit is enabled
+	   So, don't support scaling + alpha */
+	if (result->overlay_flags & GVOverlayFlag_Scalable)
+	{
+		switch(result->format)
+		{
+		case PIXELFORMAT_4444_ABGR:
+		case PIXELFORMAT_4444_ARGB:
+		case PIXELFORMAT_1555_ABGR:
+		case PIXELFORMAT_1555_ARGB:
+		case PIXELFORMAT_8888_ABGR:
+		case PIXELFORMAT_8888_ARGB:
+			return (_kernel_oserror *)"\0\0\0\0Alpha not supported with scaling";
+		}
+	}
+#endif
+	int claimed_overlays = (1<<modelocked->overlay_desktop) | (1<<modelocked->overlay_pointer);
+	int i = -1;
+	for(int j=0;j<GVOVERLAY_MAX;j++)
+	{
+		if (gvoverlays[j].overlay == OVERLAY_MAX)
+		{
+			i = j;
+		}
+		else
+		{
+			claimed_overlays |= 1<<gvoverlays[j].overlay;
+		}
+	}
+	if (i == -1)
+	{
+		return (_kernel_oserror *)"\0\0\0\0No spare overlays";
+	}
+	/* We've found a spare logical slot, now look for a suitable physical one */
+	int overlay;
+	/* Mark any overlays which can't support the chosen format as claimed */
+	claimed_overlays |= ~checkformat(modelocked->default_display, result->format);
+	if (result->overlay_flags & GVOverlayFlag_Scalable)
+	{
+		/* Also mark the overlays that can't support scaling as being claimed */
+		claimed_overlays |= ~omap_scalable_overlays(modelocked, modelocked->default_display, result->format);
+	}
+	for(overlay=0;overlay<OVERLAY_MAX;overlay++)
+	{
+		if (!(claimed_overlays & (1<<overlay)))
+		{
+			break;
+		}
+	}
+	if (overlay==OVERLAY_MAX)
+	{
+		return (_kernel_oserror *)"\0\0\0\0No spare overlays can satisfy that format";
+	}
+	/* Ensure overlay features don't contradict features needed by any other overlays (except the pointer, since that's flexible - but since it's flexible it doesn't request any features anyway) */
+	if (!canhaveoverlay(result->format,modelocked))
+	{
+		return (_kernel_oserror *)"\0\0\0\0Format requirements conflict with head configuration";
+	}
+	if (out_idx)
+	{
+		*out_idx = i;
+	}
+	if (out_phys)
+	{
+		*out_phys = (overlayidx) overlay;
+	}
+	result->return_flags = current_gvoverlay_mode;
+	/* Get width & height from GPU's perspective */
+	uint32_t width = (result->overlay_flags & ModeFlag_Transform_Rotate90) ? desc->yres : desc->xres;
+	uint32_t height = (result->overlay_flags & ModeFlag_Transform_Rotate90) ? desc->xres : desc->yres;
+	if (result->overlay_flags & GVOverlayFlag_Scalable)
+	{
+		/* Since the aspect ratio is specified as a ratio, we can easily use it to work out some dimensions to check */
+		uint32_t width_aspect = aspect>>16;
+		uint32_t height_aspect = aspect & 0xffff;
+		/* Pick scale factors which will give us these important FIR values, and test each in turn */
+		static const uint32_t important_fir[] = {128,256,512,1024,2048,3072,4096};
+		result->min_w = INT_MAX;
+		result->min_h = INT_MAX;
+		result->max_w = INT_MIN;
+		result->max_h = INT_MIN;
+		for(int i=0;i<sizeof(important_fir)/sizeof(int);i++)
+		{
+			/* Check X:
+			   FIR_x = width*scale/width_aspect
+			   Rearranging gives:
+			   scale = FIR_x*width_aspect/width
+			   Which can then be used to calculate FIR_y:
+			   FIR_y = height*scale/height_aspect
+			   */
+			uint32_t fir_x = important_fir[i];
+			uint32_t scale = (fir_x*width_aspect); /* divided by width */
+			uint32_t denom = height_aspect*width;
+			uint32_t fir_y = (height*scale+(denom/2))/denom;
+			int scaled_w = ((width<<10)+(fir_x>>1))/fir_x;
+			int scaled_h = ((height<<10)+(fir_y>>1))/fir_y;
+			/* TODO: Re-calculate FIR values to ensure this calculation matches the results of CALC_FIR */
+			if (omap_check_fir(fir_x,fir_y,height,scaled_w,scaled_h,result->format,modelocked,modelocked->default_display,NULL))
+			{
+				if ((result->min_w > scaled_w) || (result->min_h > scaled_h))
+				{
+					result->min_w = scaled_w;
+					result->min_h = scaled_h;
+				}
+				if ((result->max_w < scaled_w) || (result->max_h < scaled_h))
+				{
+					result->max_w = scaled_w;
+					result->max_h = scaled_h;
+				}
+			}
+			/* Check Y */
+			fir_y = fir_x;
+			scale = (fir_y*height_aspect); /* divided by height */
+			denom = width_aspect*height;
+			fir_x = (width*scale+(denom/2))/denom;
+			scaled_w = ((width<<10)+(fir_x>>1))/fir_x;
+			scaled_h = ((height<<10)+(fir_y>>1))/fir_y;
+			if (omap_check_fir(fir_x,fir_y,height,scaled_w,scaled_h,result->format,modelocked,modelocked->default_display,NULL))
+			{
+				if ((result->min_w > scaled_w) || (result->min_h > scaled_h))
+				{
+					result->min_w = scaled_w;
+					result->min_h = scaled_h;
+				}
+				if ((result->max_w < scaled_w) || (result->max_h < scaled_h))
+				{
+					result->max_w = scaled_w;
+					result->max_h = scaled_h;
+				}
+			}
+		}
+		if (result->min_w == INT_MAX)
+		{
+			/* Could be a really awkward aspect ratio?
+			   TODO: Try harder (or at least fall back to 1:1?) */
+			return (_kernel_oserror *)"\0\0\0\0Failed to find any working scale factors";
+		}
+	}
+	else
+	{
+		result->min_w = result->max_w = width;
+		result->min_h = result->max_h = height;
+	}
+	return NULL;
+}
+
+_kernel_oserror *gvoverlay_create(const modeselector_t *desc,uint32_t aspect,uint32_t flags,uint32_t heads,const modelocked_t *modelocked,gvoverlay_create_vet_result_t *result,int *out_idx)
+{
+	int i;
+	overlayidx overlay;
+	_kernel_oserror *e = create_vet_common(desc,aspect,flags,heads,modelocked,result,&i,&overlay);
+	if (e != NULL)
+	{
+		return e;
+	}
+	/* Attempt to get buffer instance */
+	buffer_t *buffer;
+	buffer_desc_t b;
+	b.width = desc->xres;
+	b.height = desc->yres;
+	b.rotation = (result->overlay_flags & ModeFlag_Transform_Mask)/ModeFlag_Transform_Rotate90;
+	b.maxbank = result->banks - 1;
+	b.format = result->format;
+	e = buffer_create(&b,&buffer);
+	if (e)
+	{
+		return e;
+	}
+	/* Update head features */
+	omap_update_features(overlay, modelocked->default_display, result->format);
+	/* Setup the gvoverlay slot */
+	gvoverlay_t *gvoverlay = &gvoverlays[i];
+	gvoverlay->overlay = overlay;
+	gvoverlay->display = -1;
+	gvoverlay->flags = result->overlay_flags;
+	gvoverlay->buffer = buffer;
+	/* Configure the known parameters of the overlay */
+	{
+		overlaycfg_t *o = &irqlocked_lock()->overlays[overlay];
+		overlaycfg_reset(o);
+		o->buf_w = o->scaled_w = (result->overlay_flags & ModeFlag_Transform_Rotate90) ? desc->yres : desc->xres;
+		o->buf_h = o->scaled_h = (result->overlay_flags & ModeFlag_Transform_Rotate90) ? desc->xres : desc->yres;
+		o->format = result->format;
+		o->target = modelocked->default_display;
+		o->rotation = (result->overlay_flags & ModeFlag_Transform_Mask)/ModeFlag_Transform_Rotate90;
+		o->desktopclip = true;
+		irqlocked_unlock();
+	}
+
+	*out_idx = i;
+	return NULL;
+}
+
+_kernel_oserror *gvoverlay_vet(const modeselector_t *desc,uint32_t aspect,uint32_t flags,uint32_t heads,const modelocked_t *modelocked,gvoverlay_create_vet_result_t *result)
+{
+	_kernel_oserror *e = create_vet_common(desc,aspect,flags,heads,modelocked,result,NULL,NULL);
+	if (e)
+	{
+		return e;
+	}
+	/* Check with the buffer manager */
+	buffer_desc_t b;
+	b.width = desc->xres;
+	b.height = desc->yres;
+	b.rotation = (result->overlay_flags & ModeFlag_Transform_Mask)/ModeFlag_Transform_Rotate90;
+	b.maxbank = result->banks - 1;
+	b.format = result->format;
+	if (!buffer_vet(&b))
+	{
+		return (_kernel_oserror *)"\0\0\0\0Buffer manager says no";
+	}
+	return NULL;
+}
+
+_kernel_oserror *gvoverlay_destroy(int o,const modelocked_t *modelocked)
+{
+	if ((o < 0) || (o > GVOVERLAY_MAX))
+	{
+		return NULL;
+	}
+	overlayidx overlay = gvoverlays[o].overlay;
+	if (overlay == OVERLAY_MAX)
+	{
+		return NULL;
+	}
+	/* Disable & release the physical overlay */
+	{
+		irqlocked_t *irqlocked = irqlocked_lock();
+		overlaycfg_t *cfg = &irqlocked->overlays[overlay];
+		if (cfg->enabled)
+		{
+			cfg->enabled = false;
+			dispc_update_overlay(overlay,modelocked,irqlocked);
+		}
+		cfg->target = TARGET_NONE;
+		/* Release features */
+		omap_update_features(overlay, TARGET_NONE, PIXELFORMAT_MAX);
+		irqlocked_unlock();
+	}
+	/* Release the buffer */
+	_kernel_oserror *e = buffer_destroy(gvoverlays[o].buffer);
+	if (e)
+	{
+		/* TODO; Deal with this more gracefully */
+		return e;
+	}
+	/* Release our allocation */
+	gvoverlays[o].overlay = OVERLAY_MAX;
+	return NULL;
+}
+
+_kernel_oserror *gvoverlay_setposition(int o,int x,int y,int bank,const modelocked_t *modelocked)
+{
+	if ((o < 0) || (o > GVOVERLAY_MAX))
+	{
+		return (_kernel_oserror *)"\0\0\0\0Bad overlay";
+	}
+	gvoverlay_t *gvoverlay = &gvoverlays[o];
+	overlayidx overlay = gvoverlay->overlay;
+	if (overlay == OVERLAY_MAX)
+	{
+		return (_kernel_oserror *)"\0\0\0\0Bad overlay";
+	}
+	if ((bank < -1) || (bank >= GVBANK_MAX))
+	{
+		return (_kernel_oserror *)"\0\0\0\0Bad bank";
+	}
+	int oldbank = gvoverlay->display;
+	{
+		irqlocked_t *irqlocked = irqlocked_lock();
+		overlaycfg_t *cfg = &irqlocked->overlays[overlay];
+		if ((oldbank == bank) && ((bank == -1) || ((cfg->x == x) && (cfg->y == y))))
+		{
+			/* Nothing to do */
+			irqlocked_unlock();
+			return NULL;
+		}
+		/* OK, update everything */
+		if (bank != -1)
+		{
+			/* The memory is write-through cacheable, so ensure all writes have been flushed */
+			dmb();
+			_kernel_oserror *e = buffer_config_gpu(gvoverlay->buffer,bank,&cfg->ba,&cfg->ba_uv,&cfg->stride);
+			if (e)
+			{
+				irqlocked_unlock();
+				return e;
+			}
+			cfg->x = x;
+			cfg->y = y;
+			cfg->la = NULL; /* Shouldn't be needed (and might not be logically mapped) */
+			cfg->enabled = true;
+		}
+		else
+		{
+			cfg->enabled = false;
+		}
+		gvoverlays[o].display = bank;
+		dispc_update_overlay(overlay,modelocked,irqlocked);
+		irqlocked_unlock();
+	}
+	if (oldbank != -1)
+	{
+		/* TODO: Once we have dynamic GPU memory configuration, this will need delaying until VSync to make sure the GPU has finished rendering the frame */
+		buffer_release_gpu(gvoverlay->buffer,oldbank);
+	}
+	return NULL;
+}
+
+_kernel_oserror *gvoverlay_map(int o, int b, gvoverlay_plane_mapping_t **mapping)
+{
+	if ((o < 0) || (o > GVOVERLAY_MAX))
+	{
+		return (_kernel_oserror *)"\0\0\0\0Bad overlay";
+	}
+	gvoverlay_t *gvoverlay = &gvoverlays[o];
+	overlayidx overlay = gvoverlay->overlay;
+	if (overlay == OVERLAY_MAX)
+	{
+		return (_kernel_oserror *)"\0\0\0\0Bad overlay";
+	}
+	gvoverlay_plane_mapping_t *planes = &gvoverlay->cpu_mappings[b][0];
+	_kernel_oserror *e = buffer_config_cpu(gvoverlay->buffer,b,&(planes[0].ba),&(planes[1].ba),&(planes[0].stride));
+	if (!e)
+	{
+		*mapping = planes;
+		planes[1].stride = planes[0].stride;
+	}
+	return e;
+}
+
+_kernel_oserror *gvoverlay_unmap(int o, int b)
+{
+	if ((o < 0) || (o > GVOVERLAY_MAX))
+	{
+		return (_kernel_oserror *)"\0\0\0\0Bad overlay";
+	}
+	gvoverlay_t *gvoverlay = &gvoverlays[o];
+	overlayidx overlay = gvoverlay->overlay;
+	if (overlay == OVERLAY_MAX)
+	{
+		return (_kernel_oserror *)"\0\0\0\0Bad overlay";
+	}
+	return buffer_release_cpu(gvoverlay->buffer,b);
+}
+
+_kernel_oserror *gvoverlay_discard(int o, int b, const modelocked_t *modelocked)
+{
+	if ((o < 0) || (o > GVOVERLAY_MAX))
+	{
+		return (_kernel_oserror *)"\0\0\0\0Bad overlay";
+	}
+	gvoverlay_t *gvoverlay = &gvoverlays[o];
+	overlayidx overlay = gvoverlay->overlay;
+	if (overlay == OVERLAY_MAX)
+	{
+		return (_kernel_oserror *)"\0\0\0\0Bad overlay";
+	}
+	if(b == gvoverlay->display)
+	{
+		/* Switch off overlay */
+		gvoverlay_setposition(o,0,0,-1,modelocked);
+	}
+	return buffer_discard(gvoverlay->buffer,b);
+}
+
+_kernel_oserror *gvoverlay_settransform(int o,gvoverlay_transform_t *xform,const modelocked_t *modelocked)
+{
+	if ((o < 0) || (o > GVOVERLAY_MAX))
+	{
+		return (_kernel_oserror *)"\0\0\0\0Bad overlay";
+	}
+	gvoverlay_t *gvoverlay = &gvoverlays[o];
+	overlayidx overlay = gvoverlay->overlay;
+	if (overlay == OVERLAY_MAX)
+	{
+		return (_kernel_oserror *)"\0\0\0\0Bad overlay";
+	}
+	irqlocked_t *irqlocked = irqlocked_lock();
+	overlaycfg_t *cfg = &irqlocked->overlays[gvoverlays[o].overlay];
+	/* Handle scaling */
+	if (gvoverlay->flags & GVOverlayFlag_Scalable)
+	{
+		int w = xform->width;
+		int h = xform->height;
+		/* Check FIR values */
+		int32_t fir_x = CALC_FIR(cfg->buf_w,w);
+		int32_t fir_y = CALC_FIR(cfg->buf_h,h);
+		bool v5tap;
+		if (!omap_check_fir(fir_x,fir_y,cfg->buf_h,w,h,cfg->format,modelocked,cfg->target,&v5tap))
+		{
+			/* TODO: Clamp to be within range */
+			irqlocked_unlock();
+			return (_kernel_oserror*)"\0\0\0\0Bad scale";
+		}
+		cfg->scaled_w = xform->width = w;
+		cfg->scaled_h = xform->height = h;
+		cfg->v5tap = v5tap;
+	}
+	else
+	{
+		/* Override to 1:1 scale */
+		xform->width = cfg->scaled_w;
+		xform->height = cfg->scaled_h;
+	}
+	/* Handle cropping */
+	/* TODO - Predict how dispc_get_lloverlaycfg will adjust things */
+	xform->clip_x0 = cfg->clip[0] = MAX(xform->clip_x0,0);
+	xform->clip_y0 = cfg->clip[1] = MAX(xform->clip_y0,0);
+	xform->clip_x1 = cfg->clip[2] = MIN(xform->clip_x1,cfg->scaled_w);
+	xform->clip_y1 = cfg->clip[3] = MIN(xform->clip_y1,cfg->scaled_h);
+	if (cfg->enabled)
+	{
+		dispc_update_overlay(overlay,modelocked,irqlocked);
+	}
+	irqlocked_unlock();
+	return NULL;
+}
+
+_kernel_oserror *gvoverlay_setzorder(const uint8_t *ids,int count,const modelocked_t *modelocked)
+{
+	int seen = (1<<modelocked->overlay_pointer) | (1<<modelocked->overlay_desktop);
+	overlayidx order[OVERLAY_MAX];
+	int j=0;
+	order[j++] = modelocked->overlay_pointer;
+#if 1//ndef DEBUGLIB
+	order[j++] = modelocked->overlay_desktop;
+#endif
+	for(int i=0;i<count;i++)
+	{
+		int o = ids[i] - TARGET_MAX; /* Convert from external ID to internal */
+		if ((o < 0) || (o > GVOVERLAY_MAX))
+		{
+			return (_kernel_oserror *)"\0\0\0\0Bad overlay";
+		}
+		overlayidx overlay = gvoverlays[o].overlay;
+		if (overlay == OVERLAY_MAX)
+		{
+			return (_kernel_oserror *)"\0\0\0\0Bad overlay";
+		}
+		if (seen & (1<<overlay))
+		{
+			return (_kernel_oserror *)"\0\0\0\0Bad list";
+		}
+		order[j++] = overlay;
+		seen |= 1<<overlay;
+	}
+#if 0//def DEBUGLIB
+	order[j++] = modelocked->overlay_desktop;
+#endif
+	omap_set_zorder(order, j, modelocked);
+	return NULL;
+}

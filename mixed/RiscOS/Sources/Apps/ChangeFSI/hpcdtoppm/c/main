@@ -1,0 +1,1358 @@
+/* hpcdtoppm (Hadmut's pcdtoppm) v0.6
+*  Copyright (c) 1992, 1993, 1994 by Hadmut Danisch (danisch@ira.uka.de).
+*  Permission to use and distribute this software and its
+*  documentation for noncommercial use and without fee is hereby granted,
+*  provided that the above copyright notice appear in all copies and that
+*  both that copyright notice and this permission notice appear in
+*  supporting documentation. It is not allowed to sell this software in 
+*  any way. This software is not public domain.
+*/
+
+#include "hpcdtoppm.h"
+
+
+uBYTE sbuffer[SECSIZE];
+
+enum TURNS  turn     = T_UNSPEC;
+enum TURNS  contori  = T_UNSPEC;
+enum SIZES  size     = S_UNSPEC;
+enum OUTFOR outfor   = O_UNSPEC;
+enum CORR   corrmode = C_UNSPEC;
+
+sINT do_info,do_diff,do_overskip,do_sharp,monochrome,paper;
+sINT do_melde,do_rep,do_crop;
+sINT flhori=0,flvert=0;
+sINT bufpos=0;
+
+char *pcdname=0,*ppmname=0;
+static FILE  *fin=0,*fout=0;
+
+static char    *suba1=0,*suba2=0; /* ,*dir64=0; */
+static implane Luma, Chroma1,Chroma2;
+static implane *PLuma,*PChroma1,*PChroma2;
+static sINT    contsize=1;
+static sINT    emulate_seek=0;
+static sINT    print_pos;
+
+static char    dir64[512];
+static void    get_dir64(void);
+
+#define PrintPos(x) {if(print_pos) fprintf(stderr,"File-Offset: %8d = %8x (hex) = %d (sec)\n",(x),(x),(x)/0x800);}
+
+static void checkin(void);
+static void parseargs(int,char**);
+static void sizecontrol(sizeinfo *,dim,dim,dim sMASK);
+static void f_1 (dim,dim,sINT,sINT);
+static void f_3 (dim,dim,sINT);
+static void f_4 (dim,dim,sINT);
+static void f_5 (dim,dim);
+static void f_6 (dim,dim);
+static void f_ov(dim,dim,sINT,sINT);
+static void f_co(dim,dim,sINT,sINT);
+
+
+
+void close_all(void)
+ {
+  if(fin && (fin != stdin)) fclose(fin);
+
+  if(fout)
+   {if(fout==stdout) 
+      fflush(fout);
+    else 
+      fclose(fout);
+   }
+ }
+
+
+
+
+
+
+#ifdef RISCOS_TWEAK
+/* One less warning */
+int main(int argc,char **argv)
+#else
+void main(int argc,char **argv)
+/* One less warning */
+#endif
+ {
+
+  typecheck();
+
+  do_info=do_diff=do_overskip=do_sharp=monochrome=paper=0;
+  do_melde=do_rep=do_crop=0;
+  print_pos=0;
+
+
+  parseargs(argc,argv);
+
+  if(size     == S_UNSPEC) size     = S_DEFAULT;
+  if(outfor   == O_UNSPEC) outfor   = O_DEFAULT;
+  if(corrmode == C_UNSPEC) corrmode = C_DEFAULT;
+  if(turn     == T_UNSPEC) turn     = T_DEFAULT;
+
+  monochrome=(outfor==O_PGM)||(outfor==O_PSG)||(outfor==O_EPSG)||(outfor==O_PSD)||(outfor==O_EPSD);
+  paper     =(outfor==O_PS )||(outfor==O_EPS)||(outfor==O_PSG )||(outfor==O_EPSG)||(outfor==O_PSD)||(outfor==O_EPSD);
+
+
+
+  if((size==S_Over) && (!ppmname)) error(E_ARG);
+  if((size==S_Contact) && do_crop) error(E_ARG);
+  if(do_overskip && do_diff)       error(E_OPT);
+
+  if(do_diff && (size != S_4Base) && (size != S_16Base) && (size != S_64Base)) error(E_OPT);
+
+  if(do_overskip && (size != S_Base16) && (size != S_Base4) && (size != S_Base) && (size != S_4Base) ) error(E_OVSKIP);
+  if(print_pos   && (size != S_Base16) && (size != S_Base4) && (size != S_Base) && (size != S_4Base) ) error(E_OPT);
+  if(do_info     && (size != S_Base16) && (size != S_Base4) && (size != S_Base) && (size != S_4Base) ) error(E_OPT);
+  if(monochrome && do_overskip) error(E_OPT);
+  if((size==S_Contact) &&((contsize<1) || (contsize>100))) error(E_OPT);
+  if(suba1 && ( size==S_Contact || size==S_Over)) error(E_OPT);
+  if(suba1 && do_crop) error(E_OPT);
+
+#ifndef RISCOS_TWEAK
+/* No postscript,so no papersizes */
+  if((!paper) && (PSIZE_SET || DPI_SET || FAK_SET)) error(E_OPT);
+  if(PSIZE_SET && DPI_SET && FAK_SET) error(E_OPT);
+  if((DPI_SET || FAK_SET) && (outfor!=O_PSD) && (outfor!=O_EPSD)) error(E_OPT);
+/* No postscript,so no papersizes */
+#endif
+
+
+
+  if(strcmp(pcdname,"-"))
+   { if(!(fin=fopen(pcdname,R_OP))) error(E_FOPEN);
+     emulate_seek=0;
+   }
+  else
+   {pcdname="<stdin>";
+    emulate_seek=1;
+    /* 64Base can't be on stdin - need a suitable error message */
+    if (size == S_64Base) error(E_FOPEN);
+#ifdef USE_FDOPEN
+    fin=fdopen(fileno(stdin),R_OP);
+    if(!fin) error(E_READ);
+#else
+    fin=stdin;
+#endif
+   }
+
+  bufpos=0;
+
+
+  if((size != S_Over) && (size != S_Contact)) checkin();
+
+  PLuma=    &Luma;
+  PChroma1= monochrome ? 0 : &Chroma1; 
+  PChroma2= monochrome ? 0 : &Chroma2; 
+
+  switch(size)
+   {
+    case S_Base16:  f_1(BaseW/4,BaseH/4,L_Head,(L_Head+L_Base16));
+                    break;
+
+    case S_Base4:   f_1(BaseW/2,BaseH/2,(L_Head+L_Base16),(L_Head+L_Base16+L_Base4));
+                    break;
+
+    case S_Base:    f_3(BaseW,BaseH,(L_Head+L_Base16+L_Base4));
+                    break;
+
+    case S_4Base:   f_4(BaseW*2,BaseH*2,(L_Head+L_Base16+L_Base4));
+                    break;
+
+    case S_16Base:  f_5(BaseW*4,BaseH*4);
+                    break;
+
+    case S_64Base:  f_6(BaseW*8,BaseH*8);
+                    break;
+
+    case S_Over:    f_ov(BaseW/4,BaseH/4,5,SeBase16);
+                    break;
+
+    case S_Contact: f_co(BaseW/4,BaseH/4,5,SeBase16);
+                    break;
+
+    default: error(E_INTERN); 
+   }
+
+  close_all();
+  exit(0);
+
+ }
+
+
+
+
+
+
+static void openoutput(void)
+ {
+  if(!ppmname) 
+   {
+#ifdef USE_FDOPEN
+    fout=fdopen(fileno(stdout),W_OP);
+    if(!fout) error(E_WRITE);
+#else
+    fout=stdout;
+#endif
+   }
+  else
+   {if (!(fout=fopen(ppmname,W_OP))) error(E_WRITE);
+   }
+ }
+
+
+
+
+
+
+
+static void f_1(dim w,dim h,sINT normal,sINT overskip)
+ {sizeinfo si;
+ 
+  sizecontrol(&si,w,h,~3);
+
+                   planealloc(PLuma   ,si.rdhlen,si.rdvlen);
+  if (!monochrome) planealloc(PChroma1,si.rdhlen,si.rdvlen);
+  if (!monochrome) planealloc(PChroma2,si.rdhlen,si.rdvlen);
+
+  PrintPos(normal*SECSIZE);
+  SEEK(normal+1);                   
+      
+  if(!do_overskip)
+    { error(readplain(&si,1,PLuma,PChroma1,PChroma2));
+      if (!monochrome) 
+        {interpolate(PChroma1);
+         interpolate(PChroma2);
+        }
+    }
+  else
+    { error(readplain(&si,1,PLuma,nullplane,nullplane));
+      SEEK(overskip+1);
+      error(readplain(&si,2,nullplane,PChroma1,PChroma2));
+    }
+   
+
+  colconvert(&si,PLuma,PChroma1,PChroma2);
+  /* Now Luma holds red, Chroma1 hold green, Chroma2 holds blue */
+
+
+  openoutput();
+  writepicture(fout,&si,PLuma,PChroma1,PChroma2,turn);
+
+ } 
+
+
+static void f_3(dim w,dim h,sINT normal)
+ {sINT cd_offset,cd_offhelp;
+  sizeinfo si;
+
+  sizecontrol(&si,w,h,~3);
+
+  PrintPos(normal*SECSIZE);
+  SEEK(normal+1);
+
+  if(!do_overskip)
+    {                 planealloc(PLuma   ,si.rdhlen,si.rdvlen);
+     if (!monochrome) planealloc(PChroma1,si.rdhlen,si.rdvlen);
+     if (!monochrome) planealloc(PChroma2,si.rdhlen,si.rdvlen);
+
+     error(readplain(&si,1,PLuma,PChroma1,PChroma2));
+      if (!monochrome) 
+        {interpolate(PChroma1);
+         interpolate(PChroma2);
+        }
+    }
+   else
+    {planealloc(PLuma   ,  si.rdhlen,  si.rdvlen);
+     planealloc(PChroma1,2*si.rdhlen,2*si.rdvlen);
+     planealloc(PChroma2,2*si.rdhlen,2*si.rdvlen);
+
+     error(readplain(&si,1,PLuma,PChroma1,PChroma2));
+     interpolate(PChroma1);
+     interpolate(PChroma2);
+     interpolate(PChroma1);
+     interpolate(PChroma2);
+
+     cd_offset=Skip4Base();
+     SEEK(cd_offset+10);          EREADBUF;    cd_offhelp=(((uINT)sbuffer[2])<<8)|sbuffer[3];
+     SEEK(cd_offset+12);          readhqt(3);
+     SEEK(cd_offset+cd_offhelp);  decode(&si,4,nullplane,PChroma1,PChroma2,1);
+
+     halve(PChroma1);
+     halve(PChroma2);
+    }
+  colconvert(&si,PLuma,PChroma1,PChroma2);
+  /* Now Luma holds red, Chroma1 hold green, Chroma2 holds blue */
+
+  openoutput();
+  writepicture(fout,&si,PLuma,PChroma1,PChroma2,turn);
+
+
+ }
+
+
+
+static void f_4(dim w,dim h,sINT normal)
+ {sINT cd_offset,cd_offhelp;
+  sizeinfo si;
+  sizecontrol(&si,w,h,~3);
+
+                   planealloc(PLuma   ,si.rdhlen,si.rdvlen);
+  if (!monochrome) planealloc(PChroma1,si.rdhlen,si.rdvlen);
+  if (!monochrome) planealloc(PChroma2,si.rdhlen,si.rdvlen);
+
+  PrintPos((L_Head+L_Base16+L_Base4+L_Base)*SECSIZE);
+
+  if(!do_overskip)
+   {SEEK(L_Head+L_Base16+L_Base4+1);
+    error(readplain(&si,-2,PLuma,PChroma1,PChroma2));
+    interpolate(PLuma);
+    if (!monochrome) 
+     {interpolate(PChroma1);
+      interpolate(PChroma1);
+      interpolate(PChroma2);
+      interpolate(PChroma2);
+     }
+
+    if(do_diff) {clearimpl(PLuma,neutrLum);clearimpl(PChroma1,neutrCh1);clearimpl(PChroma2,neutrCh2);}
+
+    cd_offset = L_Head + L_Base16 + L_Base4 + L_Base ;
+    SEEK(cd_offset + 4);     readhqt(1);
+    SEEK(cd_offset + 5);     decode(&si,1,PLuma,nullplane,nullplane,0);
+   }
+  else
+   {SEEK(L_Head+L_Base16+L_Base4+1);
+    error(readplain(&si,-2,PLuma,PChroma1,PChroma2));
+    interpolate(PLuma);
+    interpolate(PChroma1);
+    interpolate(PChroma1);
+    interpolate(PChroma2);
+    interpolate(PChroma2);
+
+    cd_offset = L_Head + L_Base16 + L_Base4 + L_Base ;
+    SEEK(cd_offset + 4);     readhqt(1);
+    SEEK(cd_offset + 5);     decode(&si,1,PLuma,nullplane,nullplane,0);
+
+    cd_offset=bufpos;
+    if(cd_offset % SECSIZE) error(E_POS);
+    cd_offset/=SECSIZE;
+    SEEK(cd_offset+10);          EREADBUF;    cd_offhelp=(((uINT)sbuffer[2])<<8)|sbuffer[3];
+    SEEK(cd_offset+12);          readhqt(3);
+    SEEK(cd_offset+cd_offhelp);  decode(&si,2,nullplane,PChroma1,PChroma2,1);
+     
+   }
+  colconvert(&si,PLuma,PChroma1,PChroma2);
+  /* Now Luma holds red, Chroma1 hold green, Chroma2 holds blue */
+
+  openoutput();
+  writepicture(fout,&si,PLuma,PChroma1,PChroma2,turn);
+
+ }
+
+
+
+
+
+
+
+
+
+
+
+
+
+static void f_5sub(dim w, dim h, sizeinfo *sip,int fak1,int fak2,int fak3,dim sMASK)
+ {sINT cd_offset;
+  
+  sizecontrol(sip,w,h,sMASK);
+
+                   planealloc(PLuma   ,sip->rdhlen,sip->rdvlen);
+  if (!monochrome) planealloc(PChroma1,sip->rdhlen,sip->rdvlen);
+  if (!monochrome) planealloc(PChroma2,sip->rdhlen,sip->rdvlen);
+
+  SEEK(L_Head+L_Base16+L_Base4+1);
+  error(readplain(sip,fak1,PLuma,PChroma1,PChroma2));
+  interpolate(PLuma);
+  if(!monochrome)
+   {interpolate(PChroma1);
+    interpolate(PChroma1);
+    interpolate(PChroma2);
+    interpolate(PChroma2);
+   }
+
+  cd_offset = L_Head + L_Base16 + L_Base4 + L_Base ;
+  SEEK(cd_offset + 4);       readhqt(1);
+  SEEK(cd_offset + 5);       decode(sip,fak2,PLuma,nullplane,nullplane,0);
+  interpolate(PLuma);
+
+  if(do_diff) {clearimpl(PLuma,neutrLum);clearimpl(PChroma1,neutrCh1);clearimpl(PChroma2,neutrCh2);}
+
+  cd_offset=bufpos;
+  if(cd_offset % SECSIZE) error(E_POS);
+  PrintPos(cd_offset);
+  cd_offset/=SECSIZE;
+
+  SEEK(cd_offset+12);        readhqt(3);
+  SEEK(cd_offset+14);        decode(sip,fak3,PLuma,PChroma1,PChroma2,0);
+
+ }
+
+
+
+
+static void f_5(dim w,dim h)
+ {sizeinfo si;
+
+  f_5sub(w,h,&si,-4,-2,1,~7);
+
+  if(!monochrome)
+   {interpolate(PChroma1);
+    interpolate(PChroma2);
+   }
+
+  colconvert(&si,PLuma,PChroma1,PChroma2);
+  /* Now Luma holds red, Chroma1 hold green, Chroma2 holds blue */
+
+  openoutput();
+  writepicture(fout,&si,PLuma,PChroma1,PChroma2,turn);
+
+ }
+
+
+
+
+static void f_6(dim w,dim h)
+ {sizeinfo si;
+  FILE *ic,*icr[10];
+  struct ic_header ic_h;
+  struct ic_descr descr[3];
+  struct ic_fname names[10];
+  struct ic_entry efrom,eto;
+  struct file16 namecount,descrcount;
+  int i,j,nc,dc;
+  char   FN[300];
+  int first,last,ffrom,fto,foff;
+
+
+  f_5sub(w,h,&si,-8,-4,-2,~15);
+
+  interpolate(PLuma);
+  if(!monochrome)
+   {interpolate(PChroma1);
+    interpolate(PChroma2);
+   }
+
+  get_dir64();
+
+  sprintf(FN,"%s%c%s",dir64,DIRSEP,"info.ic");
+  if(!(ic=fopen(FN,R_OP))) error(E_FOPEN);
+  if(fread(&ic_h,sizeof(ic_h),1,ic)<1) error(E_READ);
+
+
+
+
+  /******************************************************************************/
+  /* layer descriptions */
+  /******************************************************************************/
+  if(fseek(ic,FILE32(ic_h.off_descr),0)) error(E_READ);
+  
+  if(fread(&descrcount,sizeof(descrcount),1,ic)<1) error(E_READ);
+  dc=FILE16(descrcount);
+
+  if((dc<1) || (dc>3)) error(E_SEQ);
+  if((!monochrome) && (dc<3))         error(E_SEQ);
+
+  if(fread(descr,sizeof(descr[0]),dc,ic)<dc) error(E_READ);
+
+
+
+
+
+
+  /******************************************************************************/
+  /* Filenames */
+  /******************************************************************************/
+  if(fseek(ic,FILE32(ic_h.off_fnames),0)) error(E_READ);
+
+  if(fread(&namecount,sizeof(namecount),1,ic)<1) error(E_READ);
+  nc=FILE16(namecount);
+
+  if((nc<1) || (nc>10)) error(E_SEQ);
+  if((!monochrome) && (nc<3))         error(E_SEQ);
+
+  if(fread(names,sizeof(names[0]),nc,ic)<nc) error(E_READ);
+
+#ifdef SMALLNAMES
+  for (i=0;i<nc;i++)
+   { 
+    {for (j=0;j<sizeof(names[0].fname);j++)
+      {if((names[i].fname[j]>= 'A') && (names[i].fname[j]<= 'Z'))
+        names[i].fname[j] += 'a'-'A';
+      }
+    }
+#ifdef DEBUG
+   fprintf(stderr,"%-*.*s %d\n",sizeof(names[0].fname),sizeof(names[0].fname),names[i].fname, FILE32(names[i].size));
+#endif
+   }
+#endif
+
+  /******************************************************************************/
+  /* Huffman-Tables */
+  /******************************************************************************/
+  if(fseek(ic,FILE32(ic_h.off_huffman),0)) error(E_READ);
+  if(fread(sbuffer,1,sizeof(sbuffer),ic)<5) error(E_READ);
+
+  readhqtx(monochrome?1:3);
+
+
+
+  /******************************************************************************/
+  /* Decode it */
+  /******************************************************************************/
+  for(i=0;i< (monochrome?1:3); i++)
+   {
+    first=si.rdvoff;    last =si.rdvoff+si.rdvlen;
+
+    if(!i)
+     { /* luma */
+       if(last>=h) last=h-1;
+     }
+    else
+     { /* chroma */
+       first/=2;
+       last=(last+1)/2;
+       if(last>=h/2) last=h/2-1;
+     }
+
+    if(fseek(ic,FILE32(descr[i].off_pointers)+ 6*4*first,0)) error(E_READ);
+    if(fread(&efrom,sizeof(efrom),1,ic)<1) error(E_READ);
+
+    if(fseek(ic,FILE32(descr[i].off_pointers)+ 6*4*last,0)) error(E_READ);
+    if(fread(&eto  ,sizeof(eto  ),1,ic)<1) error(E_READ);
+
+    ffrom=FILE16(efrom.fno);
+    fto  =FILE16(eto.fno);
+    foff =FILE32(efrom.offset);
+
+
+/*    fprintf(stderr,"XXX:  %d  %d  %d\n",ffrom,fto,foff);*/
+
+    for(j=ffrom;j<=fto;j++)
+     {sprintf(FN,"%s%c%s",dir64,DIRSEP,names[j].fname);
+
+#ifdef DEBUG
+    fprintf(stderr,"Filename %s\n",FN);
+#endif
+      if(!(icr[j-ffrom]=fopen(FN,R_OP))) error(E_FOPEN);
+     }
+    icr[j-ffrom]=0;
+
+    if(fseek(icr[0],foff,0)) error(E_READ);
+
+    switch (i)
+     {case 0:  decodex(icr,0,&descr[0],&si, 1,PLuma,   1);  break;
+      case 1:  decodex(icr,1,&descr[1],&si,-2,PChroma1,1);  break;
+      case 2:  decodex(icr,2,&descr[2],&si,-2,PChroma2,1);  break;
+     }
+
+
+    for(j=ffrom;j<=fto;j++)  fclose(icr[j-ffrom]);
+
+
+   }
+  fclose(ic);
+
+  if(!monochrome)
+   {interpolate(PChroma1);
+    interpolate(PChroma2);
+   }
+
+  colconvert(&si,PLuma,PChroma1,PChroma2);
+  openoutput();
+  writepicture(fout,&si,PLuma,PChroma1,PChroma2,turn);
+
+ }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+static void f_ov(dim w,dim h,sINT offset,sINT imsize)
+ {sINT bildnr,bilder;
+  dim wx,hx;
+  enum ERRORS eret;
+  enum TURNS imorient;
+  char nbuf[100];
+  uBYTE hbuf[SECSIZE];
+  sizeinfo si;
+  
+  sizecontrol(&si,w,h,~3);
+
+  wx=w; hx=h;
+
+                   planealloc(PLuma   ,si.rdhlen,si.rdvlen);
+  if (!monochrome) planealloc(PChroma1,si.rdhlen,si.rdvlen);
+  if (!monochrome) planealloc(PChroma2,si.rdhlen,si.rdvlen);
+
+ 
+  SEEK(0); 
+  if(READ(hbuf,sizeof(hbuf))<1) error(E_READ);
+
+  bilder=(((sINT) hbuf[10])<<8) | hbuf[11];
+
+
+  for(bildnr=0;bildnr<bilder;bildnr++)
+   {w=wx;h=hx;
+    sizecontrol(&si,w,h,~3);
+    PLuma->im=PLuma->mp;
+    if(PChroma1) PChroma1->im=PChroma1->mp;
+    if(PChroma2) PChroma2->im=PChroma2->mp;
+
+    SEEK(offset+imsize*bildnr);
+  
+    eret=readplain(&si,1,PLuma,PChroma1,PChroma2);
+    if(eret==E_READ) break;
+    error(eret);
+
+    if(!monochrome)
+     {interpolate(PChroma1);
+      interpolate(PChroma2);
+     }
+
+    colconvert(&si,PLuma,PChroma1,PChroma2);
+  
+    sprintf(nbuf,"%s%04d",ppmname,bildnr+1);
+    if (!(fout=fopen(nbuf,W_OP))) error(E_WRITE);
+     switch(hbuf[12+bildnr] & 3)
+      {case 0:  imorient=T_NONE;  break;
+       case 1:  imorient=T_LEFT;  break;
+       case 2:  imorient=T_HEAD;  break;
+       case 3:  imorient=T_RIGHT; break;
+       default: imorient=T_NONE;
+      }
+    writepicture(fout,&si,PLuma,PChroma1,PChroma2,turn != T_AUTO ? turn : imorient);
+    fclose(fout);
+    fout=0;
+   }
+ }
+
+
+
+
+static void f_co(dim w,dim h,sINT offset,sINT imsize)
+ {sINT bildnr,bilder,cols,rows,xstep,ystep,mw,mh;
+  enum ERRORS eret;
+  enum TURNS imorient;
+  implane mLuma,mChroma1,mChroma2;
+  implane *pmL,*pmCh1,*pmCh2;
+  uBYTE hbuf[SECSIZE];
+  sizeinfo sibig,sismall;
+
+  pmL=                    &mLuma;
+  pmCh1= monochrome ? 0 : &mChroma1; 
+  pmCh2= monochrome ? 0 : &mChroma2; 
+
+
+  SEEK(0); 
+  if(READ(hbuf,sizeof(hbuf))<1) error(E_READ);
+  bilder=(((sINT) hbuf[10])<<8) | hbuf[11];
+
+  cols=contsize;
+  rows=(bilder+cols-1)/cols;
+
+  xstep=ystep=0;
+  switch(turn)
+   {case T_NONE: 
+    case T_HEAD: xstep=w;ystep=h; break;
+    case T_RIGHT:
+    case T_LEFT: xstep=h;ystep=w; break;
+    case T_AUTO: xstep=ystep=w;   break;
+    default: error(E_INTERN);
+   }
+
+  mw=cols*xstep;
+  mh=rows*ystep;
+
+  sizecontrol(&sibig  ,mw,mh,~3);
+  sizecontrol(&sismall, w, h,~3);
+
+  planealloc(PLuma   ,w,h);
+  if (!monochrome) planealloc(PChroma1,w,h);
+  if (!monochrome) planealloc(PChroma2,w,h);
+
+  planealloc(pmL,mw,mh);
+  mLuma.iwidth=mw;
+  mLuma.iheight=mh;
+  clearimpl(pmL,CONTLUM);
+
+  if(!monochrome)
+   { planealloc(pmCh1,mw,mh);
+     mChroma1.iwidth=mw;
+     mChroma1.iheight=mh;
+     clearimpl(pmCh1,CONTCH1);
+
+     planealloc(pmCh2,mw,mh);
+     mChroma2.iwidth=mw;
+     mChroma2.iheight=mh;
+     clearimpl(pmCh2,CONTCH2);
+   }
+
+
+  for(bildnr=0;bildnr<bilder;bildnr++)
+   {SEEK(offset+imsize*bildnr);
+  
+    eret=readplain(&sismall,1,PLuma,PChroma1,PChroma2);
+    if(eret==E_READ) break;
+    error(eret);
+
+    if(!monochrome)
+     {interpolate(PChroma1);
+      interpolate(PChroma2);
+     }
+
+    switch(hbuf[12+bildnr] & 3)
+     {case 0:  imorient=T_NONE;  break;
+      case 1:  imorient=T_LEFT;  break;
+      case 2:  imorient=T_HEAD;  break;
+      case 3:  imorient=T_RIGHT; break;
+      default: imorient=T_NONE;
+     }
+    pastein(pmL,(bildnr%cols)*xstep,xstep,(bildnr/cols)*ystep,ystep,PLuma,((turn==T_AUTO)? imorient:turn));
+    if(!monochrome)
+     {pastein(pmCh1,(bildnr%cols)*xstep,xstep,(bildnr/cols)*ystep,ystep,PChroma1,((turn==T_AUTO)? imorient:turn));
+      pastein(pmCh2,(bildnr%cols)*xstep,xstep,(bildnr/cols)*ystep,ystep,PChroma2,((turn==T_AUTO)? imorient:turn));
+     }
+   }
+
+  colconvert(&sibig,pmL,pmCh1,pmCh2);
+
+  openoutput();
+  writepicture(fout,&sibig,pmL,pmCh1,pmCh2,contori);
+
+ }
+
+
+
+
+
+
+
+
+#define ASKIP { argc--; argv ++;}
+
+static void parseargs(int  argc,char **argv)
+ {
+  char *opt;
+
+  ASKIP;
+
+  while((argc>0) && argv[0][0]=='-' && argv[0][1])
+   {
+    opt= (*argv)+1;
+    ASKIP;
+
+/**** additional options ****/
+
+    if(!strcmp(opt,"x")) 
+     { if (!do_overskip) do_overskip=1;
+       else error(E_ARG);
+       continue;
+     }
+
+    if(!strcmp(opt,"s")) 
+     { if (!do_sharp) do_sharp=1;
+       else error(E_ARG);
+       continue;
+     }
+
+    if(!strcmp(opt,"d")) 
+     { if (!do_diff) do_diff=1;
+       else error(E_ARG);
+       continue;
+     }
+
+    if(!strcmp(opt,"i")) 
+     { if (!do_info) do_info=1;
+       else error(E_ARG);
+       continue;
+     }
+
+
+    if(!strcmp(opt,"m")) 
+     { if (!do_melde) do_melde=1;
+       else error(E_ARG);
+       continue;
+     }
+
+    if(!strcmp(opt,"crop")) 
+     { if (!do_crop) do_crop=1;
+       else error(E_ARG);
+       continue;
+     }
+
+    if(!strcmp(opt,"pos")) 
+     { if (!print_pos) print_pos=1;
+       else error(E_ARG);
+       continue;
+     }
+
+    if(!strcmp(opt,"rep")) 
+     { if (!do_rep) do_rep=1;
+       else error(E_ARG);
+       continue;
+     }
+
+/****  Orientation options ****/
+ 
+    if(!strcmp(opt,"n"))
+     {if (turn == T_UNSPEC) turn=T_NONE;
+      else error(E_ARG);
+      continue;
+     }
+
+    if(!strcmp(opt,"r"))
+     {if (turn == T_UNSPEC) turn=T_RIGHT;
+      else error(E_ARG);
+      continue;
+     }
+
+    if(!strcmp(opt,"l"))
+     {if (turn == T_UNSPEC) turn=T_LEFT;
+      else error(E_ARG);
+      continue;
+     }
+
+    if(!strcmp(opt,"h"))
+     {if (turn == T_UNSPEC) turn=T_HEAD;
+      else error(E_ARG);
+      continue;
+     }
+
+    if(!strcmp(opt,"a"))
+     {if (turn == T_UNSPEC) turn=T_AUTO;
+      else error(E_ARG);
+      continue;
+     }
+
+    if(!strcmp(opt,"vert"))
+     {if (!flvert) flvert=1;
+      else error(E_ARG);
+      continue;
+     }
+
+    if(!strcmp(opt,"hori"))
+     {if (!flhori) flhori=1;
+      else error(E_ARG);
+      continue;
+     }
+
+
+
+
+
+
+/**** Output options ****/
+
+
+    if((!strcmp(opt,"ppm")) || (!strcmp(opt,"PPM")))
+     { if (outfor == O_UNSPEC) outfor=O_PPM;
+       else error(E_ARG);
+       continue;
+     }
+
+#ifndef RISCOS_TWEAK
+/* Unused output options */
+    if((!strcmp(opt,"pgm")) || (!strcmp(opt,"PGM")))
+     { if (outfor == O_UNSPEC) outfor=O_PGM;
+       else error(E_ARG);
+       continue;
+     }
+
+    if(!strcmp(opt,"ycc")) 
+     { if (outfor == O_UNSPEC) outfor=O_YCC;
+       else error(E_ARG);
+       continue;
+     }
+
+    if((!strcmp(opt,"ps")) || (!strcmp(opt,"PS")))
+     { if (outfor == O_UNSPEC) outfor=O_PS;
+       else error(E_ARG);
+       continue;
+     }
+
+    if((!strcmp(opt,"eps")) || (!strcmp(opt,"EPS")))
+     { if (outfor == O_UNSPEC) outfor=O_EPS;
+       else error(E_ARG);
+       continue;
+     }
+
+    if((!strcmp(opt,"psg")) || (!strcmp(opt,"PSG")))
+     { if (outfor == O_UNSPEC) outfor=O_PSG;
+       else error(E_ARG);
+       continue;
+     }
+
+    if((!strcmp(opt,"epsg")) || (!strcmp(opt,"EPSG")))
+     { if (outfor == O_UNSPEC) outfor=O_EPSG;
+       else error(E_ARG);
+       continue;
+     }
+
+    if((!strcmp(opt,"psd")) || (!strcmp(opt,"PSD")))
+     { if (outfor == O_UNSPEC) outfor=O_PSD;
+       else error(E_ARG);
+       continue;
+     }
+
+    if((!strcmp(opt,"epsd")) || (!strcmp(opt,"EPSD")))
+     { if (outfor == O_UNSPEC) outfor=O_EPSD;
+       else error(E_ARG);
+       continue;
+     }
+
+
+
+
+
+    if(!strcmp(opt,"pl" ))
+     { if(argc<1) error(E_ARG);
+       if((sscanf(*argv,SSFLTPT,&PAPER_LEFT))!=1) error(E_ARG);
+       ASKIP;
+       continue;
+     }
+
+    if(!strcmp(opt,"pb" ))
+     { if(argc<1) error(E_ARG);
+       if((sscanf(*argv,SSFLTPT,&PAPER_BOTTOM))!=1) error(E_ARG);
+       ASKIP;
+       continue;
+     }
+
+
+    if(!strcmp(opt,"pw" ))
+     { if(argc<1) error(E_ARG);
+       PSIZE_SET=1;
+       if((sscanf(*argv,SSFLTPT,&PAPER_WIDTH))!=1) error(E_ARG);
+       ASKIP;
+       continue;
+     }
+
+    if(!strcmp(opt,"ph" ))
+     { if(argc<1) error(E_ARG);
+       PSIZE_SET=1;
+       if((sscanf(*argv,SSFLTPT,&PAPER_HEIGHT))!=1) error(E_ARG);
+       ASKIP;
+       continue;
+     }
+
+
+    if(!strcmp(opt,"dpi" ))
+     { if(argc<1) error(E_ARG);
+       DPI_SET=1;
+       if((sscanf(*argv,SSFLTPT,&PRINTER_XDPI))!=1) error(E_ARG);
+       if(PRINTER_XDPI <= 0.0) error(E_OPT);
+       PRINTER_YDPI=PRINTER_XDPI;
+       ASKIP;
+       continue;
+     }
+
+    if(!strcmp(opt,"fak" ))
+     { if(argc<1) error(E_ARG);
+       FAK_SET=1;
+       if((sscanf(*argv,SSFLTPT,&PRINTER_FAK))!=1) error(E_ARG);
+       if(PRINTER_FAK <= 0.0) error(E_OPT);
+       if(PRINTER_FAK >  1000.0) error(E_OPT);
+       ASKIP;
+       continue;
+     }
+/* Unused output options */
+#endif
+
+
+/**** Color model options ****/
+
+    if(!strcmp(opt,"c0")) 
+     { if (corrmode == C_UNSPEC) corrmode = C_LINEAR;
+       else error(E_ARG);
+       continue;
+     }
+
+    if(!strcmp(opt,"c-")) 
+     { if (corrmode == C_UNSPEC) corrmode = C_DARK;
+       else error(E_ARG);
+       continue;
+     }
+
+    if(!strcmp(opt,"c+")) 
+     { if (corrmode == C_UNSPEC) corrmode = C_BRIGHT;
+       else error(E_ARG);
+       continue;
+     }
+
+   
+/**** Subrectangel option ****/
+    
+    if(!strcmp(opt,"S"))
+     { if (suba1) error(E_ARG);
+       if(argc<2) error(E_ARG);
+       suba1=argv[0];
+       ASKIP;
+       suba2=argv[0];
+       ASKIP;
+       continue;
+     }
+
+
+/**** Resolution options ****/
+   
+    if((!strcmp(opt,"Base/16")) || (!strcmp(opt,"1"))  || (!strcmp(opt,"128x192")))
+     { if (size == S_UNSPEC) size = S_Base16;
+       else error(E_ARG);
+       continue;
+     }
+    if((!strcmp(opt,"Base/4" )) || (!strcmp(opt,"2"))  || (!strcmp(opt,"256x384")))
+     { if (size == S_UNSPEC) size = S_Base4;
+       else error(E_ARG);
+       continue;
+     }
+    if((!strcmp(opt,"Base"   )) || (!strcmp(opt,"3"))  || (!strcmp(opt,"512x768")))
+     { if (size == S_UNSPEC) size = S_Base;
+       else error(E_ARG);
+       continue;
+     }
+    if((!strcmp(opt,"4Base"  )) || (!strcmp(opt,"4"))  || (!strcmp(opt,"1024x1536")))
+     { if (size == S_UNSPEC) size = S_4Base;
+       else error(E_ARG);
+       continue;
+     }
+    if((!strcmp(opt,"16Base" )) || (!strcmp(opt,"5"))  || (!strcmp(opt,"2048x3072")))
+     { if (size == S_UNSPEC) size = S_16Base;
+       else error(E_ARG);
+       continue;
+     }
+
+    if((!strcmp(opt,"64Base" )) || (!strcmp(opt,"6"))  || (!strcmp(opt,"4096x6144")))
+     { if (size == S_UNSPEC) size = S_64Base;
+       else error(E_ARG);
+/*
+       if(argc<1) error(E_ARG);
+       dir64=argv[0];
+       ASKIP;
+*/
+       continue;
+     }
+
+    if((!strcmp(opt,"Overview" )) || (!strcmp(opt,"0"))  || (!strcmp(opt,"O")))
+     { if (size == S_UNSPEC) size = S_Over;
+       else error(E_ARG);
+       continue;
+     }
+
+    if((!strcmp(opt,"Contact" )) || (!strcmp(opt,"C")))
+     { if (size == S_UNSPEC) size = S_Contact;
+       else error(E_ARG);
+       if(argc<2) error(E_ARG);
+       if((sscanf(*argv,"%d",&contsize))!=1) error(E_ARG);
+       ASKIP;
+       if     (!strcmp(*argv,"n")) contori=T_NONE;
+       else if(!strcmp(*argv,"r")) contori=T_RIGHT;
+       else if(!strcmp(*argv,"l")) contori=T_LEFT;
+       else if(!strcmp(*argv,"h")) contori=T_HEAD;
+       else error(E_ARG);
+       ASKIP;
+
+       continue;
+     }
+
+   fprintf(stderr,"Unknown option: -%s\n",opt);
+   error(E_ARG);
+   }
+
+  
+  if(argc<1) error(E_ARG);
+  pcdname= *argv;
+  ASKIP;
+
+  if(argc>0) 
+   {ppmname= *argv;
+    ASKIP;
+   }
+  
+  if(argc>0) error(E_ARG);
+
+
+ }
+#undef ASKIP
+
+
+
+
+
+
+
+
+
+
+static void checkin(void)
+ { 
+   if (do_info || (turn==T_AUTO)) 
+     { SEEK(1);
+       EREADBUF;
+     }
+
+    if(turn==T_AUTO) 
+     {
+      switch(sbuffer[0xe02 & 0x7ff]&0x03)
+       {case 0x00: turn=T_NONE;  break;
+        case 0x01: turn=T_LEFT;  break;
+        case 0x02: turn=T_HEAD;  break;
+        case 0x03: turn=T_RIGHT; break;
+        default: error(E_TCANT);
+       }
+      }
+
+    if(do_info) druckeid();
+
+ }
+
+
+
+/************************** file access functions **************/
+
+int READ(uBYTE *ptr,int n)
+ {int d;
+  if(!n) return 1;
+  bufpos+=n;
+  for(;;)
+   {d=fread((char *)ptr,1,n,fin);
+    if(d<1) return 0;
+    n-=d;
+    if (!n) break;
+    ptr+=d;
+   }
+  return 1;
+ }
+
+static int friss(int n)
+ {int d;
+
+  while(n>0)
+   {
+    d= n>sizeof(sbuffer) ? sizeof(sbuffer) : n;
+    n-=d;
+    if(READ(sbuffer,d) !=1) return 1;
+   }
+
+  return 0;
+ }
+
+
+void SEEK(int x)
+ {
+  x *= SECSIZE;
+  if(x<bufpos) error(E_INTERN);
+  if(x==bufpos) return;
+
+  if(emulate_seek)
+   {if(friss(x-bufpos)) error(E_READ);
+    if(x!=bufpos) error(E_INTERN);
+   }
+  else
+   {bufpos=x;
+    if (fseek(fin,x,0)) error(E_READ);
+   }
+#ifdef DEBUG
+  fprintf(stderr,"S-Position %x\n",bufpos);
+#endif
+
+ }
+
+
+
+int SKIPn(int n)
+ {
+  if(!n) return 0;
+  if(n<0) error(E_INTERN);
+    
+  if(emulate_seek)
+   {return friss(n);
+   }
+  else
+   {bufpos+=n;
+    return fseek(fin,(n),1);
+   }
+ }
+
+
+
+
+
+/************************** size control functions **************/
+
+#define ISDIGIT(x) (((x)>='0') && ((x)<='9'))
+
+static void number(char **s,char **i,char **f)
+ {char *p;
+
+  p= *s;
+  (*i)=(*f)=0;
+
+  if(!ISDIGIT(*p)) error(E_SUBR);
+  while(ISDIGIT(*p)) p++;
+  if(*p != '.') 
+   { *i=*s;
+     *s=p; 
+     return;
+   }
+  p++;
+  if(!ISDIGIT(*p)) error(E_SUBR);
+  while(ISDIGIT(*p)) p++;
+  *f=*s;
+  *s=p;  
+ }
+
+static sdim makedim(sdim full,char *i,char *f)
+ {sdim val;
+  FLTPT fl;
+
+  if(i) 
+   {if(f) error(E_INTERN);
+    if(sscanf(i,"%u",&val) != 1) error(E_SUBR);
+    if((val<0) || (val >full)) error(E_SUBR);
+    return val;
+   }
+  else
+   {if(!f) error(E_INTERN);
+    if(sscanf(f,SSFLTPT,&fl) != 1) error(E_SUBR);
+    if((fl < 0.0) || (fl > 1.0)) error(E_SUBR);
+    val= full * fl + 0.5;
+    return val;
+   }
+ }
+
+/*
+#define xsMASK (~7)
+#define sMASK (~15)
+*/
+static void sizealign(char *str,dim full,
+                      dim *rdoff,dim *rdlen,dim *imoff,dim *imlen,dim sMASK)
+ {char *i1,*f1,*tr,*i2,*f2,*ptr;
+  int vonbis=0;
+  sdim von,len,rest;
+
+  i1=f1=tr=i2=f2=0;
+
+  ptr=str;
+  number(&ptr,&i1,&f1);
+
+  if(*ptr == '-') vonbis=1;
+  else if (*ptr == '+') vonbis=0;
+  else error(E_SUBR);
+  ptr++;
+
+  number(&ptr,&i2,&f2);
+  if(*ptr) error(E_SUBR);
+
+  von=makedim(full,i1,f1);
+  len=makedim(full,i2,f2);
+  if(vonbis) len-=von;
+  rest=full-von-len;
+
+  if((von<0) || (len<1) || (rest<0)) error(E_SUBR);
+  
+  *imlen = (dim) len;
+
+  *rdoff = (dim) (von & sMASK); 
+  *rdlen = full - *rdoff - ((dim)( rest & sMASK) );
+
+  *imoff = ((dim) von) - *rdoff;
+
+ }
+
+
+static void sizecontrol(sizeinfo *si,dim w,dim h,dim sMASK)
+ {
+  si->w=w;
+  si->h=h;
+
+  if(!suba1)
+   {
+    si->rdhlen=w;
+    si->rdvlen=h;
+    si->rdhoff=0;
+    si->rdvoff=0;
+    si->imhlen=0;
+    si->imvlen=0;
+    si->imhoff=0;
+    si->imvoff=0;
+   }
+  else
+   {sizealign(suba1,w,&si->rdhoff,&si->rdhlen,&si->imhoff,&si->imhlen,sMASK);
+    sizealign(suba2,h,&si->rdvoff,&si->rdvlen,&si->imvoff,&si->imvlen,sMASK);
+   }
+
+#ifdef DEBUG
+  fprintf(stderr,"Align: %5d %5d \n",si->w,si->h);
+  fprintf(stderr,"Align: %5d %5d %5d %5d \n",si->rdhoff,si->rdhlen,si->rdvoff,si->rdvlen);
+  fprintf(stderr,"Align: %5d %5d %5d %5d \n",si->imhoff,si->imhlen,si->imvoff,si->imvlen);
+#endif
+
+ }
+ 
+
+
+/* Thanks to James Pearson for writing get_dir64 */
+
+/* finds dir64 from the given input filename 
+   Had to change DIRSEP from a string to a character */
+static void get_dir64(void)
+{
+	char	name[32];
+	char	*n, *p, *d;
+	
+	d = dir64;
+
+	/* find if input filename includes a path */
+	if ((p = strrchr(pcdname,DIRSEP)) == 0)
+		p = pcdname;
+	else
+	{
+		/* copy path to start of dir64 */
+		n = pcdname;
+		p++;
+		while (n < p)
+			*d++ = *n++;
+	}
+
+	/* get first part of filename (the bit before .pcd) */
+	n = name; 
+	while (*p != '.' && *p != '\0')
+		*n++ = *p++;
+
+	*n = '\0';
+
+#ifdef DEBUG
+	*d = '\0';
+	fprintf(stderr,"Path64: %s\nName64: %s\n",dir64,name);
+#endif
+
+	/* construct path */
+#ifdef SMALLNAMES
+	sprintf(d,"..%cipe%c%s%c64base",DIRSEP,DIRSEP,name,DIRSEP);
+#else
+	sprintf(d,"..%cIPE%c%s%c64BASE",DIRSEP,DIRSEP,name,DIRSEP);
+#endif
+}

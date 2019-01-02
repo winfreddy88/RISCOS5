@@ -1,0 +1,524 @@
+/*
+ * Copyright (c) 2017, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include <stdlib.h>
+#include <stdio.h>
+#include "kernel.h"
+#include "swis.h"
+
+#include "DebugLib/DebugLib.h"
+
+#include "Global/OSMem.h"
+#include "Global/OSMisc.h"
+
+#include "tiler.h"
+#include "regs.h"
+#include "gvoverlay.h"
+#include "buffer.h"
+#include "pmp.h"
+#include "consts.h"
+#include "utils.h"
+
+#define ERROR_BAD_BANK ((_kernel_oserror*)"\0\0\0\0Bad bank")
+#define ERROR_BAD_DESC ((_kernel_oserror*)"\0\0\0\0Buffer descriptor unacceptable")
+
+//#define TILER_CACHEABLE
+
+#ifdef TILER_CACHEABLE
+#define TILER_MEMORY_FLAGS (OSMemReason_MapIOPermanent+(1<<17)+(memory_access_privilege<<24)+(CP_CB_Writethrough<<10)+(3<<8)) /* Write-through cacheable, user R/W */
+static void (*clean_invalidate)(int base,int limit);
+#else
+#define TILER_MEMORY_FLAGS (OSMemReason_MapIOPermanent+(1<<17)+(memory_access_privilege<<24)+(1<<8)) /* Bufferable, user R/W */
+#endif
+
+#define TILER_CONTAINER_SIZE	(1<<27) /* 128MB */
+#define TILER_VIEW_SIZE			(4<<27) /* 512MB */
+#define TILER_ALIASED_CONTAINER	0x60000000 /* Base physical address of the CPU-accessible container; DMM_TILER_OR registers control which view it accesses for each initiator */
+
+/* Offsets of each container within a view */
+#define TILER_CONTAINER_8BIT	(0*TILER_CONTAINER_SIZE)
+#define TILER_CONTAINER_16BIT	(1*TILER_CONTAINER_SIZE)
+#define TILER_CONTAINER_32BIT	(2*TILER_CONTAINER_SIZE)
+#define TILER_CONTAINER_PAGE	(3*TILER_CONTAINER_SIZE)
+
+#define TILER_VIEW_NATURAL		0
+#define TILER_VIEW_VMIRROR		1
+#define TILER_VIEW_HMIRROR		2
+#define TILER_VIEW_180			3
+#define TILER_VIEW_90_VMIRROR	4
+#define TILER_VIEW_270			5
+#define TILER_VIEW_90			6
+#define TILER_VIEW_90_HMIRROR	7
+
+#define TILER_VIEW_XBIT			1 /* X axis is flipped */
+#define TILER_VIEW_YBIT			2 /* Y axis is flipped */
+#define TILER_VIEW_SBIT			4 /* X & Y axis swapped (after any flipping) */
+
+/* Map GraphicsV rotations to TILER rotations */
+static const uint8_t rot_lut[4] = { TILER_VIEW_NATURAL, TILER_VIEW_90, TILER_VIEW_180, TILER_VIEW_270 };
+
+/* It's assumed that all these are the same */
+#define TILER_PAGE_SIZE_LOG2	12
+#define PAT_PAGE_SIZE_LOG2		12
+#define ARM_PAGE_SIZE_LOG2		12
+
+#define PAT_TABLE_WIDTH		256
+#define PAT_TABLE_HEIGHT	128
+
+static volatile dmm_regs_t *dmm;
+
+typedef struct {
+	uint8_t x0,y0,x1,y1; /* Inclusive coordinates of rectangle within PAT */
+	pmp_block_t *pmp; /* Memory backing, NULL if this entry isn't in use */
+} pat_mapping_t;
+
+/* Trivial PAT management. Split PAT into two areas each 128x128 pages in size (max framebuffer size 4Kx4K in 32bpp)
+   This will need revising once we need more than two areas (e.g. >2 rotated overlays, or planar YUV) */
+#define MAX_PAT_MAPPING 2
+#define MAX_MAPPING_WIDTH (PAT_TABLE_WIDTH/2)
+#define MAX_MAPPING_HEIGHT PAT_TABLE_HEIGHT
+static pat_mapping_t pat_mappings[MAX_PAT_MAPPING] = {
+	{ .x0 = 0, .y0 = 0 },
+	{ .x0 = MAX_MAPPING_WIDTH, .y0 = 0 },
+};
+
+/* Dimensions of the TILER view for each BPP */
+#define TILER_WIDTH_LOG2(bpp) ((bpp)==32?13:14)
+#define TILER_HEIGHT_LOG2(bpp) ((bpp)==8?13:12)
+
+/* PAT/TILER page sizes in pixels, for each BPP (for the natural view)
+   This is an inverse of the equation given in section 15.2.5.4.2 of the OMAP4 TRM ("TILER Page Mapping") */
+#define TILER_PAGE_CONFIGURATION_c (TILER_PAGE_SIZE_LOG2-12)
+#define TILER_PAGE_DIMENSIONS(bpp) (1<<TILER_WIDTH_LOG2(bpp))/(64*(1<<(2-TILER_PAGE_CONFIGURATION_c))), (1<<TILER_HEIGHT_LOG2(bpp))/(32*(1<<(2-TILER_PAGE_CONFIGURATION_c)))
+static const uint8_t page_sizes[3][2] = {
+	{ TILER_PAGE_DIMENSIONS(8) }, /* 64x64 */
+	{ TILER_PAGE_DIMENSIONS(16) }, /* 64x32 */
+	{ TILER_PAGE_DIMENSIONS(32) }, /* 32x32 */
+};
+
+static void pat_fill(const pat_mapping_t *mapping)
+{
+	uint32_t pa = mapping->pmp->pa;
+	for(uint32_t y=mapping->y0;y<=mapping->y1;y++)
+	{
+		for(uint32_t x=mapping->x0;x<=mapping->x1;x++)
+		{
+			dmm->pat_refill[0].area = (x<<DMM_PAT_AREA_X0_SHIFT)+(y<<DMM_PAT_AREA_Y0_SHIFT);
+			dmm->pat_refill[0].data = pa;
+			pa += 1<<PAT_PAGE_SIZE_LOG2;
+		}
+	}
+	dprintf(("","refill status: %08x\n",dmm->pat_status[0]));
+}
+
+/* Translate a pixel coordinate (in natural view) to a PAT page coordinate
+   As per section 15.2.5.4.2 of OMAP4 TRM ("TILER Page Mapping") */
+static void tiler_to_pat(uint32_t x,uint32_t y,uint32_t log2W,uint32_t log2H,uint32_t *Px,uint32_t *Py)
+{
+	const uint32_t c = TILER_PAGE_SIZE_LOG2-12;
+	*Px = (64*x*(1<<(2-c)))>>log2W;
+	*Py = (32*y*(1<<(2-c)))>>log2H;
+//	dprintf(("","%d x %d @ %d x %d -> %d x %d\n",x,y,log2W,log2H,*Px,*Py));
+}
+
+#if 0
+/* Calculate width & height (in PAT pages) of a framebuffer with the given (natural) dimensions */
+static void pat_dimensions(uint32_t w,uint32_t h,uint32_t bpp,uint32_t *Pw,uint32_t *Ph)
+{
+	uint32_t log2W = (bpp==32?13:14);
+	uint32_t log2H = (bpp==8?13:12);
+	tiler_to_pat(w-1,h-1,log2W,log2H,Pw,Ph); /* Get coordinate of bottom-right pixel */
+	(*Pw)++; /* +1 to get required dimensions */
+	(*Ph)++;
+}
+#endif
+
+typedef struct {
+	uint32_t addr; /* Address within the 4GB TILER virtual address space
+	                  Bits 31-29 give view/rotation (i.e. which 512MB view to use)
+	                  Bits 28-27 give element size (which 128MB container to use)
+	                  Bits 26-0 give X,Y coodinates within that view
+	                  The OS always uses natural view, so this can be used as an offset into the aliased container in order to get CPU-accessible address */
+	uint32_t stride; /* Row stride */
+	uint32_t bank_offsets[2]; /* Bank offsets in A & B directions */
+} tiler_view_t;
+
+typedef struct {
+	tiler_view_t gpu,os; /* Different buffer views to be used by GPU & OS */
+	uint32_t Pw,Ph; /* PAT area required */
+	uint8_t banks[2]; /* Number of banks in A & B directions */
+} tiler_config_t;
+
+typedef struct {
+	buffer_t base;
+	tiler_config_t config;
+	pat_mapping_t *mapping;
+	uint8_t *os_la; /* Virtual address of OS view of first bank */
+} tiler_buffer_t;
+
+static bool tiler_vet(const buffer_desc_t *desc);
+static _kernel_oserror *tiler_create(const buffer_desc_t *desc,buffer_t **out_buffer);
+static _kernel_oserror *tiler_destroy(buffer_t *buffer);
+static _kernel_oserror *tiler_config_gpu(buffer_t *buffer,uint32_t bank,uint32_t *out_pa,uint32_t *out_pa2,uint32_t *out_stride);
+static _kernel_oserror *tiler_release_gpu(buffer_t *buffer,uint32_t bank);
+static _kernel_oserror *tiler_config_cpu(buffer_t *buffer,uint32_t bank,void **out_la,void **out_la2,uint32_t *out_stride);
+static _kernel_oserror *tiler_release_cpu(buffer_t *buffer,uint32_t bank);
+static _kernel_oserror *tiler_discard(buffer_t *buffer,uint32_t bank);
+#ifdef DEBUGLIB
+static void tiler_describe(buffer_t *buffer);
+#endif
+
+
+static buffer_if_t tiler_if = 
+{
+	.vet = tiler_vet,
+	.create = tiler_create,
+	.destroy = tiler_destroy,
+	.config_gpu = tiler_config_gpu,
+	.release_gpu = tiler_release_gpu,
+	.config_cpu = tiler_config_cpu,
+	.release_cpu = tiler_release_cpu,
+	.discard = tiler_discard,
+#ifdef DEBUGLIB
+	.describe = tiler_describe,
+#endif
+};
+
+void tiler_init(void)
+{
+	/* TODO: Get this from a HAL device or something */
+	_swix(OS_Memory,_INR(0,2)|_OUT(3),13,0x4e000000,4096,&dmm);
+	/* Disable refill engine 0 - for simplicity we program PAT manually */
+	dmm->pat_config = DMM_PAT_CONFIG_MODE0;
+	/* Set up PAT views */
+	dmm->pat_view[0] = ((uint32_t)(DMM_PAT_VIEW_VIEW_WRITE))*0x11111111u;
+	dmm->pat_view[1] = ((uint32_t)(DMM_PAT_VIEW_VIEW_WRITE))*0x11111111u;
+	dmm->pat_view_map[0] = DMM_PAT_VIEW_MAP_CONT_ACCESS_8 | DMM_PAT_VIEW_MAP_CONT_ACCESS_16 | DMM_PAT_VIEW_MAP_CONT_ACCESS_32 | DMM_PAT_VIEW_MAP_CONT_ACCESS_PAGE;
+	/* Ensure translated PAT addresses target RAM */
+	dmm->pat_view_map_base = DMM_PAT_VIEW_MAP_BASE_BASE_ADDR;
+	/* Set the aliased container to natural view, for all initiators */
+	dmm->tiler_or[0] = ((uint32_t)(TILER_VIEW_NATURAL | DMM_TILER_OR_ORIENTATION_WRITE))*0x11111111u;
+	dmm->tiler_or[1] = ((uint32_t)(TILER_VIEW_NATURAL | DMM_TILER_OR_ORIENTATION_WRITE))*0x11111111u;
+	/* Register with the buffer manager */
+	buffer_rotation_if = &tiler_if;
+}
+
+static bool tiler_get_config(const buffer_desc_t *desc,tiler_config_t *ret,uint8_t Px,uint8_t Py)
+{
+	uint32_t width = desc->width;
+	uint32_t height = desc->height;
+	uint32_t bpp = pixel_format_bpp[desc->format];
+	/* YUV needs treating as 32bpp */
+	if (buffer_alignment_pixels[desc->format])
+	{
+		bpp = 32;
+		width>>=1; /* This should be guaranteed to be a multiple of two */
+	}
+	/* Get pixel dimensions of the (natural) view for this BPP */
+	uint32_t log2W = (bpp==32?13:14);
+	uint32_t log2H = (bpp==8?13:12);
+	/* Pack screen banks side-by-side so that they fit within MAX_MAPPING_WIDTH x MAX_MAPPING_HEIGHT area */
+	uint32_t maxbanks[2];
+	maxbanks[0] = (1<<log2W)/width; /* N.B. this calculates the max as if we could use all of PAT! MAX_MAPPING_WIDTH / MAX_MAPPING_HEIGHT restriction is only applied below (inefficient!) */
+	maxbanks[1] = (1<<log2H)/height;
+	if (maxbanks[0] >= 256)
+	{
+		maxbanks[0] = 255;
+	}
+	if (maxbanks[1] >= 256)
+	{
+		maxbanks[1] = 255;
+	}
+	if (maxbanks[0]*maxbanks[1] <= desc->maxbank)
+	{
+		return false;
+	}
+	ret->Pw = MAX_MAPPING_WIDTH+1;
+	ret->Ph = MAX_MAPPING_HEIGHT+1;
+	ret->banks[0] = ret->banks[1] = 0;
+	for(int i=1;i<=maxbanks[0];i++)
+	{
+		for(int j=1;j<=maxbanks[1];j++)
+		{
+			if (i*j <= desc->maxbank)
+			{
+				continue;
+			}
+			/* Work out dimensions of PAT area */
+			uint32_t Pw,Ph;
+			tiler_to_pat(i*width-1,j*height-1,log2W,log2H,&Pw,&Ph);
+			Pw++;
+			Ph++;
+			if ((Pw > MAX_MAPPING_WIDTH) || (Ph > MAX_MAPPING_HEIGHT))
+			{
+				/* Too big for our memory management */
+				continue;
+			}
+			if ((Pw*Ph < ret->Pw*ret->Ph) /* If it uses less memory */
+			|| ((Pw*Ph == ret->Pw*ret->Ph) && (i*j > ret->banks[0]*ret->banks[1]))) /* Or fits more banks in the same space */
+			{
+				/* Then accept it as the new best */
+				ret->Pw = Pw;
+				ret->Ph = Ph;
+				ret->banks[0] = i;
+				ret->banks[1] = j;
+			}
+		}
+	}
+	if (ret->Pw == MAX_MAPPING_WIDTH+1)
+	{
+		return false;
+	}
+
+	uint32_t log2bpp = log2(bpp)-3; /* log2 bytes per pixel */
+	ret->os.stride = 1<<(log2W+log2bpp);
+	if (desc->rotation & 1)
+	{
+		ret->gpu.stride = 1<<(log2H+log2bpp);
+	}
+	else
+	{
+		ret->gpu.stride = 1<<(log2W+log2bpp);
+	}
+
+	/* Get the pixel dimensions of the TILER container */
+	uint32_t buffer_width = 1<<log2W;
+	uint32_t buffer_height = 1<<log2H;
+	/* Get the pixel coordinates of 0,0 within the first screen bank (for natural view) */
+	uint32_t x = 0 + Px*page_sizes[log2bpp][0];
+	uint32_t y = 0 + Py*page_sizes[log2bpp][1];
+	dprintf(("","top-left at %dx%d\n",x,y));
+	/* Calculate inter-bank offsets, and offset to first bank within window */
+	ret->os.addr = (x<<log2bpp) | (y*ret->os.stride) | (log2bpp<<27);
+	ret->os.bank_offsets[0] = width<<log2bpp;
+	ret->os.bank_offsets[1] = height*ret->os.stride;
+	switch(desc->rotation)
+	{
+	case 0:
+		ret->gpu.addr = (x<<log2bpp) | (y*ret->gpu.stride);
+		ret->gpu.bank_offsets[0] = width<<log2bpp;
+		ret->gpu.bank_offsets[1] = height*ret->gpu.stride;
+		break;
+	case 1:
+		/* Skip padding rows that were inserted on the bottom of the unrotated image
+		   (which will appear on the left edge of this rotated view) */
+		ret->gpu.addr = ((buffer_height - (height+y))<<log2bpp) + (x*ret->gpu.stride);
+		ret->gpu.bank_offsets[0] = width*ret->gpu.stride;
+		ret->gpu.bank_offsets[1] = -height<<log2bpp;
+		break;
+	case 2:
+		/* Skip padding row and columns */
+		ret->gpu.addr = (buffer_height - (height+y))*ret->gpu.stride + ((buffer_width - (width+x))<<log2bpp);
+		ret->gpu.bank_offsets[0] = -width<<log2bpp;
+		ret->gpu.bank_offsets[1] = -height*ret->gpu.stride;
+		break;
+	case 3:
+		/* Skip padding columns that were inserted to the right of the unrotated image
+		   (which will appear on the top edge of this rotated view) */
+		ret->gpu.addr = (buffer_width - (width+x))*ret->gpu.stride + (y<<log2bpp);
+		ret->gpu.bank_offsets[0] = -width*ret->gpu.stride;
+		ret->gpu.bank_offsets[1] = height<<log2bpp;
+		break;
+	}
+	/* Fill in the high bits of the GPU address */
+	ret->gpu.addr |= (log2bpp<<27) | (rot_lut[desc->rotation]<<29);
+	return true;
+}
+
+static _kernel_oserror *tiler_program_mapping(const tiler_config_t *config,pat_mapping_t *m)
+{
+	/* Allocate the backing pages */
+	_kernel_oserror *e = pmp_alloc((config->Pw*config->Ph)<<PAT_PAGE_SIZE_LOG2,&m->pmp);
+	if (e)
+	{
+		return e;
+	}
+	/* Fill in rectangle details */
+	m->x1 = m->x0 + config->Pw-1;
+	m->y1 = m->y0 + config->Ph-1;
+	/* Program PAT */
+	pat_fill(m);
+	dmb();
+	return NULL;
+}
+
+static void tiler_release_mapping(pat_mapping_t *m)
+{
+	/* TODO: Disable within TILER */
+	pmp_free(m->pmp);
+	m->pmp = NULL;
+}
+
+static bool tiler_vet(const buffer_desc_t *desc)
+{
+	tiler_config_t config;
+	if (FORMAT_IS_NV12(desc->format))
+	{
+		/* Not supported yet */
+		return false;
+	}
+	return tiler_get_config(desc,&config,0,0);
+}
+
+static _kernel_oserror *tiler_create(const buffer_desc_t *desc,buffer_t **out_buffer)
+{
+	/* Look for a free block */
+	pat_mapping_t *m = NULL;
+	for(int i=0;i<MAX_PAT_MAPPING;i++)
+	{
+		if (!pat_mappings[i].pmp)
+		{
+			m = &pat_mappings[i];
+			break;
+		}
+	}
+	if (!m)
+	{
+		return (_kernel_oserror *)"\0\0\0\0No free PAT mappings";
+	}
+	/* Get a config with the correct coordinates for this block */
+	tiler_config_t config;
+	if (!tiler_get_config(desc,&config,m->x0,m->y0))
+	{
+		return ERROR_BAD_DESC;
+	}
+	tiler_buffer_t *b = calloc(1,sizeof(tiler_buffer_t));
+	if (!b)
+	{
+		return (_kernel_oserror *)"\0\0\0\0No memory";
+	}
+	b->base.iface = &tiler_if;
+	b->config = config;
+	b->mapping = m;
+	b->os_la = NULL;
+	/* Allocate the memory + configure PAT */
+	_kernel_oserror *e = tiler_program_mapping(&b->config,b->mapping);
+	if (e)
+	{
+		free(b);
+		return e;
+	}
+	*out_buffer = &b->base;
+	return NULL;
+}
+
+static _kernel_oserror *tiler_destroy(buffer_t *buffer)
+{
+	tiler_buffer_t *b = (tiler_buffer_t *) buffer;
+	tiler_release_mapping(b->mapping);
+	free(b);
+	return NULL;
+}
+
+static _kernel_oserror *tiler_config_gpu(buffer_t *buffer,uint32_t bank,uint32_t *out_pa,uint32_t *out_pa2,uint32_t *out_stride)
+{
+	tiler_buffer_t *b = (tiler_buffer_t *) buffer;
+	uint32_t bankvals[2];
+	bankvals[0] = bank % b->config.banks[0];
+	bankvals[1] = bank / b->config.banks[0];
+	if (bankvals[1] >= b->config.banks[1])
+	{
+		return ERROR_BAD_BANK;
+	}
+	*out_pa = b->config.gpu.addr + bankvals[0]*b->config.gpu.bank_offsets[0] + bankvals[1]*b->config.gpu.bank_offsets[1];
+	*out_stride = b->config.gpu.stride;
+	return NULL;
+}
+
+static _kernel_oserror *tiler_release_gpu(buffer_t *buffer,uint32_t bank)
+{
+	(void) buffer;
+	(void) bank;
+	/* NOP */
+	return NULL;
+}
+
+static _kernel_oserror *tiler_config_cpu(buffer_t *buffer,uint32_t bank,void **out_la,void **out_la2,uint32_t *out_stride)
+{
+	tiler_buffer_t *b = (tiler_buffer_t *) buffer;
+	uint32_t bankvals[2];
+	bankvals[0] = bank % b->config.banks[0];
+	bankvals[1] = bank / b->config.banks[0];
+	if (bankvals[1] >= b->config.banks[1])
+	{
+		return ERROR_BAD_BANK;
+	}
+	if (b->os_la == NULL)
+	{
+		/* Map the container we care about */
+		uint32_t base_phys = (b->config.os.addr & (3<<27)) + TILER_ALIASED_CONTAINER;
+		uint32_t base_log;
+		_kernel_oserror *e = _swix(OS_Memory,
+			_INR(0,2)|_OUT(3),
+			TILER_MEMORY_FLAGS,
+			base_phys,
+			TILER_CONTAINER_SIZE,
+			&base_log);
+		if (e)
+		{
+			return e;
+		}
+#ifdef TILER_CACHEABLE
+		/* In case something else was previously mapped here, clean + invalidate the cache for the region */
+		clean_invalidate(base,base+TILER_CONTAINER_SIZE); /* Just do the whole thing for simplicity (slow!) */
+#endif
+		b->os_la = ((uint8_t *)base_log) + (b->config.os.addr & ~(3<<27));
+	}
+	*out_la = b->os_la + bankvals[0]*b->config.os.bank_offsets[0] + bankvals[1]*b->config.os.bank_offsets[1];
+	*out_stride = b->config.os.stride;
+	return NULL;
+}
+
+static _kernel_oserror *tiler_release_cpu(buffer_t *buffer,uint32_t bank)
+{
+	(void) buffer;
+	(void) bank;
+	/* NOP */
+	return NULL;
+}
+
+static _kernel_oserror *tiler_discard(buffer_t *buffer,uint32_t bank)
+{
+	(void) buffer;
+	(void) bank;
+	/* NOP */
+	return NULL;
+}
+
+#ifdef DEBUGLIB
+static void tiler_describe(buffer_t *buffer)
+{
+	tiler_buffer_t *b = (tiler_buffer_t *) buffer;
+	printf(" TILER buffer:\n");
+	printf("  GPU addr %08x stride %08x bank_offsets %08x %08x\n",b->config.gpu.addr,b->config.gpu.stride,b->config.gpu.bank_offsets[0],b->config.gpu.bank_offsets[1]);
+	printf("   OS addr %08x stride %08x bank_offsets %08x %08x\n",b->config.os.addr,b->config.os.stride,b->config.os.bank_offsets[0],b->config.os.bank_offsets[1]);
+	printf("  PAT area %d x %d banks %d x %d\n",b->config.Pw,b->config.Ph,b->config.banks[0],b->config.banks[1]);
+	printf("  mapping %d x %d -> %d x %d\n",b->mapping->x0,b->mapping->y0,b->mapping->x1,b->mapping->y1);
+	printf("  buffer PA %08x\n",b->mapping->pmp->pa);
+	printf("  os_la %08x\n",b->os_la);
+}
+#endif

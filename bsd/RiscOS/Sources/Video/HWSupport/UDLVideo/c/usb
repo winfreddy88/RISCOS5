@@ -1,0 +1,161 @@
+/*
+ * Copyright (c) 2014, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include <dev/usb/usb.h>
+#include <dev/usb/usbdi.h>
+#include <dev/usb/usbdevs.h>
+
+#include <stdio.h>
+#include <stdlib.h>
+
+#include "kernel.h"
+#include "swis.h"
+
+#include "Interface/HighFSI.h"
+
+#include "udl_riscos.h"
+
+usbd_status usbd_device2interface_handle(usbd_device_handle dev, u_int8_t ifaceno, usbd_interface_handle *iface)
+{
+	(void) ifaceno;
+
+	/* interface handle is just pointer to dev */
+	*iface = (usbd_interface_handle) dev;
+	return USBD_NORMAL_COMPLETION;
+}
+
+usbd_status usbd_open_pipe(usbd_interface_handle iface, u_int8_t address, u_int8_t flags, usbd_pipe_handle *pipe)
+{
+	(void) address;
+	(void) flags;
+
+	my_usbdev *mdev = (my_usbdev *) iface;
+	my_pipe *mpipe = (my_pipe *) malloc(sizeof(my_pipe));
+	if(!mpipe)
+		return USBD_NOMEM;
+	memset(mpipe,0,sizeof(my_pipe));
+	mpipe->dev = mdev;
+
+	/* TODO - Tune buffer size */
+	char buf[64];
+	sprintf(buf,"Devices#bulk;size%d;usbtimeout5000:$.%s",64*1024+1,mdev->devname);
+	if(_swix(OS_Find,_INR(0,1)|_OUT(0),OSFind_OpenOut+open_mustopen+open_nodir+open_nopath,buf,&mpipe->fh))
+	{
+		usbd_close_pipe((usbd_pipe_handle) mpipe);
+		return USBD_INVAL;
+	}
+
+	/* Get the DeviceFS buffer handle */
+	if(_swix(DeviceFS_CallDevice,_INR(0,2)|_OUTR(3,5),DeviceCall_USB_GetHandles2,mdev->devname,mpipe->fh,&mpipe->bufh,&mpipe->devh,&mpipe->strh))
+	{
+		usbd_close_pipe((usbd_pipe_handle) mpipe);
+		return USBD_INVAL;
+	}
+
+	/* Get the internal buffer info */
+	if(_swix(Buffer_InternalInfo,_IN(0)|_OUTR(0,2),mpipe->bufh,&mpipe->internal.handle,&mpipe->internal.service,&mpipe->internal.r12))
+	{
+		usbd_close_pipe((usbd_pipe_handle) mpipe);
+		return USBD_INVAL;
+	}
+
+	*pipe = (usbd_pipe_handle) mpipe;
+	return USBD_NORMAL_COMPLETION;
+}
+
+usbd_status usbd_close_pipe(usbd_pipe_handle pipe)
+{
+	my_pipe *mpipe = (my_pipe *) pipe;
+	if(mpipe->fh)
+	{
+		_swix(OS_Find,_INR(0,1),OSFind_Close,mpipe->fh);
+	}
+	free(mpipe);
+	return USBD_NORMAL_COMPLETION;
+}
+
+usbd_status usbd_do_request(usbd_device_handle dev, usb_device_request_t *req, void *data)
+{
+	my_usbdev *mdev = (my_usbdev *) dev;
+	_kernel_oserror *e = _swix(DeviceFS_CallDevice,_INR(0,1)|_INR(3,5),DeviceCall_USB_USBRequest,mdev->devname,((int *) req)[0],((int *) req)[1],data);
+	if(e)
+	{
+		dprintf(("","%s %x %s\n",mdev->devname,e->errnum,e->errmess));
+		return USBD_INVAL;
+	}
+	return USBD_NORMAL_COMPLETION;
+}
+
+const char *usbd_errstr(usbd_status err)
+{
+	(void) err;
+
+	return "XXX ERROR XXX";
+}
+
+usb_device_descriptor_t *usbd_get_device_descriptor(usbd_device_handle dev)
+{
+	return &((my_usbdev *) dev)->ddesc;
+}
+
+usbd_status usbd_get_string_desc(usbd_device_handle dev, int sindex, int langid, usb_string_descriptor_t *sdesc, int *sizep)
+{
+	usb_device_request_t req;
+	usbd_status err;
+	/* Read the length */
+	req.bmRequestType = UT_READ_DEVICE;
+	req.bRequest = UR_GET_DESCRIPTOR;
+	USETW2(req.wValue, UDESC_STRING, sindex);
+	USETW(req.wIndex, langid);
+	USETW(req.wLength, 1);
+	sdesc->bLength = 0;
+	err = usbd_do_request(dev,&req,sdesc);
+	if(err)
+		return err;
+	if(sdesc->bLength < 2)
+		return USBD_SHORT_XFER;
+	/* Now get the full string */
+	USETW(req.wLength,sdesc->bLength);
+	err = usbd_do_request(dev,&req,sdesc);
+	if(!err)
+		*sizep = sdesc->bLength;
+	return err;
+}
+
+usbd_status usbd_set_config_no(usbd_device_handle dev, int no, int msg)
+{
+	(void) msg;
+
+	my_usbdev *mdev = (my_usbdev *) dev;
+	/* Using the *command is the easiest way of doing this */
+	char cmd[32];
+	sprintf(cmd,"usbsetconfig %s %d",mdev->devname+3,no);
+	_kernel_oserror *e = _swix(OS_CLI,_IN(0),cmd);
+	if(e)
+		return USBD_INVAL;
+	return USBD_NORMAL_COMPLETION;
+}

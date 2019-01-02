@@ -1,0 +1,2348 @@
+/* Copyright 2003 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*-*-C-*-
+ *
+ * Document handling
+ */
+
+#include "resed.h"
+
+#define DOCUMENT_LEFT_MARGIN 16
+#define DOCUMENT_RIGHT_MARGIN 16
+#define DOCUMENT_TOP_MARGIN 16
+#define DOCUMENT_BOTTOM_MARGIN 16
+#define DOCUMENT_VERTICAL_SPACING 32
+#define DOCUMENT_HORIZONTAL_SPACING 32
+
+static WindowPtr docprotowin = NULL;
+static WindowPtr winprotowin = NULL;
+static WindowPtr docwarnwin = NULL;
+
+static IconRec docspriteproto, docnameproto, docrenameproto;
+static int iconwidth, iconheight;     /* size of whole icon */
+static int maxgridwidth, maxgridheight;
+static MenuPtr docmenu = NULL, filemenu = NULL, selmenu = NULL, newmenu = NULL;
+
+static int key_delete, key_save, key_selectall, key_clearsel;
+
+static error * _document_close_window (DocumentPtr doc);
+
+#define DOCMENU_FILE 0
+#define DOCMENU_SELECTION 1
+#define DOCMENU_SELECTALL 2
+#define DOCMENU_CLEARSELECTION 3
+#define DOCMENU_NEWWINDOW 4
+
+#define NEWMENU_NEWNAME 0
+
+#define SELMENU_DELETE 0
+#define SELMENU_SAVE 1
+
+#define FILEMENU_SAVE 0
+#define FILEMENU_CHEADER 1
+
+#define NAMEVALIDATION "A~ "
+
+
+/*
+ * Check whether the given name is unique in the document.
+ */
+
+static Bool checkunique (DocumentPtr doc, char *name)
+{
+    ResourcePtr res;
+    for (res = doc->resources; res; res = res->next)
+        if (strcmp (res->name, name) == 0)
+            return FALSE;
+    return TRUE;
+}
+
+
+/*
+ * Check to see if a named resource is already present in the document.  If so,
+ * disambiguate until it is unique.  Returns name in the same buffer that
+ * was passed in; note the buffer is expected to be RESOURCENAMELEN bytes long,
+ * ie enough for the longest valid name and a null terminator.
+ * Returns TRUE is the name was changed, FALSE otherwise.
+ */
+
+Bool document_disambiguate_name (DocumentPtr doc, char *name)
+{
+    int number = 0, oldlen;
+    char oldname[RESOURCENAMELEN];
+
+    if (checkunique (doc, name))
+        return FALSE;
+
+    strcpy (oldname, name);
+    oldlen = strlen (oldname);
+
+    /* If there is a "dot-number" suffix, increment it, else append one */
+    block
+    {
+        char *dot = strrchr (oldname, '.');
+        if (dot)
+        {
+            char *s;
+            for (s = dot + 1; *s && isdigit (*s); s++)
+                ;
+            if (*s == 0)
+            {
+                number = atoi (dot + 1);
+                oldlen = dot - oldname;
+            }
+        }
+    }
+
+    for (;;)
+    {
+        int pos = oldlen;
+        number++;
+        sprintf(name, ".%d", number);
+        if (pos + strlen (name) >= RESOURCENAMELEN)
+            pos = RESOURCENAMELEN - strlen(name) - 1;
+        strcpy (name, oldname);
+        sprintf (name + pos, ".%d", number);
+        if (checkunique (doc, name))
+            break;
+    }
+    return TRUE;
+}
+
+
+/*
+ * What grid width is possible with the current window size?  Must be
+ * at least one.
+ */
+
+static int find_grid_width (WindowPtr win)
+{
+    int width = win->visarea.maxx - win->visarea.minx;
+    width -= DOCUMENT_LEFT_MARGIN + DOCUMENT_RIGHT_MARGIN;
+    width += DOCUMENT_HORIZONTAL_SPACING;
+    width /= iconwidth + DOCUMENT_HORIZONTAL_SPACING;
+    return width > 1 ? width : 1;
+}
+
+
+/*
+ * What grid height is possible with the current window size?  Must be
+ * at least one.
+ */
+
+static int find_grid_height (WindowPtr win)
+{
+    int height = win->visarea.maxy - win->visarea.miny;
+    height -= DOCUMENT_TOP_MARGIN + DOCUMENT_BOTTOM_MARGIN;
+    height += DOCUMENT_VERTICAL_SPACING;
+    height /= iconheight + DOCUMENT_VERTICAL_SPACING;
+    return height > 1 ? height : 1;
+}
+
+
+/*
+ * What window extent is needed to accomodate the grid width of this document?
+ * Always returns enough width for one row, even if no icons there.
+ */
+
+static int find_extent_width (int gridwidth)
+{
+    int cols = gridwidth ? gridwidth : 1;
+    return DOCUMENT_LEFT_MARGIN
+        + cols * iconwidth
+            + (cols - 1) * DOCUMENT_HORIZONTAL_SPACING
+                + DOCUMENT_RIGHT_MARGIN;
+    /* XXX round up to whole pixels? */
+}
+    
+
+/*
+ * What window extent is needed to accomodate the grid height of this document?
+ * Always returns enough height for one row, even if no icons there.
+ */
+
+static int find_extent_height (int gridheight)
+{
+    int rows = gridheight ? gridheight : 1;
+    return DOCUMENT_TOP_MARGIN
+        + rows * iconheight
+            + (rows - 1) * DOCUMENT_VERTICAL_SPACING
+                + DOCUMENT_BOTTOM_MARGIN;
+    /* XXX round up to whole pixels? */
+}
+    
+
+/*
+ * Determine width of window required for the given title string.
+ * Allow 2 char cells for the " *" modified flag, and 2 each for the
+ * window decorations.  Assumes system-font.
+ */
+
+static int find_title_width (DocumentPtr doc)
+{
+    int num = strlen(doc->title) + (2 * 3);
+    if (!doc->modified) num += 2;
+    return num * 16;
+}
+
+
+/*
+ * Determine bounding box, on the work area, of the n'th icon
+ * on the document window's grid.  Numbering starts at 0.
+ * NB: it is expected to fit on the window's extent - no checking.
+ */
+
+static void get_icon_bbox (DocumentPtr doc, int nth, ResourcePtr res)
+{
+    int row = nth / doc->gridwidth;
+    int col = nth % doc->gridwidth;
+    int topleftx = DOCUMENT_LEFT_MARGIN + col * (iconwidth + DOCUMENT_HORIZONTAL_SPACING);
+    int toplefty = -(DOCUMENT_TOP_MARGIN + row * (iconheight + DOCUMENT_VERTICAL_SPACING));
+    res->spritebbox = docspriteproto.bbox;
+    res->spritebbox.minx += topleftx;
+    res->spritebbox.maxx += topleftx;
+    res->spritebbox.miny += toplefty;
+    res->spritebbox.maxy += toplefty;
+    res->namebbox = docnameproto.bbox;
+    res->namebbox.minx += topleftx;
+    res->namebbox.maxx += topleftx;
+    res->namebbox.miny += toplefty;
+    res->namebbox.maxy += toplefty;
+}
+
+
+/*
+ * Determine which icon, starting at zero, the given point is inside.
+ * The point is in work-area coordinates.  If it does not correspond
+ * to any icon, return NULL
+ */
+
+static ResourcePtr which_sprite_icon (DocumentPtr doc, PointPtr position)
+{
+    ResourcePtr res;
+    for (res = doc->resources; res; res = res->next)
+        if (wimp_point_inside (&res->spritebbox, position))
+            return res;
+    return NULL;
+}
+
+
+/*
+ * Determine which name icon, starting at zero, the given point is inside.
+ * The point is in work-area coordinates.  If it does not correspond
+ * to any icon, return NULL
+ */
+
+static ResourcePtr which_name_icon (DocumentPtr doc, PointPtr position)
+{
+    ResourcePtr res;
+    for (res = doc->resources; res; res = res->next)
+        if (wimp_point_inside (&res->namebbox, position))
+            return res;
+    return NULL;
+}
+
+
+/*
+ * Try to grow the visible area of the window with Filer-like
+ * behaviour. If it returns TRUE, the visible area has changed
+ * and doc->gridwidth has been updated.
+ */
+
+static Bool increase_visarea (DocumentPtr doc, int newnum)
+{
+    int viswidth = find_grid_width(&doc->window);/*doc->gridwidth;*/
+    int visheight = find_grid_height(&doc->window);
+    int ovisheight = visheight;
+
+    if (viswidth * visheight >= newnum)
+        return FALSE;           /* no need */
+
+    if (doc->window.visarea.maxy - doc->window.visarea.miny <
+        doc->window.workarea.maxy - doc->window.workarea.miny)
+        return FALSE;           /* scrolled, so don't */
+
+    if (visheight == 1)
+    {
+        /* Try adding columns */
+        while (viswidth < maxgridwidth)
+        {
+            viswidth++;
+            if (viswidth * visheight >= newnum)
+                goto changeit;
+        }
+    }
+
+ retry:
+    /* Try adding rows */
+    while (visheight < maxgridheight)
+    {
+        visheight++;
+        if (viswidth * visheight >= newnum)
+            goto changeit;
+    }
+
+ changeit:
+    doc->window.visarea.maxx = MAX(doc->window.visarea.minx + find_extent_width(viswidth),
+                                   doc->window.visarea.maxx);
+    doc->window.visarea.miny = doc->window.visarea.maxy - find_extent_height(visheight);
+
+    /* Ensure that the work area is at least that big too! */
+    doc->window.workarea.maxx = MAX(doc->window.workarea.maxx,
+                                    doc->window.workarea.minx + find_extent_width(viswidth));
+    doc->window.workarea.miny = MIN(doc->window.workarea.miny,
+                                    doc->window.workarea.maxy - find_extent_height(visheight));
+
+
+    /* Attempt to open the window at the new size */
+    {
+        /* To get 'behind' handle afresh */
+        WindowRec state;
+
+        state.handle = doc->window.handle;
+        _swix(Wimp_GetWindowState, _IN(1),
+              &state);
+        doc->window.behind = state.behind;
+
+        _swix(Wimp_SetExtent, _INR(0,1),
+              doc->window.handle, &doc->window.workarea);
+        _swix(Wimp_OpenWindow, _IN(1),
+              &doc->window);
+    }
+
+    /* And now get the window's real new size, in case it didn't grow as much
+     * as we wanted. 
+     */
+
+    _swix(Wimp_GetWindowState, _IN(1),
+          &doc->window);
+    if ((doc->gridwidth = find_grid_width (&doc->window)) != viswidth)
+    {
+        viswidth = doc->gridwidth;
+        visheight = ovisheight;
+        goto retry;             /* assert: won't happen more than once */
+    }
+    return TRUE;
+}
+
+
+/*
+ * Document is getting more/less icons. Sort out value of gridheight.
+ * Fix extent up.  If getting smaller, change visible area
+ * too (and fix scroll bar position).  Does not alter doc->numresources.
+ * Note that if this returns *redraw == TRUE, the caller must call
+ * Wimp_OpenWindow pretty soon to actually effect the changes on-screen.
+ * If 'newwin' is set, then a minimum size of the titlebar's width
+ * will be enforced.  If 'newwin' is not set then this minimum will only
+ * be enforced when altering the window's width as a result of
+ * adding/removing icons.
+ */
+
+static error * changing_size (DocumentPtr doc, int newnum, Bool *reopen, Bool newwin)
+{
+    int newgridheight;
+
+dprintf("*** CHANGING_SIZE IN *** width is %d, height is %d\n" _ doc->gridwidth _ doc->gridheight);
+
+    *reopen = FALSE;
+    
+    if (newnum > doc->numresources)
+        *reopen = increase_visarea(doc, newnum);
+
+    newgridheight = (newnum + doc->gridwidth - 1) / doc->gridwidth;
+    if (newgridheight < 1)
+        newgridheight = 1;
+
+dprintf("New gridheight is %d\n" _ newgridheight);
+
+    if (newgridheight > doc->gridheight)
+    {
+        /* Make vertical extent bigger */
+dprintf("Making bigger\n");
+        doc->gridheight = newgridheight;
+        doc->window.workarea.miny = -find_extent_height(doc->gridheight);
+        ER ( _swix(Wimp_SetExtent, _INR(0,1),
+                   doc->window.handle, &doc->window.workarea) );
+    }
+
+    else if (newgridheight < doc->gridheight)
+    {
+        /* Make vertical extent smaller, fix up win size and scroll offset */
+        int newextent, visheight;
+
+dprintf("Making smaller\n");
+        doc->gridheight = newgridheight;
+        newextent = find_extent_height(doc->gridheight);
+        
+        visheight = doc->window.visarea.maxy - doc->window.visarea.miny;
+
+        if (visheight > newextent)
+        {
+            doc->window.visarea.miny = doc->window.visarea.maxy - newextent;
+            doc->window.scrolloffset.y = 0;
+            *reopen = TRUE;
+        }
+        else if (newextent + doc->window.scrolloffset.y < visheight)
+        {
+            doc->window.scrolloffset.y = visheight - newextent;
+            *reopen = TRUE;
+        }
+
+        doc->window.workarea.miny = -newextent;
+        ER ( _swix(Wimp_SetExtent, _INR(0,1),
+                   doc->window.handle, &doc->window.workarea) );
+    }
+
+    if (newgridheight <= 1)
+    {
+        /* Sort out horizontal work area, restricting the width.
+         * If this change is due to the number of icons changing, ensure
+         * that the window size is at least the titlebar width.
+         */
+        int width, twidth = find_title_width(doc);
+dprintf("ONE\n");
+        doc->gridwidth = newnum ? newnum : 1;
+        width = find_extent_width (doc->gridwidth);
+        if (newwin || newnum != doc->numresources)
+        {
+dprintf("TWO\n");
+            if (twidth > width)
+                width = twidth;
+            if (doc->window.visarea.maxx > doc->window.visarea.minx + width)
+            {
+dprintf("THREE\n");
+                doc->window.visarea.maxx = doc->window.visarea.minx + width;
+                *reopen = TRUE;
+            }
+            doc->gridwidth = find_grid_width(&doc->window);
+        }
+        else if (!newwin && newnum == doc->numresources)
+        {
+dprintf("FOUR\n");
+            if (twidth > width)
+                width = twidth;
+        }
+        doc->window.workarea.maxx = doc->window.workarea.minx + width;
+        ER ( _swix(Wimp_SetExtent, _INR(0,1),
+                   doc->window.handle, &doc->window.workarea) );
+    }
+    else
+    {
+        /* Unrestrict the width */
+dprintf("FIVE\n");
+        doc->window.workarea.maxx = doc->window.workarea.minx + 
+            (docprotowin->workarea.maxx - docprotowin->workarea.minx);
+        ER ( _swix(Wimp_SetExtent, _INR(0,1),
+                   doc->window.handle, &doc->window.workarea) );
+    }
+
+dprintf("***OUT *** width is %d, height is %d\n" _ doc->gridwidth _ doc->gridheight);
+
+    return NULL;
+}
+
+
+/*
+ * Redo the layout of a document window after deleting a resource or
+ * altering the number of rows.  Forces a redraw.
+ */
+
+static error * relayout (DocumentPtr doc)
+{
+    ResourcePtr res = doc->resources;
+    int i = 0;
+    for (; res; res = res->next, i++)
+        get_icon_bbox(doc, i, res);
+
+    return wimp_invalidate (&doc->window, &doc->window.workarea);
+}
+
+
+/*
+ * Select or deselect an icon according to the
+ * value passed in.  Redraws screen and keeps
+ * numselected up to date.
+ */
+
+static error * select_icon (DocumentPtr doc, ResourcePtr res, Bool newstate)
+{
+    if (res->selected == newstate)
+        return NULL;
+    doc->numselected += newstate ? 1 : -1;
+    res->selected = newstate;
+
+    if (doc->numselected)
+        selection_claim (doc->window.handle);
+    else
+        selection_giveup (doc->window.handle);
+
+    ER   ( wimp_invalidate (&doc->window, &res->spritebbox) );
+    return wimp_invalidate (&doc->window, &res->namebbox);
+}
+
+
+/*
+ * Select any icons in the window that intersect the given
+ * bounding box.  If the 'toggle' parameter is TRUE, then
+ * toggle state rather than setting.  If 'toggle' FALSE, then
+ * icons not in the bbox are cleared.  Forces redraw of the
+ * appropriate parts of the screen.
+ */
+
+static error * select_bounded_icons (DocumentPtr doc, RectPtr inside, Bool toggle)
+{
+    ResourcePtr res = doc->resources;
+    Bool anyinvalid = FALSE;
+    RectRec invalid;
+    invalid.minx = invalid.miny = 1000000;
+    invalid.maxx = invalid.maxy = -1000000;
+
+    for (; res; res = res->next)
+    {
+        Bool changed = FALSE;
+        if (wimp_rects_intersect(&res->spritebbox, inside) ||
+            wimp_rects_intersect(&res->namebbox, inside))
+        {
+            if (res->selected)
+            {
+                if (toggle)
+                {
+                    /* Toggle off */
+                    res->selected = FALSE;
+                    doc->numselected--;
+                    changed = TRUE;
+                }
+            }
+            else
+            {
+                /* Switch on */
+                res->selected = TRUE;
+                doc->numselected++;
+                changed = TRUE;
+            }
+        }
+        else
+        {
+            if (res->selected && !toggle)
+            {
+                /* clear selection */
+                res->selected = FALSE;
+                doc->numselected--;
+                changed = TRUE;
+            }
+        }
+
+        if (changed)
+        {
+            wimp_merge_bboxes (&invalid, &invalid, &res->spritebbox);
+            wimp_merge_bboxes (&invalid, &invalid, &res->namebbox);
+            anyinvalid = TRUE;
+        }
+    }
+
+    if (doc->numselected)
+        selection_claim (doc->window.handle);
+    else
+        selection_giveup (doc->window.handle);
+
+    if (anyinvalid)
+        ER ( wimp_invalidate (&doc->window, &invalid) );
+    return NULL;
+}
+
+
+/*
+ * Select all icons in the window.
+ */
+
+static error * document_select_all (DocumentPtr doc)
+{
+    return select_bounded_icons (doc, &doc->window.workarea, FALSE);
+}
+
+
+/*
+ * Deselect all icons in the window.
+ */
+
+error * document_lose_selection (DocumentPtr doc)
+{
+    RectRec outside;
+    if (selection_current(NULL) != doc->window.handle)
+        return NULL;
+    outside.minx = outside.miny = -2;
+    outside.maxx = outside.maxy = -2;
+    ER ( select_bounded_icons (doc, &outside, FALSE) );
+    return NULL;
+}
+
+
+/*
+ * Called from saveas module, for saving a whole Document
+ */
+
+static error * save_document_cb (SaveAsReason reason, char **buf, int *size, void *closure)
+{
+    DocumentPtr doc = (DocumentPtr) closure;
+dprintf("In save_document_cb %d\n" _ reason);
+    switch (reason)
+    {
+    case SaveAsGetSize:
+        *size = template_file_size (doc, NULL, FALSE);
+        break;
+    case SaveAsGetBlock:
+        *buf = malloc (*size);
+        if (*buf == NULL)
+            return error_lookup("NoMem");
+        return template_save_to_memory (doc, NULL, *buf, FALSE, NULL);
+    case SaveAsFreeBlock:
+        free (*buf);
+        break;
+    case SaveAsSuccess:
+        /* Only called if file is "safe".  *buf points to filename */
+        document_change_filename (doc, *buf, TRUE);
+        document_modified (doc, FALSE);
+        break;
+    case SaveAsDelete:
+        /* Only called if file is "safe" and the caller wants the document closed */
+        return _document_close_window (doc);
+    }
+    return NULL;
+}
+
+
+/*
+ * Called when the user clicks on File->Save menu entry
+ */
+
+static error * save_document_directly (DocumentPtr doc)
+{
+    char name[FILENAMELEN];
+    if (doc->fullpath)
+    {
+        sprintf (name, "%.*s", doc->namelength, doc->title);
+        ER ( template_save_file (doc, NULL, name, FALSE, NULL) );
+        document_modified (doc, FALSE);
+    }
+    else
+    {
+        PointerInfoRec pointer;
+        sprintf (name, "%.*s", doc->namelength, doc->title);
+        ER ( _swix(Wimp_GetPointerInfo, _IN(1),
+                   &pointer) );
+        return saveas_open (TRUE, FALSE, &pointer.position, name, FileType_Template, save_document_cb, (void *) doc);
+    }
+    return NULL;
+}
+ 
+
+/*
+ * Called from the menu warning for File->Save
+ */
+
+static error * save_document (MenuPtr menu, MessageMenuWarningPtr warn, void *closure)
+{
+    DocumentPtr doc = (DocumentPtr) closure;
+    char name[FILENAMELEN];
+    sprintf (name, "%.*s", doc->namelength, doc->title);
+    return saveas_open (FALSE, FALSE, &warn->position, name, FileType_Template, save_document_cb, closure);
+}
+ 
+
+/*
+ * Called from saveas module, for saving the selection
+ */
+
+static error * save_selection_cb (SaveAsReason reason, char **buf, int *size, void *closure)
+{
+    DocumentPtr doc = (DocumentPtr) closure;
+dprintf("In save_selection_cb %d\n" _ reason);
+    switch (reason)
+    {
+    case SaveAsGetSize:
+        *size = template_file_size (doc, NULL, TRUE);
+        break;
+    case SaveAsGetBlock:
+        *buf = malloc (*size);
+        if (*buf == NULL)
+            return error_lookup("NoMem");
+        return template_save_to_memory (doc, NULL, *buf, TRUE, NULL);
+    case SaveAsFreeBlock:
+        free (*buf);
+        break;
+    }
+    return NULL;
+}
+
+
+/*
+ * Called from the menu warning for Selection->Save
+ */
+
+static error * save_selection (MenuPtr menu, MessageMenuWarningPtr warn, void *closure)
+{
+    return saveas_open (FALSE, FALSE, &warn->position, message_lookup (&msgs, "Selection"),
+                        FileType_Template, save_selection_cb, closure);
+}
+ 
+
+/*
+ * Called from the menu warning for Save->Header
+ */
+
+static error * save_header (MenuPtr menu, MessageMenuWarningPtr warn, void *closure)
+{
+    return saveas_open (FALSE, FALSE, &warn->position, message_lookup (&msgs, "IconDefs"),
+                        FileType_Text, genheader_saveas_cb, closure);
+}
+ 
+
+/*
+ * Called while the Templates file is open
+ */
+
+error * document_load_prototypes ()
+{
+    ER ( wimp_load_template("WinProto", &winprotowin) );
+    ER ( wimp_load_template("DocProto", &docprotowin) );
+    ER ( wimp_load_template("DocWarn", &docwarnwin) );
+
+    /* Document window: first two icons are prototypes for others */
+    if (docprotowin->numicons != 3)
+        return error_lookup("DocProtos");
+
+    docspriteproto = docprotowin->icons[0];
+    docnameproto = docprotowin->icons[1];
+    docrenameproto = docprotowin->icons[2];
+
+    /* Determine size of whole icon, and offsets of the parts */
+    {
+        RectRec bbox;
+        wimp_merge_bboxes (&bbox, &docspriteproto.bbox, &docnameproto.bbox);
+        iconwidth = bbox.maxx - bbox.minx;
+        iconheight = bbox.maxy - bbox.miny;
+
+        /* Now make the two bboxes relative to the whole bbox */
+        docspriteproto.bbox.minx -= bbox.minx;
+        docspriteproto.bbox.maxx -= bbox.minx;
+        docspriteproto.bbox.miny -= bbox.maxy;
+        docspriteproto.bbox.maxy -= bbox.maxy;
+        docnameproto.bbox.minx -= bbox.minx;
+        docnameproto.bbox.maxx -= bbox.minx;
+        docnameproto.bbox.miny -= bbox.maxy;
+        docnameproto.bbox.maxy -= bbox.maxy;
+    }
+
+    /* Now zap the icons in the window record, we don't want them created */
+    docprotowin->numicons = 0;
+
+    /* Use initial visarea of window to determine how much
+     * it can auto-grow
+     */
+    maxgridwidth = find_grid_width (docprotowin);
+    maxgridheight = find_grid_height (docprotowin);
+
+    /* Sort out the minimum size for all Document windows now:- */
+
+#if 0
+    docprotowin->minsize.width = (short) 0; /* title size */
+#else
+    docprotowin->minsize.width = (short) find_extent_width(1);
+#endif
+    docprotowin->minsize.height = (short) find_extent_height(1);
+
+    /* We fix the initial size in document_create */
+
+    /* Open at top of window stack */
+    docprotowin->behind = -1;
+
+    /* Use this opportunity to create menus */
+
+    ER ( menu_create (2, message_lookup (&msgs, "DFM_Name"), &filemenu) );
+    ER ( menu_entry (filemenu, FILEMENU_SAVE, message_lookup (&msgs, "DFM_Save"),
+                     0, MF_MESSAGE, -1, -1, (void *) save_document) );
+    ER ( menu_entry (filemenu, FILEMENU_CHEADER, message_lookup (&msgs, "DFM_CHdr"),
+                     0, MF_MESSAGE, -1, -1, (void *) save_header) );
+
+    ER ( menu_create (2, message_lookup (&msgs, "DSM_Name"), &selmenu) );
+    ER ( menu_entry (selmenu, SELMENU_DELETE, message_lookup (&msgs, "DSM_Dele"),
+                     0, 0, -1, -1, NULL) );
+    ER ( menu_entry (selmenu, SELMENU_SAVE, message_lookup (&msgs, "DSM_Save"),
+                     0, MF_MESSAGE, -1, -1, (void *) save_selection) );
+
+    ER ( menu_create (1, message_lookup (&msgs, "DNM_Name"), &newmenu) );
+    ER ( menu_entry (newmenu, NEWMENU_NEWNAME, NULL, RESOURCENAMELEN, MF_WRITEABLE, -1, -1, NULL ) );
+    menu_set_validation (newmenu, NEWMENU_NEWNAME, NAMEVALIDATION);
+        
+    ER ( menu_create (5, message_lookup (&msgs, "DM_Name"), &docmenu) );
+    ER ( menu_entry (docmenu, DOCMENU_FILE, message_lookup (&msgs, "DM_File"),
+                     0, 0, -1, -1, (void *) filemenu) );
+    ER ( menu_entry (docmenu, DOCMENU_SELECTION, message_lookup (&msgs, "DM_Seln"),
+                     0, MF_DOTTED, -1, -1, (void *) selmenu) );
+    ER ( menu_entry (docmenu, DOCMENU_SELECTALL, message_lookup (&msgs, "DM_SAll"),
+                     0, 0, -1, -1, NULL) );
+    ER ( menu_entry (docmenu, DOCMENU_CLEARSELECTION, message_lookup (&msgs, "DM_CSel"),
+                     0, MF_DOTTED, -1, -1, NULL) );
+    ER ( menu_entry (docmenu, DOCMENU_NEWWINDOW, message_lookup (&msgs, "DM_NWin"),
+                     0, 0, -1, -1, (void *) newmenu) );
+
+    key_save = atoi (message_lookup (&msgs, "KeyDFM_Save"));
+    key_delete = atoi (message_lookup (&msgs, "KeyDSM_Dele"));
+    key_selectall = atoi (message_lookup (&msgs, "KeyDM_SAll"));
+    key_clearsel = atoi (message_lookup (&msgs, "KeyDM_CSel"));
+
+    return NULL;
+}
+
+
+/*
+ * Redo titlebar, putting modified flag in if wanted.  Only
+ * force a redraw if caller wants it, as the window may not
+ * be open yet.
+ */
+
+static error * fix_titlebar (DocumentPtr doc, Bool redraw)
+{
+    if (doc->modified)
+        strcpy (doc->title + doc->namelength, " *");
+    else
+        doc->title[doc->namelength] = 0;
+    if (redraw)
+    {
+        WindowRedrawRec win, vis;
+        win.handle = vis.handle = doc->window.handle;
+        ER ( _swix(Wimp_GetWindowOutline, _IN(1),
+                   &win) );
+        ER ( _swix(Wimp_GetWindowState, _IN(1),
+                   &vis) );
+        ER ( _swix(Wimp_ForceRedraw, _INR(0,4),
+                   -1, win.visarea.minx, vis.visarea.maxy, win.visarea.maxx, win.visarea.maxy) );
+    }
+    return NULL;
+}
+
+
+/*
+ * Update current notion of whether the document is modified or
+ * not.  Update titlebar on screen.
+ */
+
+error * document_modified (DocumentPtr doc, Bool modified)
+{
+    if (!doc->internal)
+    {
+        if (doc->modified != modified)
+        {
+            doc->modified = modified;
+            ER ( fix_titlebar (doc, TRUE) );
+        }
+    }
+    return NULL;
+}
+
+
+/*
+ * Set the document's filename.  If the filename supplied is
+ * NULL or "" or <Wimp$Scrap>, then sets it to Untitled.
+ */
+
+error * document_change_filename (DocumentPtr doc, char *filename, Bool redraw)
+{
+    char fname[256];
+    if (filename == NULL || *filename == 0 || strcmp(filename, "<Wimp$Scrap>") == 0)
+    {
+        static int numuntitled = 0;
+        sprintf(fname, message_lookup(&msgs, "Untitled"), ++numuntitled);
+        filename = fname;
+        doc->fullpath = FALSE;
+    }
+    else
+        doc->fullpath = TRUE;
+    strcpy (doc->title, filename);
+    doc->namelength = strlen(filename);
+    return fix_titlebar (doc, redraw);
+}
+
+/*
+ * Create a new empty document record from the prototype.
+ * Create its window, register it and open it.  Modify the
+ * position each time around, so that we don't get bored
+ * with the window position.
+ *
+ * If filename is NULL, then this is an "internal" document,
+ * ie. the one used to hold the palette.  Don't display
+ * the window (but create it so that the lower level routines
+ * don't need to know the difference between this and
+ * other documents.)  Also, don't register the window.
+ *
+ * If filename is "", this is an "untitled" document.
+ */
+
+error * document_create (DocumentPtr *ret, char *filename)
+{
+    static int lasty = -1;
+    Bool dummy;
+    DocumentPtr doc = (DocumentPtr) calloc (1, sizeof(DocumentRec));
+    if (doc == NULL)
+        return error_lookup("NoMem");
+    
+    doc->internal = filename == NULL;
+
+    doc->window = *docprotowin;
+    doc->window.titledata[0] = (int) doc->title;
+    doc->window.titledata[2] = FILENAMELEN;
+    ER ( document_change_filename(doc, filename ? filename : "palette", FALSE) );
+
+    /* 
+     * Create windows in slightly different positions each time.
+     */
+
+    if (!doc->internal)
+    {
+        if (lasty == -1)
+            lasty = doc->window.visarea.maxy;
+        else
+        {
+            int height = doc->window.visarea.maxy - doc->window.visarea.miny;
+            lasty -= 40;
+            doc->window.visarea.maxy = lasty;
+            doc->window.visarea.miny = doc->window.visarea.maxy - height;
+        }
+
+        ER ( _swix(Wimp_CreateWindow, _IN(1) | _OUT(0),
+                   &doc->window.visarea, &doc->window.handle) );
+    
+        doc->gridwidth = 1;
+        doc->gridheight = 10;
+        changing_size(doc, 0, &dummy, TRUE);
+        
+        ER ( registry_register_window(doc->window.handle, Document, (void *) doc) );
+        ER ( _swix(Wimp_OpenWindow, _IN(1),
+                   &doc->window) );
+
+        /*
+         * If the final position of the window is different from the
+         * one we tried for, then reset the 'marching windows' to the
+         * initial position.
+         */
+        
+        ER ( _swix(Wimp_GetWindowState, _IN(1),
+                   &doc->window) );
+        if (doc->window.visarea.maxy != lasty)
+            lasty = -1;
+    }
+
+    *ret = doc;
+    return NULL;
+}
+
+
+/*
+ * Add a resource to the list for the given document.  It has
+ * an icon created for it; this is placed in its appropriate
+ * place on the grid layout (ie at the end).  This may cause the
+ * extent of the window to increase, but it won't cause a re-layout
+ * or scroll.
+ */
+
+error * document_add_resource (DocumentPtr doc, char *name, ResourcePtr *ret)
+{
+    ResourcePtr new = calloc(1, sizeof(ResourceRec));
+    ResourcePtr last = doc->resources;
+    Bool reopen = FALSE;
+    error *err;
+
+    if (ret)
+        *ret = new;
+
+    if (new == NULL)
+        return error_lookup("NoMem");
+
+    grid_init(new);
+
+    /* Set up name; calloc cleared the terminating byte already */
+    strncpy(new->name, name, RESOURCENAMELEN - 1);
+
+    /* Fix up window size */
+    if (!doc->internal)
+    {
+        new->window = *winprotowin;
+        new->window.titledata[0] = (int) strsave (template_control_to_null ((char *) new->window.titledata[0]));
+
+        EG ( fail, changing_size (doc, doc->numresources + 1, &reopen, FALSE) );
+        if (reopen)
+        {
+            /* To get 'behind' handle afresh */
+            WindowRec state;
+            state.handle = doc->window.handle;
+            EG ( fail, _swix(Wimp_GetWindowState, _IN(1),
+                             &state) );
+            doc->window.behind = state.behind;
+
+            EG ( fail, _swix(Wimp_OpenWindow, _IN(1),
+                             &doc->window) );
+        }
+
+        /* Determine position of the icon */
+        get_icon_bbox (doc, doc->numresources, new);
+
+        /* And tell the Wimp that this area needs redrawing */
+        EG ( fail, wimp_invalidate (&doc->window, &new->spritebbox) );
+        EG ( fail, wimp_invalidate (&doc->window, &new->namebbox) );
+    }
+
+    new->type = Window;
+    new->owner = doc;
+    new->window.handle = -1;
+
+    /* Finally link this resource into the document */
+    while (last && last->next)
+        last = last->next;
+    if (last) last->next = new; else doc->resources = new;
+    doc->numresources++;
+
+    document_modified (doc, TRUE);
+    return NULL;                /* success */
+
+ fail:
+    if (new) free((char *)new);
+    return err;
+}
+
+
+#if 0
+/*
+ * Make a copy of the specified resource.  XXX incomplete!!
+ */
+
+static error * clone_resource (ResourcePtr res, ResourcePtr *new)
+{
+    ResourcePtr copy = calloc(1, sizeof(ResourceRec));
+    if (copy == NULL)
+        return error_lookup("NoMem");
+    *copy = *res;
+    *new = copy;
+    return NULL;
+}
+#endif
+
+
+/*
+ * Called when a resource is being deleted; causes the winflags
+ * etc windows to be shaded.
+ */
+
+static void resource_going (ResourcePtr this)
+{
+    if (this == winflags_current())
+        winflags_select (NULL);
+    if (this == grid_current())
+        grid_select (NULL);
+    if (this == extent_current())
+        extent_select (NULL);
+    if (this == colours_current())
+        colours_select (NULL);
+}
+
+
+/*
+ * Delete any selected items in this document, redraw window, etc.
+ */
+
+error * document_delete_selection (DocumentPtr doc)
+{
+    ResourcePtr this = doc->resources, prev = NULL;
+    Bool reopen;
+
+    if (selection_current(NULL) != doc->window.handle)
+        return NULL;
+    
+    while (this)
+    {
+        ResourcePtr next = this->next;
+        if (this->selected)
+        {
+            resource_going (this);
+            if (prev)
+                prev->next = next;
+            else
+                doc->resources = next;
+            template_free (this);
+        }
+        else
+            prev = this;
+        this = next;
+    }
+
+    /* Fix up window size */
+    ER ( changing_size (doc, doc->numresources - doc->numselected, &reopen, FALSE) );
+    doc->numresources -= doc->numselected;
+    doc->numselected = 0;
+    selection_giveup (doc->window.handle);
+
+    if (reopen)
+    {
+        /* To get 'behind' handle afresh */
+        WindowRec state;
+        state.handle = doc->window.handle;
+        ER ( _swix(Wimp_GetWindowState, _IN(1),
+                   &state) );
+        doc->window.behind = state.behind;
+
+        ER ( _swix(Wimp_OpenWindow, _IN(1),
+                   &doc->window) );
+    }
+
+    ER ( relayout(doc) );       /* does ForceRedraw for us */
+
+    document_modified (doc, TRUE);
+    return NULL;
+}
+
+
+/*
+ * Delete the specified resource from the document.
+ */
+
+error * document_delete_resource (ResourcePtr res)
+{
+    DocumentPtr doc = res->owner;
+    ER ( document_lose_selection (doc) );
+    ER ( select_icon (doc, res, TRUE) );
+    return document_delete_selection (doc);
+}
+
+
+/* 
+ * Respond to open_window_request on a document window.
+ * Note: the 'win' parameter is only a partial window structure
+ * (just the fields returned with Open_Window_Request).
+ */
+
+error * document_open_window (WindowPtr win, DocumentPtr doc)
+{
+    int newcols;
+
+    doc->window.visarea = win->visarea;
+    doc->window.scrolloffset = win->scrolloffset;
+    doc->window.behind = win->behind;
+    
+#if 0
+    {
+        /* Restrict the width */
+        int width;
+        width = find_extent_width (doc->numresources);
+
+        if (doc->window.visarea.maxx > doc->window.visarea.minx + width)
+            doc->window.visarea.maxx = doc->window.visarea.minx + width;
+    }
+#endif
+
+    /* Does our new size require more or less columns? */
+    newcols = find_grid_width(&doc->window);
+    if (newcols != doc->gridwidth)
+    {
+        Bool reopen;            /* ignored, we always reopen */
+        doc->gridwidth = newcols;
+        ER ( changing_size (doc, doc->numresources, &reopen, FALSE) );
+        ER ( relayout(doc) );   /* does ForceRedraw for us */
+    }
+
+    return _swix(Wimp_OpenWindow, _IN(1),
+                 &doc->window);
+}
+
+
+/* 
+ * Respond to close_window_request on a document window.
+ * Note: the 'win' parameter is only a partial window structure
+ * (just the fields returned with Close_Window_Request).
+ * Close and free up all associated templates too.
+ */
+
+static error * _document_close_window (DocumentPtr doc)
+{
+    ResourcePtr res = doc->resources;
+    selection_giveup (doc->window.handle);
+    registry_deregister_window (doc->window.handle);
+    _swix(Wimp_DeleteWindow, _IN(1),
+          &doc->window);
+
+    while (res)
+    {
+        ResourcePtr next = res->next;
+        resource_going (res);
+        template_free (res);
+        res = next;
+    }
+
+    free ((char *) doc);
+    return NULL;
+}
+
+
+/*
+ * Interactor for the warning window.
+ */
+
+static error * close_interactor (unsigned int event, int *buf, void *closure, Bool *consumed)
+{
+    DocumentPtr doc = (DocumentPtr) closure;
+    MouseClickPtr mouse = (MouseClickPtr) buf;
+    WindowPtr win = (WindowPtr) buf;         /* only half there */
+    MessagePtr mess = (MessagePtr) buf;
+    char name[FILENAMELEN];
+
+    if (buf == NULL)                     /* we are being asked to cancel */
+    {
+        _swix(Wimp_CreateMenu, _IN(1),
+              -1);
+        return NULL;
+    }
+
+dprintf("in close_interactor %d\n" _ event);
+
+    switch (event)
+    {
+    case EV_OPEN_WINDOW_REQUEST:
+        if (win->handle == docwarnwin->handle)
+        {
+            *consumed = TRUE;
+            return _swix(Wimp_OpenWindow, _IN(1),
+                         win);
+        }
+        break;
+
+    case EV_MOUSE_CLICK:
+        if (mouse->windowhandle == docwarnwin->handle)
+        {
+            *consumed = TRUE;
+            switch (mouse->iconhandle)
+            {
+            case I_DOCWARN_DISCARD:
+                _document_close_window (doc);
+                /* FALLTHRU */
+            case I_DOCWARN_CANCEL:
+                interactor_cancel ();
+                return NULL;
+            case I_DOCWARN_SAVE:
+                interactor_cancel ();
+                sprintf (name, "%.*s", doc->namelength, doc->title);
+                return saveas_open (TRUE, TRUE, &mouse->position, name, FileType_Template, save_document_cb, (void *) doc);
+            }
+        }
+        break;
+
+    case EV_USER_MESSAGE:
+    case EV_USER_MESSAGE_RECORDED:
+        if (mess->code == 0x400c9)
+        {
+            interactor_cancel();
+            *consumed = TRUE;
+        }
+        break;
+    }
+
+    return NULL;
+}
+
+
+error * document_close_window (DocumentPtr doc)
+{
+    if (doc->modified)
+    {
+        char *s = dbox_getstring (docwarnwin, I_DOCWARN_MESSAGE);
+        char name[FILENAMELEN];
+        if (docwarnwin->handle <= 0)
+        {
+            ER ( _swix(Wimp_CreateWindow, _IN(1) | _OUT(0),
+                       &docwarnwin->visarea,
+                       &docwarnwin->handle) );
+        }
+        sprintf (name, "%.*s", doc->namelength, doc->title);
+        sprintf (s, message_lookup (&msgs, "DocWarn"), name);
+        dbox_setstring (docwarnwin, I_DOCWARN_MESSAGE, s);
+        ER ( _swix(Wimp_CreateMenu, _INR(1,3),
+                   docwarnwin->handle, docwarnwin->visarea.minx, docwarnwin->visarea.maxy) );
+        interactor_install (close_interactor, (void *) doc);
+        return NULL;
+    }
+    else
+    {
+        return _document_close_window (doc);
+    }
+}
+
+
+/*
+ * Redraw loop for the document window.
+ */
+
+static error * _document_redraw_window (WindowRedrawPtr redraw, DocumentPtr doc, RectPtr lassoo)
+{
+    int more;
+    
+    ER ( _swix(Wimp_RedrawWindow, _IN(1) | _OUT(0),
+               redraw,
+               &more) );
+    while (more)
+    {
+        RectRec work;
+        ResourcePtr res;
+
+        /* Determine work-area relative bbox of invalid area */
+        wimp_convert_rect(ScreenToWork, (WindowPtr) redraw, &redraw->graphwin, &work);
+
+        for (res = doc->resources; res; res = res->next)
+        {
+            if (wimp_rects_intersect(&res->spritebbox, &work))
+            {
+                IconRec icon = docspriteproto;
+                icon.bbox = res->spritebbox;
+                if (res->selected)
+                    icon.flags |= IF_SELECTED;
+                ER ( _swix(Wimp_PlotIcon, _IN(1),
+                           &icon) );
+            }
+            if (wimp_rects_intersect(&res->namebbox, &work))
+            {
+                IconRec icon = docnameproto;
+                icon.bbox = res->namebbox;
+                if (res->selected)
+                    icon.flags |= IF_SELECTED;
+                icon.data[0] = (unsigned int) res->name;
+                icon.data[2] = (unsigned int) RESOURCENAMELEN;
+                ER ( _swix(Wimp_PlotIcon, _IN(1),
+                           &icon) );
+            }
+        }
+
+        if (lassoo)
+            wimp_plot_eor_box (&doc->window, lassoo);
+
+        ER ( _swix(Wimp_GetRectangle, _IN(1) | _OUT(0),
+                   redraw,
+                   &more) );
+    }
+    return NULL;
+}
+
+
+error * document_redraw_window (WindowRedrawPtr redraw, DocumentPtr doc, RectPtr lassoo)
+{
+    return _document_redraw_window (redraw, doc, NULL);
+}
+
+
+/*
+ * Get work area coords of the selection's bounding box
+ */
+
+static void get_selection_bbox (DocumentPtr doc, RectPtr bbox)
+{
+    ResourcePtr res;
+    bbox->minx = bbox->miny = 1000000;
+    bbox->maxx = bbox->maxy = -1000000;
+    if (selection_current(NULL) != doc->window.handle)
+        return;
+    for (res = doc->resources; res; res = res->next)
+        if (res->selected)
+        {
+            wimp_merge_bboxes (bbox, bbox, &res->spritebbox);
+            wimp_merge_bboxes (bbox, bbox, &res->namebbox);
+        }
+}
+
+
+#if 0
+/*
+ * Move the selected icons from 'doc' to 'dst'.  Selection travels
+ * with them.
+ */
+
+static error * move_internal (DocumentPtr doc, DocumentPtr dst)
+{
+    ResourcePtr this = doc->resources, prev = NULL, last;
+    Bool reopen;
+
+    if (selection_current(NULL) != doc->window.handle ||
+        doc->numselected == 0)
+        return NULL;
+
+    document_lose_selection(dst);               /* zeroes numselected */
+
+    for (last = dst->resources; last && last->next; last = last->next)
+        ;
+    
+    while (this)
+    {
+        ResourcePtr next = this->next;
+        if (this->selected)
+        {
+            /* Unlink this from doc */
+            if (prev)
+                prev->next = next;
+            else
+                doc->resources = next;
+
+            /* And append it to dst */
+            if (last)
+                last->next = this;
+            else
+                dst->resources = this;
+
+            this->owner = dst;
+            last = this;
+            last->next = NULL;
+        }
+        else
+            prev = this;
+        this = next;
+    }
+    
+
+    /* Resize/redraw both */
+
+    ER ( changing_size (doc, doc->numresources - doc->numselected, &reopen, FALSE) );
+    if (reopen)
+        ER ( _swix(Wimp_OpenWindow, _IN(1),
+                   &doc->window) );
+
+    ER ( changing_size (dst, dst->numresources + doc->numselected, &reopen, FALSE) );
+    if (reopen)
+        ER ( _swix(Wimp_OpenWindow, _IN(1),
+                   &dst->window) );
+
+    dst->numresources += doc->numselected;
+    dst->numselected = doc->numselected;
+    doc->numresources -= doc->numselected;
+    doc->numselected = 0;
+
+    selection_giveup (doc->window.handle);
+    selection_claim (dst->window.handle);
+
+    ER ( relayout(dst) );       /* does ForceRedraw for us */
+    ER ( relayout(doc) );       /* does ForceRedraw for us */
+
+    document_modified (doc, TRUE);
+    document_modified (dst, TRUE);
+
+    return NULL;
+}
+
+
+/*
+ * Copy the selected icons from 'doc' to 'dst'.  Selection travels
+ * with them.
+ */
+
+static error * copy_internal (DocumentPtr doc, DocumentPtr dst)
+{
+    ResourcePtr this = doc->resources, last;
+    Bool reopen;
+
+    if (selection_current(NULL) != doc->window.handle ||
+        doc->numselected == 0)
+        return NULL;
+
+    document_lose_selection(dst);               /* zeroes numselected */
+
+    for (last = dst->resources; last && last->next; last = last->next)
+        ;
+    
+    while (this)
+    {
+        if (this->selected)
+        {
+            /* Make a copy of this resource */
+            ResourcePtr copy;
+            ER ( clone_resource (this, &copy) );
+            copy->owner = dst;
+            copy->next = NULL;
+
+            /* And append it to dst */
+            if (last)
+                last->next = copy;
+            else
+                dst->resources = copy;
+            last = copy;
+        }
+        this = this->next;
+    }
+
+    /* Resize/redraw both */
+
+
+    ER ( changing_size (dst, dst->numresources + doc->numselected, &reopen, FALSE) );
+    if (reopen)
+        ER ( _swix(Wimp_OpenWindow, _IN(1),
+                   &dst->window) );
+
+    dst->numresources += doc->numselected;
+    dst->numselected = doc->numselected;
+    document_lose_selection(doc);               /* zeroes numselected, gives up selection */
+    selection_claim (dst->window.handle);
+
+    ER ( relayout(doc) );       /* does ForceRedraw for us */
+    ER ( relayout(dst) );       /* does ForceRedraw for us */
+
+    document_modified (dst, TRUE);
+    return NULL;
+}
+#endif
+
+/*
+ * Closure for the drag and lassoo interactors
+ */
+
+typedef struct
+{
+    DocumentPtr doc;
+    RectRec workbox;
+    unsigned int buttons, modifiers;
+} DragClosureRec, *DragClosurePtr;
+
+
+#if 0
+/*
+ * Interactor for the drag operation.
+ */
+
+static error * drag_interactor (unsigned int event, int *buf, void *closure, Bool *consumed)
+{
+    DragClosurePtr drag = (DragClosurePtr) closure;
+
+    if (buf == NULL)            /* we are being asked to cancel */
+        return _swix(Wimp_DragBox, _IN(1),
+                     0);
+    
+    switch (event)
+    {
+    case EV_USER_DRAG_BOX:
+        {
+            PointerInfoRec pointer;
+            RegistryType type;
+            void *closure;
+
+            interactor_cancel();
+            *consumed = TRUE;
+
+            ER ( _swix(Wimp_GetPointerInfo, _IN(1)
+                       &pointer) );
+
+            if (pointer.windowhandle == -2 && pointer.iconhandle == iconhandle)
+            {
+                DocumentPtr newdoc;
+                ER ( document_create(&newdoc) );
+                pointer.windowhandle = newdoc->window.handle;
+            }
+
+            if (pointer.windowhandle == drag->doc->window.handle)
+                return NULL;
+            else if ((type = registry_lookup_window(pointer.windowhandle, &closure)) == Document)
+            {
+                if (drag->modifiers & MODIFIER_SHIFT)
+                {
+                    ER ( move_internal (drag->doc, (DocumentPtr) closure) );
+                }
+                else
+                {
+                    ER ( copy_internal (drag->doc, (DocumentPtr) closure) );
+                }
+            }
+            /* Add code to export here... */
+            return NULL;
+        }
+        break;
+    }
+    return NULL;
+}
+#endif
+
+        
+/*
+ * Interactor for the lassoo operation
+ */
+
+static error * lassoo_interactor (unsigned int event, int *buf, void *closure, Bool *consumed)
+{
+    DragClosurePtr drag = (DragClosurePtr) closure;
+    static Bool donepointer = FALSE;
+    Bool removeptr;
+
+    if (buf == NULL)            /* we are being asked to cancel */
+    {
+        if (donepointer)
+        {
+            (void) _swix(Wimp_SetPointerShape, _INR(0,1),
+                         1, -1);
+            donepointer = FALSE;
+        }
+        wimp_update_eor_box (&drag->doc->window, &drag->workbox);
+        (void) dragdrop_scroll (NULL, NULL, NULL);
+        return _swix(Wimp_DragBox, _IN(1),
+                     0);
+    }
+    
+    switch (event)
+    {
+    case EV_NULL_REASON_CODE:
+        {
+            PointerInfoRec pointer;
+            PointRec work;
+
+            (void) _swix(Wimp_GetPointerInfo, _IN(1),
+                         &pointer);
+            
+            wimp_convert_point (ScreenToWork, &drag->doc->window, &pointer.position, &work);
+
+            if (work.x != drag->workbox.maxx || work.y != drag->workbox.miny)
+            {
+                wimp_update_eor_box (&drag->doc->window, &drag->workbox);
+                drag->workbox.maxx = work.x;
+                drag->workbox.miny = work.y;
+                wimp_update_eor_box (&drag->doc->window, &drag->workbox);
+            }
+
+            /* See if scrolling would be in order.  If it does scroll, then
+             * the next thing received will be an Open Request.  We will issue
+             * an Open Window, which will cause the window to scroll.  We will
+             * then receive a redraw request for the area that got uncovered
+             * as a result of the scroll.  This we field below, asking the
+             * redraw code to draw any portions of rubber box that need
+             * filling in.  The result should (!) be that the rubber box will be
+             * fully intact at the end of all this, with no "bits" left behind...
+             */
+
+            if (dragdrop_scroll (&drag->doc->window, &pointer.position, &removeptr))
+            {
+                if (donepointer == FALSE)
+                {
+                    ER ( _swix(Wimp_SpriteOp, _IN(0) | _INR(2,7),
+                               36, "ptr_scroll", 2, 12, 12, 0, 0) );
+                    donepointer = TRUE;
+                }
+            }
+            if (donepointer && removeptr)
+            {
+                (void) _swix(Wimp_SetPointerShape, _INR(0,1),
+                             1, -1);
+                donepointer = FALSE;
+            }
+        }
+        break;
+
+    case EV_REDRAW_WINDOW_REQUEST:
+        block
+        {
+            WindowRedrawPtr redraw = (WindowRedrawPtr) buf;
+            
+            if (redraw->handle == drag->doc->window.handle)
+            {
+                *consumed = TRUE;
+                return _document_redraw_window (redraw, drag->doc, &drag->workbox);
+            }
+        }
+        break;
+
+    case EV_USER_DRAG_BOX:
+        {
+            interactor_cancel();
+            *consumed = TRUE;
+            wimp_regularise_rect (&drag->workbox);
+            return select_bounded_icons (drag->doc, &drag->workbox, drag->buttons == MB_DRAG(MB_ADJUST));
+        }
+        break;
+    }
+    return NULL;
+}
+
+
+/*
+ * Determine best filetype for transfer.  If we can't agree on one, send
+ * my favorite.  Actually I can only do one, so this code is a little
+ * over the top, but I might add other formats later...
+ */
+
+int document_negotiate_filetype (int *mypref, int *yourpref)
+{
+    int *mp;
+    for (; *yourpref != -1; yourpref++)
+        for (mp = mypref; *mp != -1; mp++)
+            if (*mp == *yourpref)
+                return *mp;
+    return *mypref;
+}
+        
+
+/*
+ * Closure record for the Data_Save interactor.
+ */
+
+typedef struct
+{
+    DocumentPtr doc;                                     /* src doc */
+    Bool move;                                           /* TRUE => delete src */
+} DataSaveClosureRec, *DataSaveClosurePtr;
+
+
+/*
+ * Interactor for datasaving a selection from a document.
+ */
+
+static error * datasave_interactor (unsigned int event, int *buf, void *closure, Bool *consumed)
+{
+    DataSaveClosurePtr cls = (DataSaveClosurePtr) closure;
+    MessageDataSavePtr save = (MessageDataSavePtr) buf;
+    MessageDataLoadPtr load = (MessageDataLoadPtr) buf;
+    
+    if (buf == NULL) return NULL;                        /* cancel */
+
+    switch (event)
+    {
+    case EV_USER_MESSAGE:
+    case EV_USER_MESSAGE_RECORDED:
+        if (save->header.messageid == MESSAGE_DATA_SAVE_ACK)
+        {
+            dprintf("Data Save Ack\n");
+            *consumed = TRUE;
+            ER ( template_save_file (cls->doc, NULL, save->leafname, TRUE, NULL) );
+            load->header.yourref = save->header.myref;
+            load->header.messageid = MESSAGE_DATA_LOAD;
+            return _swix(Wimp_SendMessage, _INR(0,2),
+                         EV_USER_MESSAGE_RECORDED, load, save->header.taskhandle);
+        }
+        else if (load->header.messageid == MESSAGE_DATA_LOAD_ACK)
+        {
+            *consumed = TRUE;
+            interactor_cancel();
+            if (cls->move)
+                return document_delete_selection (cls->doc);
+        }
+        break;
+    case EV_USER_MESSAGE_ACKNOWLEDGE:
+        if (save->header.messageid == MESSAGE_DATA_SAVE ||
+            load->header.messageid == MESSAGE_DATA_LOAD)
+        {
+            dprintf("Message bounced: %d; datasave cancelled\n" _ save->header.messageid);
+            *consumed = TRUE;                            /* error message here? */
+            interactor_cancel();
+        }
+    }
+    return NULL;
+}       
+
+
+/*
+ * Finalise a drag operation from the Document window.  All
+ * drags are done with DataSave, even internal ones - it just
+ * simplifies the code.  Add internal copy/move code as an optimisation later.
+ */
+
+static error * drag_callback (void *cls, DragDropCallbackPtr dd)
+{
+    DocumentPtr doc = (DocumentPtr) cls;                 /* src doc */
+    void *closure;
+    RegistryType type = registry_lookup_window (dd->mouse.windowhandle, &closure);
+    static DataSaveClosureRec dsclosure;
+
+    if (type == Document && doc == (DocumentPtr) closure)
+    {
+        /* It's a drag to the same window; ignore unless SHIFT, in which case copy */
+        if (dd->dragflags & BIT(3))
+            dsclosure.move = FALSE;
+        else
+        {
+            dragdrop_cancel ();
+            return NULL;
+        }
+    }
+    else
+    {
+        if (dd->dragflags & BIT(3))
+            dsclosure.move = TRUE;
+        else if (dd->claimant != -1 && (dd->claimantsflags & BIT(3)))
+            dsclosure.move = TRUE;
+        else
+            dsclosure.move = FALSE;
+    }
+
+    if (type == Template && ((ResourcePtr) closure)->owner == doc)
+    {
+        /* It's a drag to one of the src doc's resource windows.  Disallow this if the
+         * selection includes that resource, otherwise allow it
+         */
+        ResourcePtr res;
+        for (res = doc->resources; res; res = res->next)
+        {
+            if (res->selected && res->window.handle == dd->mouse.windowhandle)
+            {
+                dragdrop_cancel ();
+                return error_lookup ("DragSelf", res->name);
+            }
+        }
+    }
+
+    /* DataSave the selection in "doc" to the drop window */
+
+    block
+    {
+        MessageDataSaveRec msg;
+
+        if (dd->claimant != -1)                          /* find an agreeable filetype */
+            msg.filetype = document_negotiate_filetype (dd->filetypes, dd->claimantstypes);
+        else
+            msg.filetype = dd->filetypes[0];
+
+        msg.header.size = sizeof(MessageDataSaveRec);
+        msg.header.yourref = (dd->claimant != -1 ? dd->claimantsref : 0);
+        msg.header.messageid = MESSAGE_DATA_SAVE;
+        msg.windowhandle = dd->mouse.windowhandle;
+        msg.iconhandle = dd->mouse.iconhandle;
+        msg.position = dd->mouse.position;
+        msg.estsize = template_file_size (doc, NULL, TRUE);
+        strcpy(msg.leafname, message_lookup(&msgs, "Selection"));
+
+        ER ( _swix(Wimp_SendMessage, _INR(0,3),
+                   EV_USER_MESSAGE_RECORDED, &msg, dd->mouse.windowhandle, dd->mouse.iconhandle) );
+
+        dsclosure.doc = doc;
+
+        interactor_install (datasave_interactor, (void *) &dsclosure);
+    }
+    return NULL;
+}
+
+
+/*
+ * Commence a drag operation on the document window.  The coords in
+ * 'mouse' are screen-relative.
+ */
+
+static int filetypes [] = {FileType_Template, -1};
+
+static error * start_drag (DocumentPtr doc, ResourcePtr res, MouseClickPtr mouse, unsigned int modifiers)
+{
+    if (res)
+    {
+        /* Drag selection */
+        RectRec bbox;
+        get_selection_bbox (doc, &bbox);
+        wimp_convert_rect (WorkToScreen, &doc->window, &bbox, &bbox);
+        ER ( dragdrop_start (&bbox, FALSE,               /* bbox is not data's real size */
+                             BIT(1) | ((modifiers & MODIFIER_SHIFT) ? BIT(3) : 0),
+                             filetypes,
+                             drag_callback,
+                             (void *) doc) );
+    }
+    else
+    {
+        /* Lassoo icons */
+        DragBoxRec drag;
+        static DragClosureRec closure;
+        PointRec work;
+
+        interactor_cancel();
+        wimp_convert_point (ScreenToWork, &doc->window, &mouse->position, &work);
+        closure.doc = doc;
+        closure.buttons = mouse->buttons;
+        closure.modifiers = modifiers;
+        closure.workbox.minx = work.x;
+        closure.workbox.miny = work.y;
+        closure.workbox.maxx = work.x + scalex;
+        closure.workbox.maxy = work.y + scaley;
+
+        wimp_update_eor_box (&doc->window, &closure.workbox);
+
+        drag.windowhandle = doc->window.handle;
+        drag.type = 7;
+        drag.constrain = doc->window.visarea;
+
+        ER ( _swix(Wimp_DragBox, _IN(1),
+                   &drag) );
+
+        interactor_install (lassoo_interactor, (void *) &closure);
+        interactor_enable_events (BIT(EV_NULL_REASON_CODE));
+        interactor_set_timeout (2);
+    }
+    return NULL;
+}
+
+
+/*
+ * Type-in renaming.
+ */
+
+typedef struct
+{
+    DocumentPtr doc;
+    ResourcePtr res;
+    int icon;
+    char newname[RESOURCENAMELEN];
+    CaretPositionRec caret;
+    Bool resetcaret;
+} RenameClosureRec, *RenameClosurePtr;
+
+
+/*
+ * RETURN finishes a rename operation.  Many other events cause cancellation.  The
+ * losing caret stuff is surprisingly difficult to get right.
+ */
+
+static error * rename_interactor (unsigned int event, int *buf, void *closure, Bool *consumed)
+{
+    RenameClosurePtr rename = (RenameClosurePtr) closure;
+    CaretPositionPtr caret = (CaretPositionPtr) buf;
+    MouseClickPtr mouse = (MouseClickPtr) buf;
+    KeyPressPtr key = (KeyPressPtr) buf;
+    PointRec p;
+    
+    if (buf == NULL)            /* we are being asked to cancel */
+    {
+        int iblock[2];
+        iblock[0] = rename->doc->window.handle;
+        iblock[1] = rename->icon;
+        ER ( _swix(Wimp_DeleteIcon, _IN(1),
+                   &iblock) );
+        ER ( wimp_invalidate (&rename->doc->window, &rename->res->namebbox) );
+
+        if (rename->resetcaret)
+            return _swix(Wimp_SetCaretPosition, _INR(0,5),
+                         rename->caret.windowhandle, rename->caret.iconhandle, rename->caret.position.x, rename->caret.position.y, rename->caret.height, rename->caret.index);
+    }
+
+    switch (event)
+    {
+    case EV_NULL_REASON_CODE:           case EV_REDRAW_WINDOW_REQUEST:
+    case EV_POINTER_ENTERING_WINDOW:    case EV_POINTER_LEAVING_WINDOW:
+    case EV_GAIN_CARET:                 case EV_USER_MESSAGE:
+    case EV_USER_MESSAGE_RECORDED:      case EV_USER_MESSAGE_ACKNOWLEDGE:
+        break;
+
+    case EV_LOSE_CARET:
+        if (caret->windowhandle == rename->doc->window.handle &&
+            wimp_point_inside(&rename->res->namebbox, &caret->position))
+        {
+            rename->resetcaret = FALSE;
+            interactor_cancel();
+        }
+        break;
+
+    case EV_MOUSE_CLICK:
+        p.x = mouse->position.x - (rename->doc->window.visarea.minx - rename->doc->window.scrolloffset.x);
+        p.y = mouse->position.y - (rename->doc->window.visarea.maxy - rename->doc->window.scrolloffset.y);
+        if (mouse->windowhandle == rename->doc->window.handle &&
+            wimp_point_inside(&rename->res->namebbox, &p))
+            *consumed = TRUE;
+        else
+            interactor_cancel();
+        break;
+
+    case EV_KEY_PRESSED:
+        if (key->caret.windowhandle == rename->doc->window.handle &&
+            key->code == 13)
+        {
+            /* Name changed.  Check to see if it is unique */
+            interactor_cancel();
+            *consumed = TRUE;
+
+            if (strlen (rename->newname) == 0)
+                return NULL;    /* quietly refuse */
+            if (strcmp (rename->newname, rename->res->name) == 0)
+                return NULL;    /* same name */
+            else if (checkunique (rename->doc, rename->newname) == FALSE)
+                return error_lookup ("NotUnique", rename->newname); 
+            
+            sprintf (rename->res->name, "%.*s", RESOURCENAMELEN - 1, rename->newname);
+            if (rename->res == winflags_current())
+                winflags_retitle (rename->res);
+            if (rename->res == grid_current())
+                grid_retitle (rename->res);
+            if (rename->res == extent_current())
+                extent_retitle (rename->res);
+            if (rename->res == colours_current())
+                colours_retitle (rename->res);
+
+            document_modified (rename->doc, TRUE);
+        }
+        break;
+
+    default:
+        interactor_cancel();
+        break;
+    }
+    return NULL;
+}
+
+
+static error * start_rename (DocumentPtr doc, ResourcePtr res, PointPtr position)
+{
+    static RenameClosureRec closure;
+    CreateIconRec create;
+
+    interactor_cancel();
+
+    sprintf (closure.newname, "%.*s", RESOURCENAMELEN - 1, res->name);
+
+    create.windowhandle = doc->window.handle;
+    create.icon = docrenameproto;
+    create.icon.bbox = res->namebbox;
+    create.icon.data[0] = (int) closure.newname;
+
+    ER ( _swix(Wimp_CreateIcon, _IN(1) | _OUT(0),
+               &create, &closure.icon) );
+    closure.doc = doc;
+    closure.res = res;
+    closure.resetcaret = TRUE;
+
+    ER ( wimp_invalidate (&doc->window, &res->namebbox) );
+
+    interactor_install (rename_interactor, (void *) &closure);
+    
+    ER ( _swix(Wimp_GetCaretPosition, _IN(1),
+               &closure.caret) );
+    ER ( _swix(Wimp_SetCaretPosition, _INR(0,5),
+               doc->window.handle, closure.icon, position->x, position->y, -1, -1) );
+
+    return  NULL;
+}
+
+
+/*
+ * Callback for the document menu.
+ */
+
+static error * docmenu_cb (MenuPtr menu, int *buf, void *closure, Bool adjust)
+{
+    DocumentPtr doc = (DocumentPtr) closure;
+    Bool temp;
+    if (buf)
+    {
+        if (buf[0] == DOCMENU_SELECTALL)
+            ER ( document_select_all (doc) )
+        else if (buf[0] == DOCMENU_CLEARSELECTION)
+            ER ( document_lose_selection (doc) )
+        else if (buf[0] == DOCMENU_FILE && buf[1] == FILEMENU_SAVE)
+            ER ( save_document_directly (doc) )
+        else if (buf[0] == DOCMENU_SELECTION && buf[1] == SELMENU_DELETE)
+            ER ( document_delete_selection (doc) )
+        else if (buf[0] == DOCMENU_NEWWINDOW && buf[1] == NEWMENU_NEWNAME)
+        {
+            char *name = menu_get_entry (newmenu, 0);
+            if (strlen (name) == 0)
+                return NULL;    /* just ignore */
+            else if (checkunique (doc, name) == FALSE)
+                return error_lookup ("NotUnique", name); 
+            else
+            {
+                ER ( document_add_resource (doc, name, NULL) );
+            }
+        }
+
+        if (adjust)
+        {
+            if (selection_current(NULL) == doc->window.handle)
+            {
+                /* The selection we have is fine */
+                menu_shade_menu (selmenu, FALSE);
+                menu_shade (docmenu, DOCMENU_CLEARSELECTION, FALSE);
+            }
+            else
+            {
+                menu_shade_menu (selmenu, TRUE);
+                menu_shade (docmenu, DOCMENU_CLEARSELECTION, TRUE);
+            }
+        }
+    }
+    else
+        if (!adjust && selection_current(&temp) == doc->window.handle && temp)
+            selection_lose();
+
+    return NULL;
+}
+
+
+static error * post_docmenu (PointPtr workposition, PointPtr screenposition, DocumentPtr doc)
+{
+    ResourcePtr res;
+    if (selection_current(NULL) == doc->window.handle)
+    {
+        /* The selection we have is fine */
+        menu_shade_menu (selmenu, FALSE);
+        menu_shade (docmenu, DOCMENU_CLEARSELECTION, FALSE);
+    }
+    else if (selection_current(NULL) != -1)
+    {
+        /* Another window has selection */
+        menu_shade_menu (selmenu, TRUE);
+        menu_shade (docmenu, DOCMENU_CLEARSELECTION, TRUE);
+    }
+    else if ((res = which_sprite_icon (doc, workposition)) != NULL ||
+             (res = which_name_icon (doc, workposition)) != NULL)
+    {
+        select_icon (doc, res, TRUE);
+        selection_set_temporary (TRUE);
+        menu_shade_menu (selmenu, FALSE);
+        menu_shade (docmenu, DOCMENU_CLEARSELECTION, FALSE);
+    }
+    else
+    {
+        menu_shade_menu (selmenu, TRUE);
+        menu_shade (docmenu, DOCMENU_CLEARSELECTION, TRUE);
+    }
+
+    return menu_post (docmenu, screenposition, FALSE, docmenu_cb, (void *) doc);
+}
+
+
+/*
+ * Handle clicks on Document window.
+ */
+
+error * document_mouse_click (MouseClickPtr mouse, unsigned int modifiers, DocumentPtr doc)
+{
+    PointRec position;
+    ResourcePtr res;
+
+    position.x = mouse->position.x - (doc->window.visarea.minx - doc->window.scrolloffset.x);
+    position.y = mouse->position.y - (doc->window.visarea.maxy - doc->window.scrolloffset.y);
+
+    /* All clicks gain the caret */
+    ER ( _swix(Wimp_SetCaretPosition, _INR(0,5),
+               doc->window.handle, -1, 0, 0, BIT(25), 0) );
+
+    switch (mouse->buttons)
+    {
+    case MB_DOUBLE(MB_SELECT):
+        res = which_name_icon (doc, &position);
+        if (!res) res = which_sprite_icon (doc, &position);
+        if (!res) break;
+
+        res->window.behind = -1;
+        if (res->window.handle == -1)
+        {
+            /* Create window, doctoring some of the flag values */
+            WindowRec temp = res->window;
+            temp.flags &= ~(WF_AUTO_REDRAW | WF_BACKDROP);
+            temp.workareaflags = 10 << 12;
+            if (res->window.colours.workBG == 0xff)
+                temp.colours.workBG = 0;
+
+            ER ( _swix(Wimp_CreateWindow, _IN(1) | _OUT(0),
+                       &temp.visarea,
+                       &res->window.handle) );
+            ER ( registry_register_window(res->window.handle, Template, (void *) res) );
+        }
+
+        /* Raise */
+        ER ( _swix(Wimp_OpenWindow, _IN(1),
+                   &res->window) );
+        
+        /* Put caret in new window */
+        ER ( _swix(Wimp_SetCaretPosition, _INR(0,5),
+                   res->window.handle, -1, 0, 0, BIT(25), 0) );
+
+        break;
+        
+    case MB_SINGLECLICK(MB_SELECT):
+        res = which_name_icon (doc, &position);
+        if (res)
+        {
+            ER ( start_rename (doc, res, &position) );
+        }
+        else
+        {
+            res = which_sprite_icon (doc, &position);
+            if (res == NULL)
+            {
+                ER ( selection_claim (doc->window.handle) );
+                ER ( document_lose_selection(doc) );
+            }
+            else if (!res->selected)
+            {
+                document_lose_selection(doc);
+                ER ( select_icon(doc, res, TRUE) );
+            }
+        }
+        break;
+
+    case MB_SINGLECLICK(MB_ADJUST):
+        res = which_sprite_icon (doc, &position);
+        if (res)
+            ER ( select_icon(doc, res, !res->selected) );
+        break;
+
+    case MB_MENU:
+        post_docmenu (&position, &mouse->position, doc);
+        break;
+
+    case MB_DRAG(MB_SELECT):
+    case MB_DRAG(MB_ADJUST):
+        res = which_sprite_icon (doc, &position);
+        ER ( start_drag(doc, res, mouse, modifiers) );
+        break;
+    }
+    return NULL;
+}
+
+
+/*
+ * Message_Dragging handler for Document windows.  This does not have to
+ * do much since the document window does not have any concept
+ * of insertion point.  A more complex one would do ghost
+ * caret feedback, etc, and would store data for the DataSave handler
+ * to use later.
+ */
+
+error * document_claim_drag (DocumentPtr doc,            /* the document in this window */
+                             int windowhandle,           /* window handle of receiver/claimant */
+                             MessageDraggingPtr msg,     /* may contain different widow handle */
+                             int *claimref)              /* update with new myref, else 0 */
+{
+    int reply[64];
+    MessageDragClaimPtr claim = (MessageDragClaimPtr) reply;
+    static Bool donepointer = FALSE;
+    Bool removeptr;
+
+    *claimref = 0;
+
+    if (msg == NULL)                                     /* Drag-n-drop aborted */
+    {
+        donepointer = FALSE;
+        (void) dragdrop_scroll (NULL, NULL, NULL);
+        return NULL;                                     /* no feedback to undo */
+    }
+
+dprintf ("        MESSAGE_DRAGGING Offered to win %d (for %d)\n" _ windowhandle _ msg->windowhandle);
+
+    if (windowhandle != msg->windowhandle)    /* Left claim window, so bounce message */
+    {
+        donepointer = FALSE;
+        (void) dragdrop_scroll (NULL, NULL, NULL);
+        return NULL;
+    }
+
+    if (dragdrop_scroll (&doc->window, &msg->position, &removeptr))
+    {
+        if (donepointer == FALSE)
+        {
+            ER ( _swix(Wimp_SpriteOp, _IN(0) | _INR(2,7),
+                       36, "ptr_scroll", 2, 12, 12, 0, 0) );
+            donepointer = TRUE;
+        }
+    }
+    if (donepointer && removeptr)
+        donepointer = FALSE;
+
+    claim->header.yourref = msg->header.myref;           /* Reply */
+    claim->header.messageid = MESSAGE_DRAG_CLAIM;
+/*    claim->flags = 0;*/
+    claim->flags = donepointer ? BIT(0) : 0;
+    claim->filetypes[0] = FileType_Template;
+    claim->filetypes[1] = -1;
+    claim->header.size = sizeof (MessageDragClaimRec) + sizeof(int);
+                                                         /* needs increasing if length of filetypes list grows*/
+
+    ER ( _swix(Wimp_SendMessage, _INR(0,2),
+               EV_USER_MESSAGE, claim, msg->header.taskhandle) );
+    *claimref = claim->header.myref;
+dprintf("         Replying with MESSAGE_DRAG_CLAIM ref == %d\n" _ *claimref);
+    return NULL;
+}
+
+
+/*
+ * Clear up on exit.  Loses fonts.
+ */
+
+void document_free_all ()
+{
+    int i = 0;
+    RegistryType type;
+    void *closure;
+    while ((i = registry_enumerate_windows (i, &type, NULL, &closure)) != 0)
+    {
+        if (type == Document)
+        {
+            DocumentPtr doc = (DocumentPtr) closure;
+            _document_close_window (doc);
+        }
+    }
+}
+
+
+/*
+ * Look for a document with the given filename.
+ */
+
+DocumentPtr document_lookup_by_filename (char *name)
+{
+    int i = 0;
+    RegistryType type;
+    void *closure;
+    while ((i = registry_enumerate_windows (i, &type, NULL, &closure)) != 0)
+    {
+        if (type == Document)
+        {
+            DocumentPtr doc = (DocumentPtr) closure;
+            if (doc->fullpath &&
+                doc->namelength == strlen(name) &&
+                strncmp (name, doc->title, doc->namelength) == 0)
+            {
+                return doc;
+            }
+        }
+    }
+    return NULL;
+}
+
+
+error * document_raise_window (DocumentPtr doc)
+{
+    if (doc->window.handle != -1)
+    {
+        doc->window.behind = -1;
+        ER ( _swix(Wimp_OpenWindow, _IN(1),
+                   &doc->window) );
+    }
+    return NULL;
+}
+
+
+/*
+ * Keyboard shortcuts.
+ */
+
+error * document_key_pressed (DocumentPtr doc, KeyPressPtr key, Bool *consumed)
+{
+    *consumed = TRUE;
+    if (key->code == key_save)
+    {
+        PointerInfoRec pointer;
+        char name[FILENAMELEN];
+        sprintf (name, "%.*s", doc->namelength, doc->title);
+        ER ( _swix(Wimp_GetPointerInfo, _IN(1),
+                   &pointer) );
+        return saveas_open (TRUE, FALSE, &pointer.position, name, FileType_Template, save_document_cb, (void *) doc);
+    }
+    else if (key->code == key_delete)
+        return document_delete_selection (doc);
+    else if (key->code == key_selectall)
+        return document_select_all (doc);
+    else if (key->code == key_clearsel)
+        return document_lose_selection (doc);
+    *consumed = FALSE;
+    return NULL;
+}

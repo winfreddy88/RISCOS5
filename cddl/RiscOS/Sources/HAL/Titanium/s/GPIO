@@ -1,0 +1,182 @@
+;
+; CDDL HEADER START
+;
+; The contents of this file are subject to the terms of the
+; Common Development and Distribution License (the "Licence").
+; You may not use this file except in compliance with the Licence.
+;
+; You can obtain a copy of the licence at
+; cddl/RiscOS/Sources/HAL/Titanium/LICENCE.
+; See the Licence for the specific language governing permissions
+; and limitations under the Licence.
+;
+; When distributing Covered Code, include this CDDL HEADER in each
+; file and include the Licence file. If applicable, add the
+; following below this CDDL HEADER, with the fields enclosed by
+; brackets "[]" replaced with your own identifying information:
+; Portions Copyright [yyyy] [name of copyright owner]
+;
+; CDDL HEADER END
+;
+;
+; Copyright 2014 Elesar Ltd.  All rights reserved.
+; Use is subject to license terms.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:OSEntries
+
+        GET     hdr.RegMap
+        GET     hdr.StaticWS
+                
+        AREA    |GPIO$$Code|, CODE, READONLY, PIC
+
+        EXPORT  GPIOInit
+        EXPORT  GPIOMakeInput
+        EXPORT  GPIOMakeOutput
+        EXPORT  GPIOReadPin
+        EXPORT  GPIOSetPinHigh
+        EXPORT  GPIOSetPinLow
+
+; There are 8 GPIO banks
+; GPIO1 => user port handshaking (2b), RAM type (2b)
+; GPIO2 => CMOS lock option (1b)
+; GPIO3 => DVI hotplug inputs (2x1b)
+; GPIO4 => user port data (8b)
+; GPIO5 => unused
+; GPIO6 => USB power switch o/c detect (8b)
+; GPIO7 => soft off (1b), modem handshaking (4b), RAM type (2b), PMIC int (1b)
+; GPIO8 => unused
+GPIOClocks
+        DCD     -1
+        DCD     CM_WKUPAON_GPIO1_CLKCTRL + 1 ; Odd one out clock
+        DCD     CM_L4PER_GPIO2_CLKCTRL
+        DCD     CM_L4PER_GPIO3_CLKCTRL
+        DCD     CM_L4PER_GPIO4_CLKCTRL
+        DCD     CM_L4PER_GPIO5_CLKCTRL
+        DCD     CM_L4PER_GPIO6_CLKCTRL
+        DCD     CM_L4PER_GPIO7_CLKCTRL
+        DCD     CM_L4PER_GPIO8_CLKCTRL
+GPIOBases
+        DCD     -1
+        DCD     GPIO1_PhysBase
+        DCD     GPIO2_PhysBase
+        DCD     GPIO3_PhysBase
+        DCD     GPIO4_PhysBase
+        DCD     GPIO5_PhysBase
+        DCD     GPIO6_PhysBase
+        DCD     GPIO7_PhysBase
+        DCD     GPIO8_PhysBase
+GPIOCount       * (. - GPIOBases):SHR:2
+        ASSERT  ?GPIO_LogBase = (4 * GPIOCount)
+        
+; GPIOInit
+GPIOInit ROUT
+        Push    "v1-v5, lr"
+
+        MOV     v1, #1                  ; Keep naturally numbered for sanity
+        ADR     v2, GPIOBases
+        ADR     v3, GPIO_LogBase
+        LDR     v4, CMWakeUp_LogBase
+        LDR     v5, CMCoreL4PER_LogBase
+10
+        ; Map in the GPIO controller
+        MOV     a1, #0
+        LDR     a2, [v2, v1, LSL #2]
+        MOV     a3, #GPIO_PhysSize
+        CallOS  OS_MapInIO
+        STR     a1, [v3, v1, LSL #2]    ; Assigned logical base
+
+        ; Turn on the clock
+        MOV     a3, #CM_CLKCTRL_MODULEMODE_AUTO
+        ADR     a2, GPIOClocks
+        LDR     a2, [a2, v1, LSL #2]    ; Respective CLKCTRL offset
+        TST     a2, #1
+        BICNE   a2, a2, #1
+        STRNE   a3, [v4, a2]            ; WakeUp clock domain
+        STREQ   a3, [v5, a2]            ; L4PER clock domain
+20
+        LDR     a3, [a1, #GPIO_REVISION]
+        TEQ     a3, #0                  ; Wait for idle exit
+        BEQ     %BT20
+
+        ADD     v1, v1, #1
+        TEQ     v1, #GPIOCount
+        BNE     %BT10
+
+        Pull    "v1-v5, pc"
+
+; GPIOMakeInput
+; => a1 = port/pin to change
+GPIOMakeInput ROUT
+        SETV
+        B       %FT10
+        
+; GPIOMakeOutput
+; => a1 = port/pin to change
+GPIOMakeOutput
+        CLRV
+10
+        ADR     ip, GPIO_LogBase
+        MOV     a2, a1, LSR #8          ; Port
+        LDR     ip, [ip, a2, LSL #2]
+        MOV     a2, #1
+        AND     a1, a1, #&1F
+        MOV     a2, a2, LSL a1          ; Pin
+
+        ; Be atomic while OE bit twiddling
+        MRS     a4, CPSR
+        ORR     a3, a4, #I32_bit
+        MSR     CPSR_c, a3
+
+        LDR     a3, [ip, #GPIO_OE]
+        ORRVS   a3, a3, a2
+        BICVC   a3, a3, a2
+        STR     a3, [ip, #GPIO_OE]
+
+        MSR     CPSR_c, a4
+
+        MOV     pc, lr
+
+; GPIOReadPin
+; => a1 = port/pin to read
+; <= a1 = state of pin (0 or 1)
+GPIOReadPin ROUT
+        ADR     ip, GPIO_LogBase
+        MOV     a2, a1, LSR #8          ; Port
+        LDR     ip, [ip, a2, LSL #2]
+        MOV     a2, #1
+        AND     a1, a1, #&1F
+        MOV     a2, a2, LSL a1          ; Pin
+        LDR     a3, [ip, #GPIO_DATAIN]
+        ANDS    a1, a3, a2
+        MOVNE   a1, #1
+        MOV     pc, lr
+
+; GPIOSetPinHigh
+; => a1 = port/pin to change
+GPIOSetPinHigh ROUT
+        ADR     ip, GPIO_LogBase
+        MOV     a2, a1, LSR #8          ; Port
+        LDR     ip, [ip, a2, LSL #2]
+        MOV     a2, #1
+        AND     a1, a1, #&1F
+        MOV     a2, a2, LSL a1          ; Pin
+        STR     a2, [ip, #GPIO_SETDATAOUT]
+        MOV     pc, lr
+        
+; GPIOSetPinLow
+; => a1 = port/pin to change
+GPIOSetPinLow ROUT
+        ADR     ip, GPIO_LogBase
+        MOV     a2, a1, LSR #8          ; Port
+        LDR     ip, [ip, a2, LSL #2]
+        MOV     a2, #1
+        AND     a1, a1, #&1F
+        MOV     a2, a2, LSL a1          ; Pin
+        STR     a2, [ip, #GPIO_CLEARDATAOUT]
+        MOV     pc, lr
+
+        END

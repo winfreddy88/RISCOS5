@@ -1,0 +1,288 @@
+; Copyright 2015 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:Machine.<Machine>
+        GET     Hdr:ImageSize.<ImageSize>
+        $GetIO
+
+        GET     Hdr:OSEntries
+        GET     Hdr:HALEntries
+
+        GET     hdr.omap543x
+        GET     hdr.StaticWS
+        GET     hdr.Timers
+        GET     hdr.PRCM
+        GET     hdr.USB
+        GET     hdr.GPIO
+        GET     hdr.irqids543x
+
+        AREA    |Asm$$Code|, CODE, READONLY, PIC
+
+        EXPORT  USB_Init
+
+        EXPORT  HAL_USBControllerInfo
+        EXPORT  HAL_USBPortPower
+
+        IMPORT  HAL_CounterDelay
+        IMPORT  GPIOx_SetAsOutput
+        IMPORT  GPIOx_SetOutput
+
+
+; GPIO pins for USB
+GPIO_HUB_NRESET         *       80      ; HS USB Port 2
+GPIO_ETH_NRESET         *       79      ; HS USB Port 3
+
+USB_HUB_RESET_Delay1    *       100000  ; >= 100 ms
+
+OHCI_IRQ                *       OMAP54XX_IRQ_USB_HOST_HS_OHCI
+EHCI_IRQ                *       OMAP54XX_IRQ_USB_HOST_HS_EHCI
+MUSB_IRQ                *       OMAP54XX_IRQ_USB_OTG_SS_CORE
+
+
+USB_Init
+        Push    "lr"
+        ; Initialise USB
+
+        ; initialise port 2 + 3 in EHCI_HCD_OMAP_MODE_HSIC and GPIO pins
+        LDR     a1, L4_Core_Log
+        LDR     a2, =(L4_CTRL_MODULE_CORE_PAD - L4_Core)
+        ADD     a1, a2, a1
+        LDR     a2, =0x01000100         ; inputs: IEN + Mode 0
+        LDR     a3, =0x0006             ; output + Mode 6
+        STR     a2, [a1, #0x00C4]       ; USB2_HSIC_STROBE + USB2_HSIC_DATA
+        STRH    a3, [a1, #0x00AE]       ; gpio3_79 == ETH_RESET
+        STRH    a3, [a1, #0x00B0]       ; gpio3_80 == HUB_RESET
+        ADD     a1, a1, #0x100
+        STRH    a2, [a1, #0x00DE]       ; USB3_HSIC_STROBE
+        STRH    a2, [a1, #0x00E0]       ; USB3_HSIC_DATA
+
+        ; reset hubs
+        MOV     a1, #GPIO_HUB_NRESET
+        MOV     a2, #0
+        BL      GPIOx_SetAsOutput
+        MOV     a1, #GPIO_ETH_NRESET
+        MOV     a2, #0
+        BL      GPIOx_SetAsOutput
+
+        ; Enable L3INIT power domain
+        LDR     a1, L4_PRM_Log
+        ADD     a1, a1, #L3INIT_PRM
+        LDR     a2, [a1, #PM_L3INIT_PWRSTCTRL]
+        ORR     a2, a2, #1              ; ON state
+        STR     a2, [a1, #PM_L3INIT_PWRSTCTRL]
+
+        ; Disable optional function clocks for SCRM (is this needed?)
+        ADD     a1, a1, #(WKUPAON_CM - L3INIT_PRM)
+        MOV     a2, #0
+        STR     a2, [a1, #CM_WKUPAON_SCRM_CLKCTRL]
+
+        ; Activate SCRM_AUXCLK1
+        LDR     a1, L4_Wakeup_Log
+        ADD     a1, a1, #(L4_SCRM - L4_Wakeup)
+        LDR     a2, =(1 << 8)   ; ENABLE=1, SRCSELECT=0 (SYS_CLK), CLKDIV=0 (/1)
+        STR     a2, [a1, #SCRM_AUXCLK1]
+
+        ; Enable L3INIT clocks (is this needed?)
+        LDR     a1, L4_CM_CORE_Log
+        ADD     a1, a1, #CORE_CM_CORE
+        LDR     a2, [a1, #CM_L3MAIN1_CLKSTCTRL]
+        ORR     a2, a2, #3              ; HW_AUTO
+        STR     a2, [a1, #CM_L3MAIN1_CLKSTCTRL]
+        LDR     a2, [a1, #CM_L3MAIN2_CLKSTCTRL]
+        ORR     a2, a2, #3              ; HW_AUTO
+        STR     a2, [a1, #CM_L3MAIN2_CLKSTCTRL]
+
+        ; Enable USBHOST TLL clocks: OPTFCLKEN_USB_CH2_CLK + OPTFCLKEN_USB_CH1_CLK
+        ADD     a1, a1, #(L3INIT_CM_CORE - CORE_CM_CORE)
+        MOV     a2, #((1 << 10) + (1 << 9))
+        ORR     a2, a2, #1              ; enable module
+        STR     a2, [a1, #CM_L3INIT_USB_TLL_HS_CLKCTRL]
+
+        ; Enable all clocks for port 2 + 3: HSIC480M, HSIC60M + UTMI
+        LDR     a2, [a1, #CM_L3INIT_USB_HOST_HS_CLKCTRL]
+        LDR     a3, =((3 << 6) + (3 << 9) + (1 << 12) + (1 << 14))
+        ORR     a2, a2, a3
+        BIC     a2, a2, #3
+        ORR     a2, a2, #2              ; enable module
+        STR     a2, [a1, #CM_L3INIT_USB_HOST_HS_CLKCTRL]
+
+        ; TLL soft reset
+        LDR     a1, L4_USBTLL_Log
+        MOV     a2, #2          ; SOFTRESET
+        STR     a2, [a1, #USBTLL_SYSCONFIG]
+5
+        LDR     a2, [a1, #USBTLL_SYSSTATUS]
+        TST     a2, #1          ; RESETDONE
+        BEQ     %BT5
+
+        ; Configure channels
+        LDR     a2, [a1, #TLL_CHANNEL_CONF_1]
+        BIC     a2, a2, #(3 << 1)
+        ORR     a2, a2, #((2 << 1) + 1) ; CHANMODE=2 + CHANEN
+        STR     a2, [a1, #TLL_CHANNEL_CONF_1]
+        LDR     a2, [a1, #TLL_CHANNEL_CONF_2]
+        BIC     a2, a2, #(3 << 1)
+        ORR     a2, a2, #((2 << 1) + 1) ; CHANMODE=2 + CHANEN
+        STR     a2, [a1, #TLL_CHANNEL_CONF_2]
+
+        ; Now configure UHH
+        LDR     a1, L4_USB_Host_Log
+        ; reset HS USB controller
+;       MOV     a2, #((2 << 2) + (1 << 0))      ; SmartIdle + SOFTRESET
+        MOV     a2, #((1 << 2) + (1 << 0))      ; No-Idle + SOFTRESET
+        STR     a2, [a1, #UHH_SYSCONFIG]
+        ; Remark: this seems to be inverted compared to OMAP4 ==> check it!
+        ; for OMAP4: 1 == Out of reset, 0 == Under reset
+        ; for OMAP5: 1 == Under reset,  0 == Out of reset
+        ; after check: OMAP5 docu is wrong!
+6
+        LDR     a2, [a1, #UHH_SYSSTATUS]
+;       ANDS    a2, a2, #((1 << 2) + (1 << 1))  ; EHCI_RESETDONE + OHCI_RESETDONE
+        CMP     a2, #((1 << 2) + (1 << 1))      ; EHCI_RESETDONE + OHCI_RESETDONE
+        BNE     %BT6
+
+        ; according to Linux sources: errata i660 and i571 ==> don't use SmartIdle
+        LDR     a2, =((1 << 4) + (1 << 2))      ; No-Standby + No-Idle
+        STR     a2, [a1, #UHH_SYSCONFIG]
+        ; Configure for HSIC mode port2 + port3
+        ; P3: HSIC, P2: HSIC, INCR4/8/16 bursts enabled
+        LDR     a2, =((3 << 20) + (3 << 18) + (1 << 4) + (1 << 3) + (1 << 2))
+        STR     a2, [a1, #UHH_HOSTCONFIG]
+
+        ; keep USB hubs in reset until USB is powered (needed for EVM)
+  [ {FALSE}
+        ; wait a bit - let hardware settle
+        LDR     a1, =USB_HUB_RESET_Delay1
+        BL      HAL_CounterDelay
+
+        ; release hubs out of reset
+        MOV     a1, #GPIO_HUB_NRESET
+        MOV     a2, #1
+        BL      GPIOx_SetOutput
+        MOV     a1, #GPIO_ETH_NRESET
+        MOV     a2, #1
+        BL      GPIOx_SetOutput
+
+        ; wait a bit
+        LDR     a1, =USB_HUB_RESET_Delay1
+        BL      HAL_CounterDelay
+  ]
+
+        Pull    "pc"
+
+
+        ; a1 = interface #
+        ; a2 = usbinfo ptr
+        ; a3 = sizeof(usbinfo)
+        ; Return sizeof(usbinfo) or 0 for no more devices
+        ; If supplied size isn't large enough, only the controller type will be filled in
+HAL_USBControllerInfo
+        CMP     a1, #1
+        MOVHI   a1, #0
+        MOVHI   pc, lr
+        BEQ     %FT10
+        ; Fill in the usbinfo struct
+        MOV     a1, #HALUSBControllerType_EHCI
+        STR     a1, [a2, #HALUSBControllerInfo_Type]
+        CMP     a3, #HALUSBControllerInfo_SizeOf
+        MOV     a1, #HALUSBControllerInfo_SizeOf
+        MOVLO   pc, lr
+        ; EHCI did seem to work OK without forcing 32bit register access,
+        ; but it is technically needed so I'll leave it set.
+        MOV     a4, #(HALUSBControllerFlag_32bit_Regs + HALUSBControllerFlag_HAL_Port_Power)
+        STR     a4, [a2, #HALUSBControllerInfo_Flags]
+        LDR     a4, L4_USB_Host_Log
+        ADD     a4, a4, #EHCI_BASE
+        STR     a4, [a2, #HALUSBControllerInfo_HW]
+        MOV     a4, #EHCI_IRQ
+        STR     a4, [a2, #HALUSBControllerInfo_DevNo]
+        MOV     pc, lr
+10
+        MOV     a1, #HALUSBControllerType_MUSBMHDRC
+        STR     a1, [a2, #HALUSBControllerInfo_Type]
+        CMP     a3, #HALUSBControllerInfo_SizeOf
+        MOV     a1, #HALUSBControllerInfo_SizeOf
+        MOVLO   pc, lr
+        MOV     a4, #0
+        STR     a4, [a2, #HALUSBControllerInfo_Flags]
+        LDR     a4, L4_USB_OTG_Log
+        STR     a4, [a2, #HALUSBControllerInfo_HW]
+        MOV     a4, #MUSB_IRQ
+        STR     a4, [a2, #HALUSBControllerInfo_DevNo]
+        MOV     pc, lr
+
+        ; a1 = interface #
+        ; a2 = port #
+        ; a3 = power state of port
+        ; Return 0 on success
+HAL_USBPortPower
+        ; remark: act on all ports at once (use lowest port # for action)
+        CMP     a2, #1
+        MOVNE   a1, #-1
+        MOVNE   pc, lr
+
+        Push    "v1,lr"
+
+        ; switch off power for all ports (needed for EVM)
+        LDR     v1, L4_USB_Host_Log
+        ADD     v1, v1, #EHCI_BASE
+        MOV     a4, #0
+        STR     a4, [v1, #EHCI_PORTSC_1]
+        STR     a4, [v1, #EHCI_PORTSC_2]
+
+        ; wait a bit
+        LDR     a1, =USB_HUB_RESET_Delay1
+        BL      HAL_CounterDelay
+
+        ; reset hubs
+        MOV     a1, #GPIO_HUB_NRESET
+        MOV     a2, #0
+        BL      GPIOx_SetOutput
+        MOV     a1, #GPIO_ETH_NRESET
+        MOV     a2, #0
+        BL      GPIOx_SetOutput
+
+        ; wait a bit
+        LDR     a1, =USB_HUB_RESET_Delay1
+        BL      HAL_CounterDelay
+
+        ; activate used ports
+        MOV     a2, #(1 << 12)  ; power on
+        STR     a2, [v1, #EHCI_PORTSC_1]
+        STR     a2, [v1, #EHCI_PORTSC_2]
+
+        ; wait a bit
+        LDR     a1, =USB_HUB_RESET_Delay1
+        BL      HAL_CounterDelay
+
+        ; release hubs out of reset
+        MOV     a1, #GPIO_HUB_NRESET
+        MOV     a2, #1
+        BL      GPIOx_SetOutput
+        MOV     a1, #GPIO_ETH_NRESET
+        MOV     a2, #1
+        BL      GPIOx_SetOutput
+
+        ; wait a bit
+        LDR     a1, =USB_HUB_RESET_Delay1
+        BL      HAL_CounterDelay
+
+        MOV     a1, #0
+        Pull    "v1,pc"
+
+        END

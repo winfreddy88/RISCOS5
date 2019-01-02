@@ -1,0 +1,484 @@
+; Copyright 2011 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:Machine.<Machine>
+        GET     Hdr:ImageSize.<ImageSize>
+
+        GET     Hdr:OSEntries
+        GET     Hdr:HALEntries
+
+        GET     hdr.omap4430
+        GET     hdr.StaticWS
+        GET     hdr.Interrupts
+
+        AREA    |Asm$$Code|, CODE, READONLY, PIC
+
+        EXPORT  Interrupt_Init
+        EXPORT  HAL_IRQEnable
+        EXPORT  HAL_IRQDisable
+        EXPORT  HAL_IRQClear
+        EXPORT  HAL_IRQSource
+        EXPORT  HAL_IRQStatus
+        EXPORT  HAL_FIQEnable
+        EXPORT  HAL_FIQDisable
+        EXPORT  HAL_FIQDisableAll
+        EXPORT  HAL_FIQClear
+        EXPORT  HAL_FIQSource
+        EXPORT  HAL_FIQStatus
+        EXPORT  HAL_IRQMax
+        EXPORT  HAL_IRQProperties
+        EXPORT  HAL_IRQSetCores
+        EXPORT  HAL_IRQGetCores
+
+        ; $base += ($num >> 5) << 2
+        ; $bit = 1 << ($num & 31)
+        ; NE if $num >= 32
+        ; $temp can be $num
+        MACRO
+        BitMap  $num, $base, $bit, $temp
+        MOVS    $bit, $num, LSR #5
+        AND     $temp, $num, #31
+        ADD     $base, $base, $bit, LSL #2
+        MOV     $bit, #1
+        MOV     $bit, $bit, LSL $temp
+        MEND
+
+        ; As above, but $base = ($num >> 5) << 2
+        MACRO
+        BitMap0 $num, $base, $bit, $temp
+        MOVS    $base, $num, LSR #5
+        AND     $temp, $num, #31
+        MOV     $base, $base, LSL #2
+        MOV     $bit, #1
+        MOV     $bit, $bit, LSL $temp
+        MEND
+
+Interrupt_Init
+        ; 1. disable Distributor Controller
+        LDR     a1, MPU_INTC_Log
+        ADD     a1, a1, #MPU_INTC_DIST
+        MOV     a2, #0          ; disable ICDDCR
+        STR     a2, [a1, #GIC_DIST_CTRL]
+
+        ; 2. set all global interrupts to be level triggered, active low
+        ADD     a3, a1, #GIC_DIST_CONFIG
+        ADD     a3, a3, #8
+        MOV     a4, #INTERRUPT_MAX-32
+        MOV     ip, #32
+10
+        STR     a2, [a3], #4
+        ADD     ip, ip, #16
+        CMP     ip, a4
+        BNE     %BT10
+
+        ; 3. set all global interrupts to this CPU only
+        ADD     a3, a1, #(GIC_DIST_TARGET + 32)
+        MOV     ip, #32
+        MOV     a2, #1
+        ORR     a2, a2, a2, LSL #8
+        ORR     a2, a2, a2, LSL #16
+20
+        STR     a2, [a3], #4
+        ADD     ip, ip, #4
+        CMP     ip, a4
+        BNE     %BT20
+
+        ; 4. set priority on all interrupts
+        ADD     a3, a1, #(GIC_DIST_PRI + 32)
+        MOV     ip, #32
+        MOV     a2, #&A0
+        ORR     a2, a2, a2, LSL #8
+        ORR     a2, a2, a2, LSL #16
+30
+        STR     a2, [a3], #4
+        ADD     ip, ip, #4
+        CMP     ip, a4
+        BNE     %BT30
+
+        ; 5. disable all interrupts
+        ADD     a3, a1, #GIC_DIST_ENABLE_CLEAR
+        MOV     ip, #32
+        MOV     a2, #-1
+40
+        STR     a2, [a3], #4
+        ADD     ip, ip, #32
+        CMP     ip, a4
+        BNE     %BT40
+
+        ; 6. enable Distributor Controller
+        MOV     a2, #ICDDCR_ENABLE
+        STR     a2, [a1, #GIC_DIST_CTRL]
+
+        ; 7. set PRIMASK in CPU interface
+        LDR     a1, MPU_INTC_Log
+        MOV     a2, #&F0
+        STR     a2, [a1, #(MPU_INTC_CPU + GIC_CPU_PRIMASK)]
+
+        ; 8. enable CPU interface
+        MOV     a2, #ICCICR_ENABLE
+        STR     a2, [a1, #(MPU_INTC_CPU + GIC_CPU_CTRL)]
+        ; ... and everything else looks good?
+        MOV     pc, lr
+
+HAL_IRQEnable   ROUT
+        CMP     a1, #INTERRUPT_MAX
+        MOVHS   a1, #0
+        MOVHS   pc, lr
+        BitMap0 a1, a2, a3, a4
+        CMP     a1, #32
+        LDR     a4, MPU_INTC_Log
+        SUBHS   a2, a2, #4 ; Remap to GIC registers (assume we won't get called with wrong private interrupt)
+        ADD     a4, a4, #MPU_INTC_DIST + GIC_DIST_ENABLE_SET
+        LDR     a1, [a4, a2] ; Get old state
+        STR     a3, [a4, a2] ; Set new state
+        AND     a1, a1, a3 ; Return value
+        MOV     pc, lr
+
+HAL_IRQDisable  ROUT
+        CMP     a1, #INTERRUPT_MAX
+        MOVHS   a1, #0
+        MOVHS   pc, lr
+        BitMap0 a1, a2, a3, a4
+        CMP     a1, #32
+        LDR     ip, MPU_INTC_Log
+        SUBHS   a2, a2, #4 ; Remap to GIC registers (assume we won't get called with wrong private interrupt)
+        ADD     a4, ip, #MPU_INTC_DIST + GIC_DIST_ENABLE_CLEAR
+        LDR     a2, [a4, a2]! ; Get old state
+        STR     a3, [a4] ; Set new state
+        LDR     a4, [a4, #GIC_DIST_ACTIVE_BIT-GIC_DIST_ENABLE_CLEAR] ; TODO could this be bogus? - if register isn't banked we'll do the wrong thing
+        SUBHS   a1, a1, #32
+        TST     a4, a3 ; Was it active?
+        BEQ     %FT90
+        CMPLO   a1, #16 ; LO if this is core 0 private, check to see if SGI
+        ORRLO   a1, a1, #1<<10 ; Set opposite to current CPU
+        STR     a1, [ip, #(MPU_INTC_CPU + GIC_CPU_EOI)]
+90
+        AND     a1, a2, a3 ; Return value
+        DSB     SY
+        MOV     pc, lr
+
+HAL_IRQClear    ROUT
+        CMP     a1, #32
+        SUBHS   a1, a1, #32     ; Map to GIC interrupt number
+        ; Signal End Of Interrupt
+        CMP     a1, #16         ; SGI?
+        BHS     %FT10
+        MRC     p15, 0, a2, c0, c0, 5
+        TST     a2, #1
+        ADDEQ   a1, a1, #1<<10  ; Assume it came from the other CPU
+10
+        LDR     a2, MPU_INTC_Log
+        STR     a1, [a2, #(MPU_INTC_CPU + GIC_CPU_EOI)]
+        ; Data synchronisation barrier to make sure INTC gets the message
+        DSB     SY
+        MOV     pc, lr
+
+HAL_IRQSource   ROUT
+        LDR     a2, MPU_INTC_Log
+        LDR     a3, [a2, #(MPU_INTC_CPU + GIC_CPU_INTACK)]
+        BIC     a1, a3, #ICCIAR_CPUID
+        CMP     a1, #INTERRUPT_MAX-32
+        MOVHI   a1, #-1            ; Spurious interrupt, ignore it
+        MOVHI   pc, lr
+        MRC     p15, 0, a4, c0, c0, 5
+        AND     a4, a4, #1
+        CMP     a1, #32
+        ADDLO   a1, a1, a4, LSL #5 ; Remap private interrupt
+        ADDHS   a1, a1, #32        ; Remap shared interrupt
+        MOV     pc, lr
+
+HAL_IRQStatus
+        ; Test if IRQ is firing, irrespective of mask state
+        CMP     a1, #INTERRUPT_MAX
+        MOVHS   a1, #0
+        MOVHS   pc, lr
+        LDR     a2, MPU_INTC_Log
+        ADD     a2, a2, #(MPU_INTC_DIST + GIC_DIST_ACTIVE_BIT)
+        BitMap  a1, a2, a3, a4
+        SUBNE   a2, a2, #4      ; Remap to GIC registers
+        LDR     a1, [a2]        ; Get status
+        AND     a1, a1, a3
+        MOV     pc, lr
+
+
+;
+; ToDo: do we have FIQs in Non-Secure environment GIC ???
+;    FIQ_Supported part contains register names from OMAP3 implementation;
+;    this needs updating for GICv1 naming conventions!
+;
+                GBLL    FIQ_Supported
+FIQ_Supported   SETL    {FALSE}
+
+HAL_FIQEnable
+  [ FIQ_Supported
+        CMP     a1, #INTERRUPT_MAX
+        MOVHS   a1, #0
+        MOVHS   pc, lr
+        ; Disable interrupts while we update the controller
+        MRS     a4, CPSR
+        ORR     a3, a4, #F32_bit+I32_bit
+        MSR     CPSR_c, a3
+        ; Set the interrupt type & priority, and then unmask it
+        MOV     a2, #1 ; highest priority for all FIQs.
+        LDR     a3, MPU_INTC_Log
+        ADD     ip, a3, #INTCPS_ILR
+        ASSERT  INTCPS_ILR_SIZE = 4
+        STR     a2, [ip, a1, LSL #2]
+        AND     a2, a1, #&1F ; Mask bit
+        MOV     a1, a1, LSR #5 ; BITS index
+        ASSERT  INTCPS_BITS_SIZE = 32
+        ADD     ip, a3, a1, LSL #5
+        MOV     a1, #1
+        MOV     a2, a1, LSL a2
+        LDR     a1, [ip, #INTCPS_BITS+INTCPS_BITS_MIR] ; Get old state
+        STR     a2, [ip, #INTCPS_BITS+INTCPS_BITS_MIR_CLEAR] ; Write to clear reg to set new state
+        MSR     CPSR_c, a4 ; Re-enable interrupts
+        MVN     a1, a1 ; Invert so we get a mask of enabled interrupts
+        AND     a1, a1, a2 ; Test if it was enabled or not
+        MOV     pc, lr
+  |
+        MOV     a1, #0
+        MOV     pc, lr
+  ] ; FIQ_Supported
+
+HAL_FIQDisable
+  [ FIQ_Supported
+        CMP     a1, #INTERRUPT_MAX
+        MOVHS   a1, #0
+        MOVHS   pc, lr
+        Push    "lr"
+        ; Disable interrupts while we update the controller (not necessarily needed for disabling them?)
+        MRS     a4, CPSR
+        ORR     a3, a4, #F32_bit+I32_bit
+        MSR     CPSR_c, a3
+        ; Check if this is actually an FIQ
+        LDR     a3, MPU_INTC_Log
+        ASSERT  INTCPS_ILR_SIZE = 4
+        ADD     a2, a3, a1, LSL #2
+        LDR     a2, [a2, #INTCPS_ILR]
+        TST     a2, #1
+        MOVEQ   a1, #0 ; This is an IRQ, so don't disable it
+        MSREQ   CPSR_c, a4
+        Pull    "pc", EQ
+        ; Now mask the interrupt
+        AND     a2, a1, #&1F ; Mask bit
+        MOV     lr, a1, LSR #5 ; BITS index
+        ASSERT  INTCPS_BITS_SIZE = 32
+        ADD     ip, a3, lr, LSL #5
+        MOV     lr, #1
+        MOV     a2, lr, LSL a2
+        LDR     lr, [ip, #INTCPS_BITS+INTCPS_BITS_MIR] ; Get old state
+        STR     a2, [ip, #INTCPS_BITS+INTCPS_BITS_MIR_SET] ; Mask the interrupt
+        ; Check if we just disabled the active interrupt
+        LDR     ip, [a3, #INTCPS_SIR_FIQ]
+        CMP     ip, a1
+        MOVEQ   ip, #2
+        STREQ   ip, [a3, #INTCPS_CONTROL]
+        MSR     CPSR_c, a4 ; Re-enable interrupts
+        BIC     a1, a2, lr ; Clear the masked interrupts from a2 to get nonzero result if it was enabled
+        Pull    "pc"
+  |
+        MOV     a1, #0
+        MOV     pc, lr
+  ] ; FIQ_Supported
+
+HAL_FIQDisableAll
+  [ FIQ_Supported
+        ; This isn't particularly great, we need to scan the entire ILR array
+        ; and work out which are FIQs, and then write to the ISR_SET registers
+        ; We should probably keep our own array of enabled FIQs so this can be
+        ; done more quickly
+        MRS     a4, CPSR
+        ORR     a3, a4, #F32_bit+I32_bit
+        MSR     CPSR_c, a3
+        LDR     a1, MPU_INTC_Log
+        ADD     a1, a1, #INTCPS_ILR
+        MOV     a2, #1 ; Mask to write
+        ADD     a3, a1, #INTCPS_BITS+INTCPS_BITS_MIR_SET-INTCPS_ILR
+HAL_FIQDisableAll_Loop1
+        LDR     ip, [a1],#INTCPS_ILR_SIZE
+        TST     ip, #1 ; 1=FIQ, 0=IRQ
+        STRNE   a2, [a3] ; Disable it
+        MOVS    a2, a2, LSL #1
+        BCC     HAL_FIQDisableAll_Loop1
+        ; Move on to next word
+        MOV     a2, #1
+        ADD     a3, a3, #INTCPS_BITS_SIZE
+HAL_FIQDisableAll_Loop2
+        LDR     ip, [a1],#INTCPS_ILR_SIZE
+        TST     ip, #1 ; 1=FIQ, 0=IRQ
+        STRNE   a2, [a3] ; Disable it
+        MOVS    a2, a2, LSL #1
+        BCC     HAL_FIQDisableAll_Loop2
+        ; Move on to last word
+        MOV     a2, #1
+        ADD     a3, a3, #INTCPS_BITS_SIZE
+HAL_FIQDisableAll_Loop3
+        LDR     ip, [a1],#INTCPS_ILR_SIZE
+        TST     ip, #1 ; 1=FIQ, 0=IRQ
+        STRNE   a2, [a3] ; Disable it
+        MOVS    a2, a2, LSL #1
+        BCC     HAL_FIQDisableAll_Loop3
+        ; Done
+        ASSERT  INTCPS_BITS_COUNT = 3
+        MSR     CPSR_c, a4
+        ; FIQDisableAll is only called during emergency situations, so restart INTC priority
+        ; sorting to avoid having to rewrite various bits of RISC OS code to query FIQ sources
+        ; and call FIQClear on each one (which would otherwise be the only legal way of
+        ; stopping all FIQs from firing)
+        LDR     a2, MPU_INTC_Log
+        MOV     a1, #2
+        STR     a1, [a2, #INTCPS_CONTROL]
+        ; Data synchronisation barrier to make sure INTC gets the message
+        DSB     SY
+  ] ; FIQ_Supported
+        MOV     pc, lr
+
+HAL_FIQClear
+  [ FIQ_Supported
+        ; Restart INTC priority sorting
+        LDR     a2, MPU_INTC_Log
+        MOV     a1, #2
+        STR     a1, [a2, #INTCPS_CONTROL]
+        ; Data synchronisation barrier to make sure INTC gets the message
+        DSB     SY
+  ] ; FIQ_Supported
+        MOV     pc, lr
+
+HAL_FIQStatus
+  [ FIQ_Supported
+        ; Test if FIQ is firing, irrespective of mask state
+        CMP     a1, #INTERRUPT_MAX
+        MOVHS   a1, #0
+        MOVHS   pc, lr
+        ; First we need to make sure this is an FIQ, not an IRQ?
+        MRS     a4, CPSR
+        ORR     a3, a4, #F32_bit+I32_bit
+        MSR     CPSR_c, a3
+        LDR     a2, MPU_INTC_Log
+        ASSERT  INTCPS_ILR_SIZE = 4
+        ADD     a3, a2, a1, LSL #2
+        LDR     a3, [a3, #INTCPS_ILR]
+        TST     a3, #1
+        MOVEQ   a1, #0 ; This is an IRQ, so it can't fire for FIQ
+        MSREQ   CPSR_c, a4
+        MOVEQ   pc, lr
+        ; Now check if it's firing
+        ASSERT  INTCPS_BITS_SIZE = 32
+        MOV     a3, a1, LSR #5
+        ADD     a3, a2, a3, LSL #5
+        LDR     a3, [a3, #INTCPS_BITS+INTCPS_BITS_ITR]
+        MSR     CPSR_c, a4
+        AND     a1, a1, #31
+        MOV     a1, a3, LSR a1 ; Shift and invert so 1=active
+        AND     a1, a1, #1 ; 0 = not firing, 1 = firing
+        MOV     pc, lr
+  |
+        MOV     a1, #0
+        MOV     pc, lr
+  ] ; FIQ_Supported
+
+HAL_FIQSource
+  [ FIQ_Supported
+        ; Does the ARM think an interrupt is occuring?
+        MRC     p15, 0, a1, c12, c1, 0
+        TST     a1, #F32_bit
+        MOVEQ   a1, #-1
+        MOVEQ   pc, lr
+        LDR     a2, MPU_INTC_Log
+        LDR     a1, [a2, #INTCPS_SIR_FIQ]
+        CMP     a1, #INTERRUPT_MAX
+        ANDLO   a1, a1, #&7F
+        MOVLO   pc, lr
+        ; Authentic spurious interrupt - restart INTC and return -1
+        MOV     a1, #-1
+        MOV     a3, #2
+        STR     a3, [a2, #INTCPS_CONTROL]
+        ; Data synchronisation barrier to make sure INTC gets the message
+        DSB     SY
+        MOV     pc, lr
+  |
+        MOV     a1, #0
+        MOV     pc, lr
+  ] ; FIQ_Supported
+
+HAL_IRQMax
+        MOV     a1, #INTERRUPT_MAX
+        MOV     pc, lr
+
+; In: a1 = device number
+; Out: a1 = IRQ mask
+;      a2 = FIQ mask
+;           bits 0-29 of each register give cores that the interrupt can be
+;           assigned to
+;           bit 30 = private flag
+;           bit 31 = interrupt can be routed to multiple cores at once
+HAL_IRQProperties
+        ; 0-31 for core 0
+        ; 32-63 for core 1
+        ; 64+ for shared
+        CMP     a1, #INTERRUPT_MAX
+        MOVHS   a2, #0
+        BHS     %FT10
+        CMP     a1, #64
+        MOVLO   a2, #2 + HALIRQProperty_Private
+        MOVHS   a2, #3 + HALIRQProperty_Multicore
+        CMP     a1, #32
+        MOVLO   a2, #1 + HALIRQProperty_Private
+10
+        MOV     a1, a2
+      [ :LNOT: FIQ_Supported
+        MOV     a2, #0
+      ]
+        MOV     pc, lr
+
+; In: a1 = device number
+;     a2 = desired core mask
+; Out: a1 = actual core mask
+HAL_IRQSetCores
+        CMP     a1, #INTERRUPT_MAX
+        MOVHS   a1, #0
+        MOVHS   pc, lr
+        CMP     a1, #64
+        BLO     %FT10
+        LDR     a3, MPU_INTC_Log
+        ADD     a3, a3, #MPU_INTC_DIST + GIC_DIST_TARGET
+        ADD     a3, a3, a1
+        AND     a1, a2, #3
+        STRB    a1, [a3, #-32] ; Update mapping
+        MOV     pc, lr
+
+HAL_IRQGetCores ; read-only version of IRQSetCores
+        CMP     a1, #INTERRUPT_MAX
+        MOVHS   a1, #0
+        MOVHS   pc, lr
+        CMP     a1, #64
+        BLO     %FT10
+        LDR     a3, MPU_INTC_Log
+        ADD     a3, a3, #MPU_INTC_DIST + GIC_DIST_TARGET
+        ADD     a3, a3, a1
+        LDRB    a1, [a3, #-32] ; Get mapping
+        MOV     pc, lr
+
+10
+        CMP     a1, #32
+        MOVHS   a1, #2
+        MOVLO   a1, #1
+        MOV     pc, lr
+
+        END

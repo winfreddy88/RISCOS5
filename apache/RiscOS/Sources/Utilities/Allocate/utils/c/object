@@ -1,0 +1,479 @@
+/*
+ * Name   : object.c
+ * Desc   : object control for the !allocate application
+ * Auther : James Bye
+ * Date   : 18-Jul-1994
+ *
+ *
+ */
+
+//#include "wimp.h"        /*  access to WIMP SWIs                      */
+//#include "wimpt.h"       /*  wimp task facilities                     */
+//#include "win.h"         /*  registering window handlers              */
+//#include "event.h"       /*  poll loops, etc                          */
+//#include "baricon.h"     /*  putting icon on icon bar                 */
+//#include "werr.h"        /*  error reporting                          */
+//#include "res.h"         /*  access to resources                      */
+//#include "resspr.h"      /*  sprite resources                         */
+//#include "flex.h"        /*  dynamic mem alloc from WIMP              */
+//#include "template.h"    /*  reading in template file                 */
+//#include "dbox.h"        /*  dialogue box handling                    */
+//#include "msgs.h"
+//#include "fileicon.h"
+//#include "xfersend.h"
+
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+
+#include "kernel.h"
+
+#include "object.h"
+#include "file.h"
+#include "guard.h"
+
+#include "swis.h"
+
+/********************************************************
+ * Icon definitions                                     *
+ ********************************************************/
+
+#define i_Messages_BlockRequired   2
+#define i_Messages_Description     6
+#define i_Messages_Help            5
+#define i_Messages_Cancel          7
+#define i_Messages_Add             3
+
+#define i_SWIChunk_Prefix          4
+#define i_SWIChunk_Description     6
+#define i_SWIChunk_Help            7
+#define i_SWIChunk_Cancel          5
+#define i_SWIChunk_Add             3
+
+#define i_Reservation_Text         9
+#define i_Reservation_Type         6
+#define i_Reservation_PopUp        8
+#define i_Reservation_Help         7
+#define i_Reservation_Cancel       3
+#define i_Reservation_Add          2
+
+#define i_FileType_AppName         2
+#define i_FileType_FName           5
+#define i_FileType_DoubleClick     7
+#define i_FileType_Sprite         11
+#define i_FileType_ProdDesc       15
+#define i_FileType_Format          3
+#define i_FileType_Help           14
+#define i_FileType_Cancel         12
+#define i_FileType_Add            10
+
+#define i_ErrorBlock_BlockRequired  2
+#define i_ErrorBlock_Description    6
+#define i_ErrorBlock_Help           5
+#define i_ErrorBlock_Cancel         7
+#define i_ErrorBlock_Add            3
+
+#define i_Podule_ManfId       8
+#define i_Podule_Allocate    10
+#define i_Podule_Name         9
+#define i_Podule_Description  3
+#define i_Podule_Help         4
+#define i_Podule_Cancel      11
+#define i_Podule_Add          7
+
+#define i_DrawTags_BaseRequired  2
+#define i_DrawTags_Description   6
+#define i_DrawTags_Help          5
+#define i_DrawTags_Cancel        7
+#define i_DrawTags_Add           3
+
+#define i_DrawObjects_BaseRequired  2
+#define i_DrawObjects_Description   6
+#define i_DrawObjects_Help          5
+#define i_DrawObjects_Cancel        7
+#define i_DrawObjects_Add           3
+
+#define i_FilingSystem_Name         2
+#define i_FilingSystem_Select       3
+#define i_FilingSystem_Help        14
+#define i_FilingSystem_Cancel      12
+#define i_FilingSystem_Add         10
+
+#define i_Services_BlockRequired    2
+#define i_Services_Description      6
+#define i_Services_Help             5
+#define i_Services_Cancel           7
+#define i_Services_Add              3
+
+#define i_Devices_Name              4
+#define i_Devices_Description       6
+#define i_Devices_Help              7
+#define i_Devices_Cancel            5
+#define i_Devices_Add               3
+
+/********************************************************
+ * Function prototypes                                  *
+ ********************************************************/
+
+static int  swichunk_describe_fields ( ObjectBlock *, char *, int );
+
+static int  messages_describe_fields ( ObjectBlock *, char *, int );
+
+static int  reservation_describe_fields ( ObjectBlock *, char *, int );
+
+static int  filetype_describe_fields ( ObjectBlock *, char *, int );
+
+static int  errorblock_describe_fields ( ObjectBlock *, char *, int );
+
+static int  podule_describe_fields ( ObjectBlock *, char *, int );
+
+static int  drawtags_describe_fields ( ObjectBlock *, char *, int );
+
+static int  drawobjects_describe_fields ( ObjectBlock *, char *, int );
+
+static int  filingsystem_describe_fields ( ObjectBlock *, char *, int );
+
+static int  services_describe_fields ( ObjectBlock *, char *, int );
+
+static int  devices_describe_fields ( ObjectBlock *, char *, int );
+
+/********************************************************
+ * internal function/icon table for the objects         *
+ ********************************************************/
+
+typedef int (*object_describe_fields)  ( ObjectBlock *o, char *memory, int size );
+
+typedef struct
+{
+  /*-- id for object --*/
+
+  int id;
+
+  /*-- functions --*/
+
+  object_describe_fields describe_fields;
+} OTable;
+
+
+static OTable table[] = {
+  Object_SWIChunk, swichunk_describe_fields,
+
+  Object_Messages, messages_describe_fields,
+
+  Object_Reservation, reservation_describe_fields,
+
+  Object_FileType, filetype_describe_fields,
+
+  Object_ErrorBlock, errorblock_describe_fields,
+
+  Object_Podule, podule_describe_fields,
+
+  Object_DrawTags, drawtags_describe_fields,
+
+  Object_DrawObjects, drawobjects_describe_fields,
+
+  Object_FilingSystem, filingsystem_describe_fields,
+
+  Object_Services, services_describe_fields,
+
+  Object_Devices, devices_describe_fields
+                        };
+
+
+
+/***********************************************
+ * Info block for an object window             *
+ ***********************************************/
+
+typedef struct
+{
+  /*-- add function and handle passed to object_show --*/
+
+  void          *add_handle;
+
+  /*-- pointer to relevant table object --*/
+
+  OTable *tab;
+
+  /*-- pointer to object block --*/
+
+  ObjectBlock *object;
+  BOOL new;
+
+  /*-- help window struct --*/
+
+} ObjectShowBlock;
+
+
+
+/***********************************************
+ * SWI Chunk object functions                  *
+ ***********************************************/
+
+/*
+ * describes fields for the swi chunk object
+ */
+
+static int swichunk_describe_fields ( ObjectBlock *object, char *buffer, int size )
+{
+  int writ=0;
+
+  writ += sprintf(buffer,"SWI chunk:\n"
+                         "  Prefix: %s\n"
+                         "  Description: %s\n",
+                         object->data.swichunk.prefix,
+                         object->data.swichunk.description);
+
+  return writ;
+}
+
+/***********************************************
+ * Messages object functions                   *
+ ***********************************************/
+
+/*
+ * describes fields for the messages object
+ */
+
+static int messages_describe_fields ( ObjectBlock *object, char *buffer, int size )
+{
+  int writ=0;
+
+  writ += sprintf(buffer,"Messages:\n"
+                         "  Description: %s\n",
+                         object->data.messages.description);
+
+  return writ;
+}
+
+/***********************************************
+ * Services object functions                   *
+ ***********************************************/
+
+/*
+ * describes fields for the services object
+ */
+
+static int services_describe_fields ( ObjectBlock *object, char *buffer, int size )
+{
+  int writ=0;
+
+  writ += sprintf(buffer,"Service block:\n"
+                         "  Description: %s\n",
+                         object->data.services.description);
+
+  return writ;
+}
+
+/***********************************************
+ * Filing System object functions              *
+ ***********************************************/
+
+/*
+ * describes fields for the filing system object
+ */
+
+static int filingsystem_describe_fields ( ObjectBlock *object, char *buffer, int size )
+{
+  int writ=0;
+
+  writ += sprintf(buffer,"Filing system:\n"
+                         "  Name: %s\n"
+                         "  Select: %s\n",
+                         object->data.filingsystem.name,
+                         object->data.filingsystem.select);
+
+  return writ;
+}
+
+
+/***********************************************
+ * Devices object functions                     *
+ ***********************************************/
+
+/*
+ * describes fields for the devices object
+ */
+
+static int devices_describe_fields ( ObjectBlock *object, char *buffer, int size )
+{
+  int writ=0;
+
+  writ += sprintf(buffer,"Devices:\n"
+                         "  Name: %s\n"
+                         "  Description: %s\n",
+                         object->data.devices.name,
+                         object->data.devices.description);
+
+  return writ;
+}
+
+
+/***********************************************
+ * Reservation object functions                *
+ ***********************************************/
+
+/*
+ * describes fields for the reservation object
+ */
+
+static int reservation_describe_fields ( ObjectBlock *object, char *buffer, int size )
+{
+  int writ=0;
+
+  writ += sprintf(buffer,"Reservation (%s): %s\n",
+                         object->data.reservation.type,
+                         object->data.reservation.text);
+
+  return writ;
+}
+
+
+/***********************************************
+ * FileType object functions                   *
+ ***********************************************/
+
+/*
+ * describes fields for the filetype object
+ */
+
+static int filetype_describe_fields ( ObjectBlock *object, char *buffer, int size )
+{
+  int writ=0;
+
+  writ += sprintf(buffer,"Filetype:\n"
+                         "  Application: %s\n"
+                         "  Typename: %s\n"
+                         "  Double-click: %s\n",
+                         object->data.filetype.appname,
+                         object->data.filetype.fname,
+                         object->data.filetype.double_clicking ? "yes" : "no");
+
+  return writ;
+}
+
+
+
+/***********************************************
+ * Error Block object functions                *
+ ***********************************************/
+
+/*
+ * describes fields for the devices object
+ */
+
+static int errorblock_describe_fields ( ObjectBlock *object, char *buffer, int size )
+{
+  int writ=0;
+
+  writ += sprintf(buffer,"Error block:\n"
+                         "  Description: %s\n",
+                         object->data.errorblock.description);
+
+  return writ;
+}
+
+
+/***********************************************
+ * Podule object functions                     *
+ ***********************************************/
+
+/*
+ * sets fields for the podule object
+ */
+
+/*
+ * describes fields for the devices object
+ */
+
+static int podule_describe_fields ( ObjectBlock *object, char *buffer, int size )
+{
+  char manf[8];
+  int writ=0;
+
+  sprintf(manf,"%i",object->data.podule.manf);
+
+  writ += sprintf(buffer,"Podule:\n"
+                         "  Name: %s\n"
+                         "  Description: %s\n"
+                         "  Manufacturer ID: %s\n",
+                         object->data.podule.podule_name,
+                         object->data.podule.description,
+                         object->data.podule.allocate_manf ?
+                            "required" : manf);
+
+  return writ;
+}
+
+/***********************************************
+ * Draw Tags object functions                  *
+ ***********************************************/
+
+/*
+ * describes fields for the draw tags object
+ */
+
+static int drawtags_describe_fields ( ObjectBlock *object, char *buffer, int size )
+{
+  int writ=0;
+
+  writ += sprintf(buffer,"Draws tag block:\n"
+                         "  Description: %s\n",
+                         object->data.drawtag.description);
+
+  return writ;
+}
+
+
+/***********************************************
+ * Draw Objects object functions               *
+ ***********************************************/
+
+/*
+ * describes fields for the draw object object
+ */
+
+static int drawobjects_describe_fields ( ObjectBlock *object, char *buffer, int size )
+{
+  int writ=0;
+
+  writ += sprintf(buffer,"Draws object block:\n"
+                         "  Description: %s\n",
+                         object->data.drawobject.description);
+
+  return writ;
+}
+
+
+/*
+ * works out the space for an object, allocates it and sets up
+ * any variables
+ */
+
+/****************************************************
+ * External functions                               *
+ ****************************************************/
+
+/*
+ * Name     : object_describe
+ * Desc     : describes's an object into a buffer
+ * Parms    : ObjectBlock *object
+ *            buffer-> the buffer to write to
+ *            size = the length of the buffer
+ * Returns  : size written
+ */
+
+extern int object_describe ( ObjectBlock *object, char *buffer, int size )
+{
+  OTable *tab = &table[object->id];
+  if ( tab->describe_fields )
+  {
+    /* _swix(0x104,0); printf("object_describe... describe_fields = %p\n",tab->describe_fields);    return 0;
+ */
+    return tab->describe_fields(object, buffer,size);
+  }
+  else
+    return 0;
+}
+/*-- end --*/
+

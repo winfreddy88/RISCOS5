@@ -1,0 +1,459 @@
+; Copyright 2005 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+; Flash recovery 
+
+p555    RN      3
+p2AA    RN      5
+c55     RN      6
+cAA     RN      7
+DQ5     *       &20
+DQ7     *       &80
+ts_665LED_on    *       &10             ; assert SEL0 and MotorEN0
+ts_665LED_off   *       &11
+ts_665LEDaddr   *       &03f2           ; 82C711 FDC digital output port
+
+recover_flash
+      [ {FALSE}
+      ;FlashCheck
+        ; Get some static workspace above the stack
+        LDR     sb, =Boot_RAM_Base + &1000
+
+        ; Need these variables,but they're physical addresses now
+        LDR     ip, =PMMR
+        STR     ip, PMMR_Address
+        LDR     a1, =PCI_IO_Base
+        STR     a1, PCI_IO_Address
+
+        BL      minimal_pci_setup
+
+        HAL_PCIWriteConfigWord(0, PCI_DEVFN(8,0), PCI_PRIMARY_BUS, 0x00010100);
+        LDR     a1, =&01000018          ; set bridge's primary bus to 0,
+        STR     a1, [ip, #ATU_OCCAR]    ; and secondary and subordinate to 1
+        LDR     a2, =&00010100          ; to allow config cycles to pass
+        STR     a2, [ip, #ATU_OCCDR]
+
+        HAL_PCIWriteConfigHalfword(0, PCI_DEVFN(8,0), PCI_IO_BASE, 0x7F00);
+        LDR     a1, =&0100001C          ; set I/O cycle address region (also does IO_LIMIT)
+        STR     a1, [ip, #ATU_OCCAR]    ; so we can get at the serial port and floppy
+        LDR     a2, =&7F00
+        ADD     a1, ip, #ATU_OCCDR:AND::NOT:&FF
+        STRH    a2, [a1, #ATU_OCCDR:AND:&FF]
+
+        ; HAL_PCIWriteConfigWord(0, PCI_DEVFN(8,0), PCI_IO_BASE_UPPER, 0x0);
+        LDR     a1, =&01000030          ; in case it's not zero already (also does IO_LIMIT_UPPER)
+        STR     a1, [ip, #ATU_OCCAR]
+        LDR     a2, =&0
+        STR     a2, [ip, #ATU_OCCDR]
+
+        ; HAL_PCIWriteConfigHalfword(0, PCI_DEVFN(8,0), PCI_COMMAND, 0x00000005);
+        LDR     a1, =&01000004          ; set bridge to let through I/O cycles up and downstream
+        STR     a1, [ip, #ATU_OCCAR]
+        LDR     a2, =&00000005
+        ADD     a1, ip, #ATU_OCCDR:AND::NOT:&FF
+        STRH    a2, [a1, #ATU_OCCDR:AND:&FF]
+
+        LDR     a1, PCI_IO_Address
+        BL      Configure37C665
+
+        LDR     v1, PCI_IO_Address
+      [ DebugPort = 3
+        ADD     v1, v1, #IO_UART3
+      |
+        ADD     v1, v1, #IO_UART1
+      ]
+        BL      ConfigureDebugUART
+
+05
+        ADR     a3, recover_corruptmssg
+        BL      recover_print_string
+        LDR     a1, =R_ROMFAILBIT + R_MEMSKIP + R_ARM3   ; the rom sum failed,we didn't do a memory test,
+        BL      recover_morse                            ;    and the ARM id was read
+        BEQ     %BT05                                    ; keep shouting until the user guesses the serial settings!
+
+        ; Get 4M of data
+        ADRL    a3, recover_sendmssg
+        BL      recover_print_string
+10
+        LDRB    a2, [ip, #UART_LSR]
+        TST     a2, #DR
+        BEQ     %BT10                                    ; wait for serial port action
+        ADRL    a3, recover_rcvbusy
+        BL      recover_print_string
+        LDR     a3, =Boot_RAM_Base + &100000
+        MOV     a4, #OSROM_ImageSize * 1024
+        MOV     v4, #0                                   ; for the checksum
+15
+        BL      recover_rxbyte
+        CMP     a1, #-1
+        BEQ     %BT15
+        STRB    a1, [a3], #1
+        BL      recover_hourglass
+        ANDS    a1, a3, #3
+        LDREQ   a1, [a3, #-4]
+        ADDEQ   v4, v4, a1                               ; checksum
+        SUBS    a4, a4, #1
+        BNE     %BT15
+
+        SUB     v4, v4, a1                               ; correct for overshoot
+        LDR     a1, [a3, #-8]
+        SUBS    v4, v4, a1
+        BEQ     %FT20
+        ADRL    a3, recover_duffrom                      ; failed checksum,try again
+        BL      recover_print_string
+        B       %BT10
+20
+        ; Next,rechecksum the image given the first 8k never gets erased
+        ADRL    a3, HAL_Base
+        ADD     a2, a3, #sizeofRecoveryArea
+        MOV     a4, #-1
+        MOV     v4, #0
+25
+        LDR     a1, [a3], #4
+        TEQ     a3, a2
+        LDREQ   a3, =Boot_RAM_Base + &100000             ; hop to the ram portion now
+        ADDEQ   a4, a3, #OSROM_ImageSize * 1024
+        ADDEQ   a3, a3, #sizeofRecoveryArea
+        SUB     v4, v4, a1
+        TEQ     a3, a4
+        BNE     %BT25
+
+        ADD     v4, v4, a1                               ; correct for overshoot
+        LDR     a1, [a3, #-8]
+        ADD     v4, v4, a1
+        LDR     a1, [a3, #-12]                           ; don't include the checksum itself!
+        ADD     v4, v4, a1
+        STR     v4, [a3, #-12]
+30
+        ; This flash programming stuff should look familiar!
+        LDR     R0, =Boot_RAM_Base + &100000
+        ADD     R1, R0, #OSROM_ImageSize * 1024
+        MOV     R4, #ROM_Base
+        ADD     p555, R4, #&055*2
+        ADD     p555, p555, #&500*2     ; R3 -> &555
+        ADD     p2AA, R4, #&0AA*2
+        ADD     p2AA, p2AA, #&200*2     ; R5 -> &2AA
+        MOV     c55, #&55               ; R6 = &55
+        MOV     cAA, #&AA               ; R7 = &AA
+        ; Erase
+        Push    "a1-a3,ip"
+        ADRL    a3, recover_erasebusy
+        BL      recover_print_string
+        Pull    "a1-a3,ip"
+
+        Push    "R4"
+        ADD     R4, R4, #OSROM_ImageSize * 1024
+        SUB     R4, R4, #sizeofSectors
+02
+        STRH    cAA, [p555]
+        STRH    c55, [p2AA]
+        MOV     R8, #&80
+        STRH    R8, [p555]
+        STRH    cAA, [p555]
+        STRH    c55, [p2AA]
+        MOV     R8, #&30
+        STRH    R8, [R4]
+        ; Poll for completion
+        MOV     R8, #&FF
+        ORR     R8, R8, #&FF00
+        BL      recover_poll
+        BVS     recover_fatalerror
+        MOV     a3, R4, LSR#3           ; keep the egg timer active
+        BL      recover_hourglass
+        MOV     a3, #ROM_Base
+        ADD     a3, a3, #sizeofBootArea
+        CMP     R4, a3
+        SUBHI   R4, R4, #sizeofSectors  ; the flash better be bottom boot!
+        SUBLS   R4, R4, #sizeofBootSectors
+        TEQ     R4, #ROM_Base           ; Don't erase 1st 8k
+        BNE     %BT02
+        Pull    "R4"
+        ADD     R4, R4, #sizeofRecoveryArea   ; Don't program 1st 8k either
+        ADD     R0, R0, #sizeofRecoveryArea
+
+        ; Program
+        Push    "a1-a3,ip"
+        ADRL    a3, recover_progbusy
+        BL      recover_print_string
+        Pull    "a1-a3,ip"
+
+        SUB     R4, R4, #2
+05
+        STRH    cAA, [p555]
+        STRH    c55, [p2AA]
+        MOV     R8, #&A0
+        STRH    R8, [p555]
+        LDRH    R8, [R0], #2
+        STRH    R8, [R4, #2]!
+        BL      recover_poll
+        BVS     recover_fatalerror
+        MOV     a3, R4                  ; my head hurts
+        BL      recover_hourglass
+        TEQ     R0, R1
+        BNE     %BT05
+
+        ; Job done!
+        ADRL    a3, recover_success
+        BL      recover_print_string
+        LDR     ip, PMMR_Address
+        LDR     a1, [ip, #ATU_PCSR]
+        ORR     a1, a1, #1:SHL:5
+        STR     a1, [ip, #ATU_PCSR]
+        B       .
+
+recover_poll    ROUT
+        AND     R10, R8, #DQ7
+10      LDRH    R12,[R4]
+        AND     R11, R12, #DQ7
+        CMP     R11, R10        ; Clear V
+        BEQ     %FT15
+        TST     R12, #DQ5
+        BEQ     %BT10
+15      LDRH    R12, [R4]
+        TEQ     R12, R8
+        MOVEQ   PC,R14
+        ; Read/Reset
+        MOV     R10, #&F0
+        STRH    R10, [R4]
+        MSR     CPSR_f, #V_bit
+        MOV     PC, R14
+
+recover_fatalerror
+        ADRL    a3, recover_fatal
+        BL      recover_print_string
+        B       .
+
+recover_corruptmssg
+        =       13,10,"Warning: the operating system image is damaged!",13,10
+        =       "To begin recovery, ensure your settings are 115200 baud 8N1 with",13,10
+        =       "hardware handshaking then press a key on the serial console...",13,10,7,0
+recover_sendmssg
+        =       13,10,"Waiting to accept a replacement image in binary mode now.",13,10,0
+recover_sands
+        =       45,92,124,47
+recover_rcvbusy
+        =       13,10,"Receiving  ",0
+recover_erasebusy
+        =       13,10,"Erasing  ",0
+recover_progbusy
+        =       13,10,"Programming  ",0
+recover_fatal
+        =       13,10,"Flash recovery failed, return unit for service",7,0
+recover_duffrom
+        =       13,10,"Receive error detected, please resend now.",13,10,7,0
+recover_success
+        =       13,10,"Flash recovery successful, rebooting...",0
+        ALIGN
+
+recover_hourglass ROUT
+        ; In: a3 is some number such that the hourglass advances every 16k
+        ;     and uses bits 14 & 15 to decide where the hourglass is
+        Push    "a1,a2,lr"
+        BIC     a1, a3, #&FF
+        BICS    a1, a1, #&3F00
+        TEQ     a1, a3
+        Pull    "a1,a2,pc", NE
+        MOV     a1, #8
+        BL      recover_txbyte_nohandshake
+        ADR     a1, recover_sands
+        MOV     a2, a3, LSR#14
+        AND     a2, a2, #3
+        LDRB    a1, [a1, a2]
+        BL      recover_txbyte_nohandshake
+        Pull    "a1,a2,pc"
+
+recover_print_string ROUT
+        ; Print a zero terminated string
+        ; In: a3 -> string
+        Push    "lr"
+10
+        LDRB    a1, [a3], #1
+        TEQ     a1, #0
+        Pull    "pc", EQ
+        BLNE    recover_txbyte_nohandshake
+        B       %BT10
+
+recover_txbyte_nohandshake ROUT
+        ; Send a byte serially,ignoring CTS (might be no cable plugged in)
+        LDR     ip, DebugUART_Address
+05      LDRB    a2, [ip, #UART_LSR]
+        TST     a2, #THRE
+        BEQ     %BT05
+        STRB    a1, [ip, #UART_THR]
+        MOV     pc, lr
+
+recover_rxbyte ROUT
+        ; Get a byte serially
+        LDR     ip, DebugUART_Address
+        LDRB    a2, [ip, #UART_LSR]
+        TST     a2, #DR
+        MOVEQ   a1, #-1
+        LDRNEB  a1, [ip, #UART_RBR]
+        MOV     pc, lr
+
+recover_morse ROUT
+        ; Flash the floppy drive light with the bit pattern in a1
+        ; To mimick a Risc PC the MSB is sent first
+        ; Data is sent in nybbles with 1s between nybbles
+        ; For a '0' send OFF - ON
+        ; For a '1' send OFF - ON - ON - ON
+
+        ; Exit: EQ = no key pressed
+        ;       NE = a key pressed
+        Push    "lr"
+        LDR     ip, PCI_IO_Address
+        LDR     a4, =ts_665LEDaddr
+        ADD     ip, a4, ip
+        MOV     a2, #ts_665LED_off     ; force off at start
+        STRB    a2, [ip]
+        Delay   2000000, a3
+        MOV     a4, #0
+05
+        Delay   250000, a3
+        MOV     a2, #ts_665LED_on      ; now on
+        STRB    a2, [ip]
+        Delay   250000, a3
+        ADDS    a1, a1, a1
+        BCC     %FT10
+        Delay   500000, a3             ; was '1',so keep on
+10
+        MOV     a2, #ts_665LED_off
+        STRB    a2, [ip]
+
+        Push    "ip,a1"
+        BL      recover_rxbyte         ; scan the keyboard
+        CMP     a1, #-1
+        Pull    "ip,a1,pc", NE
+        Pull    "ip,a1", EQ
+
+        ADD     a4, a4, #1
+        TST     a4, #3                 ; check for nybble boundary
+        BNE     %FT15
+        Delay   1000000, a3
+15
+        TEQ     a4, #32
+        BNE     %BT05
+        Pull    "pc"
+
+      ] ; FlashCheck
+
+;
+; Set the ATU up to get the PCI bus going
+;
+
+;minimal_pci_setup
+;        LDR     ip, PMMR_Address
+;        MOV     a1, #8
+;        STRB    a1, [ip, #ATU_ATUCLSR]          ; Cache line size = 8 words
+;        MOV     a1, #&20
+;        STRB    a1, [ip, #ATU_ATULT]            ; Latency timer = 32 clocks
+;        MOV     a1, #0
+;        STR     a1, [ip, #ATU_IABAR0]
+;        STR     a1, [ip, #ATU_IALR0]            ; Close window 0 (for now)
+;        MOV     a1, #&C0000000
+;        STR     a1, [ip, #ATU_IALR2]            ; RAM window is 1GB
+; [ ShadowRAMWindow
+;        STR     a1, [ip, #ATU_IALR3]
+; ]
+;        MOV     a1, #RAM_Base
+;        ORR     a1, a1, #2_1100                 ; Prefetchable, 64-bit
+;        STR     a1, [ip, #ATU_IABAR2]           ; RAM window (&C0000000)
+; [ ShadowRAMWindow
+;        MOV     a1, #&40000000
+;        ORR     a1, a1, #2_1000                 ; Prefetchable, 32-bit
+;        STR     a1, [ip, #ATU_IABAR3]
+; ]
+;        MOV     a1, #RAM_Base
+;        STR     a1, [ip, #ATU_IATVR2]
+; [ ShadowRAMWindow
+;        STR     a1, [ip, #ATU_IATVR3]
+; ]
+;        LDR     a1, [ip, #ATU_ATUCMD]
+;        ORR     a1, a1, #2_110                  ; Bus Master and memory response
+;        STR     a1, [ip, #ATU_ATUCMD]
+;        LDR     a1, [ip, #ATU_ATUCR]
+;        ORR     a1, a1, #1:SHL:1                ; Outbound ATU enable
+;        ORR     a1, a1, #1:SHL:8                ; Direct addressing enable
+;        STR     a1, [ip, #ATU_ATUCR]
+;        MOV     pc, lr
+
+;
+; Simplified version of Configure82C710 programs ALI 1535 only.
+;
+
+Configure37C665 Entry
+;        SETPSR  I_bit + F_bit, ip,, r2  ; Disable FIQ and IRQ
+;
+;        MOV     lr, #&51
+;        STRB    lr, [r0, #IO_ConfigIndex]    ; Write magic &51 &23 to CRI711
+;        MOV     lr, #&23
+;        STRB    lr, [r0, #IO_ConfigIndex]    ;   to enter configuration mode
+;
+;        ADR     r1, ConfigSMCTable      ; R1-> SMC 665 configuration data
+;20
+;        LDRB    lr, [r1], #1            ; get config index
+;        STRB    lr, [r0, #IO_ConfigIndex]
+;        TEQ     lr, #&BB                ; end of table?
+;        LDRNEB  lr, [r1], #1            ; if not then get config data
+;        STRNEB  lr, [r0, #IO_ConfigData]    ; and write it
+;        BNE     %BT20
+;
+;        MOV     r1, #IOST_37C665
+;30
+;        STRB    r1, IOSystemType
+;
+;        RestPSR r2                      ; Restore IRQ/FIQ state
+
+        EXIT
+
+ConfigSMCTable
+        DCB     &07, 0                  ; Access device 0 (FDC)
+        DCB     &30, 1                  ; Enable device (IO 03F0, IRQ6, DMA2)
+        DCB     &07, 4                  ; Access device 4 (UART 1)
+        DCB     &70, 9                  ; Select IRQ9
+        DCB     &30, 1                  ; Enable device (at &03F8)
+        DCB     &F0, 2                  ; Enable UART 1 high speed mode
+        DCB     &07, &B                 ; Access device B (UART 3)
+        DCB     &70, 10                 ; Select IRQ10
+        DCB     &30, 1                  ; Enable device (at &02F8)
+        DCB     &F0, 2                  ; Enable UART 3 high speed mode
+        DCB     &BB                     ; Exit config mode
+        ALIGN
+
+;
+; Do some UART set up
+;
+
+ConfigureDebugUART  Entry
+;       In:  v1 = address of UART
+;       Out: a1 corrupt
+        STR     v1, DebugUART_Address
+        MOV     a1, #0
+        STRB    a1, [v1, #UART_IER]
+        MOV     a1, #DLAB
+        STRB    a1, [v1, #UART_LCR]
+        MOV     a1, #1                          ; 115200 baud
+        STRB    a1, [v1, #UART_DLL]
+        MOV     a1, #0
+        STRB    a1, [v1, #UART_DLM]
+        MOV     a1, #FIFOEN+FIFORSTRX+FIFORSTTX+FIFO64
+        STRB    a1, [v1, #UART_FCR]
+        MOV     a1, #WLS_8
+        STRB    a1, [v1, #UART_LCR]
+        MOV     a1, #DTR+RTS
+        STRB    a1, [v1, #UART_MCR]
+
+        EXIT
+
+        END

@@ -1,0 +1,747 @@
+; Copyright 2011 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:Machine.<Machine>
+        GET     Hdr:ImageSize.<ImageSize>
+        $GetIO
+        GET     Hdr:Proc
+
+        GET     Hdr:OSEntries
+        GET     Hdr:HALEntries
+
+        GET     hdr.omap4430
+        GET     hdr.StaticWS
+        GET     hdr.GPIO
+
+        AREA    |Asm$$Code|, CODE, READONLY, PIC
+
+        EXPORT  GPIO_Init
+        EXPORT  GPIOx_SetAsOutput
+        EXPORT  GPIOx_SetOutput
+        EXPORT  GPIOx_SetAndEnableIRQ
+        EXPORT  GPIO_InitDevices
+        IMPORT  memcpy
+
+GPIO_Init
+        ; Don't bother resetting the controllers for now, just make sure no IRQs are enabled
+        ADR     a1, L4_GPIO_Table
+        MOV     a2, #GPIO_PORT_MAX
+        MVN     a3, #0
+10
+        LDR     a4, [a1], #4
+        SUBS    a2, a2, #1
+        STR     a3, [a4, #GPIO_IRQSTATUS_CLR_0]
+        BNE     %BT10
+        MOV     pc, lr
+
+        ; a1 = GPIO # (OMAP)
+        ; a2 = initial value (zero or nonzero)
+GPIOx_SetAsOutput
+        SUBS    a3, a1, #GPIO_PIN_MAX
+        MOVGE   pc, lr
+        ; OMAP GPIO
+        GPIO_PrepareR a3, a4, a1
+        GPIO_SetAsOutput a3, a4, a1
+        GPIO_SetOutput a2, a3, a4
+        MOV     pc, lr
+
+        ; a1 = GPIO # (OMAP)
+        ; a2 = value (zero or nonzero)
+GPIOx_SetOutput
+        SUBS    a3, a1, #GPIO_PIN_MAX
+        MOVGE   pc, lr
+        ; OMAP GPIO
+        GPIO_PrepareR a3, a4, a1
+        GPIO_SetOutput a2, a3, a4
+        MOV     pc, lr
+
+        ; a1 = GPIO # (OMAP only!)
+        ; a2 = IRQ type flags:
+        ;      +1 = LEVELDETECT0
+        ;      +2 = LEVELDETECT1
+        ;      +4 = RISINGDETECT
+        ;      +8 = FALLINGDETECT
+GPIOx_SetAndEnableIRQ
+        GPIO_PrepareR a3, a4, a1
+        MRS     ip, CPSR
+        ORR     a1, ip, #I32_bit ; interrupts off
+        MSR     CPSR_c, a1
+        MOV     a2, a2, LSL #28
+        MSR     CPSR_f, a2 ; load into NZCV flags (MI EQ CS VS condition codes)
+        LDR     a1, [a3, #GPIO_FALLINGDETECT]
+        BICPL   a1, a1, a4
+        LDR     a2, [a3, #GPIO_RISINGDETECT]
+        ORRMI   a1, a1, a4
+        STR     a1, [a3, #GPIO_FALLINGDETECT]
+        BICNE   a2, a2, a4
+        LDR     a1, [a3, #GPIO_LEVELDETECT1]
+        ORREQ   a2, a2, a4
+        STR     a2, [a3, #GPIO_RISINGDETECT]
+        BICCC   a1, a1, a4
+        LDR     a2, [a3, #GPIO_LEVELDETECT0]
+        ORRCS   a1, a1, a4
+        STR     a1, [a3, #GPIO_LEVELDETECT1]
+        BICVC   a2, a2, a4
+        LDR     a1, [a3, #GPIO_OE]
+        ORRVS   a2, a2, a4
+        ORR     a1, a1, a4 ; set pin as input
+        STR     a2, [a3, #GPIO_LEVELDETECT0]
+        STR     a1, [a3, #GPIO_OE]
+        STR     a4, [a3, #GPIO_IRQSTATUS_SET_0]
+        MSR     CPSR_c, ip ; interrupts restored
+        MOV     pc, lr
+
+; Template for GPIO interface
+GPIOTemplate
+        DCW     HALDeviceType_Comms + HALDeviceComms_GPIO
+        DCW     HALDeviceID_GPIO_OMAP4
+        DCD     HALDeviceBus_Peri + HALDevicePeriBus_Sonics3220
+        DCD     &10000          ; API 1.0
+TDesc   DCD     0               ; Description (filled at runtime)
+TAddr   DCD     0               ; Address (filled at runtime)
+        %       12              ; Reserved
+        DCD     GPIOActivate
+        DCD     GPIODeactivate
+        DCD     GPIOReset
+        DCD     GPIOSleep
+        DCD     -1              ; Device (none)
+        DCD     0               ; TestIRQ
+        DCD     0               ; ClearIRQ
+        %       4               ; Reserved
+        DCD     GPIO_PORT_MAX
+TNumb   DCD     0               ; Port number (filled at runtime)
+        DCD     GPIOEnumerate
+        DCD     GPIOSetDataBits
+        DCD     GPIOClearDataBits
+        DCD     GPIOToggleDataBits
+        DCD     GPIOReadDataBits
+        DCD     GPIODataDirection
+        DCD     GPIOReadMode
+        DCD     GPIOWriteMode
+        DCD     GPIOPullControl
+        DCD     GPIOPullDirection
+        DCD     GPIOEdgeControl
+        DCD     GPIOEdgePollStatus
+        ASSERT  (. - GPIOTemplate) = HALDevice_GPIO_Size_1_0
+
+; GPIO structures
+                    ^ 0
+                    # HALDevice_GPIO_Size_1_0
+WkspValidMask       # 4                 ; Valid bits on this port for this Type/Revision
+WkspCopySB          # 4
+Wksp_GPIO_Size      # 0
+                    ASSERT ?GPIOWS = GPIO_PORT_MAX * Wksp_GPIO_Size
+
+; Map Type/Revision to entry in GPIOFreeToUse table
+                    ^ 0
+GPIOType_Panda      # 1 ; OMAP4430
+GPIOType_PandaES    # 1 ; OMAP4460
+GPIOType_Max        # 0
+
+GPIOTypeMap
+        DCD     BoardType_OMAP4_Panda, BoardRevision_Panda,   GPIOType_Panda
+        DCD     BoardType_OMAP4_Panda, BoardRevision_PandaES, GPIOType_PandaES
+        DCD     -1, -1, -1
+
+; Friendly names
+GPIODesc0
+        DCB     "OMAP GPIO interface pins 0-31", 0
+GPIODesc1
+        DCB     "OMAP GPIO interface pins 32-63", 0
+GPIODesc2
+        DCB     "OMAP GPIO interface pins 64-95", 0
+GPIODesc3
+        DCB     "OMAP GPIO interface pins 96-127", 0
+GPIODesc4
+        DCB     "OMAP GPIO interface pins 128-159", 0
+GPIODesc5
+        DCB     "OMAP GPIO interface pins 160-191", 0
+        ALIGN
+GPIODescriptions
+        DCD     GPIODesc0
+        DCD     GPIODesc1
+        DCD     GPIODesc2
+        DCD     GPIODesc3
+        DCD     GPIODesc4
+        DCD     GPIODesc5
+
+; Half a register of CONTROL_PADCONF
+PADCONF_MUXMODE_SHIFT        * 0
+PADCONF_MUXMODE_BITS         * 3
+PADCONF_MUXMODE_GPIO         * 4:SHL:PADCONF_MUXMODE_SHIFT
+PADCONF_MUXMODE_SAFE         * 7:SHL:PADCONF_MUXMODE_SHIFT
+PADCONF_MUXMODE_MASK         * 7:SHL:PADCONF_MUXMODE_SHIFT
+PADCONF_PULLUDENABLE_SHIFT   * 3
+PADCONF_PULLUDENABLE         * 1:SHL:PADCONF_PULLUDENABLE_SHIFT
+PADCONF_PULLTYPESELECT_SHIFT * 4
+PADCONF_PULLTYPESELECT       * 1:SHL:PADCONF_PULLTYPESELECT_SHIFT
+PADCONF_INPUTENABLE_SHIFT    * 8
+PADCONF_INPUTENABLE          * 1:SHL:PADCONF_INPUTENABLE_SHIFT
+PADCONF_OFFENABLE            * 1:SHL:9
+PADCONF_OFFOUTENABLE         * 1:SHL:10
+PADCONF_OFFOUTVALUE          * 1:SHL:11
+PADCONF_OFFPULLUDENABLE      * 1:SHL:12
+PADCONF_OFFPULLTYPESELECT    * 1:SHL:13
+PADCONF_WAKEUPENABLE         * 1:SHL:14
+PADCONF_WAKEUPEVENT          * 1:SHL:15
+
+; Offset to CONTROL_PADCONF register from OMAP4460 datasheet Table 18-9 and 18-10
+;                                         OMAP4430 datasheet Table 18-8 and 18-9
+; Those in CONTROL_WKUP have b15 set, those in CONTROL_CORE do not
+GPIOPadConfs
+        DCW     &8040, &8042, &8044, &8046, &8048, &8050, &8054, &805A ; 0-31      
+        DCW     &805C, &8068, &806A, &01AE, &01B0, &01B2, &01B4, &01B6             
+        DCW     &01B8, &01BA, &01BC, &01BE, &01C0, &01C2, &01C4, &01C6             
+        DCW     &01C8, &01CA, &01CC, &01CE, &01D0, &8066, &8056, &8058             
+        DCW     &0050, &0052, &0054, &0056, &0058, &005A, &005C, &005E ; 32-63     
+        DCW     &0060, &0062, &0064, &0066, &0068, &006A, &006C, &006E             
+        DCW     &0070, &0072, &0074, &0076, &0078, &007A, &007C, &007E             
+        DCW     &0080, &0082, &0084, &0086, &0088, &008A, &008C, &0098             
+        DCW     &009A, &009C, &009E, &00A0, &00A2, &00A4, &00A6, &00A8 ; 64-95     
+        DCW     &00AA, &00AC, &00AE, &00B0, &00B2, &00B4, &00B6, &00B8             
+        DCW     &00BA, &00BC, &00BE, &00C0, &00C2, &00C4, &00C6, &00C8             
+        DCW     &00CA, &00CC, &00CE, &00D0, &00D2, &00D4, &00D6, &00D8             
+        DCW     &00DA, &00DC, &00DE, &00E0, &00E2, &00E4, &00E6, &00E8 ; 96-127    
+        DCW     &00EA, &00EC, &00EE, &00F0, &00F2, &00F4, &00F6, &00F8             
+        DCW     &00FA, &00FC, &00FE, &0100, &0102, &0104, &010E, &0110             
+        DCW     &0112, &0114, &0116, &0118, &011A, &011C, &011E, &0120             
+        DCW     &0126, &0128, &012A, &012C, &012E, &0130, &0132, &0134 ; 128-159   
+        DCW     &0136, &0138, &013A, &013C, &013E, &0140, &0142, &0144             
+        DCW     &0146, &0148, &014A, &014C, &014E, &0150, &0152, &0154             
+        DCW     &0156, &0158, &015A, &015C, &015E, &0160, &0162, &0164             
+        DCW     &0166, &0168, &016A, &016C, &016E, &0170, &0172, &0174 ; 160-191   
+        DCW     &0176, &0178, &017A, &017C, &017E, &0180, &0182, &0188
+        DCW     &018A, &018C, &018E, &0196, &0198, &019A, &019C, &01A0
+        DCW     &01A2, &01A4, &01A6, &01A8, &01AA, &01AC, &01D2, &01D4
+        ALIGN
+GPIOAltsTables
+        DCD     GPIOAlts0
+        DCD     GPIOAlts1
+        DCD     GPIOAlts2
+        DCD     GPIOAlts3
+        DCD     GPIOAlts4
+        DCD     GPIOAlts5
+
+; Available pins per target board
+GPIOFreeToUse
+        ASSERT  (. - GPIOFreeToUse):SHR:2 = (GPIOType_Panda * GPIO_PORT_MAX)
+        DCD     2_00000000000000000001100110000000 ; PandaBoard
+        DCD     2_00101001110011001011010111111111
+        DCD     2_00000000000011100001111111111000
+        DCD     2_00000010000000000000000000000000
+        DCD     2_00011000000000000001111111111111
+        DCD     2_00000000001000000000000000000000
+        ASSERT  (. - GPIOFreeToUse):SHR:2 = (GPIOType_PandaES * GPIO_PORT_MAX)
+        DCD     2_00000000000000000011100100000000 ; PandaBoard ES
+        DCD     2_00001001110111001011010111111111
+        DCD     2_00000000000011100001111111111000
+        DCD     2_00000010000000100100000001100000
+        DCD     2_00011000000000000001111111111111
+        DCD     2_00001000001000000000000000000000
+        ASSERT  (. - GPIOFreeToUse):SHR:2 = (GPIOType_Max * GPIO_PORT_MAX)
+
+        ; Init our GPIO HAL devices
+        ; a1 = BoardType value
+        ; a2 = BoardRevision value
+GPIO_InitDevices ROUT
+        Push    "v1-v3, lr"
+
+        ADRL    ip, GPIOTypeMap
+10
+        LDMIA   ip!, {a3,a4,v1}
+        CMP     a3, #-1
+        CMPEQ   a4, #-1
+        Pull    "v1-v3, pc", EQ         ; Not in known table
+        TEQ     a3, a1
+        TEQEQ   a4, a2
+        BNE     %BT10
+
+        ; Copy each port's template and update the varying fields
+        MOV     v3, #0
+        ADRL    v2, GPIOWS
+20
+        MOV     a1, v2
+        ADRL    a2, GPIOTemplate
+        MOV     a3, #HALDevice_GPIO_Size_1_0
+        BL      memcpy
+
+        ADR     a2, GPIOFreeToUse
+        MOV     a3, #GPIO_PORT_MAX:SHL:2
+        MLA     a2, v1, a3, a2          ; Masks for that type
+        LDR     a2, [a2, v3, LSL #2]    ; Mask for this port
+        STR     a2, [a1, #WkspValidMask]
+
+        STR     sb, [a1, #WkspCopySB]
+        STR     v3, [a1, #TNumb - GPIOTemplate]
+
+        ADR     a3, L4_GPIO_Table
+        LDR     a3, [a3, v3, LSL #2]    ; Logical address of this port
+        STR     a3, [a1, #TAddr - GPIOTemplate]
+
+        ADR     a3, GPIODescriptions
+        LDR     a3, [a3, v3, LSL #2]    ; Name of this port
+        STR     a3, [a1, #TDesc - GPIOTemplate]
+
+        MOV     a1, #0
+        MOV     a2, v2
+        CallOS  OS_AddDevice            ; Register it
+
+        ADD     v3, v3, #1              ; Next port
+        CMP     v3, #GPIO_PORT_MAX
+        ADDCC   v2, v2, #Wksp_GPIO_Size
+        BCC     %BT20
+        
+        Pull    "v1-v3, pc"
+
+GPIOActivate
+        MOV     a1, #1
+GPIODeactivate
+GPIOReset
+        MOV     pc, lr
+
+GPIOSleep
+        MOV     a1, #0
+        MOV     pc, lr
+
+; int GPIOSetDataBits(struct gpiodevice *, int bits)
+; Enter with a1 = device struct pointer
+;            a2 = any bit set will cause that pin to be set
+; Return     a1 = previous value
+GPIOSetDataBits ROUT
+        LDR     a3, [a1, #HALDevice_Address]
+        LDR     a4, [a1, #WkspValidMask]
+        ANDS    a2, a4, a2              ; Ensure bits being asked are valid
+
+        LDR     ip, [a3, #GPIO_OE]
+        LDR     a1, [a3, #GPIO_DATAOUT]
+        BIC     a4, a1, ip              ; State of outputs
+        LDR     a1, [a3, #GPIO_DATAIN]
+        AND     a1, a1, ip              ; State of inputs
+        ORR     a1, a1, a4
+
+        STRNE   a2, [a3, #GPIO_SETDATAOUT]
+        MOV     pc, lr
+
+; int GPIOClearDataBits(struct gpiodevice *, int bits)
+; Enter with a1 = device struct pointer
+;            a2 = any bit set will cause that pin to be cleared
+; Return     a1 = previous value
+GPIOClearDataBits ROUT
+        LDR     a3, [a1, #HALDevice_Address]
+        LDR     a4, [a1, #WkspValidMask]
+        ANDS    a2, a4, a2              ; Ensure bits being asked are valid
+
+        LDR     ip, [a3, #GPIO_OE]
+        LDR     a1, [a3, #GPIO_DATAOUT]
+        BIC     a4, a1, ip              ; State of outputs
+        LDR     a1, [a3, #GPIO_DATAIN]
+        AND     a1, a1, ip              ; State of inputs
+        ORR     a1, a1, a4
+
+        STRNE   a2, [a3, #GPIO_CLEARDATAOUT]
+        MOV     pc, lr
+
+; void GPIOToggleDataBits(struct gpiodevice *, int bits)
+; Enter with a1 = device struct pointer
+;            a2 = any bit set will cause that pin to be toggled from its current value
+GPIOToggleDataBits ROUT
+        LDR     a3, [a1, #HALDevice_Address]
+        LDR     a4, [a1, #WkspValidMask]
+        ANDS    a2, a4, a2              ; Ensure bits being asked are valid
+        MOVEQ   pc, lr
+
+        PHPSEI  ip                      ; No toggle register, emulate in software
+        LDR     a1, [a3, #GPIO_DATAOUT]
+        EOR     a1, a1, a2
+        STR     a1, [a3, #GPIO_DATAOUT]
+        PLP     ip
+
+        MOV     pc, lr
+
+; int GPIOReadDataBits(struct gpiodevice *)
+; Enter with a1 = device struct pointer
+; Return     a1 = previous value
+GPIOReadDataBits ROUT
+        LDR     a3, [a1, #HALDevice_Address]
+
+        LDR     ip, [a3, #GPIO_OE]
+        LDR     a1, [a3, #GPIO_DATAOUT]
+        BIC     a4, a1, ip              ; State of outputs
+        LDR     a1, [a3, #GPIO_DATAIN]
+        AND     a1, a1, ip              ; State of inputs
+        ORR     a1, a1, a4
+
+        MOV     pc, lr
+
+; int GPIODataDirection(struct gpiodevice *, int pins, int dir)
+; Enter with a1 = device struct pointer
+;            a2 = bits to change
+;            a3 = direction to set the bits to (1=input 0=output)
+; Return     a1 = previous data direction bits (or current if pins=0)
+GPIODataDirection ROUT
+        LDR     a4, [a1, #WkspValidMask]
+        ANDS    a2, a4, a2              ; Ensure bits being asked are valid
+        LDREQ   a3, [a1, #HALDevice_Address]
+        LDREQ   a1, [a3, #GPIO_OE]
+        MOVEQ   pc, lr
+
+        Push    "v1-v5, sb, lr"
+
+        MOV     v2, a2
+        AND     v3, a4, a3
+
+        LDR     sb, [a1, #WkspCopySB]
+
+        LDR     v4, [a1, #TNumb - GPIOTemplate]
+        LDR     v5, [a1, #HALDevice_Address] 
+
+        MOV     v1, #0                  ; Go bitwise because CONTROL_PADCONF has input direction too
+10
+        MOV     lr, #1
+        MOV     lr, lr, LSL v1
+        TST     lr, v2
+        BEQ     %FT20                   ; No change
+
+        ADD     a1, v1, v4, LSL #5      ; Global pin number
+        ANDS    a2, lr, v3
+        MOVNE   a2, #1
+        MOV     a3, #PADCONF_INPUTENABLE_SHIFT
+        MOV     a4, #1
+        BL      BitFieldInsertPadConf
+20
+        ADD     v1, v1, #1
+        CMP     v1, #32
+        BCC     %BT10
+
+        LDR     a1, [v5, #GPIO_OE]
+
+        PHPSEI  ip                      ; Safe read/modify/write
+        BIC     a4, a1, v2
+        ORR     a4, a4, v3              ; 1 = input, 0 = output
+        STR     a4, [v5, #GPIO_OE]
+        PLP     ip
+
+        Pull    "v1-v5, sb, pc"
+
+; void GPIOEdgeControl(struct gpiodevice *, int pins, int *enable, int *edge, int *risehigh)
+; Enter with a1 = device struct pointer
+;            a2 = bits to change
+;            a3 = pointer to bits to enable detection on
+;            a4 = pointer to bits set for edge mode (else level)
+;        [sp+0] = pointer to bits set to detect on rising/high (else falling/low)
+GPIOEdgeControl ROUT
+        LDR     ip, [sp, #0]
+
+        Push    "v1-v5, lr"
+        Push    "a3-a4, ip"
+
+        LDR     v1, [a1, #HALDevice_Address]
+
+        LDR     a3, [a3]                ; Pick up new values
+        LDR     a4, [a4]
+        LDR     ip, [ip]
+
+        PHPSEI  v2                      ; Safe read/modify/write
+
+        LDR     v3, [v1, #GPIO_RISINGDETECT]
+        LDR     a1, [v1, #GPIO_FALLINGDETECT]
+        MOV     v5, v3                  ; rising = rising
+        ORR     v4, v3, a1              ; OR(rising,falling) = edge
+        ORR     v3, v3, a1              ; OR(rising,falling) = edge enable
+        LDR     lr, [v1, #GPIO_LEVELDETECT1]
+        LDR     a1, [v1, #GPIO_LEVELDETECT0]
+        ORR     v5, v5, lr              ; OR(rising,high) = rising/high
+        ORR     a1, a1, lr
+        ORR     v3, v3, a1              ; OR(edge enable,OR(high,low)) = enable
+        TEQ     a2, #0
+        BEQ     %FT10
+
+        LDR     a1, [v1, #GPIO_RISINGDETECT]
+        BIC     a1, a1, a2              ; disable by default
+        AND     lr, a3, a4
+        AND     lr, lr, ip             
+        ORR     a1, a1, lr              ; AND(enable,edge,rising) = rising
+        STR     a1, [v1, #GPIO_RISINGDETECT]
+
+        LDR     a1, [v1, #GPIO_FALLINGDETECT]
+        BIC     a1, a1, a2              ; disable by default
+        AND     lr, a3, a4
+        BIC     lr, lr, ip             
+        ORR     a1, a1, lr              ; AND(enable,edge,NOT(rising)) = falling
+        STR     a1, [v1, #GPIO_FALLINGDETECT]
+
+        LDR     a1, [v1, #GPIO_LEVELDETECT1]
+        BIC     a1, a1, a2              ; disable by default
+        BIC     lr, a3, a4
+        AND     lr, lr, ip             
+        ORR     a1, a1, lr              ; AND(enable,NOT(edge),rising) = high
+        STR     a1, [v1, #GPIO_LEVELDETECT1]
+
+        LDR     a1, [v1, #GPIO_LEVELDETECT0]
+        BIC     a1, a1, a2              ; disable by default
+        BIC     lr, a3, a4
+        BIC     lr, lr, ip             
+        ORR     a1, a1, lr              ; AND(enable,NOT(edge),NOT(rising)) = low
+        STR     a1, [v1, #GPIO_LEVELDETECT0]
+10
+        PLP     v2
+
+        Pull    "a3-a4, ip"
+        STR     v3, [a3]                ; Write out previous values
+        STR     v4, [a4]
+        STR     v5, [ip]
+
+        Pull    "v1-v5, pc"
+ 
+; int GPIOEdgePollStatus(struct gpiodevice *, int collect)
+; Enter with a1 = device struct pointer
+;            a2 = clear these bits having polled the status
+; Return     a1 = states latched in edge/level since last poll
+GPIOEdgePollStatus ROUT
+        LDR     a3, [a1, #HALDevice_Address]
+        LDR     a4, [a1, #WkspValidMask]
+        ANDS    a2, a4, a2              ; Ensure bits being cleared are valid
+        LDR     a1, [a3, #GPIO_IRQSTATUS_0]
+        STRNE   a2, [a3, #GPIO_IRQSTATUS_0]
+        MOV     pc, lr
+
+; enum HAL_GPIOReadMode(struct gpiodevice *, int pin)
+; Enter with a1 = device struct pointer
+;            a2 = pin (singular) to read
+; Return     a1 = current mode
+GPIOReadMode ROUT
+        MOV     a3, #-1
+        ; Fall through
+
+; enum GPIOWriteMode(struct gpiodevice *, int pin, enum useage)
+; Enter with a1 = device struct pointer
+;            a2 = pin (singular) to change
+;            a3 = new mode (opaque value from Enumerate)
+; Return     a1 = previous mode
+GPIOWriteMode      
+        Push    "sb, lr"
+
+        LDR     sb, [a1, #WkspCopySB]
+
+        LDR     a4, [a1, #TNumb - GPIOTemplate]
+        ADD     a1, a2, a4, LSL #5      ; Global pin number
+        MOV     a2, a3
+        MOV     a3, #PADCONF_MUXMODE_SHIFT
+        MOV     a4, #PADCONF_MUXMODE_BITS
+        BL      BitFieldInsertPadConf
+        ASSERT  PADCONF_MUXMODE_SHIFT = 0
+
+        Pull    "sb, pc"
+
+; int GPIOPullControl(struct gpiodevice *, int pins, int enable)
+; Enter with a1 = device struct pointer
+;            a2 = bits to change
+;            a3 = pull resistor enables for those pins
+; Return     a1 = previous pull enable bits (or current if pins=0)
+GPIOPullControl ROUT
+        Push    "v1-v5, sb, lr"
+
+        LDR     v5, [a1, #TNumb - GPIOTemplate]
+        LDR     a4, [a1, #WkspValidMask]
+        AND     v3, a4, a3
+        AND     v2, a4, a2
+
+        LDR     sb, [a1, #WkspCopySB]
+
+        MOV     v4, #0                  ; Previous values
+        MOV     v1, #0                  ; For each pin
+10
+        ADD     a1, v1, v5, LSL #5      ; Global pin number
+        MOV     lr, #1
+        MOV     lr, lr, LSL v1
+        ANDS    a2, lr, v3
+        MOVNE   a2, #1
+        TST     v2, lr
+        MOVEQ   a2, #-1                 ; No change
+        MOV     a3, #PADCONF_PULLUDENABLE_SHIFT
+        MOV     a4, #1
+        BL      BitFieldInsertPadConf
+        TEQ     a1, #0
+        ORRNE   v4, v4, #1:SHL:31       ; Was previously set
+
+        ADD     v1, v1, #1              ; Next pin
+        CMP     v1, #32
+        MOVCC   v4, v4, LSR #1
+        BCC     %BT10
+
+        MOV     a1, v4
+
+        Pull    "v1-v5, sb, pc"
+
+; int GPIOPullDirection(struct gpiodevice *, int pins, int up)
+; Enter with a1 = device struct pointer
+;            a2 = bits to change
+;            a3 = bits to set as pull up else pull down
+; Return     a1 = previous pull direction bits (or current if pins=0)
+GPIOPullDirection ROUT 
+        Push    "v1-v5, sb, lr"
+
+        LDR     v5, [a1, #TNumb - GPIOTemplate]
+        LDR     a4, [a1, #WkspValidMask]
+        AND     v3, a4, a3
+        AND     v2, a4, a2
+
+        LDR     sb, [a1, #WkspCopySB]
+
+        MOV     v4, #0                  ; Previous values
+        MOV     v1, #0                  ; For each pin
+10
+        ADD     a1, v1, v5, LSL #5      ; Global pin number
+        MOV     lr, #1
+        MOV     lr, lr, LSL v1
+        ANDS    a2, lr, v3
+        MOVNE   a2, #1
+        TST     v2, lr
+        MOVEQ   a2, #-1                 ; No change
+        MOV     a3, #PADCONF_PULLTYPESELECT_SHIFT
+        MOV     a4, #1
+        BL      BitFieldInsertPadConf
+        TEQ     a1, #0
+        ORRNE   v4, v4, #1:SHL:31       ; Was previously set
+
+        ADD     v1, v1, #1              ; Next pin
+        CMP     v1, #32
+        MOVCC   v4, v4, LSR #1
+        BCC     %BT10
+
+        MOV     a1, v4
+
+        Pull    "v1-v5, sb, pc"
+
+; int BitFieldInsertPadConf(int pin, int value, int lsb, int width)
+; Enter with a1 = flattened pin number
+;            a2 = new value for bit(s), or -1 to read
+;            a3 = leftmost bit position
+;            a4 = bit width
+;            sb = HAL workspace
+; Return     a1 = old value for bit(s)
+BitFieldInsertPadConf ROUT
+        Push   "v1, lr"
+
+        MOV     v1, #1
+        MOV     v1, v1, LSL a4
+        SUB     v1, v1, #1              ; Mask of bits to change
+        CMP     a2, #-1
+        ANDNE   a2, a2, v1              ; Sanitised input value
+
+        ADRL    lr, GPIOPadConfs        ; Array of half words
+        ADD     lr, lr, a1, LSL #1
+        LDRSH   lr, [lr]                ; Offset from L4_Control
+        CMP     lr, #-1
+        Pull    "v1, pc", EQ            ; Missing PADCONF register
+       
+        TST     lr, #1:SHL:15           ; WKUP or CORE?
+        BFC     lr, #15, #17
+        LDREQ   a1, L4_Core_Log
+        ADDEQ   a1, a1, #L4_SYSCTRL_PADCONF_CORE-L4_Core
+        LDRNE   a1, L4_Wakeup_Log
+        ADDNE   a1, a1, #L4_SYSCTRL_PADCONF_WKUP-L4_Wakeup
+        ADD     lr, a1, lr
+
+        PHPSEI  ip                      ; Safe read/modify/write
+        LDRH    a1, [lr]                ; 18.4.8 "These registers can be accessed using 8-, 16-, or 32-bit operations"
+        CMP     a2, #-1
+        BICNE   a4, a1, v1, LSL a3
+        ORRNE   a4, a4, a2, LSL a3
+        STRNEH  a4, [lr]
+        PLP     ip
+
+        MOV     a1, a1, LSR a3
+        AND     a1, a1, v1
+
+        Pull    "v1, pc"
+
+; struct onepin *GPIOEnumerate(struct gpiodevice *, int *carryon)
+; Enter with a1 = device struct pointer
+;            a2 = pointer to continuation value (0 to start)
+; Return     a1 = pointer to pin info for one more pin
+;            continuation value updated (-1 if no more)
+GPIOEnumerate
+        Push    "v1-v3, lr"
+
+        LDR     v1, [a1, #WkspValidMask]
+        LDR     a1, [a1, #TNumb - GPIOTemplate]
+
+        LDR     a3, [a2]                ; Just use the continuation value as a bit position
+        CMP     a3, #32
+        BCS     %FT60                   ; Out of bounds
+
+        CMP     a3, #0
+        BNE     %FT20                   ; Not the start condition
+
+        MOVS    ip, v1
+        BEQ     %FT60                   ; No valid pins
+10
+        ; Find first set
+        MOVS    ip, ip, LSR #1          
+        ADDCC   a3, a3, #1
+        BCC     %BT10
+20
+        MOV     ip, #1
+        TST     v1, ip, LSL a3
+        BEQ     %FT60                   ; Invalid on this target
+
+        ADRL    v2, GPIOAltsTables
+        LDR     v2, [v2, a1, LSL #2]    ; Start of pin data
+        MOV     v3, #0
+30
+        LDR     ip, [v2], #4            ; Fetch & skip private word
+        CMP     ip, #-1
+        BEQ     %FT60                   ; Reached table end
+
+        TEQ     v3, a3
+        MOVEQ   a1, v2
+        BEQ     %FT40
+
+        ; Jump to next item
+        ADD     v2, v2, #GPIOEnumerate_GroupList
+        ADD     ip, ip, #1              ; List terminator is one entry
+        ASSERT  GPIOGroupList_Size = 4
+        ADD     v2, v2, ip, LSL #2      ; Account for list entries
+        ADD     v3, v3, #1              ; Next pin
+        B       %BT30
+40
+        ; Find next set
+        ADD     v3, v3, #1
+        CMP     v3, #32
+        MOVNES  v1, v1, LSR v3
+        BEQ     %FT70
+50
+        MOVS    v1, v1, LSR #1
+        ADDCC   v3, v3, #1
+        BCC     %BT50
+
+        STR     v3, [a2]
+
+        Pull    "v1-v3, pc"
+60
+        MOV     a1, #0                  ; Nothing found
+70
+        MOV     ip, #-1                 ; Continuation value set for last one
+        STR     ip, [a2]
+
+        Pull    "v1-v3, pc"
+
+        GET     hdr.GPIOPadConf
+
+        END

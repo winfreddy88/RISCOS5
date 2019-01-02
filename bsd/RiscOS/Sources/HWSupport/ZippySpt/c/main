@@ -1,0 +1,153 @@
+/*
+ * Copyright (c) 2012, Ben Avison
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of the copyright holder nor the names of their
+ *       contributors may be used to endorse or promote products derived from
+ *       this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY
+ * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <stdint.h>
+#include "swis.h"
+
+#include "Global/HALDevice.h"
+#include "Global/NewErrors.h"
+
+#include "ZippySupportHdr.h"
+#include "mmc2.h"
+
+/* A quick macro to silence compiler warnings about unused parameters */
+#define IGNORE(x) do { (void)(x); } while(0)
+
+/* Macro to switch endianness of 16-bit numbers - for some mad reason,
+ * the expansion card IDs are big endian! */
+#define BIG_ENDIAN(x) ((((x) & 0xFF) << 8) | (((x) & 0xFF00) >> 8))
+
+/* Standard I2C address of Beagleboard expansion ID EEPROM */
+#define I2CID (0x50)
+
+/* Beagleboard expansion I2C bus */
+#define I2CBUS (1)
+
+/* Recognised Beagleboard expansion vendor IDs */
+#define VENDOR_TINCANTOOLS (0x0001u)
+
+/* Recognised Beagleboard expansion device IDs */
+#define DEVICE_ZIPPY       (0x0001u)
+#define DEVICE_ZIPPY2      (0x0002u)
+
+/* GPIO HAL device */
+typedef struct
+{
+  struct device dev;
+  uint32_t      gpiotype;
+  uint32_t      gpiorevision;
+}
+gpiodevice_t;
+
+/* OMAP3 GPIO types */
+#define GPIOType_OMAP3_BeagleBoard    (0)
+
+/* Beagleboard revisions */
+#define GPIORevision_BeagleBoard_AB   (0) // Rev A or B
+#define GPIORevision_BeagleBoard_C123 (1) // Rev C1, C2 or C3
+#define GPIORevision_BeagleBoard_C4   (2) // Rev C4
+
+_kernel_oserror *Init(const char *cmd_tail, int podule_base, void *pw)
+{
+  IGNORE(cmd_tail);
+  IGNORE(podule_base);
+  IGNORE(pw);
+  
+  _kernel_oserror *e;
+  bool found = false;
+  
+  uint32_t handle = 0;
+  gpiodevice_t *device;
+  for (;;)
+  {
+    e = _swix(OS_Hardware, _INR(0,1)|_IN(8)|_OUTR(1,2),
+      HALDeviceType_Comms + HALDeviceComms_GPIO,
+      handle, 4, &handle, &device);
+    if (e != NULL || handle == -1u)
+      break;
+    if (device->dev.id == HALDeviceID_GPIO_OMAP3)
+    {
+      if (device->gpiotype == GPIOType_OMAP3_BeagleBoard &&
+          (device->gpiorevision == GPIORevision_BeagleBoard_AB ||
+           device->gpiorevision == GPIORevision_BeagleBoard_C123 ||
+           device->gpiorevision == GPIORevision_BeagleBoard_C4))
+        found = true;
+      break;
+    }
+  }
+  
+  if (found)
+  {
+    uint8_t reg = 0;
+    uint16_t ids[2];
+    struct
+    {
+      uint32_t addr;
+      void *block;
+      size_t bytes;
+    }
+    transfers[2] =
+    {
+      { (I2CID << 1) | 0, &reg, sizeof reg },
+      { (I2CID << 1) | 1, &ids, sizeof ids },
+    };
+    e = _swix(OS_IICOp, _INR(0,1), &transfers, (I2CBUS << 24) | 2);
+    if (e ||
+        BIG_ENDIAN(ids[0]) != VENDOR_TINCANTOOLS ||
+        (BIG_ENDIAN(ids[1]) != DEVICE_ZIPPY && BIG_ENDIAN(ids[1]) != DEVICE_ZIPPY2))
+    {
+      found = false;
+    }
+  }
+  
+  if (!found)
+  {
+    static const struct
+    {
+      uint32_t errnum;
+      char     errmsg[8];
+    }
+    errtok = { ErrorNumber_BadHard, ErrorString_BadHard };
+    return _swix(MessageTrans_ErrorLookup, _INR(0,2), &errtok, 0, 0);
+  }
+  
+  /* Now we know we're running on appropriate hardware, install drivers */
+  return mmc2_Init();
+}
+
+_kernel_oserror *Final(int fatal, int podule, void *pw)
+{
+  IGNORE(fatal);
+  IGNORE(podule);
+  IGNORE(pw);
+  
+  mmc2_Final();
+  
+  return 0;
+}

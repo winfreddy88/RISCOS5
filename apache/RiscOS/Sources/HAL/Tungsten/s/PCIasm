@@ -1,0 +1,496 @@
+; Copyright 2002 Tematic Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:PCI
+        GET     Hdr:OSEntries
+        GET     Hdr:Proc
+
+        GET     hdr.80321
+        GET     hdr.StaticWS
+
+        AREA    |Asm$$Code|, CODE, READONLY, PIC
+
+        EXPORT  PCI_Init
+        EXPORT  PCI_TungstenSecondaryBus
+        EXPORT  HAL_PCIFeatures
+        EXPORT  HAL_PCIReadConfigByte
+        EXPORT  HAL_PCIReadConfigHalfword
+        EXPORT  HAL_PCIReadConfigWord
+        EXPORT  HAL_PCIWriteConfigByte
+        EXPORT  HAL_PCIWriteConfigHalfword
+        EXPORT  HAL_PCIWriteConfigWord
+        EXPORT  HAL_PCIAddresses
+        EXPORT  HAL_PCISlotTable
+        EXPORT  generate_POR_flags
+        EXPORT  pci_set_host_fastb2b
+
+        IMPORT  pci_initialise
+        IMPORT  get_end_of_ram
+
+        MACRO
+        pci_config_prelim $wordaligned
+        ; In: a1 = bus, a2 = dev/fn, a3 = addr
+        ; Out: a1 = address for OCCAR, ip -> PMMR, a2 -> PMMR + low 2 bits of addr
+        TEQ     a1, #0                          ; make a type 0 access for bus 0
+        MOVEQ   a1, #1:SHL:16                   ; - set bit 16+dev
+        MOVEQ   ip, a2, LSR #3
+        ORREQ   a1, a3, a1, LSL ip
+        ORRNE   a1, a3, a1, LSL #16             ; type 1 for other buses - need bus no
+        LDR     ip, PMMR_Address
+        ORR     a1, a1, a2, LSL #8              ; merge in dev no + func
+      [ "$wordaligned" = ""
+        BIC     a1, a1, #2_11
+        AND     a2, a3, #3
+        ADD     a2, ip, a2
+      ]
+        ORRNE   a1, a1, #2_01                   ; set type
+        MEND
+
+; void PCI_Init(void)
+PCI_Init
+        Push    "v1,r11,lr"
+
+        LDR     ip, PMMR_Address
+        MOV     a1, #8
+        STRB    a1, [ip, #ATU_ATUCLSR]          ; Cache line size = 8 words
+        MOV     a1, #&20
+        STRB    a1, [ip, #ATU_ATULT]            ; Latency timer = 32 clocks
+        MOV     a1, #0
+        STR     a1, [ip, #ATU_IABAR0]
+        STR     a1, [ip, #ATU_IALR0]            ; Close window 0 (for now)
+        MOV     a1, #&C0000000
+        STR     a1, [ip, #ATU_IALR2]            ; RAM window is 1GB
+ [ ShadowRAMWindow
+        STR     a1, [ip, #ATU_IALR3]
+ ]
+        MOV     a1, #RAM_Base
+        ORR     a1, a1, #2_1100                 ; Prefetchable, 64-bit
+        STR     a1, [ip, #ATU_IABAR2]           ; RAM window (&C0000000)
+ [ ShadowRAMWindow
+        MOV     a1, #&40000000
+        ORR     a1, a1, #2_1000                 ; Prefetchable, 32-bit
+        STR     a1, [ip, #ATU_IABAR3]
+ ]
+        MOV     a1, #RAM_Base
+        STR     a1, [ip, #ATU_IATVR2]
+ [ ShadowRAMWindow
+        STR     a1, [ip, #ATU_IATVR3]
+ ]
+        LDR     a1, [ip, #ATU_ATUCMD]
+        ORR     a1, a1, #2_1000110              ; Bus Master + memory + parity
+        ORR     a1, a1, #1:SHL:8                ; SERR# enable
+        STR     a1, [ip, #ATU_ATUCMD]
+        LDR     a1, [ip, #ATU_ATUCR]
+        ORR     a1, a1, #1:SHL:1                ; Outbound ATU enable
+        ORR     a1, a1, #1:SHL:8                ; Direct addressing enable
+        STR     a1, [ip, #ATU_ATUCR]
+        MOV     r11, #0
+ [ (RAM_Base :AND: &80000000) = 0
+        BL      get_end_of_ram
+ |
+        MOV     a1, #0
+ ]
+        MOV     a2, #PCI_Size
+        SUB     a2, a2, #1
+        BL      pci_initialise          ; scan the world for PCI devices
+
+        LDR     a1, PCI_IO_Address
+        BL      Configure37C665         ; set the 665 up
+
+        Pull    "v1,r11,pc"
+
+; uint8_t PCI_TungstenSecondaryBus(void)
+; returns bus number of the secondary bus
+PCI_TungstenSecondaryBus
+        Push    "lr"
+        MOV     a1, #0                  ; Bus 0
+        MOV     a2, #8*8                ; Dev 8, Fn 0 = PCI-PCI bridge
+        MOV     a3, #PCIConf1_SecondaryBus
+        BL      HAL_PCIReadConfigByte
+        Pull    "pc"
+
+; uint8_t pci_read_config_byte(int bus, int devfn, int addr)
+HAL_PCIReadConfigByte
+        pci_config_prelim
+        LDR     a3, [ip, #ATU_OCCAR]
+        STR     a1, [ip, #ATU_OCCAR]
+        MOV     a1, #&FF                ; Default return value in case of abort
+        LDRB    a1, [a2, #ATU_OCCDR]
+        NOP
+        NOP
+        NOP
+        STR     a3, [ip, #ATU_OCCAR]
+        MOV     pc, lr
+
+; uint16_t pci_read_config_halfword(int bus, int devfn, int addr)
+HAL_PCIReadConfigHalfword
+        pci_config_prelim
+        LDR     a3, [ip, #ATU_OCCAR]
+        STR     a1, [ip, #ATU_OCCAR]
+        ADD     a2, a2, #ATU_OCCDR:AND::NOT:&FF
+        MOV     a1, #&FF00
+        ORR     a1, a1, #&FF            ; Default return value in case of abort
+        LDRH    a1, [a2, #ATU_OCCDR:AND:&FF]
+        NOP
+        NOP
+        NOP
+        STR     a3, [ip, #ATU_OCCAR]
+        MOV     pc, lr
+
+; uint32_t pci_read_config_word(int bus, int devfn, int addr)
+HAL_PCIReadConfigWord
+        pci_config_prelim wordaligned
+        LDR     a3, [ip, #ATU_OCCAR]
+        STR     a1, [ip, #ATU_OCCAR]
+        MVN     a1, #0                  ; Default return value in case of abort
+        LDR     a1, [ip, #ATU_OCCDR]
+        NOP
+        NOP
+        NOP
+        STR     a3, [ip, #ATU_OCCAR]
+        MOV     pc, lr
+
+; void pci_write_config_byte(int bus, int devfn, int addr, uint8_t value)
+HAL_PCIWriteConfigByte
+        pci_config_prelim
+        LDR     a3, [ip, #ATU_OCCAR]
+        STR     a1, [ip, #ATU_OCCAR]
+        STRB    a4, [a2, #ATU_OCCDR]
+        STR     a3, [ip, #ATU_OCCAR]
+        MOV     pc, lr
+
+; void pci_write_config_halfword(int bus, int devfn, int addr, uint16_t value)
+HAL_PCIWriteConfigHalfword
+        pci_config_prelim
+        LDR     a3, [ip, #ATU_OCCAR]
+        STR     a1, [ip, #ATU_OCCAR]
+        ADD     a2, a2, #ATU_OCCDR:AND::NOT:&FF
+        STRH    a4, [a2, #ATU_OCCDR:AND:&FF]
+        STR     a3, [ip, #ATU_OCCAR]
+        MOV     pc, lr
+
+; void pci_read_config_word(int bus, int devfn, int addr, uint32_t value)
+HAL_PCIWriteConfigWord
+        pci_config_prelim wordaligned
+        LDR     a3, [ip, #ATU_OCCAR]
+        STR     a1, [ip, #ATU_OCCAR]
+        STR     a4, [ip, #ATU_OCCDR]
+        STR     a3, [ip, #ATU_OCCAR]
+        MOV     pc, lr
+
+     [ {FALSE}
+; uint8_t pci_read_io_byte(uint32_t address)
+HAL_PCIReadIOByte
+        LDR     a4, PCI_IO_Address
+        CMP     a1, #&10000
+        MOVHS   a1, #&FF
+        LDRLOB  a1, [a4, a1]
+        MOV     pc, lr
+
+HAL_PCIReadIOHalfword
+        LDR     a4, PCI_IO_Address
+        CMP     a1, #&10000
+        LDRHS   a1, =&FFFF
+        LDRLOH  a1, [a4, a1]
+        MOV     pc, lr
+
+HAL_PCIReadIOWord
+        LDR     a4, PCI_IO_Address
+        CMP     a1, #&10000
+        MOVHS   a1, #&FFFFFFFF
+        LDRLO   a1, [a4, a1]
+        MOV     pc, lr
+
+; void pci_write_io_byte(uint32_t address, uint8_t value)
+HAL_PCIWriteIOByte
+        LDR     a4, PCI_IO_Address
+        CMP     a1, #&10000
+        STRLOB  a2, [a4, a1]
+        MOV     pc, lr
+
+HAL_PCIWriteIOHalfword
+        LDR     a4, PCI_IO_Address
+        CMP     a1, #&10000
+        STRLOH  a2, [a4, a1]
+        MOV     pc, lr
+
+HAL_PCIWriteIOWord
+        LDR     a4, PCI_IO_Address
+        CMP     a1, #&10000
+        STRLO   a2, [a4, a1]
+        MOV     pc, lr
+     ]
+
+; Word 0: number of entries
+; Words 1+: 8 bytes per "slot"
+;
+; Byte 0: Bus number
+; Byte 1: Device number (times 8)
+; Byte 2: INTA# interrupt number (255 if none)
+; Byte 3: INTB# interrupt number
+; Byte 4: INTC# interrupt number
+; Byte 5: INTD# interrupt number
+; Byte 6: flags: bits 0-3 set if INTx# is not shared
+;                bit 4: set if 64-bit slot
+;                bit 5: set if 66-MHz capable slot
+;                bit 6: network interface (=> gets NIC CMOS)
+;                bit 7 reserved
+; Byte 7: slot number (0 if motherboard)
+SlotTablePrototype
+        DCD     (SlotTablePrototypeEnd - SlotTablePrototype - 4) / 8
+        DCB     0, 6*8, Device_XINT2, Device_XINT3, Device_XINT0, Device_XINT1, 2_00110000, 7
+        DCB     0, 7*8, Device_XINT3, Device_XINT0, Device_XINT1, Device_XINT2, 2_00110000, 6
+        DCB     1, 8*8, Device_XINT0, Device_XINT1, Device_XINT2, Device_XINT3, 2_00000000, 4
+        DCB     1, 9*8, Device_XINT1, Device_XINT2, Device_XINT3, Device_XINT0, 2_00000000, 5
+        DCB     0, 4*8, Device_XINT0, 255,          255,          255,          2_01100000, 0
+        DCB     0, 8*8, Device_XINT0, Device_XINT1, Device_XINT2, Device_XINT3, 2_00110000, 0
+        DCB     1, 1*8, Device_AC97,  255,          255,          255,          2_00000000, 0
+        DCB     1, 2*8, 255,          255,          255,          255,          2_00000000, 0
+        DCB     1, 3*8, Device_Modem, 255,          255,          255,          2_00000000, 0
+        DCB     1,10*8, Device_USB2,  255,          255,          255,          2_00000000, 0
+        DCB     1,11*8, Device_XINT1, 255,          255,          255,          2_00000000, 0
+        DCB     1,12*8, Device_XINT1, 255,          255,          255,          2_00000000, 0
+        DCB     1,15*8, Device_XINT1, 255,          255,          255,          2_00000000, 0
+SlotTablePrototypeEnd
+
+; In: a1 -> buffer, or 0
+;     a2 = buffer size, or 0
+; Out: a1 = buffer length required; buffer filled in if a2 in >= a1 out
+HAL_PCISlotTable ROUT
+        CMP     a2, #SlotTablePrototypeEnd - SlotTablePrototype
+        MOVLO   a1, #SlotTablePrototypeEnd - SlotTablePrototype
+        MOVLO   pc, lr
+        Push    "a1,lr"                 
+        ; Check secondary bus number of PCI-PCI bridge (OS may have renumbered)
+        BL      PCI_TungstenSecondaryBus
+        Pull    "lr"
+        ADR     ip, SlotTablePrototype
+        LDR     a4, [ip], #4
+        STR     a4, [lr], #4
+10      LDMIA   ip!, {a2, a3}
+        STMIA   lr!, {a2, a3}
+        AND     a3, a2, #&FF
+        TEQ     a3, #1                  ; Update secondary bus number
+        STREQB  a1, [lr, #-8]
+        SUBS    a4, a4, #1
+        BNE     %BT10
+        MOV     a1, #SlotTablePrototypeEnd - SlotTablePrototype
+        Pull    "pc"
+
+; Number to add to PCI memory address to get ARM physical address
+; Range of PCI memory addresses available for allocation
+; Number to add to PCI I/O address to get ARM physical address
+; Range of PCI I/O addresses available for allocation
+; Value to add to physical RAM address to get PCI memory address
+;
+address_table
+        DCD     PCI_Base
+        DCD     &00000000
+        DCD     &7FFFFFFF
+        DCD     PCI_IO_Base
+        DCD     &00001000       ; steer clear of crufty super I/O
+        DCD     &0000FFFF
+        DCD     0
+
+; In: a1 -> buffer
+;     a2 = length
+; Out: a1 = length filled in
+HAL_PCIAddresses
+        ADR     a4, address_table
+        MOV     a3, a1
+10      SUBS    a2, a2, #4
+        LDRPL   ip, [a4], #4
+        STRPL   ip, [a1], #4
+        BPL     %BT10
+        SUB     a1, a1, a3
+        MOV     pc, lr
+
+; Not called by PCI manager? Also doesn't even vaguely match docs!
+; TODO: Fix me
+HAL_PCIFeatures
+        MOV     a1, #&0220
+        MOV     pc, lr
+
+;
+; Simplified version of Configure82C710 programs ALI 1535 only.
+;
+
+Configure37C665 Entry
+        SETPSR  I_bit + F_bit, ip,, r2  ; Disable FIQ and IRQ
+
+        MOV     lr, #&51
+        STRB    lr, [r0, #IO_ConfigIndex]    ; Write magic &51 &23 to CRI711
+        MOV     lr, #&23
+        STRB    lr, [r0, #IO_ConfigIndex]    ;   to enter configuration mode
+
+        ADR     r1, ConfigSMCTable      ; R1-> SMC 665 configuration data
+20
+        LDRB    lr, [r1], #1            ; get config index
+        STRB    lr, [r0, #IO_ConfigIndex]
+        TEQ     lr, #&BB                ; end of table?
+        LDRNEB  lr, [r1], #1            ; if not then get config data
+        STRNEB  lr, [r0, #IO_ConfigData]    ; and write it
+        BNE     %BT20
+
+        MOV     r1, #IOST_37C665
+30
+        STRB    r1, IOSystemType
+
+        RestPSR r2                      ; Restore IRQ/FIQ state
+
+        EXIT
+
+ConfigSMCTable
+        DCB     &07, 0                  ; Access device 0 (FDC)
+        DCB     &30, 1                  ; Enable device (IO 03F0, IRQ6, DMA2)
+        DCB     &07, 4                  ; Access device 4 (UART 1)
+        DCB     &70, 9                  ; Select IRQ9
+        DCB     &30, 1                  ; Enable device (at &03F8)
+        DCB     &F0, 2                  ; Enable UART 1 high speed mode
+        DCB     &07, &B                 ; Access device B (UART 3)
+        DCB     &70, 10                 ; Select IRQ10
+        DCB     &30, 1                  ; Enable device (at &02F8)
+        DCB     &F0, 2                  ; Enable UART 3 high speed mode
+        DCB     &BB                     ; Exit config mode
+        ALIGN
+
+generate_POR_flags
+;       In:  No registers, pre-MMU stage;
+;       Out: a1 = OSStartFlag
+
+        LDR     ip, =PMMR
+
+        LDR     a1, [ip, #ATU_ATUCMD]
+        ORR     a1, a1, #2_100          ; Bus Master enable
+        STR     a1, [ip, #ATU_ATUCMD]
+        LDR     a1, [ip, #ATU_ATUCR]
+        ORR     a1, a1, #1:SHL:1        ; Outbound ATU enable
+        STR     a1, [ip, #ATU_ATUCR]
+
+        LDR     a1, =&01000018          ; set bridge's primary bus to 0,
+        STR     a1, [ip, #ATU_OCCAR]    ; and secondary and subordinate to 1
+        LDR     a2, =&00010100          ; to allow config cycles to pass
+        STR     a2, [ip, #ATU_OCCDR]
+
+        LDR     a1, =&00011040 :OR: 1   ; check the "32-bit DMA" flag in config byte &42
+        STR     a1, [ip, #ATU_OCCAR]    ; the 1535. If set, it's not a
+        LDRB    a1, [ip, #ATU_OCCDR+2]  ; power-on reset.
+        TST     a1, #&40
+        MOVEQ   a3, #OSStartFlag_POR
+        MOVNE   a3, #0
+
+        LDR     a1, =&000160B4 :OR: 1   ; check the GPI25 bit in config byte &B6
+        STR     a1, [ip, #ATU_OCCAR]    ; the 7101. If set, the CMOS protection
+        LDRB    a1, [ip, #ATU_OCCDR+2]  ; link is open
+        TST     a1, #&2
+        ORREQ   a3, a3, #OSStartFlag_NoCMOSReset
+
+        MOV     a1, a3
+        MOV     pc, lr
+
+; bool pci_set_host_fastb2b(bool)
+pci_set_host_fastb2b
+        LDR     ip, PMMR_Address
+        ADD     ip, ip, #ATU_ATUCMD:AND::NOT:&FF
+        TEQ     a1, #0
+        LDRH    a2, [ip, #ATU_ATUCMD:AND:&FF]
+        ORRNE   a2, a2, #&0200
+        BICEQ   a2, a2, #&0200
+        STRH    a2, [ip, #ATU_ATUCMD:AND:&FF]
+        MOV     pc, lr
+
+        EXPORT  memset
+memset
+        ORR     ip, a1, a3
+        TST     ip, #3
+        BEQ     memset_wordaligned
+        MOV     a4, a1
+        TEQ     a3, #0
+10      STRNEB  a2, [a4], #1
+        SUBS    a3, a3, #1
+        BNE     %BT10
+        MOV     pc, lr
+
+memset_wordaligned
+        AND     a2, a2, #&FF
+        ORR     a2, a2, a2, LSL #8
+        ORR     a2, a2, a2, LSL #16
+        ; fall through
+
+        EXPORT  _memset
+_memset
+        MOV     a4, a1
+        TEQ     a3, #0
+10      STRNE   a2, [a4], #4
+        SUBS    a3, a3, #4
+        BNE     %BT10
+        MOV     pc, lr
+
+; alloc_usbhal relies on hal_alloc not corrupting a4
+        EXPORT  hal_alloc
+hal_alloc
+        ADD     a1, a1, #3
+        BIC     a1, a1, #3
+        LDR     a2, AllocNext
+        TEQ     a2, #0
+        ADREQ   a2, AllocArea
+        ADD     a3, a2, a1
+        STR     a3, AllocNext
+        MOV     a1, a2
+        MOV     pc, lr
+
+        EXPORT  hal_free
+hal_free
+        MOV     pc, lr
+
+        EXPORT  alloc_contig
+alloc_contig
+        CMP     a2, #4
+        MOVLO   a2, #4
+        SUB     a2, a2, #1
+        LDR     ip, NCNBAllocNext
+        TEQ     ip, #0
+        LDREQ   ip, NCNBWorkspace
+        ADD     ip, ip, a2
+        BIC     ip, ip, a2
+        ADD     a4, ip, a1
+        STR     a4, NCNBAllocNext
+        MOV     a3, a1
+        MOV     a2, #0
+        MOV     a1, ip
+        B       memset
+
+        EXPORT  free_contig
+free_contig
+        MOV     pc, lr
+
+        EXPORT  pci_set_state
+pci_set_state
+        STR     a1, PCIState
+        MOV     pc, lr
+
+        EXPORT  pci_get_state
+pci_get_state
+        LDR     a1, PCIState
+        MOV     pc, lr
+
+        EXPORT  panic
+panic
+        BKPT    &1234
+        B       panic
+
+        END

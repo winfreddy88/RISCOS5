@@ -1,0 +1,268 @@
+;
+; Copyright (c) 2015, RISC OS Open Ltd
+; All rights reserved.
+;
+; Redistribution and use in source and binary forms, with or without
+; modification, are permitted provided that the following conditions are met: 
+;     * Redistributions of source code must retain the above copyright
+;       notice, this list of conditions and the following disclaimer.
+;     * Redistributions in binary form must reproduce the above copyright
+;       notice, this list of conditions and the following disclaimer in the
+;       documentation and/or other materials provided with the distribution.
+;     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+;       may be used to endorse or promote products derived from this software
+;       without specific prior written permission.
+; 
+; THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+; AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+; IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+; ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+; LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+; CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+; SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+; INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+; CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+; ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+; POSSIBILITY OF SUCH DAMAGE.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:SprExtend
+        GET     Hdr:Sprite
+        GET     Hdr:FSNumbers
+        GET     Hdr:NewErrors
+
+        AREA    CFSIjpeg, CODE, READONLY, PIC
+
+                       ^ 0
+cinfo_error_code       # 4              ; error code (from jerror.h) or 0 if no error
+cinfo_error_argument   # 4              ; supplementary error information
+cinfo_pad              # 12             ; backwards compatible layout with IJG4
+cinfo_image_width      # 4              ; pixels
+cinfo_image_height     # 4              ; pixels
+cinfo_colour_space     # 4              ; 1 = greyscale, 3 = YUV or RGB, 4 = YCCK or CMYK
+                       # 0
+cinfo_band_ycoord      # 4              ; start of band
+cinfo_band_log2bpp     # 4              ; 5 or 4
+cinfo_log2_band_height * 4              ; must be >= 1 to avoid a bug in old SpriteExtend and
+                                        ; choosing 16 buffers the most common 2x2 DCTSIZE
+cinfo_band_height      * 1:SHL:cinfo_log2_band_height
+cinfo_jpeg_buffer      # 4
+cinfo_jpeg_buffer_size # 4
+cinfo_spritearea       # SpriteAreaCBsize
+cinfo_sprite           # SpriteCBsize
+cinfo_pixels           # 0              ; from here on
+cinfo_size             * :INDEX: @
+
+JERR_OUT_OF_MEMORY     * 55             ; from the IJG error table
+JERR_INPUT_EMPTY       * 43
+JERR_BAD_BUFFER_MODE   * 3
+
+; This makes an image of assembler code that can be loaded in by ChangeFSI
+; and then called, to decompress a JPEG image data stream.
+;
+; While it would be entirely possible to inline this within the sprawling
+; mass of conditional assembler already in ChangeFSI, keeping it isolated
+; perhaps makes things easier to read?
+;
+; It's intended to be used as a library by things other than ChangeFSI so
+; starts with a magic jump table that's always in the same place...
+
+        B       setup_for_32bpp_output
+        B       decompress_one_line
+        B       find_image_dimensions
+        B       setup_for_16bpp_output
+        DCD     3                       ; version number
+
+setup_for_32bpp_output ROUT
+        ; Prepare to work with a JPEG and return lines of 32bpp 8:8:8 BGR pixels
+        ; => r0 -> cinfo workspace
+        ;    r1 = byte size of cinfo workspace
+        ;    r2 -> JPEG image
+        ;    r3 = byte size of JPEG image
+        ; <= r0 = error code (from jerror.h) or 0 if no error
+        ;         and first few words of cinfo workspace updated
+        Push    "r1-r6, r11-r12, lr"
+        MOV     r12, r0
+
+        MOV     r0, #5
+        STR     r0, [r12, #cinfo_band_log2bpp]
+10
+        SavePSR r11
+
+        MOV     r0, #0
+        STR     r0, [r12, #cinfo_error_code]
+        STR     r0, [r12, #cinfo_error_argument]
+
+        MOV     r0, #-1
+        STR     r0, [r12, #cinfo_band_ycoord]
+
+        STR     r2, [r12, #cinfo_jpeg_buffer]
+        STR     r3, [r12, #cinfo_jpeg_buffer_size]
+
+        MOV     r0, r2
+        ADD     r1, r12, #cinfo_image_width
+        ADD     r2, r12, #cinfo_image_height
+        ADD     r3, r12, #cinfo_colour_space
+        SUB     sp, sp, #4
+        MOV     r4, sp                  ; For size of workspace
+        BL      find_image_dimensions
+
+        STR     r0, [r12, #cinfo_error_code]
+
+        Pull    "r4"                    ; Size of workspace
+        CMP     r0, #0
+        BNE     %FT20
+
+        LDR     r1, [sp, #0*4]
+        CMP     r4, r1
+        MOVHI   r0, #JERR_OUT_OF_MEMORY
+        BHI     %FT20
+
+        ; Init the sprite area
+        ADD     r1, r12, #cinfo_spritearea
+        LDR     r3, [r12, #cinfo_image_width]
+        MOV     r3, r3, LSL #2 + cinfo_log2_band_height
+        ADD     r3, r3, #SpriteAreaCBsize + SpriteCBsize
+        STR     r3, [r1, #saEnd]
+
+        ASSERT  cinfo_sprite = cinfo_spritearea + SpriteAreaCBsize
+        MOV     r3, #SpriteAreaCBsize
+        STR     r3, [r1, #saFirst]
+
+        LDR     r0, =SpriteReason_ClearSprites + 256
+        SWI     XOS_SpriteOp
+        MOVVS   r0, #JERR_BAD_BUFFER_MODE
+        BVS     %FT20
+
+        ; Create a 32 or 16bpp sprite
+        LDR     r0, =SpriteReason_CreateSprite + 256
+        ADR     r2, sprite_name
+        MOV     r3, #0                  ; True colour, no palette
+        LDR     r4, [r12, #cinfo_image_width]
+        MOV     r5, #cinfo_band_height
+        LDR     r6, [r12, #cinfo_band_log2bpp]
+        TEQ     r6, #5
+        LDR     r6, =(180:SHL:14) :OR: (180:SHL:1) :OR: 1
+        ORREQ   r6, r6, #SpriteType_New32bpp:SHL:27
+        ORRNE   r6, r6, #SpriteType_New16bpp:SHL:27
+        SWI     XOS_SpriteOp
+        MOVVS   r0, #JERR_BAD_BUFFER_MODE
+        BVS     %FT20
+        
+        MOV     r0, #0                  ; No error
+20
+        RestPSR r11,,f
+        Pull    "r1-r6, r11-r12, pc"
+
+sprite_name
+        DCB     "cfsi-jpeg", 0
+        ALIGN
+
+setup_for_16bpp_output
+        ; Prepare to work with a JPEG and return lines of 16bpp 5:5:5 BGR pixels
+        ; => r0 -> cinfo workspace
+        ;    r1 = byte size of cinfo workspace
+        ;    r2 -> JPEG image
+        ;    r3 = byte size of JPEG image
+        ; <= r0 = error code (from jerror.h) or 0 if no error
+        ;         and first few words of cinfo workspace updated
+        Push    "r1-r6, r11-r12, lr"
+        MOV     r12, r0
+
+        MOV     r0, #4
+        STR     r0, [r12, #cinfo_band_log2bpp]
+        B       %BT10
+
+decompress_one_line ROUT
+        ; De JPEG one line of the image
+        ; => r0 -> cinfo workspace
+        ;    r1 = y coordinate of line required
+        ; <= r0 -> decompressed line
+        Push    "r1-r6, r11-r12, lr"
+        MOV     r12, r0
+
+        MOV     r6, r1, LSR #cinfo_log2_band_height
+        MOV     r6, r6, LSL #cinfo_log2_band_height
+        LDR     r5, [r12, #cinfo_band_ycoord]
+        TEQ     r5, r6                  ; Is it already buffered?
+        MOVEQ   r5, #0
+        BEQ     %FT10
+
+        ; Refill the band buffer
+        LDR     r0, =SpriteReason_SwitchOutputToSprite + 512
+        ADD     r1, r12, #cinfo_spritearea
+        ADD     r2, r12, #cinfo_sprite
+        MOV     r3, #0
+        SWI     XOS_SpriteOp
+        MOVVS   r5, #JERR_BAD_BUFFER_MODE
+        BVS     %FT10
+
+        Push    "r0-r3"                 ; Keep previous switch state
+
+        LDR     r0, [r12, #cinfo_jpeg_buffer]
+        MOV     r1, #0                  ; x
+        RSB     r2, r6, #0              ; -y
+        MOV     r3, #0                  ; No scaling
+        LDR     r4, [r12, #cinfo_jpeg_buffer_size]
+        MOV     r5, #JPEGFlag_Scaled_Dither_Enable
+        SWI     XJPEG_PlotScaled
+        MOVVS   r5, #JERR_INPUT_EMPTY
+        STRVC   r6, [r12, #cinfo_band_ycoord]
+        MOVVC   r5, #0                  ; No error
+        Pull    "r0-r3"
+        SWI     XOS_SpriteOp            ; Switch back
+10
+        STR     r5, [r12, #cinfo_error_code]
+
+        ; Modulo adjust input y to the band buffer
+        ADD     r1, r12, #cinfo_sprite
+        LDR     r0, [r1, #spImage]
+        ADD     r0, r1, r0              ; -> sprite image
+        LDR     r2, [r1, #spWidth]
+        ADD     r2, r2, #1              ; Word width
+        MOV     r2, r2, LSL #2          ; Byte width
+        LDR     r3, [sp, #0]            ; Recover y
+        AND     r3, r3, #cinfo_band_height - 1
+        RSB     r3, r3, #cinfo_band_height - 1
+        MLA     r0, r2, r3, r0          ; -> sprite line for y
+        RestPSR r11,,f
+        Pull    "r1-r6, r11-r12, pc"
+
+find_image_dimensions ROUT
+        ; Deduce JPEG image size and future workspace requirements
+        ; => r0 -> JPEG image
+        ;    r1 -> word to receive image width
+        ;    r2 -> word to receive image height
+        ;    r3 -> word to receive image colour space
+        ;    r4 -> word to receive size of workspace needed
+        ; <= r0 = 0 if it is a JPEG than can be handled, or non 0 to bail out
+        Push    "r1-r7, r11-r12, lr"
+        SavePSR r11
+        MOV     r1, r0
+        MOV     r2, #256*65536          ; Image size only needed to check header validity
+                                        ; so 256 tags each of maximal size should suffice
+        MOV     r0, #JPEGFlag_Return_Dimensions
+        SWI     XJPEG_Info
+        BVS     %FT10                   ; Error will be non zero r0, so just return
+
+        LDMIA   sp, { r4-r7 }
+        STR     r2, [r4]                ; Width
+        STR     r3, [r5]                ; Height
+        TST     r0, #JPEGFlag_Info_Greyscale
+        MOVNE   r0, #1
+        MOVEQ   r0, #3
+        STR     r0, [r6]                ; Colour space
+        MOV     r12, r2, LSL #2 + cinfo_log2_band_height
+        ASSERT  cinfo_pixels = cinfo_size
+        ADD     r12, r12, #cinfo_size
+        STR     r12, [r7]               ; Workspace plus bands of word buffer
+        MOV     r0, #0                  ; No error
+10
+        RestPSR r11,,f
+        Pull    "r1-r7, r11-r12, pc"
+
+        END
+                

@@ -1,0 +1,565 @@
+; Copyright 2012 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:Machine.<Machine>
+        GET     Hdr:ImageSize.<ImageSize>
+        $GetIO
+
+        GET     Hdr:OSEntries
+        GET     Hdr:HALEntries
+        GET     Hdr:HALDevice
+        GET     Hdr:AudioDevice
+        GET     Hdr:MixerDevice
+        GET     Hdr:Proc
+
+        GET     hdr.omap3530
+        GET     hdr.StaticWS
+        GET     hdr.PRCM
+        GET     hdr.GPIO
+
+        AREA    |Asm$$Code|, CODE, READONLY, PIC
+
+        EXPORT  PandoraAudio_Init
+
+        IMPORT  TPSRead
+        IMPORT  TPSWrite
+
+        IMPORT  memcpy
+        IMPORT  HAL_IRQClear
+        IMPORT  HAL_CounterDelay
+
+; Pandora audio driver
+;
+; The Pandora is different to the other OMAP boards. Instead of having the TPS connected to McBSP2 and using it for both input and output, things are set up as follows:
+; * McBSP2 is used for audio output and is connected to a PCM1773
+; * McBSP4 is used for audio input and is connected to the TPS
+; * McBSP2 produces the bit clock that's sent to the PCM1773
+; * The TPS produces the Fs*256 clock that's sent to the PCM1773
+; * The Fs*256 clock is also sent to the McBSP2, and is used for the source of the bit clock
+; The PCM1773 is a fairly dumb DAC, unlike its bigger brother the PCM1772. This means we don't have any hardware mixing controls available for audio output.
+; Since audio input on RISC OS is still a work-in-progress, this means that we can ignore McBSP4 and skip creating a mixer device. We only need minimal TPS code to set up the correct Fs*256 clock, and the code necessary for driving McBSP2 as a clock master instead of slave.
+
+PCM1773_POWER_GPIO * 118
+AMP_POWER_GPIO * 14
+
+; Flag to enable gobs of debug output
+            GBLL    AudioDebug
+AudioDebug  SETL    {FALSE}
+
+PandoraAudio_Init
+        Push    "v1-v4,lr"
+ [ AudioDebug
+        DebugTX "Audio_Init"
+ ]
+        ADRL    v1, AudioWS
+        MOV     a1, v1
+        ADR     a2, AudioTemplate
+        MOV     a3, #Audio_DeviceSize
+        BL      memcpy
+        STR     sb, [v1, #:INDEX:AudioWorkspace]
+        ; Make sure PCM1773 + amplifier are off
+        GPIO_PrepareC a1, a2, AMP_POWER_GPIO
+        GPIO_SetAsOutput a1, a2, a3
+        GPIO_SetOutput0 a1, a2
+        MOV     a1, #1000
+        BL      HAL_CounterDelay
+        GPIO_PrepareC a1, a2, PCM1773_POWER_GPIO
+        GPIO_SetAsOutput a1, a2, a3
+        GPIO_SetOutput0 a1, a2
+        ; Get McBSP2 logical address
+        LDR     v2, L4_Per_Log
+        ADD     v2, v2, #L4_McBSP2-L4_Per
+        STR     v2, [v1, #:INDEX:AudioRegs]
+ [ AudioDebug
+        DebugReg v2, "McBSP2 @ "
+ ]
+
+        ; Before we go any further, turn on the power to McBSP2 & make sure it's in a reset state
+        ; TODO - This should probably go in AudioActivate!
+        LDR     a1, L4_ClockMan_Log
+        ADD     a1, a1, #CM_FCLKEN_PER
+        LDR     a2, [a1]
+        ORR     a2, a2, #1 ; McBSP2 clock enable
+        STR     a2, [a1]
+        LDR     a2, [a1, #CM_ICLKEN_PER-CM_FCLKEN_PER]!
+        ORR     a2, a2, #1
+        STR     a2, [a1]
+        ; CONTROL_DEVCONF0: McBSP2 gets its clock from McBSP_CLKS
+        LDR     a1, L4_Core_Log
+        ADD     a1, a1, #&2200
+        LDR     a2, [a1, #&74]
+        ORR     a2, a2, #1<<6
+        STR     a2, [a1, #&74]
+        ; Set McBSP2 to reset state
+        MOV     a1, #0
+        STR     a1, [v2, #MCBSPLP_SPCR1]
+        MOV     a1, #&200
+        STR     a1, [v2, #MCBSPLP_SPCR2]
+        ; Perform full reset, in fact
+        MOV     a1, #2
+        STR     a1, [v2, #MCBSPLP_SYSCONFIG]
+10
+        LDR     a1, [v2, #MCBSPLP_SYSCONFIG]
+        TST     a1, #2
+        BNE     %BT10
+        ; Set smart idle mode. No auto-idle available! :(
+        MOV     a1, #2<<3
+        STR     a1, [v2, #MCBSPLP_SYSCONFIG]
+        ; One-time setup of transmitter registers
+        LDR     a1, =&0F0F ; Active-low RX/TX frame sync, RX on rising, TX on falling, clocks in master mode 
+        STR     a1, [v2, #MCBSPLP_PCR]
+        MOV     a1, #&40 ; 16bit words, 1 word per frame
+        STR     a1, [v2, #MCBSPLP_XCR1]
+        LDR     a1, =&8041 ; dual-phase frame, (16 bit, 1 word), MSB first, 1-bit delay
+        STR     a1, [v2, #MCBSPLP_XCR2]
+        ; Program sample rate generator registers
+        LDR     a1, =&f07 ; 16 bit frame width-1, CLKGDV=7. Fs*256/(CLKGDV+1) = 2*16 bits per Fs
+        STR     a1, [v2, #MCBSPLP_SRGR1]
+        LDR     a1, =&101f ; FPER=2*16 bit-1, SRG drives TX frame sync 
+        STR     a1, [v2, #MCBSPLP_SRGR2]
+
+        ; Register audio device
+        MOV     a2, v1
+        MOV     a1, #0
+        CallOS  OS_AddDevice
+
+        ; Set TPS audio registers to default values
+        MOV     a1, #TPSAUDIO_IIC*2
+        ADR     a2, TPSDefaults
+        MOV     a3, #1 ; Program CODEC_MODE first to make sure the power is off, then program everything else in one go
+        MOV     a4, #CODEC_MODE
+        LDR     v1, OSentries+4*OS_IICOpV
+        BL      TPSWrite
+ [ AudioDebug
+        CMP     a1, #0
+        BEQ     %FT10
+        DebugTX "Audio_Init: TPS CODEC_MODE reset failed!"
+10
+ ]
+        MOV     a1, #TPSAUDIO_IIC*2
+        ADD     a2, a2, #1
+        MOV     a3, #(MISC_SET_2+1)-OPTION
+        ADD     a4, a4, #1
+        BL      TPSWrite
+ [ AudioDebug
+        CMP     a1, #0
+        BEQ     %FT10
+        DebugTX "Audio_Init: TPS audio reset failed!"
+10
+ ]
+        ; Write APLL_CTL with the right value
+        MOV     a1, #TPSAUDIO_IIC*2
+        ADD     a2, sb, #BoardConfig_APLL_CTL
+        MOV     a3, #1
+        MOV     a4, #APLL_CTL
+        BL      TPSWrite
+ [ AudioDebug
+        CMP     a1, #0
+        BEQ     %FT10
+        DebugTX "Audio_Init: APLL_CTL write failed!"
+10
+ ]
+
+ [ AudioDebug
+        DebugTX "Audio_Init done"
+ ]
+        Pull    "v1-v4,pc"
+
+TPSDefaults ; List of default settings for TPS registers
+        ; These are based around the standard settings from s.Audio, then tweaked for the Pandora
+        DCB &00 ; CODEC_MODE
+        DCB &C3 ; OPTION - RX path 2 & TX path 1 enabled 
+        DCB &00 ; (unused)
+        DCB &00 ; MCBIAS_CTL
+        DCB &00 ; ANAMICL - linux has 01
+        DCB &00 ; ANAMICR
+        DCB &00 ; AVADC_CTL
+        DCB &00 ; ADCMICSEL
+        DCB &00 ; DIGMIXING
+        DCB &00 ; ATXL1PGA
+        DCB &00 ; ATXR1PGA
+        DCB &00 ; ATXL2PGA
+        DCB &00 ; AVTXR2PGA
+        DCB &82 ; AUDIO_IF - slave mode with Fs*256 output
+        DCB &00 ; VOICE_IF
+        DCB &00 ; ARXR1PGA mute
+        DCB &00 ; ARXL1PGA mute
+        DCB &00 ; ARXR2PGA mute
+        DCB &00 ; ARXL2PGA mute
+        DCB &00 ; VRXPGA
+        DCB &00 ; VSTPGA
+        DCB &00 ; VRX2ARXPGA
+        DCB &00 ; AVDAC_CTL
+        DCB &00 ; ARX2VTXPGA
+        DCB &30 ; ARXL1_APGA_CTL mute
+        DCB &30 ; ARXR1_APGA_CTL mute
+        DCB &30 ; ARXL2_APGA_CTL mute
+        DCB &30 ; ARXR2_APGA_CTL mute
+        DCB &00 ; ATX2ARXPGA
+        DCB &00 ; BT_IF
+        DCB &00 ; BTPGA
+        DCB &00 ; BTSTPGA
+        DCB &00 ; EAR_CTL
+        DCB &00 ; HS_SEL
+        DCB &00 ; HS_GAIN_SET
+        DCB &00 ; HS_POPN_SET
+        DCB &00 ; PREDL_CTL
+        DCB &00 ; PREDR_CTL
+        DCB &00 ; PRECKL_CTL
+        DCB &00 ; PRECKR_CTL
+        DCB &00 ; HFL_CTL
+        DCB &00 ; HFR_CTL
+        DCB &05 ; ALC_CTL
+        DCB &00 ; ALC_SET1
+        DCB &00 ; ALC_SET2
+        DCB &00 ; BOOST_CTL
+        DCB &00 ; SOFTVOL_CTL
+        DCB &13 ; DTMF_FREQSEL
+        DCB &00 ; DTMF_TONEXT1H
+        DCB &00 ; DTMF_TONEXT1L
+        DCB &00 ; DTMF_TONEXT2H
+        DCB &00 ; DTMF_TONEXT2L
+        DCB &79 ; DTMF_TONOFF
+        DCB &11 ; DTMF_WANONOFF
+        DCB &00 ; CODEC_RX_SCRAMBLE_H
+        DCB &00 ; CODEC_RX_SCRAMBLE_M
+        DCB &00 ; CODEC_RX_SCRAMBLE_L
+        DCB &00 ; APLL_CTL - gets filled in properly afterwards
+        DCB &00 ; DTMF_CTL
+        DCB &00 ; DTMF_PGA_CTL2
+        DCB &00 ; DTMF_PGA_CTL1
+        DCB &02 ; MISC_SET_1
+        DCB &00 ; PCMBTMUX
+        DCB &00 ; (unused)
+        DCB &00 ; (unused)
+        DCB &00 ; (unused)
+        DCB &00 ; RX_PATH_SEL
+        DCB &00 ; VDL_APGA_CTL
+        DCB &00 ; VIBRA_CTL
+        DCB &00 ; VIBRA_SET
+        DCB &00 ; (unused)
+        DCB &00 ; ANAMIC_GAIN
+        DCB &00 ; MISC_SET_2
+
+        ASSERT (. - TPSDefaults) = (MISC_SET_2+1)-CODEC_MODE
+        
+        ALIGN 
+
+; Sample rate table
+; The first 'reserved' byte is used to store the value that needs programming into the TPS CODEC_MODE register
+
+        GBLA    numrate
+numrate SETA    0
+
+        MACRO
+$lab    cdf     $freq, $per, $mode      ; CD-derived rate ($freq in Hz, since all integral)
+$lab    DCD     $freq*1024              ; frequency value as reported by Sound_SampleRate
+        DCB     $per                    ; period as reported via Sound_Configure
+        DCB     $mode                   ; CODEC_MODE setting    
+        DCW     0                       ; padding to 8 bytes
+numrate SETA    numrate+1
+        MEND
+
+        ASSERT  AudioRateTableSize = 8
+
+ratetab cdf     8000, 125, &00          ;  8kHz     (125usec)  AC97/6
+        cdf     11025, 91, &10          ; 11.025kHz (~91 usec) CD/4
+        cdf     12000, 83, &20          ; 12kHz     (~83 usec) AC97/4
+        cdf     16000, 63, &40          ; 16kHz     (~63 usec) AC97/3
+        cdf     22050, 45, &50          ; 22.05kHz  (~45 usec) CD/2
+        cdf     24000, 42, &60          ; 24kHz     (~42 usec) AC97/2
+        cdf     32000, 31, &80          ; 32kHz     (~31 usec) AC97*2/3
+        cdf     44100, 23, &90          ; 44.1kHz   (~23 usec) CD/1
+        cdf     48000, 21, &a0          ; 48kHz     (~21 usec) AC97/1
+
+; Audio controller HAL device
+
+AudioTemplate
+        DCW     HALDeviceType_Audio + HALDeviceAudio_AudC
+        DCW     HALDeviceID_AudC_Pandora
+        DCD     HALDeviceBus_Ser + HALDeviceSerBus_IIC
+        DCD     2:SHL:16        ; API version
+        DCD     AudioDesc
+        DCD     0               ; Address - N/A
+        %       12              ; Reserved
+        DCD     AudioActivate
+        DCD     AudioDeactivate
+        DCD     AudioReset
+        DCD     AudioSleep
+        DCD     McBSP2_IRQ      ; Device
+        DCD     0               ; TestIRQ cannot be called
+        %       8
+        DCD     0               ; No mixer device
+        DCD     1               ; Output channels (supported so far)
+        DCD     0               ; Input channels (supported so far)
+        ASSERT  (.-AudioTemplate) = HALDevice_Audio_Size
+        ; DMA channel parameters
+        DCD     0 ; flags
+        DCD     McBSP2_DMA_TX + 1 ; logical channel
+        DCD     0 ; 'cycle speed'
+        DCD     2 ; transfer unit size
+        DCD     L4_McBSP2+MCBSPLP_DXR ; *physical* address to send data to
+        ; Enable/disable/IRQ routines
+        DCD     PreEnable
+        DCD     PostEnable
+        DCD     PreDisable
+        DCD     PostDisable
+        DCD     IRQHandle
+        DCD     numrate         ; Number of sample rates
+        DCD     ratetab         ; Sample rate table
+        DCD     AudioSetRate    ; SetRate function
+        ASSERT  (.-AudioTemplate) = HALDevice_Audio_Size_1
+        DCD     0               ; AudioCustomDMAEnable
+        DCD     AudioFlag_StereoReverse
+        DCD     0               ; AudioMinBuffSize
+        DCD     0               ; AudioBuffAlign
+        ASSERT  (.-AudioTemplate) = HALDevice_Audio_Size_2
+        DCD     0               ; Filled in during init
+        DCD     0               ; Filled in during init
+        DCD     0
+        ALIGN
+
+        ASSERT  (.-AudioTemplate) = Audio_DeviceSize
+
+AudioDesc
+        =       "Pandora audio controller", 0
+        ALIGN
+
+AudioActivate
+        MOV     a1, #1
+        MOV     pc, lr
+
+AudioDeactivate
+        MOV     pc, lr
+
+AudioReset
+        MOV     pc, lr
+
+AudioSleep
+        MOV     a1, #0
+        MOV     pc, lr
+
+SetCodecMode
+        ; Reprogram CODEC_MODE from softcopy
+        ; Assumes a1=audio device ptr, sb=HAL workspace
+        Entry   "a1-a4,v1"
+        ADR     a2, AudioMode
+        MOV     a1, #TPSAUDIO_IIC*2
+        MOV     a3, #1
+        MOV     a4, #CODEC_MODE
+        LDR     v1, OSentries+4*OS_IICOpV
+        BL      TPSWrite
+ [ AudioDebug
+        CMP     a1, #0
+        EXIT EQ
+        DebugTX "SetCodecMode: TPS write failed!"
+ ]
+        EXIT
+
+PreEnable
+        ; a2 = DMA buffer length
+        ; Use the buffer length to calculate a DMA packet size that fits in the FIFO.
+        LDR     a3, AudioWorkspace
+        MOV     a4, #1
+10
+        MOV     a2, a2, LSR #1 ; Number of DMA elements/FIFO entries
+        CMP     a2, #&200 ; FIFO size is &500. To try and avoid underflow, try to make sure there's no more than &200 free entries.
+        STRLE   a2, [a3, #:INDEX:DMAPktSz_Audio]
+        MOVLE   pc, lr
+        ; Divide size by two until we reach our goal
+        TST     a2, #1
+        MOVEQ   a4, a4, LSL #1
+        BEQ     %BT10
+        ; If we're here, it means we can't divide any more, and we're still stuck with a large transfer size.
+        ; For RISC OS, the largest non-fittable size is 4K-4, which will result in a2=&3FF and a4=2
+        ; Since &3FF is smaller than the FIFO size we'll make an exception to our above rule and allow it to be used
+        ; But to future-proof ourselves against buffers larger than 4K we'll fall back to using a4 if needed. Transferring only two elements at a time will hurt the memory bus a bit, but at least it'll work!
+        CMP     a2, #&400
+        STRLE   a2, [a3, #:INDEX:DMAPktSz_Audio]
+        STRGT   a4, [a3, #:INDEX:DMAPktSz_Audio]
+        MOV     pc, lr
+
+PostEnable
+        ; a2 = DMA buffer length
+        ; This function is a mix of two things - the TPS programming steps from section 14.5.3 of the manual (swcu050d.pdf, page 715/716), and the McBSP programming steps
+        ; The steps for both have been stripped down to the bare minimum that are required for (re)initialisation.
+        ; The McBSP instance is initialised first, to allow the DMA to prefill the TX FIFO. The TWL/TPS is then initialised afterwards.
+        Entry   "v1-v3,sb"
+        LDR     sb, AudioWorkspace
+ [ AudioDebug
+        DebugTX "PostEnable"
+ ]
+        Push    "a1"
+        LDR     v1, AudioRegs
+        ; Set McBSP instance to reset state (although it should be reset already)
+        MOV     a1, #0
+        STR     a1, [v1, #MCBSPLP_SPCR1]
+        MOV     a1, #&200
+        STR     a1, [v1, #MCBSPLP_SPCR2]
+        ; Reset IRQ state, and enable underflow/overflow IRQ
+        MVN     a1, #0
+        STR     a1, [v1, #MCBSPLP_IRQSTATUS]
+        MOV     a1, #&1800
+        STR     a1, [v1, #MCBSPLP_IRQENABLE]
+        ; Program FIFO threshold value, using our precomputed packet size
+        LDR     a2, DMAPktSz_Audio
+ [ AudioDebug
+        DebugReg a2, "Packet size="
+ ]        
+        SUB     a2, a2, #1
+        STR     a2, [v1, #MCBSPLP_THRSH2] ; Threshold = number of 16bit samples that SDMA sends, minus one. Any other value is wrong and will cause audio corruption.
+        ; Wait 2 SRG clock cycles
+        ; For now, just wait for a msec or so
+        MOV     a1, #1024
+        BL      HAL_CounterDelay
+        ; Bring sample rate generator out of reset (required even with external clocks)
+        MOV     v2, #&240
+        STR     v2, [v1, #MCBSPLP_SPCR2]
+        ; Bring transmitter out of reset
+        ORR     v2, v2, #1
+        STR     v2, [v1, #MCBSPLP_SPCR2]
+        ; Wait some more, according to linux
+        MOV     a1, #1024
+        BL      HAL_CounterDelay
+        Pull    "a1"
+        ; Now start frame sync
+        ORR     v2, v2, #&80
+        STR     v2, [v1, #MCBSPLP_SPCR2]
+        ; Wait for FIFO to fill by DMA
+        LDR     v3, DMAPktSz_Audio
+        ; Use the 32K timer to provide a clock reference for a timeout (in
+        ; case DMA isn't running for some reason, e.g. DMAManager being
+        ; naughty and sneakily resetting it during Service_PreReset)
+        LDR     v2, L4_32KTIMER_Log
+        LDR     a3, [v2, #REG_32KSYNCNT_CR]
+10
+        LDR     a2, [v1, #MCBSPLP_XBUFFSTAT]
+        CMP     a2, v3
+        BLE     %FT20
+        LDR     ip, [v2, #REG_32KSYNCNT_CR]
+        SUB     ip, ip, a3
+        CMP     ip, #16384 ; Half a second should be more than enough
+        BLO     %BT10
+ [ AudioDebug
+        DebugTX "FIFO fill timeout!"
+ ]
+        ; Since timeouts shouldn't happen, I don't think anyone will mind if
+        ; we just bug out and don't start the audio codec
+        EXIT
+20
+ [ AudioDebug
+        DebugReg a2, "Post-prime XBUFFSTAT="
+ ]
+        
+        ; TPS Step 18 - turn codec power on
+        LDR     v1, AudioMode
+        ORR     v1, v1, #2
+        STR     v1, AudioMode
+        BL      SetCodecMode
+        ; Bring PCM1773 + amplifier out of reset
+        GPIO_PrepareC a1, a2, PCM1773_POWER_GPIO
+        GPIO_SetOutput1 a1, a2
+        GPIO_PrepareC a1, a2, AMP_POWER_GPIO
+        GPIO_SetOutput1 a1, a2
+        EXIT
+
+PreDisable
+        ; Disable the DAC + AMP, TWL/TPS, and then McBSP
+        ; This should avoid unwanted underflow IRQs
+        Entry   "v1,sb"
+        LDR     sb, AudioWorkspace
+ [ AudioDebug
+        DebugTX "PreDisable"
+ ]
+        ; Disable IRQs
+        LDR     a2, AudioRegs
+        MOV     a3, #0
+        STR     a3, [a2, #MCBSPLP_IRQENABLE]
+        ; Turn PCM1773 + AMP power off
+        Push    "a1"
+        GPIO_PrepareC a1, a2, AMP_POWER_GPIO
+        GPIO_SetOutput0 a1, a2
+        MOV     a1, #1000
+        BL      HAL_CounterDelay
+        GPIO_PrepareC a1, a2, PCM1773_POWER_GPIO
+        GPIO_SetOutput0 a1, a2
+        Pull    "a1"
+        ; Turn codec power off
+        LDR     a2, AudioMode
+        BIC     a2, a2, #2
+        STR     a2, AudioMode
+        BL      SetCodecMode
+        ; Disable McBSP
+        LDR     v1, AudioRegs
+        MOV     a1, #0
+        STR     a1, [v1, #MCBSPLP_SPCR1]
+        MOV     a1, #&200
+        STR     a1, [v1, #MCBSPLP_SPCR2]
+        EXIT
+
+PostDisable
+        MOV     pc, lr
+
+IRQHandle
+ [ AudioDebug
+        Push    "sb,lr"
+        LDR     sb, AudioWorkspace
+        LDR     a2, AudioRegs
+        LDR     a2, [a2, #MCBSPLP_IRQSTATUS]
+        DebugReg a2,"IRQHandle: IRQSTATUS="
+        Pull    "sb,lr"
+ ]
+        ; Just clear the IRQ and ask for an audio reset
+        LDR     a3, AudioRegs
+        MOV     a2, #0
+        STR     a2, [a3, #MCBSPLP_IRQENABLE] ; Make sure we don't get bothered about this again - we can't guarantee when the OS will get round to resetting the audio, and could potentially get stuck in a loop if we allow the IRQ to keep firing
+        MVN     a2, #0
+        STR     a2, [a3, #MCBSPLP_IRQSTATUS]
+        MOV     a1, #AudioIRQHandle_RequestReset
+        MOV     pc, lr
+
+AudioSetRate
+        ; a2 = sample rate index (0-based)
+        Entry   "sb"
+        LDR     sb, AudioWorkspace
+ [ AudioDebug
+        DebugReg a2, "AudioSetRate: "
+ ]
+        ; Reload CODEC_MODE with the required value
+        ; The manual states APLL_RATE can only be changed if the codec is off!
+        ADRL    a3, ratetab
+        ASSERT  AudioRateTableSize = 8
+        ADD     a3, a3, a2, LSL #3
+        LDRB    a3, [a3, #5]
+        LDR     a2, AudioMode
+        CMP     a2, a3
+        EXIT EQ ; Redundant update, ignore
+        TST     a2, #2
+ [ AudioDebug
+        BEQ     %FT10
+        DebugTX "AudioSetRate: Failed, codec is active!"
+        EXIT
+10
+ |
+        EXIT NE
+ ]
+        STR     a3, AudioMode
+        BL      SetCodecMode        
+        EXIT
+
+        END

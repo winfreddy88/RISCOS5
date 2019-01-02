@@ -1,0 +1,412 @@
+/* Copyright 1998 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*---------------------------------------------------------------------------*/
+/* File:    c.acornlogo                                                      */
+/* Purpose: Simple screen saver.                                             */
+/* Author:  Richard Leggett                                                  */
+/* History: 21-Nov-97: RML: Created.                                         */
+/*          23-Mar-98: RML: Minor modifications.                             */
+/*          03-Jun-98: RML: Removed reference to PhotoQV in error reporting. */
+/*          05-Jun-98: RML: Screen banking added.                            */
+/*                                                                           */
+/* Copyright © 1998 Acorn Computers Ltd., Cambridge, UK.                     */
+/*---------------------------------------------------------------------------*/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "Global/Sprite.h"
+#include "Global/VduExt.h"
+
+#include "wimp.h"
+#include "wimplib.h"
+#include "swis.h"
+#include "toolbox.h"
+#include "event.h"
+#include "window.h"
+
+#include "main.h"
+#include "squash.h"
+#include "saver.h"
+
+#define SettingsRO           "Choices:ScrSavers.AcornLogo"
+#define FirstLoopingFrame    34
+#define LastLoopingFrame     34
+#define DelayBetweenFrames   2
+#define DelayBetweenMoves    1
+#define JustStarting         -2
+#define DefaultSpeed         1
+
+
+static char      *ctrans_table = 0;
+static char       spritename[SpriteNameSize + 1];
+static IdBlock    idb;
+static MessagesFD messages_desc;
+static int        screenw, screenh;
+static int        screenbanks;
+static int        xeig, yeig;
+static int        spritew, spriteh;
+static int        logo_x, logo_y, old_x, old_y;
+static int        x_step;
+static int        y_step;
+static int        last_frame;
+static int        last_move;
+int              *sprites;
+
+/*---------------------------------------------------------------------------*
+ * program_exit                                                              *
+ *                                                                           *
+ * Finished with this plug-in, so exit.                                      *
+ *---------------------------------------------------------------------------*/
+
+void program_exit(void)
+{
+    saver_exit();
+    exit(0);
+}
+
+
+/*---------------------------------------------------------------------------*
+ * read_settings                                                             *
+ *                                                                           *
+ * Read the current settings file.                                           *
+ *---------------------------------------------------------------------------*/
+
+void read_settings(void)
+{
+    FILE *fp;
+    char  string[256];
+    int   speed = DefaultSpeed;
+
+    fp=fopen(SettingsRO, "r");
+    if (fp)
+    {
+        fgets(string, 256, fp);
+        sscanf(string, "Speed %d", &speed);
+        fclose(fp);
+    }
+
+    if (speed<0) speed = 1;
+    if (speed>10) speed = 10;
+    x_step = speed<<xeig;
+    y_step = speed<<yeig;
+}        
+
+
+
+/*---------------------------------------------------------------------------*
+ * plot_sprite                                                               *
+ *                                                                           *
+ * Er, plot the sprite.                                                      *
+ *---------------------------------------------------------------------------*/
+
+void plot_sprite(void)
+{
+    _swix(OS_SpriteOp, _INR(0,7), 256 + SpriteReason_PutSpriteScaled,
+                                  sprites,
+                                  spritename,
+                                  logo_x,
+                                  logo_y,
+                                  32,
+                                  0,
+                                  ctrans_table);
+}
+
+
+/*---------------------------------------------------------------------------*
+ * initialise_animation                                                      *
+ *                                                                           *
+ * Set up the animation.                                                     *
+ *---------------------------------------------------------------------------*/
+
+static _kernel_oserror *initialise_animation(void)
+{
+    _kernel_oserror *e;
+    int              size = 0;
+    
+    /* Load the sprites and find the size of a frame */
+    e = squash_decompress_file("<BlankTask$Dir>.Frames");
+    if (e == NULL)
+    {
+        e = _swix(OS_SpriteOp, _INR(0,2)|_OUTR(3,4), 256 + SpriteReason_ReadSpriteSize,
+                               sprites, "logo0", &spritew, &spriteh);
+        spritew = spritew<<xeig;
+        spriteh = spriteh<<yeig;
+    }
+    if (e != NULL) return e;
+
+    /* Generate a colourtrans table */
+    e = _swix(ColourTrans_GenerateTable, _INR(0,5)|_OUT(4), sprites, "logo0", -1, -1, 0, 16, &size);
+    if (e != NULL) return e;
+    ctrans_table = malloc(size);
+    if (ctrans_table == NULL)
+    {
+        return _swix(MessageTrans_ErrorLookup, _INR(0,2), "    NoMem", 0, 0);
+    }
+    e = _swix(ColourTrans_GenerateTable, _INR(0,5), sprites, "logo0", -1, -1, ctrans_table, 16);
+    if (e != NULL)
+    {
+        free(ctrans_table);
+        return e;
+    }
+
+    /* Set initial position and direction */
+    strcpy(spritename, "logo0");
+    _swix(OS_ReadMonotonicTime, _OUT(0), &last_frame); 
+    last_move = last_frame;
+    logo_x = old_x = saver_rnd(screenw-spritew);
+    logo_y = old_y = saver_rnd(screenh-spriteh);
+    
+    screenbanks = saver_decide_double_buffering();
+
+    return NULL;
+}
+    
+
+/*---------------------------------------------------------------------------*
+ * null_event                                                                *
+ *                                                                           *
+ * Null event handler - we do all our animation etc. here.                   *
+ *---------------------------------------------------------------------------*/
+
+int null_event(int event_code, WimpPollBlock *event, IdBlock *id_block, void *handle)
+{
+    static int current_frame = JustStarting;
+    int        time;
+    int        plot_it = 0;
+
+    /* If we're just starting, then remove the high priority on pollword */
+    if (current_frame == JustStarting)
+    {
+        saver_error_trap(event_set_mask(Wimp_Poll_PollWord), 0);    
+        plot_it = 1;
+    }
+ 
+    /* Change the frame? */
+    _swix(OS_ReadMonotonicTime, _OUT(0), &time);
+    if ((time-last_frame) >= DelayBetweenFrames)
+    {
+        last_frame = time;
+        current_frame++;
+        if (current_frame>LastLoopingFrame) current_frame = FirstLoopingFrame;
+        plot_it = 1;
+        sprintf(spritename, "logo%d", current_frame);
+    }
+
+    /* Move the animation? */
+    if (current_frame >= FirstLoopingFrame)
+    {
+        if ((time-last_move) >= DelayBetweenMoves)
+        {
+            old_x = logo_x;
+            old_y = logo_y;
+
+            last_move = time;
+            logo_x += x_step;
+            logo_y += y_step;
+
+            if ( (logo_x > (screenw - spritew))
+              || (logo_x < 0) )
+            {
+                x_step = -x_step;
+                logo_x += x_step;
+            }
+            
+            if ( (logo_y > (screenh - spriteh))
+              || (logo_y < 0) )
+            {
+                y_step = -y_step;
+                logo_y += y_step;
+            }
+            
+            plot_it = 1;
+        }
+    }
+
+    if (plot_it)
+    {
+       /* Switch banks and draw the new location */
+       saver_write_bank();
+       plot_sprite();
+       saver_read_bank();
+
+       /* For the single bank case, need to add a black border (of width = stepsize)
+        * to cover up the previous location and avoid flicker.
+        * For the dual bank case, just plot over the sprite.
+        */
+       _swix(ColourTrans_SetGCOL, _IN(0)|_IN(3)|_IN(4), 0, 0, 0);
+       saver_write_bank();
+       if (screenbanks > 1)
+       {
+           _swix(OS_Plot, _INR(0, 2), OSPlot_Move, old_x, old_y);
+           _swix(OS_Plot, _INR(0, 2), OSPlot_RectangleFill, spritew, spriteh);
+       }
+       else
+       {
+           /* Below */
+           _swix(OS_Plot, _INR(0, 2), OSPlot_Move, old_x, old_y);
+           _swix(OS_Plot, _INR(0, 2), OSPlot_RectangleFill, spritew, -y_step);
+           /* Above */
+           _swix(OS_Plot, _INR(0, 2), OSPlot_Move, old_x, old_y + spriteh);
+           _swix(OS_Plot, _INR(0, 2), OSPlot_RectangleFill, spritew, y_step);
+           /* Left + corners */
+           _swix(OS_Plot, _INR(0, 2), OSPlot_Move, old_x - x_step, old_y - y_step);
+           _swix(OS_Plot, _INR(0, 2), OSPlot_RectangleFill, x_step, spriteh + (2 * y_step));
+           /* Right + corners */
+           _swix(OS_Plot, _INR(0, 2), OSPlot_Move, old_x + spritew, old_y - y_step);
+           _swix(OS_Plot, _INR(0, 2), OSPlot_RectangleFill, x_step, spriteh + (2 * y_step));
+       }
+    }
+    
+    return 1;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * gain_pointer                                                              *
+ *                                                                           *
+ * Pointer has entered my window - turn it off!                              *
+ *---------------------------------------------------------------------------*/
+
+int gain_pointer(int event_code, WimpPollBlock *event, IdBlock *id_block, void *handle)
+{
+    saver_hide_pointer();
+
+    return 1;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * lose_pointer                                                              *
+ *                                                                           *
+ * Pointer has left my window - switch it back on again!                     *
+ *---------------------------------------------------------------------------*/
+
+int lose_pointer(int event_code, WimpPollBlock *event, IdBlock *id_block, void *handle)
+{
+    saver_show_pointer();
+
+    return 1;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * redraw                                                                    *
+ *                                                                           *
+ * Handle redraw events - do nothing!                                        *
+ *---------------------------------------------------------------------------*/
+
+int redraw(int event_code, WimpPollBlock *event, IdBlock *id_block, void *handle)
+{
+    WimpRedrawWindowBlock block;
+    int                   more;
+    
+    wimp_redraw_window(&block, &more);
+    while (more)
+    {
+        wimp_get_rectangle(&block, &more);
+    }
+    
+    return 1;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * pollword                                                                  *
+ *                                                                           *
+ * Handle pollword non-zero events                                           *
+ *---------------------------------------------------------------------------*/
+
+int pollword(int event_code, WimpPollBlock *event, IdBlock *id_block, void *handle)
+{
+    program_exit();
+    
+    return 1;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * message_quit                                                              *
+ *                                                                           *
+ * Called when wimp quit message received.                                   *
+ *---------------------------------------------------------------------------*/
+ 
+int message_quit(WimpMessage *event, void *handler)
+{
+    program_exit();
+    
+    return 1;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * main_initialise                                                           *
+ *---------------------------------------------------------------------------*/
+
+static void main_initialise(void)
+{
+    int main_window;
+    int task_handle;
+
+    /* Initialise toolbox */
+    saver_error_trap(toolbox_initialise(0, 310, 0, 0, "<BlankTask$Dir>",
+                                  &messages_desc, &idb, 0, &task_handle, 0), 1);
+    saver_error_trap(event_initialise(&idb), 1);
+    saver_error_trap(event_set_mask(Wimp_Poll_PollWord +
+                              Wimp_Poll_PollWordHighPriority), 1);    
+
+    /* Register event handlers */
+    saver_error_trap(event_register_message_handler(Wimp_MQuit, message_quit, NULL), 1);
+    saver_error_trap(event_register_wimp_handler(-1, Wimp_ENull, null_event, NULL), 1);
+    saver_error_trap(event_register_wimp_handler(-1, Wimp_ERedrawWindow, redraw, NULL), 1);
+    saver_error_trap(event_register_wimp_handler(-1, Wimp_EPollWordNonZero, pollword, NULL), 1);
+    saver_error_trap(event_register_wimp_handler(-1, Wimp_EPointerEnteringWindow, gain_pointer, NULL), 1);
+    saver_error_trap(event_register_wimp_handler(-1, Wimp_EPointerLeavingWindow, lose_pointer, NULL), 1);
+
+    /* Open covering window */
+    saver_read_screensize(&screenw, &screenh, &xeig, &yeig);
+    saver_error_trap(toolbox_create_object(0, "Window", &main_window), 1);
+    saver_open_covering_window(main_window);
+    
+    /* More initialisation */
+    saver_set_rnd_seed();
+    read_settings();
+    saver_error_trap(initialise_animation(), 1);
+}
+
+
+/*---------------------------------------------------------------------------*
+ * main                                                                      *
+ *---------------------------------------------------------------------------*/
+
+int main(int argc, char **argv)
+{
+    WimpPollBlock  wpb;
+    int            event_code;
+    int           *pollword = NULL;
+
+    if (argc>1) pollword = (int*) atoi(argv[1]);
+    if (!pollword) program_exit();
+
+    main_initialise();
+    
+    while (TRUE)
+    {
+        saver_error_trap(event_poll(&event_code, &wpb, pollword), 0);
+    }
+    
+    return 0;
+}

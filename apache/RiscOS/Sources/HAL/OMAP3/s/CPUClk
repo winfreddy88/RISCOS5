@@ -1,0 +1,592 @@
+; Copyright 2011 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:Machine.<Machine>
+        GET     Hdr:ImageSize.<ImageSize>
+        $GetIO
+
+        GET     Hdr:OSEntries
+        GET     Hdr:HALEntries
+        GET     Hdr:Proc
+
+        GET     hdr.omap3530
+        GET     hdr.StaticWS
+        GET     hdr.PRCM
+
+        AREA    |Asm$$Code|, CODE, READONLY, PIC
+
+        EXPORT  CPUClk_PreInit
+        EXPORT  CPUClk_Init
+        EXPORT  CPUClk_AdjustDPLL
+        EXPORT  CPUClk_PreReset
+
+        IMPORT  TPSRead
+        IMPORT  TPSWrite
+        IMPORT  memcpy
+        IMPORT  __rt_udiv
+        IMPORT  IIC_DoOp_Poll
+
+        GBLL    DebugCPUClk
+DebugCPUClk SETL {FALSE}
+
+CPUClk_PreInit ROUT
+        ; Identify the OMAP type, set up the HAL device descriptor, then put the CPU speed to max to help cut down our boot time
+        Entry   "v1-v4"
+      [ {TRUE}
+        ; Try smartreflex
+        IMPORT  SR37x_PreInit
+        BL      SR37x_PreInit
+        CMP     a1, #0
+        EXIT    EQ
+      ]
+        ; First identify the OMAP type
+        LDR     a1, L4_Wakeup_Log
+        LDR     a2, =L4_CONTROL_IDCODE-L4_Wakeup
+        LDR     a1, [a2, a1]!
+        UBFX    a1, a1, #12, #16
+        ADR     a3, CPUList
+10
+        LDMIA   a3!,{a4,v1,v2}
+        CMP     a4,#0
+        EXIT    EQ ; Unrecognised CPU!
+        CMP     a1, a4
+        BNE     %BT10
+        ; Extra logic for detecting 720MHz OMAP3's
+        MOV     v4, #0
+        LDR     a3, =HAWKEYE_OMAP35x_ES10
+        CMP     a3, a1
+        LDRNE   a3, =HAWKEYE_OMAP35x
+        CMPNE   a3, a1
+        LDREQ   a2, [a2, #L4_PRODID-L4_CONTROL_IDCODE]
+        ANDEQ   v4, a2, #&F ; 0x0 for 600MHz, 0x8 for 720MHz
+ [ DebugCPUClk
+        DebugReg a4, "CPU="
+        DebugReg v1, "OPPTbl size="
+        DebugReg v2, "OPPTbl ptr="
+        DebugReg v4, "720MHz="
+ ]
+        ; v1 = OPPTbl size
+        ; v2 = OPPTbl ptr
+        ; Init the HAL device descriptor
+        ADRL    v3, CPUClkWS
+        MOV     a1, v3
+        ADR     a2, CPUClkDevTemplate
+        MOV     a3, #HALDevice_CPUClk_Size_0_2
+        BL      memcpy
+        ADR     a1, CPUClk_Shutdown
+        STR     a1, [v3, #:INDEX: CPUClkShutdown]
+        STR     sb, [v3, #:INDEX: CPUClkWorkspace]
+        STR     v1, [v3, #:INDEX: CPUClkOPPTblSize]
+        ADD     a1, v3, #:INDEX: CPUClkOPPTbl
+        MOV     a2, v2
+        ASSERT  OPPTbl_Size = 4
+        LDR     a3, [v2, v1, LSL #2] ; Get shutdown setting
+        STR     a3, [v3, #:INDEX: CPUClkOPPDefault]
+        MOV     a3, v1, LSL #2
+        BL      memcpy
+        ; Poke the last entry in the table if this was a 720MHz model
+        CMP     v4, #8
+        MOVEQ   v4, #720
+        STREQH  v4, [v3, #:INDEX: CPUClkOPPTbl + End_OPPTbl_OMAP35x-OPPTbl_OMAP35x - OPPTbl_Size + OPPTbl_MHz]
+        SUB     sp, sp, #4
+        MOV     a2, sp
+        MOV     a3, #1
+        ADRL    v1, IIC_DoOp_Poll
+        ; Make sure VDD1_VMODE_CFG is set correctly
+        ; We want READ_REG set, ENABLE_VMODE clear
+        MOV     a1, #TPSPM_IIC*2
+        MOV     a4, #VDD1_VMODE_CFG
+        BL      TPSRead
+        CMP     a1, #0
+        BNE     %FT20
+        LDRB    ip, [a2]
+ [ DebugCPUClk
+        DebugReg ip, "VDD1_VMODE_CFG="
+ ]
+        BIC     lr, ip, #1
+        ORR     lr, lr, #2
+        CMP     lr, ip
+        BEQ     %FT10
+        STRB    lr, [a2]
+        MOV     a1, #TPSPM_IIC*2
+        BL      TPSWrite
+        CMP     a1, #0
+        BNE     %FT20
+10
+        ; Ensure smartreflex is disabled in the TPS
+        MOV     a1, #TPSPM_IIC*2
+        MOV     a4, #DCDC_GLOBAL_CFG
+        BL      TPSRead
+        CMP     a1, #0
+        BNE     %FT20
+        LDRB    ip, [a2]
+        TST     ip, #1<<3
+        BEQ     %FT20
+        BIC     ip, ip, #1<<3
+        STRB    ip, [a2]
+        MOV     a1, #TPSPM_IIC*2
+        BL      TPSWrite
+20
+        CMP     a1, #0
+        ADD     sp, sp, #4
+        EXIT    NE
+        ; TODO - Extra setup steps:
+        ; - Ensure DSP is off
+        ; - Ensure VMODE is off (CPU side)
+        ; - Ensure smartreflex is off (CPU side)
+        ; Go to max speed
+        MOV     a1, v3
+        MVN     a2, #0
+        STR     a2, CPUClkNewSpeed
+        LDR     a2, CPUClkOPPTblSize
+        BL      CPUClk_Set
+ [ DebugCPUClk
+        DebugTX "CPUClk_PreInit done"
+ ]
+        EXIT
+
+CPUClk_Init ROUT
+        ; Register device with OS
+        ; Note if smartreflex is in use, this will be the smartreflex device which we're registering
+        ADRL    a2, CPUClkWS
+        LDR     a3, [a2]
+        MOV     a1, #0
+        CMP     a3, #0 ; Don't register if we didn't set up the device (e.g. unknown OMAP type)
+        MOVEQ   pc, lr
+        CallOS  OS_AddDevice,tailcall
+
+CPUClk_PreReset
+        ; Call the appropriate shutdown function
+        ADRL    a1, CPUClkWS
+        LDR     a2, CPUClkShutdown
+        TEQ     a2, #0
+        MOVNE   pc, a2
+        MOV     pc, lr
+
+        MACRO
+        OPPTblEntry $mhz,$vdd1,$clkout_m2
+        ; VDD1 specified in mV
+        DCW $mhz
+        DCB ((($vdd1-600)*10)+124)/125 ; VDD1_VSEL = ((V-0.6)+0.0124)/0.0125
+        DCB $clkout_m2
+        MEND
+
+OPPTbl_OMAP35x
+        OPPTblEntry  125, 0985, 1 ; OPP1
+        OPPTblEntry  250, 1060, 1 ; OPP2
+        OPPTblEntry  500, 1200, 1 ; OPP3
+        OPPTblEntry  550, 1270, 1 ; OPP4
+        OPPTblEntry  600, 1350, 1 ; OPP5
+End_OPPTbl_OMAP35x
+        OPPTblEntry  500, 1200, 1 ; Shutdown setting: OPP3 @ 1.2V
+
+OPPTbl_AMDM37x
+        OPPTblEntry  300, 0970, 2 ; OPP50
+        OPPTblEntry  600, 1140, 1 ; OPP100
+        OPPTblEntry  800, 1270, 1 ; OPP130
+End_OPPTbl_AMDM37x  
+        OPPTblEntry  600, 1200, 1 ; Shutdown setting: OPP100 @ 1.2V
+
+        MACRO
+        CPUListEntry $hawkeye, $list
+        DCD $hawkeye
+        ASSERT (End_$list-$list)/OPPTbl_Size <= OPPTbl_Max
+        DCD (End_$list-$list)/OPPTbl_Size
+        DCD $list
+        MEND
+
+CPUList
+        CPUListEntry HAWKEYE_OMAP35x_ES10, OPPTbl_OMAP35x
+        CPUListEntry HAWKEYE_OMAP35x,      OPPTbl_OMAP35x
+        CPUListEntry HAWKEYE_AMDM37x,      OPPTbl_AMDM37x
+        DCD 0
+
+CPUClkDevTemplate
+        DCW     HALDeviceType_SysPeri + HALDeviceSysPeri_CPUClk
+        DCW     HALDeviceID_CPUClk_OMAP3
+        DCD     HALDeviceBus_Peri + HALDevicePeriBus_Sonics3220
+        DCD     2                     ; API version (v0.2)
+        DCD     CPUClk_Desc           ; Description
+        DCD     0                     ; Address - unused
+        %       12                    ; Unused
+        DCD     CPUClk_Activate
+        DCD     CPUClk_Deactivate
+        DCD     CPUClk_Reset
+        DCD     CPUClk_Sleep
+        DCD     -1                    ; Device - unused
+        DCD     0                     ; TestIRQ
+        DCD     0                     ; ClearIRQ
+        %       4
+        ASSERT  (.-CPUClkDevTemplate) = HALDeviceSize
+        DCD     CPUClk_NumSpeeds
+        DCD     CPUClk_Info
+        DCD     CPUClk_Get
+        DCD     CPUClk_Set
+        DCD     CPUClk_Override
+        DCD     CPUClk_GetOverride
+        DCD     CPUClk_GetDieTemp
+        ASSERT  (.-CPUClkDevTemplate) = HALDevice_CPUClk_Size_0_2
+
+CPUClk_Desc
+        =       "OMAP3 CPU clock generator",0
+        ALIGN
+
+CPUClk_Activate
+        ; Do nothing
+        MOV     a1, #1
+CPUClk_Deactivate
+CPUClk_Reset
+        MOV     pc, lr
+
+CPUClk_Sleep
+        MOV     a1, #0
+        MOV     pc, lr
+
+CPUClk_NumSpeeds
+        ; Out: a1 = num entries in table
+        LDR     a1, CPUClkOPPTblSize
+        MOV     pc, lr
+
+CPUClk_Info
+        ; In: a2 = table index
+        ; Out: a1 = MHz
+        ADR     a3, CPUClkOPPTbl
+        ASSERT  OPPTbl_Size = 4
+        ASSERT  OPPTbl_MHz = 0
+        ADD     a3, a3, a2, LSL #2
+        LDRH    a1, [a3]
+        MOV     pc, lr
+
+CPUClk_Get
+        ; Return current table index
+        EntryS  "sb"
+        CPSID   i ; Prevent speed changing while we're reading it
+        LDR     a2, CPUClkNewSpeed
+        LDR     sb, CPUClkWorkspace
+        CMP     a2, #-1 ; Are we changing speed?
+        BLNE    CPUClk_Set ; Yes, complete the change so that the returned value is accurate
+        ADRL    a2, CPUClkWS
+        LDR     a1, CPUClkCurSpeed
+        EXITS
+
+CPUClk_Set ROUT
+        ; a2 = new table index
+        ; Return 0 on success, -1 on failure
+        EntryS  "v1-v5,sb", 4
+        ; Turn IRQs off so that we only have to worry about being re-entered during IIC ops
+        ; Keeping IRQs off will also help reduce the time spent with the DPLL unlocked
+        CPSID   i
+        ; Clamp a2, get table entry
+        LDR     sb, CPUClkWorkspace
+        CMP     a2, #0
+        LDR     v3, CPUClkOPPTblSize
+        MOVLT   a2, #0
+        ADR     v2, CPUClkOPPTbl
+        CMP     a2, v3
+        SUBGE   a2, v3, #1
+        ASSERT  OPPTbl_Size = 4
+        ASSERT  OPPTbl_MHz = 0
+        ADD     v2, v2, a2, LSL #2
+10
+        LDRH    v3, [v2, #OPPTbl_MHz]
+        ; a2 = new idx
+        ; v2 = OPP table entry ptr
+        ; v3 = new clock rate
+ [ DebugCPUClk
+        DebugReg a2,"CPUClk_Set: Idx="
+        DebugReg v2,"OPPTbl ptr="
+        DebugReg v3,"New rate="
+        LDR     a3, CPUClkNewSpeed
+        DebugReg a3,"Re-entrancy flag="
+ ]
+        ; Set the re-entrancy flag
+        STR     a2, CPUClkNewSpeed
+        ; Get current VDD1
+        LDR     v1, HALInitialised
+        MOV     a1, #TPSPM_IIC*2
+        MOV     a2, sp
+        MOV     a3, #1
+        CMP     v1, #0
+        MOV     a4, #VDD1_VSEL
+        ADREQL  v1, IIC_DoOp_Poll
+        LDRNE   v1, OSentries+4*OS_IICOpV
+        BL      TPSRead
+        CMP     a1, #0
+        BNE     %FT80
+        ; Check if this change has been completed/cancelled by us being re-entered
+        ADRL    a1, CPUClkWS
+        LDR     a1, CPUClkNewSpeed
+        CMP     a1, #-1
+        EXITS   EQ,c
+        LDRB    a1, [a2]
+        LDRB    ip, [v2, #OPPTbl_VDD1]
+ [ DebugCPUClk
+        DebugReg a1,"VDD1 currently "
+        DebugReg ip,"VDD1 needed "
+ ]
+        CMP     a1, ip
+        BHS     %FT30
+        ; Pre-increment VDD1
+ [ DebugCPUClk
+        DebugReg ip,"Increasing VDD1 to "
+ ]
+        STRB    ip, [a2]
+        MOV     a1, #TPSPM_IIC*2
+        BL      TPSWrite
+        CMP     a1, #0
+        BNE     %FT80
+        ; Check if this change has been completed/cancelled by us being re-entered
+        ADRL    a1, CPUClkWS
+        LDR     a1, CPUClkNewSpeed
+        CMP     a1, #-1
+        EXITS   EQ,c
+30
+        ; Adjust DPLL registers
+        LDRB    a1, [v2, #OPPTbl_CLKOUT_M2]
+        BL      CPUClk_AdjustDPLL ; v3-v5, ip corrupt
+        ; Now check if we need to reduce VDD1
+        ; a2-v1 still valid from earlier
+        LDRB    a1, [a2]
+        LDRB    ip, [v2, #OPPTbl_VDD1]
+        CMP     a1, ip
+        BEQ     %FT70
+ [ DebugCPUClk
+        DebugReg ip,"Decreasing VDD1 to "
+ ]
+        STRB    ip, [a2]
+        MOV     a1, #TPSPM_IIC*2
+        BL      TPSWrite
+        CMP     a1, #0
+        BNE     %FT80
+70
+ [ DebugCPUClk
+        DebugTX "CPUClk_Set done"
+ ]
+        ; All done
+        ; However it's still possible we were re-entered; only set CPUClkSpeed if CPUClkNewSpeed != -1
+        ADRL    a1, CPUClkWS
+        LDR     a2, CPUClkNewSpeed
+        CMP     a2, #-1
+        STRNE   a2, CPUClkCurSpeed
+        MVN     a3, #0
+        STR     a3, CPUClkNewSpeed
+        MOV     a1, #0
+        EXITS   ,c
+80
+        ; Something bad happened!
+ [ DebugCPUClk
+        DebugReg a1,"IIC error! "
+ ]
+        ; Best we can really do is give up
+        ADRL    a2, CPUClkWS
+        MVN     a1, #0
+        STR     a1, [a2, #:INDEX:CPUClkNewSpeed]
+90
+        EXITS   ,c
+
+CPUClk_Shutdown ALTENTRY
+        ; Reset to default speed & voltage prior to reset/power off
+        ; This avoids Pandora Linux often hanging on boot after RISC OS has been run
+        CPSID   i
+        ADR     v2, CPUClkOPPDefault
+        B       %BT10
+
+CPUClk_Override ROUT
+        EntryS
+        CPSID   i
+        ; a2 = table ptr
+        ; a3 = num entries
+        ; a4 = format no.
+        CMP     a4, #OPPTbl_Format
+        BNE     %FT20
+        CMP     a3, #OPPTbl_Max
+        BGT     %FT20
+        ; Check we aren't in the middle of setting the speed
+        LDR     ip, CPUClkNewSpeed
+        CMP     ip, #-1
+        MVNNE   a1, #0 ; -1 for try again later
+        EXITS   NE,c
+        ; Update table
+        ASSERT  OPPTbl_Size = 4
+        STR     a3, CPUClkOPPTblSize
+        ADR     ip, CPUClkOPPTbl
+10
+        LDR     a4, [a2], #4
+        SUBS    a3, a3, #1
+        STR     a4, [ip], #4
+        BNE     %BT10
+20
+        MOV     a1, #OPPTbl_Format ; Return expected table format
+        EXITS   ,c
+
+CPUClk_GetOverride ROUT
+        Entry
+        ; a2 = table ptr
+        ; a3 = num entries
+        ; a4 = format no.
+        CMP     a4, #OPPTbl_Format
+        BNE     %FT20
+        CMP     a3, #OPPTbl_Max
+        BGT     %FT20
+        ; copy table into supplied buffer
+        ASSERT  OPPTbl_Size = 4
+        ADR     ip, CPUClkOPPTbl
+10
+        LDR     a4, [ip], #4
+        SUBS    a3, a3, #1
+        STR     a4, [a2], #4
+        BNE     %BT10
+20
+        MOV     a1, #OPPTbl_Format ; Return expected table format
+        EXIT
+
+
+CPUClk_AdjustDPLL ROUT
+        ; Common routine shared with SmartReflex driver
+        ; In:
+        ;       a1 = new CLKOUT_M2 setting
+        ;       v3 = new MHz value
+        ;       sb = HAL workspace
+        ;       IRQs disabled
+        ; Out:
+        ;       v3-v5, ip corrupt
+        Entry
+        MUL     v3, a1, v3
+        LDR     ip, L4_ClockMan_Log
+        LDR     lr, [ip, #CM_CLKSEL1_PLL_MPU]
+        MOV     v4, lr
+        BFI     v4, v3, #8, #11 ; Update MPU_DPLL_MULT
+        LDR     v5, [ip, #CM_CLKSEL2_PLL_MPU]
+        LDR     v3, [ip, #CM_CLKEN_PLL_MPU]
+        ; v4 = new CM_CLKSEL1_PLL_MPU
+        ; a1 = new CM_CLKSEL2_PLL_MPU
+        ; lr = old CM_CLKSEL1_PLL_MPU
+        ; v5 = old CM_CLKSEL2_PLL_MPU
+ [ DebugCPUClk
+        Push    "lr"
+        DebugReg v4, "New CM_CLKSEL1_PLL_MPU="
+        DebugReg a1, "New CM_CLKSEL2_PLL_MPU="
+        LDR     lr,[sp]
+        DebugReg lr, "Old CM_CLKSEL1_PLL_MPU="
+        DebugReg v5, "Old CM_CLKSEL2_PLL_MPU="
+        Pull    "lr"
+ ]
+        CMP     v4, lr
+        CMPEQ   a1, v5
+        ANDEQ   lr, v3, #7
+        CMPEQ   lr, #7
+        BEQ     %FT60 ; No parameters need updating, skip the update
+ [ DebugCPUClk
+        DebugTX "Going to bypass mode"
+ ]
+        ; Go to bypass mode
+        MOV     lr, #5
+        BFI     v3, lr, #0, #3
+        STR     v3, [ip, #CM_CLKEN_PLL_MPU]
+        ; Wait for completion
+40
+        LDR     lr, [ip, #CM_IDLEST_PLL_MPU]
+        TST     lr, #1
+        BNE     %BT40
+ [ DebugCPUClk
+        DebugTX "Setting new clock rate"
+ ]
+        ; Set new frequency
+        STR     v4, [ip, #CM_CLKSEL1_PLL_MPU]
+        STR     a1, [ip, #CM_CLKSEL2_PLL_MPU]
+ [ DebugCPUClk
+        DebugTX "Requesting lock"
+ ]
+        ; Request lock
+        ORR     v3, v3, #7
+        STR     v3, [ip, #CM_CLKEN_PLL_MPU]
+        ; Wait for completion
+50
+        LDR     lr, [ip, #CM_IDLEST_PLL_MPU]
+        TST     lr, #1
+        BEQ     %BT50
+ [ DebugCPUClk
+        DebugTX "Lock complete"
+ ]
+60
+        EXIT
+
+
+; support for die temperature measurement
+
+; CPU die temperature related register - relative to L4_Core
+CONTROL_COMMON_OFFSET   *       &2000
+CONTROL_TEMP_SENSOR     *       &0524
+
+; bits in CONTROL_TEMP_SENSOR
+TEMP_SENSOR_EOCZ        *       (1 << 7)        ; End Of Conversion
+TEMP_SENSOR_SOC         *       (1 << 8)        ; Start Of Conversion
+TEMP_SENSOR_MASK        *       0x7F
+
+; Temperature calculation constants (in units of 2^-18)
+; derived from table 7-11 ADC Code Versus Temperature (OMAP353x TRM)
+TEMP_SCALE              *       18
+TEMP_KELVIN_OFFS        *       2732            ; in 0.1 K
+TEMP_CONST_A0           *       -120889352
+TEMP_CONST_A1           *       3827850
+TEMP_CONST_A2           *       -1159
+
+CPUClk_GetDieTemp
+        ; Out: a1 = CPU die temperature in units of 0.1 K
+        Entry   "sb"
+        LDR     sb, CPUClkWorkspace
+        LDR     ip, L4_ClockMan_Log
+        LDR     lr, [ip, #CM_FCLKEN3_CORE]
+        ORR     lr, lr, #(1 << 1)               ; enable ADC clock for temperature conversion
+        STR     lr, [ip, #CM_FCLKEN3_CORE]
+        LDR     a4, L4_Core_Log
+        ADD     a4, a4, #CONTROL_COMMON_OFFSET
+        LDR     a2, [a4, #CONTROL_TEMP_SENSOR]
+        ORR     a2, a2, #TEMP_SENSOR_SOC
+        STR     a2, [a4, #CONTROL_TEMP_SENSOR]
+        ; Wait until conversion starts
+10
+        LDR     a2, [a4, #CONTROL_TEMP_SENSOR]
+        TST     a2, #TEMP_SENSOR_EOCZ
+        BEQ     %BT10
+        ; Reset SOC bit
+        BIC     a2, a2, #TEMP_SENSOR_SOC
+        STR     a2, [a4, #CONTROL_TEMP_SENSOR]
+        ; Wait until conversion is finished
+20
+        LDR     a2, [a4, #CONTROL_TEMP_SENSOR]
+        TST     a2, #TEMP_SENSOR_EOCZ
+        BNE     %BT20
+        UBFX    a2, a2, #0, #7                  ; extract temperature ADC value
+        BIC     lr, lr, #(1 << 1)               ; disable ADC clock
+        STR     lr, [ip, #CM_FCLKEN3_CORE]
+        ; now convert the ADC value to a temperature
+        ; instead of using a table (OMAP353x TRM, page 791 - 792)
+        ; we are calculating a polynom of second order derived from above table
+        ; y := temp; x := ADC value
+        ; y = ((A2 * x + A1) * x + A0) >> TEMP_SCALE
+        LDR     a3, =TEMP_CONST_A2
+        LDR     a4, =TEMP_CONST_A1
+        MLA     a1, a3, a2, a4
+        LDR     a4, =TEMP_CONST_A0
+        MLA     a3, a1, a2, a4
+        LDR     a4, =TEMP_KELVIN_OFFS
+        ADD     a1, a4, a3, ASR #TEMP_SCALE
+        EXIT
+
+        END

@@ -1,0 +1,431 @@
+/*	$OpenBSD: udl.c,v 1.76 2013/05/30 16:15:02 deraadt Exp $ */
+
+/*
+ * Copyright (c) 2009 Marcus Glocker <mglocker@openbsd.org>
+ *
+ * Permission to use, copy, modify, and distribute this software for any
+ * purpose with or without fee is hereby granted, provided that the above
+ * copyright notice and this permission notice appear in all copies.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ */
+
+/*
+ * Driver for the ``DisplayLink DL-120 / DL-160'' graphic chips based
+ * on the reversed engineered specifications of Florian Echtler
+ * <floe@butterbrot.org>:
+ *
+ * 	http://floe.butterbrot.org/displaylink/doku.php
+ *
+ * This driver has been inspired by the cfxga(4) driver because we have
+ * to deal with similar challenges, like no direct access to the video
+ * memory.
+ */
+
+#include <sys/param.h>
+#include <sys/device.h>
+#include <sys/kernel.h>
+#include <sys/systm.h>
+
+#include "udl_riscos.h"
+#include "netbsd.h"
+#include "udl.h"
+#include "screen.h"
+
+#include "kernel.h"
+#include "swis.h"
+
+#include "Interface/DeviceFS.h"
+
+/*
+ * Defines.
+ */
+#define DPRINTF(l, ...) dprintf(("",__VA_ARGS__))
+
+#define DN(sc)		((sc)->sc_dev.dv_xname)
+#define FUNC		__func__
+
+/*
+ * Prototypes.
+ */
+
+usbd_status	udl_write_1(struct udl_softc *, uint16_t, uint8_t);
+usbd_status	udl_set_enc_key(struct udl_softc *, const uint8_t *, uint8_t);
+
+int		udl_cmd_alloc_buf(struct udl_softc *);
+void		udl_cmd_free_buf(struct udl_softc *);
+void		udl_cmd_insert_int_1(struct udl_softc *, uint8_t);
+void		udl_cmd_insert_int_2(struct udl_softc *, uint16_t);
+void		udl_cmd_insert_int_3(struct udl_softc *, uint32_t);
+void		udl_cmd_insert_int_4(struct udl_softc *, uint32_t);
+void		udl_cmd_write_reg_3(struct udl_softc *, uint8_t, uint32_t);
+
+/*
+ * Encryption.
+ */
+static const uint8_t udl_null_key_1[] = {
+	0x57, 0xcd, 0xdc, 0xa7, 0x1c, 0x88, 0x5e, 0x15, 0x60, 0xfe, 0xc6, 0x97,
+	0x16, 0x3d, 0x47, 0xf2
+};
+
+/*
+ * Matching devices.
+ */
+
+int
+udl_attach(struct device *parent, struct device *self, void *aux)
+{
+	(void) parent;
+	(void) aux;
+
+	struct udl_softc *sc = (struct udl_softc *)self;
+	usbd_status error;
+	int err;
+
+	/*
+	 * Set device configuration descriptor number.
+	 */
+	error = usbd_set_config_no(sc->sc_udev, 1, 0);
+	if (error != USBD_NORMAL_COMPLETION)
+		return -1;
+
+	/*
+	 * Create device handle to interface descriptor.
+	 */
+	error = usbd_device2interface_handle(sc->sc_udev, 0, &sc->sc_iface);
+	if (error != USBD_NORMAL_COMPLETION)
+		return -1;
+
+	/*
+	 * Allocate command buffer.
+	 */
+	err = udl_cmd_alloc_buf(sc);
+	if (err != 0)
+		return -1;
+
+	/*
+	 * Open bulk TX pipe.
+	 */
+	error = usbd_open_pipe(sc->sc_iface, 0x01, USBD_EXCLUSIVE_USE,
+	    &sc->sc_tx_pipeh);
+	if (error != USBD_NORMAL_COMPLETION)
+		return -1;
+
+	/*
+	 * Initialize chip.
+	 */
+	error = udl_init_chip(sc);
+	if (error != USBD_NORMAL_COMPLETION)
+		return -1;
+
+	return 0;
+}
+
+int
+udl_detach(struct device *self, int flags)
+{
+	(void) flags;
+
+	struct udl_softc *sc = (struct udl_softc *)self;
+
+	/*
+	 * Close bulk TX pipe.
+	 */
+	if (sc->sc_tx_pipeh != NULL) {
+		usbd_close_pipe(sc->sc_tx_pipeh);
+	}
+
+	/*
+	 * Free command buffer.
+	 */
+	udl_cmd_free_buf(sc);
+
+	return (0);
+}
+
+/* ---------- */
+
+usbd_status
+udl_ctrl_msg(struct udl_softc *sc, uint8_t rt, uint8_t r,
+    uint16_t index, uint16_t value, uint8_t *buf, size_t len)
+{
+	usb_device_request_t req;
+	usbd_status error;
+
+	req.bmRequestType = rt;
+	req.bRequest = r;
+	USETW(req.wIndex, index);
+	USETW(req.wValue, value);
+	USETW(req.wLength, len);
+
+	error = usbd_do_request(sc->sc_udev, &req, buf);
+	if (error != USBD_NORMAL_COMPLETION) {
+		DPRINTF(0, "%s: %s: %s!\n", DN(sc), FUNC, usbd_errstr(error));
+		return (error);
+	}
+
+	return (USBD_NORMAL_COMPLETION);
+}
+
+usbd_status
+udl_poll(struct udl_softc *sc, uint32_t *buf)
+{
+	uint8_t lbuf[4];
+	usbd_status error;
+
+	error = udl_ctrl_msg(sc, UT_READ_VENDOR_DEVICE,
+	    UDL_CTRL_CMD_READ_STATUS, 0x0000, 0x0000, lbuf, 4);
+	if (error != USBD_NORMAL_COMPLETION) {
+		DPRINTF(0, "%s: %s: %s!\n", DN(sc), FUNC, usbd_errstr(error));
+		return (error);
+	}
+	*buf = *(uint32_t *)lbuf;
+
+	return (USBD_NORMAL_COMPLETION);
+}
+
+usbd_status
+udl_read_1(struct udl_softc *sc, uint16_t addr, uint8_t *buf)
+{
+	uint8_t lbuf[1];
+	usbd_status error;
+
+	error = udl_ctrl_msg(sc, UT_READ_VENDOR_DEVICE,
+	    UDL_CTRL_CMD_READ_1, addr, 0x0000, lbuf, 1);
+	if (error != USBD_NORMAL_COMPLETION) {
+		DPRINTF(0, "%s: %s: %s!\n", DN(sc), FUNC, usbd_errstr(error));
+		return (error);
+	}
+	*buf = *(uint8_t *)lbuf;
+
+	return (USBD_NORMAL_COMPLETION);
+}
+
+usbd_status
+udl_write_1(struct udl_softc *sc, uint16_t addr, uint8_t buf)
+{
+	usbd_status error;
+
+	error = udl_ctrl_msg(sc, UT_WRITE_VENDOR_DEVICE,
+	    UDL_CTRL_CMD_WRITE_1, addr, 0x0000, &buf, 1);
+	if (error != USBD_NORMAL_COMPLETION) {
+		DPRINTF(0, "%s: %s: %s!\n", DN(sc), FUNC, usbd_errstr(error));
+		return (error);
+	}
+
+	return (USBD_NORMAL_COMPLETION);
+}
+
+usbd_status
+udl_set_enc_key(struct udl_softc *sc, const uint8_t *buf, uint8_t len)
+{
+	usbd_status error;
+
+	error = udl_ctrl_msg(sc, UT_WRITE_VENDOR_DEVICE,
+	    UDL_CTRL_CMD_SET_KEY, 0x0000, 0x0000, (uint8_t *) buf, len);
+	if (error != USBD_NORMAL_COMPLETION) {
+		DPRINTF(0, "%s: %s: %s!\n", DN(sc), FUNC, usbd_errstr(error));
+		return (error);
+	}
+	
+	return (USBD_NORMAL_COMPLETION);
+}
+
+usbd_status
+udl_set_decomp_table(struct udl_softc *sc, const uint8_t *buf, uint16_t len)
+{
+	int err;
+
+	udl_cmd_insert_int_1(sc, UDL_BULK_SOC);
+	udl_cmd_insert_int_1(sc, UDL_BULK_CMD_DECOMP);
+	udl_cmd_insert_int_4(sc, 0x263871cd);	/* magic number */
+	udl_cmd_insert_int_4(sc, 0x00000200);	/* 512 byte chunks */
+	udl_cmd_insert_buf(sc, buf, len);
+
+	err = udl_cmd_send(sc);
+	if (err != 0)
+		return (USBD_INVAL);
+
+	return (USBD_NORMAL_COMPLETION);
+}
+
+/* ---------- */
+
+int
+udl_cmd_alloc_buf(struct udl_softc *sc)
+{
+	struct udl_cmd_buf *cb = &sc->sc_cmd_buf;
+
+	cb->buf = malloc(UDL_CMD_MAX_XFER_SIZE);
+	if (cb->buf == NULL) {
+		DPRINTF(0, "%s: %s: can't allocate buffer!\n",
+		    DN(sc), FUNC);
+		return (ENOMEM);
+	}
+	cb->off = 0;
+
+	return (0);
+}
+
+void
+udl_cmd_free_buf(struct udl_softc *sc)
+{
+	struct udl_cmd_buf *cb = &sc->sc_cmd_buf;
+
+	if (cb->buf != NULL) {
+		free(cb->buf);
+		cb->buf = NULL;
+	}
+	cb->off = 0;
+}
+
+void
+udl_cmd_insert_int_1(struct udl_softc *sc, uint8_t value)
+{
+	struct udl_cmd_buf *cb = &sc->sc_cmd_buf;
+
+	cb->buf[cb->off] = value;
+
+	cb->off += 1;
+}
+
+void
+udl_cmd_insert_int_2(struct udl_softc *sc, uint16_t value)
+{
+	uint16_t lvalue;
+	struct udl_cmd_buf *cb = &sc->sc_cmd_buf;
+
+	lvalue = htobe16(value);
+	bcopy(&lvalue, cb->buf + cb->off, 2);
+
+	cb->off += 2;
+}
+
+void
+udl_cmd_insert_int_3(struct udl_softc *sc, uint32_t value)
+{
+	uint32_t lvalue;
+	struct udl_cmd_buf *cb = &sc->sc_cmd_buf;
+#if BYTE_ORDER == BIG_ENDIAN
+	lvalue = htobe32(value) << 8;
+#else
+	lvalue = htobe32(value) >> 8;
+#endif
+	bcopy(&lvalue, cb->buf + cb->off, 3);
+
+	cb->off += 3;
+}
+
+void
+udl_cmd_insert_int_4(struct udl_softc *sc, uint32_t value)
+{
+	uint32_t lvalue;
+	struct udl_cmd_buf *cb = &sc->sc_cmd_buf;
+
+	lvalue = htobe32(value);
+	bcopy(&lvalue, cb->buf + cb->off, 4);
+
+	cb->off += 4;
+}
+
+void
+udl_cmd_insert_buf(struct udl_softc *sc, const uint8_t *buf, uint32_t len)
+{
+	struct udl_cmd_buf *cb = &sc->sc_cmd_buf;
+
+	bcopy(buf, cb->buf + cb->off, len);
+
+	cb->off += len;
+}
+
+void
+udl_cmd_write_reg_1(struct udl_softc *sc, uint8_t reg, uint8_t val)
+{
+	DPRINTF(0, "%s: %s: %02x %02x\n", DN(sc), FUNC, reg, val);
+	udl_cmd_insert_int_1(sc, UDL_BULK_SOC);
+	udl_cmd_insert_int_1(sc, UDL_BULK_CMD_REG_WRITE_1);
+	udl_cmd_insert_int_1(sc, reg);
+	udl_cmd_insert_int_1(sc, val);
+}
+
+void
+udl_cmd_write_reg_2(struct udl_softc *sc, uint8_t reg, uint16_t val)
+{
+	udl_cmd_write_reg_1(sc, reg + 0, (val >> 8) & 0xff);
+	udl_cmd_write_reg_1(sc, reg + 1, (val >> 0) & 0xff);
+}
+
+void
+udl_cmd_write_reg_3(struct udl_softc *sc, uint8_t reg, uint32_t val)
+{
+	udl_cmd_write_reg_1(sc, reg + 0, (val >> 16) & 0xff);
+	udl_cmd_write_reg_1(sc, reg + 1, (val >> 8) & 0xff);
+	udl_cmd_write_reg_1(sc, reg + 2, (val >> 0) & 0xff);
+}
+
+usbd_status
+udl_cmd_send(struct udl_softc *sc)
+{
+	struct udl_cmd_buf *cb = &sc->sc_cmd_buf;
+	int len;
+	usbd_status error;
+
+	/* mark end of command stack */
+	udl_cmd_insert_int_1(sc, UDL_BULK_SOC);
+	udl_cmd_insert_int_1(sc, UDL_BULK_CMD_EOC);
+
+	len = cb->off;
+
+	bool ok = finish_packet(sc,cb->buf,cb->buf+len);
+	error = (ok?USBD_NORMAL_COMPLETION:USBD_STALLED);
+
+	DPRINTF(1, "%s: %s: sent %d of %d bytes\n",
+	    DN(sc), FUNC, len, cb->off);
+
+	cb->off = 0;
+
+	return (error);
+}
+
+/* ---------- */
+
+usbd_status
+udl_init_chip(struct udl_softc *sc)
+{
+	usbd_status error;
+
+	error = udl_write_1(sc, 0xc41f, 0x01);
+	if (error != USBD_NORMAL_COMPLETION)
+		return (error);
+	DPRINTF(1, "%s: %s: write 0x01 to 0xc41f\n", DN(sc), FUNC);
+
+	error = udl_set_enc_key(sc, udl_null_key_1, sizeof(udl_null_key_1));
+	if (error != USBD_NORMAL_COMPLETION)
+		return (error);
+	DPRINTF(1, "%s: %s: set encryption key\n", DN(sc), FUNC);
+
+	error = udl_write_1(sc, 0xc40b, 0x00);
+	if (error != USBD_NORMAL_COMPLETION)
+		return (error);
+	DPRINTF(1, "%s: %s: write 0x00 to 0xc40b\n", DN(sc), FUNC);
+
+	return (USBD_NORMAL_COMPLETION);
+}
+
+void
+udl_init_fb_offsets(struct udl_softc *sc, uint32_t start16, uint32_t stride16,
+    uint32_t start8, uint32_t stride8)
+{
+	udl_cmd_write_reg_1(sc, UDL_REG_SYNC, 0x00);
+	udl_cmd_write_reg_3(sc, UDL_REG_ADDR_START16, start16);
+	udl_cmd_write_reg_3(sc, UDL_REG_ADDR_STRIDE16, stride16);
+	udl_cmd_write_reg_3(sc, UDL_REG_ADDR_START8, start8);
+	udl_cmd_write_reg_3(sc, UDL_REG_ADDR_STRIDE8, stride8);
+	udl_cmd_write_reg_1(sc, UDL_REG_SYNC, 0xff);
+}

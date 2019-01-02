@@ -1,0 +1,400 @@
+/*
+ * Copyright (c) 2017, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include <stdint.h>
+#include <stdlib.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <string.h>
+#include "swis.h"
+
+#include "Global/RISCOS.h"
+#include "Global/OsBytes.h"
+#include "Global/Services.h"
+#include "Global/NewErrors.h"
+#include "Global/Variables.h"
+#include "AsmUtils/osvarlen.h"
+
+#include "sys/param.h"
+#include "sys/syslog.h"
+#include "sys/types.h"
+#include "sys/signal.h"
+#include "sys/dcistructs.h"
+#include "unixlib.h"
+
+#include "routedaemon.h"
+#include "RouteDHdr.h"
+
+/* Global state */
+const char *__progname = Module_Title;
+
+/* Local state */
+static uint32_t msgs_struct[4];
+static volatile bool cb_pending;
+
+/* External functions */
+extern int main(int, char **);
+extern void main_tick(void);
+extern void main_input(void);
+extern void sigterm(int);
+extern void logbad(int, const char *, ...);
+extern void trace_off(const char *p, ...);
+extern void set_tracelevel(void);
+extern void set_tracefile(const char *, const char *, int);
+
+/*
+ * Glue functions
+ */
+void vsyslog(int level, const char *msg, va_list list)
+{
+	UNUSED(level);
+	UNUSED(msg);
+	UNUSED(list);
+}
+
+void syslog(int level, const char *msg, ...)
+{
+	UNUSED(level);
+	UNUSED(msg);
+}
+
+typedef struct rtalloc
+{
+	struct rtalloc *next;
+	char            store[1];
+} rtalloc_t;
+
+static rtalloc_t *allocs = NULL;
+
+void *rtmalloc(size_t size, const char *msg)
+{
+	rtalloc_t *mem;
+
+	/* Ask for the requested amount plus space for the linked list */
+	mem = malloc(size + sizeof(struct rtalloc *));
+	if (mem == NULL)
+	{
+		logbad(1, "malloc failure of %u for '%s'", size, msg);
+
+		return NULL;
+	}
+
+	/* Add that allocation to the list */
+	mem->next = allocs;
+	allocs = mem;
+
+	return mem->store;
+}
+
+/*
+ * Initialisation
+ */
+_kernel_oserror *rdaemon_init(const char *cmd_tail, int podule_base, void *pw)
+{
+	_kernel_oserror *err;
+	const char *options;
+	char *argv[2];
+	char  optvar[32];
+
+#ifndef ROM
+	err = _swix(ResourceFS_RegisterFiles, _IN(0), Resources());
+	if (err != NULL)
+	{
+		return err;
+	}
+#endif
+	err = _swix(MessageTrans_OpenFile, _INR(0,2),
+	            msgs_struct, Module_MessagesFile, 0);
+	if (err != NULL)
+	{
+#ifndef ROM
+		_swix(ResourceFS_DeregisterFiles, _IN(0), Resources());
+#endif
+		return err;
+	}
+
+	/* Read the options, or use defaults if unset */
+	if (osvarlen("Inet$RouteDOptions", VarType_Expanded) == -1)
+	{
+		options = "default";
+	}
+	else
+	{
+		size_t length;
+
+		err = _swix(OS_ReadVarVal, _INR(0,4) | _OUT(2), "Inet$RouteDOptions",
+		            optvar, sizeof(optvar) - 1, 0, VarType_Expanded,
+		            &length);
+		if (err != NULL) goto initclose;
+		optvar[length] = '\0';
+		options = optvar;
+	}
+	if (strcasecmp("default", options) == 0)
+	{
+		options = "-s";
+	}
+	else
+	{
+		char  crunch[sizeof(optvar)];
+		char *src = optvar, *dst = crunch;
+		bool  empty = TRUE;
+
+		/* Crunch spaces, prefix with hyphen */
+		dst[0] = '-';
+		while (*src)
+		{
+			if (*src != ' ')
+			{
+				empty = FALSE;
+				dst++;
+				*dst = *src;
+			}
+			src++;
+		}
+		dst[1] = '\0';
+		strcpy(optvar, empty ? "-s" : crunch);
+	}
+
+	/* Call the bit of main() that we need to initialise */
+	argv[0] = (char *)__progname;
+	argv[1] = (char *)options;
+	if (main(2, argv) < -1)
+	{
+		static const internaterr_t badparm = { ErrorNumber_BadParm, "BadParm" };
+
+		err = _swix(MessageTrans_ErrorLookup, _INR(0,2), &badparm, 0, 0);
+		goto initclose;
+	}
+
+	/* Listen to socket events */
+	err = _swix(OS_Claim, _INR(0,2), EventV, rdaemon_events, pw);
+	if (err != NULL) goto initclose;
+	_swix(OS_Byte, _INR(0,1), OsByte_EnableEvent, Event_Internet);
+
+	/* Tick every second */
+	err = _swix(OS_CallEvery, _INR(0,2), 100 - 1, rdaemon_ticks, pw);
+	if (err != NULL) goto initrelease;
+
+	UNUSED(podule_base);
+	UNUSED(cmd_tail);
+
+	return NULL;
+
+initrelease:
+	_swix(OS_Byte, _INR(0,1), OsByte_DisableEvent, Event_Internet);
+	_swix(OS_Release, _INR(0,2), EventV, rdaemon_events, pw);
+initclose:
+	_swix(MessageTrans_CloseFile, _IN(0), msgs_struct);
+#ifndef ROM
+	_swix(ResourceFS_DeregisterFiles, _IN(0), Resources());
+#endif
+	return err;
+}
+
+/*
+ * Finalisation
+ */
+_kernel_oserror *rdaemon_final(int fatal, int podule, void *pw)
+{
+	rtalloc_t *list, *step;
+
+	if (cb_pending)
+	{
+		_swix(OS_RemoveCallBack, _INR(0,1), rdaemon_fgticks, pw);
+		cb_pending = false;
+	}
+	_swix(OS_RemoveTickerEvent, _INR(0,1), rdaemon_ticks, pw);
+	_swix(OS_Byte, _INR(0,1), OsByte_DisableEvent, Event_Internet);
+	_swix(OS_Release, _INR(0,2), EventV, rdaemon_events, pw);
+
+	/* Tell the daemon to close its sockets */
+	sigterm(SIGQUIT);
+
+	/* Unlike an application, we can't rely on the C
+	 * runtime to clear away all the malloc() operations during
+	 * the course of running, because they came from the RMA.
+	 * Run through the list of allocations and free them here.
+	 */
+	list = allocs;
+	while (list != NULL)
+	{
+		step = list->next;
+		free(list);
+		list = step;
+	}
+	allocs = NULL;
+
+	_swix(MessageTrans_CloseFile, _IN(0), msgs_struct);
+#ifndef ROM
+	_swix(ResourceFS_DeregisterFiles, _IN(0), Resources());
+#endif
+
+	UNUSED(fatal);
+	UNUSED(podule);
+
+	return NULL;
+}
+
+/*
+ * Event handler
+ */
+int rdaemon_events_handler(_kernel_swi_regs *r, void *pw)
+{
+	extern fd_set fdbits;
+	static bool busy;
+
+	if ((r->r[0] == Event_Internet) &&
+	    (r->r[1] == Event_Internet_SocketAsync) &&
+	    FD_ISSET(r->r[2], &fdbits) &&
+	    !busy)
+	{
+		/* Socket of interest has data waiting. The busy
+		 * guard is needed because refreshing the routes can
+		 * send data which results in further (TX complete) events.
+		 */
+		busy = true;
+		main_input();
+		busy = false;
+	}
+	UNUSED(pw);
+
+	return 1; /* Never claim */
+}
+
+/*
+ * Tick handler
+ */
+_kernel_oserror *rdaemon_ticks_handler(_kernel_swi_regs *r, void *pw)
+{
+	if (!cb_pending)
+	{
+		/* Simplest to assume none of the network stack can be called
+		 * from inside a CallEvery, so pend a callback for later.
+		 */
+		cb_pending = _swix(OS_AddCallBack, _INR(0,1),
+		                   rdaemon_fgticks, pw) == NULL;
+	}
+	UNUSED(r);
+
+	return NULL;
+}
+
+/*
+ * Foreground tick handler
+ */
+_kernel_oserror *rdaemon_fgticks_handler(_kernel_swi_regs *r, void *pw)
+{
+	if (cb_pending)
+	{
+		main_tick();
+		cb_pending = false;
+	}
+	UNUSED(r);
+	UNUSED(pw);
+
+	return NULL;
+}
+
+/*
+ * Service call handler
+ */
+void rdaemon_services(int service_number, _kernel_swi_regs *r, void *pw)
+{
+	switch (service_number)
+	{
+#ifndef ROM
+		case Service_ResourceFSStarting:
+			/* Reregister the messages */
+			(*(void (*)(void *, void *, void *, void *))r->r[2])(Resources(), 0, 0, (void *)r->r[3]);
+			break;
+#endif
+		case Service_DCIProtocolStatus:
+			if ((r->r[2] == DCIPROTOCOL_DYING) &&
+			    (strcmp((const char *)r->r[4], "Internet") == 0))
+			{
+				/* All our sockets just vanished */
+				sigterm(SIGHUP);
+			}
+			break;
+	}
+
+	UNUSED(pw);
+}
+
+/*
+ * Command handler
+ */
+_kernel_oserror *rdaemon_commands(const char *arg_string, int argc, int cmd_no, void *pw)
+{
+	switch (cmd_no)
+	{
+		case CMD_RouteDTraceOff:
+			trace_off("RouteDTraceOff");
+			break;
+
+		case CMD_RouteDTraceOn:
+		{
+			extern char inittracename[MAXPATHLEN+1];
+			extern int new_tracelevel;
+			int level;
+			_kernel_oserror *err;
+			struct
+			{
+				char *level;
+				char *name;
+				char  buffer[2 /* Level */ + MAXPATHLEN+1 /* Name */];
+			} args;
+
+			err = _swix(OS_ReadArgs, _INR(0,3), ",", arg_string, &args, sizeof(args));
+			if (err == NULL) err = _swix(OS_ReadUnsigned, _INR(0,2) | _OUT(2),
+			                             1<<29, args.level, 4, &level);
+			if (err != NULL)
+			{
+				return err;
+			}
+			new_tracelevel = level;
+			if (args.name == NULL)
+			{
+				/* When no filename is given, ensure messages do still go via
+				 * fopen() machinery by opening a handle on the VDU instead.
+				 */
+				strcpy(inittracename, "vdu:");
+			}
+			else
+			{
+				strncpy(inittracename, args.name, sizeof(inittracename)-1);
+			}
+			set_tracefile(args.name, "%s", -1);
+			set_tracelevel();
+		}
+		break;
+	}
+	UNUSED(pw);
+	UNUSED(argc);
+
+	return NULL;
+}

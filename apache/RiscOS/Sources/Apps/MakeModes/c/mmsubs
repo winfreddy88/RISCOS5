@@ -1,0 +1,1690 @@
+/* Copyright 2003 Tematic Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*************************************************
+*          Subroutines for MakeModes             *
+*************************************************/
+
+/* Last updated: May 1994 */
+/* Last updated: Oct 1994 */
+/* Support for saving a single mode definition to a file */
+
+#include "makemodes.h"
+#include "IconDefs.h"
+#include "DebugIt.h"
+#include <stdio.h>
+#include <stdint.h>
+
+void blip(wimp_w w, wimp_i i, int state)
+{
+
+    switch (state)
+    {
+    case 1 : wimp_set_icon_state(w,i,wimp_ISELECTED,wimp_ISELECTED);
+             break;
+    case 0 : wimp_set_icon_state(w,i,(wimp_iconflags)0,wimp_ISELECTED);
+             break;
+    }
+
+}
+
+/*************************************************
+*          Call SWI; fail if error               *
+*************************************************/
+
+int SWI(int swi, int count, ...)
+{
+_kernel_swi_regs swi_regs;
+int i;
+_kernel_oserror *error;
+va_list ap;
+va_start(ap, count);
+for (i = 0; i < count; i++) swi_regs.r[i] = va_arg(ap, int);
+va_end(ap);
+error = _kernel_swi(swi, &swi_regs, &swi_regs);
+if (error != NULL)
+  {
+  error_moan(1, error->errnum, error->errmess, swi);  /* Hard error */
+  }
+return swi_regs.r[0];  /* Commonly needed value */
+}
+
+
+
+
+/*************************************************
+*           Copy significant string chars        *
+*************************************************/
+
+void sigstrcpy(char *t, char *s)
+{
+char *tstart = t;
+while (*s == ' ') s++;
+while (*s >= ' ') *t++ = *s++;
+while (t > tstart && t[-1] == ' ') t--;
+*t = 0;
+}
+
+
+
+/*************************************************
+*           Initialize list of montypes          *
+*************************************************/
+
+/* The montypes file contains a list of monitor types
+and the corresponding files that have to be scanned
+when generating modes for them. */
+
+void init_montypes(void)
+{
+montype **mm = &montypes;
+char buff[256];
+FILE *f = fopen("<MakeModes$Dir>.MonModes", "r");
+
+if (f == NULL)
+  {
+    werr(0,"%s",msgs_lookup("25"));
+    exit(99);
+  }
+
+while (fgets(buff, sizeof(buff), f) != NULL)
+  {
+  int used;
+  montype *m;
+  stringchain **ss;
+  char *p = buff;
+  char field[256];
+
+  while (*p == ' ' || *p == '\t') p++;
+  if (*p == '#' || *p == '\n') continue;
+
+  sscanf(p, "%s%n", field, &used);
+  p += used;
+  m = malloc(sizeof(montype));
+  if (m == NULL)
+    {
+      werr(0,"%s",msgs_lookup("26"));
+      exit(99);
+    }
+
+  m->next = NULL;
+  strncpy(m->typename, field, 20);
+  m->files = NULL;
+  ss = &(m->files);
+
+  while (sscanf(p, "%s%n", field, &used) > 0)
+    {
+    stringchain *s = malloc(sizeof(stringchain) + strlen(field));
+    if (s == NULL)
+      {
+        werr(0,"%s",msgs_lookup("26"));
+        exit(99);
+      }
+    s->next = NULL;
+    strcpy(s->text, field);
+    *ss = s;
+    ss = &(s->next);
+    p += used;
+    }
+
+  *mm = m;
+  mm = &(m->next);
+  }
+
+fclose(f);
+
+if (montypes == NULL)
+  {
+    werr(0,"%s",msgs_lookup("28"));
+    exit(99);
+  }
+monitor_type = montypes;  /* Default to first type */
+}
+
+
+
+/*************************************************
+*           Initialize list of monitors          *
+*************************************************/
+
+/* The monlist file contains a list of actual monitors
+and their characteristics. */
+
+
+void init_monitors(void)
+{
+monitor **mm = &monitors;
+monitor *mon;
+char buff[256];
+int x = 0;
+FILE *f = fopen("<MakeModes$Dir>.Monlist", "r");
+
+if (f == NULL)
+  {
+    werr(0,"%s",msgs_lookup("30"));
+    exit(99);
+  }
+
+while (fgets(buff, sizeof(buff), f) != NULL)
+  {
+  int len, used;
+  monitor *m;
+  char *p = buff;
+
+  while (*p == ' ' || *p == '\t') p++;
+  if (*p == '#' || *p == '\n') continue;
+
+  monitor_count++;
+  len = strlen(p) - 1;
+  while (len >= 0 && (p[len] == '\n' || p[len] == ' ' || p[len] == '\t'))
+    p[len--] = 0;
+
+  m = malloc(sizeof(monitor));
+  if (m == NULL)
+    {
+      werr(0,"%s",msgs_lookup("26"));
+      exit(99);
+    }
+
+  sscanf(p, "%s %d %d %d %d %d%n", &(m->typename), &(m->dpms), &(m->min_h),
+    &(m->max_h), &(m->min_v), &(m->max_v), &used);
+  p += used;
+  while (*p == ' ' || *p == '\t') p++;
+
+  strcpy(m->name, p);
+  m->next = NULL;
+  *mm = m;
+  mm = &(m->next);
+  }
+
+fclose(f);
+mon = monitors;
+for(x = 0; x < monitor_count; x++)
+{
+  /*werr(0,"%s", mon->name);*/
+  mon = mon->next;
+}
+}
+
+
+
+/*************************************************
+*            Sort modes into correct order       *
+*************************************************/
+
+/* The sorting is by resolution, then by frame rate */
+
+static int modecmp(mode *a, mode *b)
+{
+if (a->x_resolution < b->x_resolution) return -1;
+if (a->x_resolution > b->x_resolution) return +1;
+if (a->y_resolution < b->y_resolution) return -1;
+if (a->y_resolution > b->y_resolution) return +1;
+if (a->frame_rate   < b->frame_rate)   return -1;
+if (a->frame_rate   > b->frame_rate)   return +1;
+return 0;
+}
+
+/* As we are not expecting to be sorting very many modes,
+we use a simple insertion sort. Continually rescan the
+chain, picking off the "smallest" mode, and add it on the
+front of a new list that is built up. */
+
+void sort_modes(void)
+{
+mode *newhead = NULL;
+
+while (mode_chain != NULL && mode_chain->next != NULL)
+  {
+  mode *this = mode_chain->next;
+  mode *max = mode_chain;
+  mode **thisptr = &(mode_chain->next);
+  mode **maxptr = &mode_chain;
+
+  while (this != NULL)
+    {
+    if (modecmp(this, max) > 0)
+      { max = this; maxptr = thisptr; }
+    thisptr = &(this->next);
+    this = this->next;
+    }
+
+  *maxptr = max->next;
+  max->next = newhead;
+  newhead = max;
+  }
+
+mode_chain->next = newhead;
+}
+
+
+
+
+
+/*************************************************
+*              Free mode store                   *
+*************************************************/
+
+void free_modes(void)
+{
+while (mode_chain != NULL)
+  {
+  mode *this = mode_chain;
+  mode_chain = mode_chain->next;
+  free(this);
+  }
+last_mode = NULL;
+}
+
+
+
+
+/*************************************************
+*              Free comments store               *
+*************************************************/
+
+void free_comments(void)
+{
+while (comments != NULL)
+  {
+  stringchain *this = comments;
+  comments = comments->next;
+  free(this);
+  }
+}
+
+
+
+
+/*************************************************
+*          Initialise at start of new file       *
+*************************************************/
+
+/* If the flag is TRUE, a file is about to be read, so set
+up nothing. Otherwise, initialize one default mode. */
+
+void data_init(int filetocome)
+{
+file_format = 1;
+monitor_title[0] = 0;
+monitor_dpms_state = 0;
+hrequired_set = vrequired_set = FALSE;
+mode_number = 0;
+
+if (filetocome)
+  {
+  mode_count = 0;
+  mode_chain = last_mode = NULL;
+  set_icon_colours(window_display, icon_h_required,colour_req_fore2, colour_req_back);
+  set_icon_colours(window_display, icon_v_required,colour_req_fore2, colour_req_back);
+  file_saved = TRUE;
+  }
+else
+  {
+  /*
+  int block[4];
+
+  block[0] = window_display;
+  block[1] = icon_title;
+  block[2] = F_selected;
+  block[3] = F_selected;
+  SWI(Wimp_SetIconState, 2, 0, (int)block);
+  */
+  blip(window_display, icon_title, 1);
+  strcpy(file_name, "ModeFile");
+  mode_count = 1;
+  mode_chain = last_mode = malloc(sizeof(mode));
+  if(mode_chain == NULL)
+  {
+    werr(0,"Cant get memory for mode_chain");
+    return;
+  }
+  memset(mode_chain, 0, sizeof(mode));
+  mode_chain->next = NULL;
+  mode_chain->write_name = TRUE;
+
+  strcpy(mode_chain->mode_name, "dummy mode");
+
+  set_icon_num(window_display, icon_dpms_state, 0);
+  set_icon_colours(window_display, icon_h_required,colour_req_fore1, colour_req_back);
+  set_icon_colours(window_display, icon_v_required,colour_req_fore1, colour_req_back);
+  /*file_saved = FALSE;*/
+  /*set_icon_text(window_save, icon_filename, "Modefile");*/
+  }
+}
+
+
+
+
+
+/*************************************************
+*              Load comments                     *
+*************************************************/
+
+/* Heading comments terminated by a non-comment line */
+
+static int load_comments(FILE *f, char *filename)
+{
+stringchain **cc = &comments;
+char buff[256];
+fpos_t pos;
+
+for (;;)
+  {
+  stringchain *c;
+
+  fgetpos(f, &pos);
+  if (fgets(buff, sizeof(buff), f) == NULL)
+    {
+    error_moan(10, filename, line_number, (line_number==1)? "" : "s");
+    return FALSE;
+    }
+  line_number++;
+  if (buff[0] != '#')
+    {
+    /* A non-comment line. Unget that line and finish. */
+    fsetpos(f, &pos);
+    break;
+    }
+
+  if (strncmp(buff, "# Modefile written by !MakeModes", 32) == 0) continue;
+
+  c = malloc(sizeof(stringchain) + strlen(buff));
+  if (c == NULL)
+    {
+      werr(0,"%s",msgs_lookup("19"));
+      return FALSE;
+    }
+  *cc = c;
+  cc = &(c->next);
+  c->next = NULL;
+  strcpy(c->text, buff);
+  }
+
+return TRUE;
+}
+
+
+
+
+/*************************************************
+*                Load a parameter                *
+*************************************************/
+
+static int load_parameter(FILE *f, char *filename, char *s, int *a, char *b, int eofok)
+{
+int len = strlen(s);
+char buff[256];
+fpos_t pos;
+
+fgetpos(f, &pos);
+
+for (;;)
+  {
+  char *pp;
+  char *p = buff;
+  if (fgets(buff, sizeof(buff), f) == NULL)
+    {
+    if (!eofok) error_moan(10, filename, line_number,
+      (line_number==1)? "" : "s");
+    return 1;
+    }
+  line_number++;
+
+  pp = buff + strlen(buff);
+  while (pp > buff && (pp[-1] == '\n' || pp[-1] == ' ')) pp--;
+  *pp = 0;
+
+  while (*p == ' ') p++;
+  if (*p != 0 && *p != '#')
+    {
+    if (strncmp(p, s, len) == 0)
+      {
+      if (a != NULL) *a = atoi(p+len);
+        else if (b != NULL) strcpy(b, p + len);
+      return 0;
+      }
+    else
+      {
+        if(strcmp(s,"DPMS_state:") == 0)
+        {
+          *a = 0;
+          fsetpos(f,&pos);
+          return 0;
+        }
+      error_moan(8, filename, line_number, s);
+      return 2;
+      }
+    }
+  }
+}
+
+
+
+/*************************************************
+*              Load a mode                       *
+*************************************************/
+
+static int load_mode(FILE *f, char *filename)
+{
+mode *m;
+char buff[256];
+
+int rc = load_parameter(f, filename, "startmode", NULL, NULL, TRUE);
+if (rc) return rc;
+
+m = malloc(sizeof(mode));
+memset(m, 0, sizeof(mode));
+m->next = NULL;
+if (last_mode == NULL) mode_chain = m;
+  else last_mode->next = m;
+last_mode = m;
+
+/* We load the mode name, though in fact it will be regenerated from
+the resolutions. If it is null, set the flag to cause it not to be
+written out. */
+
+if (load_parameter(f, filename, "mode_name:", NULL, m->mode_name, FALSE)) return 2;
+m->write_name = (m->mode_name[0] != 0);
+
+if (load_parameter(f, filename, "x_res:", &m->x_resolution, NULL, FALSE)) return 2;
+if (load_parameter(f, filename, "y_res:", &m->y_resolution, NULL, FALSE)) return 2;
+if (load_parameter(f, filename, "pixel_rate:", &m->pixel_rate, NULL, FALSE)) return 2;
+
+if (load_parameter(f, filename, "h_timings:", NULL, buff, FALSE)) return 2;
+sscanf(buff, "%d,%d,%d,%d,%d,%d", &m->h_sync_width, &m->h_back_porch,
+  &m->h_left_border, &m->h_display, &m->h_right_border,
+  &m->h_front_porch);
+
+if (load_parameter(f, filename, "v_timings:", NULL, buff, FALSE)) return 2;
+sscanf(buff, "%d,%d,%d,%d,%d,%d", &m->v_sync_width, &m->v_back_porch,
+  &m->v_top_border, &m->v_display, &m->v_bottom_border,
+  &m->v_front_porch);
+
+if (load_parameter(f, filename, "sync_pol:", &m->sync_pol, NULL, FALSE)) return 2;
+if (load_parameter(f, filename, "endmode", NULL, NULL, FALSE)) return 2;
+
+sum_horizontal(m);
+sum_vertical(m);
+
+mode_count++;
+return 0;
+}
+
+
+
+/*************************************************
+*           Read start of a mode file            *
+*************************************************/
+
+static int mode_file_init(FILE *f, char *name, int want_comments)
+{
+if (f == NULL)
+  {
+  error_moan(6, name);
+  return FALSE;
+  }
+line_number = 0;
+
+/* First we have any number of comment lines */
+
+if (want_comments && !load_comments(f, name))
+  {
+  fclose(f);
+  return FALSE;
+  }
+
+/* Next we have the file_format */
+
+if (load_parameter(f, name, "file_format:", &file_format, NULL, FALSE))
+  {
+  fclose(f);
+  return FALSE;
+  }
+
+if (file_format != 1)
+  {
+  error_moan(11, file_format);
+  fclose(f);
+  return FALSE;
+  }
+
+/* Next the monitor title */
+
+if (load_parameter(f, name, "monitor_title:", NULL, monitor_title, FALSE))
+  {
+  fclose(f);
+  return FALSE;
+  }
+
+/* And finally the DPMS data */
+
+if (load_parameter(f, name, "DPMS_state:", &monitor_dpms_state, NULL, FALSE))
+  {
+  fclose(f);
+  return FALSE;
+  }
+
+return TRUE;
+}
+
+BOOL check_monitor_title(char *c_mon, BOOL update_window)
+{
+  BOOL found = FALSE;
+  int x;
+  monitor *mon;
+
+  mon = monitors;
+
+  for(x = 0; x < monitor_count; x++)
+  {
+    /*werr(0,"%s",mon->name);*/
+    if(!strncmp(mon->name, c_mon, strlen(mon->name)+1))
+    {
+      found = TRUE;
+      break;
+    }
+    mon = mon->next;
+  }
+
+  if(found && update_window)
+  {
+    current_monitor = x+1;
+    set_icon_text(window_display, icon_monitor_title, mon->name);
+    strcpy(monitor_title, mon->name);
+    set_icon_text(window_generate, icon_g_monitor_title, mon->name);
+    set_icon_num(window_generate, icon_g_hrate_max,mon->max_h);
+    set_icon_num(window_generate, icon_g_hrate_min,mon->min_h);
+    set_icon_num(window_generate, icon_g_vrate_min, mon->min_v);
+    set_icon_num(window_generate, icon_g_vrate_max, mon->max_v);
+    set_icon_num(window_generate, icon_g_dpms, mon->dpms);
+    set_icon_text(window_generate, icon_g_type, mon->typename);
+    copy_generate_info();
+    check_frame_rate();
+    check_line_rate();
+    return TRUE;
+  }
+
+  if(found)
+   return TRUE;
+  else
+   return FALSE;
+}
+
+
+/*************************************************
+*            Load a new file                     *
+*************************************************/
+
+int load_file(void)
+{
+FILE *f = fopen(file_name, "r");
+
+/* Handle the start-of-file stuff */
+
+if (!mode_file_init(f, file_name, TRUE)) return FALSE;
+
+/* And now we have the modes themselves */
+
+for (;;)
+  {
+  switch (load_mode(f, file_name))
+    {
+    case 1:                               /* end of file */
+    fclose(f);
+    if (mode_chain != NULL)
+      {
+      current_mode = mode_chain;
+      update_frame_rate(current_mode);
+      hrequired_set = vrequired_set = TRUE;
+      /*set_icon_text(window_save, icon_filename, file_name);*/
+      if(!check_monitor_title(monitor_title, TRUE))
+       werr(0,msgs_lookup("MNF"));
+      return TRUE;
+      }
+    else
+      {
+      error_moan(9, file_name);
+      return FALSE;
+      }
+    break;
+
+    case 2:            /* error */
+    fclose(f);
+    free_modes();
+    free_comments();
+    return FALSE;                         /* error */
+    }
+  }
+}
+
+/*************************************************
+*       Generate modes from the base files       *
+*************************************************/
+
+/* This entry is called when the dialogue box has been filled in */
+
+int generate_modes_from_dialogue(void)
+{
+  char *title = get_icon_text(window_generate, icon_g_monitor_title);
+  int dpms_state = atoi(get_icon_text(window_generate, icon_g_dpms));
+
+  int tolerance = atoi(get_icon_text(window_generate, icon_g_tolerance));
+
+  int hmax = atoi(get_icon_text(window_generate, icon_g_hrate_max));
+  int hmin = atoi(get_icon_text(window_generate, icon_g_hrate_min));
+  int vmax = atoi(get_icon_text(window_generate, icon_g_vrate_max));
+  int vmin = atoi(get_icon_text(window_generate, icon_g_vrate_min));
+
+  /*mon = monitors;
+  sigstrcpy(mon->typename, tmp);*/
+
+  hmax += (hmax*tolerance)/100;
+  hmin -= (hmin*tolerance)/100;
+  vmax += (vmax*tolerance)/100;
+  vmin -= (vmin*tolerance)/100;
+  DEBUG debug_output("generate_modes_from_dialogue","In generate_modes_from_dialogue\n");
+  return generate_modes(hmin, hmax, vmin, vmax, title, dpms_state, monitor_type);
+}
+
+/*************************************************
+*       Generate modes from the base files       *
+*************************************************/
+
+/* This is the routine that actually does all the work */
+
+int generate_modes(int hmin, int hmax, int vmin, int vmax, char *title,int dpms_state, montype *mtype)
+{
+  mode *prev = NULL;
+  stringchain *fileptr = mtype->files;
+  
+  /* Unset required flags, so each mode sets the fields. */
+  
+  hrequired_set = vrequired_set = FALSE;
+  
+  /* Check parameters for total rubbish */
+  
+  DEBUG debug_output("generate_modes","fileptr->text = %s, base_subdir = %s\n",fileptr->text, base_subdir);
+  
+  if (hmax < hmin || vmax < vmin || hmax == 0 || hmin == 0 ||
+    vmax == 0 || vmin == 0)
+      {
+        werr(0,"%s",msgs_lookup("27"));
+        return FALSE;
+      }
+  
+  /* Insist on there being a non-null title */
+  
+  while (*title == ' ') title++;
+  if (*title <= 32)
+    {
+       werr(0,"%s",msgs_lookup("21"));
+       return FALSE;
+    }
+  
+  /* Now we have to loop, reading all the files that are relevant to
+  this particular monitor type. */
+  
+  DEBUG debug_output("generate_modes","Entering loop to read files\n");
+  
+  while (fileptr != NULL)
+    {
+    char filebuffer[100];
+    FILE *f;
+    sprintf(filebuffer, "<MakeModes$Dir>.BaseModes.%s.", base_subdir);
+    DEBUG debug_output("generate_modes","file %s\n",filebuffer);
+    strcat(filebuffer, fileptr->text);
+    DEBUG debug_output("generate_modes","fileptr->text = %s\n",fileptr->text);  
+    f = fopen(filebuffer, "r");
+  
+    if (f == NULL)
+      {
+      error_moan(29, filebuffer);
+      free_modes();
+      free_comments();
+      return FALSE;
+      }
+  
+    /* Handle the start of the mode file as for loading a file */
+  
+    DEBUG debug_output("generate_modes","About to do a mode file init\n");
+    if (!mode_file_init(f, filebuffer, FALSE))
+    {
+      free_modes();
+      free_comments();
+      return FALSE;
+    }
+  
+    /* And now we scan the modes and keep any that match the parameters
+    required. */
+  
+    DEBUG debug_output("generate_modes","Got the building loop\n");
+  
+    for (;;)
+      {
+      switch (load_mode(f, filebuffer))
+        {
+        case 0:                               /* read a mode */
+        if (last_mode->line_rate  > hmax || last_mode->line_rate  < hmin ||
+            last_mode->frame_rate > vmax || last_mode->frame_rate < vmin)
+          {
+          mode *this = last_mode;
+          if (prev == NULL) mode_chain = NULL;
+            else prev->next = NULL;
+          last_mode = prev;
+          mode_count--;
+          free(this);
+          }
+        else prev = last_mode;
+        break;
+  
+        case 1:                               /* end of file */
+        fclose(f);
+        goto NEXTFILE;                        /* can't avoid this... */
+        break;
+  
+        case 2:        /* error */
+        fclose(f);
+        free_modes();
+        free_comments();
+        return FALSE;
+        }
+      }
+  
+    NEXTFILE:
+    fileptr = fileptr->next;
+    }
+  
+  /* If we have read some modes, set up for display; else grumble */
+  
+  DEBUG debug_output("generate_modes","Got here.........\n");
+  
+  if (mode_chain != NULL)
+    {
+    strcpy(file_name, "ModeFile");
+    /*set_icon_text(window_save, icon_filename, file_name);*/
+    sort_modes();
+    current_mode = mode_chain;
+  
+    update_display();
+    hrequired_set = vrequired_set = TRUE;
+    /*file_saved = FALSE;*/
+    }
+  else
+    {
+      werr(0,"%s",msgs_lookup("24"));
+      free_comments();
+      return FALSE;
+    }
+  
+  /* Set up the monitor title - can't do before, as the head of the
+  mode files have generic titles, which set this field. Ditto for
+  the DPMS state. */
+  DEBUG debug_output("generate_modes","Got to this place\n");
+  strcpy(monitor_title, title);
+  monitor_dpms_state = dpms_state;
+  check_frame_rate();
+  check_line_rate();
+  return TRUE;
+}
+
+/*************************************************
+*           Set the colours of an icon           *
+*************************************************/
+
+void set_icon_colours(int window, int icon, int foreground, int background)
+{
+int setblock[4];
+icon_state_block isb;
+isb.window = setblock[0] = window;
+isb.icon = setblock[1] = icon;
+SWI(Wimp_GetIconState, 2, 0, (int)(&isb));
+setblock[2] = (isb.ib.flags & ~F_colours) |
+  (foreground << FS_fore) | (background << FS_back);
+setblock[3] = -1;
+SWI(Wimp_SetIconState, 2, 0, (int)(setblock));
+}
+
+
+
+
+/*************************************************
+*         Get ptr to the text of an icon         *
+*************************************************/
+
+char *terminate_string ( char *text )
+{
+  char *p = text;
+  while(*p++ >= 32);
+  *--p = '\0';
+  return(text);
+}
+
+char *get_icon_text(int window, int icon)
+{
+int flags;
+
+icon_state_block isb;
+isb.window = window;
+isb.icon = icon;
+
+SWI(Wimp_GetIconState, 2, 0, (int)(&isb));
+
+flags = isb.ib.flags;
+
+if ((flags & (F_indirected | F_text)) != (F_indirected | F_text))
+  {
+  return terminate_string(isb.ib.id.name);
+  }
+else return terminate_string(isb.ib.id.ind.text);
+}
+
+/*************************************************
+*      Set the (indirected) text of an icon      *
+*************************************************/
+
+void set_icon_text(wimp_w window, wimp_i i, char *string)
+{
+  wimp_icon icon;
+
+  wimp_get_icon_info(window, i, &icon);
+  memcpy(icon.data.indirecttext.buffer, string,icon.data.indirecttext.bufflen);
+  wimp_set_icon_state(window, i, (wimp_iconflags)0,(wimp_iconflags)0);
+}
+
+/*************************************************
+*      Set a numerical value into an icon        *
+*************************************************/
+
+void set_icon_num(wimp_w window, wimp_i icon, int number)
+{
+char buffer[32];
+sprintf(buffer, "%d", number);
+set_icon_text(window, icon, buffer);
+}
+
+
+
+
+/*************************************************
+*            Update display to current mode      *
+*************************************************/
+
+void update_display(void)
+{
+char buff[24];
+int total_res = 0;
+
+/*
+block[0] = window_display;
+block[1] = icon_title;
+block[2] = (current_mode->write_name)? 0 : F_selected;
+block[3] = F_selected;
+SWI(Wimp_SetIconState, 2, 0, (int)block);
+*/
+blip(window_display, icon_title, (current_mode->write_name)? 1 : 0);
+total_res = current_mode->x_resolution * current_mode->y_resolution;
+
+set_icon_num(window_display,  icon_file_format, file_format);
+set_icon_num(window_display,  icon_mode_count, mode_count);
+set_icon_text(window_display, icon_monitor_title, monitor_title);
+set_icon_num(window_display,  icon_dpms_state, monitor_dpms_state);
+
+check_frame_rate();
+check_line_rate();
+
+/*
+sprintf(buff, "%d Hz", current_mode->frame_rate);
+set_icon_text(window_display, icon_frame_rate, buff);
+*/
+
+sprintf(buff, "%d Hz", current_mode->line_rate);
+set_icon_text(window_display, icon_line_rate,buff);
+
+/*if (current_mode->write_name)*/
+  sprintf(buff, "%s", current_mode->mode_name);
+/*else
+  sprintf(buff, "");*/
+
+  set_icon_text(window_display, icon_mode_name, buff);
+
+set_icon_num(window_display, icon_h_back_porch,   current_mode->h_back_porch);
+set_icon_num(window_display, icon_h_display,      current_mode->h_display);
+set_icon_num(window_display, icon_h_left_border,  current_mode->h_left_border);
+set_icon_num(window_display, icon_h_front_porch,  current_mode->h_front_porch);
+set_icon_num(window_display, icon_h_required,     current_mode->h_required);
+set_icon_num(window_display, icon_h_right_border, current_mode->h_right_border);
+set_icon_num(window_display, icon_h_sync_width,   current_mode->h_sync_width);
+set_icon_num(window_display, icon_h_total,        current_mode->h_total);
+set_icon_num(window_display, icon_pixel_rate,     current_mode->pixel_rate);
+set_icon_num(window_display, icon_sync_pol,       current_mode->sync_pol);
+set_icon_num(window_display, icon_v_back_porch,   current_mode->v_back_porch);
+set_icon_num(window_display, icon_v_bottom_border,current_mode->v_bottom_border);
+set_icon_num(window_display, icon_v_display,      current_mode->v_display);
+set_icon_num(window_display, icon_v_front_porch,  current_mode->v_front_porch);
+set_icon_num(window_display, icon_v_required,     current_mode->v_required);
+set_icon_num(window_display, icon_v_sync_width,   current_mode->v_sync_width);
+set_icon_num(window_display, icon_v_top_border,   current_mode->v_top_border);
+set_icon_num(window_display, icon_v_total,        current_mode->v_total);
+set_icon_num(window_display, icon_x_resolution,   current_mode->x_resolution);
+set_icon_num(window_display, icon_y_resolution,   current_mode->y_resolution);
+}
+
+void check_frame_rate(void)
+{
+    char buff[24];
+    monitor *mon;
+    mode *m;
+    int x = 0;
+    m = current_mode;
+
+    mon = monitors;
+
+    /* Find monitor in linked list */
+
+    for(x = 0; x < current_monitor-1 ;x++)
+     mon = mon->next;
+
+    /*
+    tracef1("minv = %d \n",mon->min_v);
+    tracef1("maxv = %d \n",mon->max_v);
+    */
+
+    if((m->frame_rate) < mon->min_v || (m->frame_rate) > mon->max_v)
+       set_icon_colours(window_display, icon_frame_rate,11, 1);
+    else
+       set_icon_colours(window_display, icon_frame_rate,7, 1);
+
+    sprintf(buff, "%d Hz", m->frame_rate);
+    set_icon_text(window_display, icon_frame_rate, buff);
+}
+
+void check_line_rate(void)
+{
+    char buff[24];
+    monitor *mon;
+    mode *m;
+    int x = 0;
+    m = current_mode;
+
+    mon = monitors;
+
+    /* Find monitor in linked list */
+
+    for(x = 0; x < current_monitor -1 ;x++)
+     mon = mon->next;
+
+    DEBUG debug_output("check_line_rate","current monitor = %d\n",current_monitor);
+    DEBUG debug_output("check_line_rate","Monitor title = %s\n",mon->name);
+    DEBUG debug_output("check_line_rate","min line rate = %d\n",mon->min_h);
+    DEBUG debug_output("check_line_rate","max line rate = %d\n",mon->max_h);
+    
+
+    if((m->line_rate) < mon->min_h || (m->line_rate) > mon->max_h)
+       set_icon_colours(window_display, icon_line_rate,11, 1);
+    else
+       set_icon_colours(window_display, icon_line_rate,7, 1);
+
+    sprintf(buff, "%d Hz", m->line_rate);
+    set_icon_text(window_display, icon_line_rate, buff);
+
+}
+
+void update_my_display(void)
+{
+char buff[24];
+int total_res = 0;
+float multiplier, tmp;
+
+total_res = current_mode->x_resolution * current_mode->y_resolution;
+
+switch (bpp_selected)
+{
+  case 1:
+    multiplier = (float)(1.0/8.0);
+    strcpy(max_cols, "G2");
+    break;
+  case 2:
+    multiplier = (float)(1.0/4.0);
+    strcpy(max_cols, "G4");
+    break;
+  case 4:
+    multiplier = (float)(1.0/2.0);
+    strcpy(max_cols, "C16");
+    break;
+  case 8:
+    multiplier = 1;
+    strcpy(max_cols, "C256");
+    break;
+  case 16:
+    multiplier = 2;
+    strcpy(max_cols, "C32K");
+    break;
+  case 32:
+    multiplier = 4;
+    strcpy(max_cols, "C16M");
+    break;
+}
+
+tmp = (float)((current_mode->pixel_rate/1000.0)*multiplier);
+
+if(tmp > vidc_bandwidth_limit[vram_fitted])
+  set_icon_colours(window_display, icon_bandwidth,11, 1);
+else
+  set_icon_colours(window_display, icon_bandwidth,7, 1);
+
+/*tracef1("bandwidth = %f\n",(((current_mode->pixel_rate)/1000)*multiplier) );*/
+
+sprintf(buff, "%dMB/sec", (int)tmp);
+set_icon_text(window_display, icon_bandwidth,buff);
+
+tmp = total_res * multiplier / 1024;
+
+if(tmp > screen_memory)
+ set_icon_colours(window_display, icon_screen_memory,11, 1);
+else
+ set_icon_colours(window_display, icon_screen_memory,7, 1);
+
+sprintf(buff, "%dK",(int)tmp);
+set_icon_text(window_display, icon_screen_memory,buff);
+
+check_mode_timings();
+
+}
+
+/*************************************************
+*         Update the line & frame rates          *
+*************************************************/
+
+/* The rates are computed from the horizontal and vertical
+timing totals and the pixel rate. Algorithm from Tim Dobson.
+The internal mode name (for use in the menu) must be updated
+to include the pixel rate. */
+
+void update_frame_rate(mode *m)
+{
+
+if (m->h_total == 0 || m->v_total == 0) m->frame_rate = 0; else
+  {
+  int frame_rate;
+  m->line_rate = (m->pixel_rate * 1000) / m->h_total;
+  frame_rate = (m->line_rate * 1000) / m->v_total;
+  m->frame_rate = (frame_rate + 500) / 1000;
+  }
+
+/*
+sprintf(m->mode_name, "%d x %d (%d Hz)%s", m->x_resolution, m->y_resolution,
+  m->frame_rate, m->write_name? "" : "*");
+  */
+
+if (m == current_mode)
+  {
+      check_line_rate();
+      check_frame_rate();
+  }
+}
+
+
+
+/*************************************************
+*         Compute sum of horizontal timings      *
+*************************************************/
+
+void sum_horizontal(mode *m)
+{
+m->h_total =
+  m->h_sync_width   + m->h_back_porch +
+  m->h_left_border  + m->h_display +
+  m->h_right_border + m->h_front_porch;
+set_icon_num(window_display, icon_h_total, m->h_total);
+if (!hrequired_set)
+  {
+  m->h_required = m->h_total;
+  set_icon_num(window_display, icon_h_required, m->h_total);
+  }
+update_frame_rate(m);
+}
+
+
+
+/*************************************************
+*         Compute sum of vertical timings        *
+*************************************************/
+
+void sum_vertical(mode *m)
+{
+m->v_total =
+  m->v_sync_width    + m->v_back_porch +
+  m->v_top_border    + m->v_display +
+  m->v_bottom_border + m->v_front_porch;
+set_icon_num(window_display, icon_v_total, m->v_total);
+if (!vrequired_set)
+  {
+  m->v_required = m->v_total;
+  set_icon_num(window_display, icon_v_required, m->v_total);
+  }
+update_frame_rate(m);
+}
+
+
+
+/*************************************************
+*     Print a text field, stopping at control    *
+*************************************************/
+
+/* Text fields from icons tend to end with character 13 rather than 0. */
+
+static void fieldprint(FILE *f, char *s)
+{
+if (s == NULL) return;
+while (*s >= 32) fputc(*s++, f);
+}
+
+/*
+ * Save a single mode definition to a file.
+ */
+
+int save_a_definition(int number)
+{
+  FILE *f;
+  mode *p;
+
+  f = fopen(file_name, "w");
+  if (f == NULL)
+    {
+    error_moan(6, file_name);
+    return FALSE;
+    }
+
+  fprintf(f, "# Modefile written by !MakeModes version %s\n", msgs_lookup("_Version"));
+
+  /* Write the heading lines */
+
+  fprintf(f, "\nfile_format:%d\n", file_format);
+  fprintf(f, "monitor_title:");
+  fieldprint(f, monitor_title);
+  fprintf(f, "\n");
+  fprintf(f, "DPMS_state:%d\n", monitor_dpms_state);
+
+  /* If called with -1, this routine will save the currently selected mode,
+     if not, it will save the mode corresponding to 'number' */
+
+  if(number == -1)
+  {
+    if(current_mode == NULL)
+     current_mode = mode_chain;
+    p = current_mode;
+  }
+  else
+   {
+     int x;
+     p = mode_chain;
+     for(x = 0; x<number; x++)
+     {
+       p = p->next;
+       if(p == NULL)
+        werr(0,msgs_lookup("34"));
+     }
+   }
+
+  fprintf(f, "\n# %d x %d (%dHz)\n", p->x_resolution, p->y_resolution,
+             p->frame_rate);
+  fprintf(f, "startmode\n");
+
+  if (p->write_name)
+  {
+    fprintf(f, "mode_name:%s\n", p->mode_name);
+  }
+  else
+  {
+    if(number == -1)
+     fprintf(f, "mode_name: TmpMode\n");
+    else
+    {
+      char buffer[350];
+      werr(0,msgs_lookup("33"));
+      fclose(f);
+      sprintf(buffer,"delete %s",file_name);
+      SWI(OS_CLI,1,buffer);
+      return FALSE;
+    }
+  }
+
+  fprintf(f, "x_res:%d\n", p->x_resolution);
+  fprintf(f, "y_res:%d\n", p->y_resolution);
+  fprintf(f, "pixel_rate:%d\n", p->pixel_rate);
+  fprintf(f, "h_timings:%d,%d,%d,%d,%d,%d\n", p->h_sync_width,
+              p->h_back_porch, p->h_left_border, p->h_display,
+              p->h_right_border, p->h_front_porch);
+  fprintf(f, "v_timings:%d,%d,%d,%d,%d,%d\n", p->v_sync_width,
+              p->v_back_porch, p->v_top_border, p->v_display,
+              p->v_bottom_border, p->v_front_porch);
+  fprintf(f, "sync_pol:%d\n", p->sync_pol);
+  fprintf(f, "endmode\n");
+
+  /* Close the file and return success */
+
+  fprintf(f, "\n# End\n");
+  fclose(f);
+  return TRUE;
+}
+
+/*************************************************
+*          Save modes in a modefile              *
+*************************************************/
+
+/* Yield FALSE if something goes wrong. File_name must
+contain a fully-qualified path. */
+
+int save_file(void)
+{
+FILE *f;
+mode *p, *l;
+char *mn = monitor_title;
+stringchain *c = comments;
+int i;
+
+/* Ensure that the modes are in ascending order */
+
+sort_modes();
+
+/* If the name doesn't contain a dollar, it can't be fully qualified. */
+
+if (strchr(file_name, '$') == NULL)
+  {
+    werr(0,"%s",msgs_lookup("4"));
+    return FALSE;
+  }
+
+/* Get last square pixel mode */
+
+p = mode_chain;
+i = 0;
+while(p!=NULL)
+{
+  if((p->x_resolution/p->y_resolution) < 2)
+   l = p;
+
+  p = p->next;
+  i++;
+}
+
+/* Ensure that the last square pixel mode in the chain has a name. If it does
+   not, DisplayManager 0.28 will crash */
+
+if( !l->write_name )
+{
+  werr(0,"%s (%d x %d %d Hz)",msgs_lookup("32"),l->x_resolution,l->y_resolution,l->frame_rate);
+  return FALSE;
+}
+
+/* Check that a monitor name exists */
+
+while (*mn == ' ') mn++;
+if (*mn == 0)
+  {
+     werr(0,"%s",msgs_lookup("21"));
+     return FALSE;
+  }
+
+/* Prepare to write the file */
+
+f = fopen(file_name, "w");
+if (f == NULL)
+  {
+  error_moan(6, file_name);
+  return FALSE;
+  }
+
+/* Write out the comments lines, ensuring they start with # characters */
+
+fprintf(f, "# Modefile written by !MakeModes version %s\n", msgs_lookup("_Version"));
+if (c != NULL)
+  {
+  while (c != NULL)
+    {
+    fprintf(f, "%s%s", (c->text[0] != '#')? "# " : "", c->text);
+    c = c->next;
+    }
+  fprintf(f, "\n");
+  }
+
+/* Write the heading lines */
+
+fprintf(f, "\nfile_format:%d\n", file_format);
+fprintf(f, "monitor_title:");
+fieldprint(f, monitor_title);
+fprintf(f, "\n");
+fprintf(f, "DPMS_state:%d\n", monitor_dpms_state);
+
+/* Write out each mode */
+
+p = mode_chain;
+while (p != NULL)
+  {
+  fprintf(f, "\n# %d x %d (%dHz)\n", p->x_resolution, p->y_resolution,
+    p->frame_rate);
+  fprintf(f, "startmode\n");
+
+  if (p->write_name)
+  {
+    fprintf(f, "mode_name:%s\n", p->mode_name);
+  }
+  else
+    fprintf(f, "mode_name:\n");
+
+  fprintf(f, "x_res:%d\n", p->x_resolution);
+  fprintf(f, "y_res:%d\n", p->y_resolution);
+  fprintf(f, "pixel_rate:%d\n", p->pixel_rate);
+  fprintf(f, "h_timings:%d,%d,%d,%d,%d,%d\n", p->h_sync_width,
+    p->h_back_porch, p->h_left_border, p->h_display,
+    p->h_right_border, p->h_front_porch);
+  fprintf(f, "v_timings:%d,%d,%d,%d,%d,%d\n", p->v_sync_width,
+    p->v_back_porch, p->v_top_border, p->v_display,
+    p->v_bottom_border, p->v_front_porch);
+  fprintf(f, "sync_pol:%d\n", p->sync_pol);
+  fprintf(f, "endmode\n");
+
+  p = p->next;
+  }
+
+/* Close the file and return success */
+
+fprintf(f, "\n# End\n");
+fclose(f);
+return TRUE;
+}
+
+/*************************************************
+*            Check current mode is OK            *
+*************************************************/
+
+/* This check is called before leaving a mode or saving the file. It
+checks that required field checks out. No longer used, not much point!*/
+
+int check_mode(void)
+{
+if (!hrequired_set || !vrequired_set)
+  {
+    werr(0,"%s",msgs_lookup("13"));
+    return FALSE;
+  }
+
+if (current_mode->h_total != current_mode->h_required ||
+    current_mode->v_total != current_mode->v_required)
+  {
+    werr(0,"%s",msgs_lookup("14"));
+    return FALSE;
+  }
+return TRUE;
+}
+
+
+
+
+
+/*************************************************
+*         Create a menu for the modes            *
+*************************************************/
+
+void make_modes_menu(void)
+{
+int i, tick;
+char buffer[2048];
+char tmp[256];
+mode *p;
+
+if(menu_modes != NULL)
+ menu_dispose(&menu_modes,0);
+
+sort_modes();
+
+p = mode_chain;
+
+buffer[0] = '\0';
+
+for (i = 0; i < mode_count; i++)
+  {
+    sprintf(tmp, "%d x %d (%d Hz)%s",p->x_resolution, p->y_resolution, p->frame_rate, p->write_name? "":"*");
+    /*strcat(buffer, p->mode_name);*/
+    strcat(buffer, tmp);
+    strcat(buffer,",");
+    if(p == current_mode)
+    {
+      if(i<mode_count)
+       tick = i+1;
+    }
+    p = p->next;
+  }
+
+  buffer[strlen(buffer)-1] = '\0';
+  terminate_string(buffer);
+  menu_modes = menu_new("Modes", buffer);
+
+  menu_setflags(menu_modes, tick, 1,NULL);
+  return;
+}
+
+menu calculate_menu_position(menu mn, wimp_mousestr *m)
+{
+  wimp_eventstr *e = wimpt_last_event();
+  int x,y;
+  wimp_icon icon;
+  wimp_wstate state;
+  wimp_winfo  winfo;
+
+  wimpt_complain(wimp_get_icon_info(m->w, m->i, &icon));
+
+  winfo.w = m->w;
+  wimp_get_wind_info((wimp_winfo *)((uintptr_t)&winfo | 1 /* No icons */));
+
+  wimp_get_wind_state(m->w, &state);
+  x = (state.o.x + state.o.box.x0 + icon.box.x1 + 50) - (winfo.info.scx * 2);
+  y = -state.o.y + state.o.box.y1 + icon.box.y1 - 4;
+  if(e->data.but.m.x != x || e->data.but.m.y != y)
+  {
+     e->data.but.m.x = x;
+     e->data.but.m.y = y;
+     wimpt_fake_event(e);
+     return((menu)&dummy);
+  }
+
+  return(mn);
+}
+
+menu alter_monitors_menu(void *handle)
+{
+  wimp_mousestr m;
+  BOOL rebuild = event_is_menu_being_recreated();
+
+  dummy.m = 0;
+
+  if(rebuild)
+    return(last_menu);
+
+  wimp_get_point_info(&m);
+
+  if(m.w == window_generate)
+  {
+    switch(m.i)
+    {
+      case icon_g_monitor_menu:    last_menu = menu_monitors;
+                                   help_register_handler(NULL,NULL);
+                                   return(calculate_menu_position(menu_monitors, &m));
+                                   break;
+    }
+  }
+
+  if(m.w == window_display)
+  {
+    switch(m.i)
+    {
+      case icon_current_mode  :    last_menu = menu_modes;
+                                   help_register_handler(NULL, NULL);
+                                   return(calculate_menu_position(menu_modes, &m));
+                                   break;
+
+      case icon_monitor_menu  :    last_menu = menu_monitors;
+                                   help_register_handler(NULL, NULL);
+                                   return(calculate_menu_position(menu_monitors, &m));
+                                   break;
+
+      case icon_bpp_menu      :    last_menu = menu_bpp;
+                                   help_register_handler(help_simplehandler, (char *)"BppHelp");
+                                   return(calculate_menu_position(menu_bpp, &m));
+                                   break;
+    }
+  }
+
+  if(m.w == window_display)
+  {
+    last_menu = menu_display;
+    help_register_handler(help_simplehandler, (char *)"DispHelp");
+    return(menu_display);
+  }
+
+  return ((menu)&dummy);
+}
+
+/***********************************************
+*        Create a monitors memu                *
+***********************************************/
+
+void make_new_monitors_menu(void)
+{
+  int i,len = 0;
+  monitor *p = monitors;
+  char buffer[2048];
+
+  buffer[0] = '\0';
+
+  for(i=0; i < monitor_count; i++)
+  {
+    len+=strlen(p->name)+1;
+    strcat(buffer, p->name);
+    strcat(buffer, ",");
+    p = p->next;
+  }
+
+  buffer[strlen(buffer)-1] = '\0';
+
+  terminate_string(buffer);
+
+  menu_monitors = menu_new("Monitors",buffer);
+}
+
+/*************************************************
+*         Create a menu for the monitors         *
+*************************************************/
+
+menu_block *make_monitors_menu(void)
+{
+int i;
+int maxlength = 0;
+monitor *p = monitors;
+menu_item *mm;
+menu_block *m = malloc(sizeof(menu_block) +
+  (monitor_count - 1)*sizeof(menu_item));
+
+if (m == NULL)
+  {
+    werr(0,"%s",msgs_lookup("12"));
+    return NULL;
+  }
+
+strcpy(m->title, "Monitors");
+m->title_foreground = 7;
+m->title_background = 2;
+m->work_foreground = 7;
+m->work_background = 0;
+m->item_height = menu_item_height;
+m->item_gap = 0;
+
+for (i = 0; i < monitor_count; i++)
+  {
+  indirect_icon_data *ii;
+  int length = strlen(p->name);
+
+  mm = m->items + i;
+  ii = &(mm->idata.ind);
+
+  mm->flags = 0;
+  mm->submenu = (menu_block *)(-1);
+  mm->iflags = F_indirected + F_text + F_filled + 0x07000000,
+
+  ii->text = p->name;
+  ii->valid = NULL;
+  ii->length = length;
+  if (length > maxlength) maxlength = length;
+
+  p = p->next;
+  }
+
+m->item_width = 8 + (16*maxlength) + 8;
+mm->flags |= F_last;
+
+return m;
+}
+
+
+
+
+/*************************************************
+*            Open the checksave window           *
+*************************************************/
+
+void open_checksave(void)
+{
+window_state_block ws;
+ws.window = window_checksave;
+ws.infront = -1;
+SWI(Wimp_GetWindowState, 2, 0, (int)(&ws));
+SWI(Wimp_OpenWindow, 2, 0, (int)(&ws));
+checksave_open = TRUE;
+}
+
+
+
+
+/*************************************************
+*             Discard the data                   *
+*************************************************/
+
+/* This routine also closes the window. */
+
+void discard_data(void)
+{
+free_modes();
+free_comments();
+
+mode_count = 0;
+last_mode = NULL;
+SWI(Wimp_CloseWindow, 2, 0, (int)(&window_display));
+display_open = FALSE;
+}
+
+/*************************************************
+*              Close the checksave window        *
+*************************************************/
+
+
+void close_checksave(void)
+{
+SWI(Wimp_CloseWindow, 2, 0, (int)(&window_checksave));
+checksave_open = FALSE;
+}
+
+
+/* End of mmsubs.c */
+

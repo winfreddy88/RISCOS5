@@ -1,0 +1,628 @@
+/* Copyright 2007 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/* -> c.Edit
+ * Title: Edit
+ * Purpose: main driving program for text editor.
+ * History:
+ *   13-Mar-88: WRS: history started.
+ *    1-Jun-90: NDR: Check for Message_DataOpen with estimated size <= -2, and load untitled
+ *   08-Nov-90: IDJ: major surgery to merge sources with SrcEdit (the DDE editor)
+ *                   if SRCEDIT is #defined during compilation, then this makes !SrcEdit
+ *                   otherwise it is plain old Edit
+ *   07-Mar-91: IDJ: use flex_budge on startup
+ *
+ *   Re-release
+ *   12-Nov-91: IDJ: fixed int help message from iconbar (DDE-0812)
+ *   14-Nov-91: IDJ: cache mode vars on a mode change (DDE-0859)
+ *   11-Jun-07: CGR: Basic Editing added, Create more filetypes and unnamed filetype
+ */
+
+#define BOOL int
+#define TRUE 1
+#define FALSE 0
+
+#define BASIC TRUE
+
+
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <time.h>
+#include "kernel.h"
+#include "utils.h"
+
+#include "akbd.h"
+#include "flex.h"
+#include "os.h"
+#include "swis.h"
+#include "wimp.h"
+#include "sprite.h"
+#include "wimpt.h"
+#include "werr.h"
+#include "win.h"
+#include "menu.h"
+#include "template.h"
+#include "dbox.h"
+#include "txt.h"
+#include "txtscrap.h"
+#include "typdat.h"
+#include "txtedit.h"
+#include "event.h"
+#include "res.h"
+#include "resspr.h"
+#include "trace.h"
+#include "dboxquery.h"
+#include "baricon.h"
+#include "xferrecv.h"
+#include "msgs.h"
+#include "help.h"
+#include "txtopt.h"
+#include <limits.h>
+
+#include "taskwin.h"
+#include "editv.h"
+
+#ifdef SRCEDIT
+
+#include "languages.h"
+#include "options.h"
+#include "bool.h"
+#include "multiedit.h"
+#include "upcalls.h"
+#include "throwback.h"
+#include "DDEswis.h"
+#include "saveall.h"
+#include "langhelp.h"
+
+#endif
+
+
+/* defines for editors - Edit and SrcEdit main differences are collected here */
+
+static menu edit__iconmenu = 0;
+
+#ifdef SRCEDIT
+
+   #define EDITOR_NAME    "!SrcEdit"
+   #define EDITOR_DIR     "<SrcEdit$Dir>"
+   #define EDITOR_OBEYDIR "SrcEdit$Dir"
+   #define EDITOR_OPTIONS "SrcEdit$Options"
+   #define EDITOR_TASK    "SrcEdit"
+
+   #define MProg         1
+   #define MSaveAll      2
+   #define MSaveOptions  3
+   #define MOptions      4
+   #define MCreate       5
+   #define MQuit         6
+
+   #define MText     1
+   #define MData     2
+   #define MExec     3
+   #define MObey     4
+   #define MMake     5
+   #define MTask     6
+   #define MTaskObey 7
+   #define MBasic    8
+   #define MWrite    9
+
+
+#else
+
+   #define EDITOR_NAME    "!Edit"
+   #define EDITOR_DIR     "<Edit$Dir>"
+   #define EDITOR_OBEYDIR "Edit$Dir"
+   #define EDITOR_OPTIONS "Edit$Options"
+   #define EDITOR_TASK    "Edit"
+
+   #define MProg   1
+   #define MCreate 2
+   #define MQuit   3
+
+   #define MText 1
+   #define MData 2
+   #define MExec 3
+   #define MObey 4
+   #define MTask 5
+
+#endif
+
+static char filetypebuff[10] = "";
+
+/* -------- Icon Bar Icon. -------- */
+
+static void edit__clickproc(wimp_i i)
+{
+  i=i;
+  txtedit_new("", 0xfff);
+}
+
+
+
+static void edit__iconmenuproc(void *handle, char *hit)
+{
+  txtedit_state *s;
+
+  handle=handle;
+
+  switch (hit[0])
+  {
+     case MProg:
+        editv_infoaboutprogram();
+        break;
+
+#ifdef SRCEDIT
+
+/* --- main menu entries which only apply to SrcEdit --- */
+
+      case MSaveAll:
+        saveall_savethem();
+        break;
+
+      case MSaveOptions:
+        options_save();
+        break;
+
+      case MOptions:
+        if (hit[1] != 0)
+           options_menu_processor(handle, hit+1);
+        break;
+
+#endif
+
+     case MCreate:
+        switch (hit[1])
+        {
+           case MText:
+              s = txtedit_new("", 0xfff);
+              break;
+
+           case MData:
+              s = txtedit_new("", 0xffd);
+              break;
+
+           case MExec:
+              s = txtedit_new("", 0xffe);
+              break;
+
+           case MObey:
+              s = txtedit_new("", 0xfeb);
+              if (s != 0)
+              break;
+
+#ifdef SRCEDIT
+
+           case MMake:
+             s = txtedit_new("", 0xfe1);
+             break;
+
+#endif
+
+           case MTask:
+              if (wimpt_complain(os_cli
+#ifdef SRCEDIT
+                  ("RMEnsure TaskWindow 0.25 RMLoad System:Modules.TaskWindow")
+#else
+                  ("RMEnsure TaskWindow 0 RMLoad "EDITOR_DIR".TaskWindow")
+#endif
+                  ) == 0)
+              {
+                message_taskwindow("ShellCLI_Task");
+              };
+              break;
+           case MTaskObey:
+             s = txtedit_new("", 0xfd7);
+             break;
+           case MBasic:
+             s = txtedit_new("", 0xffb);
+             break;
+           case MWrite:
+             { os_regset r;
+               char *p = filetypebuff;
+
+               while (*p >= ' ' && p-filetypebuff < 9) p++;
+               *p = 0;
+
+               r.r[0] = 31;
+               r.r[1] = (int)filetypebuff;
+               if (wimpt_complain(os_swix(OS_FSControl, &r)) == 0) {
+                 wimp_create_menu((wimp_menustr*)-1, 0, 0);
+                 s = txtedit_new("", r.r[2]);
+               }
+             }
+             break;
+       }
+       break;
+
+     case MQuit:
+       if (txtedit_mayquit()) exit(0);
+       break;
+  }
+}
+
+
+/* --------------------------- the main menu maker for SrcEdit ------------------------ */
+
+#ifdef SRCEDIT
+
+static menu edit__menu_maker(void *handle)
+{
+   menu opts = options_menu_maker(handle);
+   handle = handle;
+   help_register_handler(help_simplehandler, "IHELP");
+   if (edit__iconmenu == 0)
+   {
+       menu create_submenu;
+       edit__iconmenu = menu_new(msgs_lookup("srcedit1:SrcEdit"),
+                                msgs_lookup("srcedit2:>Info,Save all files        \x8b\x46\x39,Save options,Options,Create,Quit"));
+       create_submenu= menu_new(
+           msgs_lookup("srcedit3:Create"),
+           msgs_lookup("srcedit4:Text file,Data file,Command file,Obey file,Make file,Task window,TaskObey file,BASIC file,example"));
+       menu_make_writeable(create_submenu,MWrite,filetypebuff,9,"a~.");
+       { wimp_menuhdr *sizemenu;
+         wimp_menuitem *sizeitem;
+
+         sizemenu = (wimp_menuhdr*) menu_syshandle(create_submenu);
+         sizeitem = (wimp_menuitem*) (sizemenu+1);
+         sizeitem += MWrite-1;
+         sizeitem->iconflags &= ~wimp_IHCENTRE;
+       }
+       menu_submenu(edit__iconmenu, MCreate,create_submenu);
+       menu_submenu(edit__iconmenu, MOptions, opts);
+   }
+
+   return(edit__iconmenu);
+}
+
+#else
+
+/* --------------------------- the main menu maker for Edit ------------------------ */
+
+static menu edit__menu_maker(void *handle)
+{
+   handle = handle;
+
+   help_register_handler(help_simplehandler, "IHELP");
+
+   if (edit__iconmenu == 0)
+   {
+       edit__iconmenu = menu_new(msgs_lookup("main1"), msgs_lookup("main2"));
+       menu_submenu(edit__iconmenu, MCreate, menu_new(msgs_lookup("main3"), msgs_lookup("main4")));
+   }
+
+   return(edit__iconmenu);
+}
+
+#endif
+
+
+static void edit__createicon(void)
+{
+   baricon(EDITOR_NAME, 1, edit__clickproc);
+   event_attachmenumaker(win_ICONBAR, edit__menu_maker, edit__iconmenuproc, 0);
+}
+
+
+/* -------- Desktop saving. -------- */
+
+static os_error * save_desktop(int handle)
+{
+   char buffer[300];
+   char buffer2[256];
+   char *ptr = buffer;
+
+   os_read_var_val(EDITOR_OPTIONS, buffer2, sizeof(buffer2));
+   if (buffer2[0] != 0)
+   {
+     sprintf(ptr, "Set "EDITOR_OPTIONS" %s\n", buffer2);
+     ptr += strlen(ptr);
+   }
+
+   os_read_var_val(EDITOR_OBEYDIR,buffer2,sizeof(buffer2));
+   sprintf(ptr, "Run %s\n",buffer2);
+
+   for (ptr=buffer; *ptr; ptr++) {
+     os_error * error = os_swi2(OS_BPut, *ptr, handle);
+     if (error) return(error);
+   }
+
+   return NULL;
+}
+
+static void save_one_txt(txt t, int handle)
+{
+  size_t p = 0;
+  char  *a;
+  int    n;
+
+  do
+  {
+    /* Not sure where the dot is, so locate each segment in turn */
+    txt_arrayseg(t, p, &a, &n);
+    if (n) os_swix4(OS_GBPB, 2, handle, a, n);
+    p += n;
+  } while(n);
+}
+
+/* -------- Background sink for all unclaimed events. -------- */
+
+static void edit__bkg_events(wimp_eventstr *e, void *handle)
+{
+   handle=handle;
+
+   switch(e->e)
+   {
+      case wimp_ESEND:
+      case wimp_ESENDWANTACK:
+         if (e->data.msg.hdr.action == wimp_MPREQUIT)
+         {
+            txtedit_prequit();
+         }
+         else if (e->data.msg.hdr.action == wimp_MHELPREQUEST
+                    && e->data.msg.data.helprequest.m.w == -2
+                   )
+         {
+            e->data.msg.hdr.your_ref = e->data.msg.hdr.my_ref;
+            e->data.msg.hdr.action = wimp_MHELPREPLY;
+            e->data.msg.hdr.size = 256; /* be generous! */
+#ifdef SRCEDIT
+            sprintf(e->data.msg.data.helpreply.text, msgs_lookup("srcedit5"));
+#else
+            sprintf(e->data.msg.data.helpreply.text, msgs_lookup("main5"));
+#endif
+
+            wimpt_noerr(
+             wimp_sendmessage(wimp_ESEND, &e->data.msg, e->data.msg.hdr.task));
+
+         }
+         else if (help_process(e))
+         {
+            ; /* already done */
+         }
+         else if (e->data.msg.hdr.action == wimp_SAVEDESK)
+         {
+           if (wimpt_complain(save_desktop(e->data.msg.data.savedesk.filehandle)) != 0)
+           {
+              /* Things went wrong (e.g. disc full on file output): ack the message,
+              to stop the closedown sequence. */
+              e->data.msg.hdr.your_ref = e->data.msg.hdr.my_ref;
+              wimpt_complain(wimp_sendmessage(wimp_EACK, &e->data.msg, e->data.msg.hdr.task));
+           }
+
+         }
+
+#if BASIC
+    else if (e->data.msg.hdr.action == wimp_MPrintTypeOdd) 
+    {
+       txtedit_state *s = 0;
+       BOOL newtext = FALSE;
+       os_regset r;
+
+       if (e->data.msg.data.print.type != 0xffb  /* not basic */)
+          return;
+
+       /* --- reply --- */
+       e->data.msg.hdr.action = wimp_MPrintTypeKnown;
+       e->data.msg.hdr.your_ref = e->data.msg.hdr.my_ref;
+       if (wimpt_complain(wimp_sendmessage(wimp_ESEND, &e->data.msg, e->data.msg.hdr.task)))
+          return;
+
+       /* --- load the file --- */
+       /* look for it first */
+       s = txtedit_getstates();
+       while (s != 0)
+       {
+          if (s != 0 && !cistrcmp(s->filename, e->data.msg.data.print.name))
+             break;
+          s = s->next;
+       }
+
+       if (s == 0 || (s != 0 && (txt_charoptions(s->t) & txt_UPDATED)))
+       {
+          if ((s = txtedit_new(e->data.msg.data.print.name, 0xfff)) == 0)
+             return;
+          txt_hide(s->t);
+          newtext = TRUE;
+       }
+
+       /* --- save to Printer$Temp --- */
+       r.r[0] = 0x83; /* Open out, no path */
+       r.r[1] = (int)"<Printer$Temp>";
+       if (os_find(&r) == NULL)
+       {
+         int h = r.r[0];
+
+         save_one_txt(s->t, h);
+
+         r.r[0] = 0; /* Close */
+         r.r[1] = h;
+         os_find(&r);
+         os_swix3(OS_File, 18, "<Printer$Temp>", 0xfff);
+       }
+
+       if (newtext) txtedit_dispose(s);
+    } 
+
+#endif
+
+#ifdef SRCEDIT
+
+         /* --- request to start a throwback sesh --- */
+
+         else if (e->data.msg.hdr.action == MSG_Throwback_Start)
+         {
+           throwback_new_session(e->data.msg.hdr.task);
+         }
+
+         /* --- mode chanfe (recache mode vars) --- */
+         else if (e->data.msg.hdr.action == wimp_MMODECHANGE)
+         {
+            wimpt_checkmode();
+         }
+#endif
+         else
+         {
+
+            int estsize;
+            int filetype = xferrecv_checkimport(&estsize);
+            if (filetype != -1)
+            {
+               /* drag icon in-store to icon bar. Create window and insert. */
+               txtedit_state *s = txtedit_new("", filetype);
+               if (s != 0)
+               {  /* 14-Dec-88 WRS: check inserted. */
+                  if (! txtedit_doimport(s, filetype, estsize))
+                    txtedit_dispose(s);
+               }
+            }
+            else
+            {
+               char *filename;
+               BOOL generalload = wimpt_last_event()->data.msg.hdr.action == wimp_MDATAOPEN;
+               BOOL untitledgeneral = generalload && wimpt_last_event()->data.msg.data.dataload.size <= -2;
+                    /* note that the Filer in RISC OS 2.00 supplies estsize = -1, so we check for -2 */
+               filetype = xferrecv_checkinsert(&filename);
+               if (filetype == 0xfff || (filetype != -1 && !generalload))
+               {
+                  if (xferrecv_file_is_safe() && !untitledgeneral)
+                  {  /* it's a "real" file, with estsize > -2 */
+                     txtedit_state *s;
+#ifdef SRCEDIT
+                     multiedit_reset_closeit();
+#endif
+                     s = txtedit_new(filename, filetype);
+                     xferrecv_insertfileok();
+#ifdef SRCEDIT
+                     /* 28-Feb-90: IDJ: see if edit should be cancelled */
+                     if (multiedit_closeit())
+                         txtedit_dispose(s);
+#endif
+
+                  }
+                  else
+                  {
+                     txtedit_state *s;
+
+#ifdef SRCEDIT
+                     multiedit_reset_closeit();
+#endif
+
+                     s = txtedit_new("", filetype);
+                     if (s != 0)
+                     {
+                        txtedit_doinsertfile(s, filename, FALSE);
+                        xferrecv_insertfileok();
+#ifdef SRCEDIT
+                        /* 28-Feb-90: IDJ: see if edit should be cancelled */
+                        if (multiedit_closeit())
+                            txtedit_dispose(s);
+#endif
+                     }
+                  }
+               }
+            }
+         }
+         break;
+      default:
+        tracef1("edit: unrecognised event type %i.\n", e->e);
+   }
+}
+
+
+#ifdef SRCEDIT
+
+/* -------- exit handler to stop throwback sent to us --- */
+static void unregister_throwback(void)
+{
+   os_swix1(DDEUtils_ThrowbackUnregister, wimpt_task());
+}
+
+#endif
+
+/* -------- Main Program. -------- */
+
+int main(int argc, char *argv[])
+{
+   char *filename;
+   argc=argc;
+
+   wimp_corrupt_fp_state_on_poll();
+   wimpt_init(EDITOR_TASK);
+
+   flex_init();
+#ifdef SRCEDIT
+   /* Not necessary with current RISC_OSLib */
+   /* _kernel_register_slotextend(flex_budge); */
+#endif
+   res_init(EDITOR_TASK);
+   msgs_init();
+   resspr_init();
+   template_init();
+   dbox_init();
+   dboxquery_close(0); /* init */
+   dboxquery_quit(0);
+#ifdef SRCEDIT
+   txtopt_set_name("SrcEditLib");
+   languages_init();
+   options_init();
+#endif
+   txt_init();
+   txtedit_init();
+
+   edit__createicon();
+
+#ifdef SRCEDIT
+
+   /* register txtedit_state open/close handlers */
+   txtedit_register_open_handler(upcalls_open_handler, 0);
+   txtedit_register_close_handler(upcalls_close_handler, 0);
+
+#endif
+#if BASIC
+  {
+    int tok, detok;
+    char buff[255];
+
+    os_read_var_val("SrcEdit$Detokenise", buff, 255);
+    detok = atoi(buff);
+    os_read_var_val("SrcEdit$Tokenise", buff, 255);
+    tok = atoi(buff);
+    txtedit_setBASICaddresses(tok, detok);
+    txtedit_setBASICstrip(options_basicstrip()); /* ensure txtedit is in sync with our flag */
+    txtedit_setBASICincrement(options_basicincrm());
+  }
+#endif
+
+   filename = argv[1];
+   if (filename != NULL) txtedit_new(filename, 0);
+
+   win_register_event_handler(win_ICONBARLOAD, edit__bkg_events, 0);
+   win_claim_unknown_events(win_ICONBARLOAD);
+   message_init();
+   atexit(killalltasks);
+
+#ifdef SRCEDIT
+
+   /* register ourselves as a throwback task */
+   os_swix1(DDEUtils_ThrowbackRegister, wimpt_task());
+   atexit(unregister_throwback);
+
+#endif
+
+   while (TRUE)
+     event_process();
+
+   return 0;
+}

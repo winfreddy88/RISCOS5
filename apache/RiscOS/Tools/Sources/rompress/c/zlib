@@ -1,0 +1,120 @@
+/* Copyright 2012 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+
+#include "zlib/zlib.h"
+#include "CLX/err.h"
+
+#include "rompress.h"
+#include "zlib.h"
+
+extern char rompress_zinflate__base[], rompress_zinflate__limit[];
+
+static uint32_t test_ws;
+
+static voidpf test_alloc(voidpf opaque,uInt items,uInt size)
+{
+  (void)opaque;
+  uint32_t sz = items*size;
+  test_ws += (sz+3)&~3;
+  return calloc(items,size);
+}
+
+static void test_free(voidpf opaque,voidpf address)
+{
+  (void)opaque;
+  free(address);
+}
+
+static uint32_t test_inflate(void *dest,uint32_t destlen,void *source,uint32_t sourcelen)
+{
+  int error;
+  test_ws = 0;
+  /* Set up stream structure */
+  z_stream stream;
+  stream.zalloc = test_alloc;
+  stream.zfree = test_free;
+  stream.opaque = Z_NULL;
+  error = inflateInit(&stream);
+  if (error)
+  {
+    err_report("Error code %d received from inflate engine",error);
+    return 0;
+  }
+  stream.next_in = source;
+  stream.avail_in = sourcelen;
+  stream.next_out = dest;
+  stream.avail_out = destlen;
+  error = inflate(&stream,Z_FINISH);
+  inflateEnd(&stream);
+  if(error != Z_STREAM_END)
+  {
+    err_report("Error code %d received from inflate engine",error);
+    return 0;
+  }
+  return test_ws;
+}
+
+void do_zlib(OSHdr *hdr,char *data,uint32_t len)
+{
+  char *outbuf = safemalloc(len);
+  uLong outsize = len;
+  /* Take the easy route and compress into a temp buffer */
+  int error = compress2((Bytef *) outbuf,&outsize,(Bytef *) data,len,Z_BEST_COMPRESSION);
+  if ((error == Z_BUF_ERROR) || (((outsize+3)&~3) >= len))
+  {
+    /* Failed to compress; don't complain */
+    if(outsize > len) err_fail("zlib library overflowed compression buffer!");
+    free(outbuf);
+    return;
+  }
+  else if (error)
+  {
+    /* Unexpected error - complain! */
+    err_report("Error code %d received from deflate engine",error);
+    free(outbuf);
+    return;
+  }
+  /* Test decompression to find out how much workspace is needed */
+  uint32_t ws = test_inflate(data,len,outbuf,(uint32_t) outsize);
+  /* Copy compressed data back to source buffer */
+  memcpy(data,outbuf,(size_t) outsize);
+  free(outbuf);
+  if(!ws)
+    return;
+  /* Align */
+  uint32_t zsize = (uint32_t) outsize;
+  while(outsize & 3)
+    data[outsize++] = 'z';
+  /* Copy in decompression stub */
+  uint32_t stubsize = rompress_zinflate__limit-rompress_zinflate__base;
+  if(len-outsize <= stubsize)
+    return;
+  memcpy(data+outsize,rompress_zinflate__base,stubsize);
+  /* Patch up the OS header */
+  hdr->DecompressHdr = (uint32_t) outsize+((uint32_t) data)-((uint32_t) hdr);
+  hdr->CompressedSize = hdr->DecompressHdr+stubsize;
+  /* Patch up the decompression stub */
+  ws += hdr->CompressedSize-hdr->CompressOffset;
+  ws = (ws+4095)&~4095;
+  uint32_t *stub = (uint32_t *) (outsize+data);
+  stub[0] = ws;
+  stub[2] = zsize;
+  stub[3] = outsize+stubsize;
+}

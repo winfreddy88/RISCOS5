@@ -1,0 +1,1611 @@
+/*
+ * Copyright (c) 2014, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
+#include "udl_riscos.h"
+
+#include <dev/usb/usb.h>
+#include <dev/usb/usbdi.h>
+
+#include "kernel.h"
+#include "swis.h"
+
+#include "Interface/DeviceFS.h"
+
+#include "udl.h"
+#include "screen.h"
+#include "netbsd.h"
+#include "instance.h"
+
+/* Insert a huffman bit sequence into an output buffer */
+#define INSERT_BITS(BASE,CHECK) \
+{ \
+	int bits = MIN(8-(bit&7),bit_count); \
+	byte |= bit_pattern<<(bit & 7); \
+	bit_pattern >>= bits; \
+	bit += bits; \
+	bit_count -= bits; \
+	if(!(bit & 7)) \
+	{ \
+		BASE[(bit>>3)-1] = byte; \
+		CHECK(bit_count >= 8) \
+		{ \
+			BASE[bit>>3] = bit_pattern; \
+			bit_pattern >>= 8; \
+			bit += 8; \
+			bit_count -= 8; \
+		} \
+		byte = bit_pattern; \
+		bit += bit_count; \
+	} \
+}
+
+#define INSERT_BITS_CUR \
+{ \
+	int bits = MIN(8-(bit&7),bit_count); \
+	byte |= bit_pattern<<(bit & 7); \
+	bit_pattern >>= bits; \
+	bit += bits; \
+	bit_count -= bits; \
+	if(!(bit & 7)) \
+	{ \
+		*cur_p++ = byte; \
+		bit += bit_count; \
+		while(bit_count >= 8) \
+		{ \
+			*cur_p++ = bit_pattern; \
+			bit_pattern >>= 8; \
+			bit_count -= 8; \
+		} \
+		byte = bit_pattern; \
+	} \
+}
+
+/* Max huffman packet size for a 256 word write operation */
+static const int max_huffman_16_packet_size = 4*256+6; /* Over-estimate */
+static const int max_huffman_8_packet_size = (10*256/8)+6; /* Exact - longest sequence is 10 bits */
+
+#ifdef DEBUGLIB
+static uint8_t *get_packet_(struct udl_softc *sc,int size,int line)
+{
+	if(size > UDL_CMD_MAX_XFER_SIZE)
+	{
+		dprintf(("","buffer overflow! %d @ %d\n",size,line));
+	}
+	if(sc->sc_cmd_buf.off)
+	{
+		dprintf(("","udl_cmd_buf not empty! @ %d\n",line));
+	}
+#define get_packet(A,B) get_packet_(A,B,__LINE__)
+#else
+static uint8_t *get_packet(struct udl_softc *sc,int size)
+{
+#endif
+	my_pipe *mpipe = (my_pipe *) sc->sc_tx_pipeh;
+	void *ptr;
+	/* When generating data packets we prefer to write directly into the DeviceFS buffer. If there isn't enough room, use sc_cmd_buf and rely on the buffer manager to copy the data for us. */
+	size_t avail = buffer_nextfreeblock(mpipe->bufh,&ptr);
+	if(avail < size)
+	{
+		return sc->sc_cmd_buf.buf;
+	}
+	return (uint8_t *) ptr;
+}
+
+bool finish_packet(struct udl_softc *sc,uint8_t *start,uint8_t *end)
+{
+	my_usbdev *mdev = (my_usbdev *) sc->sc_iface;
+	my_pipe *mpipe = (my_pipe *) sc->sc_tx_pipeh;
+	size_t remain = end-start;
+	bool warned = false;
+	clock_t t = clock();
+	clock_t t2 = t;
+#ifdef SPOOL
+	if(spool) fwrite(start,remain,1,spool);
+#endif
+	do
+	{
+		remain = buffer_insert(&mpipe->internal,end-remain,remain);
+		if(remain)
+		{
+			if(!warned)
+			{
+				dprintf(("","finish_packet: %d/%d remain\n",remain,end-start));
+				warned = true;
+			}
+			/* Are we already aware of a breakage? */
+			if(mdev->broken)
+			{
+				dprintf(("","finish_packet: Device broken\n"));
+				return false;
+			}
+			/* If the buffer is full it might be because of an error */
+			_kernel_oserror *e = _swix(DeviceFS_CallDevice,_INR(0,2),DeviceCall_MonitorTX,mdev->devname,mpipe->strh);
+			if(e)
+			{
+				dprintf(("","finish_packet: Error %x %s\n",e->errnum,e->errmess));
+				mdev->broken = true;
+				return false;
+			}
+			/* However if the device has crashed then we can usually only find out about it by polling the status register
+			   Only poll infrequently, to avoid generating too much extra bus traffic */
+			t2 = clock();
+			if(t2-t >= 2)
+			{
+				t = t2;
+				uint32_t status;
+				usbd_status err = udl_poll(sc,&status);
+				if(err)
+				{
+					dprintf(("","finish_packet: Poll err %d\n",err));
+					mdev->broken = true;
+					return false;
+				}
+				/* A status of xxxx2xxx appears to correspond to a stuffed device */
+				if((status & 0xf000) == 0x2000)
+				{
+					dprintf(("","finish_packet: Status %08x\n",status));
+					mdev->broken = true;
+					return false;
+				} 
+			}
+		}
+	} while(remain);
+
+	return true;
+}
+
+/* TODO make caller add offsets to dest1+dest2 */
+static void memset32x2(void *dest1,void *dest2,int offset,int w,uint32_t val)
+{
+	if(offset & 2)
+	{
+		((uint16_t *)dest1)[offset/2] = val;
+		((uint16_t *)dest2)[offset/2] = val;
+		w-=2;
+		offset += 2;
+	}
+	offset = offset>>2;
+	uint32_t *d1 = ((uint32_t *) dest1)+offset;
+	uint32_t *d2 = ((uint32_t *) dest2)+offset;
+	while(w>=4)
+	{
+		*d1++ = val;
+		*d2++ = val;
+		w-=4;
+	}
+	if(w)
+		*((uint16_t *)d1) = *((uint16_t *)d2) = val;
+}
+
+static inline int MIN(int a,int b)
+{
+	return (a<b?a:b);
+}
+
+void screen_clear(struct udl_softc *sc,int words)
+{
+	/* Clear screen without touching any RO screen buffers */
+
+	if(!words)
+		words = (sc->sc_width*sc->sc_height*3+1)/2; /* Assume 24bpp */
+
+	/* Work out chunk size required to avoid overflowing sc_cmd_buf */
+	int chunk_size = words;
+	while(((chunk_size+255)>>8)*9 > UDL_CMD_MAX_XFER_SIZE)
+		chunk_size >>= 1;
+ 
+	int offset = 0;
+	while(words)
+	{
+		uint8_t *packet = get_packet(sc,((chunk_size+255)>>8)*9);
+		uint8_t *cur_p = packet;
+
+		int chunk = MIN(words,chunk_size);
+		words -= chunk;
+
+		while(chunk)
+		{
+			int amount = MIN(chunk,256);
+	
+			*cur_p++ = UDL_BULK_SOC;
+			*cur_p++ = UDL_BULK_CMD_FB_RLE16;
+			*cur_p++ = offset>>16;
+			*cur_p++ = offset>>8;
+			*cur_p++ = offset;
+			*cur_p++ = amount;
+			*cur_p++ = amount;
+			*cur_p++ = 0;
+			*cur_p++ = 0;
+	
+			offset += amount*2;
+			chunk -= amount;
+		}
+		if(!finish_packet(sc,packet,cur_p))
+			return;
+	}
+}
+
+
+
+/*
+
+				16BPP ROUTINES
+
+*/
+
+bool screen_process_16(instance_t *i,int amount)
+{
+	if(i->huffman_enabled)
+	{
+		return screen_process_16_huff(i,amount);
+	}
+	const uint32_t *screen = (const uint32_t *) i->scrstate.screen;
+	uint32_t *shadow = (uint32_t *) i->scrstate.shadow;
+	int offset = i->scrstate.curoffset/4;
+	bool updated = false;
+	while(amount)
+	{
+		int process = MIN(amount,i->scrstate.vend-(offset<<2));
+		amount -= process;
+
+		/* Scan ahead to the first difference */
+		int skip = memcmp_len(screen,shadow,offset<<2,process);
+		offset += skip>>2;
+		process -= skip;
+
+		while(process)
+		{
+			uint32_t word = screen[offset];
+			process-=4;
+			if(word != shadow[offset])
+			{
+				int temp = offset<<2;
+				shadow[offset++] = word;
+
+				uint8_t *packet = get_packet(&i->softc,6+256*2);
+				uint8_t *cur_p = packet;
+				*cur_p++ = UDL_BULK_SOC;
+				*cur_p++ = UDL_BULK_CMD_FB_WRITE16;
+				*cur_p++ = temp>>16;
+				*cur_p++ = temp>>8;
+				*cur_p++ = temp;
+				cur_p++; /* Skip length field */
+				*cur_p++ = word>>8;
+				*cur_p++ = word;
+				*cur_p++ = word>>24;
+				*cur_p++ = word>>16;
+				int count=2;
+				int rewind=0;
+				while((count < 256) && process && (rewind < 3))
+				{
+					word = screen[offset];
+					if(word == shadow[offset])
+					{
+						/* Keep track of longest run of matching pixels, so that if it gets too long we can split this into two commands to save space */
+						rewind++;
+					}
+					else
+					{
+						rewind = 0;
+						shadow[offset] = word;
+					}
+					offset++;
+					process-=4;
+					count += 2;
+					*cur_p++ = word>>8;
+					*cur_p++ = word;
+					*cur_p++ = word>>24;
+					*cur_p++ = word>>16;
+				}
+				/* Trim any unmatched pixels */
+				count -= rewind*2;
+				cur_p -= rewind*4;
+				packet[5] = count;
+				if(!finish_packet(&i->softc,packet,cur_p))
+					return false;
+				updated = true;
+			}
+			else
+			{
+				offset++;
+			}
+
+			if(process)
+			{
+				/* Scan ahead to the next difference */
+				int skip = memcmp_len(screen,shadow,offset<<2,process);
+				offset += skip>>2;
+				process -= skip;
+			}
+		}
+		if(offset == i->scrstate.vend/4)
+			offset = i->scrstate.vinit/4;
+	}
+	i->scrstate.curoffset = offset*4;
+
+	return updated;
+}
+
+void screen_fill_16(instance_t *i,uint16_t col,int x,int y,int w,int h)
+{
+	/* Work out chunk size to avoid overflowing sc_cmd_buf */
+	int chunk_h = h;
+	while(chunk_h*((w+255)>>8)*9 > UDL_CMD_MAX_XFER_SIZE)
+		chunk_h >>= 1;
+
+	while(h)
+	{
+		int chunk = MIN(h,chunk_h);
+		uint8_t *packet = get_packet(&i->softc,chunk*((w+255)>>8)*9);
+		uint8_t *cur_p = packet;
+
+		h -= chunk;
+
+		while(chunk--)
+		{
+			int offset = x*2+y*i->scrstate.stride+i->scrstate.vrender;
+			memset32x2(i->scrstate.screen,i->scrstate.shadow,offset,w*2,col|(col<<16));
+			int cur_w = w;
+			while(cur_w)
+			{
+				int amount = MIN(cur_w,256);
+
+				*cur_p++ = UDL_BULK_SOC;
+				*cur_p++ = UDL_BULK_CMD_FB_RLE16;
+				*cur_p++ = offset>>16;
+				*cur_p++ = offset>>8;
+				*cur_p++ = offset;
+				*cur_p++ = amount;
+				*cur_p++ = amount;
+				*cur_p++ = col>>8;
+				*cur_p++ = col;
+
+				offset += amount*2;
+				cur_w -= amount;
+			}
+			y++;
+		}
+		finish_packet(&i->softc,packet,cur_p);
+	}
+}
+
+static void screen_copy_packet_16(instance_t *i,int srcoffset,int destoffset,int w)
+{
+	/* Worst-case: need to update this block and then copy it */
+	/* TODO: Process a word at a time. Or at least read screen pixels a word at a time. */
+	uint8_t *packet = get_packet(&i->softc,6+w*2+9);
+	uint8_t *cur_p = packet;
+	const uint16_t *src = (const uint16_t *) (i->scrstate.screen+srcoffset);
+	uint16_t *shadow = (uint16_t *) (i->scrstate.shadow+srcoffset);
+	uint16_t *dest = (uint16_t *) (i->scrstate.screen+destoffset);
+	uint16_t *destshadow = (uint16_t *) (i->scrstate.shadow+destoffset);
+	int rewind=0;
+	int orig_w=w;
+	while(w--)
+	{
+		uint16_t pixel = *src++;
+		/* Deal with the update command */
+		if(*shadow != pixel)
+		{
+			*shadow = pixel;
+			if(packet == cur_p)
+			{
+				/* Start the update packet */
+				*cur_p++ = UDL_BULK_SOC;
+				*cur_p++ = UDL_BULK_CMD_FB_WRITE16;
+				int temp = ((uint8_t *) shadow)-i->scrstate.shadow;
+				*cur_p++ = temp>>16;
+				*cur_p++ = temp>>8;
+				*cur_p++ = temp;
+				cur_p++; /* Skip size field */
+			}
+			rewind = 0;
+		}
+		else
+			rewind++;
+		if(packet != cur_p)
+		{
+			*cur_p++ = pixel>>8;
+			*cur_p++ = pixel;
+		}
+		shadow++;
+		/* Deal with updating the screen & shadow with the copy result */
+		*dest++ = pixel;
+		*destshadow++ = pixel;
+	}
+	/* Finish up the update packet, trimming any matching end pixels */
+	if(packet != cur_p)
+	{
+		cur_p -= rewind*2;
+		packet[5] = (cur_p-(packet+6))/2;
+	}
+	/* Now add the copy command */
+	*cur_p++ = UDL_BULK_SOC;
+	*cur_p++ = UDL_BULK_CMD_FB_COPY16;
+	*cur_p++ = destoffset>>16;
+	*cur_p++ = destoffset>>8;
+	*cur_p++ = destoffset;
+	*cur_p++ = orig_w;
+	*cur_p++ = srcoffset>>16;
+	*cur_p++ = srcoffset>>8;
+	*cur_p++ = srcoffset;
+	finish_packet(&i->softc,packet,cur_p);
+}
+
+static void screen_copy_mem_16(instance_t *i,int srcoffset,int destoffset,int w)
+{
+	do
+	{
+		int amt = MIN(w,256);
+		screen_copy_packet_16(i,srcoffset,destoffset,amt);
+		srcoffset += amt*2;
+		destoffset += amt*2;
+		w -= amt;
+	}
+	while(w);
+}
+
+void screen_copy_16(instance_t *i,int srcx,int srcy,int destx,int desty,int w,int h)
+{
+	if(i->huffman_enabled)
+	{
+		screen_copy_16_huff(i,srcx,srcy,destx,desty,w,h);
+		return;
+	}
+	int step = i->scrstate.stride;
+	int srcoffset = srcx*2+srcy*step+i->scrstate.vrender;
+	int destoffset = destx*2+desty*step+i->scrstate.vrender;
+	if(desty > srcy)
+	{
+		srcoffset += step*(h-1);
+		destoffset += step*(h-1);
+		step = -step;
+	}
+	while(h--)
+	{
+		screen_copy_mem_16(i,srcoffset,destoffset,w);
+		srcoffset += step;
+		destoffset += step;
+	}
+}
+
+void pointer_show_16(instance_t *i,pointer_t *p)
+{
+	/* Early-exit if off screen */
+	if((p->vinit == ~0) || (p->x <= -32) || (p->y <= -32) || (p->x >= i->softc.sc_width) || (p->y >= i->softc.sc_height))
+		return;
+
+	for(int row=0;row<32;row++)
+	{
+		int y = row+p->y;
+		uint64_t pixels = p->image[row];
+		if(y>=i->softc.sc_height)
+			return;
+		if((y<0) || !pixels)
+			continue;
+
+		/* Crop to right edge of screen */
+		int x = p->x;
+		int count = MIN(i->softc.sc_width-x,32);
+
+		/* Crop to left edge of screen */
+		if(x < 0)
+		{
+			pixels >>= (-x*2);
+			count += x;
+			x = 0;
+		}
+		if(!pixels)
+			continue;
+
+		/* Skip transparent pixels at start */
+		while(!(pixels & 3) && --count)
+		{
+			pixels >>= 2;
+			x++;
+		}
+		if(count <= 0)
+			continue;
+
+		uint32_t offset = x*2+y*i->scrstate.stride+p->vinit;
+		const uint8_t *src = i->scrstate.shadow+offset;
+
+		uint8_t *packet = get_packet(&i->softc,6+count*2);
+		uint8_t *cur_p = packet;
+		*cur_p++ = UDL_BULK_SOC;
+		*cur_p++ = UDL_BULK_CMD_FB_WRITE16;
+		*cur_p++ = offset>>16;
+		*cur_p++ = offset>>8;
+		*cur_p++ = offset;
+		int actual = 0;
+		cur_p++;
+		while(count && pixels)
+		{
+			int col = ((int)pixels) & 3;
+			if(col)
+			{
+				*cur_p++ = p->pal[col][0];
+				*cur_p++ = p->pal[col][1];
+			}
+			else
+			{
+				*cur_p++ = src[1];
+				*cur_p++ = src[0];
+			}
+			src += 2;
+			pixels >>= 2;
+			actual++;
+			count--;
+		}
+		packet[5] = actual;
+		if(!finish_packet(&i->softc,packet,cur_p))
+			return;
+	}
+}
+
+void pointer_remove_16(instance_t *i,pointer_t *p)
+{
+	/* Early-exit if off screen */
+	if((p->vinit == ~0) || (p->x <= -32) || (p->y <= -32) || (p->x >= i->softc.sc_width) || (p->y >= i->softc.sc_height))
+		return;
+
+	for(int row=0;row<32;row++)
+	{
+		int y = row+p->y;
+		uint64_t pixels = p->image[row];
+		if(y>=i->softc.sc_height)
+			return;
+		if((y<0) || !pixels)
+			continue;
+
+		/* Crop to right edge of screen */
+		int x = p->x;
+		int count = MIN(i->softc.sc_width-x,32);
+
+		/* Crop to left edge of screen */
+		if(x < 0)
+		{
+			pixels >>= (-x*2);
+			count += x;
+			x = 0;
+		}
+		if(!pixels)
+			continue;
+
+		/* Skip transparent pixels at start */
+		while(!(pixels & 3) && --count)
+		{
+			pixels >>= 2;
+			x++;
+		}
+		if(count <= 0)
+			continue;
+
+		uint32_t offset = x*2+y*i->scrstate.stride+p->vinit;
+		const uint8_t *src = i->scrstate.shadow+offset;
+
+		uint8_t *packet = get_packet(&i->softc,6+count*2);
+		uint8_t *cur_p = packet;
+		*cur_p++ = UDL_BULK_SOC;
+		*cur_p++ = UDL_BULK_CMD_FB_WRITE16;
+		*cur_p++ = offset>>16;
+		*cur_p++ = offset>>8;
+		*cur_p++ = offset;
+		int actual = 0;
+		cur_p++;
+		while(count && pixels)
+		{
+			*cur_p++ = src[1];
+			*cur_p++ = src[0];
+			src += 2;
+			pixels >>= 2;
+			actual++;
+			count--;
+		}
+		packet[5] = actual;
+		if(!finish_packet(&i->softc,packet,cur_p))
+			return;
+	}
+}
+
+
+
+/*
+
+				16BPP ROUTINES (HUFFMAN)
+
+*/
+
+bool screen_process_16_huff(instance_t *i,int amount)
+{
+	const uint16_t *screen = (const uint16_t *) i->scrstate.screen;
+	uint16_t *shadow = (uint16_t *) i->scrstate.shadow;
+	int offset = i->scrstate.curoffset/2;
+	const uint8_t *huff_bitcounts = huffman_16_bits + UDL_HUFFMAN_BASE;
+	const uint32_t *huff_patterns = huffman_16_patterns + UDL_HUFFMAN_BASE;
+	bool updated = false;
+	while(amount)
+	{
+		int process = MIN(amount,i->scrstate.vend-(offset<<1));
+		amount -= process;
+
+		/* Scan ahead to the first difference */
+		int skip = memcmp_len(screen,shadow,offset<<1,process);
+		offset += skip>>1;
+		process -= skip;
+
+		while(process)
+		{
+			uint16_t word = screen[offset];
+			if(word != shadow[offset])
+			{
+				/* Only process one command's worth of data */
+				int this_process = MIN(process,512);
+
+				int temp = offset<<1;
+				uint8_t *packet = get_packet(&i->softc,max_huffman_16_packet_size);
+				uint8_t *cur_p = packet;
+				*cur_p++ = UDL_BULK_SOC;
+				*cur_p++ = UDL_BULK_CMD_FB_WRITE16 | UDL_BULK_CMD_FB_COMP;
+				*cur_p++ = temp>>16;
+				*cur_p++ = temp>>8;
+				*cur_p++ = temp;
+				cur_p++; /* Skip count */
+				uint16_t prev = 0;
+				int bit = (6)*8;
+				int count = 0;
+				int byte = 0;
+				int rewind_count = 0;
+				int rewind_bits = 0;
+				/* Use 10 bytes as the rewind threshold - 6 bytes for new command header + 4 bytes for worst-case bit sequence */
+				while((count < this_process) && (rewind_bits < 10*8))
+				{
+					if(count)
+						word = screen[offset];
+					int16_t diff = word - prev;
+					/* Get huffman value */
+					int bit_count = huff_bitcounts[diff];
+					uint32_t bit_pattern = huff_patterns[diff];
+					prev = word;
+					/* Keep track of rewind position */
+					if(shadow[offset] == word)
+					{
+						rewind_count++;
+						rewind_bits += bit_count;
+					}
+					else
+					{
+						rewind_count = rewind_bits = 0;
+						shadow[offset] = word;
+					}
+					/* Write out the sequence */
+					INSERT_BITS(packet,while)
+					offset++;
+					count+=2;
+				}
+				process -= count;
+				/* Write end byte (sometimes redundant if rewinding far enough!) */
+				if(bit & 7)
+					packet[bit>>3] = byte;
+				/* Rewind */
+				count -= rewind_count*2;
+				bit -= rewind_bits;
+				/* Write length */
+				packet[5] = count>>1;
+				/* Send packet */
+				if(!finish_packet(&i->softc,packet,packet+((bit+7)>>3)))
+					return false;
+				updated = true;
+			}
+			else
+			{
+				offset++;
+				process-=2;
+			}
+
+			if(process)
+			{
+				/* Scan ahead to the next difference */
+				int skip = memcmp_len(screen,shadow,offset<<1,process);
+				offset += skip>>1;
+				process -= skip;
+			}
+		}
+		if(offset == i->scrstate.vend/2)
+			offset = i->scrstate.vinit/2;
+	}
+	i->scrstate.curoffset = offset*2;
+
+	return updated;
+}
+
+static void screen_copy_packet_16_huff(instance_t *i,int srcoffset,int destoffset,int w)
+{
+	uint8_t *packet = get_packet(&i->softc,max_huffman_16_packet_size+9);
+	uint8_t *cur_p = packet;
+	const uint16_t *src = (const uint16_t *) (i->scrstate.screen+srcoffset);
+	uint16_t *shadow = (uint16_t *) (i->scrstate.shadow+srcoffset);
+	uint16_t *dest = (uint16_t *) (i->scrstate.screen+destoffset);
+	uint16_t *destshadow = (uint16_t *) (i->scrstate.shadow+destoffset);
+	const uint8_t *huff_bitcounts = huffman_16_bits + UDL_HUFFMAN_BASE;
+	const uint32_t *huff_patterns = huffman_16_patterns + UDL_HUFFMAN_BASE;
+	int bit = (6)*8;
+	int count = 0;
+	int byte = 0;
+	int rewind_count = 0;
+	int rewind_bits = 0;
+	int orig_w=w;
+	uint16_t prev = 0;
+	while(w--)
+	{
+		uint16_t pixel = *src++;
+		/* Deal with the update command */
+		if(*shadow != pixel)
+		{
+			*shadow = pixel;
+			if(packet == cur_p)
+			{
+				/* Start the update packet */
+				*cur_p++ = UDL_BULK_SOC;
+				*cur_p++ = UDL_BULK_CMD_FB_WRITE16 | UDL_BULK_CMD_FB_COMP;
+				int temp = ((uint8_t *) shadow)-i->scrstate.shadow;
+				*cur_p++ = temp>>16;
+				*cur_p++ = temp>>8;
+				*cur_p++ = temp;
+				cur_p++; /* Skip size field */
+			}
+			rewind_count = rewind_bits = 0;
+		}
+		else
+		{
+			rewind_count++;
+		}
+		if(packet != cur_p)
+		{
+			int16_t diff = pixel - prev;
+			/* Get huffman value */
+			int bit_count = huff_bitcounts[diff];
+			uint32_t bit_pattern = huff_patterns[diff];
+			prev = pixel;
+			/* Keep track of rewind position */
+			if(rewind_count)
+				rewind_bits += bit_count;
+			/* Write out the sequence */
+			INSERT_BITS_CUR
+			count++;
+		}
+		shadow++;
+		/* Deal with updating the screen & shadow with the copy result */
+		*dest++ = pixel;
+		*destshadow++ = pixel;
+	}
+	/* Finish up the update packet, trimming any matching end pixels */
+	if(packet != cur_p)
+	{
+		if(bit & 7)
+			*cur_p = byte;
+		count -= rewind_count;
+		bit -= rewind_bits;
+		cur_p = packet+((bit+7)>>3);
+		packet[5] = count;
+	}
+	/* Now add the copy command */
+	*cur_p++ = UDL_BULK_SOC;
+	*cur_p++ = UDL_BULK_CMD_FB_COPY16;
+	*cur_p++ = destoffset>>16;
+	*cur_p++ = destoffset>>8;
+	*cur_p++ = destoffset;
+	*cur_p++ = orig_w;
+	*cur_p++ = srcoffset>>16;
+	*cur_p++ = srcoffset>>8;
+	*cur_p++ = srcoffset;
+	finish_packet(&i->softc,packet,cur_p);
+}
+
+static void screen_copy_mem_16_huff(instance_t *i,int srcoffset,int destoffset,int w)
+{
+	do
+	{
+		int amt = MIN(w,256);
+		screen_copy_packet_16_huff(i,srcoffset,destoffset,amt);
+		srcoffset += amt*2;
+		destoffset += amt*2;
+		w -= amt;
+	}
+	while(w);
+}
+
+void screen_copy_16_huff(instance_t *i,int srcx,int srcy,int destx,int desty,int w,int h)
+{
+	int step = i->scrstate.stride;
+	int srcoffset = srcx*2+srcy*step+i->scrstate.vrender;
+	int destoffset = destx*2+desty*step+i->scrstate.vrender;
+	if(desty > srcy)
+	{
+		srcoffset += step*(h-1);
+		destoffset += step*(h-1);
+		step = -step;
+	}
+	while(h--)
+	{
+		screen_copy_mem_16_huff(i,srcoffset,destoffset,w);
+		srcoffset += step;
+		destoffset += step;
+	}
+}
+
+
+
+/*
+
+				24BPP ROUTINES
+
+*/
+
+bool screen_process_24(instance_t *i,int amount)
+{
+	if(i->huffman_enabled)
+	{
+		return screen_process_24_huff(i,amount);
+	}
+	const uint32_t *screen = (const uint32_t *) i->scrstate.screen;
+	uint32_t *shadow = (uint32_t *) i->scrstate.shadow;
+	int offset = i->scrstate.curoffset/4;
+	bool updated = false;
+	while(amount)
+	{
+		int process = MIN(amount,i->scrstate.vend-(offset<<2));
+		amount -= process;
+
+		/* Scan ahead to the first difference */
+		int skip = memcmp_len(screen,shadow,offset<<2,process);
+		offset += skip>>2;
+		process -= skip;
+
+		while(process)
+		{
+			uint32_t word = screen[offset];
+			process-=4;
+			if(word != shadow[offset])
+			{
+				int temp = offset<<1;
+				shadow[offset++] = word;
+
+				uint8_t *packet = get_packet(&i->softc,12+256*3);
+				uint8_t *cur_p = packet;
+				uint8_t bytes[256];
+				*cur_p++ = UDL_BULK_SOC;
+				*cur_p++ = UDL_BULK_CMD_FB_WRITE16;
+				*cur_p++ = temp>>16;
+				*cur_p++ = temp>>8;
+				*cur_p++ = temp;
+				cur_p++; /* Skip length field */
+				MUNGE24_8(word,cur_p[0],cur_p[1],bytes[0])
+				cur_p+=2;
+				int count=1;
+				int rewind=0;
+				while((count < 256) && process && (rewind < 3))
+				{
+					word = screen[offset];
+					if(word == shadow[offset])
+					{
+						/* Keep track of longest run of matching pixels, so that if it gets too long we can split this into two commands to save space */
+						rewind++;
+					}
+					else
+					{
+						rewind = 0;
+						shadow[offset] = word;
+					}
+					offset++;
+					process-=4;
+					MUNGE24_8(word,cur_p[0],cur_p[1],bytes[count++])
+					cur_p+=2;
+				}
+				/* Trim any unmatched pixels */
+				count -= rewind;
+				cur_p -= rewind*2;
+				packet[5] = count;
+				/* Append the byte plane */
+				*cur_p++ = UDL_BULK_SOC;
+				*cur_p++ = UDL_BULK_CMD_FB_WRITE8;
+				temp = (temp/2)+i->scrstate.byte_base;
+				*cur_p++ = temp>>16;
+				*cur_p++ = temp>>8;
+				*cur_p++ = temp;
+				*cur_p++ = count;
+				memcpy(cur_p,bytes,count);
+				if(!finish_packet(&i->softc,packet,cur_p+count))
+					return false;
+				updated = true;
+			}
+			else
+			{
+				offset++;
+			}
+
+			if(process)
+			{
+				/* Scan ahead to the next difference */
+				int skip = memcmp_len(screen,shadow,offset<<2,process);
+				offset += skip>>2;
+				process -= skip;
+			}
+		}
+		if(offset == i->scrstate.vend/4)
+			offset = i->scrstate.vinit/4;
+	}
+	i->scrstate.curoffset = offset*4;
+
+	return updated;
+}
+
+void screen_fill_24(instance_t *i,uint32_t col,int x,int y,int w,int h)
+{
+	/* Work out chunk size to avoid overflowing sc_cmd_buf */
+	int chunk_h = h;
+	while(chunk_h*((w+255)>>8)*17 > UDL_CMD_MAX_XFER_SIZE)
+		chunk_h >>= 1;
+
+	uint8_t hi,lo,eight;
+	MUNGE24_8(col,hi,lo,eight)
+
+	while(h)
+	{
+		int chunk = MIN(h,chunk_h);
+		uint8_t *packet = get_packet(&i->softc,chunk*((w+255)>>8)*17);
+		uint8_t *cur_p = packet;
+
+		h -= chunk;
+
+		while(chunk--)
+		{
+			int offset = x*4+y*i->scrstate.stride+i->scrstate.vrender;
+			memset32x2(i->scrstate.screen,i->scrstate.shadow,offset,w*4,col); /* TODO this version doesn't need to worry about halfword alignment */
+			offset >>= 1;
+			int offset2 = (offset/2)+i->scrstate.byte_base;
+			int cur_w = w;
+			while(cur_w)
+			{
+				int amount = MIN(cur_w,256);
+
+				*cur_p++ = UDL_BULK_SOC;
+				*cur_p++ = UDL_BULK_CMD_FB_RLE16;
+				*cur_p++ = offset>>16;
+				*cur_p++ = offset>>8;
+				*cur_p++ = offset;
+				*cur_p++ = amount;
+				*cur_p++ = amount;
+				*cur_p++ = hi;
+				*cur_p++ = lo;
+
+				*cur_p++ = UDL_BULK_SOC;
+				*cur_p++ = UDL_BULK_CMD_FB_RLE8;
+				*cur_p++ = offset2>>16;
+				*cur_p++ = offset2>>8;
+				*cur_p++ = offset2;
+				*cur_p++ = amount;
+				*cur_p++ = amount;
+				*cur_p++ = eight;
+
+				offset += amount*2;
+				offset2 += amount;
+				cur_w -= amount;
+			}
+			y++;
+		}
+		finish_packet(&i->softc,packet,cur_p);
+	}
+}
+
+static void screen_copy_packet_24(instance_t *i,int srcoffset,int destoffset,int w)
+{
+	/* Worst-case: need to update this block and then copy it */
+	/* TODO: Process a word at a time. Or at least read screen pixels a word at a time. */
+	uint8_t *packet = get_packet(&i->softc,6+6+w*3+9+9);
+	uint8_t *cur_p = packet;
+	const uint32_t *src = (const uint32_t *) (i->scrstate.screen+srcoffset);
+	uint32_t *shadow = (uint32_t *) (i->scrstate.shadow+srcoffset);
+	uint32_t *dest = (uint32_t *) (i->scrstate.screen+destoffset);
+	uint32_t *destshadow = (uint32_t *) (i->scrstate.shadow+destoffset);
+	int rewind=0;
+	int orig_w=w;
+	uint8_t bytes[256];
+	uint8_t *bytep = bytes;
+	int updateoffset = 0;
+	while(w--)
+	{
+		uint32_t pixel = *src++;
+		/* Deal with the update command */
+		if(*shadow != pixel)
+		{
+			*shadow = pixel;
+			if(packet == cur_p)
+			{
+				/* Start the update packet */
+				*cur_p++ = UDL_BULK_SOC;
+				*cur_p++ = UDL_BULK_CMD_FB_WRITE16;
+				updateoffset = (((uint8_t *) shadow)-i->scrstate.shadow)>>1;
+				*cur_p++ = updateoffset>>16;
+				*cur_p++ = updateoffset>>8;
+				*cur_p++ = updateoffset;
+				cur_p++; /* Skip size field */
+			}
+			rewind = 0;
+		}
+		else
+			rewind++;
+		if(packet != cur_p)
+		{
+			MUNGE24_8(pixel,cur_p[0],cur_p[1],*bytep++)
+			cur_p += 2;
+		}
+		shadow++;
+		/* Deal with updating the screen & shadow with the copy result */
+		*dest++ = pixel;
+		*destshadow++ = pixel;
+	}
+	/* Finish up the update packet, trimming any matching end pixels */
+	if(packet != cur_p)
+	{
+		cur_p -= rewind*2;
+		int temp = (cur_p-(packet+6))/2;
+		packet[5] = temp;
+		/* Insert the byte update packet */
+		*cur_p++ = UDL_BULK_SOC;
+		*cur_p++ = UDL_BULK_CMD_FB_WRITE8;
+		updateoffset = (updateoffset/2) + i->scrstate.byte_base;
+		*cur_p++ = updateoffset>>16;
+		*cur_p++ = updateoffset>>8;
+		*cur_p++ = updateoffset;
+		*cur_p++ = temp;
+		memcpy(cur_p,bytes,temp);
+		cur_p += temp;
+	}
+	/* Now add the copy commands */
+	destoffset >>= 1;
+	srcoffset >>= 1;
+	*cur_p++ = UDL_BULK_SOC;
+	*cur_p++ = UDL_BULK_CMD_FB_COPY16;
+	*cur_p++ = destoffset>>16;
+	*cur_p++ = destoffset>>8;
+	*cur_p++ = destoffset;
+	*cur_p++ = orig_w;
+	*cur_p++ = srcoffset>>16;
+	*cur_p++ = srcoffset>>8;
+	*cur_p++ = srcoffset;
+	srcoffset = (srcoffset/2)+i->scrstate.byte_base;
+	destoffset = (destoffset/2)+i->scrstate.byte_base;
+	*cur_p++ = UDL_BULK_SOC;
+	*cur_p++ = UDL_BULK_CMD_FB_COPY8;
+	*cur_p++ = destoffset>>16;
+	*cur_p++ = destoffset>>8;
+	*cur_p++ = destoffset;
+	*cur_p++ = orig_w;
+	*cur_p++ = srcoffset>>16;
+	*cur_p++ = srcoffset>>8;
+	*cur_p++ = srcoffset;
+	finish_packet(&i->softc,packet,cur_p);
+}
+
+static void screen_copy_mem_24(instance_t *i,int srcoffset,int destoffset,int w)
+{
+	do
+	{
+		int amt = MIN(w,256);
+		screen_copy_packet_24(i,srcoffset,destoffset,amt);
+		srcoffset += amt*4;
+		destoffset += amt*4;
+		w -= amt;
+	}
+	while(w);
+}
+
+void screen_copy_24(instance_t *i,int srcx,int srcy,int destx,int desty,int w,int h)
+{
+	if(i->huffman_enabled)
+	{
+		screen_copy_24_huff(i,srcx,srcy,destx,desty,w,h);
+		return;
+	}
+	int step = i->scrstate.stride;
+	int srcoffset = srcx*4+srcy*step+i->scrstate.vrender;
+	int destoffset = destx*4+desty*step+i->scrstate.vrender;
+	if(desty > srcy)
+	{
+		srcoffset += step*(h-1);
+		destoffset += step*(h-1);
+		step = -step;
+	}
+	while(h--)
+	{
+		screen_copy_mem_24(i,srcoffset,destoffset,w);
+		srcoffset += step;
+		destoffset += step;
+	}
+}
+
+void pointer_show_24(instance_t *i,pointer_t *p)
+{
+	/* Early-exit if off screen */
+	if((p->vinit == ~0) || (p->x <= -32) || (p->y <= -32) || (p->x >= i->softc.sc_width) || (p->y >= i->softc.sc_height))
+		return;
+
+	for(int row=0;row<32;row++)
+	{
+		int y = row+p->y;
+		uint64_t pixels = p->image[row];
+		if(y>=i->softc.sc_height)
+			return;
+		if((y<0) || !pixels)
+			continue;
+
+		/* Crop to right edge of screen */
+		int x = p->x;
+		int count = MIN(i->softc.sc_width-x,32);
+
+		/* Crop to left edge of screen */
+		if(x < 0)
+		{
+			pixels >>= (-x*2);
+			count += x;
+			x = 0;
+		}
+		if(!pixels)
+			continue;
+
+		/* Skip transparent pixels at start */
+		while(!(pixels & 3) && --count)
+		{
+			pixels >>= 2;
+			x++;
+		}
+		if(count <= 0)
+			continue;
+
+		uint32_t offset = x*4+y*i->scrstate.stride+p->vinit;
+		const uint32_t *src = (uint32_t *) (i->scrstate.shadow+offset);
+
+		uint8_t *packet = get_packet(&i->softc,12+count*3);
+		uint8_t *cur_p = packet;
+		uint8_t bytes[32];
+		*cur_p++ = UDL_BULK_SOC;
+		*cur_p++ = UDL_BULK_CMD_FB_WRITE16;
+		offset >>= 1;
+		*cur_p++ = offset>>16;
+		*cur_p++ = offset>>8;
+		*cur_p++ = offset;
+		int actual = 0;
+		cur_p++;
+		while(count && pixels)
+		{
+			int col = ((int) pixels) & 3;
+			if(col)
+			{
+				*cur_p++ = p->pal[col][0];
+				*cur_p++ = p->pal[col][1];
+				bytes[actual] = p->pal[col][2];
+			}
+			else
+			{
+				MUNGE24_8(*src,cur_p[0],cur_p[1],bytes[actual])
+				cur_p += 2;
+			}
+			src++;
+			pixels >>= 2;
+			actual++;
+			count--;
+		}
+		packet[5] = actual;
+		/* Append the byte plane */
+		*cur_p++ = UDL_BULK_SOC;
+		*cur_p++ = UDL_BULK_CMD_FB_WRITE8;
+		offset = (offset>>1)+i->scrstate.byte_base;
+		*cur_p++ = offset>>16;
+		*cur_p++ = offset>>8;
+		*cur_p++ = offset;
+		*cur_p++ = actual;
+		memcpy(cur_p,bytes,actual);
+		if(!finish_packet(&i->softc,packet,cur_p+actual))
+			return;
+	}
+}
+
+void pointer_remove_24(instance_t *i,pointer_t *p)
+{
+	/* Early-exit if off screen */
+	if((p->vinit == ~0) || (p->x <= -32) || (p->y <= -32) || (p->x >= i->softc.sc_width) || (p->y >= i->softc.sc_height))
+		return;
+
+	for(int row=0;row<32;row++)
+	{
+		int y = row+p->y;
+		uint64_t pixels = p->image[row];
+		if(y>=i->softc.sc_height)
+			return;
+		if((y<0) || !pixels)
+			continue;
+
+		/* Crop to right edge of screen */
+		int x = p->x;
+		int count = MIN(i->softc.sc_width-x,32);
+
+		/* Crop to left edge of screen */
+		if(x < 0)
+		{
+			pixels >>= (-x*2);
+			count += x;
+			x = 0;
+		}
+		if(!pixels)
+			continue;
+
+		/* Skip transparent pixels at start */
+		while(!(pixels & 3) && --count)
+		{
+			pixels >>= 2;
+			x++;
+		}
+		if(count <= 0)
+			continue;
+
+		uint32_t offset = x*4+y*i->scrstate.stride+p->vinit;
+		const uint32_t *src = (uint32_t *) (i->scrstate.shadow+offset);
+
+		uint8_t *packet = get_packet(&i->softc,12+count*3);
+		uint8_t *cur_p = packet;
+		uint8_t bytes[32];
+		*cur_p++ = UDL_BULK_SOC;
+		*cur_p++ = UDL_BULK_CMD_FB_WRITE16;
+		offset >>= 1;
+		*cur_p++ = offset>>16;
+		*cur_p++ = offset>>8;
+		*cur_p++ = offset;
+		int actual = 0;
+		cur_p++;
+		while(count && pixels)
+		{
+			MUNGE24_8(*src,cur_p[0],cur_p[1],bytes[actual])
+			cur_p += 2;
+			src++;
+			pixels >>= 2;
+			actual++;
+			count--;
+		}
+		packet[5] = actual;
+		/* Append the byte plane */
+		*cur_p++ = UDL_BULK_SOC;
+		*cur_p++ = UDL_BULK_CMD_FB_WRITE8;
+		offset = (offset>>1)+i->scrstate.byte_base;
+		*cur_p++ = offset>>16;
+		*cur_p++ = offset>>8;
+		*cur_p++ = offset;
+		*cur_p++ = actual;
+		memcpy(cur_p,bytes,actual);
+		if(!finish_packet(&i->softc,packet,cur_p+actual))
+			return;
+	}
+}
+
+
+
+/*
+
+				24BPP ROUTINES (HUFFMAN)
+
+*/
+
+bool screen_process_24_huff(instance_t *i,int amount)
+{
+	const uint32_t *screen = (const uint32_t *) i->scrstate.screen;
+	uint32_t *shadow = (uint32_t *) i->scrstate.shadow;
+	int offset = i->scrstate.curoffset/4;
+	const uint8_t *huff_bitcounts = huffman_16_bits + UDL_HUFFMAN_BASE;
+	const uint32_t *huff_patterns = huffman_16_patterns + UDL_HUFFMAN_BASE;
+	bool updated = false;
+	while(amount)
+	{
+		int process = MIN(amount,i->scrstate.vend-(offset<<2));
+		amount -= process;
+
+		/* Scan ahead to the first difference */
+		int skip = memcmp_len(screen,shadow,offset<<2,process);
+		offset += skip>>2;
+		process -= skip;
+
+		while(process)
+		{
+			uint32_t word = screen[offset];
+			if(word != shadow[offset])
+			{
+				/* Only process one command's worth of data */
+				int this_process = MIN(process,1024);
+
+				int temp = offset<<1;
+				uint8_t *packet = get_packet(&i->softc,max_huffman_16_packet_size+max_huffman_8_packet_size);
+				uint8_t *cur_p = packet;
+				uint8_t bytes[256];
+				*cur_p++ = UDL_BULK_SOC;
+				*cur_p++ = UDL_BULK_CMD_FB_WRITE16 | UDL_BULK_CMD_FB_COMP;
+				*cur_p++ = temp>>16;
+				*cur_p++ = temp>>8;
+				*cur_p++ = temp;
+				cur_p++; /* Skip length field */
+				uint16_t prev = 0;
+				int bit = (6)*8;
+				int count = 0;
+				int byte = 0;
+				int rewind_count = 0;
+				int rewind_bits = 0;
+				/* Use 10 bytes as the rewind threshold - 6 bytes for new command header + 4 bytes for worst-case bit sequence
+				   Note - doesn't take into account the space used by the byte plane! */
+				while((count < this_process) && (rewind_bits < 10*8))
+				{
+					if(count)
+						word = screen[offset];
+					uint16_t word16;
+					MUNGE24_16(word,word16,bytes[count>>2])
+					int16_t diff = word16 - prev;
+					/* Get huffman value */
+					int bit_count = huff_bitcounts[diff];
+					uint32_t bit_pattern = huff_patterns[diff];
+					prev = word16;
+					/* Keep track of rewind position */
+					if(shadow[offset] == word)
+					{
+						rewind_count++;
+						rewind_bits += bit_count;
+					}
+					else
+					{
+						rewind_count = rewind_bits = 0;
+						shadow[offset] = word;
+					}
+					/* Write out the sequence */
+					INSERT_BITS(packet,while)
+					offset++;
+					count+=4;
+				}
+				process -= count;
+				/* Write end byte (sometimes redundant if rewinding far enough!) */
+				if(bit & 7)
+					packet[bit>>3] = byte;
+				/* Rewind */
+				count -= rewind_count*4;
+				bit -= rewind_bits;
+				/* Write length */
+				packet[5] = count>>2;
+				/* Now process the byte plane */
+				cur_p = packet+((bit+7)>>3);
+				*cur_p++ = UDL_BULK_SOC;
+				*cur_p++ = UDL_BULK_CMD_FB_WRITE8 | UDL_BULK_CMD_FB_COMP;
+				temp = (temp/2)+i->scrstate.byte_base;
+				*cur_p++ = temp>>16;
+				*cur_p++ = temp>>8;
+				*cur_p++ = temp;
+				*cur_p++ = count>>2;
+				bit = 0;
+				byte = 0;
+				prev = 0;
+				for(int j=0;j<(count>>2);j++)
+				{
+					word = bytes[j];
+					int diff = (word-prev)&0xff;
+					prev = word;
+					int bit_count = huffman_8[diff].bits;
+					uint32_t bit_pattern = huffman_8[diff].pattern;
+					/* Write out the sequence */
+					INSERT_BITS(cur_p,if)
+				}
+				/* Write end byte */
+				if(bit & 7)
+					cur_p[bit>>3] = byte;
+				cur_p += (bit+7)>>3;
+				if(!finish_packet(&i->softc,packet,cur_p))
+					return false;
+				updated = true;
+			}
+			else
+			{
+				offset++;
+				process-=4;
+			}
+
+			if(process)
+			{
+				/* Scan ahead to the next difference */
+				int skip = memcmp_len(screen,shadow,offset<<2,process);
+				offset += skip>>2;
+				process -= skip;
+			}
+		}
+		if(offset == i->scrstate.vend/4)
+			offset = i->scrstate.vinit/4;
+	}
+	i->scrstate.curoffset = offset*4;
+
+	return updated;
+}
+
+static void screen_copy_packet_24_huff(instance_t *i,int srcoffset,int destoffset,int w)
+{
+	uint8_t *packet = get_packet(&i->softc,max_huffman_16_packet_size+max_huffman_8_packet_size+9+9);
+	uint8_t *cur_p = packet;
+	const uint32_t *src = (const uint32_t *) (i->scrstate.screen+srcoffset);
+	uint32_t *shadow = (uint32_t *) (i->scrstate.shadow+srcoffset);
+	uint32_t *dest = (uint32_t *) (i->scrstate.screen+destoffset);
+	uint32_t *destshadow = (uint32_t *) (i->scrstate.shadow+destoffset);
+	const uint8_t *huff_bitcounts = huffman_16_bits + UDL_HUFFMAN_BASE;
+	const uint32_t *huff_patterns = huffman_16_patterns + UDL_HUFFMAN_BASE;
+	int bit = (6)*8;
+	int count = 0;
+	int byte = 0;
+	int rewind_count = 0;
+	int rewind_bits = 0;
+	int orig_w=w;
+	uint16_t prev = 0;
+	uint8_t bytes[256];
+	uint8_t *bytep = bytes;
+	int updateoffset = 0;
+	while(w--)
+	{
+		uint32_t pixel = *src++;
+		/* Deal with the update command */
+		if(*shadow != pixel)
+		{
+			*shadow = pixel;
+			if(packet == cur_p)
+			{
+				/* Start the update packet */
+				*cur_p++ = UDL_BULK_SOC;
+				*cur_p++ = UDL_BULK_CMD_FB_WRITE16 | UDL_BULK_CMD_FB_COMP;
+				updateoffset = (((uint8_t *) shadow)-i->scrstate.shadow)>>1;
+				*cur_p++ = updateoffset>>16;
+				*cur_p++ = updateoffset>>8;
+				*cur_p++ = updateoffset;
+				cur_p++; /* Skip size field */
+			}
+			rewind_count = rewind_bits = 0;
+		}
+		else
+		{
+			rewind_count++;
+		}
+		if(packet != cur_p)
+		{
+			uint16_t word16;
+			MUNGE24_16(pixel,word16,*bytep++)
+			int16_t diff = word16 - prev;
+			/* Get huffman value */
+			int bit_count = huff_bitcounts[diff];
+			uint32_t bit_pattern = huff_patterns[diff];
+			prev = word16;
+			/* Keep track of rewind position */
+			if(rewind_count)
+				rewind_bits += bit_count;
+			/* Write out the sequence */
+			INSERT_BITS_CUR
+			count++;
+		}
+		shadow++;
+		/* Deal with updating the screen & shadow with the copy result */
+		*dest++ = pixel;
+		*destshadow++ = pixel;
+	}
+	/* Finish up the update packet, trimming any matching end pixels */
+	if(packet != cur_p)
+	{
+		if(bit & 7)
+			*cur_p = byte;
+		count -= rewind_count;
+		bit -= rewind_bits;
+		cur_p = packet+((bit+7)>>3);
+		packet[5] = count;
+		/* Insert the byte update packet */
+		*cur_p++ = UDL_BULK_SOC;
+		*cur_p++ = UDL_BULK_CMD_FB_WRITE8 | UDL_BULK_CMD_FB_COMP;
+		updateoffset = (updateoffset/2) + i->scrstate.byte_base;
+		*cur_p++ = updateoffset>>16;
+		*cur_p++ = updateoffset>>8;
+		*cur_p++ = updateoffset;
+		*cur_p++ = count;
+		bit = 0;
+		byte = 0;
+		prev = 0;
+		for(int j=0;j<count;j++)
+		{
+			uint8_t pixel = bytes[j];
+			int diff = (pixel-prev)&0xff;
+			prev = pixel;
+			int bit_count = huffman_8[diff].bits;
+			uint32_t bit_pattern = huffman_8[diff].pattern;
+			/* Write out the sequence */
+			INSERT_BITS(cur_p,if)
+		}
+		/* Write end byte */
+		if(bit & 7)
+			cur_p[bit>>3] = byte;
+		cur_p += (bit+7)>>3;
+	}
+	/* Now add the copy commands */
+	destoffset >>= 1;
+	srcoffset >>= 1;
+	*cur_p++ = UDL_BULK_SOC;
+	*cur_p++ = UDL_BULK_CMD_FB_COPY16;
+	*cur_p++ = destoffset>>16;
+	*cur_p++ = destoffset>>8;
+	*cur_p++ = destoffset;
+	*cur_p++ = orig_w;
+	*cur_p++ = srcoffset>>16;
+	*cur_p++ = srcoffset>>8;
+	*cur_p++ = srcoffset;
+	srcoffset = (srcoffset/2)+i->scrstate.byte_base;
+	destoffset = (destoffset/2)+i->scrstate.byte_base;
+	*cur_p++ = UDL_BULK_SOC;
+	*cur_p++ = UDL_BULK_CMD_FB_COPY8;
+	*cur_p++ = destoffset>>16;
+	*cur_p++ = destoffset>>8;
+	*cur_p++ = destoffset;
+	*cur_p++ = orig_w;
+	*cur_p++ = srcoffset>>16;
+	*cur_p++ = srcoffset>>8;
+	*cur_p++ = srcoffset;
+	finish_packet(&i->softc,packet,cur_p);
+}
+
+static void screen_copy_mem_24_huff(instance_t *i,int srcoffset,int destoffset,int w)
+{
+	do
+	{
+		int amt = MIN(w,256);
+		screen_copy_packet_24_huff(i,srcoffset,destoffset,amt);
+		srcoffset += amt*4;
+		destoffset += amt*4;
+		w -= amt;
+	}
+	while(w);
+}
+
+void screen_copy_24_huff(instance_t *i,int srcx,int srcy,int destx,int desty,int w,int h)
+{
+	int step = i->scrstate.stride;
+	int srcoffset = srcx*4+srcy*step+i->scrstate.vrender;
+	int destoffset = destx*4+desty*step+i->scrstate.vrender;
+	if(desty > srcy)
+	{
+		srcoffset += step*(h-1);
+		destoffset += step*(h-1);
+		step = -step;
+	}
+	while(h--)
+	{
+		screen_copy_mem_24_huff(i,srcoffset,destoffset,w);
+		srcoffset += step;
+		destoffset += step;
+	}
+}

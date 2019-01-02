@@ -1,0 +1,1283 @@
+/* $Header: /home/rool/cvsroot/gpl/RiscOS/Utilities/Perl/c/acorn,v 1.3 2013/12/06 19:01:44 jlee Exp $
+ *
+ *    (C) Copyright 1989, 1990 Paul Moore.
+ *
+ *    You may distribute under the terms of the GNU General Public License
+ *    as specified in the README file that comes with the perl 3.0 kit.
+ *
+ * $Log: acorn,v $
+ * Revision 1.3  2013/12/06 19:01:44  jlee
+ * Fix occasional heap corruption errors on startup
+ * Detail:
+ *   c/acorn - Some extra debug output pointed to _make_environ() as the location of the heap corruption crashes.
+ *   Although I didn't track down exactly where the old code was going wrong, the string manipulation code looked like it could easily fall over in a variety of situations.
+ *   So now the whole routine has been replaced with a new implementation which just reads the environment variables directly using OS_ReadVarVal instead of spooling the output of *show to a temporary file and then trying to parse that.
+ *   As an added bonus, numerical and macro environment variables should now work in a sensible manner - the old code would have left the "(Number)" and "(Macro)" etc. suffixes on the variable names, left behind from the *show output.
+ * Admin:
+ *   Tested performing several Disc builds
+ *   No failures due to heap corruption errors, whereas before there would have been several
+ *
+ *
+ * Version 0.04. Tagged as 'Perl-0_04'
+ *
+ * Revision 1.2  2004/11/05 13:38:46  bavison
+ * Increased filename buffer sizes from 64 to 256 bytes.
+ * This was tripping up BBE builds.
+ *
+ * Version 0.03. Tagged as 'Perl-0_03'
+ *
+ * Revision 1.1.1.1  2003/12/11 15:47:22  bavison
+ * Sources to RISC OS Perl 5 port 1.51 discovered in a dusty corner of the
+ * Internet, given a new build structure and makefile, and knocked into C99
+ * shape. Various functions missing from the original sources have been
+ * recreated either in assembler or C, by disassembling the binary from
+ * RiscOS.Apps.!Perl.Perl.
+ * Tested in a desktop machine ROM build.
+ *
+ * Revision 3.0.1.1  90/03/27  16:10:41  lwall
+ * patch16: MSDOS support
+ *
+ * Revision 1.1  90/03/18  20:32:01  dds
+ * Initial revision
+ *
+ */
+
+/*
+ * Various Unix compatibility functions for Archimedes RISC OS.
+ * This file is basically the same as Paul Moore's one for the original RISC OS
+ * port of Perl 3. Some changes have been made to bring it up to date with Perl 5's
+ * way of doing things. There are also some extra functions LT - June 1995
+ */
+
+/* Additonal functionality added S.W.Ellacott@brighton.ac.uk Feb 1996 */
+
+
+
+#include <stdio.h>
+#include <limits.h>
+#include <time.h>
+#include "kernel.h"
+#include "swis.h"
+#include <string.h>
+#include <stdlib.h>
+
+#include "EXTERN.h"
+#include "perl.h"
+
+#define PATHNAME_MAX 256 /* This used to be 64, can you believe it? */
+
+#undef fopen	/* fopen was redefined to my_fopen in perl.h but we don't want that here */
+
+/* I'm not sure what the equivalents of these are in Perl 5 so I've just redefined
+them here for the moment. Possibly the Error[1] array in perl.h is the same as err_no */
+
+#include "acorn.h"
+static int _get_name( SV *** spadr);
+static int suffix_swap(char *name);
+
+char err_mess[255];			/* Last OS error string */
+int err_no;				/* Last OS error number - just use errno ? */
+
+int h_errno = 0;
+
+/*
+ * file test functions
+ */
+
+/* Oh dear, this is dreadful, but I can't find an elegant solution.
+   This flag tells Perl whether to decrement the local stack pointer
+   after calls to _get_name. */
+
+int _hack_flag;
+
+/* fstat is hard under RISCOS, instead try to
+recover the file name  and use stat. */
+
+I32
+my_stat(ARGS)
+dARGS
+{
+    dSP;
+    IO *io;
+    GV* tmpgv;
+    SV * sv;
+    STRLEN i;
+
+    char * filename;
+    sv = ( SV *) _get_name( &sp );
+    if ( !sv ) return -1;
+    filename = SvPV(sv, i);
+    laststatval = stat( filename, &statcache);
+    return  laststatval;
+}
+
+
+static int
+_get_name( SV *** spadr)
+{
+/* This is based on pp_fttext in pp_sys */
+    SV ** sp = ( * spadr);
+    I32 i;
+    I32 len;
+    STDCHAR tbuf[512];
+    register STDCHAR *s;
+    register IO *io;
+    SV *sv;
+
+    _hack_flag = 0;
+
+    if (op->op_flags & OPf_REF) {
+	EXTEND(SP, 1);
+	if (cGVOP->op_gv == defgv) {
+	    if (statgv)
+		io = GvIO(statgv);
+	    else {
+		sv = statname;
+		goto really_filename;
+	    }
+	}
+	else {
+	    statgv = cGVOP->op_gv;
+	    sv_setpv(statname, "");
+	    io = GvIO(statgv);
+	}
+	if (io && IoIFP(io)) {
+	    warn("Test not implemented for filehandles");
+	}
+	else {
+	    if (dowarn)
+		warn("Test on unopened file <%s>");
+	    return NULL;
+	}
+    }
+    else {
+        sv = ( *sp );
+        (*spadr)--;
+	statgv = Nullgv;
+	sv_setpv(statname, SvPV(sv, na));
+	_hack_flag = 1;
+      really_filename:
+      return (int) sv;
+    }
+}
+
+
+int
+_is_text( SV * sv )
+{
+  char * filename;
+  STRLEN i;
+  _kernel_swi_regs regs;
+
+  filename = SvPV(sv, i);
+
+  regs.r[0] = 5; /* Read catalogue info */
+  regs.r[1] = (int) filename;
+  regs.r[2] = 0;
+  regs.r[3] = 0;
+  regs.r[4] = 0;
+
+  _kernel_swi(OS_File,&regs,&regs);
+  if ( regs.r[0] != 1 ) return 0; /* not a file */
+  return (((regs.r[2]>>8)&0xFFF) == 0xFFF);
+}
+
+int
+_is_bin( SV * sv )
+{
+  char * filename;
+  STRLEN i;
+  _kernel_swi_regs regs;
+
+  filename = SvPV(sv, i);
+
+  regs.r[0] = 5; /* Read catalogue info */
+  regs.r[1] = (int) filename;
+  regs.r[2] = 0;
+  regs.r[3] = 0;
+  regs.r[4] = 0;
+
+  _kernel_swi(OS_File,&regs,&regs);
+  if ( regs.r[0] != 1 ) return 0; /* not a file */
+  return (((regs.r[2]>>8)&0xFFF) != 0xFFF);
+}
+
+/*
+ * fileglob
+ */
+FILE *
+_riscos_glob( SV * globnam )
+{
+  FILE * fp;
+  char * wildname, * ptr;
+  char Nullstr[] = "";
+  char buffer[850]; /* Enough for a full directory in one go */
+  STRLEN i;
+  int n,nmax;
+  _kernel_swi_regs regs;
+
+  wildname = SvPV(globnam, i);
+  regs.r[1] = (int) Nullstr;
+  /* Is there a path name? */
+  ptr = strrchr(wildname, '.');
+  if (ptr) {
+    ( *ptr ) = '\0';
+    regs.r[1] = (int) wildname;
+    wildname = ptr + 1;
+  }
+
+  fp = tmpfile();
+
+  regs.r[0] = 9; /* Read entries from directory */
+  regs.r[2] = (int) buffer;
+  regs.r[4] = 0;
+  regs.r[5] = 850;
+  regs.r[6] = (int) wildname;
+
+  do {
+    regs.r[3] = 77; /* Read a directory at a time if possible */
+    _kernel_swi(_kernel_NONX|OS_GBPB,&regs,&regs);
+    nmax = regs.r[3] -1; ptr = buffer;
+    for (n=0; n < nmax; n++) {
+      ptr = strchr(ptr, '\0');
+      (* ptr) = '\n';
+    }
+    if (nmax != -1 ) fprintf(fp,"%s\n",buffer);
+  } while ( regs.r[4] != -1 );
+
+  rewind(fp);
+  return fp;
+}
+
+/*
+ * Pipe commands
+ */
+extern FILE * popen (char *command, char *mode);
+extern int pclose (FILE *current);
+
+static char leafname[11];
+
+/* These are to try to trap the backtick bug */
+FILE *
+_clean_sys(char * tmps)
+{
+  char cmd[256], scrapfile[256];
+  char * ptr;
+  int rval;
+  if ( strlen(tmps) > 233 ) {
+    fprintf(stderr,"Command too long\n");
+    return NULL;
+  }
+  strcpy(scrapfile, tmpnam(NULL));
+  /* The following is to keep the filename short */
+  ptr = strrchr(scrapfile,'.');
+  ptr++;
+  strcpy(leafname,ptr);
+  ( *ptr ) = (char) 0;
+  _kernel_setenv("Pscp$Path", scrapfile);
+  sprintf(cmd, "%s{ > Pscp:%s }", tmps, leafname);
+  _kernel_setenv("Sys$ReturnCode", "0");
+  rval = system(cmd);
+  sprintf(cmd, "Pscp:%s", leafname);
+  if (rval == _kernel_ERROR) {
+    remove(cmd);
+    return NULL;
+  }
+
+  return fopen(cmd, "rb");
+}
+
+I32
+_close_sys( FILE * fp)
+{
+  I32 rval;
+  char cmd[20];
+  rval = (I32) fclose (fp);
+  sprintf(cmd, "Pscp:%s", leafname);
+  remove(cmd);
+  return rval;
+}
+
+FILE *
+my_popen (char *command, char *mode)
+{
+  /* Try and trap the backtick bug - not easy as it is not repeatable */
+  /* Is the command too long? */
+  if ( strlen(command) > 200 ) {
+    fprintf(stderr, "Command too long\n");
+    return NULL;
+  }
+  return  popen(command, mode);
+}
+
+I32
+my_pclose (FILE *current)
+{
+  return (I32) pclose ( current );
+}
+
+/*
+ * Construct a UNIX like environ array
+ */
+char * *
+_make_environ()
+{
+  char **environ;
+  char *prev=NULL;
+  int i=0;
+  environ = calloc(1,sizeof(char*));
+  if(!environ)
+  {
+    fprintf(stderr,"Not enough memory for env array\n");
+    return NULL;
+  }
+  while(1)
+  {
+    int len,type,expand,namelen;
+    char *name,*value;
+    /* Use _kernel_swi as _swix won't update the output regs on error */
+    _kernel_swi_regs regs;
+    regs.r[0] = (int) "*";
+    regs.r[1] = 0;
+    regs.r[2] = -1;
+    regs.r[3] = (int) prev;
+    regs.r[4] = 0;
+    _kernel_swi(OS_ReadVarVal,&regs,&regs);
+    len = regs.r[2];
+    name = (char *) regs.r[3];
+    type = regs.r[4];
+    if(!name)
+      break;
+    len = ~len;
+    char **environ2 = realloc(environ,sizeof(char*)*(i+2));
+    if(!environ2)
+    {
+      fprintf(stderr, "Lack of memory: truncating env array\n");
+      return environ;
+    }
+    environ = environ2;
+    environ[i+1] = NULL;
+    namelen = strlen(name);
+    expand = 0;
+    switch(type & 0xf)
+    {
+    case 1: /* Number */
+      /* Assume worst-case size */
+      len = 11;
+      expand = 3;
+      /* Fall through... */
+    case 0: /* String */
+    case 2: /* Macro */
+    case 3: /* Expanded */
+    case 4: /* Literal */
+      value = environ[i] = calloc(namelen+1+len+1,sizeof(char));
+      if(!value)
+      {
+        fprintf(stderr, "Lack of memory: truncating env array\n");
+        return environ;
+      }
+      strcpy(value,name);
+      value[namelen] = '=';
+      _swix(OS_ReadVarVal,_INR(0,4),"*",value+namelen+1,len,prev,expand);
+      i++;
+      break;
+    default:
+      /* Some unknown type. Ignore. */
+      break;
+    }
+    prev = name;
+  }
+  return environ;
+}
+
+
+/*
+ * Save the last OS error return value
+ */
+void
+save_err (void)
+{
+	_kernel_oserror *err = _kernel_last_oserror();
+
+	if (err)
+	{
+		err_no = err->errnum;
+		strcpy(err_mess, err->errmess);
+	}
+	else
+	{
+		err_no = 0;
+		strcpy(err_mess, "");
+	}
+}
+
+/*
+ * Sleep function.
+ */
+void
+sleep(unsigned len)
+{
+	time_t end;
+
+	end = time((time_t *)0) + len;
+	while (time((time_t *)0) < end)
+		;
+}
+
+/*
+ * Make and remove directories
+ */
+int
+mkdir(char *dir)
+{
+	int retval = 0;
+	int type;
+	_kernel_osfile_block blk;
+
+	if ((type = _kernel_osfile(17,dir,&blk)) != 0)
+	{
+		err_no = 215;
+		sprintf(err_mess, "%s '%s' already exists",
+			type == 1 ? "File" : "Directory", dir);
+		retval = -1;
+	}
+
+	blk.start = 0;
+	if (_kernel_osfile(8,dir,&blk) == _kernel_ERROR)
+	{
+		retval = -1;
+		save_err();
+	}
+
+	return retval;
+}
+
+int
+rmdir(char *dir)
+{
+	int retval = 0;
+	int type;
+	_kernel_osfile_block blk;
+
+	/* Check that it's a directory */
+	if ((type = _kernel_osfile(17,dir,&blk)) != 2)
+	{
+		blk.load = type;
+		_kernel_osfile(19,dir,&blk);
+		retval = -1;
+	}
+	else if (_kernel_osfile(6,dir,&blk) == _kernel_ERROR)
+	{
+		retval = -1;
+	}
+
+	if (retval == -1)
+		save_err();
+
+	return retval;
+}
+
+int
+unlink(char *file)
+{
+	int retval = 0;
+	_kernel_osfile_block blk;
+
+	if (_kernel_osfile(6,file,&blk) == _kernel_ERROR)
+	{
+		save_err();
+		retval = -1;
+	}
+
+	return retval;
+}
+
+/*
+ * Set the timestamp for a file
+ */
+void
+stamp (char *file)
+{
+	_kernel_osfile_block blk;
+
+	_kernel_osfile(9,file,&blk);
+}
+
+/*
+ * Set environment variables
+ */
+void
+my_setenv(char *var, char *val)
+{
+	if (val)
+		_kernel_setenv(var,val);
+	else
+	{
+		_kernel_swi_regs regs;
+
+		regs.r[0] = (int)var;
+		regs.r[1] = 0;
+		regs.r[2] = -1;
+		regs.r[3] = 0;
+		regs.r[4] = 0;
+
+		_kernel_swi(OS_SetVarVal,&regs,&regs);
+	}
+}
+
+/*
+ * The following code is based on the do_exec and do_aexec functions
+ * in file doio.c
+ */
+int
+do_aspawn(SV *really,SV **mark, SV **sp)
+{
+#ifdef SEE_WHAT_HAPPENS_IF_WE_FIX_THE_APPARENT_BUG
+    return exec_cmdv(0, *sp);
+#else
+    return exec_cmdv(0, (SV *) sp);
+#endif
+}
+
+int
+do_spawn(char *cmd)
+{
+    register SV *str;
+    register int status;
+
+    _kernel_setenv("Sys$ReturnCode","0");
+
+    if (*cmd == '\0')
+	return 0;
+
+/*    str = newSVpv("Call:",5);
+    sv_catpv(str,cmd); */
+    status = system(cmd);
+/*    sv_free(str); */
+
+    if (status == _kernel_ERROR)
+	save_err();
+
+    return status;
+}
+
+/*
+ * Generic exec- or spawn-type command execution.
+ */
+int
+exec_cmdv(int chain,SV *arglast)
+{
+    register SV **st = AvARRAY(stack);
+    register int sp = SvIV(&arglast[1]);
+    register int items = SvIV(&arglast[2]) - sp;
+    register char *a;
+    register char *arg;
+    SV *tmps;
+    int quotes;
+    int status = 0;
+    STRLEN len;
+
+    if (items) {
+	st += ++sp;
+
+	/* First, insert "Call:" */
+	tmps = newSVpv("Call:", 5);
+
+	/* Now add the command name */
+	sv_catsv(tmps,*st);
+
+	/* Now add each argument in turn */
+	for (--items, ++st; items > 0; --items, ++st) {
+	    if (!*st)
+		continue;
+
+	    /* Separate with spaces */
+	    sv_catpvn(tmps, " ", 1);
+
+	    arg = SvPV(*st,len);
+
+	    /* Do we need to quote this arg? */
+	    quotes = (strchr(arg,'"') || strchr(arg,' ') || strchr(arg,'\t'));
+
+	    if (!quotes)
+		sv_catsv(tmps, *st);
+	    else {
+		sv_catpvn(tmps, "\"", 1);
+
+		/* Add the argument string, backslashing " and \ */
+		while ((a = strpbrk(arg,"\"\\")) != Nullch) {
+		    sv_catpvn(tmps, arg, a - arg);
+		    sv_catpvn(tmps, "\\", 1);
+		    sv_catpvn(tmps, a, 1);
+		    arg = a + 1;
+		}
+
+		sv_catpv(tmps, arg);
+		sv_catpvn(tmps, "\"", 1);
+	    }
+	}
+
+	_kernel_setenv("Sys$ReturnCode","0");
+	status = system(SvPV(tmps,len));
+
+	sv_free(tmps);
+
+	if (status == _kernel_ERROR)
+		save_err();
+	else if (chain)
+		exit(0);
+    }
+
+    return status;
+}
+
+/*
+ * Execute a new command, based on an argv array
+ */
+void
+execv(cmd,argv)
+char *cmd;
+char **argv;
+{
+    register char *a;
+    register char *arg;
+    SV *tmps;
+    STRLEN len;
+    int quotes;
+    int result;
+
+    /* First, insert "Call:" */
+    tmps = newSVpv("Call:", 5);
+
+    /* Now add the command name */
+    sv_catpv(tmps, cmd);
+
+    /* Now add each argument in turn */
+    for (++argv; *argv; ++argv)
+    {
+	if (!**argv)
+	    continue;
+
+	/* Separate with spaces */
+	sv_catpvn(tmps, " ", 1);
+
+	arg = *argv;
+
+	/* Do we need to quote this arg? */
+	quotes = (strchr(arg,'"') || strchr(arg,' ') || strchr(arg,'\t'));
+
+	if (!quotes)
+	    sv_catpv(tmps, arg);
+	else {
+	    sv_catpvn(tmps, "\"", 1);
+
+	    /* Add the argument string, backslashing " and \ */
+	    while ((a = strpbrk(arg,"\"\\")) != Nullch) {
+		sv_catpvn(tmps, arg, a - arg);
+		sv_catpvn(tmps, "\\", 1);
+		sv_catpvn(tmps, a, 1);
+		arg = a + 1;
+	    }
+
+	    sv_catpv(tmps, arg);
+	    sv_catpvn(tmps, "\"", 1);
+	}
+    }
+
+    _kernel_setenv("Sys$ReturnCode","0");
+
+    result = system(SvPV(tmps,len));
+    sv_free(tmps);
+
+    if (result != _kernel_ERROR)
+	exit(0);
+    else
+	save_err();
+}
+
+#define SECS1970 2208988800.0 /* Number of seconds from 1/1/1900 to 1/1/1970 */
+
+/* Needs fixed */
+int fstat(int fd, struct stat *buf)
+{
+	buf->st_type = 0;
+	buf->st_load = 0;
+	buf->st_exec = 0;
+	buf->st_length = 0;
+	buf->st_attr = 0;
+	buf->st_ftype = -1;
+	buf->st_time = 0.0;
+	buf->st_utime = 0;
+
+}
+/*
+ * Get a file's catalogue information
+ */
+
+#define UG_READ         ( (S_IREAD)  | (S_IREAD >> 3)  )
+#define UG_WRITE        ( (S_IWRITE) | (S_IWRITE >> 3) )
+#define OTHER_READ      ( S_IREAD  >> 6 )
+#define OTHER_WRITE     ( S_IWRITE >> 6 )
+#define ALL_EXEC        ( (S_IEXEC)  | (S_IEXEC >> 3)  | (S_IEXEC >> 6)  )
+
+int
+stat(char *file, struct stat *buf)
+{
+	int res;
+	int mode = 0;
+	_kernel_osfile_block blk;
+
+	res = _kernel_osfile(5,file,&blk);
+
+	if (res == _kernel_ERROR || res == 0)
+		return -1;
+
+        buf->st_nlink   = 1;
+        buf->st_uid     = 0;
+        buf->st_gid     = 0;
+	buf->st_type = res;
+	buf->st_load = blk.load;
+	buf->st_exec = blk.exec;
+	buf->st_length = blk.start;          /* Size in bytes */
+	buf->st_size = (unsigned) blk.start; /* Size in chars */
+	buf->st_attr = blk.end;
+
+        /* ----- Determine file access mode ----- */
+
+        if ( res == 2 )                /* is it a directory? */
+                mode |= S_IFDIR;
+        else
+                mode |= S_IFREG;
+
+        if ( buf->st_attr & S_READ )
+                mode |= UG_READ;
+
+        if ( buf->st_attr & S_WRITE )
+                mode |= UG_WRITE;
+
+        if ( buf->st_attr & (S_READ << 4) )
+                mode |= OTHER_READ;
+
+        if ( buf->st_attr & (S_WRITE << 4) )
+                mode |= OTHER_WRITE;
+
+        mode |= ALL_EXEC;               /* Always allow execute */
+
+        buf->st_mode = mode;
+
+	if ((blk.load & 0xFFF00000) != 0xFFF00000)
+	{
+		buf->st_ftype = -1;
+		buf->st_time = 0.0;
+		buf->st_utime = 0;
+	}
+	else
+	{
+		double n;
+		buf->st_ftype = ((blk.load >> 8) & 0xFFF);
+		n = (double)((unsigned)(blk.load & 0xFF));
+		n *= 4294967296.0;	/* 2^32 */
+		n += (double)((unsigned)blk.exec);
+		buf->st_time = n;
+		n /= 100.0;
+		n -= SECS1970;
+
+		if (n < 0.0)
+		{
+			n = 0.0;
+			if (dowarn)
+				warn("Timestamp too small in stat (%s): set to %d\n",
+					file, n);
+		}
+		else if (n > (double)UINT_MAX)
+		{
+			n = (double)UINT_MAX;
+			if (dowarn)
+				warn("Timestamp too large in stat (%s): set to %d\n",
+					file, n);
+		}
+		buf->st_mtime = (time_t)n;
+		buf->st_utime = (time_t)n;
+	}
+
+	return 0;
+}
+
+/*
+ * Scan through the OS variables selected by a pattern
+ */
+char *
+getenvar (char *pat, char **val)
+{
+	static char buffer[255];
+	static char *pattern;
+	static char *name_ptr;
+	_kernel_swi_regs regs;
+
+
+
+	if (pat)
+	{
+		pattern = pat;
+		name_ptr = 0;
+	}
+
+	regs.r[0] = (int)pattern;
+	regs.r[1] = (int)buffer;
+	regs.r[2] = 255;
+	regs.r[3] = (int)name_ptr;
+	regs.r[4] = 3;
+
+	if (_kernel_swi(OS_ReadVarVal,&regs,&regs))
+		return 0;
+
+	name_ptr = (char *)regs.r[3];
+	buffer[regs.r[2]] = '\0';
+
+	*val = buffer;
+	return name_ptr;
+}
+
+
+/*
+ * Get the program start time (as a double)
+ */
+void os_starttime (double *dp)
+{
+	int i;
+	double tmp;
+	unsigned char *time;
+
+	_kernel_swi_regs regs;
+	_kernel_oserror *err = _kernel_swi(OS_GetEnv, &regs, &regs);
+
+	if (err)
+	{
+		err_no = err->errnum;
+		strcpy(err_mess, err->errmess);
+		*dp = 0.0;
+		return;
+	}
+
+	time = (unsigned char *) regs.r[2];
+	tmp = 0.0;
+
+	for (i = 4; i >= 0; --i)
+	{
+		tmp *= 256.0;
+		tmp += (double)(time[i]);
+	}
+
+	*dp = tmp;
+}
+
+/* Rename a file. If a simple OS rename fails, the file is copied.
+ * This allows renames across filing system boundaries.
+ * If the destination filename exists, the function deletes it (even
+ * if locked) first.
+ * This function does its best to be totally paranoid about errors, and
+ * returns failure if the rename does not work.
+ * Returns 0 on success, 1 on failure.
+ */
+int frename(const char *old, const char *new)
+{
+	register int result;
+	register int n;
+	FILE *in, *out;
+	_kernel_osfile_block blk;
+	char buf[BUFSIZ];
+
+	/* Check the new file. If it exists, and is not a directory,
+	 * unlock it (if necessary) and delete it.
+	 */
+	result = _kernel_osfile (17, new, &blk);
+
+	/* If the file is a directory, or an error occurred, return failure */
+	if (result == 2 || result == _kernel_ERROR)
+		return 1;
+
+	/* If the file exists and is locked, unlock it */
+	if (result == 1 && (blk.end & 0x0008) != 0)
+	{
+		blk.end &= ~0x0008;
+		if (_kernel_osfile(4, new, &blk) == _kernel_ERROR)
+			return 1;
+	}
+
+	/* If the file exists, delete it */
+	if (result == 1 && _kernel_osfile(6, new, &blk) == _kernel_ERROR)
+		return 1;
+
+	/* Now try a simple OS rename */
+	if (rename(old, new) == 0)
+		return 0;
+
+	/* No luck. Get the old file attributes (to ensure that it exists,
+	 * and is not locked, and for later copying to the new file).
+	 */
+	result = _kernel_osfile (17, old, &blk);
+
+	/* If the file is not a simple file, or an error occurred,
+	 * or the file is locked, return failure.
+	 */
+	if (result != 1 || (blk.end & 0x0008) != 0)
+		return 1;
+
+	/* Now prepare to copy the file */
+	if ((in = fopen(old, "rb")) == NULL)
+		return 1;
+
+	if ((out = fopen(new, "wb")) == NULL)
+	{
+		fclose(in);
+		return 1;
+	}
+
+	/* Copy the file */
+	while (!feof(in))
+	{
+		n = fread(buf, 1, BUFSIZ, in);
+		if (ferror(in) || fwrite(buf, 1, n, out) != n)
+		{
+			fclose(in);
+			fclose(out);
+			remove(new);
+			return 1;
+		}
+	}
+
+	if (ferror(in) || fclose(in) == EOF || ferror(out) || fclose(out) == EOF)
+	{
+		remove(new);
+		return 1;
+	}
+
+	/* Now copy the file attributes across, and delete the old
+	 * file. Don't worry about errors - they're not too serious,
+	 * and it's too late to do much anyway.
+	 */
+	_kernel_osfile(1, new, &blk);
+	_kernel_osfile(6, old, &blk);
+
+	return 0;
+}
+
+int fileno(FILE *file)
+{
+	return(0);
+}
+
+FILE *fdopen(int fd, char *mode)
+{
+	/* What to do here - about sockets etc */
+	char filename[40];
+	sprintf(filename,"<Wimp$ScrapDir>.fd%d%s\0",fd,mode);
+	printf("Opening %s\n via fdopen",filename);
+	return(fopen(filename,mode));
+}
+
+int chmod(const char *path, unsigned int mode)
+{
+	return(1);
+}
+
+FILE *warn_fopen(char *name,char *mode)
+{
+	FILE *file;
+	static int test = -1;
+
+	file = fopen(name,mode);
+	if(test < 0)
+		test = (int)getenv("PERLTEST");
+	if(test)
+		printf("fopen %s %s\n",name,(file ? " ":" -- Failed"));
+	return(file);
+}
+
+FILE *my_fopen(char *name, char *mode)
+{
+	register FILE *file;
+	char myname[PATHNAME_MAX];
+	char newname[PATHNAME_MAX];
+
+	strcpy(myname,name);
+
+	file = warn_fopen(myname,mode);
+
+	if(!file)
+	{
+		if(suffix_swap(myname))
+		{
+			file = warn_fopen(myname,mode);
+			if(!file && mode[0] == 'r')
+			{
+		/* It is a perl file so try the script directory as a last resort. *
+		 * This is a quick fix until I work out why it isn't searching automatically */
+		 		strcpy(newname,"<PerlScript$Dir>.");
+		 		if(strlen(myname) < 20)
+		 			strcat(newname,myname);
+		 		file = warn_fopen(newname,"r");
+		 		if(!file)	/* One last try - skip the pl.*/
+		 		{
+		 			strcpy(&newname[17],&myname[3]);
+		 			file = warn_fopen(newname,"r");
+		 		}
+		 	}
+		}
+	}
+	return(file);
+}
+
+int suffix_swap(char *name)
+{
+	char *sfix;
+	char *fname,tmpname[PATHNAME_MAX];
+	int len = strlen(name);
+
+	sfix = &name[len];
+
+	do
+	{
+		if(--sfix == name)
+			return 0;
+	}
+	while(*sfix != '.');
+	sfix++;
+
+	len = strlen(sfix);
+/* just do pl and pm suffixes at the moment */
+	if(len == 2)
+	{
+		tolower(sfix[0]);
+		tolower(sfix[1]);
+		if(sfix[0] == 'p' && (sfix[1] == 'l' || sfix[1] == 'm'))
+		{
+			fname = sfix - 2;
+			while(*fname != '.' && fname-- != name);
+			fname++;
+			sprintf(tmpname,".%s",fname);
+			tmpname[strlen(fname)-len] = '\0';
+			strcpy(fname,sfix);
+			strcat(fname,tmpname);
+		}
+	}
+}
+
+/*****************************************************************/
+/* Now a selection of routines missing from the original sources */
+/* reverse engineered from a disassembly of the original binary  */
+/* BA 2003-11-06                                                 */
+/*****************************************************************/
+
+static int cmp_cmd(const char *s, const char *cmd);
+
+int chdir (const char *path)
+{
+  return -!!_swix(OS_FSControl, _INR(0,1), 0, path);
+}
+
+bool _os_cmd(const char *cmd)
+{
+  static const char *os_cmds[] = {
+    "access",
+    "adfs",
+    "alphabet",
+    "alphabets",
+    "append",
+    "audio",
+    "basic",
+    "breakclr",
+    "breaklist",
+    "breakset",
+    "build",
+    "cat",
+    "cdir",
+    "channelvoice",
+    "close",
+    "configure",
+    "continue",
+    "copy",
+    "count",
+    "countries",
+    "country",
+    "create",
+    "debug",
+    "delete",
+    "deskfs",
+    "dir",
+    "dump",
+    "echo",
+    "enumdir",
+    "error",
+    "eval",
+    "ex",
+    "exec",
+    "fileinfo",
+    "fontcat",
+    "fontlist",
+    "fx",
+    "go",
+    "gos",
+    "help",
+    "iconsprites",
+    "if",
+    "ignore",
+    "info",
+    "initstore",
+    "key",
+    "keyboard",
+    "lcat",
+    "lex",
+    "lib",
+    "list",
+    "load",
+    "memory",
+    "memorya",
+    "memoryi",
+    "modules",
+    "obey",
+    "opt",
+    "poduleload",
+    "podules",
+    "podulesave",
+    "pointer",
+    "print",
+    "qsound",
+    "quit",
+    "ram",
+    "remove",
+    "rename",
+    "rmclear",
+    "rmensure",
+    "rmfaster",
+    "rmkill",
+    "rmload",
+    "rmreinit",
+    "rmrun",
+    "rmtidy",
+    "rommodules",
+    "run",
+    "save",
+    "schoose",
+    "scopy",
+    "screenload",
+    "screensave",
+    "sdelete",
+    "set",
+    "seteval",
+    "setmacro",
+    "settype",
+    "sflipx",
+    "sflipy",
+    "sget",
+    "shadow",
+    "shellcli",
+    "show",
+    "showregs",
+    "shut",
+    "shutdown",
+    "sinfo",
+    "slist",
+    "sload",
+    "smerge",
+    "snew",
+    "sound",
+    "speaker",
+    "spool",
+    "spoolon",
+    "srename",
+    "ssave",
+    "stamp",
+    "status",
+    "stereo",
+    "tempo",
+    "time",
+    "tuning",
+    "tv",
+    "type",
+    "unplug",
+    "unset",
+    "up",
+    "voices",
+    "volume",
+    "wimppalette",
+    "wimpslot",
+    "wimptask",
+    "wipe"
+  };
+  int low_bound = 0;
+  int high_bound = (sizeof os_cmds / sizeof *os_cmds) - 1;
+  while (low_bound < high_bound)
+  {
+    int trial = (low_bound + high_bound) / 2;
+    int result = cmp_cmd(cmd, os_cmds[trial]);
+    if (result == 0) return TRUE;
+    if (result >= 0) low_bound = trial + 1; else high_bound = trial - 1;
+  }
+  return FALSE;
+}
+
+static int cmp_cmd(const char *s, const char *cmd)
+{
+  while (*cmd && tolower(*s) == *cmd)
+  {
+    cmd++;
+    s++;
+  }
+  if (*cmd) return tolower(*s) - *cmd;
+  if (*s) return 1;
+  return 0;
+}
+
+char *strdup(const char *string)
+{
+  if (!string) return NULL;
+  int len = strlen(string);
+  char *out = malloc(len);
+  if (!out)
+  {
+    fprintf(stderr, "Not enough memory to save string\n");
+    exit(1);
+  }
+  return strcpy(out, string);
+}
+
+DIR *opendir(const char *dirname)
+{
+  DIR *dir = malloc(sizeof (DIR));
+  if (!dir) return NULL;
+  if (!(dir->name = malloc(strlen(dirname) + 1)))
+  {
+    free(dir);
+    return NULL;
+  }
+  strcpy(dir->name, dirname);
+  dir->offset = 0;
+  dir->pbuffer.d_name = dir->buffer;
+  return dir;
+}
+
+void closedir(DIR *dir)
+{
+  free(dir->name);
+  free(dir);
+}
+
+struct direct *readdir(DIR *dir)
+{
+  int nread = 0;
+  while (dir->offset != -1 && nread == 0)
+  {
+    _swix(OS_GBPB, _INR(0,6)|_OUTR(3,4),
+          9,
+          dir->name,
+          dir->buffer,
+          1,
+          dir->offset,
+          sizeof dir->buffer,
+          NULL,
+          &nread,
+          &dir->offset);
+  }
+  if (nread == 0) return NULL; else return &dir->pbuffer;
+}

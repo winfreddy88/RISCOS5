@@ -1,0 +1,270 @@
+/*
+ * Copyright (c) 2017, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <ctype.h>
+#include "swis.h"
+
+#include "Global/ModHand.h"
+#include "SyncLib/synclib.h"
+#include "AsmUtils/rminfo.h"
+
+#include "swidespatch.h"
+#include "asm.h"
+#include "modhdr.h"
+#include "thread.h"
+#include "errors.h"
+
+typedef struct
+{
+	int base;
+	uint64_t mask;
+	swihandler_t handler;
+} swichunk_t;
+
+#define MAX_CHUNKS 1024
+
+typedef struct
+{
+	spinrwlock_t lock;
+	int numchunks;
+	swichunk_t chunks[MAX_CHUNKS];
+} swidespatch_t;
+
+static swidespatch_t despatch =
+{
+	.lock = SPINRW_INITIALISER,
+	.numchunks = 0,
+};
+
+static _kernel_oserror *locate_default_handler(int base, swihandler_t *handler)
+{
+	/* Enumerate all modules until we find one with the given SWI chunk */
+	int module=0,instance=0;
+	do
+	{
+		uint32_t *moduleptr;
+		_kernel_oserror *e = _swix(OS_Module, _INR(0,2)|_OUTR(1,4), ModHandReason_GetNames, module, instance, &module, &instance, &moduleptr, &handler->pw);
+		if (e)
+		{
+			return e;
+		}
+		/* We're on a 32bit machine, so all the required header entries should exist */
+		if (moduleptr[Module_SWIChunk>>2] == base)
+		{
+			handler->handler = ((char *) moduleptr) + moduleptr[Module_SWIEntry>>2];
+			return NULL;
+		}
+	} while (true);
+}
+
+static swihandler_t locate_our_handler(int swino)
+{
+	int base = swino & ~63;
+	uint64_t bit = ((uint64_t)1)<<(swino & 63);
+	swihandler_t result = { NULL, NULL };
+	spinrw_read_lock(&despatch.lock);
+	for(int i=0;i<despatch.numchunks;i++)
+	{
+		swichunk_t *chunk = &despatch.chunks[i];
+		if ((chunk->base == base) && (chunk->mask & bit))
+		{
+			result = chunk->handler;
+			break;
+		}
+	}
+	spinrw_read_unlock(&despatch.lock);
+	return result;
+}
+
+_kernel_oserror *swidespatch_init(void *pw)
+{
+	/* Register our own SWI chunk */
+	swihandler_t handler =
+	{
+		pw,
+		((char *) Image_RO_Base) + (((uint32_t *) Image_RO_Base)[Module_SWIEntry>>2]),
+	};
+	swidespatch_register_custom(SMP_00, ~((uint64_t)0), handler);
+	/* Register MOS SWI handlers */
+#define SWIBIT(X) (((uint64_t)1)<<(X&63))
+	/* 0 - 63 */
+	handler.handler = (void *) &Kernel_ASM_MOSSWI0;
+	swidespatch_register_custom(0, SWIBIT(OS_UpCall) | SWIBIT(OS_GenerateError) | SWIBIT(OS_IntOn) | SWIBIT(OS_IntOff) | SWIBIT(OS_EnterOS) | SWIBIT(OS_LeaveOS) | SWIBIT(OS_Exit), handler);
+	/* 64 - 127 */
+	handler.handler = (void *) &Kernel_ASM_MOSSWI1;
+	swidespatch_register_custom(64, SWIBIT(OS_ClaimDeviceVector) | SWIBIT(OS_ReleaseDeviceVector), handler);
+	/* Register some extra SWIs */
+	swidespatch_register_single(Portable_Idle);
+	return NULL;
+}
+
+_kernel_oserror *swidespatch_register_single(int swino)
+{
+	return swidespatch_register_chunk(swino & ~63, ((uint64_t)1)<<(swino & 63));
+}
+
+_kernel_oserror *swidespatch_register_chunk(int base, uint64_t mask)
+{
+	swihandler_t handler;
+	_kernel_oserror *e = locate_default_handler(base, &handler);
+	if (e)
+	{
+		return e;
+	}
+	return swidespatch_register_custom(base, mask, handler);
+}
+
+_kernel_oserror *swidespatch_register_custom(int base, uint64_t mask, swihandler_t handler)
+{
+	_kernel_oserror *e = NULL;
+	spinrw_write_lock(&despatch.lock);
+	if (despatch.numchunks == MAX_CHUNKS)
+	{
+		e = ERROR(TooManySWIs);
+	}
+	else
+	{
+		/* Just append it to the end */
+		despatch.chunks[despatch.numchunks++] = (swichunk_t) { base, mask, handler };
+	}
+	spinrw_write_unlock(&despatch.lock);
+	return e;
+}
+
+_kernel_oserror *swidespatch_deregister_single(int swino)
+{
+	return swidespatch_deregister_chunk(swino & ~63, ((uint64_t)1)<<(swino & 63));
+}
+
+_kernel_oserror *swidespatch_deregister_chunk(int base, uint64_t mask)
+{
+	swihandler_t handler;
+	_kernel_oserror *e = locate_default_handler(base, &handler);
+	if (e)
+	{
+		return e;
+	}
+	return swidespatch_deregister_custom(base, mask, handler);
+}
+
+_kernel_oserror *swidespatch_deregister_custom(int  base, uint64_t mask, swihandler_t handler)
+{
+	_kernel_oserror *e = ERROR(NoSWIHandler);
+	swichunk_t expected = { base, mask, handler };
+	spinrw_write_lock(&despatch.lock);
+	for (int i=0;i<despatch.numchunks;i++)
+	{
+		if (!memcmp(&despatch.chunks[i], &expected, sizeof(swichunk_t)))
+		{
+			/* Swap with rear entry */
+			despatch.chunks[i] = despatch.chunks[--despatch.numchunks];
+			e = NULL;
+			break;
+		}
+	}
+	spinrw_write_unlock(&despatch.lock);
+	return e;
+}
+
+void swidespatch_despatch(armcontext_t *context)
+{
+	int swino;
+	/* Determine SWI number */
+	if (context->psr & (1<<5))
+	{
+		/* Thumb mode */
+		swino = ((uint16_t *) context->r[15])[-1] & 255;
+	}
+	else
+	{
+		/* ARM */
+		swino = ((uint32_t *) context->r[15])[-1] & 0xffffff;
+	}
+	int swinox = swino & ~XOS_Bit;
+	/* Deal with OS_CallASWI */
+	if (swinox == OS_CallASWI)
+	{
+		swino = context->r[10];
+		swinox = swino & ~XOS_Bit;
+	}
+	else if (swinox == OS_CallASWIR12)
+	{
+		swino = context->r[12];
+		swinox = swino & ~XOS_Bit;
+	}
+	if (swinox == Portable_Idle)
+	{
+		METRIC(WFI);
+	}
+	/* Now locate the SWI handler */
+	swihandler_t handler = locate_our_handler(swinox);
+	/* Invoke it */
+	if (handler.handler)
+	{
+		asm_invoke_swi(context, swinox & 63, &handler);
+	}
+	else
+	{
+		METRIC(BadSWI);
+		context->r[0] = (uint32_t) ERROR(UnsafeSWI);
+		context->psr |= (1<<28);
+	}
+	if ((context->psr & (1<<28)) && !(swinox & XOS_Bit))
+	{
+		/* Non-X SWI returned an error - try and terminate thread */
+		thread_terminate((_kernel_oserror *) context->r[0], 1);
+	}
+}
+
+void swidespatch_dump(void)
+{
+	printf("Number PrivWord Handler  Name\n");
+	spinrw_read_lock(&despatch.lock);
+	for(int i=0;i<despatch.numchunks;i++)
+	{
+		swichunk_t *chunk = &despatch.chunks[i];
+		for(int j=0;j<64;j++)
+		{
+			uint64_t bit = ((uint64_t)1)<<j;
+			if (chunk->mask & bit)
+			{
+				char name[64];
+				int swino = chunk->base + j;
+				_swix(OS_SWINumberToString, _INR(0,2), swino, name, sizeof(name));
+				char *underscore = strchr(name, '_');
+				if (underscore && isalpha(underscore[1]))
+				{
+					printf("%06x %08x %08x %s\n", swino, chunk->handler.pw, chunk->handler.handler, name);
+				}
+			}
+		}
+	}
+	spinrw_read_unlock(&despatch.lock);
+}

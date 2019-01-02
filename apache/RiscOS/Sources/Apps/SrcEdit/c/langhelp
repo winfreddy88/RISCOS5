@@ -1,0 +1,270 @@
+/* Copyright 2007 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/* Title:    langhelp.c
+ * Purpose:  Giving language specific help
+ * Author:   IDJ
+ * History:  26-Mar-90: IDJ: Created
+ *           28-Nov-90: IDJ: changed to use txt code
+ *           15-Mar-91: IDJ: use msgs.h
+ *
+ */
+
+#include <string.h>
+#include <ctype.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#include "akbd.h"
+#include "txt.h"
+#include "txtscrap.h"
+#include "dbox.h"
+#include "werr.h"
+#include "msgs.h"
+#include "win.h"
+#include "wimp.h"
+#include "wimpt.h"
+
+#include "bool.h"
+#include "languages.h"
+#include "slist.h"
+
+#include "langhelp.h"
+
+#define MAXLINELEN   256
+#define MAXSELECTION 64
+
+#define langhelp_keych '%'
+#define langhelp_commentch '#'
+
+#define langhelp__idrchar(c)  (isalnum(c) || c == '_' \
+                                          || c == '$' \
+                                          || c == '%' )
+
+typedef enum {IGNORE, KEY, HELPLINE} langhelp_state;
+
+
+static BOOL langhelp__get_selection(char selection[])
+{
+   txt owner;
+
+   if ((owner = txtscrap_selectowner()) != 0)
+   {
+      char *a;
+      int segsize;
+      int n = 0;
+      int size;
+
+      if ((size = txt_selectend(owner) - txt_selectstart(owner)) >= MAXSELECTION)
+           return FALSE;
+
+      while (n < size)
+      {
+          txt_arrayseg(owner, txt_selectstart(owner) + n, &a, &segsize);
+          segsize = (segsize < size -n) ? segsize : size - n;
+          memcpy(&selection[n], a, segsize);
+          n += segsize;
+      }
+
+      selection[n] = 0;
+      return TRUE;
+   }
+
+   return FALSE;
+}
+
+
+static void langhelp__getline(FILE *fp, langhelp_state *state, char *line)
+{
+   int ch, i=0;
+
+   /* get a line of text from the file */
+   while ((ch = fgetc(fp)) != '\n' && !feof(fp) && i < MAXLINELEN)
+      line[i++] = ch;
+   line[i] = '\0';
+
+   /* set state according to first char of line */
+   switch(line[0])
+   {
+      case langhelp_keych:
+        *state = KEY;
+        break;
+
+      case langhelp_commentch:
+      case '\0':
+        *state = IGNORE;
+        break;
+
+      default:
+        *state = HELPLINE;
+        break;
+   }
+}
+
+
+static void langhelp__txthandler(txt t, void *handle)
+{
+   txt_eventcode e;
+   handle = handle;
+
+   /* **** NOTE: this handler is here to deal with closing, and
+      up/down scrolling only - everything else is either ignored
+      or is done in the furthest recesses of RISC_OSLib for us
+      (IDJ, 28-Nov-90)
+   */
+
+   e = txt_get(t);
+
+   if (e & txt_MOUSECODE)   /* mouse drags etc. on window get reported like this */
+   {
+      /* do nothing */
+   }
+   else
+   {
+      switch(e)
+      {
+         case txt_EXTRACODE + akbd_Sh + akbd_Ctl + akbd_UpK:
+                  /* line up */
+                  txt_movevertical(t, -1, 1);
+                  break;
+
+         case txt_EXTRACODE + akbd_Sh + akbd_UpK:
+                  /* "page" up */
+                  txt_movevertical(t, -txt_visiblelinecount(t), 1);
+                  break;
+
+         case txt_EXTRACODE + akbd_Sh + akbd_Ctl + akbd_DownK:
+                  /* line down */
+                  txt_movevertical(t, 1, 1);
+                  break;
+
+         case txt_EXTRACODE + akbd_Sh + akbd_DownK:
+                  /* "page" down */
+                  txt_movevertical(t, txt_visiblelinecount(t), 1);
+                  break;
+
+         case txt_EXTRACODE + akbd_Fn + 127:
+         case akbd_Fn + akbd_Ctl + 2:
+                  /* close icon */
+                  txt_dispose(&t);
+                  break;
+
+         default:
+            break;
+      }
+   }
+}
+
+
+extern void langhelp_gethelp(void)
+{
+   char selbuffer[MAXSELECTION], *selection, *selend;
+   FILE *fp;
+   char line[MAXLINELEN], *help_file;
+   langhelp_state state = IGNORE;
+   BOOL found = FALSE;
+   wimp_caretstr caret;
+   txt t;
+
+   /* check there is a selection ! */
+   if (txtscrap_selectowner() == 0) return;
+
+   /* get selection from txt */
+   if (!langhelp__get_selection(selbuffer))
+   {
+       werr(FALSE, msgs_lookup("langhelp1:Selection limit for help is %d characters"), MAXSELECTION);
+       return;
+   }
+
+   /* --- get rid of extraneous rubbish --- */
+   selection = selbuffer;
+   selend = &selbuffer[strlen(selbuffer)-1];
+   while (!langhelp__idrchar(*selection)) selection++;
+   while (!langhelp__idrchar(*selend) && selend >= selbuffer) selend--;
+   if (selend < selbuffer || *selection == 0)
+   {
+      werr(FALSE, msgs_lookup("langhelp2:No help found for selection"));
+      return;
+   }
+   *(selend+1) = 0;
+
+   /* --- open help file --- */
+   if ((help_file = languages_help_location()) != 0 && help_file[0] != 0)
+   {
+      if ((fp = fopen(help_file, "r")) == 0)
+      {
+         werr(FALSE, msgs_lookup("langhelp3:Unable to open help file %s"), help_file);
+         return;
+      }
+   }
+   else
+      return;
+
+   /* --- find the key field in help file --- */
+   while (!feof(fp))
+   {
+      langhelp__getline(fp, &state, line);
+      if (state == KEY && !strcmp(selection, &line[1]))
+      {
+         found = TRUE;
+         break;
+      }
+   }
+
+   /* --- display help window for this entry --- */
+   if (found)
+   {
+      char title[MAXLINELEN];
+
+      /* --- create a txt object --- */
+      sprintf(title, msgs_lookup("langhelp4:Help on %s"), selection);
+      if ((t = txt_new(title)) == 0)
+      {
+         werr(FALSE, msgs_lookup("langhelp5:Failed to open window for help"));
+         fclose(fp);
+         return;
+      }
+
+      /* --- before showing the txt, see where the caret is so we can reset it --- */
+      wimp_get_caret_pos(&caret);
+      txt_show(t);
+
+      /* --- register event handler so we can scroll/close etc. --- */
+      txt_eventhandler(t, langhelp__txthandler, 0);
+
+      /* --- insert help info into it --- */
+      langhelp__getline(fp, &state, line);
+      while (!feof(fp) && state != KEY)
+      {
+          if (state == HELPLINE)
+          {
+             txt_insertstring(t, line);
+             txt_setdot(t, txt_dot(t) + strlen(line));
+             txt_insertchar(t, '\n');
+             txt_setdot(t, txt_dot(t)+1);
+             txt_setcharoptions(t, txt_CARET, 0);
+          }
+          langhelp__getline(fp, &state, line);
+      }
+
+      /* --- reset caret pos and dot (cos txt_show grabs it) --- */
+      txt_setdot(t, 0);
+      wimp_set_caret_pos(&caret);
+   }
+   else
+      werr(FALSE, msgs_lookup("langhelp2:No help found for selection"));
+
+   fclose(fp);
+}
+

@@ -1,0 +1,533 @@
+/*
+ * Copyright (c) 2012, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include "BatMgrHdr.h"
+#include "swis.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stddef.h>
+#include <stdbool.h>
+#include <time.h>
+
+#include "Global/RISCOS.h"
+#include "Global/Services.h"
+#include "Global/HALDevice.h"
+#include "Global/HALEntries.h"
+#include "Global/FSNumbers.h"
+#include "Global/Sprite.h"
+#include "Interface/HighFSI.h"
+#include "Interface/Portable.h"
+
+#include "wimp.h"
+#include "sprite.h"
+#include "font.h"
+#include "colourtran.h"
+
+#include "globals.h"
+#include "bmu.h"
+
+wimp_t taskhandle = TASKHANDLE_NONE;
+static const wimp_w iconbar_window = (wimp_w) -2; 
+static wimp_i iconbar_icon;
+
+static sprite_area *battery_sprites;
+static sprite_id battery_sprite;
+static sprite_info battery_sprite_info;
+
+static sprite_area *iconbar_sprites;
+static sprite_id iconbar_sprite;
+static sprite_info iconbar_sprite_info;
+
+static int gauge_min_x;
+static int gauge_max_x;
+
+static clock_t last_update;
+
+#define UPDATE_INTERVAL (30) /* Seconds */
+#define GAUGE_COLOUR_SPRITE (0x8c)
+#define GAUGE_COLOUR (0x62)
+
+#define COLOUR_FULL (0x62)
+#define COLOUR_LOW (87)
+#define COLOUR_FLAT (23)
+#define COLOUR_BACK (0xfd)
+#define COLOUR_ABSENT (47)
+#define COLOUR_CHARGE (248)//(244)//(195)
+#define STRIPE_SIZE (6)
+
+#define PERCENT_FULL (100)
+#define PERCENT_GOOD (65)
+#define PERCENT_LOW (30)
+#define PERCENT_FLAT (10)
+
+#define SPRITE_MODE (28)
+//#define SPRITE_MODE (1+(4<<27)+(90<<1)+(90<<14))
+
+#define TEXT_HEIGHT (22)
+
+typedef struct {
+	uint8_t *screenstart;
+	int linelength;
+	int terminator;
+} vdu_vars;
+
+static void quit(os_error *e)
+{
+	if(e)
+	{
+		wimp_reporterror(e,wimp_EOK,Module_Title);
+		exit(EXIT_FAILURE);
+	}
+	exit(EXIT_SUCCESS);
+}
+
+static void load_sprites(void)
+{
+	/* Find battery sprites in ResourceFS */
+	int fh,fhh,info;
+	_kernel_oserror *e;
+	_swi(OS_Find,_INR(0,1)|_OUT(0),OSFind_OpenIn,"Resources:$.Resources.BatMgr.Sprites",&fh);
+
+	e = _swix(OS_FSControl,_INR(0,1)|_OUTR(1,2),FSControl_ReadFSHandle,fh,&fhh,&info);
+	if(fh) _swix(OS_Find,_INR(0,1),OSFind_Close,fh);
+	if(e)
+	{
+		quit((os_error *)e);
+	}
+	if((info & 0xff) != fsnumber_resourcefs)
+	{
+		/* Give up if not in ResourceFS */
+		exit(EXIT_FAILURE);
+	}
+	battery_sprites = (sprite_area *) (fhh-4); /* Magic */
+
+	/* Find the battery sprite */
+	_swi(OS_SpriteOp,_INR(0,2)|_OUT(2),SpriteReason_SelectSprite+256,battery_sprites,"battery",&battery_sprite.s.addr);
+	battery_sprite.tag = sprite_id_addr;
+
+	/* Read its info */
+	os_error *e2 = sprite_readsize(battery_sprites,&battery_sprite,&battery_sprite_info);
+	if(e2)
+		quit(e2);
+}
+
+static os_error *put_text(font f,char *buf,int x,int y)
+{
+	os_error *e;
+	if(f)
+	{
+		font_info fi;
+		e = font_stringbbox(buf,&fi);
+		if(e)
+			return e;
+		return font_paint(buf,(1<<11),(-fi.maxx/2)+x*400,(-fi.maxy/2)+y*400);
+	}
+	/* TODO - System font version */
+	return NULL;
+}
+
+static os_error *update_battery(int i,font wimp_font,vdu_vars *vdu)
+{
+	os_error *e;
+	/* Plot base sprite */
+	e = sprite_put_given(battery_sprites,&battery_sprite,0,0,(iconbar_sprite_info.height-battery_sprite_info.height*(i+1))*2);
+	if(e)
+		return e;
+
+	int leftcol,rightcol;
+	int percent=0;
+	bool stripe=false;
+	if(bmu_state[i].statusflags == -1)
+	{
+		/* Dunno yet */
+		leftcol = rightcol = COLOUR_ABSENT;
+		stripe = true;
+	}
+	else if((bmu_state[i].validflags & PortableBMUF_BatteryPresent) && !(bmu_state[i].statusflags & PortableBMUF_BatteryPresent))
+	{
+		/* Battery not present, black it out */
+		leftcol = rightcol = COLOUR_ABSENT;
+	}
+	else
+	{
+		/* Battery probably present */
+		if(bmu_state[i].statusflags & PortableBMUF_Charging)
+			stripe = true;
+		if(bmu_state[i].statusflags & PortableBMUF_BatteryFull)
+		{
+			percent = PERCENT_FULL;
+			leftcol = COLOUR_FULL;
+		}
+		else if(bmu_state[i].statusflags & PortableBMUF_BatteryLow)
+		{
+			percent = PERCENT_LOW;
+			leftcol = COLOUR_LOW;
+		}
+		else if(bmu_state[i].statusflags & PortableBMUF_BatteryFlat)
+		{
+			percent = PERCENT_FLAT;
+			leftcol = COLOUR_FLAT;
+		}
+		else
+		{
+			percent = PERCENT_GOOD;
+			leftcol = COLOUR_FULL;
+		}
+		if(bmu_state[i].percentremaining != -1)
+			percent = bmu_state[i].percentremaining;
+		rightcol = COLOUR_BACK;
+	}
+
+	/* Fill in the gauge */
+	uint8_t *row = vdu->screenstart+vdu->linelength*i*battery_sprite_info.height;
+	int pos = (((gauge_max_x-gauge_min_x)*percent)/100)+gauge_min_x;
+	for(int y=0;y<battery_sprite_info.height;y++,row+=vdu->linelength)
+	{
+		int stripey = abs(y-battery_sprite_info.height/2) % (STRIPE_SIZE*2); 
+		for(int x=gauge_min_x;x<gauge_max_x;x++,stripey++)
+		{
+			if(stripey == STRIPE_SIZE*2)
+				stripey = 0;
+			if(row[x] == GAUGE_COLOUR)
+			{
+				if(stripe && (stripey >= STRIPE_SIZE))
+				{
+					row[x] = COLOUR_CHARGE;
+				}
+				else if(x <= pos)
+				{
+					row[x] = leftcol;
+				}
+				else
+				{
+					row[x] = rightcol;
+				}
+			}
+		}
+	}
+
+	/* Add fill percent */
+	if((bmu_state[i].statusflags != -1) && (bmu_state[i].percentremaining != -1))
+	{
+		char buf[8];
+		char buf1[4];
+		sprintf(buf1,"%d",bmu_state[i].percentremaining);
+		if(!_swix(MessageTrans_Lookup,_INR(0,4),&messages,"CHGP",buf,sizeof(buf),buf1))
+		{
+			e = put_text(wimp_font,buf,battery_sprite_info.width,(iconbar_sprite_info.height-battery_sprite_info.height*i)*2-battery_sprite_info.height);
+			if(e)
+				return e;
+		}
+	}
+
+	return NULL;
+}
+
+static void update_text(font wimp_font,vdu_vars *vdu)
+{
+	/* Clear text region of sprite to background colour */
+	uint8_t *row = vdu->screenstart+vdu->linelength*(iconbar_sprite_info.height-TEXT_HEIGHT);
+	for(int y=0;y<TEXT_HEIGHT;y++,row+=vdu->linelength)
+	{
+		for(int x=0;x<battery_sprite_info.width;x++)
+			row[x] = COLOUR_BACK;
+	}
+
+	/* Decide what to show
+	   We assume battery 0 is the interesting one */
+	char buf[20];
+	char buf1[20];
+	char buf2[20];
+	const char *tok = NULL;
+	if(bmu_state[0].statusflags == -1)
+	{
+		/* Show nothing */
+	}
+	else if(bmu_state[0].timeremaining != -1)
+	{
+		sprintf(buf1,"%d",bmu_state[0].timeremaining/60);
+		sprintf(buf2,"%02d",bmu_state[0].timeremaining%60);
+		tok = "CHGT";
+	}
+	else if(bmu_state[0].statusflags & PortableBMUF_Charging)
+	{
+		tok = "CHGI";
+	}
+	else if(bmu_state[0].statusflags & PortableBMUF_ChargerPresent)
+	{
+		tok = "CHGR";
+	}
+	else if((bmu_state[0].validflags & PortableBMUF_BatteryPresent) && !(bmu_state[0].statusflags & PortableBMUF_BatteryPresent))
+	{
+		tok = "NOBT";
+	}
+	if(tok && !_swix(MessageTrans_Lookup,_INR(0,5),&messages,tok,buf,sizeof(buf),buf1,buf2))
+		put_text(wimp_font,buf,battery_sprite_info.width,TEXT_HEIGHT+8);
+
+	/* Update mask */
+	row = vdu->screenstart+vdu->linelength*(iconbar_sprite_info.height-TEXT_HEIGHT);
+	for(int y=0;y<TEXT_HEIGHT;y++,row+=vdu->linelength)
+	{
+		for(int x=0;x<battery_sprite_info.width;x++)
+		{
+			sprite_maskstate m = (row[x] == COLOUR_BACK)?sprite_masktransparent:sprite_masksolid;
+			/* Slow! */
+			sprite_writemask(iconbar_sprites,&iconbar_sprite,x,TEXT_HEIGHT-1-y,&m);
+		}
+	}
+}
+
+static void update_sprite(void)
+{
+	/* Update the contents of the sprite */
+	font wimp_font;
+	_swi(Wimp_ReadSysInfo,_IN(0)|_OUT(0),8,&wimp_font);
+
+	int size;
+	os_error *e = (os_error *) _swix(OS_SpriteOp,_IN(0)|_IN(2)|_OUT(3),SpriteReason_ReadSaveAreaSize,0,&size);
+	if(e)
+		quit(e);
+
+	int *save_area = (int *) malloc(size);
+	if(!save_area)
+		exit(EXIT_FAILURE);
+	*save_area = 0;
+
+	sprite_state state;
+	e = (os_error *) _swix(OS_SpriteOp,_INR(0,3)|_OUTR(0,3),SpriteReason_SwitchOutputToSprite+512,iconbar_sprites,iconbar_sprite.s.addr,save_area,&state.r[0],&state.r[1],&state.r[2],&state.r[3]);
+	if(e)
+		quit(e);
+
+	vdu_vars vdu;
+	vdu.screenstart = (uint8_t *) 148;
+	vdu.linelength = 6;
+	vdu.terminator = -1;
+	e = (os_error *) _swix(OS_ReadVduVariables,_INR(0,1),&vdu,&vdu);
+	if(e)
+		goto err1;
+
+	if(wimp_font)
+	{
+		e = font_setfont(wimp_font);
+		if(e)
+			goto err1;
+		wimp_paletteword backgnd;
+		wimp_paletteword foregnd;
+		int max_offset = 14;
+		backgnd.word = 0xf0f0f000;
+		foregnd.word = 0;
+		e = colourtran_setfontcolours(&wimp_font,&backgnd,&foregnd,&max_offset);
+		if(e)
+			goto err1;
+	}
+	/* TODO - System font version */
+
+	for(int i=0;i<bmu_count;i++)
+	{
+		e = update_battery(i,wimp_font,&vdu);
+		if(e)
+			goto err1;
+	}
+
+	/* Charge state text */
+	update_text(wimp_font,&vdu);
+
+	_swix(OS_SpriteOp,_INR(0,3),state.r[0],state.r[1],state.r[2],state.r[3]);
+	free(save_area);
+	return;
+
+err1:
+	_swix(OS_SpriteOp,_INR(0,3),state.r[0],state.r[1],state.r[2],state.r[3]);
+	quit(e);
+}
+
+static os_error *create_iconbar_icon(void)
+{
+	/* Create sprite area & sprite for the icon */
+	int width = battery_sprite_info.width;
+	int height = battery_sprite_info.height*bmu_count+TEXT_HEIGHT;
+	/* If only one battery, shift it up a bit to avoid looking cramped */
+	if(bmu_count == 1)
+		height += 7;
+	int area_size = (width+4)*height*2+3*1024; /* Overestimate a bit */
+	iconbar_sprites = (sprite_area *) malloc(area_size);
+	if(!iconbar_sprites)
+		exit(EXIT_FAILURE);
+	sprite_area_initialise(iconbar_sprites,area_size);
+
+	/* Create the sprite */
+	sprite_ptr ptr;
+	os_error *e = sprite_create_rp(iconbar_sprites,"icon",sprite_nopalette,width,height,28,&ptr);
+	if(e)
+		return e;
+	iconbar_sprite.s.addr = ptr;
+	iconbar_sprite.tag = sprite_id_addr;
+	e = sprite_create_mask(iconbar_sprites,&iconbar_sprite);
+	if(e)
+		return e;
+	/* Create a 256 colour palette, otherwise the OS will fail horribly at converting the colours in some modes */
+	_swi(OS_SpriteOp,_INR(0,3),SpriteReason_CreateRemovePalette+512,iconbar_sprites,ptr,0x80000000);
+
+	e = sprite_readsize(iconbar_sprites,&iconbar_sprite,&iconbar_sprite_info);
+	if(e)
+		return e;
+
+	/* Fill in the mask, and read min/max X position for gauge */
+	gauge_min_x = width;
+	gauge_max_x = 0;
+	for(int y=0;y<battery_sprite_info.height;y++)
+		for(int x=0;x<width;x++)
+		{
+			sprite_maskstate m;
+			e = sprite_readmask(battery_sprites,&battery_sprite,x,y,&m);
+			if(e)
+				quit(e);
+			if(m != sprite_masktransparent)
+			{
+				if((x < gauge_min_x) || (x > gauge_max_x))
+				{
+					sprite_colour c;
+					e = sprite_readpixel(battery_sprites,&battery_sprite,x,y,&c);
+					if(e)
+						quit(e);
+					if(c.colour+c.tint == GAUGE_COLOUR_SPRITE)
+					{
+						if(x < gauge_min_x)
+							gauge_min_x = x;
+						if(x > gauge_max_x)
+							gauge_max_x = x;
+					}
+				}
+				continue;
+			}
+			for(int z=0;z<bmu_count;z++)
+			{
+				e = sprite_writemask(iconbar_sprites,&iconbar_sprite,x,y+(z-bmu_count)*battery_sprite_info.height+height,&m);
+				if(e)
+					quit(e);
+			}
+		}
+	gauge_max_x++;
+
+	/* Clear mask for the gap between the battery icon and the text (if any) */
+	for(int y=battery_sprite_info.height*bmu_count;y<height-TEXT_HEIGHT;y++)
+		for(int x=0;x<width;x++)
+		{
+			sprite_maskstate m;
+			m = sprite_masktransparent;
+			e = sprite_writemask(iconbar_sprites,&iconbar_sprite,x,(height-1)-y,&m);
+			if(e)
+				quit(e);
+		}
+
+	/* Fill in the sprite */
+	bmu_update();
+	update_sprite();
+	last_update = clock();
+
+	/* Create the icon */
+	wimp_icreate blk;
+	blk.w = iconbar_window;
+	blk.i.box.x0 = 0;
+	blk.i.box.y0 = -24;
+	blk.i.box.x1 = width<<1;
+	blk.i.box.y1 = (height<<1)-24;
+	blk.i.flags = wimp_ISPRITE | wimp_IHCENTRE | wimp_IVCENTRE | wimp_INDIRECT | (wimp_BCLICKAUTO*wimp_IBTYPE) | (7*wimp_IFORECOL) | (1*wimp_IBACKCOL);
+	blk.i.data.indirectsprite.name = (char *) iconbar_sprite.s.name;
+	blk.i.data.indirectsprite.spritearea = iconbar_sprites;
+	blk.i.data.indirectsprite.nameisname = 0;
+	return wimp_create_icon(&blk,&iconbar_icon);
+}
+
+static void update_icon(void)
+{
+	bmu_update();
+	update_sprite();
+	wimp_set_icon_state(iconbar_window,iconbar_icon,wimp_IREDRAW,wimp_IREDRAW);
+	last_update = clock();
+}
+
+static void not_running(void)
+{
+	taskhandle = TASKHANDLE_NONE;
+}
+
+int main(int argc,char **argv)
+{
+	(void) argc;
+	(void) argv;
+
+	os_error *e;
+
+	atexit(not_running);
+
+	load_sprites();
+
+	e = (os_error *) _swix(Wimp_Initialise,_INR(0,3)|_OUT(1),380,0x4b534154,Module_Title,NULL,&taskhandle);
+
+	if(e)
+		quit(e);
+
+	/* Create iconbar icon */
+	e = create_iconbar_icon();
+	if(e)
+		quit(e);
+
+	/* Poll */
+	do {
+		wimp_eventstr event;
+		int interval;
+		/* Poll frequently until we get a valid response for the main battery */
+		if(bmu_state[0].statusflags == -1)
+			interval = 100;
+		else
+			interval = UPDATE_INTERVAL*100;
+		e = wimp_pollidle(wimp_EMREDRAW|wimp_EMOPEN|wimp_EMCLOSE|wimp_EMPTRLEAVE|wimp_EMPTRENTER|wimp_EMUSERDRAG|wimp_EMKEY|wimp_EMMENU|wimp_EMSCROLL|wimp_EMLOSECARET|wimp_EMGAINCARET|wimp_EMACK,&event,interval);
+		if(e)
+			quit(e);
+		switch(event.e)
+		{
+		case wimp_ENULL:
+			/* Ignore spurious null events */
+			if(clock()-last_update > UPDATE_INTERVAL*CLOCKS_PER_SEC)
+				update_icon();
+			break;
+		case wimp_EBUT:
+			if((event.data.but.m.w == iconbar_window) && (event.data.but.m.bbits & wimp_BLEFT))
+				update_icon();
+			break;
+		case wimp_ESEND:
+		case wimp_ESENDWANTACK:
+			if(event.data.msg.hdr.action == wimp_MCLOSEDOWN)
+				quit(NULL);
+			break;
+		}
+	} while(1);
+
+	return 0;
+}

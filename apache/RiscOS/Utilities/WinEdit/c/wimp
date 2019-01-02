@@ -1,0 +1,296 @@
+/* Copyright 2003 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*-*-C-*-
+ *
+ * Wimp veneer routines
+ */
+
+#include "resed.h"
+
+
+/*
+ * Load the given window template into a malloced WindowRec.  The indirected
+ * data is stuck right on the end of the WindowRec so that it can be
+ * freed in one go.
+ *
+ * Note that this routine allocates enough space for the window handle
+ * to sit at the top of the returned block.
+ */
+
+error * wimp_load_template (char *name, WindowPtr *windowret)
+{
+    int buflen, indirlen;
+    char *buffer, *wbuf, *ibuf;
+
+    ER( _swix(Wimp_LoadTemplate, _IN(1) | _INR(4,6) | _OUTR(1,2),
+              0, -1, name, 0,
+              &buflen, &indirlen) );
+
+    buflen = buflen + 3 & ~3;           /* ensure indir on word boundary*/
+    buffer = calloc(sizeof(int) + buflen + indirlen, sizeof(char));
+    if (!buffer) return error_lookup("NoMem");
+    wbuf = buffer + sizeof(int);
+    
+    ibuf = wbuf + buflen;
+
+    ER( _swix(Wimp_LoadTemplate, _INR(1,6),
+              wbuf, ibuf, ibuf + indirlen, -1 /* No fonts */, name, 0) );
+
+    *windowret = (WindowPtr) buffer;
+/*    (*windowret)->handle = -1;*/
+    return NULL;
+}
+
+
+/*
+ * Is a point inside a rectangle?
+ */
+
+int wimp_point_inside (RectPtr rect, PointPtr point)
+{
+    return
+        point->x >= rect->minx &&
+            point->x < rect->maxx &&
+                point->y >= rect->miny &&
+                    point->y < rect->maxy;
+}
+
+
+/*
+ * Do two half-open rectangles intersect?
+ */
+
+int wimp_rects_intersect (RectPtr one, RectPtr two)
+{
+    return
+        one->maxx > two->minx &&
+            one->minx < two->maxx &&
+                one->maxy > two->miny &&
+                    one->miny < two->maxy;
+}
+
+
+/*
+ * Is small rectangle contained entirely within large rectangle?
+ */
+
+int wimp_rect_contained (RectPtr small, RectPtr large)
+{
+    return
+        small->minx >= large->minx &&
+            small->maxx <= large->maxx &&
+                small->miny >= large->miny &&
+                    small->maxy <= large->maxy;
+}
+
+
+/*
+ * Convert screen-relative point to work-area-relative.
+ * In and out may point to the same structure.
+ */
+
+void wimp_convert_point (ConvertType type, WindowPtr win, PointPtr in, PointPtr out)
+{
+    int offx = win->visarea.minx - win->scrolloffset.x;
+    int offy = win->visarea.maxy - win->scrolloffset.y;
+    out->x = in->x + (offx * type);
+    out->y = in->y + (offy * type);
+}
+
+
+/*
+ * Convert screen-relative area to work-area-relative.
+ * In and out may point to the same structure.
+ */
+
+void wimp_convert_rect (ConvertType type, WindowPtr win, RectPtr in, RectPtr out)
+{
+    int offx = win->visarea.minx - win->scrolloffset.x;
+    int offy = win->visarea.maxy - win->scrolloffset.y;
+    out->minx = in->minx + (offx * type);
+    out->miny = in->miny + (offy * type);
+    out->maxx = in->maxx + (offx * type);
+    out->maxy = in->maxy + (offy * type);
+}
+
+
+/*
+ * Ensure that a rectangle's min/max are the normal way round.  If not,
+ * swap them.   XXX is this correct resp. half-openness?
+ */
+
+void wimp_regularise_rect (RectPtr rect)
+{
+    int temp;
+    if (rect->minx > rect->maxx)
+    {
+        temp = rect->minx;
+        rect->minx = rect->maxx;
+        rect->maxx = temp;
+    }
+    if (rect->miny > rect->maxy)
+    {
+        temp = rect->miny;
+        rect->miny = rect->maxy;
+        rect->maxy = temp;
+    }
+}
+
+
+/*
+ * Merge two bounding boxes.  'Out' may point to the
+ * same place as one of the other parameters.
+ */
+
+void wimp_merge_bboxes (RectPtr out, RectPtr one, RectPtr two)
+{
+    out->minx = MIN(one->minx, two->minx);
+    out->miny = MIN(one->miny, two->miny);
+    out->maxx = MAX(one->maxx, two->maxx);
+    out->maxy = MAX(one->maxy, two->maxy);
+}
+
+
+Bool wimp_bboxes_different (RectPtr one, RectPtr two)
+{
+    return memcmp ((void *) one, (void *) two, sizeof(RectRec)) != 0;
+}
+
+
+/*
+ * Read values of the modifier keys
+ */
+
+unsigned int wimp_read_modifiers ()
+{
+    unsigned int ret = 0;
+    int pressed;
+    if (_swix(OS_Byte, _INR(0,2) | _OUT(1),
+              129,  KEYCODE_SHIFT ^ 0xFF, 0xFF,
+              &pressed) == NULL)
+        if (pressed) ret |= MODIFIER_SHIFT;
+    if (_swix(OS_Byte, _INR(0,2) | _OUT(1),
+              129, KEYCODE_CTRL ^ 0xFF, 0xFF,
+              &pressed) == NULL)
+        if (pressed) ret |= MODIFIER_CTRL;
+    return ret;
+}
+
+
+/*
+ * ForceRedraw a rectangle (work-area coords)
+ */
+
+error * wimp_invalidate (WindowPtr win, RectPtr area)
+{
+    return _swix(Wimp_ForceRedraw, _INR(0,4),
+                 win->handle, area->minx, area->miny, area->maxx, area->maxy);
+}
+
+
+/*
+ * Move caret from current writeable icon to another in the same
+ * window.  It is placed at the same index in the string if possible.
+ * Caret must already be in an indirected writeable icon of the window - so only
+ * use this if you are sure of that e.g. in Key_Pressed handlers.
+ */
+
+error * wimp_move_caret (WindowPtr window, int i)
+{
+    int pos = strlen((char *) window->icons[i].data[0]);
+    CaretPositionRec caret;
+
+    if (_swix(Wimp_GetCaretPosition, _IN(1),
+              &caret) == NULL && caret.index < pos)
+        pos = caret.index;
+
+    return _swix(Wimp_SetCaretPosition, _INR(0,1) | _INR(4,5),
+                 window->handle, i, -1, pos);
+}
+
+
+/*
+ * Move a window such that its top-left corner is at the specified
+ * coordinates.  This call does not do a Wimp_OpenWindow for you,
+ * it only updates the WindowRec.
+ */
+
+void wimp_move_window (WindowPtr win, int x, int y)
+{
+    RectPtr vis = &win->visarea;
+    int w = vis->maxx - vis->minx;
+    int h = vis->maxy - vis->miny;
+    vis->minx = x;
+    vis->maxy = y;
+    vis->maxx = x + w;
+    vis->miny = y - h;
+}
+
+
+/*
+ * Plot a dotted rubber box using EOR.  The coordinates are work-area
+ * ones for the given window and are half-open.  Should only
+ * be called in a Wimp_RedrawWindow or Wimp_UpdateWindow loop
+ */
+
+void wimp_plot_eor_box (WindowPtr win, RectPtr work)
+{
+    RectRec box;
+    
+    wimp_convert_rect (WorkToScreen, win, work, &box);
+    box.maxx -= scalex;     /* convert from half open */
+    box.maxy -= scaley;
+
+    _swix(Wimp_SetColour, _IN(0),
+          0x3F);
+    _swix(OS_Plot, _INR(0,2),
+          4, box.minx, box.miny);
+    _swix(OS_Plot, _INR(0,2),
+          5 | 24, box.maxx, box.miny);
+    _swix(OS_Plot, _INR(0,2),
+          5 | 48, box.maxx, box.maxy);
+    _swix(OS_Plot, _INR(0,2),
+          5 | 48, box.minx, box.maxy);
+    _swix(OS_Plot, _INR(0,2),
+          5 | 48, box.minx, box.miny);
+}
+
+
+/*
+ * Plot a dotted rubber box using EOR.  This may
+ * be called outside a redraw loop because it uses
+ * Wimp_UpdateWindow.
+ */
+
+void wimp_update_eor_box (WindowPtr win, RectPtr work)
+{
+    WindowRedrawRec temp;
+    int more;
+    
+    temp.handle = win->handle;
+    wimp_convert_rect (ScreenToWork, win, &win->visarea, &temp.visarea);
+    _swix(Wimp_UpdateWindow, _IN(1) | _OUT(0),
+          &temp,
+          &more);
+    
+    while (more)
+    {
+        wimp_plot_eor_box (win, work);
+        _swix(Wimp_GetRectangle, _IN(1) | _OUT(0),
+              &temp,
+              &more);
+    }
+}
+

@@ -1,0 +1,1506 @@
+/* Copyright 2002 Tematic Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <stddef.h>
+#include <time.h>
+#include <signal.h>
+#include "swis.h"
+
+#include "VersionNum"
+
+typedef unsigned char byte;
+typedef unsigned short halfword;
+typedef unsigned int word;
+
+enum Code
+{
+    Section = 1,
+    Procedure,
+    EndProc,
+    Variable,
+    Type,
+    Struct,
+    Array,
+    Subrange,
+    Set,
+    FileInfo,
+    ContigEnum,
+    DisContigEnum,
+    ProcDecl,
+    BeginScope,
+    EndScope
+};
+
+typedef struct syment
+{
+    struct syment *next;
+    enum Code type;
+    word location;
+    word size;
+    const char *name;
+} syment;
+
+syment *slist;
+
+int do_symbols;
+
+word RO_base, RO_limit;
+word RW_base, RW_limit;
+
+word *debug, *dend;
+FILE *out;
+int in;
+int asdversion;
+struct section_header *section;
+
+#define EXITINSTR 0xEF000011
+#define BL        0xEB000000
+#define BL_mask   0xFF000000
+
+#ifdef DEBUG
+
+const char *code_name[] = { "unknown", "section", "procedure",
+  "endproc", "variable", "type", "struct", "array", "subrange",
+  "set", "fileinfo", "contiguous enumeration",
+  "disconticuous enumeration", "procedure declaration",
+  "begin naming scope", "end naming scope"
+};
+
+const char *lang_name[] = { "none", "C", "Pascal", "Fortran", "Assembler" };
+
+const char *stc_name[] = { "unknown", "external", "static", "automatic", "register", "Pascal 'var' argument", "Fortran argument", "Fortran character argument" };
+
+#endif
+
+typedef struct {
+    word decoded_size;
+    word encoded_size;
+    word tables_size;
+    word nshorts;
+    word nlongs;
+    word bytestomove;
+} comp_table;
+
+typedef struct aif_header
+{
+    word decompress;
+    word selfreloc;
+    word zeroinit;
+    word entry;
+    word exit;
+    word ro_size;
+    word rw_size;
+    word debug_size;
+    word zi_size;
+    word debug_type;
+    word code_base;
+    word workspace;
+    word flags;
+    word data_base;
+    word reserved1;
+    word reserved2;
+    word debug_init;
+    word zi_code[15];
+} aif_header;
+
+struct section_header
+{
+    byte lang;
+    byte flags;
+    byte unused;
+    byte asdversion;
+    word codestart;
+    word datastart;
+    word codesize;
+    word datasize;
+    word fileinfo;
+    word debugsize;
+    word n;
+};
+
+struct procedure
+{
+    word type;
+    word args;
+    word sourcepos;
+    word startaddr;
+    word entry;
+    word endproc;
+    word fileentry;
+    char name[1];
+};
+
+struct endproc
+{
+    word sourcepos;
+    word endpoint;
+    word fileentry;
+    word nreturns;
+    word retaddrs[1];
+};
+
+struct variable
+{
+    word type;
+    word sourcepos;
+    word storageclass;
+    word location;
+    char name[1];
+};
+
+struct fileentry
+{
+    word len;
+    word date;
+    char filename[1];
+};
+
+struct fragment
+{
+    word size;
+    word firstline;
+    word lastline;
+    word codestart;
+    word codesize;
+    byte lineinfo[1];
+};
+
+struct field
+{
+    word offset;
+    word type;
+    char name[1];
+};
+
+struct struct_item
+{
+    word fields;
+    word size;
+    struct field fieldtable[1];
+};
+
+struct array
+{
+    word size;
+    word flags;
+    word basetype;
+    word lowerbound;
+    word upperbound;
+};
+
+struct type
+{
+    word type;
+    char name[1];
+};
+
+struct cont_enumeration
+{
+    word type;
+    word count;
+    word base;
+    char nametable[1];
+};
+
+struct subrange
+{
+    word sizeandtype;
+    word lb;
+    word hb;
+};
+
+struct set
+{
+    word size;
+};
+
+#define strsize(a) (((a)[0] + 1 + 3) &~ 3)
+
+#define line(a) ((a) & 0x3FFFFF)
+#define character(a) ((word)(a) >> 22)
+
+#define add_to_ptr(ptr, offset) ((void *) (((byte *)(ptr)) + (offset)) )
+
+#define addr(a) add_to_ptr(section, (a) - 4)
+
+#define BL_target(i, a) ((((int)(i) << 8) >> 6) + (a) + 8)
+
+static void unsqueeze(byte *p, comp_table *t, size_t comp_size, void *lowest);
+
+const char *p2c(const char *s)
+{
+    static char buffer[256];
+    int len = *s++;
+    memcpy(buffer, s, len);
+    buffer[len] = '\0';
+    return buffer;
+}
+
+const char *c2p(const char *s)
+{
+    static char buffer[256];
+    int len = strlen(s);
+    if (len > 255) len = 255;
+    buffer[0] = len;
+    memcpy(buffer+1, s, len);
+    return buffer;
+}
+
+int pstrcmp(const char *a, const char *b)
+{
+    int len = a[0];
+    if (b[0] != len) return 1;
+
+    return memcmp(a+1, b+1, len);
+}
+
+char *pstrcpy(char *dst, const char *src)
+{
+    return memcpy(dst, src, src[0] + 1);
+}
+
+size_t pstrlen(const char *p)
+{
+    return p[0];
+}
+
+char *pstrchr(const char *p, int c)
+{
+    return memchr(p+1, c, p[0]);
+}
+
+void shutall(void)
+{
+    if (in)
+    {
+        _swix(OS_Find, _INR(0,1), 0, in);
+        in = 0;
+    }
+}
+
+#define check_err(e) do { if (e) report_err(e) } while(0)
+
+void report_err(const _kernel_oserror *e)
+{
+    fprintf(stderr, "%s\n", e->errmess);
+    exit(1);
+}
+
+const char *tounix(const char *s)
+{
+    static char buffer[256];
+    char *p = buffer;
+    int b;
+
+    do
+    {
+        b = *s++;
+
+        if (b == ':')
+        {
+            if (p == buffer)                              /* Strip drive specifiers (":XXXXX.") */
+            {
+                while (b != '.' && b != '\0')
+                    b = *s++;
+                if (b == '.')
+                    continue;
+            }
+            else
+            {
+                p = buffer;                               /* Strip everything else before a ":" */
+                continue;
+            }
+        }
+
+        if (b == '.')                                     /* "." -> "/" */
+            b = '/';
+        else if (b == '/')                                /* "/" -> "." */
+            b = '.';
+        else if (b == '^')                                /* "^" -> ".." */
+            *p++ = '.', b = '.';
+        else if (b == '@')                                /* "@" -> "." */
+            b = '.';
+        else if (b == '$' || b == '&')                    /* "$" or "&" -> "~" */
+            b = '~';
+
+        *p++ = b;
+    }
+    while (b);
+
+    return buffer;
+}
+
+int type_size(word type)
+{
+    int p = type & 0xFF;
+    int code = (signed int) type >> 8;
+
+    if (p)
+        return 4; /* All pointers are 4 bytes */
+
+    if (code < 0) /* compound type */
+    {
+        word *d = addr(-code);
+        word c = *d++ & 0xFFFF;
+        switch (c)
+        {
+          case 5: /* named type */
+          {
+            struct type *t = (struct type *) d;
+            return type_size(t->type);
+          }
+          case 6: /* struct */
+          {
+            struct struct_item *s = (struct struct_item *) d;
+            return s->size;
+          }
+          case 7: /* array */
+          {
+            struct array *a = (struct array *) d;
+            #if 0
+            /* This should be it, but... */
+            return a->size;
+            #else
+            if ((a->flags & 0x3F) != 0x0A)
+                return 0;
+            return a->size * (a->upperbound - a->lowerbound + 1);
+            #endif
+          }
+          case 8: /* subrange */
+          {
+            struct subrange *s = (struct subrange *) d;
+            return s->sizeandtype & 0xFFFF;
+          }
+          case 9: /* set */
+          {
+            struct set *s = (struct set *) d;
+            return s->size;
+          }
+          case 11: /* contiguous enumeration */
+          case 12: /* discontiguous enumeration */
+          {
+            struct cont_enumeration *e = (struct cont_enumeration *) d;
+            return type_size(e->type);
+          }
+        }
+        fprintf(stderr, "Unrecognised compound type %d\n", c);
+        return 0;
+    }
+
+    switch (code)
+    {
+      case 10: case 20: return 1; /* 8-bit integer */
+      case 11: case 21: return 2; /* 16-bit integer */
+      case 12: case 22: return 4; /* 32-bit integer */
+      case 30: return 4; /* single precision float */
+      case 31: return 8; /* double precision float */
+      case 32: return 12; /* extended precision float */
+      case 40: return 4*2; /* single precision complex */
+      case 41: return 8*2; /* double precision complex */
+      case 42: return 12*2; /* extended precision complex */
+    }
+
+    fprintf(stderr, "Unrecognised type %d\n", code);
+    return 0;
+}
+
+#ifdef DEBUG
+const char *decode_type(word type)
+{
+    static char buffer[200];
+    int p = type & 0xFF;
+    int code = (signed int) type >> 8;
+
+    switch (code)
+    {
+      case 0: strcpy(buffer, "void"); break;
+      case 10: strcpy(buffer, "signed byte"); break;
+      case 11: strcpy(buffer, "signed halfword"); break;
+      case 12: strcpy(buffer, "signed word"); break;
+      case 20: strcpy(buffer, "unsigned byte"); break;
+      case 21: strcpy(buffer, "unsigned halfword"); break;
+      case 22: strcpy(buffer, "unsigned word"); break;
+      case 30: strcpy(buffer, "single"); break;
+      case 31: strcpy(buffer, "double"); break;
+      case 32: strcpy(buffer, "extended"); break;
+      case 40: strcpy(buffer, "single complex"); break;
+      case 41: strcpy(buffer, "double complex"); break;
+      case 42: strcpy(buffer, "extended complex"); break;
+      case 100: strcpy(buffer, "function"); break;
+      default:
+        if (code >= 0)
+          strcpy(buffer, "unknown");
+        else
+        {
+          word *d = addr(-code);
+          word c = *d++ & 0xFFFF;
+          switch (c)
+          {
+            case 5: /* named type */
+            {
+              struct type *t = (struct type *) d;
+              strcpy(buffer, p2c(t->name));
+              break;
+            }
+            case 7: /* array */
+            {
+              struct array *a = (struct array *) d;
+              char buffer2[256];
+              int i;
+              strcpy(buffer2, decode_type(a->basetype));
+              i = sprintf(buffer, "array [");
+              if (a->flags & 1)
+                  i += sprintf(buffer+i, "?..");
+              else if (a->flags & 2)
+                  i += sprintf(buffer+i, "%d..", a->lowerbound);
+              else if (a->flags & 16)
+              {
+                  struct variable *v = addr(a->lowerbound + 4);
+                  i += sprintf(buffer+i, "%s..", p2c(v->name));
+              }
+              if (a->flags & 4)
+                  i += sprintf(buffer+i, "?");
+              else if (a->flags & 8)
+                  i += sprintf(buffer+i, "%d", a->upperbound);
+              else if (a->flags & 32)
+              {
+                  struct variable *v = addr(a->upperbound + 4);
+                  i += sprintf(buffer+i, "%s", p2c(v->name));
+              }
+              sprintf(buffer+i, "] of %s", buffer2);
+              break;
+            }
+            case 6: /* struct */
+              sprintf(buffer, "struct (%08X)", -code);
+              break;
+            case 11:
+            case 12:
+              sprintf(buffer, "enumeration (%08X)", -code);
+              break;
+            default:
+              sprintf(buffer, "compound type (%X)", c);
+              break;
+          }
+
+        }
+        break;
+    }
+    if (p > 0)
+    {
+      strcat(buffer, " ");
+      while (p-- > 0)
+        strcat(buffer, "*");
+    }
+    return buffer;
+}
+#endif
+
+typedef void debug_processor(word code, word length, void *p);
+
+void output_symbols(const char *heading, enum Code type, int lenspec)
+{
+    syment *p, *next;
+    word size;
+
+    for (p = slist; p; p = p->next)
+    {
+        if (p->type != type)
+            continue;
+
+        size = p->size;
+
+        if (size == (word)-1 && pstrchr(p->name, '$'))
+            continue;
+
+        if (heading)
+        {
+            fprintf(out, "\n[%s]\n", heading);
+            heading = NULL;
+        }
+
+        fprintf(out, "%s %08X", p2c(p->name), p->location);
+
+        next = p->next;
+        if (size == (word)-1)
+        {
+            size = 0;
+            while (size == 0 && next)
+            {
+                size = next->location - p->location;
+                next = next->next;
+            }
+            if (size == 0)
+                size = (word)-1;
+        }
+
+        if (size == (word)-1)
+        {
+            if (p->location >= RO_base & p->location < RO_limit)
+                size = RO_limit - p->location;
+            else if (p->location >= RW_base & p->location < RW_limit)
+                size = RW_limit - p->location;
+        }
+
+        if (size == (word)-1 || size == 0)
+            size = 1;
+
+        if (lenspec)
+        {
+            if (size == 1)
+                fprintf(out, "\n");
+            else
+                fprintf(out, " %d\n", size);
+        }
+        else
+            fprintf(out, "..%08X\n", p->location + size - 1);
+    }
+}
+
+void process_functions(word code, word length, void *v)
+{
+    struct procedure *p = (struct procedure *) v;
+    struct endproc *e; 
+    syment *fp, **prevp, *next;
+    word location, size;
+
+    if (code != 2)
+        return;
+
+    if (p->endproc == 0)
+        return;
+
+    e = addr(p->endproc + 4);
+    location = p->startaddr;
+    size = e->endpoint - location;
+
+    for (prevp = &slist, fp = *prevp; fp && fp->location < location; prevp = &fp->next, fp = *prevp)
+        continue;
+
+    next = fp;
+    fp = malloc(sizeof(syment));
+    if (fp == NULL)
+    {
+        fprintf(stderr, "Out of memory\n");
+        exit(1);
+    }
+
+    *prevp = fp;
+
+    fp->next = next;
+    fp->type = Procedure;
+    fp->location = location;
+    fp->size = size;
+    fp->name = p->name;
+}
+
+/* We accumulate the variables, sort and discard duplicates, then chuck out at the end */
+void process_variables(word code, word length, void *p)
+{
+    struct variable *v = (struct variable *) p;
+    syment *vp, *next, **prevp;
+    int size;
+    word location;
+
+    if (code != 4)
+        return;
+
+    if (v->storageclass != 1 && v->storageclass != 2)
+        return;
+
+    location = v->location;
+    if (location == 0)
+        return;
+
+    size = type_size(v->type);
+    if (size == 0)
+        return;
+
+    for (prevp = &slist, vp = *prevp; vp && vp->location < location; prevp = &vp->next, vp = *prevp)
+        continue;
+
+    if (!vp || vp->location != location || vp->size != size || vp->type != Variable || pstrcmp(vp->name, v->name))
+    {
+        next = vp;
+        vp = malloc(sizeof(syment));
+        if (vp == NULL)
+        {
+            fprintf(stderr, "Out of memory\n");
+            exit(1);
+        }
+
+        *prevp = vp;
+
+        vp->next = next;
+        vp->type = Variable;
+        vp->location = location;
+        vp->size = size;
+        vp->name = v->name;
+    }
+}
+
+void process_symbols(word code, word length, void *h)
+{
+    struct section_header *s = h;
+    int i;
+    char *strings;
+    syment *p, *next, **prevp;
+    word *d;
+
+    if (code != Section || s->lang != 0)
+        return;
+
+    d = add_to_ptr(s, length - 4);
+    strings = add_to_ptr(d, s->n * 8);
+
+    for (i=s->n; i; i--)
+    {
+        word sym = *d++;
+        word flags = (sym >> 24) & 0x6;
+        word location = *d++;
+        const char *name = strings + (sym & 0xFFFFFF);
+        enum Code type;
+        int add_symbol = 1;
+
+        if (!((location >= RO_base && location < RO_limit) ||
+              (location >= RW_base && location < RW_limit)))
+            continue;
+
+        if (strchr(name, '$'))
+        {
+            if (name[0] == '$' && name[1] != '\0' && name[2] == '\0')
+            {
+                if (name[1] == 'a' || name[1] == 'd' || name[1] == 't')
+                {
+                    /* Keep the symbol, as it's useful for synthesis of
+                     * function and variable pointers to break at
+                     * ARM/Thumb/data state transitions.
+                     */
+                }
+                else
+                    continue; /* Ignore any other "$x" symbol */
+            }
+            else
+                continue; /* Ignore all other symbols containing "$" */
+        }
+
+        name = c2p(name);
+
+        switch (flags)
+        {
+          case 0:
+            if (location >= RO_base && location < RO_limit)
+              type = Procedure;
+            else
+              type = Variable;
+            break;
+          case 2:
+            type = Procedure;
+            break;
+          case 4:
+          case 6:
+            type = Variable;
+            break;
+        }
+        for (prevp = &slist, p = *prevp; p && p->location <= location; prevp = &p->next, p = *prevp)
+        {
+            if (p->size != (word)-1 && p->location + p->size > location)
+            {
+                printf("Not adding %s: ", p2c(name));
+                printf("clashes with %s (at %x, size %x)\n", p2c(p->name), p->location, p->size);
+                add_symbol = 0; /* Lies within existing function or variable */
+                break;
+            }
+        }
+
+        if (add_symbol)
+        {
+            next = p;
+            p = malloc(sizeof(syment) + 1 + pstrlen(name));
+            if (p == NULL)
+            {
+                fprintf(stderr, "Out of memory\n");
+                exit(1);
+            }
+
+            *prevp = p;
+
+            p->next = next;
+            p->type = type;
+            p->location = location;
+            p->size = (word) -1;
+            p->name = add_to_ptr(p, sizeof(syment));
+            pstrcpy((char *) p->name, name);
+        }
+    }
+}
+
+void process_lines(word code, word length, void *h)
+{
+    static int banner;
+    struct fileentry *f = (struct fileentry *) h;
+    byte *p;
+    word fragments;
+    int lastline = -1;
+
+    if (code != FileInfo)
+        return;
+
+    while (f->len)
+    {
+        p = (byte *) f->filename + ((1 + f->filename[0] + 3) &~ 3);
+        fragments = *(word *) p;
+
+        if (fragments)
+        {
+            if (!banner)
+            {
+                fprintf(out, "\n[SOURCE LINES]\n");
+                banner = 1;
+            }
+            fprintf(out, "File: %s\n", tounix(p2c(f->filename)));
+        }
+
+        p += 4;
+        while (fragments--)
+        {
+            struct fragment *g = (struct fragment *) p;
+            byte *endp = p + g->size;
+            word line = g->firstline;
+            word code = g->codestart;
+
+            p = g->lineinfo;
+            while (p < endp)
+            {
+                int codeinc, lineinc;
+
+                if (line != lastline)
+                {
+                    fprintf(out, "%d %08X\n", line, code);
+                    lastline = line;
+                }
+
+                codeinc = *p++;
+                lineinc = *p++;
+                if (codeinc == 0 && lineinc == 0)
+                {
+                    halfword *h = (halfword *) p;
+                    line += *h++;
+                    code += *h++;
+                    p += 4;
+                }
+                else if (codeinc == 0 && lineinc == 64 && asdversion >= 3)
+                {
+                    halfword *h = (halfword *) p;
+                    line += *h++;
+                    code += *h++;
+                    p += 6;
+                }
+                else
+                {
+                    if (lineinc < 64 || asdversion == 2)
+                        line += lineinc;
+                    code += codeinc;
+                }
+            }
+            if ((word) p & 0x02) p += 2;
+        }
+
+
+        f = (struct fileentry *) ((char *) f + f->len);
+    }
+
+}
+
+void process_debug(debug_processor *proc)
+{
+    word *d;
+
+    d = debug;
+
+    while (d < dend)
+    {
+        word cl = *d++;
+        word length = cl >> 16;
+        word code = cl & 0xFFFF;
+
+        if (code == Section)
+        {
+          section = (struct section_header *) d;
+          asdversion = section->asdversion;
+        }
+
+        proc(code, length, d);
+
+        /* Special jump to end of section in these two cases */
+        if (code == FileInfo && length == 0 ||
+            code == Section && section->lang == 0)
+            d = addr(section->debugsize);
+        else
+            d += length / 4 - 1;
+    }
+
+    proc(0, 0, NULL);
+}
+
+void oserr_handler(int s)
+{
+    report_err(_kernel_last_oserror());
+}
+
+int main(int argc, char **argv)
+{
+    aif_header header;
+    word debug_len;
+    word entry;
+    int executable;
+    #ifdef DEBUG
+    word *d;
+    word debugsize;
+    #endif
+    int unread;
+    char **arg = argv + 1;
+
+    argc -= 1;
+
+    while (argc >= 1 && (*arg)[0] == '-')
+    {
+        char *opt = (*arg++)+1;
+        argc--;
+        switch (*opt)
+        {
+          case 'h':
+            printf("ToGPA vsn " Module_MajorVersion " [" Module_Date "] - convert ASD debugging data to GPA format\n"
+                   "\n"
+                   "Usage: ToGPA [-s] aif-file gpa-file\n"
+                   "\n"
+                   "Input must be in AIF format. For modules or other non-AIF programs a\n"
+                   "separate non-executable AIF file with debug information may be output by a\n"
+                   "separate link using the options -d -aif -bin.\n"
+                   "\n"
+                   "The switch -s indicates that low-level symbols should be included in the GPA\n"
+                   "file.\n"
+                  );
+            return 0;
+
+          case 's':
+            do_symbols = 1;
+            break;
+
+          default:
+            argc = 0;
+            break;
+        }
+    }
+
+    if (argc != 2)
+    {
+        fprintf(stderr, "Usage: ToGPA [-s] aif-file gpa-file\n");
+        return 1;
+    }
+
+    atexit(shutall);
+
+    signal(SIGOSERROR, oserr_handler);
+
+    in = _swi(OS_Find, _INR(0,1)|_RETURN(0), 0x4C, arg[0]);
+
+    unread = _swi(OS_GBPB, _INR(0,3)|_RETURN(3), 4, in, &header, sizeof header);
+
+    /* Check it's an AIF image */
+    if (unread || header.exit != EXITINSTR || ((header.entry & BL_mask) != BL && (header.entry & BL_mask) != 0))
+    {
+        fprintf(stderr, "Unrecognised file format\n");
+        return 1;
+    }
+
+    if ((header.entry & BL_mask) == BL)
+        executable = 1;
+    else
+        executable = 0;
+
+    debug_len = header.debug_size;
+    if (debug_len == 0 || (header.debug_type & 3) == 0)
+    {
+        fprintf(stderr, "No debugging data in AIF image\n");
+        return 1;
+    }
+
+    if ((header.decompress & BL_mask) == BL)
+    {
+        byte *squeezed;
+        size_t squeezed_len;
+        word comp = BL_target(header.decompress, offsetof(aif_header, decompress));
+        comp_table t;
+
+        unread = _swi(OS_GBPB, _INR(0,4)|_RETURN(3), 3, in, &t, sizeof t, comp - sizeof t);
+
+        if (unread)
+        {
+            fprintf(stderr, "Truncated file\n");
+            return 1;
+        }
+
+        /* Do a few sanity checks on the header. If they pass, it's pretty certain that
+         * this is the right compression scheme.
+         */
+        if (t.nshorts > 0x700 || t.nlongs > 0x700 ||
+            t.bytestomove > t.encoded_size ||
+            sizeof (aif_header) + t.encoded_size + t.tables_size + sizeof t > comp)
+        {
+            fprintf(stderr, "Unrecognised compression scheme\n");
+            return 1;
+        }
+
+        squeezed_len = comp - sizeof t - sizeof(aif_header);
+
+        squeezed = malloc(t.decoded_size > squeezed_len ? t.decoded_size : squeezed_len);
+        if (!squeezed)
+        {
+            fprintf(stderr, "Out of memory\n");
+            return 1;
+        }
+
+        unread = _swi(OS_GBPB, _INR(0,4)|_RETURN(3), 3, in, squeezed, squeezed_len, sizeof(aif_header));
+        if (unread)
+        {
+            fprintf(stderr, "Error reading file\n");
+            return 1;
+        }
+
+        if (executable)
+            debug = (word *) (squeezed - sizeof(aif_header) + header.ro_size + header.rw_size);
+        else
+            debug = (word *) (squeezed + header.ro_size + header.rw_size);
+
+        unsqueeze(squeezed, &t, squeezed_len, debug);
+
+    }
+    else
+    {
+        debug = malloc(debug_len);
+        if (!debug)
+        {
+            fprintf(stderr, "Out of memory\n");
+            return 1;
+        }
+
+        unread = _swi(OS_GBPB, _INR(0,4)|_RETURN(3),
+                               3, in, debug, debug_len,
+                               executable ? header.ro_size + header.rw_size
+                                          : sizeof(aif_header) + header.ro_size + header.rw_size);
+        if (unread)
+        {
+            fprintf(stderr, "Truncated file\n");
+            return 1;
+        }
+    }
+
+    _swi(OS_Find, _INR(0,1), 0, in);
+    in = 0;
+
+    dend = add_to_ptr(debug, debug_len);
+
+#ifndef NOOUTPUT
+    out = fopen(arg[1], "w");
+    if (!out)
+    {
+        perror(arg[1]);
+        return 1;
+    }
+
+    fprintf(out, "[SECTIONS]\n");
+    if (header.ro_size)
+    {
+        RO_base = header.code_base;
+        RO_limit = RO_base + header.ro_size;
+        fprintf(out, "RO %08X..%08X\n", RO_base, RO_limit - 1);
+    }
+    if (header.rw_size + header.zi_size)
+    {
+        RW_base = header.code_base + header.ro_size;
+        RW_limit = RW_base + header.rw_size + header.zi_size;
+        fprintf(out, "RW %08X..%08X\n", RW_base, RW_limit - 1);
+    }
+
+    if (executable)
+        entry = BL_target(header.entry, header.code_base + offsetof(aif_header, entry));
+    else
+        entry = header.code_base + header.entry;
+    fprintf(out, "\n[START ADDRESS]\n%08X\n", entry);
+
+    process_debug(process_functions);
+
+    process_debug(process_variables);
+
+    if (do_symbols)
+      process_debug(process_symbols);
+
+    output_symbols("VARIABLES", Variable, 1);
+
+    output_symbols("FUNCTIONS", Procedure, 0);
+
+    process_debug(process_lines);
+
+    fclose(out);
+#endif
+
+#ifdef DEBUG
+    d = debug;
+    while (d < dend)
+    {
+        word cl = *d++;
+        word length = cl >> 16;
+        word code = cl & 0xFFFF;
+
+        printf("%08X: %s (%X)\n", (d - debug) * 4 - 4, code <= 15 ? code_name[code] : "unknown", length);
+        switch (code)
+        {
+          case 1: /* section */
+          {
+            struct section_header *s = (struct section_header *) d;
+            section = s;
+            asdversion = s->asdversion;
+            d += length / 4 - 1;
+            printf("  language: %s\n", s->lang <= 4 ? lang_name[s->lang] : "unknown");
+            printf("  flags:");
+            if (s->flags & 1) printf(" line-numbers");
+            if (s->flags & 2) printf(" variables");
+            if (s->flags & 0xFC) printf(" unknown flags %02X", s->flags & 0xFC);
+            printf("\n");
+            printf("  debugging data version %d\n", s->asdversion);
+            printf("  codestart: %08X, datastart: %08X\n", s->codestart, s->datastart);
+            printf("  codesize:  %08X, datasize:  %08X\n", s->codesize, s->datasize);
+            printf("  debugsize: %08X\n", debugsize = s->debugsize);
+            printf("  fileinfo: %08X\n", s->fileinfo);
+            if (s->lang == 0)
+            {
+                char *strings;
+                int i;
+                strings = (char *) d + (s->n) * 8;
+                for (i=s->n; i; i--)
+                {
+                    word sym = *d++;
+                    if (sym & 0x01000000)
+                        printf("    GLOBAL ");
+                    else
+                        printf("    ");
+                    if (sym & 0x10000000)
+                        printf("THUMB ");
+                    switch (sym & 0x06000000)
+                    {
+                      case 0x00000000: printf("ABS "); break;
+                      case 0x02000000: printf("CODE "); break;
+                      case 0x04000000: printf("DATA "); break;
+                      case 0x06000000: printf("ZI "); break;
+                      default: printf("(%02X) ", (sym & 0xFE000000) >> 24); break;
+                    }
+
+                    printf("%s: %08X\n", strings+(sym & 0xFFFFFF), *d++);
+                }
+                d += (*(word *) strings) / 4;
+            }
+            else
+              printf("  name: %s\n", p2c((char *) &s->n));
+            break;
+          }
+          case 2: /* procedure definition */
+          {
+            struct procedure *p = (struct procedure *) d;
+            printf("  name: %s\n", p2c(p->name));
+            printf("  return type: %s\n", decode_type(p->type));
+            printf("  arguments: %d\n", p->args);
+            printf("  line: %d, character: %d\n", line(p->sourcepos), character(p->sourcepos));
+            printf("  startaddr: %08X, entry: %08X\n", p->startaddr, p->entry);
+            printf("  endproc: %08X, fileentry: %08X\n", p->endproc, p->fileentry);
+            d += length / 4 - 1;
+            break;
+          }
+          case 3: /* endproc */
+          {
+            struct endproc *e = (struct endproc *) d;
+            printf("  line: %d, character: %d\n", line(e->sourcepos), character(e->sourcepos));
+            printf("  endpoint: %08X\n", e->endpoint);
+            printf("  fileentry: %08X\n", e->fileentry);
+            if (e->nreturns)
+            {
+                int i;
+                for (i=0; i<e->nreturns; i++)
+                    printf("  retaddr: %08X\n", e->retaddrs[i]);
+            }
+            d += length / 4 - 1;
+            break;
+          }
+          case 4: /* variable */
+          {
+            struct variable *v = (struct variable *) d;
+            printf("  name: %s\n", p2c(v->name));
+            printf("  type: %s\n", decode_type(v->type));
+            printf("  line: %d, character: %d\n", line(v->sourcepos), character(v->sourcepos));
+            printf("  storage class: %s\n", v->storageclass <= 7 ? stc_name[v->storageclass] : "unknown");
+            printf("  location: ");
+            switch (v->storageclass)
+            {
+              case 1:
+              case 2:
+              default: printf("%08X\n", v->location); break;
+              case 3:
+              case 5: printf("fp%+d\n", v->location); break;
+              case 4: if (v->location < 16) printf("R%d\n", v->location);
+                      else if (v->location < 24) printf("F%d\n", v->location - 16);
+                      else printf("??? (%d)\n", v->location);
+                      break;
+              case 6:
+              case 7: printf("arglist%+d\n", v->location); break;
+            }
+            d += length / 4 - 1;
+            break;
+          }
+          case 5: /* type */
+          {
+            struct type *t = (struct type *) d;
+            printf("  name: %s\n", p2c(t->name));
+            printf("  type: %s\n", decode_type(t->type));
+            d += length / 4 - 1;
+            break;
+          }
+          case 6: /* struct */
+          {
+            struct struct_item *s = (struct struct_item *) d;
+            int i = s->fields;
+            struct field *f = s->fieldtable;
+            while (i--)
+            {
+                 printf("  %4d: %s ", f->offset, decode_type(f->type));
+                 printf("%s\n", p2c(f->name));
+                 f = (struct field *) (f->name + strsize(f->name));
+            }
+            d += length / 4 - 1;
+            break;
+          }
+          case 10: /* fileinfo */
+          {
+            struct fileentry *f = (struct fileentry *) d;
+            byte *p;
+            word fragments;
+            while (f->len)
+            {
+                if (f->date)
+                  printf("  last modified: %s\n", ctime(&f->date));
+                printf("  filename: %s\n", p2c(f->filename));
+                p = (byte *) f->filename + ((1 + f->filename[0] + 3) &~ 3);
+                fragments = *(word *) p;
+                p += 4;
+                while (fragments--)
+                {
+                    struct fragment *g = (struct fragment *) p;
+                    byte *endp = p + g->size;
+                    word line = g->firstline;
+                    word column = 1;
+                    word code = g->codestart;
+                    printf("    fragment\n");
+                    printf("    firstline=%d, lastline=%d\n", g->firstline, g->lastline);
+                    printf("    codestart=%08X, codesize=%08X\n", g->codestart, g->codesize);
+                    p = g->lineinfo;
+                    while (p < endp)
+                    {
+                        int codeinc, lineinc;
+
+                        printf("      %08X: (%d,%d)\n", code, line, column);
+
+                        codeinc = *p++;
+                        lineinc = *p++;
+                        if (codeinc == 0 && lineinc == 0)
+                        {
+                            halfword *h = (halfword *) p;
+                            line += *h++;
+                            code += *h++;
+                            column = 1;
+                            p += 4;
+                        }
+                        else if (codeinc == 0 && lineinc == 64 && asdversion >= 3)
+                        {
+                            halfword *h = (halfword *) p;
+                            line += *h++;
+                            code += *h++;
+                            column = *h++;
+                            p += 6;
+                        }
+                        else
+                        {
+                            if (lineinc < 64 || asdversion == 2)
+                                line += lineinc, column = 1;
+                            else
+                                column += lineinc - 64;
+                            code += codeinc;
+                        }
+                    }
+                    /* Word-align (may be odd number of halfwords) */
+                    if ((word) p & 0x2) p += 2;
+                }
+
+                f = add_to_ptr(f, f->len);
+            }
+            if (length == 0)
+              d = addr(debugsize);
+            else
+              d += length / 4 - 1;
+            break;
+          }
+          case 11: /* contiguous enumeration */
+          {
+            struct cont_enumeration *e = (struct cont_enumeration *) d;
+            int i = e->count, base = e->base;
+            char *p = e->nametable;
+            while (i--)
+            {
+                printf("  %s = %d\n", p2c(p), base++);
+                p += strsize(p);
+            }
+            d += length / 4 - 1;
+            break;
+          }
+          default:
+            d += length / 4 - 1;
+            break;
+        }
+
+    }
+
+#endif
+
+    return 0;
+}
+
+
+
+/*
+ * Code to deal with compressed AIF images. Assumes that the compression scheme
+ * is the standard squeeze algorithm.
+ *
+ * Summary of the compressed data format, for those who care:
+ *
+ *  <-   encoded_size   -> <- tables_size ->
+ * ptr  <-          comp_size                   ->
+ * |-----encoded data-----|---dictionary----|-tbl-|--decomp code-|
+ * <- ->
+ *  bytestomove
+ *
+ *  <-                             decoded_size                                ->
+ * ptr
+ * |-------------------------------decoded data----------------------------------|
+ *                   ^lowest
+ *
+ *
+ * The image is scanned for up to 1792 common 32-bit words (short entries) and
+ * up to 1792 common top 24 bits of words (long entries). These form the dictionary,
+ * which is stored compressed above the compressed data.
+ *
+ * The dictionary consists of t->nshorts + t->nlongs entries. The entries are
+ * represented by:
+ *
+ *        00    WW XX YY    -> previous entry + YYXXWW (long)
+ *        00    WW XX YY ZZ -> previous entry + ZZYYXXWW (short)
+ *        01-09             -> n entries consecutive from the last one
+ *        0A-5B             -> previous entry + (n-&0A)
+ *        5C-AD XX          -> previous entry + ((n-&5C)<<8) + XX
+ *        AE-FF XX YY       -> previous entry + ((n-&AE)<<16) + YYXX
+ *
+ * Data is compressed two words at a time, and must be decompressed from the top down.
+ * The compressed form starts with a single byte (at the highest memory location), split
+ * into two nibbles. The least-significant nibble represents the lower-addressed word, the
+ * most-significant nibble the higher. Further bytes are read from decreasing memory
+ * addresses, first for the low word, then the higher, depending on the contents of the
+ * nibble. Words encoding forms are:
+ *
+ *                    0  -> 00000000
+ *       WW XX YY ZZ  1  -> WWXXYYZZ
+ *                ZZ 2-8 -> short[((n-2) << 8) + ZZ]
+ *             YY ZZ 9-F -> (long[((n-9) << 8) + ZZ] << 8) + YY
+ *
+ * For example, (45 12 34 56 78 51) represents (12345678 short[345])
+ *
+ * The encoding scheme is well suited to 32-bit oriented data, particularly ARM
+ * instructions. Before compression, the data would normally be padded out to an
+ * even number of words with zeros. This extra trailing data is harmless for AIF.
+ *
+ * A six-word header precedes the decompression code, giving details of the data
+ * and dictionary sizes. It also gives an indication of when to shuffle the final
+ * compressed data out of the way when decompressing in place (as we do).
+ *
+ * Note the optimisation of passing in the lowest address we're interested in -
+ * we only want the debug info, so no point in decompressing the code or data.
+ */
+
+typedef int int32;
+
+static void unsqueeze(byte *ptr, comp_table *t, size_t comp_size, void *lowest)
+{
+    register unsigned char *encoded_hwm = add_to_ptr(ptr, comp_size - t->tables_size);
+    register unsigned char *encoded_lwm = add_to_ptr(encoded_hwm, -t->encoded_size);
+    register int32 *decoded_hwm = add_to_ptr(ptr, t->decoded_size);
+    unsigned char *tables_lwm = encoded_hwm;
+    int32 *exptable, *decoded_table;
+    register int32 *decoded_shorts_table, *decoded_longs_table;
+    enum {
+      doing_shorts,
+      doing_longs,
+      done_shorts_and_longs
+    } decode_type = doing_shorts;
+
+    exptable = malloc((t->nshorts + t->nlongs) * 4 + t->bytestomove);
+    if (exptable == NULL) {
+        fprintf(stderr, "Out of memory\n");
+        exit(1);
+    }
+
+    decoded_shorts_table = decoded_table = exptable;
+
+    while (decode_type != done_shorts_and_longs) {
+      int32 nels = (decode_type == doing_shorts) ? t->nshorts : t->nlongs;
+      int32 prev_entry = -1;
+
+      while (--nels >= 0) {
+        int32 byte = *tables_lwm++, num;
+
+        num = byte - 10;
+        if (num >= 0) {
+          if (byte < 92) {
+            prev_entry += num;
+            *decoded_table++ = prev_entry;
+          }
+          else {
+            num = byte - 174;
+            if (num >= 0) {
+              num = (*tables_lwm++) | (num << 16);
+              prev_entry += num | ((int32) (*tables_lwm++) << 8);
+              *decoded_table++ = prev_entry;
+            }
+            else {
+              prev_entry += ((byte - 92) << 8) | (*tables_lwm++);
+              *decoded_table++ = prev_entry;
+            }
+          }
+        }
+        else {
+          if (byte == 0) {
+            num = *tables_lwm++;
+            num |= ((int32) (*tables_lwm++) << 8);
+            num |= ((int32) (*tables_lwm++) << 16);
+            if (decode_type == doing_shorts) {
+              num |= ((int32) (*tables_lwm++) << 24);
+            }
+            prev_entry += num;
+            *decoded_table++ = prev_entry;
+          }
+          else {
+            nels = (nels - byte) + 1;
+            while (byte-- > 0) {
+              *decoded_table++ = ++prev_entry;
+            }
+          }
+        }
+      }
+
+      switch (decode_type) {
+        case doing_shorts:
+          decode_type = doing_longs;
+          decoded_longs_table = decoded_table;
+          break;
+        case doing_longs:
+          decode_type = done_shorts_and_longs;
+          break;
+      }
+    }
+
+    /* Stop before we overlap */
+    encoded_lwm += t->bytestomove;
+
+  decodePair:
+    while (encoded_hwm > encoded_lwm && decoded_hwm > lowest)
+    {
+        word thisbyte = *--encoded_hwm;
+        word b = thisbyte >> 4;
+        word a = thisbyte & 0xF;
+
+        if (a >= 9) {
+          /* short0 */
+          a = decoded_shorts_table[((a - 9) << 8) | (*--encoded_hwm)];
+        }
+        else if (a >= 2) {
+          /* long0 */
+          a = decoded_longs_table[(a - 2) << 8 | (*--encoded_hwm)];
+          a = (a << 8) | (*--encoded_hwm);
+        }
+        else if (a == 0) {
+          /* notlong0 */
+          a = 0;
+        }
+        else {
+          /* literal0 */
+          a = *--encoded_hwm;
+          a |= (*--encoded_hwm) << 8;
+          a |= (*--encoded_hwm) << 16;
+          a |= (*--encoded_hwm) << 24;
+        }
+
+        if (b >= 9) {
+          /* short1 */
+          b = decoded_shorts_table[((b - 9) << 8) | (*--encoded_hwm)];
+        }
+        else if (b >= 2) {
+          /* long1 */
+          b = decoded_longs_table[(b - 2) << 8 | (*--encoded_hwm)];
+          b = (b << 8) | (*--encoded_hwm);
+        }
+        else if (b == 0) {
+          /* notlong1 */
+          b = 0;
+        }
+        else {
+          /* literal1 */
+          b = *--encoded_hwm;
+          b |= (*--encoded_hwm) << 8;
+          b |= (*--encoded_hwm) << 16;
+          b |= (*--encoded_hwm) << 24;
+        }
+
+        decoded_hwm -= 2;
+        decoded_hwm[0] = a;
+        decoded_hwm[1] = b;
+    }
+
+    if (decoded_hwm > lowest && t->bytestomove)
+    {
+        /* copy bottom t->bytestomove bytes of encoded data out of the way
+         * (into space we reserved at the end of exptable), reset the
+         * encoded range markers, and carry on decompressing.
+         */
+        byte *p = encoded_lwm - t->bytestomove;
+
+        encoded_lwm = add_to_ptr(exptable, (t->nshorts + t->nlongs) * 4);
+        encoded_hwm = add_to_ptr(encoded_lwm, t->bytestomove);
+
+        memcpy(encoded_lwm, p, t->bytestomove);
+
+        t->bytestomove = 0;
+
+        goto decodePair;
+    }
+
+    /* doneDecode */
+    free(exptable);
+}

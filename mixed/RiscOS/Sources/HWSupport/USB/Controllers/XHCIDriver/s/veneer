@@ -1,0 +1,112 @@
+; Copyright 2015 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:ModHand
+        GET     Hdr:Proc
+
+        AREA    |C$$code|, CODE, READONLY
+        EXPORT  veneer_init
+        EXPORT  glue_rt_entry
+        IMPORT  glue_rt_handler
+        IMPORT  memcpy
+
+; int glue_rt_entry(void *);
+;
+; Veneer to get back the C module environment from an RTSupport thread
+; and return back to RTSupport when done. Named as entry/handler in
+; the same way CMHG does.
+glue_rt_entry
+        ; copy relocation offsets (library/client) to base of SVC stack
+        LDMIA   a1, {a1,a2}
+        MSR     CPSR_c, #SVC32_mode
+        MOV     sl, sp, LSR #20
+        MOV     sl, sl, LSL #20
+        STMIA   sl, {a1,a2}
+
+        ; jump into C in SVC mode, IRQs enabled
+        ;             SL at relocation offsets, FP=0, R0=arg
+        ADD     sl, sl, #540
+        MOV     a1, ip
+        BL      glue_rt_handler
+
+        ; back to RTSupport in SYS mode, R0=flags
+        MSR     CPSR_c, #SYS32_mode
+        MOV     pc, lr
+   
+; int *veneer_init(void);
+;
+; Copies a little veneer to the RMA, much like the ones CMHG produces
+; so we can call an ATPCS function from another module (USBDriver) and
+; arrive with the right C environment in play.
+veneer_init ROUT
+        Entry
+
+        ; claim memory for block, exit with NULL on error
+        MOV     a1, #ModHandReason_Claim
+        MOV     a4, #magic_end - magic_start
+        SWI     XOS_Module
+        MOVVS   a1, #0
+        EXIT    VS
+
+        ; memcpy the existing block
+        MOV     a1, r2
+        ADR     a2, magic_start
+        MOV     a3, #magic_end - magic_start
+        BL      memcpy
+
+        ; poke the magic words
+        SUB     sl, sl, #540
+        LDMIA   sl, {a2,a3}
+        STMIA   a1, {a2,a3}
+        ADD     sl, sl, #540
+
+        ; Flush the cache!
+        MOV     a2, a1
+        ADD     a3, a2, #magic_end - magic_start
+        MOV     a1, #1
+        SWI     XOS_SynchroniseCodeAreas
+        MOV     a1, a2
+
+        ; return pointing to the block
+        EXIT
+
+magic_start
+mwords  DCD     0
+        DCD     0
+
+common  Entry   "v1,v2,fp"
+        SUB     sl, sl, #540
+        LDMIA   sl, {v1,v2}
+        ADR     fp, mwords
+        LDMIA   fp, {fp,lr}
+        STMIA   sl, {fp,lr}
+        ADD     sl, sl, #540
+        MOV     fp, #0
+      [ NoARMv5
+        MOV     lr, pc
+        MOV     pc, ip
+      |
+        BLX     ip
+      ]
+        SUB     sl, sl, #540
+        STMIA   sl, {v1,v2}
+        ADD     sl, sl, #540
+        EXIT
+magic_end
+
+        END

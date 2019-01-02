@@ -1,0 +1,662 @@
+;
+; Copyright (c) 2012, RISC OS Open Ltd
+; All rights reserved.
+;
+; Redistribution and use in source and binary forms, with or without
+; modification, are permitted provided that the following conditions are met:
+;     * Redistributions of source code must retain the above copyright
+;       notice, this list of conditions and the following disclaimer.
+;     * Redistributions in binary form must reproduce the above copyright
+;       notice, this list of conditions and the following disclaimer in the
+;       documentation and/or other materials provided with the distribution.
+;     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+;       may be used to endorse or promote products derived from this software
+;       without specific prior written permission.
+;
+; THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+; AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+; IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+; ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+; LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+; CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+; SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+; INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+; CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+; ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+; POSSIBILITY OF SUCH DAMAGE.
+;
+
+        EXPORT  SDIO_InitDevices
+        IMPORT  memcpy
+        IMPORT  TPSRead
+        IMPORT  TPSWrite
+        IMPORT  HAL_CounterDelay
+
+        ; KEEP ; for debugging
+
+        GET     Hdr:ListOpts
+        GET     Hdr:CPU.Arch
+        GET     Hdr:Macros
+        GET     Hdr:OSEntries
+        GET     hdr.omap4430
+        GET     hdr.GPIO
+        GET     hdr.omap4_reg
+        GET     hdr.StaticWS
+
+sb      RN      9
+
+; Timings
+
+; Maximum time bus power is allowed to take to ramp up or down.
+; MMC and SD agree this is 35 ms max ramp up, but nothing is said about ramp down so I'm assuming it's the same.
+BUS_POWER_RAMP  *       35000 ; in us
+
+; Number of reads of SYSSTATUS before we give up waiting for reset to complete
+RESET_TIMEOUT   *       100
+
+; Number of reads of SYSCTL before we give up waiting for SDCLK to stabilise
+CLOCKSET_TIMEOUT *      1000
+
+; Time to leave initialisation procedure to execute
+INIT_PROCEDURE_TIME *   1000 ; in us
+
+; Frequency of the clock which we divide to produce SDCLK
+FCLK_FREQ       *       96000 ; in kHz
+
+
+; RISC OS device numbers for each controller's IRQ line
+MMC1_IRQ        *       OMAP44XX_IRQ_MMC1
+MMC2_IRQ        *       OMAP44XX_IRQ_MMC2
+MMC3_IRQ        *       OMAP44XX_IRQ_MMC3
+MMC4_IRQ        *       OMAP44XX_IRQ_MMC4
+MMC5_IRQ        *       OMAP44XX_IRQ_MMC5
+
+; GPIO pin assignments
+                GBLS    PB_LED_D1
+                GBLS    PB_LED_D2
+                GBLS    PE_LED_D1       ; Panda ES
+PB_LED_D1       SETS    "7"
+PB_LED_D2       SETS    "8"
+PE_LED_D1       SETS    "110"
+
+
+; some definitions for TWL6030 register
+
+        MACRO
+$name   DeclareTPSReg $group, $offset
+TPSRegGroup_$name * $group
+TPSRegOffset_$name * $offset
+        MEND
+
+VMMC_CFG_GRP            DeclareTPSReg &48, &98
+VMMC_CFG_TRANS          DeclareTPSReg &48, &99
+VMMC_CFG_STATE          DeclareTPSReg &48, &9A
+VMMC_CFG_VOLTAGE        DeclareTPSReg &48, &9B
+
+MMCCTRL                 DeclareTPSReg &48, &EE
+
+; Flag to enable power OFF
+                GBLL    AutoPowOff
+AutoPowOff      SETL    {TRUE}
+
+; Bits in TWL6030 registers
+
+; bits in MMCCTRL
+STS_MMC                 *       (1 << 0)
+SW_FC                   *       (1 << 2)
+VMMC_AUTO_OFF           *       (1 << 3)
+
+; bits in VMMC_CFG_VOLTAGE
+VMMC_CFG_VOLTAGE_WR_S   *       ( 1 << 7)       ; Warm reset sensitivity
+VMMC_VSEL_MASK          *       (31 << 0)
+VMMC_VSEL_1_8V          *       ( 9 << 0)
+VMMC_VSEL_3_0V          *       (21 << 0)
+VMMC_VSEL_3_3V          *       (24 << 0)
+
+; bits in VMMC_CFG_STATE (W)
+VMMC_CFG_STATE_GRP_MOD  *       (1 << 7)
+VMMC_CFG_STATE_GRP_CON  *       (1 << 6)
+VMMC_CFG_STATE_GRP_APP  *       (1 << 5)
+VMMC_CFG_STATE_STATE_1  *       (1 << 1)
+VMMC_CFG_STATE_STATE_0  *       (1 << 0)
+VMMC_CFG_STATE_ON       *       (VMMC_CFG_STATE_GRP_APP + VMMC_CFG_STATE_STATE_0)
+
+; Selected SD controller registers and bits
+SYSCONFIG               *       &110
+SYSCONFIG_SOFTRESET     *       (1 << 1)
+SYSSTATUS               *       &114
+SYSSTATUS_RESETDONE     *       (1 << 0)
+CON                     *       &12C
+CON_OD                  *       (1 << 0)
+CON_INIT                *       (1 << 1)
+CON_DW8                 *       (1 << 5)
+CMD                     *       &20C
+HCTL                    *       &228
+HCTL_DTW                *       (1 << 1)
+HCTL_SDBP               *       (1 << 8)
+HCTL_SDVS_1_8V          *       (5 << 9)
+HCTL_SDVS_3_0V          *       (6 << 9)
+SYSCTL                  *       &22C
+SYSCTL_ICE              *       (1 << 0)
+SYSCTL_ICS              *       (1 << 1)
+SYSCTL_CEN              *       (1 << 2)
+SYSCTL_CLKD_SHIFT       *       6
+SYSCTL_CLKD_MASK        *       (&3FF << SYSCTL_CLKD_SHIFT)
+SYSCTL_SRA              *       (1 << 24)
+SYSCTL_SRC              *       (1 << 25)
+SYSCTL_SRD              *       (1 << 26)
+STAT                    *       &230
+STAT_CC                 *       (1 << 0)
+IE                      *       &234
+IE_CC                   *       (1 << 0)
+CAPA                    *       &240
+CAPA_VS30               *       (1 << 25)
+CAPA_VS18               *       (1 << 26)
+
+SDHCI_STDREGS_OFFSET    *       &200
+
+
+        AREA    |Asm$$Code|, CODE, READONLY, PIC
+
+        MACRO
+$class  HALDeviceField $field, $value
+        LCLS    myvalue
+      [ "$value" = ""
+myvalue SETS    "$field"
+      |
+myvalue SETS    "$value"
+      ]
+        ASSERT  . - %A0 = HALDevice_$class$field
+      [ ?HALDevice_$class$field = 2
+        DCW     $myvalue
+   ELIF ?HALDevice_$class$field = 4
+        DCD     $myvalue
+      |
+        %       ?HALDevice_$class$field
+      ]
+        MEND
+
+; Template for device blocks
+
+Template
+0
+        HALDeviceField Type,               HALDeviceType_ExpCtl + HALDeviceExpCtl_SDIO
+        HALDeviceField ID,                 HALDeviceID_SDIO_SDHCI
+        HALDeviceField Location,           HALDeviceBus_Peri + HALDevicePeriBus_Sonics3220
+        HALDeviceField Version,            0
+        HALDeviceField Description
+        HALDeviceField Address,            0 ; patched up at initialisation
+        HALDeviceField Reserved1,          0
+        HALDeviceField Activate,           0 ; patched up at initialisation
+        HALDeviceField Deactivate
+        HALDeviceField Reset
+        HALDeviceField Sleep
+        HALDeviceField Device,             MMC1_IRQ ; overridden in some cases
+        HALDeviceField TestIRQ
+        HALDeviceField ClearIRQ,           0
+        HALDeviceField Reserved2,          0
+SDHCI   HALDeviceField Flags,              HALDeviceSDHCI_Flag_32bit + HALDeviceSDHCI_Flag_R2bug
+SDHCI   HALDeviceField Slots,              1
+SDHCI   HALDeviceField SlotInfo,           0 ; patched up at initialisation
+SDHCI   HALDeviceField WriteRegister,      0
+SDHCI   HALDeviceField GetCapabilities,    0
+SDHCI   HALDeviceField GetVddCapabilities, 0
+SDHCI   HALDeviceField SetVdd              ; overridden in some cases
+SDHCI   HALDeviceField SetBusMode
+SDHCI   HALDeviceField PostPowerOn
+SDHCI   HALDeviceField SetBusWidth
+SDHCI   HALDeviceField GetMaxCurrent       ; overridden in some cases
+SDHCI   HALDeviceField SetSDCLK
+SDHCI   HALDeviceField GetTMCLK
+SDHCI   HALDeviceField SetActivity,        0 ; patched up at initialisation
+SDHCI   HALDeviceField GetCardDetect       ; overridden in some cases
+SDHCI   HALDeviceField GetWriteProtect,    0 ; patched up at initialisation
+        %       %A0 + HALDevice_SDHCISize - .
+        ASSERT  . - %A0 = SDHCISB
+        DCD     0                          ; patched up at initialisation
+        ASSERT  . - %A0 = SDHCISlotInfo + HALDeviceSDHCI_SlotInfo_Flags
+        DCD     0                          ; patched up at initialisation
+        ASSERT  . - %A0 = SDHCISlotInfo + HALDeviceSDHCI_SlotInfo_StdRegs
+        DCD     0                          ; patched up at initialisation
+        ASSERT  . - %A0 = SDHCISize
+
+
+        ; Init the SDHCI HAL device(s)
+        ; a1 = BoardType value
+        ; a2 = BoardRevision value
+SDIO_InitDevices ROUT
+        Push    "lr"
+        MOV     a3, #0
+        ADRL    a4, SDIOWS
+        BL      InitDevice
+        Pull    "pc"
+
+        ; Init one SDHCI HAL device
+        ; a1 = BoardType value
+        ; a2 = BoardRevision value
+        ; a3 = device number
+        ; a4 -> workspace for this device
+InitDevice ROUT
+        Push    "a1-a4,lr"
+        MOV     a1, a4
+        ADR     a2, Template
+        MOV     a3, #SDHCISize
+        BL      memcpy
+
+        Pull    "a1-a4"
+
+        ; Address and SlotInfo_StdRegs
+        LDR     ip, L4_Per_Log
+        CMP     a3, #1
+        ADDLO   lr, ip, #(L4_HSMMC1 - L4_Per)
+        ADDEQ   lr, ip, #(L4_HSMMC2 - L4_Per)
+        ADDHI   lr, ip, #(L4_MMC_SD3 - L4_Per)
+        STR     lr, [a4, #HALDevice_Address]
+        ADD     lr, lr, #SDHCI_STDREGS_OFFSET
+        STR     lr, [a4, #SDHCISlotInfo + HALDeviceSDHCI_SlotInfo_StdRegs]
+
+        ; Activate
+        ADR     lr, Activate_MMC1_Pandaboard
+        TEQ     a2, #BoardRevision_PandaES
+        ADREQ   lr, Activate_MMC1_PandaboardES
+        STR     lr, [a4, #HALDevice_Activate]
+
+        ; SlotInfo
+        ADD     lr, a4, #SDHCISlotInfo
+        STR     lr, [a4, #HALDevice_SDHCISlotInfo]
+
+        ; SetActivity
+        ADRL    lr, SetActivity_Pandaboard
+        TEQ     a2, #BoardRevision_PandaES
+        ADREQL  lr, SetActivity_PandaboardES
+        STR     lr, [a4, #HALDevice_SDHCISetActivity]
+
+        ; GetCardDetect
+        ; There is card detection integrated in TWL6030 for MMC1 interface only
+        CMP     a3, #1
+        ADRHSL  lr, GetCardDetect_NonRemovable
+        STRHS   lr, [a4, #HALDevice_SDHCIGetCardDetect]
+
+        ; GetWriteProtect
+        ADRL    lr, GetWriteProtect
+        STR     lr, [a4, #HALDevice_SDHCIGetWriteProtect]
+
+        ; SDHCISB
+        STR     sb, [a4, #SDHCISB]
+
+        ; SlotInfo_Flags
+        MOV     lr, #HALDeviceSDHCI_SlotFlag_Bus8Bit
+        STR     lr, [a4, #SDHCISlotInfo + HALDeviceSDHCI_SlotInfo_Flags]
+
+        MOV     a1, #0 ; flags
+        MOV     a2, a4
+        Pull    "lr"
+        LDR     pc, OSentries+4*OS_AddDevice ; tail call
+
+Description DATA
+        =       "TI OMAP4 SD host controller", 0
+        ALIGN
+
+NOPEntry ROUT
+        MOV     pc, lr
+
+
+        MACRO
+        MyTPSWrite $reg, $value
+        LDR     lr, =$value
+        STR     lr, [sp]
+        MOV     a1, #TPSRegGroup_$reg * 2
+        MOV     a4, #TPSRegOffset_$reg
+        BL      TPSWrite
+        MEND
+
+Activate_MMC1_Pandaboard ROUT
+        Push    "v1,sb,lr"
+        LDR     sb, [a1, #SDHCISB]
+        SUB     sp, sp, #4 ; buffer for TWL6030 register contents
+
+        ; configure LEDs as gpio pins
+        LDR     a4, L4_Wakeup_Log
+        LDR     a2, =(L4_SYSCTRL_PADCONF_WKUP - L4_Wakeup)
+        ADD     a4, a2, a4
+        MOV     a3, #3                  ; output: Mode 3 (GPIO)
+        STRH    a3, [a4, #0x5A]         ; gpio_wk7 == PB_LED_D1
+        STRH    a3, [a4, #0x5C]         ; gpio_wk8 == PB_LED_D2
+
+        ; switch OFF LED D2
+        GPIO_PrepareC a3, a2, $PB_LED_D2
+        GPIO_SetAsOutput a3, a2, a4
+        GPIO_SetOutput0 a3, a2
+
+        ; switch OFF LED D1
+        GPIO_PrepareC a3, a2, $PB_LED_D1
+        GPIO_SetAsOutput a3, a2, a4
+        GPIO_SetOutput0 a3, a2
+
+        ; Turn off automatic power OFF, set high level for detect pin
+        MOV     a2, sp
+        MOV     a3, #1
+        LDR     v1, OSentries+4*OS_IICOpV
+  [ AutoPowOff
+        MyTPSWrite MMCCTRL, (SW_FC + VMMC_AUTO_OFF)
+  |
+        MyTPSWrite MMCCTRL, SW_FC
+  ]
+
+        ADD     sp, sp, #4
+        MOV     a1, #1  ; mark successful activation
+        Pull    "v1,sb,pc"
+
+Activate_MMC1_PandaboardES ROUT
+        Push    "v1,sb,lr"
+        LDR     sb, [a1, #SDHCISB]
+        SUB     sp, sp, #4 ; buffer for TWL6030 register contents
+
+        ; configure LEDs as gpio pins
+        LDR     a4, L4_Core_Log
+        LDR     a2, =(L4_SYSCTRL_PADCONF_CORE - L4_Core)
+        ADD     a4, a2, a4
+        MOV     a3, #3                  ; output: Mode 3 (GPIO)
+        STRH    a3, [a4, #0xF6]         ; gpio_110 == PE_LED_D1
+        LDR     a4, L4_Wakeup_Log
+        LDR     a2, =(L4_SYSCTRL_PADCONF_WKUP - L4_Wakeup)
+        ADD     a4, a2, a4
+        STRH    a3, [a4, #0x5C]         ; gpio_wk8 == PB_LED_D2
+
+        ; switch OFF LED D2
+        GPIO_PrepareC a3, a2, $PB_LED_D2
+        GPIO_SetAsOutput a3, a2, a4
+        GPIO_SetOutput0 a3, a2
+
+        ; switch OFF LED D1
+        GPIO_PrepareC a3, a2, $PE_LED_D1
+        GPIO_SetAsOutput a3, a2, a4
+        GPIO_SetOutput0 a3, a2
+
+        ; Turn off automatic power OFF, set high level for detect pin
+        MOV     a2, sp
+        MOV     a3, #1
+        LDR     v1, OSentries+4*OS_IICOpV
+  [ AutoPowOff
+        MyTPSWrite MMCCTRL, (SW_FC + VMMC_AUTO_OFF)
+  |
+        MyTPSWrite MMCCTRL, SW_FC
+  ]
+
+        ADD     sp, sp, #4
+        MOV     a1, #1  ; mark successful activation
+        Pull    "v1,sb,pc"
+
+Deactivate * NOPEntry
+
+Reset ROUT
+        Push    "sb,lr"
+        LDR     sb, [a1, #SDHCISB]
+        LDR     a4, [a1, #HALDevice_Address]
+        ; 24.5.1.1.2.2 MMCHS Controller Software Reset
+        MOV     a2, #SYSCONFIG_SOFTRESET
+        STR     a2, [a4, #SYSCONFIG]
+        MOV     a3, #RESET_TIMEOUT
+00      SUBS    a3, a3, #1
+        Pull    "sb,pc", EQ ; timed out
+        LDR     a2, [a4, #SYSSTATUS]
+        TST     a2, #SYSSTATUS_RESETDONE
+        BEQ     %B00
+
+        ; 24.5.1.1.2.3 MMCHS Controller Voltage Capabilities Initialization
+        ADRL    a2, SDIOWS ; = device for MMC1
+        TEQ     a2, a1
+        MOVEQ   a2, #CAPA_VS18 :OR: CAPA_VS30
+        MOVNE   a2, #CAPA_VS18
+        STR     a2, [a4, #CAPA]
+        Pull    "sb,pc"
+
+Sleep ROUT
+        ; Could probably turn clock to controller on/off to
+        ; save power, but for now don't support power saving
+        MOV     a1, #0
+        MOV     pc, lr
+
+TestIRQ ROUT
+        ; Not a shared interrupt, so it must be our fault
+        MOV     a1, #1
+        MOV     pc, lr
+
+SetVdd ROUT ; MMC1 case
+        Push    "v1,sb,lr"
+        LDR     sb, [a1, #SDHCISB]
+
+        ; Turn on|off the power internal to the SD controller
+        ADRL    a1, SDIOWS
+        LDR     a1, [a1, #HALDevice_Address]
+
+        TEQ     a3, #0
+        MOVEQ   a2, #0
+        BEQ     %F00
+        LDR     a4, =1800
+        TEQ     a3, a4
+        MOVEQ   a2, #HCTL_SDVS_1_8V
+        BEQ     %F00
+        LDR     a4, =3000
+        TEQ     a3, a4
+        MOVEQ   a2, #HCTL_SDVS_3_0V
+        BNE     %F90 ; shouldn't happen
+
+00
+        STR     a2, [a1, #HCTL]
+        TEQ     a2, #0
+  [ AutoPowOff
+        BEQ     %F90
+        ORR     a2, a2, #HCTL_SDBP
+        STR     a2, [a1, #HCTL] ; needs to be two separate writes, the SDBP bit won't latch on the first write
+
+        SUB     sp, sp, #4 ; buffer for TWL6030 register contents
+        MOV     a2, sp
+        MOV     a3, #1
+        LDR     v1, OSentries+4*OS_IICOpV
+        MyTPSWrite VMMC_CFG_STATE, VMMC_CFG_STATE_ON
+        ADD     sp, sp, #4
+  |
+        ORRNE   a2, a2, #HCTL_SDBP
+        STRNE   a2, [a1, #HCTL] ; needs to be two separate writes, the SDBP bit won't latch on the first write
+  ]
+
+90
+        Pull    "v1,sb,pc"
+
+SetBusMode ROUT
+        Push    "sb,lr"
+        LDR     a4, [a1, #HALDevice_Address]
+        LDR     ip, [a4, #CON]
+        TEQ     a3, #0
+        ORRNE   ip, ip, #CON_OD
+        BICEQ   ip, ip, #CON_OD
+        STR     ip, [a4, #CON]
+        Pull    "sb,pc"
+
+PostPowerOn ROUT
+        Push    "v1,sb,lr"
+        LDR     sb, [a1, #SDHCISB]
+        MOV     v1, a1
+
+        LDR     a4, [v1, #HALDevice_Address]
+        LDR     a1, [a4, #CON]
+        ORR     a1, a1, #(CON_INIT + CON_OD)
+        STR     a1, [a4, #CON]
+        MOV     a3, #HCTL_SDVS_3_0V
+        STR     a3, [a4, #HCTL]
+
+        ; set clock to 160 kHz (send CMD0 twice for 1 ms)
+        MOV     a3, #SYSCTL_ICE
+        STR     a3, [a4, #SYSCTL]
+        MOV     a2, #(600 << SYSCTL_CLKD_SHIFT)
+        ORR     a3, a3, a2
+        STR     a3, [a4, #SYSCTL]
+
+        ; wait until clock is stable
+00
+        LDR     a3, [a4, #SYSCTL]
+        TST     a3, #SYSCTL_ICS
+        BEQ     %BT00
+        ; enable clock
+        ORR     a3, a3, #SYSCTL_CEN
+        STR     a3, [a4, #SYSCTL]
+
+        LDR     a3, [a4, #HCTL]
+        ORR     a3, a3, #HCTL_SDBP
+        STR     a3, [a4, #HCTL]
+05
+        LDR     a3, [a4, #HCTL]
+        TST     a3, #HCTL_SDBP
+        BEQ     %B05
+
+        ; activate status bits
+        MOV     a2, #IE_CC
+        STR     a2, [a4, #IE]
+        ; send init command
+        MOV     a2, #0
+        STR     a2, [a4, #CMD]
+05
+        LDR     a3, [a4, #STAT]
+        TST     a3, #STAT_CC
+        BEQ     %BT05
+        MOV     a3, #STAT_CC
+        STR     a3, [a4, #STAT] ; clear CC
+        ; send it once again
+        STR     a2, [a4, #CMD]
+10
+        LDR     a3, [a4, #STAT]
+        TST     a3, #STAT_CC
+        BEQ     %BT10
+        ; deactivate status bits
+        MOV     a2, #0
+        STR     a2, [a4, #IE]
+
+        LDR     a1, [a4, #CON]
+        BIC     a1, a1, #CON_INIT
+        STR     a1, [a4, #CON] ; end initialisation sequence
+
+        MOV     a1, #-1
+        STR     a1, [a4, #STAT] ; acknowledge all interrupts
+
+        Pull    "v1,sb,pc"
+
+SetBusWidth ROUT
+        LDR     a4, [a1, #HALDevice_Address]
+        LDR     ip, [a4, #CON]
+        TEQ     a3, #8
+        ORREQ   ip, ip, #CON_DW8
+        BICNE   ip, ip, #CON_DW8
+        STR     ip, [a4, #CON]
+        LDR     ip, [a4, #HCTL]
+        TEQ     a3, #4
+        ORREQ   ip, ip, #HCTL_DTW
+        BICNE   ip, ip, #HCTL_DTW
+        STR     ip, [a4, #HCTL]
+        MOV     pc, lr
+
+GetMaxCurrent ROUT ; MMC1 case
+        ; TWL6030 supplies 200 mA on VMMC
+        ; VSIM isn't used as a power line so it doesn't matter
+        MOV     a1, #200
+        MOV     pc, lr
+
+SetSDCLK ROUT
+        LDR     a1, [a1, #HALDevice_Address]
+
+        LDR     ip, =FCLK_FREQ
+        ADD     a2, ip, a3
+        SUB     a2, a2, #1 ; round divider up so we round frequency down
+        DivRem  a4, a2, a3, ip
+        CMP     a4, #(SYSCTL_CLKD_MASK :SHR: SYSCTL_CLKD_SHIFT) + 1
+        MOVHS   a4, #SYSCTL_CLKD_MASK :SHR: SYSCTL_CLKD_SHIFT
+        ; a4 = divider
+        LDR     a2, [a1, #SYSCTL]
+        BIC     a2, a2, #SYSCTL_CEN
+        STR     a2, [a1, #SYSCTL] ; stop clock going to card
+        BIC     a2, a2, #SYSCTL_ICE
+        STR     a2, [a1, #SYSCTL] ; stop clock
+        LDR     a3, =SYSCTL_CLKD_MASK
+        BIC     a2, a2, a3
+        ORR     a2, a2, a4, LSL #SYSCTL_CLKD_SHIFT
+        STR     a2, [a1, #SYSCTL] ; set divider
+        ORR     a2, a2, #SYSCTL_ICE
+        STR     a2, [a1, #SYSCTL] ; start clock
+
+        MOV     a3, #CLOCKSET_TIMEOUT
+00      SUBS    a3, a3, #1
+        MOVEQ   pc, lr ; timed out
+        LDR     a2, [a1, #SYSCTL]
+        TST     a2, #SYSCTL_ICS
+        BEQ     %B00
+
+        ORR     a2, a2, #SYSCTL_CEN
+        STR     a2, [a1, #SYSCTL] ; provide clock to card
+
+        LDR     ip, =FCLK_FREQ
+        DivRem  a1, ip, a4, a2
+
+        MOV     pc, lr
+
+GetTMCLK ROUT
+        ; Verified experimentally that the OMAP reuses SDCLK for TMCLK
+        LDR     a1, [a1, #HALDevice_Address]
+        LDR     a2, [a1, #SYSCTL]
+        LDR     a3, =SYSCTL_CLKD_MASK
+        AND     a2, a2, a3
+        MOV     a2, a2, LSR #SYSCTL_CLKD_SHIFT
+        LDR     ip, =FCLK_FREQ
+        DivRem  a1, ip, a2, a3
+        MOV     pc, lr
+
+SetActivity_Pandaboard ROUT
+        Push    "sb,lr"
+        LDR     sb, [a1, #SDHCISB]
+        GPIO_PrepareC a1, a2, $PB_LED_D2
+        TEQ     a3, #HALDeviceSDHCI_ActivityOff
+        GPIO_SetOutput0 a1, a2, EQ
+        GPIO_SetOutput1 a1, a2, NE
+        GPIO_PrepareC a1, a2, $PB_LED_D1
+        TEQ     a3, #HALDeviceSDHCI_ActivityWrite
+        GPIO_SetOutput1 a1, a2, EQ
+        GPIO_SetOutput0 a1, a2, NE
+        Pull    "sb,pc"
+
+SetActivity_PandaboardES ROUT
+        Push    "sb,lr"
+        LDR     sb, [a1, #SDHCISB]
+        GPIO_PrepareC a1, a2, $PB_LED_D2
+        TEQ     a3, #HALDeviceSDHCI_ActivityOff
+        GPIO_SetOutput0 a1, a2, EQ
+        GPIO_SetOutput1 a1, a2, NE
+        GPIO_PrepareC a1, a2, $PE_LED_D1
+        TEQ     a3, #HALDeviceSDHCI_ActivityWrite
+        GPIO_SetOutput1 a1, a2, EQ
+        GPIO_SetOutput0 a1, a2, NE
+        Pull    "sb,pc"
+
+GetCardDetect ROUT
+        Push    "v1,sb,lr"
+        LDR     sb, [a1, #SDHCISB]
+        SUB     sp, sp, #4 ; buffer for TWL6030 register contents
+        MOV     a1, #TPSRegGroup_MMCCTRL * 2
+        MOV     a2, sp
+        MOV     a3, #1
+        MOV     a4, #TPSRegOffset_MMCCTRL
+        LDR     v1, OSentries+4*OS_IICOpV
+        BL      TPSRead
+        Pull    "a1" ; value read from register
+        TST     a1, #STS_MMC ; line is active high
+        MOVEQ   a1, #0
+        MOVNE   a1, #1
+        Pull    "v1,sb,pc"
+
+GetCardDetect_NonRemovable ROUT
+        MOV     a1, #1
+        MOV     pc, lr
+
+GetWriteProtect ROUT ; WP is not connected on Pandaboard
+        MOV     a1, #0 ; permit writes
+        MOV     pc, lr
+
+        END

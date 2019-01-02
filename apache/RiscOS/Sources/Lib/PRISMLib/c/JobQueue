@@ -1,0 +1,385 @@
+/* Copyright 2005 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/**************************************************************/
+/* File:    JobQueue.c                                        */
+/*          (C) 2005 Tematic Ltd.                             */
+/*          All rights reserved                               */
+/*                                                            */
+/* Purpose: Re-entrant job queues.                            */
+/*                                                            */
+/* Author:  A.D.Hodgkinson.                                   */
+/*                                                            */
+/* History: 16-Jun-2005 (ADH): Created.                       */
+/**************************************************************/
+
+#include <stdlib.h>
+#include <stdarg.h>
+#include <stdint.h>
+
+#ifdef TRACE2
+  #define TRACE
+#endif
+#ifdef TRACE
+  #define DEBUGLIB
+#endif
+#include <debuglib/debuglib.h>
+
+#include "Errors.h"
+#include "Interrupts.h"
+#include "Internal.h"
+
+#include "JobQueue.h"
+
+/**************************************************************/
+/* prismlib_jobqueue_create()                                 */
+/*                                                            */
+/* Create a new job queue structure.                          */
+/*                                                            */
+/* Parameters:  Number of entries to hold in the queue;       */
+/*                                                            */
+/*              Number of 32-bit words making up each entry;  */
+/*                                                            */
+/*              Pointer to a prismlib_jobqueue_t, updated on  */
+/*              successful exit with the new queue handle.    */
+/*                                                            */
+/* Re-entrancy: Function is re-entrant.                       */
+/*                                                            */
+/* Interrupts:  Function is interrupt safe.                   */
+/*              Interrupts are disabled.                      */
+/**************************************************************/
+
+_kernel_oserror * prismlib_jobqueue_create
+                  (
+                    size_t                         entries,
+                    size_t                         words_per_entry,
+                    prismlib_jobqueue_t * restrict queue_handle
+                  )
+{
+  prismlib_internal_jobqueue_t * restrict queue;
+
+  /* Check input parameters */
+
+  if (entries == 0 || words_per_entry == 0 || queue_handle == NULL)
+  {
+    return prismlib_make_error(prism_error_INVALID_PARAMETERS,
+                               1,
+                               "prismlib_jobqueue_create()");
+  }
+
+  /* Interrupts off for safety */
+
+  PRISMLIB_SVC_INT_DISABLE;
+
+  /* Allocate the queue structure */
+
+  queue = malloc(sizeof(*queue));
+
+  if (queue == NULL)
+  {
+    return prismlib_make_error(prism_error_MEMORY_EXHAUSTED, 0);
+  }
+
+  /* Initialise the contents, allocating the queue array too */
+
+  queue->entries         = entries;
+  queue->words_per_entry = words_per_entry;
+  queue->write           = 0;
+  queue->read            = 0;
+  queue->used            = 0;
+  queue->queue           = calloc(entries, words_per_entry * sizeof(*(queue->queue)));
+
+  if (queue->queue == NULL)
+  {
+    free(queue);
+    return prismlib_make_error(prism_error_MEMORY_EXHAUSTED, 0);
+  }
+
+  /* All done */
+
+  *queue_handle = (prismlib_jobqueue_t) queue;
+
+  PRISMLIB_SVC_INT_RESTORE;
+  return NULL;
+}
+
+/**************************************************************/
+/* prismlib_jobqueue_delete()                                 */
+/*                                                            */
+/* Delete a job queue created by prismlib_jobqueue_create.    */
+/*                                                            */
+/* Parameters:  Pointer to a prismlib_jobqueue_t describing   */
+/*              the queue to delete, updated on successful    */
+/*              exit to zero.                                 */
+/*                                                            */
+/* Re-entrancy: Function is re-entrant.                       */
+/*                                                            */
+/* Interrupts:  Function is interrupt safe.                   */
+/*              Interrupts are disabled.                      */
+/**************************************************************/
+
+_kernel_oserror * prismlib_jobqueue_delete
+                  (
+                    prismlib_jobqueue_t * restrict queue_handle
+                  )
+{
+  prismlib_internal_jobqueue_t * queue;
+
+  if (queue_handle == NULL || *queue_handle == NULL)
+  {
+    return prismlib_make_error(prism_error_INVALID_PARAMETERS,
+                               1,
+                               "prismlib_jobqueue_delete()");
+  }
+
+  /* Interrupts off for safety, then record and clear the old
+   * queue pointer
+   */
+
+  PRISMLIB_SVC_INT_DISABLE;
+
+  queue         = (prismlib_internal_jobqueue_t *) *queue_handle;
+  *queue_handle = 0;
+
+  /* In case someone makes a stale reference to the queue later,
+   * try to be a little clever by setting the entries to zero so
+   * that no future reads or stores would work.
+   */
+
+  queue->entries = queue->used = 0;
+
+  /* Not much else to do - just free the queue array and queue
+   * structure
+   */
+
+  free(queue->queue);
+  free(queue);
+
+  PRISMLIB_SVC_INT_RESTORE;
+  return NULL;
+}
+
+/**************************************************************/
+/* prismlib_jobqueue_add()                                    */
+/*                                                            */
+/* Add a job to a job queue.                                  */
+/*                                                            */
+/* Parameters:  Handle of job queue of interest;              */
+/*                                                            */
+/*              Pointer to a pointer to a uint32_t, updated   */
+/*              on successful exit to point to an entry of    */
+/*              'n' words making up the new job, where 'n' is */
+/*              as given in the second parameter to           */
+/*              prismlib_jobqueue_create, or NULL if the job  */
+/*              queue is full (an error is only returned from */
+/*              the function if the caller has made a genuine */
+/*              mistake, such as passing invalid parameters)  */
+/*              - pass NULL if you don't care whether or not  */
+/*              the addition succeeds;                        */
+/*                                                            */
+/*              'n' words making up the entry, where 'n' is   */
+/*              as given in the second parameter of           */
+/*              prismlib_jobqueue_create.                     */
+/*                                                            */
+/* Re-entrancy: Function is re-entrant.                       */
+/*                                                            */
+/* Interrupts:  Function is interrupt safe.                   */
+/*              Interrupts are disabled.                      */
+/**************************************************************/
+
+_kernel_oserror * prismlib_jobqueue_add
+                  (
+                    prismlib_jobqueue_t             queue_handle,
+                    uint32_t            ** restrict job,
+                    ...
+                  )
+{
+  prismlib_internal_jobqueue_t * queue = (prismlib_internal_jobqueue_t *) queue_handle;
+
+  if (queue == NULL)
+  {
+    return prismlib_make_error(prism_error_INVALID_PARAMETERS,
+                               1,
+                               "prismlib_jobqueue_add()");
+  }
+
+  /* Interrupts off for safety */
+
+  PRISMLIB_SVC_INT_DISABLE;
+
+  if (queue->used == queue->entries)
+  {
+    /* Queue is full */
+
+    if (job != NULL) *job = NULL;
+  }
+  else
+  {
+    /* Queue is not full, so write in the current entry */
+
+    uint32_t * entry;
+    va_list    ap;
+    size_t     i;
+
+    /* queue->write is the entry number, so this multiplied by
+     * the words per entry gives the word number at which to
+     * start writing. Add this to 'entry' to get the address of
+     * the base of the entry by pointer arithmetic.
+     */
+
+    entry = queue->queue + (queue->write * queue->words_per_entry);
+
+    /* Fill in the entry */
+
+    va_start(ap, job);
+
+    for (i = 0; i < queue->words_per_entry; i++)
+    {
+      entry[i] = va_arg(ap, uint32_t);
+    }
+
+    va_end(ap);
+
+    /* Advance the write and used counter */
+
+    queue->used++;
+    queue->write++;
+
+    if (queue->write >= queue->entries) queue->write = 0;
+
+    /* Finally, return the job address to the caller */
+
+    if (job != NULL) *job = entry;
+  }
+
+  PRISMLIB_SVC_INT_RESTORE;
+  return NULL;
+}
+
+/**************************************************************/
+/* prismlib_jobqueue_remove()                                 */
+/*                                                            */
+/* Remove whatever job is sitting at the back of the job      */
+/* queue, if any.                                             */
+/*                                                            */
+/* Parameters:  Handle of job queue of interest.              */
+/*                                                            */
+/* Re-entrancy: Function is re-entrant.                       */
+/*                                                            */
+/* Interrupts:  Function is interrupt safe.                   */
+/*              Interrupts are disabled.                      */
+/**************************************************************/
+
+_kernel_oserror * prismlib_jobqueue_remove
+                  (
+                    prismlib_jobqueue_t queue_handle
+                  )
+{
+  prismlib_internal_jobqueue_t * queue = (prismlib_internal_jobqueue_t *) queue_handle;
+
+  if (queue == NULL)
+  {
+    return prismlib_make_error(prism_error_INVALID_PARAMETERS,
+                               1,
+                               "prismlib_jobqueue_remove()");
+  }
+
+  PRISMLIB_SVC_INT_DISABLE;
+
+  if (queue->used != 0)
+  {
+    /* Just rewind the write and used counters */
+
+    queue->used--;
+
+    if (queue->write == 0) queue->write = queue->entries - 1;
+    else                   queue->write--;
+  }
+
+  PRISMLIB_SVC_INT_RESTORE;
+  return NULL;
+}
+
+/**************************************************************/
+/* prismlib_jobqueue_read()                                   */
+/*                                                            */
+/* Read a job from the job queue.                             */
+/*                                                            */
+/* Parameters:  Handle of job queue of interest;              */
+/*                                                            */
+/*              Pointer to a pointer to a uint32_t, updated   */
+/*              on successful exit to point to an entry of    */
+/*              'n' words making up the job, where 'n' is as  */
+/*              given in the second parameter to              */
+/*              prismlib_jobqueue_create, or NULL if there    */
+/*              are no jobs queued.                           */
+/*                                                            */
+/* Re-entrancy: Function is re-entrant.                       */
+/*                                                            */
+/* Interrupts:  Function is interrupt safe.                   */
+/*              Interrupts are disabled.                      */
+/**************************************************************/
+
+_kernel_oserror * prismlib_jobqueue_read
+                  (
+                    prismlib_jobqueue_t             queue_handle,
+                    uint32_t            ** restrict job
+                  )
+{
+  prismlib_internal_jobqueue_t * queue = (prismlib_internal_jobqueue_t *) queue_handle;
+
+  if (queue == NULL || job == NULL)
+  {
+    return prismlib_make_error(prism_error_INVALID_PARAMETERS,
+                               1,
+                               "prismlib_jobqueue_read()");
+  }
+
+  PRISMLIB_SVC_INT_DISABLE;
+
+  if (queue->used == 0)
+  {
+    /* Queue is empty */
+
+    *job = NULL;
+  }
+  else
+  {
+    /* Queue has entries */
+
+    uint32_t * entry;
+
+    /* queue->read is the entry number, so this multiplied by
+     * the words per entry gives the word number at which to
+     * start reading. Add this to 'entry' to get the address of
+     * the base of the entry by pointer arithmetic.
+     */
+
+    entry = queue->queue + (queue->read * queue->words_per_entry);
+
+    /* Advance the read counter and decrement the used counter */
+
+    queue->used--;
+    queue->read++;
+
+    if (queue->read >= queue->entries) queue->read = 0;
+
+    /* Finally, return the job address to the caller */
+
+    *job = entry;
+  }
+
+  PRISMLIB_SVC_INT_RESTORE;
+  return NULL;
+}

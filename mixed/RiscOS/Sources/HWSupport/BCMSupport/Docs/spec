@@ -1,0 +1,228 @@
+BCMSupport specification
+------------------------
+
+The primary purpose of the BCMSupport module is to provide shared access to the
+mailbox channels that are used for communication between the ARM and the
+VideoCore GPU.
+
+For the low-level details of this interface, see:
+https://github.com/raspberrypi/firmware/wiki/Mailboxes
+
+BCMSupport exposes the mailboxes via the following SWI interface:
+
+
+
+                                              BCMSupport_SendMBMessage
+                                              (SWI &591C0)
+
+In: R0 = Mailbox channel (bits 0-3) and data (bits 4-31)
+    R1 = Flags:
+         Bit 0:
+           0 -> Block and wait for response
+           1 -> Don't block, call callback specified in R4-R6 on receipt of
+response
+         Bit 1:
+           0 -> Block if the send buffer is full
+           1 -> Return error if the send buffer is full
+    R2 = Response mask
+    R3 = Response value
+    If R1 bit 0 is set:
+      R4 = Response callback R0
+      R5 = Response callback R12
+      R6 = Response callback function pointer
+
+Out: All registers preserved
+     If bit 0 is clear, and a response is expected (R2 != 0), R0 = response word
+     Error on failure to send
+
+This is the lowest-level interface for sending messages via the mailbox.
+The word provided in R0 is written directly to the send channel. The values of
+R2 and R3 are used to identify the response in the receive channel, using the
+following logic:
+
+  if ((response AND R2) == R3)
+  {
+    // this is my response
+  }
+  else
+  {
+    // this is not my response
+  }
+
+Specifying a response mask of 0 indicates that no response is expected.
+
+Each sent message which is expecting a response is pushed onto a queue. When a
+response is received from the GPU the queue is searched in FIFO order until a
+match is found. By correctly setting the response mask and value in R2 and R3
+this allows the interface to cope with mailbox channels which only respond to
+messages in-order (e.g. channels 0 and 1) versus those that reply out-of-order
+(e.g. channel 8)
+
+If the call is operating in a blocking manner (R1 bit 0 or bit 1 are unset)
+then it must be called with interrupts enabled.
+
+Any response which fails to match against an entry in the expected-responses
+list will be discarded.
+
+Callback functions are called as follows:
+
+In: R0 = R4 value from send SWI
+    R1 = Response word
+    R12 = R5 value from send SWI
+    CPU in privileged mode
+    Interrupts disabled
+
+Out: R0-R3, R12 can be corrupted
+
+The callback function pointer can also be null, which is taken as an indication
+that the response should be ignored.
+
+Callback functions are called directly from the mailbox interrupt handler, and
+so must be quick and must not enable interrupts. Sending further messages from
+within a callback is discouraged (non-blocking sends are possible via making
+sure bits 0 and 1 are set, but because there is no guarantee the send will
+succeed the ability is of limited use)
+
+
+
+                                              BCMSupport_MBSync
+                                              (SWI &591C1)
+
+In: R0 = Flags:
+         Bit 0: 1 -> Sync based on response mask/value
+         Bit 1: 1 -> Sync based on callback R0
+         Bit 2: 1 -> Sync based on callback R12
+         Bit 3: 1 -> Sync based on callback pointer
+    R1 = Response mask
+    R2 = Response value
+    R3 = Callback R0
+    R4 = Callback R12
+    R5 = Callback function pointer
+
+Out: All registers preserved
+
+This SWI can be used to block until all responses (of a given type) have been
+received. This can be used, e.g. during your modules finalisation sequence to
+make sure that all pending responses have been received.
+
+For each flag specified in R0, all the criteria must match for BCMSupport to
+consider the pending response to be one that it needs to block waiting for.
+Entries which have a null callback function pointer can still match on the R0
+and R12 values, allowing them to be used as unique tokens by your code.
+
+To block for receipt of all messages, you can set bit 0 of R0 and set both R1
+and R2 to zero.
+
+This SWI is only guaranteed to block for the receipt of messages which were
+sent prior to the SWI being called. New messages which are sent after the SWI
+has begun executing may not be waited for.
+
+This SWI must not be used from within one of the message callback functions.
+
+
+
+                                              BCMSupport_AllocPropertyBuffer
+                                              (SWI &591C2)
+
+In: R0 = Required length
+
+Out: R0 -> Buffer (16 byte aligned)
+
+This SWI is used to allocate a physically contiguous buffer for use with the
+mailbox property interface.
+
+
+
+                                              BCMSupport_FreePropertyBuffer
+                                              (SWI &591C3)
+
+In: R0 -> Buffer
+
+Out: All registers preserved
+
+This SWI is used to free a buffer that was previously allocated by
+BCMSupport_AllocPropertyBuffer.
+
+
+
+                                              BCMSupport_SendPropertyBuffer
+                                              (SWI &591C4)
+
+In: R0 -> Buffer (16 byte aligned)
+    R1 = Flags:
+         Bit 0:
+           0 -> Block and wait for response
+           1 -> Don't block, call callback specified in R2-R4 on receipt of
+response
+         Bit 1:
+           0 -> Block if the send buffer is full
+           1 -> Return error if the send buffer is full
+    If R1 bit 0 is set:
+      R2 = Response callback R0
+      R3 = Response callback R12
+      R4 = Response callback function pointer
+
+Out: All registers preserved
+     Error on failure to send
+
+This SWI is used to send a buffer via the mailbox property interface. The
+buffer must be filled with a sequence of tagged messages as described here:
+https://github.com/raspberrypi/firmware/wiki/Mailbox-property-interface
+
+The buffer pointer must be at least 16 byte aligned, and located in a region of
+non-cacheable, physically contiguous memory. BCMSupport_AllocPropertyBuffer can
+be used to allocate a buffer which meets these requirements. There is no
+requirement for the caller to use memory barriers after writing the request to
+the buffer or before reading the response; BCMSupport will perform the correct
+barrier operations on your behalf.
+
+Care must be taken to ensure that the buffer is not freed or used for another
+purpose while the GPU is processing the contents.
+
+Callback functions are called as follows:
+
+In: R0 = R2 value from send SWI
+    R1 = Buffer pointer (R0 value from send SWI)
+    R12 = R3 value from send SWI
+    CPU in privileged mode
+    Interrupts disabled
+
+Out: R0-R3, R12 can be corrupted
+
+Unlike BCMSupport_SendMBMessage, it is not possible to request an async
+operation with a null callback. This is because there will be no way for you to
+know when the buffer is free for re-use. It is also recommended that once an
+operation has completed you check the buffer for any received error codes.
+
+Callback functions are called directly from the mailbox interrupt handler, and
+so must be quick and must not enable interrupts. Sending further messages from
+within a callback is discouraged (non-blocking sends are possible via making
+sure bits 0 and 1 are set, but because there is no guarantee the send will
+succeed the ability is of limited use)
+
+
+
+                                              BCMSupport_SendTempPropertyBuffer
+                                              (SWI &591C5)
+
+In: R0 -> Input buffer
+    R1 -> Output buffer
+    R2 = Flags (reserved)
+
+Out: All registers preserved
+     Error on failure to send
+
+This is a simplified version of BCMSupport_SendPropertyBuffer that does not
+require the caller to preallocate a physically contiguous buffer. Instead,
+ordinary RAM can be used for the input and output. BCMSupport will take care of
+copying the input to a temporary buffer, sending the message, and then copying
+the output to your output buffer. In most cases a pre-allocated temporary
+buffer will be used, but if the tag sequence is too long or all the
+preallocated buffers are in use then an attempt will be made to (temporarily)
+allocate a new buffer from the heap.
+
+There is no async option with this call, and it will always block until there
+is enough mailbox space available.
+
+The input and output buffer pointers must be at least 4 byte aligned. The same
+buffer can be used for both input and output.

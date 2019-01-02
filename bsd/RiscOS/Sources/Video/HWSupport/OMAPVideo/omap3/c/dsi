@@ -1,0 +1,161 @@
+/*
+ * Copyright (c) 2010, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include "dsi.h"
+#include "dss.h"
+#include "regs.h"
+#include "consts.h"
+
+#include "DebugLib/DebugLib.h"
+
+uint32_t dsi_pll_current_pixel_rate=0;
+
+/* TODO - This should be moved somewhere more sensible */
+
+typedef struct
+{
+	uint32_t min,max;
+	uint8_t freqsel;
+} freqsel_range_t;
+
+static const freqsel_range_t freqsel_table[] = {
+	{ 750000,	1000000,	0x3 },
+	{ 1000000,	1250000,	0x4 },
+	{ 1250000,	1500000,	0x5 },
+	{ 1500000,	1750000,	0x6 },
+	{ 1750000,	2100000,	0x7 },
+	{ 7500000,	10000000,	0xB },
+	{ 10000000,	12500000,	0xC },
+	{ 12500000,	15000000,	0xD },
+	{ 15000000,	17500000,	0xE },
+	{ 17500000,	21000000,	0xF },
+	{ 0,		0xFFFFFFFF,	0 } /* List terminator is catch-all for error case */
+};
+
+static uint8_t get_freqsel(uint32_t Fint)
+{
+	const freqsel_range_t *r = freqsel_table;
+	while((Fint < r->min) || (r->max < Fint))
+		r++;
+	return r->freqsel;
+}
+
+#ifdef DEBUGLIB
+static const char *cmds[4] = {"OFF","DSI_PLL_ON_HSDIVIDER_OFF","BOTH_ON","BOTH_ON_DSI_COMPLEXIO_OFF"};
+#endif
+
+static void dsi_pll_command(uint32_t cmd)
+{
+	dsi->clk_ctrl = (dsi->clk_ctrl & ~DSI_CLK_CTRL_PLL_PWR_CMD_MASK) | (cmd<<DSI_CLK_CTRL_PLL_PWR_CMD_SHIFT);
+	int timeout=1000000;
+	while(((dsi->clk_ctrl & DSI_CLK_CTRL_PLL_PWR_STATUS_MASK)>>DSI_CLK_CTRL_PLL_PWR_STATUS_SHIFT != cmd) && --timeout) {};
+	if(!timeout)
+	{
+		dprintf(("","dsi_pll_command: Timeout waiting for cmd %s; current state %s\n",cmds[cmd],cmds[(dsi->clk_ctrl & DSI_CLK_CTRL_PLL_PWR_STATUS_MASK)>>DSI_CLK_CTRL_PLL_PWR_STATUS_SHIFT]));
+	}
+}
+
+void dsi_pll_program_for_dispc(uint32_t pixel_rate)
+{
+	/* Program the DSI PLL for use by DISPC */
+	if(pixel_rate == dsi_pll_current_pixel_rate)
+		return;
+
+	clock_divider_t div = calculate_dss_clock_divider(pixel_rate);
+
+	dprintf(("","dsi_pll_program_for_dispc: Changing pixel rate from %d to %d\n",dsi_pll_current_pixel_rate,pixel_rate));
+
+	dprintf(("","REGM=%d REGN=%d REGM3=%d REGM4=%d\n",div.regm,div.regn,div.regm3,div.regm4));
+	/* TODO - Need to reset DSI as per 15.6.3.2.1 p2364? Or at least work out some other correct way of reprogramming it when it's already running */
+
+	/* Set up DSI PLL, as per spruf98d 15.6.3.2.2 p2364 (with some fairly important modifications!) */
+
+	/* 1. Turn on PLL & HSDIVIDER
+	   2. Wait for response */
+#if 0
+	dsi_pll_command(DSI_PLL_PWR_CMD_BOTH_ON_DSI_COMPLEXIO_OFF); /* We don't need the DSI clock, keep it off */
+#else
+	/* Looks like there's a bug/misfeature with DM37x where we need to use BOTH_ON instead of BOTH_ON_DSI_COMPLEXIO_OFF - see http://gitorious.org/beagleboard-validation/linux/commit/547d9d247aa30e471f143f0e6ddad646770ac5c0
+	   Naturally, this problem isn't mentioned in the TRM or errata (not that how to properly use the DSI PLL with DISPC was ever fully explained anywhere anyway). */
+	dsi_pll_command(DSI_PLL_PWR_CMD_BOTH_ON);
+#endif
+
+	/* 3-6. Program configuration1 register (according to spruf98d fig 15-139 (p2318)) */
+	/* TODO - error on invalid */
+	uint32_t config1,config2;
+	config2 = 0; /* We want DSI_PLL_CLKSEL clear so the PLL uses SYS_CLK as its source */
+	/* TODO - Remove assumption that SYS_CLK <32MHz? */
+	config1 = div.regn << DSI_PLL_CONFIGURATION1_DSI_PLL_REGN_SHIFT;
+	config1 |= div.regm << DSI_PLL_CONFIGURATION1_DSI_PLL_REGM_SHIFT;
+	config1 |= div.regm3 << DSI_PLL_CONFIGURATION1_DSS_CLOCK_DIV_SHIFT;
+	config1 |= div.regm4 << DSI_PLL_CONFIGURATION1_DSIPROTO_CLOCK_DIV_SHIFT;
+
+	/* 7. Enable PLLStopMode */
+	config1 |= DSI_PLL_CONFIGURATION1_DSI_PLL_STOPMODE;
+
+	/* 8. Program configuration2 register */
+	/* Calculate Fint so we can get freqsel value */
+	uint32_t Fint = hwconfig->sys_clk/(div.regn+1);
+	dprintf(("","Fint=%d\n",Fint));
+	config2 |= get_freqsel(Fint) << DSI_PLL_CONFIGURATION2_DSI_PLL_FREQSEL_SHIFT;
+	/* Other flags - only REFEN & DSS_CLOCK_EN are needed from the example. However we also use the drift guard, so enable that. */
+	config2 |= DSI_PLL_CONFIGURATION2_DSI_PLL_REFEN | DSI_PLL_CONFIGURATION2_DSS_CLOCK_EN | DSI_PLL_CONFIGURATION2_DSI_PLL_DRIFTGUARDEN;
+
+	/* 9. Select manual mode (and program config1, config2) */
+	dsi_pll->configuration1 = config1;
+	dsi_pll->configuration2 = config2;
+	dsi_pll->control = 0;
+
+	/* 10. Lock */
+	dsi_pll->go = DSI_PLL_GO_DSI_PLL_GO;
+
+	/* 11. Wait for GO bit to clear */
+	int timeout=1000000;
+	while((dsi_pll->go & DSI_PLL_GO_DSI_PLL_GO) && --timeout) {};
+	if(!timeout)
+	{
+		dprintf(("","dsi_pll_program_for_dispc: Timeout waiting for DSI_PLL_GO\n"));
+	}
+
+	/* 12. Wait for PLL to lock */
+	timeout=1000000;
+	while(!(dsi_pll->status & DSI_PLL_STATUS_DSI_PLL_LOCK) && --timeout) {};
+	if(!timeout)
+	{
+		dprintf(("","dsi_pll_program_for_dispc: Timeout waiting for DSI_PLL_LOCK\n"));
+	}
+
+	/* 13. Turn on PLL & HSDIVIDER - Should already be on? And the rest of the stuff is irrelevant, since we don't use DSI */
+
+	/* TODO - EXPERIMENT - Enable HSDIVIDER in bypass mode, as per HAL code (needs moving to before lock?) */
+//	config2 |= DSI_PLL_CONFIGURATION2_DSI_PLL_HSDIVBYPASS;
+
+	/* Done! */
+	dsi_pll_current_pixel_rate = pixel_rate;
+
+	dprintf(("","dsi_pll_program_for_dispc: Done\n"));
+}

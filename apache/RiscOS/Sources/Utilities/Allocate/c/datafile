@@ -1,0 +1,567 @@
+/* Copyright 2015 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*
+ * Name   : datafile.c
+ * Desc   : datafile control for the !allocate application
+ * Auther : James Bye
+ * Date   : 21-Jul-1994
+ *
+ *
+ */
+
+
+/*-- from CLib --*/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include "kernel.h"
+
+#include "Global/FileTypes.h"
+
+/*-- from RISC_OSLib --*/
+
+#include "werr.h"
+#include "trace.h"
+
+/*-- from my headers --*/
+
+#include "file.h"
+#include "object.h"
+#include "datafile.h"
+#include "guard.h"
+#include "details.h"
+
+
+/*************************************************
+ * Internal structures                           *
+ *************************************************/
+
+#define DataFile_Name     "ALLOCATE"
+#define DataFile_Version  100
+
+typedef struct
+{
+  char name[8];        /*-- must be set to be 'ALLOCATE' --*/
+  int version;
+  int no_objects;
+} DataFileHdr;
+
+
+/*-- some errors --*/
+
+static _kernel_oserror badhdr = {0,"Bad file header"};
+static _kernel_oserror badver = {0,"Version of file is not understood"};
+static _kernel_oserror nomem  = {0,"Not enough memory for file read"};
+
+
+/*************************************************
+ * Static variables                              *
+ *************************************************/
+
+static char writeb[2048];  /*-- scratch space for buffering file output --*/
+
+/*************************************************
+ * Static functions                              *
+ *************************************************/
+
+/*
+ * writes the file header
+ */
+
+static _kernel_oserror *do_write_file_hdr ( int fh, int no_objects )
+{
+DataFileHdr hdr;
+
+  /*-- set up the file hdr --*/
+
+  memcpy(hdr.name,DataFile_Name,8);
+  hdr.version = DataFile_Version;
+  hdr.no_objects = no_objects;
+
+  /*-- and write it to the file --*/
+
+  return(file_writebytes(fh,&hdr,0,sizeof(DataFileHdr),-1));
+}
+
+
+/*
+ * writes the details to the file
+ */
+
+static _kernel_oserror *do_write_details ( int fh )
+{
+  return(file_writebytes(fh,details_get_ptr(),0,sizeof(DetailsInfo),-1));
+}
+
+
+/*
+ * does the writing of the objects
+ */
+
+static _kernel_oserror *do_write_objects ( int fh, DataFileObjectList *objects )
+{
+_kernel_oserror *e;
+ObjectBlock *object;
+
+  /*-- loop writing the objects to the file --*/
+
+  while(objects != NULL)
+  {
+    object = objects->object;
+
+    /*-- the filetype object is a special case --*/
+
+    if(object->id == Object_FileType)
+    {
+    ObjectBlock copy;
+
+      /*-- make a copy of the object --*/
+
+      memcpy(&copy,object,sizeof(ObjectBlock));
+
+      /*-- calculate the real size --*/
+
+      copy.size = (copy.size - (3 * sizeof(int))) +
+                    copy.data.filetype.sprite.size +
+                    copy.data.filetype.prod_desc.size +
+                    copy.data.filetype.format.size;
+      tracef1("True size of filetype object is %d\n",copy.size);
+
+      /*-- write the two word object header --*/
+
+      if((e = file_writebytes(fh,&copy,0,sizeof(int)*2,-1)) != NULL)
+        goto finish;
+
+      /*-- write the filetype data, but without the file data elements --*/
+
+      if((e = file_writebytes(fh,&copy.data.filetype,0,
+                           sizeof(FileType)-(sizeof(FileData)*3),-1)) != NULL)
+        goto finish;
+
+      /*-- write the sprite file data --*/
+
+      if((e = file_writebytes(fh,&copy.data.filetype.sprite.size,0,sizeof(int),-1)) != NULL)
+        goto finish;
+      if((e = file_writebytes(fh,copy.data.filetype.sprite.data,0,
+                                  copy.data.filetype.sprite.size,-1)) != NULL)
+        goto finish;
+
+      /*-- write the prod_desc file data --*/
+
+      if((e = file_writebytes(fh,&copy.data.filetype.prod_desc.size,0,sizeof(int),-1)) != NULL)
+        goto finish;
+      if((e = file_writebytes(fh,copy.data.filetype.prod_desc.data,0,
+                                  copy.data.filetype.prod_desc.size,-1)) != NULL)
+        goto finish;
+
+      /*-- write the format file data --*/
+
+      if((e = file_writebytes(fh,&copy.data.filetype.format.size,0,sizeof(int),-1)) != NULL)
+        goto finish;
+      if((e = file_writebytes(fh,copy.data.filetype.format.data,0,
+                                  copy.data.filetype.format.size,-1)) != NULL)
+        goto finish;
+    }
+    else
+    {
+      /*-- do writing for all other objects --*/
+
+      if((e = file_writebytes(fh,object,0,sizeof(int)*2,-1)) != NULL)
+        goto finish;
+      if((e = file_writebytes(fh,&object->data,0,object->size,-1)) != NULL)
+        goto finish;
+    }
+
+    /*-- move onto the next object --*/
+
+    objects = objects->next;
+  }
+
+
+finish:
+
+  return(e);
+}
+
+
+/*
+ * does the reading of objects from the data file
+ */
+
+static _kernel_oserror *do_read_objects ( int fh, DataFileObjectList **objects_ptr,
+                                                                      int no_objects )
+{
+_kernel_oserror *e = NULL;
+int objects_read = 0;
+DataFileObjectList *objects = NULL;
+DataFileObjectList *new;
+DataFileObjectList *start = NULL;
+
+  /*-- loop reading all the objects from the file --*/
+
+  while(objects_read < no_objects)
+  {
+     /*-- allocate a new object list element --*/
+
+     if((new = malloc(sizeof(DataFileObjectList))) == NULL)
+     {
+       e = &nomem;
+       goto finish;
+     }
+
+     new->next = NULL;
+
+     /*-- allocate some space for the object in the object list --*/
+
+     if((new->object = malloc(sizeof(ObjectBlock))) == NULL)
+     {
+       e = &nomem;
+       goto finish;
+     }
+
+     /*-- read the first two words of the object --*/
+
+     if((e = file_readbytes(fh,new->object,sizeof(int)*2,-1)) != NULL)
+       goto finish;
+
+     /*-- check the object id because the filetype object is a special --*/
+     /*-- case                                                         --*/
+
+     if(new->object->id == Object_FileType)
+     {
+       /*-- read the filetype data apart from the three file data elements --*/
+
+       if((e = file_readbytes(fh,&new->object->data.filetype,
+                sizeof(FileType) - (sizeof(FileData)*3),-1)) != NULL)
+         goto finish;
+
+       /*-- read the size of sprite data, alloc space and load it --*/
+
+       if((e = file_readbytes(fh,&new->object->data.filetype.sprite.size,
+                            sizeof(int),-1)) != NULL)
+         goto finish;
+
+       if((new->object->data.filetype.sprite.data =
+                   malloc(new->object->data.filetype.sprite.size)) == NULL)
+       {
+         e = &nomem;
+         goto finish;
+       }
+
+       if((e = file_readbytes(fh,new->object->data.filetype.sprite.data,
+             new->object->data.filetype.sprite.size,-1)) != NULL)
+         goto finish;
+
+       /*-- read the size of prod_desc data, alloc space and load it --*/
+
+       if((e = file_readbytes(fh,&new->object->data.filetype.prod_desc.size,
+                            sizeof(int),-1)) != NULL)
+         goto finish;
+
+       if((new->object->data.filetype.prod_desc.data =
+                   malloc(new->object->data.filetype.prod_desc.size)) == NULL)
+       {
+         e = &nomem;
+         goto finish;
+       }
+
+       if((e = file_readbytes(fh,new->object->data.filetype.prod_desc.data,
+             new->object->data.filetype.prod_desc.size,-1)) != NULL)
+         goto finish;
+
+       /*-- read the size of format data, alloc space and load it --*/
+
+       if((e = file_readbytes(fh,&new->object->data.filetype.format.size,
+                            sizeof(int),-1)) != NULL)
+         goto finish;
+
+       if((new->object->data.filetype.format.data =
+                   malloc(new->object->data.filetype.format.size)) == NULL)
+       {
+         e = &nomem;
+         goto finish;
+       }
+
+       if((e = file_readbytes(fh,new->object->data.filetype.format.data,
+             new->object->data.filetype.format.size,-1)) != NULL)
+         goto finish;
+
+     }
+     else
+     {
+       if((e = file_readbytes(fh,&new->object->data,new->object->size,-1)) != NULL)
+         goto finish;
+     }
+
+     /*-- add the new object to the object list --*/
+
+     if(objects == NULL)
+     {
+       objects = new;
+       start = objects;
+     }
+     else
+     {
+       objects->next = new;
+       objects = objects->next;
+     }
+
+     /*-- increment the number of objects read counter --*/
+
+     objects_read++;
+  }
+
+
+finish:
+
+  *objects_ptr = start;
+
+  return(e);
+}
+
+
+#ifndef DateUtils_TodaysDate
+#define DateUtils_TodaysDate 0x46c42
+#endif
+
+/*
+ * does the writing of an object for the reserved names CSV file
+ */
+
+static _kernel_oserror *do_write_reserve_object ( int fh, ObjectBlock *object )
+{
+DetailsInfo *dinfo = details_get_ptr();
+char date[25];
+_kernel_swi_regs r;
+_kernel_oserror *e;
+
+  /*-- build the date string --*/
+
+#if 0
+  r.r[1] = (int) date;
+  r.r[2] = 25;
+
+  if((e = _kernel_swi(DateUtils_TodaysDate,&r,&r)) != NULL)
+    goto finish;
+#else
+  /* JRF: We no longer use DateUtils */
+  {
+    time_t now;
+    struct tm *nowtm;
+    time(&now);
+    nowtm = gmtime(&now);
+    strftime(date, sizeof(date), "%d-%b-%Y", nowtm);
+  }
+#endif
+
+  /*-- build the CSV line --*/
+
+  sprintf(writeb,"%s,%s,%s,%s,%s,%s,%s,%s\n",
+       dinfo->name,dinfo->company,dinfo->dev_no,dinfo->phone,
+       dinfo->fax,object->data.reservation.text,
+       object->data.reservation.type,date);
+
+  /*-- write the line --*/
+
+  if((e = file_writebytes(fh,writeb,0,strlen(writeb),-1)) != NULL)
+    goto finish;
+
+
+finish:
+
+  return(e);
+}
+
+/*************************************************
+ * External functions                            *
+ *************************************************/
+
+/*
+ * Name     : datafile_write_reserve_csv
+ * Desc     : writes a CSV file for reserved names
+ * Parms    : char *filename
+ *            DataFileObjecList *objects - list of reserved objects (only!)
+ * Returns  : True or False on result
+ */
+
+extern BOOL datafile_write_reserve_csv ( char *filename, DataFileObjectList *objects )
+{
+_kernel_oserror *e = NULL;
+int fh = 0;
+
+  /*-- open the file --*/
+
+  if((e = file_open(filename,&fh,OPEN_NEW_READ_WRITE)) != NULL)
+    goto finish;
+
+  /*-- loop, writing the reserved objects as a CSV file --*/
+
+  while(objects != NULL)
+  {
+    /*-- write the object --*/
+
+    if((e = do_write_reserve_object(fh,objects->object)) != NULL)
+      goto finish;
+
+    /*-- move onto the next object --*/
+
+    objects = objects->next;
+  }
+
+finish:
+
+  if(fh != 0)
+  {
+    file_close(fh);
+    file_writecat18(filename,FileType_CommaSeparatedVariables);
+  }
+
+  if(e != NULL)
+  {
+    werr(0,"%s",e->errmess);
+    return(FALSE);
+  }
+
+  return(TRUE);
+}
+
+
+
+/*
+ * Name     : datafile_load_file
+ * Desc     : loads an allocate data file
+ * Parms    : char *filename
+ *            DataFileObjectList **objects - destination for linked list pointer
+ * Returns  : True or False on result
+ */
+
+extern BOOL datafile_load_file ( char *filename, DataFileObjectList **objects )
+{
+_kernel_oserror *e = NULL;
+int fh = 0;
+DataFileHdr hdr;
+DetailsInfo dinfo;
+
+  /*-- open the file --*/
+
+  if((e = file_open(filename,&fh,OPEN_EXIST_READ)) != NULL)
+    goto finish;
+
+  /*-- load and check the file header --*/
+
+  if((e = file_readbytes(fh,&hdr,sizeof(DataFileHdr),-1)) != NULL)
+    goto finish;
+
+  if(strncmp(hdr.name,DataFile_Name,8) != 0)
+  {
+    e = &badhdr;
+    goto finish;
+  }
+
+  if(hdr.version > DataFile_Version)
+  {
+    e = &badver;
+    goto finish;
+  }
+
+  /*-- load and set the developers details --*/
+
+  if((e = file_readbytes(fh,&dinfo,sizeof(DetailsInfo),-1)) != NULL)
+    goto finish;
+
+  details_set(&dinfo);
+
+  /*-- read the objects from the file --*/
+
+  if((e = do_read_objects(fh,objects,hdr.no_objects)) != NULL)
+    goto finish;
+
+
+finish:
+
+  if(fh != 0)
+    file_close(fh);
+
+  if(e != NULL)
+  {
+    werr(0,"%s",e->errmess);
+    return(FALSE);
+  }
+
+  return(TRUE);
+}
+
+
+
+
+/*
+ * Name     : datafile_write_file
+ * Desc     : writes an allocate data file
+ * Parms    : char *filename
+ *            DataFileObjectList *objects  - pointer to link list of objects
+ *            int no_objects               - number of objects in list
+ * Returns  : True or False on result
+ */
+
+extern BOOL datafile_write_file ( char *filename, DataFileObjectList *objects, int no_objects )
+{
+_kernel_oserror *e = NULL;
+int fh = 0;
+
+  /*-- open the file --*/
+
+  if((e = file_open(filename,&fh,OPEN_NEW_READ_WRITE)) != NULL)
+    goto finish;
+
+  /*-- write the file header --*/
+
+  if((e = do_write_file_hdr(fh,no_objects)) != NULL)
+    goto finish;
+
+  /*-- write the details information --*/
+
+  if((e = do_write_details(fh)) != NULL)
+    goto finish;
+
+  /*-- and write the objects --*/
+
+  if((e = do_write_objects(fh,objects)) != NULL)
+    goto finish;
+
+
+finish:
+
+  if(fh != 0)
+  {
+    file_close(fh);
+    file_writecat18(filename,FileType_Allocate);
+  }
+
+  if(e != NULL)
+  {
+    werr(0,"%s",e->errmess);
+    return(FALSE);
+  }
+
+  return(TRUE);
+}
+
+
+
+/*-- end --*/
+
+

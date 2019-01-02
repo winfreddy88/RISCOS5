@@ -1,0 +1,957 @@
+/* Copyright 2006 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/**************************************************************/
+/* File:    Scale.c                                           */
+/*          (C) 2000 Pace Micro Technology PLC                */
+/*          All rights reserved                               */
+/*                                                            */
+/* Purpose: Handling scaled unit conversions. 64-bit integer  */
+/*          internal precision, 32-bit integers externally.   */
+/*                                                            */
+/* Author:  A.D.Hodgkinson.                                   */
+/*                                                            */
+/* History: 12-Feb-2006 (ADH): Created.                       */
+/**************************************************************/
+
+#include <stdint.h>
+#include <tboxlibs/wimp.h>
+
+#include "Scale.h"
+
+#include "Global.h"
+
+/* Fixed scaling factors */
+
+#define user_to_os_div              40000
+#define user_to_web_div             80000
+#define user_to_millipoint_div      100
+#define user_to_pdf_div             100
+#define user_to_draw_div            2500
+
+#define user_to_os_div_half         20000
+#define user_to_web_div_half        40000
+#define user_to_millipoint_div_half 50
+#define user_to_pdf_div_half        50
+#define user_to_draw_div_half       1250
+
+/**************************************************************/
+/* scale_calculate_scale_factors()                            */
+/*                                                            */
+/* Update the unit conversion multipliers and dividers in a   */
+/* given browser_data structure based on the value of its     */
+/* "scale" field, expected to be a percentage scale factor.   */
+/*                                                            */
+/* Parameters: Pointer to browser_data structure to update.   */
+/*             Its unit conversion multipliers and dividers   */
+/*             will be updated based on the value of its      */
+/*             "scale" field on entry. The "scale" field may  */
+/*             itself be updated to pull it into a bounded    */
+/*             range (see "Limits" section in Scale.h).       */
+/*                                                            */
+/* Assumes:    All pointers are non-NULL and valid.           */
+/**************************************************************/
+
+void scale_calculate_scale_factors(browser_data * restrict b)
+{
+  /* Sanity check. 0 implies scale is accidentally not initialised, less */
+  /* than 5% is unlikely to be of any use at all, more than 1000% starts */
+  /* to become wildly inaccurate given typical internal resolution and   */
+  /* severely reduces addressable signed coordinate range for millipoint */
+  /* devices (2^31 millipoints at 10x scaling gives the unscaled         */
+  /* equivalent of about 215 million millipoints each way, or about 537  */
+  /* thousand OS units, or about 224 pages vertically at 1600x1200 EY1). */
+
+  if      (b->scale == 0)         b->scale = SCALE_DEFAULT;
+  else if (b->scale <  SCALE_MIN) b->scale = SCALE_MIN;
+  else if (b->scale >  SCALE_MAX) b->scale = SCALE_MAX;
+
+  /* At 100% scaling, the scale factors are as follows:                  */
+  /*                                                                     */
+  /*   400 user-points per OS unit                                       */
+  /*   800 user-points per web pixel (1 web pixel = 2 OS units at 100%)  */
+  /*   1 user-point per millipoint                                       */
+  /*   1 user-point per PDF user space unit                              */
+  /*   25/16 user-points per Draw unit (256 Draw units per OS unit)      */
+  /*                                                                     */
+  /* To get from user-point to something else, therefore multiply by     */
+  /* 1, 1, 1 or 16 and divide by 400, 800, 1, 1 or 25.                   */
+  /*                                                                     */
+  /* Want to multiply the base scale factors by b->scale and divide by   */
+  /* 100. 64-bit internal maths avoids overflow. That way, at say 200%   */
+  /* scaling, 1 user-point equals two times as many of any other unit as */
+  /* at 100% (*200/100 = *2 vs *100/100 = *1) scaling, so items of 'n'   */
+  /* user-points length are twice the width in any other unit. At 50%    */
+  /* scaling, 1 user-point equals half as many (*50/100 = *1/2) of other */
+  /* units; and so-on.                                                   */
+
+  b->user_to_os_mul              = b->scale;
+  b->user_to_web_mul             = b->scale;
+  b->user_to_millipoint_mul      = b->scale;
+  b->user_to_pdf_mul             = b->scale;
+  b->user_to_draw_mul            = 16 * b->scale;
+
+  b->user_to_os_mul_half         = b->user_to_os_mul         / 2;
+  b->user_to_web_mul_half        = b->user_to_web_mul        / 2;
+  b->user_to_millipoint_mul_half = b->user_to_millipoint_mul / 2;
+  b->user_to_pdf_mul_half        = b->user_to_pdf_mul        / 2;
+  b->user_to_draw_mul_half       = b->user_to_draw_mul       / 2;
+}
+
+/**************************************************************/
+/* scale_user_to_os()                                         */
+/*                                                            */
+/* Convert a value in user-points to OS units.                */
+/*                                                            */
+/* Parameters: Pointer to browser_data struct containing      */
+/*             up to date scale factors;                      */
+/*                                                            */
+/*             Value in user-points to be converted.          */
+/*                                                            */
+/* Returns:    Converted scaled value in OS units.            */
+/*                                                            */
+/* Assumes:    All pointers are non-NULL and valid.           */
+/**************************************************************/
+
+int scale_user_to_os(const browser_data * restrict b, const int value)
+{
+  return (int) (((int64_t) value * b->user_to_os_mul + user_to_os_div_half) / user_to_os_div);
+}
+
+/**************************************************************/
+/* scale_user_to_web()                                        */
+/*                                                            */
+/* Convert a value in user-points to Web pixels.              */
+/*                                                            */
+/* Parameters: Pointer to browser_data struct containing      */
+/*             up to date scale factors;                      */
+/*                                                            */
+/*             Value in user-points to be converted.          */
+/*                                                            */
+/* Returns:    Converted scaled value in Web pixels.          */
+/*                                                            */
+/* Assumes:    All pointers are non-NULL and valid.           */
+/**************************************************************/
+
+int scale_user_to_web(const browser_data * restrict b, const int value)
+{
+  return (int) (((int64_t) value * b->user_to_web_mul + user_to_web_div_half) / user_to_web_div);
+}
+
+/**************************************************************/
+/* scale_user_to_millipoints()                                */
+/*                                                            */
+/* Convert a value in user-points to millipoints.             */
+/*                                                            */
+/* Parameters: Pointer to browser_data struct containing      */
+/*             up to date scale factors;                      */
+/*                                                            */
+/*             Value in user-points to be converted.          */
+/*                                                            */
+/* Returns:    Converted scaled value in millipoints.         */
+/*                                                            */
+/* Assumes:    All pointers are non-NULL and valid.           */
+/**************************************************************/
+
+int scale_user_to_millipoints(const browser_data * restrict b, const int value)
+{
+  return (int) (((int64_t) value * b->user_to_millipoint_mul + user_to_millipoint_div_half) / user_to_millipoint_div);
+}
+
+/**************************************************************/
+/* scale_user_to_pdf()                                        */
+/*                                                            */
+/* Convert a value in user-points to PDF user space units.    */
+/*                                                            */
+/* Parameters: Pointer to browser_data struct containing      */
+/*             up to date scale factors;                      */
+/*                                                            */
+/*             Value in user-points to be converted.          */
+/*                                                            */
+/* Returns:    Converted scaled value in PDF user space       */
+/*             units.                                         */
+/*                                                            */
+/* Assumes:    All pointers are non-NULL and valid.           */
+/**************************************************************/
+
+int scale_user_to_pdf(const browser_data * restrict b, const int value)
+{
+  return (int) (((int64_t) value * b->user_to_pdf_mul + user_to_pdf_div_half) / user_to_pdf_div);
+}
+
+/**************************************************************/
+/* scale_user_to_draw()                                       */
+/*                                                            */
+/* Convert a value in user-points to Draw units.              */
+/*                                                            */
+/* Parameters: Pointer to browser_data struct containing      */
+/*             up to date scale factors;                      */
+/*                                                            */
+/*             Value in user-points to be converted.          */
+/*                                                            */
+/* Returns:    Converted scaled value in Draw units.          */
+/*                                                            */
+/* Assumes:    All pointers are non-NULL and valid.           */
+/**************************************************************/
+
+int scale_user_to_draw(const browser_data * restrict b, const int value)
+{
+  return (int) (((int64_t) value * b->user_to_draw_mul + user_to_draw_div_half) / user_to_draw_div);
+}
+
+/**************************************************************/
+/* scale_os_to_user()                                         */
+/*                                                            */
+/* Convert a value in OS units to user-points.                */
+/*                                                            */
+/* Parameters: Pointer to browser_data struct containing      */
+/*             up to date scale factors;                      */
+/*                                                            */
+/*             Value in OS units to be converted.             */
+/*                                                            */
+/* Returns:    Converted scaled value in user-points.         */
+/*                                                            */
+/* Assumes:    All pointers are non-NULL and valid.           */
+/**************************************************************/
+
+int scale_os_to_user(const browser_data * restrict b, const int value)
+{
+  return (int) (((int64_t) value * user_to_os_div + b->user_to_os_mul_half) / b->user_to_os_mul);
+}
+
+/**************************************************************/
+/* scale_web_to_user()                                        */
+/*                                                            */
+/* Convert a value in Web pixels to user-points.              */
+/*                                                            */
+/* Parameters: Pointer to browser_data struct containing      */
+/*             up to date scale factors;                      */
+/*                                                            */
+/*             Value in Web pixels to be converted.           */
+/*                                                            */
+/* Returns:    Converted scaled value in user-points.         */
+/*                                                            */
+/* Assumes:    All pointers are non-NULL and valid.           */
+/**************************************************************/
+
+int scale_web_to_user(const browser_data * restrict b, const int value)
+{
+  return (int) (((int64_t) value * user_to_web_div + b->user_to_web_mul_half) / b->user_to_web_mul);
+}
+
+/**************************************************************/
+/* scale_millipoints_to_user()                                */
+/*                                                            */
+/* Convert a value in millipoints to user-points.             */
+/*                                                            */
+/* Parameters: Pointer to browser_data struct containing      */
+/*             up to date scale factors;                      */
+/*                                                            */
+/*             Value in millipoints to be converted.          */
+/*                                                            */
+/* Returns:    Converted scaled value in user-points.         */
+/*                                                            */
+/* Assumes:    All pointers are non-NULL and valid.           */
+/**************************************************************/
+
+int scale_millipoints_to_user(const browser_data * restrict b, const int value)
+{
+  return (int) (((int64_t) value * user_to_millipoint_div + b->user_to_millipoint_mul_half) / b->user_to_millipoint_mul);
+}
+
+/**************************************************************/
+/* scale_pdf_to_user()                                        */
+/*                                                            */
+/* Convert a value in PDF user space units to user-points.    */
+/*                                                            */
+/* Parameters: Pointer to browser_data struct containing      */
+/*             up to date scale factors;                      */
+/*                                                            */
+/*             Value in PDF user space units to be converted. */
+/*                                                            */
+/* Returns:    Converted scaled value in user-points.         */
+/*                                                            */
+/* Assumes:    All pointers are non-NULL and valid.           */
+/**************************************************************/
+
+int scale_pdf_to_user(const browser_data * restrict b, const int value)
+{
+  return (int) (((int64_t) value * user_to_pdf_div + b->user_to_pdf_mul_half) / b->user_to_pdf_mul);
+}
+
+/**************************************************************/
+/* scale_draw_to_user()                                       */
+/*                                                            */
+/* Convert a value in Draw units to user-points.              */
+/*                                                            */
+/* Parameters: Pointer to browser_data struct containing      */
+/*             up to date scale factors;                      */
+/*                                                            */
+/*             Value in Draw units to be converted.           */
+/*                                                            */
+/* Returns:    Converted scaled value in user-points.         */
+/*                                                            */
+/* Assumes:    All pointers are non-NULL and valid.           */
+/**************************************************************/
+
+int scale_draw_to_user(const browser_data * restrict b, const int value)
+{
+  return (int) (((int64_t) value * user_to_draw_div + b->user_to_draw_mul_half) / b->user_to_draw_mul);
+}
+
+/**************************************************************/
+/* scale_pair_user_to_os()                                    */
+/*                                                            */
+/* Convert a pair of values in user-points to OS units.       */
+/*                                                            */
+/* Parameters: Pointer to browser_data struct containing      */
+/*             up to date scale factors;                      */
+/*                                                            */
+/*             First value in user-points to be converted;    */
+/*                                                            */
+/*             Second value in user-points to be converted;   */
+/*                                                            */
+/*             Pointer to an integer, updated on exit with    */
+/*             first converted scaled value in OS units;      */
+/*                                                            */
+/*             Pointer to an integer, updated on exit with    */
+/*             second converted scaled value in OS units.     */
+/*                                                            */
+/* Assumes:    All pointers are non-NULL and valid.           */
+/**************************************************************/
+
+void scale_pair_user_to_os
+     (
+       const browser_data * restrict b,
+       const int                     x,
+       const int                     y,
+       int                * restrict r_x,
+       int                * restrict r_y
+     )
+{
+  *r_x = (int) (((int64_t) x * b->user_to_os_mul + user_to_os_div_half) / user_to_os_div);
+  *r_y = (int) (((int64_t) y * b->user_to_os_mul + user_to_os_div_half) / user_to_os_div);
+}
+
+/**************************************************************/
+/* scale_pair_user_to_web()                                   */
+/*                                                            */
+/* Convert a pair of values in user-points to Web pixels.     */
+/*                                                            */
+/* Parameters: Pointer to browser_data struct containing      */
+/*             up to date scale factors;                      */
+/*                                                            */
+/*             First value in user-points to be converted;    */
+/*                                                            */
+/*             Second value in user-points to be converted;   */
+/*                                                            */
+/*             Pointer to an integer, updated on exit with    */
+/*             first converted scaled value in Web pixels;    */
+/*                                                            */
+/*             Pointer to an integer, updated on exit with    */
+/*             second converted scaled value in Web pixels.   */
+/*                                                            */
+/* Assumes:    All pointers are non-NULL and valid.           */
+/**************************************************************/
+
+void scale_pair_user_to_web
+     (
+       const browser_data * restrict b,
+       const int                     x,
+       const int                     y,
+       int                * restrict r_x,
+       int                * restrict r_y
+     )
+{
+  *r_x = (int) (((int64_t) x * b->user_to_web_mul + user_to_web_div_half) / user_to_web_div);
+  *r_y = (int) (((int64_t) y * b->user_to_web_mul + user_to_web_div_half) / user_to_web_div);
+}
+
+/**************************************************************/
+/* scale_pair_user_to_millipoints()                           */
+/*                                                            */
+/* Convert a pair of values in user-points to millipoints.    */
+/*                                                            */
+/* Parameters: Pointer to browser_data struct containing      */
+/*             up to date scale factors;                      */
+/*                                                            */
+/*             First value in user-points to be converted;    */
+/*                                                            */
+/*             Second value in user-points to be converted;   */
+/*                                                            */
+/*             Pointer to an integer, updated on exit with    */
+/*             first converted scaled value in millipoints;   */
+/*                                                            */
+/*             Pointer to an integer, updated on exit with    */
+/*             second converted scaled value in millipoints.  */
+/*                                                            */
+/* Assumes:    All pointers are non-NULL and valid.           */
+/**************************************************************/
+
+void scale_pair_user_to_millipoints
+     (
+       const browser_data * restrict b,
+       const int                     x,
+       const int                     y,
+       int                * restrict r_x,
+       int                * restrict r_y
+     )
+{
+  *r_x = (int) (((int64_t) x * b->user_to_millipoint_mul + user_to_millipoint_div_half) / user_to_millipoint_div);
+  *r_y = (int) (((int64_t) y * b->user_to_millipoint_mul + user_to_millipoint_div_half) / user_to_millipoint_div);
+}
+
+/**************************************************************/
+/* scale_pair_user_to_pdf()                                   */
+/*                                                            */
+/* Convert a pair of values in user-points to PDF user space  */
+/* units.                                                     */
+/*                                                            */
+/* Parameters: Pointer to browser_data struct containing      */
+/*             up to date scale factors;                      */
+/*                                                            */
+/*             First value in user-points to be converted;    */
+/*                                                            */
+/*             Second value in user-points to be converted;   */
+/*                                                            */
+/*             Pointer to an integer, updated on exit with    */
+/*             first converted scaled value in PDF user space */
+/*             units;                                         */
+/*                                                            */
+/*             Pointer to an integer, updated on exit with    */
+/*             second converted scaled value in PDF user      */
+/*             space units.                                   */
+/*                                                            */
+/* Assumes:    All pointers are non-NULL and valid.           */
+/**************************************************************/
+
+void scale_pair_user_to_pdf
+     (
+       const browser_data * restrict b,
+       const int                     x,
+       const int                     y,
+       int                * restrict r_x,
+       int                * restrict r_y
+     )
+{
+  *r_x = (int) (((int64_t) x * b->user_to_pdf_mul + user_to_pdf_div_half) / user_to_pdf_div);
+  *r_y = (int) (((int64_t) y * b->user_to_pdf_mul + user_to_pdf_div_half) / user_to_pdf_div);
+}
+
+/**************************************************************/
+/* scale_pair_user_to_draw()                                  */
+/*                                                            */
+/* Convert a pair of values in user-points to Draw units.     */
+/*                                                            */
+/* Parameters: Pointer to browser_data struct containing      */
+/*             up to date scale factors;                      */
+/*                                                            */
+/*             First value in user-points to be converted;    */
+/*                                                            */
+/*             Second value in user-points to be converted;   */
+/*                                                            */
+/*             Pointer to an integer, updated on exit with    */
+/*             first converted scaled value in Draw units;    */
+/*                                                            */
+/*             Pointer to an integer, updated on exit with    */
+/*             second converted scaled value in Draw units.   */
+/*                                                            */
+/* Assumes:    All pointers are non-NULL and valid.           */
+/**************************************************************/
+
+void scale_pair_user_to_draw
+     (
+       const browser_data * restrict b,
+       const int                     x,
+       const int                     y,
+       int                * restrict r_x,
+       int                * restrict r_y
+     )
+{
+  *r_x = (int) (((int64_t) x * b->user_to_draw_mul + user_to_draw_div_half) / user_to_draw_div);
+  *r_y = (int) (((int64_t) y * b->user_to_draw_mul + user_to_draw_div_half) / user_to_draw_div);
+}
+
+/**************************************************************/
+/* scale_pair_os_to_user()                                    */
+/*                                                            */
+/* Convert a pair of values in OS units to user-points.       */
+/*                                                            */
+/* Parameters: Pointer to browser_data struct containing      */
+/*             up to date scale factors;                      */
+/*                                                            */
+/*             First value in OS units to be converted;       */
+/*                                                            */
+/*             Second value in OS units to be converted;      */
+/*                                                            */
+/*             Pointer to an integer, updated on exit with    */
+/*             first converted scaled value in user-points;   */
+/*                                                            */
+/*             Pointer to an integer, updated on exit with    */
+/*             second converted scaled value in user-points.  */
+/*                                                            */
+/* Assumes:    All pointers are non-NULL and valid.           */
+/**************************************************************/
+
+void scale_pair_os_to_user
+     (
+       const browser_data * restrict b,
+       const int                     x,
+       const int                     y,
+       int                * restrict r_x,
+       int                * restrict r_y
+     )
+{
+  *r_x = (int) (((int64_t) x * user_to_os_div + b->user_to_os_mul_half) / b->user_to_os_mul);
+  *r_y = (int) (((int64_t) y * user_to_os_div + b->user_to_os_mul_half) / b->user_to_os_mul);
+}
+
+/**************************************************************/
+/* scale_pair_web_to_user()                                   */
+/*                                                            */
+/* Convert a pair of values in Web pixels to user-points.     */
+/*                                                            */
+/* Parameters: Pointer to browser_data struct containing      */
+/*             up to date scale factors;                      */
+/*                                                            */
+/*             First value in Web pixels to be converted;     */
+/*                                                            */
+/*             Second value in Web pixels to be converted;    */
+/*                                                            */
+/*             Pointer to an integer, updated on exit with    */
+/*             first converted scaled value in user-points;   */
+/*                                                            */
+/*             Pointer to an integer, updated on exit with    */
+/*             second converted scaled value in user-points.  */
+/*                                                            */
+/* Assumes:    All pointers are non-NULL and valid.           */
+/**************************************************************/
+
+void scale_pair_web_to_user
+     (
+       const browser_data * restrict b,
+       const int                     x,
+       const int                     y,
+       int                * restrict r_x,
+       int                * restrict r_y
+     )
+{
+  *r_x = (int) (((int64_t) x * user_to_web_div + b->user_to_web_mul_half) / b->user_to_web_mul);
+  *r_y = (int) (((int64_t) y * user_to_web_div + b->user_to_web_mul_half) / b->user_to_web_mul);
+}
+
+/**************************************************************/
+/* scale_pair_millipoints_to_user()                           */
+/*                                                            */
+/* Convert a pair of values in millipoints to user-points.    */
+/*                                                            */
+/* Parameters: Pointer to browser_data struct containing      */
+/*             up to date scale factors;                      */
+/*                                                            */
+/*             First value in millipoints to be converted;    */
+/*                                                            */
+/*             Second value in millipoints to be converted;   */
+/*                                                            */
+/*             Pointer to an integer, updated on exit with    */
+/*             first converted scaled value in user-points;   */
+/*                                                            */
+/*             Pointer to an integer, updated on exit with    */
+/*             second converted scaled value in user-points.  */
+/*                                                            */
+/* Assumes:    All pointers are non-NULL and valid.           */
+/**************************************************************/
+
+void scale_pair_millipoints_to_user
+     (
+       const browser_data * restrict b,
+       const int                     x,
+       const int                     y,
+       int                * restrict r_x,
+       int                * restrict r_y
+     )
+{
+  *r_x = (int) (((int64_t) x * user_to_millipoint_div + b->user_to_millipoint_mul_half) / b->user_to_millipoint_mul);
+  *r_y = (int) (((int64_t) y * user_to_millipoint_div + b->user_to_millipoint_mul_half) / b->user_to_millipoint_mul);
+}
+
+/**************************************************************/
+/* scale_pair_pdf_to_user()                                   */
+/*                                                            */
+/* Convert a pair of values in PDF user space units to        */
+/* user-points.                                               */
+/*                                                            */
+/* Parameters: Pointer to browser_data struct containing      */
+/*             up to date scale factors;                      */
+/*                                                            */
+/*             First value in PDF user space units to be      */
+/*             converted;                                     */
+/*                                                            */
+/*             Second value in PDF user space units to be     */
+/*             converted;                                     */
+/*                                                            */
+/*             Pointer to an integer, updated on exit with    */
+/*             first converted scaled value in user-points;   */
+/*                                                            */
+/*             Pointer to an integer, updated on exit with    */
+/*             second converted scaled value in user-points.  */
+/*                                                            */
+/* Assumes:    All pointers are non-NULL and valid.           */
+/**************************************************************/
+
+void scale_pair_pdf_to_user
+     (
+       const browser_data * restrict b,
+       const int                     x,
+       const int                     y,
+       int                * restrict r_x,
+       int                * restrict r_y
+     )
+{
+  *r_x = (int) (((int64_t) x * user_to_pdf_div + b->user_to_pdf_mul_half) / b->user_to_pdf_mul);
+  *r_y = (int) (((int64_t) y * user_to_pdf_div + b->user_to_pdf_mul_half) / b->user_to_pdf_mul);
+}
+
+/**************************************************************/
+/* scale_pair_draw_to_user()                                  */
+/*                                                            */
+/* Convert a pair of values in Draw units to user-points.     */
+/*                                                            */
+/* Parameters: Pointer to browser_data struct containing      */
+/*             up to date scale factors;                      */
+/*                                                            */
+/*             First value in Draw units to be converted;     */
+/*                                                            */
+/*             Second value in Draw units to be converted;    */
+/*                                                            */
+/*             Pointer to an integer, updated on exit with    */
+/*             first converted scaled value in user-points;   */
+/*                                                            */
+/*             Pointer to an integer, updated on exit with    */
+/*             second converted scaled value in user-points.  */
+/*                                                            */
+/* Assumes:    All pointers are non-NULL and valid.           */
+/**************************************************************/
+
+void scale_pair_draw_to_user
+     (
+       const browser_data * restrict b,
+       const int                     x,
+       const int                     y,
+       int                * restrict r_x,
+       int                * restrict r_y
+     )
+{
+  *r_x = (int) (((int64_t) x * user_to_draw_div + b->user_to_draw_mul_half) / b->user_to_draw_mul);
+  *r_y = (int) (((int64_t) y * user_to_draw_div + b->user_to_draw_mul_half) / b->user_to_draw_mul);
+}
+
+/**************************************************************/
+/* scale_box_user_to_os()                                     */
+/*                                                            */
+/* Convert a bounding box in user-points to OS units.         */
+/*                                                            */
+/* Parameters: Pointer to browser_data struct containing      */
+/*             up to date scale factors;                      */
+/*                                                            */
+/*             Pointer to BBox in user-points to be           */
+/*             converted;                                     */
+/*                                                            */
+/*             Pointer to a BBox, updated on exit with        */
+/*             converted scaled values in OS units.           */
+/*                                                            */
+/* Assumes:    All pointers are non-NULL and valid.           */
+/**************************************************************/
+
+void scale_box_user_to_os
+     (
+       const browser_data * restrict b,
+       const BBox         * restrict box,
+       BBox               * restrict r_box
+     )
+{
+  r_box->xmin = (int) (((int64_t) box->xmin * b->user_to_os_mul + user_to_os_div_half) / user_to_os_div);
+  r_box->ymin = (int) (((int64_t) box->ymin * b->user_to_os_mul + user_to_os_div_half) / user_to_os_div);
+  r_box->xmax = (int) (((int64_t) box->xmax * b->user_to_os_mul + user_to_os_div_half) / user_to_os_div);
+  r_box->ymax = (int) (((int64_t) box->ymax * b->user_to_os_mul + user_to_os_div_half) / user_to_os_div);
+}
+
+/**************************************************************/
+/* scale_box_user_to_web()                                    */
+/*                                                            */
+/* Convert a bounding box in user-points to Web pixels.       */
+/*                                                            */
+/* Parameters: Pointer to browser_data struct containing      */
+/*             up to date scale factors;                      */
+/*                                                            */
+/*             Pointer to BBox in user-points to be           */
+/*             converted;                                     */
+/*                                                            */
+/*             Pointer to a BBox, updated on exit with        */
+/*             converted scaled values in Web pixels.         */
+/*                                                            */
+/* Assumes:    All pointers are non-NULL and valid.           */
+/**************************************************************/
+
+void scale_box_user_to_web
+     (
+       const browser_data * restrict b,
+       const BBox         * restrict box,
+       BBox               * restrict r_box
+     )
+{
+  r_box->xmin = (int) (((int64_t) box->xmin * b->user_to_web_mul + user_to_web_div_half) / user_to_web_div);
+  r_box->ymin = (int) (((int64_t) box->ymin * b->user_to_web_mul + user_to_web_div_half) / user_to_web_div);
+  r_box->xmax = (int) (((int64_t) box->xmax * b->user_to_web_mul + user_to_web_div_half) / user_to_web_div);
+  r_box->ymax = (int) (((int64_t) box->ymax * b->user_to_web_mul + user_to_web_div_half) / user_to_web_div);
+}
+
+/**************************************************************/
+/* scale_box_user_to_millipoints()                            */
+/*                                                            */
+/* Convert a bounding box in user-points to millipoints.      */
+/*                                                            */
+/* Parameters: Pointer to browser_data struct containing      */
+/*             up to date scale factors;                      */
+/*                                                            */
+/*             Pointer to BBox in user-points to be           */
+/*             converted;                                     */
+/*                                                            */
+/*             Pointer to a BBox, updated on exit with        */
+/*             converted scaled values in millipoints.        */
+/*                                                            */
+/* Assumes:    All pointers are non-NULL and valid.           */
+/**************************************************************/
+
+void scale_box_user_to_millipoints
+     (
+       const browser_data * restrict b,
+       const BBox         * restrict box,
+       BBox               * restrict r_box
+     )
+{
+  r_box->xmin = (int) (((int64_t) box->xmin * b->user_to_millipoint_mul + user_to_millipoint_div_half) / user_to_millipoint_div);
+  r_box->ymin = (int) (((int64_t) box->ymin * b->user_to_millipoint_mul + user_to_millipoint_div_half) / user_to_millipoint_div);
+  r_box->xmax = (int) (((int64_t) box->xmax * b->user_to_millipoint_mul + user_to_millipoint_div_half) / user_to_millipoint_div);
+  r_box->ymax = (int) (((int64_t) box->ymax * b->user_to_millipoint_mul + user_to_millipoint_div_half) / user_to_millipoint_div);
+}
+
+/**************************************************************/
+/* scale_box_user_to_pdf()                                    */
+/*                                                            */
+/* Convert a bounding box in user-points to PDF user space    */
+/* units.                                                     */
+/*                                                            */
+/* Parameters: Pointer to browser_data struct containing      */
+/*             up to date scale factors;                      */
+/*                                                            */
+/*             Pointer to BBox in user-points to be           */
+/*             converted;                                     */
+/*                                                            */
+/*             Pointer to a BBox, updated on exit with        */
+/*             converted scaled values in PDF user space      */
+/*             units.                                         */
+/*                                                            */
+/* Assumes:    All pointers are non-NULL and valid.           */
+/**************************************************************/
+
+void scale_box_user_to_pdf
+     (
+       const browser_data * restrict b,
+       const BBox         * restrict box,
+       BBox               * restrict r_box
+     )
+{
+  r_box->xmin = (int) (((int64_t) box->xmin * b->user_to_pdf_mul + user_to_pdf_div_half) / user_to_pdf_div);
+  r_box->ymin = (int) (((int64_t) box->ymin * b->user_to_pdf_mul + user_to_pdf_div_half) / user_to_pdf_div);
+  r_box->xmax = (int) (((int64_t) box->xmax * b->user_to_pdf_mul + user_to_pdf_div_half) / user_to_pdf_div);
+  r_box->ymax = (int) (((int64_t) box->ymax * b->user_to_pdf_mul + user_to_pdf_div_half) / user_to_pdf_div);
+}
+
+/**************************************************************/
+/* scale_box_user_to_draw()                                   */
+/*                                                            */
+/* Convert a bounding box in user-points to Draw units.       */
+/*                                                            */
+/* Parameters: Pointer to browser_data struct containing      */
+/*             up to date scale factors;                      */
+/*                                                            */
+/*             Pointer to BBox in user-points to be           */
+/*             converted;                                     */
+/*                                                            */
+/*             Pointer to a BBox, updated on exit with        */
+/*             converted scaled values in Draw units.         */
+/*                                                            */
+/* Assumes:    All pointers are non-NULL and valid.           */
+/**************************************************************/
+
+void scale_box_user_to_draw
+     (
+       const browser_data * restrict b,
+       const BBox         * restrict box,
+       BBox               * restrict r_box
+     )
+{
+  r_box->xmin = (int) (((int64_t) box->xmin * b->user_to_draw_mul + user_to_draw_div_half) / user_to_draw_div);
+  r_box->ymin = (int) (((int64_t) box->ymin * b->user_to_draw_mul + user_to_draw_div_half) / user_to_draw_div);
+  r_box->xmax = (int) (((int64_t) box->xmax * b->user_to_draw_mul + user_to_draw_div_half) / user_to_draw_div);
+  r_box->ymax = (int) (((int64_t) box->ymax * b->user_to_draw_mul + user_to_draw_div_half) / user_to_draw_div);
+}
+
+/**************************************************************/
+/* scale_box_os_to_user()                                     */
+/*                                                            */
+/* Convert a bounding box in OS units to user-points.         */
+/*                                                            */
+/* Parameters: Pointer to browser_data struct containing      */
+/*             up to date scale factors;                      */
+/*                                                            */
+/*             Pointer to BBox in OS units to be converted;   */
+/*                                                            */
+/*             Pointer to a BBox, updated on exit with        */
+/*             converted scaled values in user-points.        */
+/*                                                            */
+/* Assumes:    All pointers are non-NULL and valid.           */
+/**************************************************************/
+
+void scale_box_os_to_user
+     (
+       const browser_data * restrict b,
+       const BBox         * restrict box,
+       BBox               * restrict r_box
+     )
+{
+  r_box->xmin = (int) (((int64_t) box->xmin * user_to_os_div + b->user_to_os_mul_half) / b->user_to_os_mul);
+  r_box->ymin = (int) (((int64_t) box->ymin * user_to_os_div + b->user_to_os_mul_half) / b->user_to_os_mul);
+  r_box->xmax = (int) (((int64_t) box->xmax * user_to_os_div + b->user_to_os_mul_half) / b->user_to_os_mul);
+  r_box->ymax = (int) (((int64_t) box->ymax * user_to_os_div + b->user_to_os_mul_half) / b->user_to_os_mul);
+}
+
+/**************************************************************/
+/* scale_box_web_to_user()                                    */
+/*                                                            */
+/* Convert a bounding box in Web pixels to user-points.       */
+/*                                                            */
+/* Parameters: Pointer to browser_data struct containing      */
+/*             up to date scale factors;                      */
+/*                                                            */
+/*             Pointer to BBox in Web pixels to be converted; */
+/*                                                            */
+/*             Pointer to a BBox, updated on exit with        */
+/*             converted scaled values in user-points.        */
+/*                                                            */
+/* Assumes:    All pointers are non-NULL and valid.           */
+/**************************************************************/
+
+void scale_box_web_to_user
+     (
+       const browser_data * restrict b,
+       const BBox         * restrict box,
+       BBox               * restrict r_box
+     )
+{
+  r_box->xmin = (int) (((int64_t) box->xmin * user_to_web_div + b->user_to_web_mul_half) / b->user_to_web_mul);
+  r_box->ymin = (int) (((int64_t) box->ymin * user_to_web_div + b->user_to_web_mul_half) / b->user_to_web_mul);
+  r_box->xmax = (int) (((int64_t) box->xmax * user_to_web_div + b->user_to_web_mul_half) / b->user_to_web_mul);
+  r_box->ymax = (int) (((int64_t) box->ymax * user_to_web_div + b->user_to_web_mul_half) / b->user_to_web_mul);
+}
+
+/**************************************************************/
+/* scale_box_millipoints_to_user()                            */
+/*                                                            */
+/* Convert a bounding box in millipoints to user-points.      */
+/*                                                            */
+/* Parameters: Pointer to browser_data struct containing      */
+/*             up to date scale factors;                      */
+/*                                                            */
+/*             Pointer to BBox in millipoints to be           */
+/*             converted;                                     */
+/*                                                            */
+/*             Pointer to a BBox, updated on exit with        */
+/*             converted scaled values in user-points.        */
+/*                                                            */
+/* Assumes:    All pointers are non-NULL and valid.           */
+/**************************************************************/
+
+void scale_box_millipoints_to_user
+     (
+       const browser_data * restrict b,
+       const BBox         * restrict box,
+       BBox               * restrict r_box
+     )
+{
+  r_box->xmin = (int) (((int64_t) box->xmin * user_to_millipoint_div + b->user_to_millipoint_mul_half) / b->user_to_millipoint_mul);
+  r_box->ymin = (int) (((int64_t) box->ymin * user_to_millipoint_div + b->user_to_millipoint_mul_half) / b->user_to_millipoint_mul);
+  r_box->xmax = (int) (((int64_t) box->xmax * user_to_millipoint_div + b->user_to_millipoint_mul_half) / b->user_to_millipoint_mul);
+  r_box->ymax = (int) (((int64_t) box->ymax * user_to_millipoint_div + b->user_to_millipoint_mul_half) / b->user_to_millipoint_mul);
+}
+
+/**************************************************************/
+/* scale_box_pdf_to_user()                                    */
+/*                                                            */
+/* Convert a bounding box in PDF user space units to          */
+/* user-points.                                               */
+/*                                                            */
+/* Parameters: Pointer to browser_data struct containing      */
+/*             up to date scale factors;                      */
+/*                                                            */
+/*             Pointer to BBox in PDF user space units to be  */
+/*             converted;                                     */
+/*                                                            */
+/*             Pointer to a BBox, updated on exit with        */
+/*             converted scaled values in user-points.        */
+/*                                                            */
+/* Assumes:    All pointers are non-NULL and valid.           */
+/**************************************************************/
+
+void scale_box_pdf_to_user
+     (
+       const browser_data * restrict b,
+       const BBox         * restrict box,
+       BBox               * restrict r_box
+     )
+{
+  r_box->xmin = (int) (((int64_t) box->xmin * user_to_pdf_div + b->user_to_pdf_mul_half) / b->user_to_pdf_mul);
+  r_box->ymin = (int) (((int64_t) box->ymin * user_to_pdf_div + b->user_to_pdf_mul_half) / b->user_to_pdf_mul);
+  r_box->xmax = (int) (((int64_t) box->xmax * user_to_pdf_div + b->user_to_pdf_mul_half) / b->user_to_pdf_mul);
+  r_box->ymax = (int) (((int64_t) box->ymax * user_to_pdf_div + b->user_to_pdf_mul_half) / b->user_to_pdf_mul);
+}
+
+/**************************************************************/
+/* scale_box_draw_to_user()                                   */
+/*                                                            */
+/* Convert a bounding box in Draw units to user-points.       */
+/*                                                            */
+/* Parameters: Pointer to browser_data struct containing      */
+/*             up to date scale factors;                      */
+/*                                                            */
+/*             Pointer to BBox in Draw units to be converted; */
+/*                                                            */
+/*             Pointer to a BBox, updated on exit with        */
+/*             converted scaled values in user-points.        */
+/*                                                            */
+/* Assumes:    All pointers are non-NULL and valid.           */
+/**************************************************************/
+
+void scale_box_draw_to_user
+     (
+       const browser_data * restrict b,
+       const BBox         * restrict box,
+       BBox               * restrict r_box
+     )
+{
+  r_box->xmin = (int) (((int64_t) box->xmin * user_to_draw_div + b->user_to_draw_mul_half) / b->user_to_draw_mul);
+  r_box->ymin = (int) (((int64_t) box->ymin * user_to_draw_div + b->user_to_draw_mul_half) / b->user_to_draw_mul);
+  r_box->xmax = (int) (((int64_t) box->xmax * user_to_draw_div + b->user_to_draw_mul_half) / b->user_to_draw_mul);
+  r_box->ymax = (int) (((int64_t) box->ymax * user_to_draw_div + b->user_to_draw_mul_half) / b->user_to_draw_mul);
+}

@@ -1,0 +1,806 @@
+/* Copyright 2005 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/**************************************************************/
+/* File:    Effect.c                                          */
+/*          (C) 2005 Tematic                                  */
+/*          All rights reserved                               */
+/*                                                            */
+/* Purpose: Implement various screen effects.                 */
+/*                                                            */
+/* Author:  A.D.Hodgkinson.                                   */
+/*                                                            */
+/* History: 18-Aug-2005 (ADH): Created.                       */
+/**************************************************************/
+
+#include <string.h>
+#include <AsmUtils/callbacks.h>
+
+#include "Module.h"
+#include "Transfer.h"
+
+#include "Effect.h"
+
+/**************************************************************/
+/* effect_program_current()                                   */
+/*                                                            */
+/* Call vectors to program the gamma and supremacy tables     */
+/* based on the data int he global "current_*" arrays.        */
+/*                                                            */
+/* Re-entrancy: Function is not re-entrant.                   */
+/*                                                            */
+/* Threading:   Function is not thread-safe.                  */
+/**************************************************************/
+
+static _kernel_oserror * effect_program_current(void)
+{
+  /* Program the R, G and B tables */
+
+  PRISMLIB_RETERR(_swix(OS_CallAVector,
+                        _INR(0,2) | _IN(4) | _IN(9),
+
+                        current_r,
+                        current_g,
+                        current_b,
+                        paletteV_GammaCorrection,
+                        PaletteV));
+
+  /* Program the supremacy data */
+
+  return _swix(OS_CallAVector,
+               _IN(0) | _IN(4) | _IN(9),
+
+               current_s,
+               paletteV_SetSupremacyTransfer,
+               PaletteV);
+}
+
+/**************************************************************/
+/* effect_preamble()                                          */
+/*                                                            */
+/* Cancel a previous effect, read the current time, and scale */
+/* the given effect duration according to the elapsed time of */
+/* any previous interrupted effect.                           */
+/*                                                            */
+/* Parameters:  Pointer to a uin32_t, updated on exit with    */
+/*              the current monotonic time;                   */
+/*                                                            */
+/*              Pointer to a uin32_t holding the effect       */
+/*              duration, which may be updated on exit with   */
+/*              an adjusted duration.                         */
+/*                                                            */
+/* Re-entrancy: Function is not re-entrant.                   */
+/*                                                            */
+/* Threading:   Function is not thread-safe.                  */
+/**************************************************************/
+
+static _kernel_oserror * effect_preamble(uint32_t * now, uint32_t * duration)
+{
+  screenfx_effect_type_t was_fading      = fade_running;
+  uint32_t               was_starting_at = fade_start_at;
+  uint32_t               was_lasting_for = fade_duration;
+
+  /* Cancel any current effect */
+
+  PRISMLIB_RETERR(effect_cancel(false));
+
+  /* What's the time now? */
+
+  PRISMLIB_RETERR(_swix(OS_ReadMonotonicTime,
+                        _OUT(0),
+
+                        now));
+
+  /* Did we interrupt another effect? */
+
+  if (was_fading != screenfx_effect_type_NONE)
+  {
+    /* Yes. Scale the duration according to how much of the old
+     * effect had already run. This works on the assumption that
+     * if you were, say, fading out, then interrupted it to cross-fade
+     * back in, then the less of the cross-fade out had already happened,
+     * the "less far" the cross-fade in has to go too, so we don't take
+     * as long over it.
+     */
+
+    int32_t ran_for  = *now - was_starting_at;
+    int32_t complete = was_lasting_for == 0 ? 100 : (ran_for * 100) / was_lasting_for;
+
+    if      (complete < 0)   complete = 0;
+    else if (complete > 100) complete = 100;
+
+    *duration = ((*duration) * complete) / 100;
+  }
+
+  return NULL;
+}
+
+/**************************************************************/
+/* effect_enable()                                            */
+/*                                                            */
+/* Once ready to run an effect, call here to enable all       */
+/* relevant events and add all event handlers.                */
+/*                                                            */
+/* Re-entrancy: Function is not re-entrant.                   */
+/*                                                            */
+/* Threading:   Function is not thread-safe.                  */
+/**************************************************************/
+
+static _kernel_oserror * effect_enable(void)
+{
+  /* Enable VSync event */
+
+  PRISMLIB_RETERR(_swix(OS_Byte,
+                        _INR(0,1),
+
+                        OsByte_EnableEvent,
+                        Event_VSync));
+
+  /* Install the EventV handler */
+
+  PRISMLIB_RETERR(_swix(OS_Claim,
+                        _INR(0,2),
+
+                        EventV,
+                        module_event_handler_entry,
+                        module_pw));
+
+  return NULL;
+}
+
+/**************************************************************/
+/* effect_disable()                                           */
+/*                                                            */
+/* Once ready to stop an effect, call here to disable all     */
+/* relevant events and remove all event handlers.             */
+/*                                                            */
+/* Re-entrancy: Function is not re-entrant.                   */
+/*                                                            */
+/* Threading:   Function is not thread-safe.                  */
+/**************************************************************/
+
+static _kernel_oserror * effect_disable(void)
+{
+  /* Remove the EventV handler */
+
+  PRISMLIB_RETERR(_swix(OS_Release,
+                        _INR(0,2),
+
+                        EventV,
+                        module_event_handler_entry,
+                        module_pw));
+
+  /* Disable the VSync event */
+
+  PRISMLIB_RETERR(_swix(OS_Byte,
+                        _INR(0,1),
+
+                        OsByte_DisableEvent,
+                        Event_VSync));
+
+  return NULL;
+}
+
+/**************************************************************/
+/* effect_start_fade()                                        */
+/*                                                            */
+/* Start a fade effect.                                       */
+/*                                                            */
+/* Parameters:  Left hand end point, &BBGGRRSS;               */
+/*                                                            */
+/*              Right hand end point, &BBGGRRSS;              */
+/*                                                            */
+/*              Duration, centiseconds.                       */
+/*                                                            */
+/* Re-entrancy: Function is not re-entrant.                   */
+/*                                                            */
+/* Threading:   Function is not thread-safe.                  */
+/**************************************************************/
+
+_kernel_oserror * effect_start_fade
+                  (
+                    uint32_t left,
+                    uint32_t right,
+                    uint32_t duration
+                  )
+{
+  dprintf(("Effect",
+           "effect_start_fade: Called for left RGBS &%08X, right RGBS &%08X, duration %u\n",
+
+           left,
+           right,
+           duration));
+
+  PRISMLIB_RETERR(effect_preamble(&fade_start_at, &duration));
+
+  /* Copy the "current" table to the "starting" table */
+
+  memcpy(starting_table, current_table, sizeof(starting_table));
+
+  /* Set up the rest of the state variables */
+
+  fade_running  = screenfx_effect_type_FADE;
+  fade_duration = duration;
+  fade_escaped  = false;
+
+  fade_left_s   = (left)       & 0xff;
+  fade_left_r   = (left >> 8)  & 0xff;
+  fade_left_g   = (left >> 16) & 0xff;
+  fade_left_b   = (left >> 24);
+
+  fade_right_s  = (right)       & 0xff;
+  fade_right_r  = (right >> 8)  & 0xff;
+  fade_right_g  = (right >> 16) & 0xff;
+  fade_right_b  = (right >> 24);
+
+  PRISMLIB_RETERR(effect_enable());
+
+  dprintf(("Effect", "effect_start_fade: Successful\n"));
+  return NULL;
+}
+
+/**************************************************************/
+/* effect_process_fade()                                      */
+/*                                                            */
+/* Process a fade effect, programming current tables as       */
+/* required. Works entirely of fade global variables.         */
+/*                                                            */
+/* Re-entrancy: Function is not re-entrant.                   */
+/*                                                            */
+/* Threading:   Function is not thread-safe.                  */
+/**************************************************************/
+
+void effect_process_fade(void)
+{
+  _kernel_oserror * e;
+  uint32_t          now;
+  bool              complete = false;
+
+  /* Read the current time */
+
+  e = _swix(OS_ReadMonotonicTime,
+            _OUT(0),
+
+            &now);
+
+  if (e == NULL)
+  {
+    /* Work out how long the fade has been running */
+
+    int32_t run_for = now - fade_start_at;
+
+    /* Bound the result */
+
+    if      (run_for < 0)             run_for = 0;
+    else if (run_for > fade_duration) run_for = fade_duration;
+
+    /* Finished yet? */
+
+    if (run_for == fade_duration) complete = true;
+
+    /* Update the tables */
+
+    transfer_fill_for_step(current_s,
+                           starting_s[0],
+                           starting_s[255],
+                           fade_left_s,
+                           fade_right_s,
+                           run_for,
+                           fade_duration);
+
+    transfer_fill_for_step(current_r,
+                           starting_r[0],
+                           starting_r[255],
+                           fade_left_r,
+                           fade_right_r,
+                           run_for,
+                           fade_duration);
+
+    transfer_fill_for_step(current_g,
+                           starting_g[0],
+                           starting_g[255],
+                           fade_left_g,
+                           fade_right_g,
+                           run_for,
+                           fade_duration);
+
+    transfer_fill_for_step(current_b,
+                           starting_b[0],
+                           starting_b[255],
+                           fade_left_b,
+                           fade_right_b,
+                           run_for,
+                           fade_duration);
+
+    /* Program these values */
+
+    (void) effect_program_current();
+
+    /* Shut down if we've completed */
+
+    if (complete == true) (void) effect_cancel(false);
+  }
+}
+
+/**************************************************************/
+/* effect_start_crossfade()                                   */
+/*                                                            */
+/* Start a cross-fade effect.                                 */
+/*                                                            */
+/* Cross-fades work by assuming an image has been dithered    */
+/* into the upper half of each colour component, and another  */
+/* image has been dithered into the lower half. For example,  */
+/* we might dither a 24bpp image down to 12bpp, writing the   */
+/* 4 bits of the colour components in the 12bpp image into    */
+/* the upper 4 bits of each 8bpp colour component in screen   */
+/* RAM, then similarly take a 24bpp image and dither it to    */
+/* 12bpp in the lower 4 bits of each 8bpp component.          */
+/*                                                            */
+/* The cross-fade routine then programs gamma tables so a     */
+/* full spectrum of brightness is available in the upper 4 or */
+/* lower 4 bits of each colour component, creating in essence */
+/* a 12bpp screen display. It then fades between this table   */
+/* and one showing the lower or upper 4 bits, to achieve a    */
+/* visual cross-fade effect with minimal processing power.    */
+/*                                                            */
+/* In practice, 1 bit per component per image is allowed for  */
+/* 8bpp modes (set a greyscale palette), 2 bits per component */
+/* is allowed for 16bpp modes (bits 0-1 and 2-3 are used,     */
+/* bit 4 is ignored), and 4 bits per component is allowed for */
+/* 32bpp modes.                                               */
+/*                                                            */
+/* Parameters:  'true' to fade to a table making the low half */
+/*              visible, else make the high half visible;     */
+/*                                                            */
+/*              Duration, centiseconds.                       */
+/*                                                            */
+/* Re-entrancy: Function is not re-entrant.                   */
+/*                                                            */
+/* Threading:   Function is not thread-safe.                  */
+/**************************************************************/
+
+_kernel_oserror * effect_start_crossfade
+                  (
+                    bool     to_low,
+                    uint32_t duration
+                  )
+{
+  uint32_t log2bpp;
+
+  dprintf(("Effect",
+           "effect_start_crossfade: Called with to_low flag %s, duration %u\n",
+           TOBOOL(to_low),
+           duration));
+
+  /* Is the bits value valid? */
+
+  _swix(OS_ReadModeVariable,
+        _INR(0,1) | _OUT(2),
+
+        -1, /* Read current mode details */
+        9,  /* 9 = get Log2BPP value     */
+
+        &log2bpp);
+
+  if (log2bpp < 3)
+  {
+    return prismlib_make_error(screenfx_error_INVALID_COLOUR_DEPTH, 0);
+  }
+
+  PRISMLIB_RETERR(effect_preamble(&fade_start_at, &duration));
+
+  /* Copy the "current" table to the "starting" table */
+
+  memcpy(starting_table, current_table, sizeof(starting_table));
+
+  /* Set up the rest of the state variables */
+
+  fade_running  = screenfx_effect_type_CROSSFADE;
+  fade_duration = duration;
+
+  /* Build the cross-fade high and low tables */
+
+  switch (log2bpp)
+  {
+    /* 16M colour modes: Easy, just make the upper 4 or lower 4 bits
+     * of the colour component significant, with brightness values
+     * of 0-255 in 16 levels for each.
+     */
+
+    default:
+    {
+      for (uint32_t i = 0; i <= 255; i++)
+      {
+        crossfade_hi[i] = (i >> 4) * 17;
+        crossfade_lo[i] = (i & 15) * 17;
+      }
+    }
+    break;
+
+    /* 256 colour modes: The palette is used to look up a value in
+     * the gamma tables, so for this to work we're expecting a linear
+     * greyscale palette to be set up.
+     */
+
+    case 3:
+    {
+      for (uint32_t i = 0; i <= 255; i++)
+      {
+        crossfade_hi[i] = (i >> 7) * 255;
+        crossfade_lo[i] = (i &  1) * 255;
+      }
+    }
+    break;
+
+    /* 32K colour modes: Hard. The OS takes each 5-bit colour
+     * component, shifts it up to make an 8 bit colour component,
+     * then replicates the 3 most significant bits as the 3 least
+     * significant bits to get an index. This gives index values
+     * from 0 to 255 for original colour component values 0 to 31
+     * in reasonably equal steps without much CPU power. Thus,
+     * it is only these table entries that are significant in our
+     * gamma lookup.
+     */
+
+    case 4:
+    {
+      uint32_t index;
+
+      for (uint32_t i = 0; i <= 255; i++)
+      {
+        crossfade_hi[i] = crossfade_lo[i] = 0;
+      }
+
+      for (uint32_t i = 0; i <= 31; i++)
+      {
+        index = (i << 3) | (i >> 2);
+
+        crossfade_hi[index] = ((i & 0xC) >> 2) * 85;
+        crossfade_lo[index] = ((i & 0x3))      * 85;
+      }
+    }
+    break;
+  }
+
+  /* Work out the fade direction */
+
+  if (to_low == true)
+  {
+    crossfade_start = crossfade_hi;
+    crossfade_end   = crossfade_lo;
+  }
+  else
+  {
+    crossfade_start = crossfade_lo;
+    crossfade_end   = crossfade_hi;
+  }
+
+  PRISMLIB_RETERR(effect_enable());
+
+  dprintf(("Effect", "effect_start_crossfade: Successful\n"));
+  return NULL;
+}
+
+/**************************************************************/
+/* effect_process_crossfade()                                 */
+/*                                                            */
+/* Process a cross-fade effect, programming current tables as */
+/* required. Works entirely of fade global variables.         */
+/*                                                            */
+/* Re-entrancy: Function is not re-entrant.                   */
+/*                                                            */
+/* Threading:   Function is not thread-safe.                  */
+/**************************************************************/
+
+void effect_process_crossfade(void)
+{
+  _kernel_oserror * e;
+  uint32_t          now;
+  bool              complete = false;
+
+  /* Read the current time */
+
+  e = _swix(OS_ReadMonotonicTime,
+            _OUT(0),
+
+            &now);
+
+  if (e == NULL)
+  {
+    /* Work out how long the fade has been running */
+
+    int32_t run_for = now - fade_start_at;
+
+    /* Bound the result */
+
+    if      (run_for < 0)             run_for = 0;
+    else if (run_for > fade_duration) run_for = fade_duration;
+
+    /* Finished yet? */
+
+    if (run_for == fade_duration) complete = true;
+
+    /* Update the tables */
+
+    transfer_interpolate_for_step(current_s,
+                                  crossfade_start,
+                                  crossfade_end,
+                                  run_for,
+                                  fade_duration);
+
+    transfer_interpolate_for_step(current_r,
+                                  crossfade_start,
+                                  crossfade_end,
+                                  run_for,
+                                  fade_duration);
+
+    transfer_interpolate_for_step(current_g,
+                                  crossfade_start,
+                                  crossfade_end,
+                                  run_for,
+                                  fade_duration);
+
+    transfer_interpolate_for_step(current_b,
+                                  crossfade_start,
+                                  crossfade_end,
+                                  run_for,
+                                  fade_duration);
+
+    /* Program these values */
+
+    (void) effect_program_current();
+
+    /* Shut down if we've completed */
+
+    if (complete == true) (void) effect_cancel(false);
+  }
+}
+
+/**************************************************************/
+/* effect_cancel()                                            */
+/*                                                            */
+/* Cancel any running effect(s).                              */
+/*                                                            */
+/* Parameters:  'true' if cancelling due to an escape event,  */
+/*              'false' for any other reason.                 */
+/*                                                            */
+/* Re-entrancy: Function is not re-entrant.                   */
+/*                                                            */
+/* Threading:   Function is not thread-safe.                  */
+/**************************************************************/
+
+_kernel_oserror * effect_cancel(bool escape_event)
+{
+  dprintf(("Effect", "effect_cancel: Called - escape_event = %u\n", escape_event));
+
+  /* If there's a fade running, release EventV and disable the
+   * VSync event. Reset the state variables.
+   */
+
+  if (fade_running != screenfx_effect_type_NONE)
+  {
+    PRISMLIB_RETERR(effect_disable());
+
+    /* Reset state variables */
+
+    fade_running  = screenfx_effect_type_NONE;
+    fade_start_at = 0;
+    fade_duration = 0;
+    fade_escaped  = escape_event;
+
+    fade_left_s   = 0;
+    fade_left_r   = 0;
+    fade_left_g   = 0;
+    fade_left_b   = 0;
+
+    fade_right_s  = 0;
+    fade_right_r  = 0;
+    fade_right_g  = 0;
+    fade_right_b  = 0;
+  }
+
+  dprintf(("Effect", "effect_cancel: Successful\n"));
+  return NULL;
+}
+
+/**************************************************************/
+/* effect_reset()                                             */
+/*                                                            */
+/* Reset the screen to default values, of linear tables with  */
+/* value 0 at index 0 through to value 255 at index 255.      */
+/*                                                            */
+/* Re-entrancy: Function is not re-entrant.                   */
+/*                                                            */
+/* Threading:   Function is not thread-safe.                  */
+/**************************************************************/
+
+_kernel_oserror * effect_reset(void)
+{
+  uint32_t i;
+
+  dprintf(("Effect", "effect_reset: Called\n"));
+
+  /* Reset the internal tables */
+
+  for (i = 0; i < 256; i++) starting_r[i] = i;
+
+  memcpy(starting_g, starting_r, 256);
+  memcpy(starting_b, starting_r, 256);
+  memcpy(starting_s, starting_r, 256);
+
+  memcpy(current_r,  starting_r, 256);
+  memcpy(current_g,  starting_r, 256);
+  memcpy(current_b,  starting_r, 256);
+  memcpy(current_s,  starting_r, 256);
+
+  /* Program the values */
+
+  dprintf(("Effect", "effect_reset: Exiting through effect_program_current()...\n"));
+  return effect_program_current();
+}
+
+/**************************************************************/
+/* effect_pack()                                              */
+/*                                                            */
+/* Utility function to return a &BBGGRRSS format 32-bit word  */
+/* from four 8-bit values.                                    */
+/*                                                            */
+/* Parameters:  Red value (0-255);                            */
+/*                                                            */
+/*              Green value (0-255);                          */
+/*                                                            */
+/*              Blue value (0-255);                           */
+/*                                                            */
+/*              Supremacy value (0-255).                      */
+/*                                                            */
+/* Returns:     32-bit packed value in &BBGGRRSS format.      */
+/*                                                            */
+/* Re-entrancy: Function is re-entrant.                       */
+/*                                                            */
+/* Threading:   Function is thread-safe.                      */
+/**************************************************************/
+
+uint32_t effect_pack(uint8_t r, uint8_t g, uint8_t b, uint8_t s)
+{
+  return s | (b << 8) | (g << 16) | (r << 24);
+}
+
+/**************************************************************/
+/* effect_block()                                             */
+/*                                                            */
+/* Utility function to block until a fade effect finishes.    */
+/*                                                            */
+/* Parameters:  Expected fade duration in cs - function will  */
+/*              bail out if this duration is exceeded by a    */
+/*              certain amount (currently 100cs);             */
+/*                                                            */
+/*              'true' to stop callbacks going off, else      */
+/*              trigger them whilst waiting;                  */
+/*                                                            */
+/*              'true' to enable escape handling during the   */
+/*              fade, else don't.                             */
+/*                                                            */
+/* Returns:     'true' if a blocking fade was interrupted by  */
+/*              Escape, else 'false'.                         */
+/*                                                            */
+/* Re-entrancy: Function is not re-entrant.                   */
+/*                                                            */
+/* Threading:   Function is not thread-safe.                  */
+/**************************************************************/
+
+bool effect_block(uint32_t fade_duration, bool no_callbacks, bool allow_escape)
+{
+  uint32_t start, now;
+  uint32_t old_esc = 0;
+
+  dprintf(("Effect", "effect_block: Blocking call requested\n"));
+
+  _swix(OS_ReadMonotonicTime,
+        _OUT(0),
+
+        &start);
+
+  /* Sit waiting on VSyncs until the "fade running" flag clears.
+   * Just in case there's a problem, also check the timer; if we
+   * go 1 second beyond the expected fade length, cancel and
+   * bail out.
+   */
+
+  if (allow_escape)
+  {
+    /* Enable Escape event */
+
+    dprintf(("Effect", "effect_block: Enabling Escape event\n"));
+
+    (void) _swix(OS_Byte,
+                 _INR(0,1),
+
+                 OsByte_EnableEvent,
+                 Event_Escape);
+
+    /* Ensure Escape key is enabled */
+
+    (void) _swix(OS_Byte,
+                 _INR(0,2) | _OUT(1),
+
+                 OsByte_ReadWriteEscapeKeyStatus,
+                 0,
+                 0,
+
+                 &old_esc);
+  }
+
+  dprintf(("Effect", "effect_block: Waiting...\n"));
+
+  do
+  {
+    _swix(OS_Byte,
+          _IN(0),
+
+          OsByte_WaitForVSync);
+
+    /* Trigger callbacks after the VSync wait, unless
+     * flags tell us not to.
+     */
+
+    if (no_callbacks == false)
+    {
+      usermode_donothing(); /* (From AsmUtils) */
+    }
+
+    _swix(OS_ReadMonotonicTime,
+          _OUT(0),
+
+          &now);
+  }
+  while (
+          fade_running != screenfx_effect_type_NONE &&
+          now - start < fade_duration + 100
+        );
+
+  dprintf(("Effect", "effect_block: ...exited wait loop\n"));
+
+  if (allow_escape)
+  {
+    /* Disable the Escape event */
+
+    dprintf(("Effect", "effect_block: Disabling Escape event\n"));
+
+    (void) _swix(OS_Byte,
+                 _INR(0,1),
+
+                 OsByte_DisableEvent,
+                 Event_Escape);
+
+    /* Restore old escape key status */
+
+    (void) _swix(OS_Byte,
+                 _INR(0,2),
+
+                 OsByte_ReadWriteEscapeKeyStatus,
+                 old_esc,
+                 0);
+  }
+
+  /* Is the fade still running? */
+
+  if (fade_running != screenfx_effect_type_NONE)
+  {
+    dprintf(("SWI", "effect_block: Timed out - fade still going; bailing!\n"));
+
+    (void) effect_cancel(fade_escaped);
+  }
+
+  return fade_escaped;
+}

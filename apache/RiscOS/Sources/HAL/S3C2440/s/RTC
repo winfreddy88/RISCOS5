@@ -1,0 +1,212 @@
+; Copyright 2011 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:Machine.<Machine>
+        GET     Hdr:ImageSize.<ImageSize>
+        $GetIO
+
+        GET     Hdr:OSEntries
+        GET     Hdr:HALEntries
+        GET     Hdr:HALDevice
+        GET     Hdr:RTCDevice
+
+        GET     hdr.StaticWS
+
+
+        AREA    |Asm$$Code|, CODE, READONLY, PIC
+
+        EXPORT  RTC_Init
+
+	IMPORT  serial8
+
+
+;       Note - debug stuff won't work since we don't get passed a HAL workspace pointer!
+;        IMPORT  DebugHALPrint
+;        IMPORT  DebugHALPrintReg
+;        IMPORT  DebugMemDump
+;        IMPORT  DebugHALPrintByte
+
+; TWL/TPS RTC IIC address
+TPSRTC_IIC     * &4b
+
+; Some RTC registers
+SECONDS_REG       * &1C
+RTC_CTRL_REG      * &29
+RTC_STATUS_REG    * &2a
+
+
+        MACRO
+        CallOS  $entry, $tailcall
+        ASSERT  $entry <= HighestOSEntry
+ [ "$tailcall"=""
+        MOV     lr, pc
+ |
+   [ "$tailcall"<>"tailcall"
+        ! 0, "Unrecognised parameter to CallOS"
+   ]
+ ]
+        LDR     pc, OSentries + 4*$entry
+        MEND
+
+RTC_Init
+	STMDB	sp!,{lr}
+	MOV	r0,   #0xF9000000
+	ORR	r0, r0, #0xF00000
+	ADR	r1, RTCDevice
+	LDR	r4, [r1, #HALDevice_Activate]
+	BL	serial8
+	LDMIA	sp!,{lr}
+        ; Just register our HAL Device with the OS
+        MOV     a1, #0
+        ADR     a2, RTCDevice
+        CallOS  OS_AddDevice, tailcall
+
+RTCDevice
+        DCW     HALDeviceType_SysPeri + HALDeviceSysPeri_RTC
+        DCW     HALDeviceID_RTC_TPS65950
+        DCD     HALDeviceBus_Pro
+        DCD     0               ; API version
+        DCD     RTCDesc
+        DCD     0               ; Address - N/A
+        %       12              ; Reserved
+        DCD     RTCActivate
+        DCD     RTCDeactivate
+        DCD     RTCReset
+        DCD     RTCSleep
+        DCD     -1              ; Interrupt N/A
+        DCD     0
+        %       8
+        DCB     RTCTimeFormat_BCD
+        DCB     RTCFormatFlags_BCD_YearLOIsGood ; todo - add RTCFormatFlags_BCD_NeedsYearHelp once NVRAM is implemented
+        %       2
+        DCD     RTCReadTime
+        DCD     RTCWriteTime
+
+RTCDesc
+        DCB "S3C2440 real-time clock",0
+
+        ALIGN
+
+RTCActivate
+        MOV     a1, #1
+RTCDeactivate
+RTCReset
+        MOV     pc, lr
+
+RTCSleep
+        MOV     a1, #0 ; Previously at full power
+        MOV     pc, lr
+
+RTCReadTime
+        ; In:
+        ; a1 = HALDevice ptr
+        ; a2 = RTCTimeStruct ptr
+        ; a3 = IICOp func ptr
+        ; a4 = kernel workspace ptr
+        ; Out:
+        ; a1 = return code
+        ; RTCTimeStruct updated
+        Push    "v1-v3,lr"
+        MOV     v1, a3
+        MOV     v2, a4
+        MOV     v3, a2
+
+	STMDB	sp!, {r2-r12}
+	MOV	r0, #13
+	ORR	r0,r0,#&20000
+	ORR	r0,r0,#&3C0000
+	MOV	r1,#&57000000
+	MOV	r2,#&100000
+	SWI	0x68
+	MOV	a1, r3
+	LDMIA	sp!, {r2-r12}
+
+	;LDR	a1, RTC_Address
+
+	LDRB	a2, [a1, #0x70]
+	STRB	a2, [v3, #RTCTimeStruct_BCD_Seconds]
+	LDRB	a2, [a1, #0x74]
+	STRB	a2, [v3, #RTCTimeStruct_BCD_Minutes]
+	LDRB	a2, [a1, #0x78]
+	STRB	a2, [v3, #RTCTimeStruct_BCD_Hours]
+	LDRB	a2, [a1, #0x7C]
+	STRB	a2, [v3, #RTCTimeStruct_BCD_DayOfMonth]
+	LDRB	a2, [a1, #0x84]
+	STRB	a2, [v3, #RTCTimeStruct_BCD_Month]
+	LDRB	a2, [a1, #0x88]
+	STRB	a2, [v3, #RTCTimeStruct_BCD_YearLO]
+	MOV	a2, #0
+	STRB    a2, [v3, #RTCTimeStruct_BCD_Centiseconds]
+
+        ; Construct a fakey YearHI by looking at YearLO
+        ; Anything 70 or above is considered 1970+, else 2000+
+        ; This should work OK, since RISC OS clamps the time to 1970 for unix compatability (or it does on boot, at least)
+        LDRB    a2, [v3, #RTCTimeStruct_BCD_YearLO]
+        CMP     a2, #&70
+        MOVGE   a3, #&19
+        MOVLT   a3, #&20
+        STRB    a3, [v3, #RTCTimeStruct_BCD_YearHI]
+	MOV	a1, #0
+        ASSERT  RTCRetCode_OK = 0
+        Pull    "v1-v3,pc"
+
+RTCWriteTime
+        ; In:
+        ; a1 = HALDevice ptr
+        ; a2 = RTCTimeStruct ptr
+        ; a3 = IICOp func ptr
+        ; a4 = kernel workspace ptr
+        ; Out:
+        ; a1 = return code
+        Push    "v1-v3,lr"
+        MOV     v1, a3
+        MOV     v2, a4
+        MOV     v3, a2
+        ; Writing the time safely involves several transfers:
+        ; 1. Write 0 to RTC_CTRL_REG to stop the clock (just in case there are any issues with the clock updating while it's being written to)
+        ; 2. Write the new time values
+        ; 3. Write 1 to RTC_CTRL_REG to start the clock
+
+	STMDB	sp!, {r2-r12}
+	MOV	r0, #13
+	ORR	r0,r0,#&20000
+	ORR	r0,r0,#&3C0000
+	MOV	r1,#&57000000
+	MOV	r2,#&100000
+	SWI	0x68
+	MOV	a1, r3
+	LDMIA	sp!, {r2-r12}
+
+;	LDR	a1, RTC_Address
+
+	LDRB	a2, [v3, #RTCTimeStruct_BCD_Seconds]
+	STRB	a2, [a1, #0x70]
+	LDRB	a2, [v3, #RTCTimeStruct_BCD_Minutes]
+	STRB	a2, [a1, #0x74]
+	LDRB	a2, [v3, #RTCTimeStruct_BCD_Hours]
+	STRB	a2, [a1, #0x78]
+	LDRB	a2, [v3, #RTCTimeStruct_BCD_DayOfMonth]
+	STRB	a2, [a1, #0x7C]
+	LDRB	a2, [v3, #RTCTimeStruct_BCD_Month]
+	STRB	a2, [a1, #0x84]
+	LDRB	a2, [v3, #RTCTimeStruct_BCD_YearLO]
+	STRB	a2, [a1, #0x88]
+
+        Pull    "v1-v3,pc"
+
+
+        END

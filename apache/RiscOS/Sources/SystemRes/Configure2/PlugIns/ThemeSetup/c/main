@@ -1,0 +1,695 @@
+/* Copyright 2013 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*---------------------------------------------------------------------------*/
+/* File:    main.c                                                           */
+/* Purpose: Configure plugin main loop and event handling                    */
+/*---------------------------------------------------------------------------*/
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+#include "swis.h"
+#include "Global/CMOS.h"
+#include "Global/FileTypes.h"
+#include "Interface/HighFSI.h"
+#include "toolbox.h"
+#include "wimplib.h"
+#include "event.h"
+#include "common.h"
+#include "window.h"
+#include "fontmenu.h"
+#include "menu.h"
+#include "defines.h"
+#include "loadtheme.h"
+#include "deskfont.h"
+#include "VersionNum"
+
+/* Global variables */
+ObjectId main_window;
+ObjectId preview_window;
+ObjectId theme_menu;
+ObjectId font_menu;
+int      wh_of_preview = -1;
+int      ih_of_rendering;
+int      ih_of_unavailable;
+
+/* Local variables */
+static IdBlock    idb;
+static MessagesFD messages_desc;
+static char       messages_string[255];
+static BOOL       bootmerge_alive;
+static int        bootmerge_taskhandle;
+
+
+/*---------------------------------------------------------------------------*
+ * program_exit                                                              *
+ *                                                                           *
+ * Finished with this plug-in, so exit.                                      *
+ *---------------------------------------------------------------------------*/
+
+static void program_exit(void)
+{
+    if (bootmerge_alive)
+    {
+        WimpMessage buffer;
+
+        /* Sink the boot merge boat too */
+        buffer.hdr.size = 20;
+        buffer.hdr.your_ref = 0;
+        buffer.hdr.action_code = Wimp_MQuit;
+        wimp_send_message(Wimp_EUserMessage, &buffer, bootmerge_taskhandle, 0, NULL);
+    }
+    exit(0);
+}
+
+
+/*---------------------------------------------------------------------------*
+ * font_selected                                                             *
+ *                                                                           *
+ * Handler for when menu selection in the font menu.                         *
+ *---------------------------------------------------------------------------*/
+
+static int font_selected(int event_code, ToolboxEvent *event_block, IdBlock *id_block, void *handle)
+{
+    deskfont_update_display_field();
+    return 1;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * submenu_navigate                                                          *
+ *                                                                           *
+ * Handler for when menu submenu is hovered over.                            *
+ *---------------------------------------------------------------------------*/
+
+static int submenu_navigate(int event_code, ToolboxEvent *event_block, IdBlock *id_block, void *handle)
+{
+    const theme_t *theme = themehead;
+
+    while (theme != NULL)
+    {
+        if (id_block->self_component == theme->menuid) break;
+        theme = theme->next;
+    }
+    render_theme_preview(theme);
+
+    return 1;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * theme_selected                                                            *
+ *                                                                           *
+ * Handler for when menu selection in the theme menu.                        *
+ *---------------------------------------------------------------------------*/
+
+static int theme_selected(int event_code, ToolboxEvent *event_block, IdBlock *id_block, void *handle)
+{
+    const theme_t *theme = themehead;
+
+    while (theme != NULL)
+    {
+        if (id_block->self_component == theme->menuid)
+        {
+            /* Pick that one */
+            select_and_merge_theme(theme->name, NULL);
+            break;
+        }
+        theme = theme->next;
+    }
+
+    return 1;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * option_changed                                                            *
+ *                                                                           *
+ * Handler for when option buttons are ticked or unticked.                   *
+ *---------------------------------------------------------------------------*/
+
+static int option_changed(int event_code, ToolboxEvent *event_block, IdBlock *id_block, void *handle)
+{
+    OptionButtonStateChangedEvent *block = (OptionButtonStateChangedEvent *)event_block;
+        
+    switch (id_block->self_component)
+    {
+        case CheckUseOutlineFont:
+            enable_gadget(main_window, DisplayFont, block->new_state);
+            enable_gadget(main_window, PopUpFont, block->new_state); 
+            break;
+            
+        case CheckLoadTheme:
+            enable_gadget(main_window, DisplayTheme, block->new_state);
+            enable_gadget(main_window, PopUpTheme, block->new_state);
+            enable_gadget(main_window, ButtonInstall, block->new_state);
+            break;
+             
+        case CheckTexturedMenus:
+            enable_gadget(main_window, CheckDifferentMenuTexture, block->new_state);
+            break;
+
+        case Check3DWindows:
+            enable_gadget(main_window, CheckFully3DIconbar, block->new_state);
+            break;
+
+        default:
+            /* Nothing to do until 'Set' pressed */
+            break;
+    }
+
+    return 1;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * task_closing                                                              *
+ *                                                                           *
+ * Announcements that a Wimp task is finishing somewhere.                    *
+ *---------------------------------------------------------------------------*/
+
+static int task_closing(WimpMessage *message, void *handle)
+{
+    if (message->hdr.sender == bootmerge_taskhandle)
+    {
+       /* Keep our view consistent */
+       bootmerge_alive = FALSE;
+    }
+    return 1;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * save_choices                                                              *
+ *                                                                           *
+ * Read the choices from the window and output a command file.               *
+ *---------------------------------------------------------------------------*/
+
+static void save_choices(void)
+{
+    FILE *fp;
+    char  string[256];
+    int   state, borders, cmos;
+
+    /* Ensure choices directory exists */
+    error_trap(_swix(OS_File, _INR(0,1) | _IN(4), 8, ChoicesDir, 0), 0);
+
+    /* Open the joint commands/choices file */
+    fp = fopen(ConfigFile, "w");
+    if (fp == NULL)
+    {
+        error_trap(common_error(messages_lookup("ChoicesFileNotOpen")), 0);
+        return;
+    }
+    fputs(HeaderTag, fp);
+    fputc(NewLine, fp);
+
+    /* Format version incase we change our minds later */
+    sprintf(string, "%s:%u", VersionTag, Module_Version);
+    fputs(string, fp);
+    fputc(NewLine, fp);
+
+    /* Common visual flags */
+    strcpy(string, WimpVisFlagsTag);
+    error_trap(optionbutton_get_state(0, main_window, CheckTexturedMenus, &state), 0);
+    if (state)
+    {
+        strcat(string, " -TexturedMenus"); 
+        error_trap(optionbutton_get_state(0, main_window, CheckDifferentMenuTexture, &state), 0);
+        if (state) strcat(string, " -UseAlternateMenuBg");
+    }
+    error_trap(optionbutton_get_state(0, main_window, Check3DWindows, &borders), 0);
+    if (borders)
+    {
+        strcat(string, " -3DWindowBorders");
+        error_trap(optionbutton_get_state(0, main_window, CheckFully3DIconbar, &state), 0);
+        if (state) strcat(string, " -Fully3DIconBar");
+    }
+    error_trap(optionbutton_get_state(0, main_window, CheckLoadTheme, &state), 0);
+    if (state)
+    {
+        char theme[ThemeNameLen], colour[16];
+        int  dummy;
+        const theme_t *match;
+
+        error_trap(displayfield_get_value(0, main_window, DisplayTheme, theme, sizeof(theme), &dummy), 0);
+
+        /* A whole pile more flags */
+        match = match_theme_by_name(theme);
+        if (match != NULL)
+        {
+            if (match->wvf.removeiconboxes) strcat(string, " -RemoveIconBoxes");
+            if (match->wvf.noiconboxesintranswin) strcat(string, " -NoIconBoxesInTransWindows");
+            if (match->wvf.fontblend) strcat(string, " -FontBlending");
+            if (match->wvf.winoutlineover) strcat(string, " -WindowOutlineOver");
+            sprintf(colour, " -WOC &%X", match->wvf.winoutline); strcat(string, colour);
+            if (borders)
+            {
+                sprintf(colour, " -WBFC &%X", match->wvf.winborderface); strcat(string, colour);
+                sprintf(colour, " -WBOC &%X", match->wvf.winborderopp); strcat(string, colour);
+                sprintf(colour, " -MBFC &%X", match->wvf.menuborderface); strcat(string, colour);
+                sprintf(colour, " -MBOC &%X", match->wvf.menuborderopp); strcat(string, colour);
+            }
+        }
+        fputs(string, fp);
+        fputc(NewLine, fp);
+        sprintf(string, ThemeSet " %s.", theme);
+        fputs(string, fp);
+        fputc(NewLine, fp);
+    }
+    else
+    {
+        /* Disable loading and only just the common visual flags */
+        fputs(ThemeDisabled " 1", fp);
+        fputc(NewLine, fp);
+        fputs(string, fp);
+        fputc(NewLine, fp);
+    }
+    error_trap(optionbutton_get_state(0, main_window, CheckUseOutlineFont, &state), 0);
+    if (state)
+    {
+        error_trap(fontmenu_get_font(0, font_menu, string, sizeof(string), NULL), 0);
+    }
+    else
+    {
+        strcpy(string, "SystemFont");
+    }
+    deskfont_set(fp, string);
+    fclose(fp);
+    error_trap(_swix(OS_File, _INR(0,2), OSFile_SetType, ConfigFile, FileType_Obey), 0);
+
+    /* CMOS bits */
+    error_trap(optionbutton_get_state(0, main_window, CheckProtectIcons, &state), 0);
+    sprintf(string, "CONFIGURE WimpSpritePrecedence %s", state ? "ROM" : "RAM");
+    _swix(OS_CLI, _IN(0), string);  
+    error_trap(optionbutton_get_state(0, main_window, CheckTexturedWindows, &state), 0);
+    cmos = read_cmos_value(DesktopFeaturesCMOS) & ~desktopwindowtile;
+    if (!state) cmos = cmos | desktopwindowtile;
+    write_cmos_value(DesktopFeaturesCMOS, cmos);
+
+    /* Try to get rid of any obey file left over from when
+     * the font setup plugin looked after the desktop font.
+     */
+    _swix(OS_CLI, _IN(0), "REMOVE " ConfigFontFile);
+
+    /* Run the obey file for those settings that can change right away. The
+     * font change sends a Wimp message that triggers a redraw.
+     */
+    _swix(OS_CLI, _IN(0), "RUN " ConfigFileRO);
+}
+
+
+/*---------------------------------------------------------------------------*
+ * set_default_choices                                                       *
+ *                                                                           *
+ * Fill in the default choices in the dialogue box.                          *
+ *---------------------------------------------------------------------------*/
+
+static void set_default_choices(void)
+{
+    OptionButtonStateChangedEvent obsce;
+
+    /* Font #8 */
+    enable_gadget(main_window, DisplayFont, TRUE);
+    enable_gadget(main_window, PopUpFont, TRUE);
+    deskfont_get_by_number(8);
+
+    /* No theme, no protection, no menu background, no 3D borders */
+    error_trap(optionbutton_set_state(0, main_window, CheckLoadTheme, 0), 0);
+    error_trap(optionbutton_set_state(0, main_window, CheckProtectIcons, 0), 0);
+    error_trap(optionbutton_set_state(0, main_window, CheckTexturedMenus, 0), 0);
+    error_trap(optionbutton_set_state(0, main_window, Check3DWindows, 0), 0);
+
+    /* Fake events to fix up shading */
+    obsce.hdr.event_code = OptionButton_StateChanged;
+    obsce.hdr.size = sizeof(OptionButtonStateChangedEvent);
+    obsce.new_state = 0;
+    error_trap(toolbox_raise_toolbox_event(0, main_window, CheckLoadTheme, (ToolboxEvent *)&obsce), 0);
+    error_trap(toolbox_raise_toolbox_event(0, main_window, CheckProtectIcons, (ToolboxEvent *)&obsce), 0);
+    error_trap(toolbox_raise_toolbox_event(0, main_window, CheckTexturedMenus, (ToolboxEvent *)&obsce), 0);
+    error_trap(toolbox_raise_toolbox_event(0, main_window, Check3DWindows, (ToolboxEvent *)&obsce), 0);
+
+    /* Yes to window backgrounds */
+    error_trap(optionbutton_set_state(0, main_window, CheckTexturedWindows, 1), 0);
+}
+
+
+/*---------------------------------------------------------------------------*
+ * read_options                                                              *
+ *                                                                           *
+ * Read the help config file.                                                *
+ *---------------------------------------------------------------------------*/
+
+static void read_options(void)
+{
+    FILE    *fp;
+    char     buffer[256], test[4];
+    char     theme[ThemeNameLen], font[FontNameLen], wimpvis[WimpVisFlagsLen];
+    int      wimpfont;
+    BOOL     dontload, protecticons, texturedwindows;
+    char    *env, *more = (char *)!NULL;
+
+    /* Prefill incase the tags are not found */
+    theme[0] = '\0';
+    font[0] = '\0';
+    wimpvis[0] = '\0';
+    dontload = FALSE;
+
+    /* Open configuration file */
+    fp = fopen(ConfigFileRO, "r");
+    if (fp != NULL)
+    {
+        while (more != NULL)
+        {
+            /* Get the next line from the file */
+            more = fgets(buffer, sizeof(buffer), fp);
+            if (more != NULL)
+            {
+                /* Check for starting with a known tag */
+                if (strncmp(buffer, ThemeDisabled, sizeof(ThemeDisabled) - 1) == 0)
+                {
+                    /* Any non empty string will do */
+                    dontload = _swix(OS_GSTrans, _INR(0,2) | _RETURN(2),
+                                     &buffer[sizeof(ThemeDisabled) - 1],
+                                     test, sizeof(test)) != 0;
+                }
+                if (strncmp(buffer, ThemeSet, sizeof(ThemeSet) - 1) == 0)
+                {
+                    sscanf(buffer, ThemeSet " %s", theme);
+                }
+                if (strncmp(buffer, FontTag, sizeof(FontTag) - 1) == 0)
+                {
+                    sscanf(buffer, FontTag " %s", font);
+                }
+                if (strncmp(buffer, WimpVisFlagsTag, sizeof(WimpVisFlagsTag) - 1) == 0)
+                {
+                    /* Too hard for scanf() */
+                    strcpy(wimpvis, &buffer[sizeof(WimpVisFlagsTag) - 1]);
+                }
+            }
+        }
+        fclose(fp);
+    }
+
+    /* Then get the CMOS based ones */
+    wimpfont = (read_cmos_value(DesktopFeaturesCMOS) & desktopfontbits) >> 1;
+    protecticons = (read_cmos_value(DesktopFeaturesCMOS) & desktopwimpspriteprotection) != 0;
+    texturedwindows = (read_cmos_value(DesktopFeaturesCMOS) & desktopwindowtile) == 0;
+
+    /* Fill in any inconsistencies */
+    if ((wimpfont == 0) && (strlen(font) == 0))
+    {
+        env = getenv("Wimp$Font");
+        if (env != NULL) strcpy(font, env);
+    }
+    if (strlen(theme) == 0)
+    {
+        env = getenv("Wimp$IconTheme"); 
+        if (env != NULL) strcpy(theme, env);
+    }
+    more = strrchr(theme, '.'); /* Zap the path dot */
+    if (more != NULL) *more = '\0';
+
+    /* Stuff into dialogue box */
+    if (wimpfont == 0)
+    {
+        deskfont_get_by_name(font);
+    }
+    else
+    {
+        deskfont_get_by_number(wimpfont);
+    }
+    error_trap(optionbutton_set_state(0, main_window, CheckProtectIcons, protecticons ? 1 : 0), 0);
+    error_trap(optionbutton_set_state(0, main_window, CheckTexturedWindows, texturedwindows ? 1 : 0), 0);
+    error_trap(optionbutton_set_state(0, main_window, CheckLoadTheme, dontload ? 0 : 1), 0);
+
+    /* Try to set the theme last as it might override the options */
+    select_and_merge_theme(theme, wimpvis);
+}
+
+
+/*---------------------------------------------------------------------------*
+ * open_configure_window                                                     *
+ *                                                                           *
+ * Called to open the configure window on screen and register handlers.      *
+ *---------------------------------------------------------------------------*/
+
+static void open_configure_window(int at_x, int at_y)
+{
+    /* Create theme menu */
+    scan_installed_themes();
+
+    /* Default anything that can't be read from the options */
+    set_default_choices();
+    read_options();
+    if ((at_x == -1) && (at_y == -1))
+    {
+        /* No position supplied in the command line, just centre it */
+        error_trap(toolbox_show_object(0, main_window, Toolbox_ShowObject_Centre, NULL, 0, 0), 0);
+    }
+    else
+    {
+        int   buffer[2];
+
+        buffer[0] = at_x;
+        buffer[1] = at_y;
+        error_trap(toolbox_show_object(0, main_window, Toolbox_ShowObject_TopLeft, buffer, 0, 0), 0);
+    }
+}
+
+
+/*---------------------------------------------------------------------------*
+ * toolbox_error                                                             *
+ *                                                                           *
+ * Handler for errors from toolbox.                                          *
+ *---------------------------------------------------------------------------*/
+
+static int toolbox_error(int event_code, ToolboxEvent *event, IdBlock *id_block, void *handle)
+{
+    ToolboxErrorEvent *error_event = (ToolboxErrorEvent *)event;
+    _kernel_oserror err;
+
+    strcpy(err.errmess, error_event->errmess);
+    err.errnum=error_event->errnum;
+    wimp_report_error(&err, 0, "Configure", 0, 0, 0);
+
+    return 1;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * key_handler                                                               *
+ *                                                                           *
+ * Handler for key presses.                                                  *
+ *---------------------------------------------------------------------------*/
+
+static int key_handler(int event_code, WimpPollBlock *event, IdBlock *id_block, void *handle)
+{
+    int key_code = event->key_pressed.key_code;
+ 
+    wimp_process_key(key_code);
+ 
+    return 1;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * action_selected                                                           *
+ *                                                                           *
+ * Handler for when action buttons are clicked on.                           *
+ *---------------------------------------------------------------------------*/
+
+static int action_selected(int event_code, ToolboxEvent *event_block, IdBlock *id_block, void *handle)
+{
+    ActionButtonSelectedEvent *block = (ActionButtonSelectedEvent *) event_block;
+    int     icon = id_block->self_component;
+
+    switch (icon)
+    {
+        case ButtonSet:
+            save_choices();
+            if ((block->hdr.flags & 7)==0) program_exit(); /* Return pressed */
+            if (block->hdr.flags & 4) program_exit();      /* Left button */
+            break;
+
+        case ButtonCancel:
+            if ((block->hdr.flags & 7)==0) program_exit(); /* Escape pressed */
+            if (block->hdr.flags & 1)                      /* Right button */
+            {
+                 read_options();
+            }
+            if (block->hdr.flags & 4) program_exit();      /* Left button */
+            break;
+            
+        case ButtonDefault:
+            set_default_choices();
+            break;
+
+        case ButtonInstall:
+            if (bootmerge_alive)
+            {
+                WimpMessage message;
+
+                /* Bring to top */
+                message.hdr.size = 20;
+                message.hdr.your_ref = 0;
+                message.hdr.action_code = Wimp_MOpenConfigWindow;
+                error_trap(wimp_send_message(Wimp_EUserMessage, &message, bootmerge_taskhandle, 0, NULL), 0);
+            }
+            else
+            {
+                WimpGetWindowStateBlock state;
+                BBox gadget;
+                char command[256];
+                int  x0, y1;
+
+                /* Run a new copy near the button just pressed */
+                error_trap(window_get_wimp_handle(0, main_window, &state.window_handle), 0);
+                error_trap(wimp_get_window_state(&state), 0);
+                error_trap(gadget_get_bbox(0, main_window, ButtonInstall, &gadget), 0);
+                x0 = gadget.xmin + state.visible_area.xmin - state.xscroll;
+                y1 = gadget.ymax + state.visible_area.ymax - state.yscroll;
+                sprintf(command, "/BootResources:Configure.!BootSetup.!BootMerge.!Run -openat %i %i", x0, y1);
+                bootmerge_taskhandle = _swi(Wimp_StartTask, _IN(0) | _RETURN(0), command);
+                bootmerge_alive = bootmerge_taskhandle != 0;
+            }
+            break;
+    }
+
+    return 1;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * message_quit                                                              *
+ *                                                                           *
+ * Called when wimp quit message received.                                   *
+ *---------------------------------------------------------------------------*/
+ 
+static int message_quit(WimpMessage *event, void *handler)
+{
+    program_exit();
+    
+    return 1;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * message_reopen                                                            *
+ *                                                                           *
+ * Called when we receive a message from Configure telling us to reopen our  *
+ * window.                                                                   *
+ *---------------------------------------------------------------------------*/
+
+static int message_reopen(WimpMessage *event, void *handler)
+{
+    error_trap(toolbox_show_object(0, main_window, 0, 0, 0, 0), 0);
+
+    return 1;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * main_initialise                                                           *
+ *                                                                           *
+ * Initialise toolbox etc. Returns: 1 if everything went okay, 0 otherwise   *
+ *---------------------------------------------------------------------------*/
+
+static int main_initialise(void)
+{
+    static int mess_wanted[] = {Wimp_MQuit,
+                                Wimp_MOpenConfigWindow,
+                                Wimp_MTaskCloseDown,
+                                0};
+    static int tbox_wanted[] = {Toolbox_Error,
+                                ActionButton_Selected,
+                                OptionButton_StateChanged,
+                                Menu_Selection,
+                                Menu_SubMenu,
+                                FontMenu_Selection,
+                                0};
+    int        task_handle, dummy;
+    void      *area;
+
+    error_trap(toolbox_initialise(0, 310, mess_wanted, tbox_wanted,
+                                  "<ThmeSetup$Dir>", &messages_desc, &idb,
+                                  0, &task_handle, &area), 1);
+    spritearea = (int *)area;
+    error_trap(event_initialise(&idb), 1);
+    error_trap(event_set_mask(Wimp_Poll_NullMask), 0);
+    messages_register(&messages_desc, messages_string);
+    error_trap(toolbox_create_object(0, "FontMenu", &font_menu), 1);
+    error_trap(toolbox_create_object(0, "ThemeMenu", &theme_menu), 1);
+    error_trap(toolbox_create_object(0, "Theme", &main_window), 1);
+    error_trap(toolbox_create_object(0, "Preview", &preview_window), 1);
+    error_trap(popup_set_menu(0, main_window, PopUpTheme, theme_menu), 1);
+    error_trap(popup_set_menu(0, main_window, PopUpFont, font_menu), 1);
+
+    /* Get the underlying window/icon number for the rendering */
+    error_trap(window_get_wimp_handle(0, preview_window, &wh_of_preview), 0);
+    error_trap(gadget_get_icon_list(0, preview_window, SpriteRendering,
+                                    &ih_of_rendering, sizeof(ih_of_rendering), &dummy), 0);
+    error_trap(gadget_get_icon_list(0, preview_window, ButtonUnavailable,
+                                    &ih_of_unavailable, sizeof(ih_of_unavailable), &dummy), 0);
+    
+    /* Register handlers for the configure window */
+    error_trap(event_register_toolbox_handler(-1, Toolbox_Error, toolbox_error, NULL) ,0);
+    error_trap(event_register_toolbox_handler(main_window, ActionButton_Selected, action_selected, NULL), 0);
+    error_trap(event_register_toolbox_handler(main_window, OptionButton_StateChanged, option_changed, NULL), 0);
+    error_trap(event_register_toolbox_handler(theme_menu, Menu_Selection, theme_selected, NULL), 0);
+    error_trap(event_register_toolbox_handler(theme_menu, Menu_SubMenu, submenu_navigate, NULL), 0);
+    error_trap(event_register_toolbox_handler(font_menu, FontMenu_Selection, font_selected, NULL), 0);
+    error_trap(event_register_wimp_handler(-1, Wimp_EKeyPressed, key_handler, NULL), 0);
+    error_trap(event_register_message_handler(Wimp_MQuit, message_quit, NULL), 0);
+    error_trap(event_register_message_handler(Wimp_MOpenConfigWindow, message_reopen, NULL), 0);
+    error_trap(event_register_message_handler(Wimp_MTaskCloseDown, task_closing, NULL), 0);
+
+    return 1;
+}
+                                  
+
+/*---------------------------------------------------------------------------*
+ * main                                                                      *
+ *                                                                           *
+ * Main polling loop                                                         *
+ *---------------------------------------------------------------------------*/
+
+int main(int argc, char *argv[])
+{
+    WimpPollBlock wpb;
+    int           event_code;
+    int           openat_x = -1;
+    int           openat_y = -1;
+
+    /* Have we been passed any co-ordinates to open at? */
+    if ((argc >= 4) && (strcmp(argv[1], "-openat") == 0))
+    {
+        openat_x = atoi(argv[2]);
+        openat_y = atoi(argv[3]);
+    }
+
+    /* Do main initialisation */
+    if (!main_initialise()) return 0;
+    deskfont_build_romfont_table("Resources:$.Fonts", NULL);
+
+    /* Open configure window */
+    open_configure_window(openat_x, openat_y);
+    
+    /* Poll loop */
+    while (TRUE)
+    {
+        error_trap(event_poll(&event_code, &wpb, NULL), 0);
+    }
+}         

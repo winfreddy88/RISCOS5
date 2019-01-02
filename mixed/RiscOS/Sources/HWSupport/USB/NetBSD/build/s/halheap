@@ -1,0 +1,754 @@
+; Copyright 2011 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+
+; Simple heap manager for HAL USB drivers. This is a hacked apart version of
+; the OS_Heap code, with the following changes:
+;
+; * Support for re-entrancy removed, since the HAL can't really gain access
+;   to IRQSema. Instead, all heap ops run with IRQs disabled.
+; * No support for expanding/describing the heap, etc.
+; * Proper support for aligned allocs. Rather than using the cheap-and-nasty
+;   hack of allocating (blocksize+align) it considers each free block on a case
+;   by case basis to work out whether it can be used to satisfy the size &
+;   alignment constriants, then allocates the appropriate subsection of the
+;   free block.
+; * Register allocation & calling conventions tweaked:
+;   - Uses HAL-compatible calling conventions
+;   - InitHeap: hpd = r0, size = r1
+;   - GetArea: hpd = r0, size = r1, result in R0 (either a pointer or NULL)
+;   - FreeArea: hpd = r0, addr = r1 
+; * Some debugging/error checking code maintained, other bits stripped out.
+;   Debug code will need converting to use HAL-friendly macros before it can be
+;   used.
+; * Added GetAreaAligned, for memory-efficient allocation of aligned blocks:
+;   hpd = r0, size = r1, alignment = r2, result in R0 (either a pointer or NULL)
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:Machine.<Machine>
+        GET     Hdr:ImageSize.<ImageSize>
+
+        AREA    |C$$code|, CODE, READONLY
+
+        EXPORT  HALHeap_InitHeap
+        EXPORT  HALHeap_GetArea
+        EXPORT  HALHeap_GetAreaAligned
+        EXPORT  HALHeap_FreeArea
+
+        GBLL    debheap
+debheap SETL    1=0
+
+            GBLL    bkptonfail
+bkptonfail  SETL    {TRUE}
+
+Nil     *       0
+
+hpd     RN      r0      ; The punter sees these
+size    RN      r1
+addr    RN      r2
+
+work    RN      r3     ; But not these
+tp      RN      r4
+bp      RN      r5
+HpTemp  RN      r12
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; +                     H E A P   O R G A N I S A T I O N                     +
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; A heap block descriptor (hpd) has the form
+
+; +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+ -+ -+ -+ -+
+; |   magic   |    free   |    base   |    end    |   debug   |
+; +--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+--+- +- +- +- +
+;  0  1  2  3  4  5  6  7  8  9  10 11 12 13 14 15 16 17 18 19 20
+
+         ^      0, hpd
+hpdmagic #      4
+hpdfree  #      4
+hpdbase  #      4
+hpdend   #      4       ; Needed for debugging heap, and top end validation
+ [ debheap
+hpddebug #      4       ; 0 -> No debug, ~0 -> Debug
+ ]
+
+hpdsize  *      @-hpdmagic
+
+magic_heap_descriptor * (((((("p":SHL:8)+"a"):SHL:8)+"e"):SHL:8)+"H")
+
+; hpdmagic is a unique identification field
+; hpdfree  is the offset of the first block in the free space list
+; hpdbase  is the offset of the byte above the last one used
+; hpdend   is the offset of the byte above the last one usable
+
+;                               | hpdbase
+;                              \|/
+;      +---+--------------------+--------+
+;  low |hpd|     heap blocks    | unused | high
+;      +---+--------------------+---------+
+;              /|\                       /|\ 
+;               | hpdfree                 | hpdend
+;               | in here somewhere.
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+; Blocks in the free space list have the form :
+
+; +--+--+--+--+--+--+--+--+--+ ~ -+--+
+; | long link | long size |          |
+; +--+--+--+--+--+--+--+--+--+ ~ -+--+
+;  0  1  2  3  4  5  6  7  8      (size-1)
+;
+; where the link field is an offset to the next free block
+
+           ^    0 ; Can't use register relative unfortunately as many regs used
+frelink    #    4
+fresize    #    4
+freblksize #    0
+
+; The link field is Nil (0) for the last block in the list
+
+; Block sizes must be forced to a multiple of 8 bytes for subsequent link and
+; size information to be stored in them if they are disposed of by the user.
+
+; They must also be capable of storing a 4 byte size field while allocated.
+; This field is used to size the block to free when FreeArea is called.
+
+
+        ALIGN
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; InitHeap. Top level HeapEntry
+; ========
+;
+; Initialise a heap descriptor block
+
+; In : hpd -> block to initialise, size = size of block
+
+; To initialise (or even reinitialise) a heap descriptor:
+; $(
+;   hpd!magic := magic_heap_descriptor
+;   hpd!free  := Nil
+;   hpd!base  := hpdsize
+;   hpd!end   := size
+; $)
+
+HALHeap_InitHeap
+        LDR     HpTemp, =magic_heap_descriptor
+        STR     HpTemp, hpdmagic          ; hpd!magic := magic_heap_desc
+        MOV     HpTemp, #Nil
+        STR     HpTemp, hpdfree           ; hpd!free  := Nil
+        MOV     HpTemp, #hpdsize
+        STR     HpTemp, hpdbase           ; hpd!base  := hpdsize
+        STR     size,   hpdend            ; hpd!end   := size
+
+ [ debheap
+ MOV HpTemp, #0 ; No debugging until the punter sets this Word
+ STR HpTemp, hpddebug
+ ]
+        MOV     pc, lr
+
+        LTORG
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; GetArea. Top level HeapEntry
+; =======
+;
+; Allocate a block of memory from the heap
+
+; This will allocate the first block of sufficiently large size in the free
+; list, with an oversize block being split.
+; Failure to find a large enough block on the free list will try to claim
+; space out of the heap block.
+; Fails if requesting size = 0
+
+; In : hpd -> heap pointer, size = size of block required
+
+; Out : R0 -> got a block
+;       R0 = 0, couldn't get block
+
+HALHeap_GetArea
+        MRS     ip, CPSR
+        Push    "tp,bp,ip,lr"
+        ORR     ip, ip, #I32_bit
+        MSR     CPSR_c, ip
+
+ [ debheap
+; HpTemp not critical
+ LDR HpTemp, hpddebug
+ CMP HpTemp, #0
+ BEQ %FT00
+ Push  "r0, link"
+ MOV r0, size
+ DREG r0, "GetArea "
+ BL iShowHeap
+ Pull "r0, link"
+00
+ ]
+
+        CMP     size, #0                        ; Can't deallocate 0, so there!
+        BLE     garfailed_zero                  ; And -ve is invalid as well!
+     ; note sizes of many megabytes thrown out by looking.
+
+        ADD     size, size, #(freblksize-1)+4   ; Make block size granular
+        BIC     size, size, #(freblksize-1)     ; with size field added
+
+        ADR     addr, hpdfree-frelink           ; addr:= @(hpd!free)-frelink
+
+garloop
+        LDR     tp, [addr, #frelink]        ; tp := addr!fre.link
+        CMP     tp, #Nil                    ; Is this the end of the chain ?
+        BEQ     garmore                     ;  - so try main blk
+        ADD     addr, addr, tp              ; convert offset
+        LDR     HpTemp, [addr, #fresize]    ; If length < size then no good
+        SUBS    HpTemp, HpTemp, size        ; In case this works, for below split
+        BLO     garloop
+
+; Now addr -> a block on the free space list that our item will fit in
+; If we have an exact fit (or as close as the granularity of the free list will
+; allow), unlink this block and return it
+
+        BNE     SplitFreeBlock
+
+ [ debheap
+ LDR HpTemp, hpddebug
+ CMP HpTemp, #0
+ BEQ %FT60
+ WRLN "Got an exact fit block"
+60
+ ]
+
+        LDR     HpTemp, [addr, #frelink]  ; Move this block's link field
+        CMP     HpTemp, #Nil
+        ADDNE   HpTemp, HpTemp, tp        ; convert offset into offset from
+                                          ; previous block
+        ASSERT  frelink=0
+        STR     HpTemp, [addr, -tp]       ; store in link of previous block
+        B       ResultIsAddrPlus4
+
+SplitFreeBlock
+; Need to split the free block, returning the end portion to the caller
+
+ [ debheap
+; HpTemp critical
+ Push  HpTemp
+ LDR HpTemp, hpddebug
+ CMP HpTemp, #0
+ BEQ %FT70
+ WRLN "Splitting free block"
+70
+ Pull HpTemp
+ ]
+
+        STR     HpTemp, [addr, #fresize]  ; Adjust size of free block remaining
+        ADD     addr, addr, HpTemp        ; addr -> free block just deallocated
+
+ResultIsAddrPlus4
+
+        STR     size, [addr]           ; Store block size
+        ADD     r0, addr, #4           ; Move to correct return reg & add offset
+        Pull    "tp,bp,ip,lr"
+        MSR     CPSR_c, ip
+        MOV     pc, lr
+
+
+; Got no more free blocks of length >= size, so try to allocate more heap space
+; out of the block described by hpd
+
+garmore
+ [ debheap
+; HpTemp not critical
+ LDR HpTemp, hpddebug
+ CMP HpTemp, #0
+ BEQ %FT80
+ WRLN "Trying to get more from main block"
+80
+ ]
+
+        LDR     addr, hpdbase
+        ADD     tp, addr, size        ; addr := (hpd!base +:= size)
+        LDR     HpTemp, hpdend
+        CMP     tp, HpTemp            ; See if we'd fall out of the bottom
+        STRLS   tp, hpdbase           ; Only adjust hpdbase if valid alloc
+        ADDLS   addr, addr, hpd       ; offset conversion
+        BLS     ResultIsAddrPlus4
+ [ debheap
+ STRIM "Not enough room to allocate in main block"
+ ]
+
+garfailed
+ [ debheap
+ WRLN " : GetArea failed"
+ ]
+garfail_common
+ [ bkptonfail
+        BKPT    &123
+ ]
+        MOV     R0, #0                ; addr := 0 if we couldn't allocate
+        Pull    "tp,bp,ip,lr"
+        MSR     CPSR_c, ip
+        MOV     pc, lr        
+
+ [ debheap
+garfailed_zero
+ STRIM "Can't allocate 0 or less bytes"
+ B garfailed
+ |
+garfailed_zero * garfailed
+ ]
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; GetAreaAligned. Top level HeapEntry
+; ==============
+;
+; Allocate an aligned block of memory from the heap
+
+; This is the same as GetArea, except it will only allocate areas with the given
+; (power-of-two) alignment.
+; Fails if requesting size = 0
+
+; In : hpd -> heap pointer, size = size of block required, addr = alignment
+
+; Out : R0 -> got a block
+;       R0 = 0, couldn't get block
+
+HALHeap_GetAreaAligned
+        MRS     ip, CPSR
+        Push    "tp,bp,ip,lr"
+        ORR     ip, ip, #I32_bit
+        MSR     CPSR_c, ip
+
+        CMP     size, #0                        ; Can't deallocate 0, so there!
+        BLE     garfailed_zero                  ; And -ve is invalid as well!
+     ; note sizes of many megabytes thrown out by looking.
+
+        ADD     size, size, #(freblksize-1)     ; Make block size granular
+        BIC     size, size, #(freblksize-1)
+
+        SUB     bp, addr, #1                    ; Store alignment-1 in bp
+        CMP     bp, #3
+        MOVLT   bp, #3                          ; Minimum alignment is 4
+
+        ADR     addr, hpdfree-frelink           ; addr:= @(hpd!free)-frelink
+
+garaloop
+        LDR     tp, [addr, #frelink]        ; tp := addr!fre.link
+        CMP     tp, #Nil                    ; Is this the end of the chain ?
+        BEQ     garamore                    ;  - so try main blk
+        ADD     addr, addr, tp              ; convert offset
+        LDR     HpTemp, [addr, #fresize]
+
+; Calculate start and end addresses as if we were to allocate from this block
+        ADD     work,addr,#4 ; 4 bytes for storing block size
+        ADD     work,work,bp
+garaloop2
+        BIC     work,work,bp ; work = start of user block
+        SUB     lr,work,addr
+        CMP     lr,#4
+        BEQ     garastartok ; Start alignment is exact
+        CMP     lr,#freblksize+4
+        BGE     garastartok ; Enough space to fit a free block at the start
+
+; We need a free block, but there isn't enough space for it.
+; Shift 'work' up by one unit of alignment and try again.
+
+        ADD     work,work,bp,LSL #1
+        B       garaloop2
+
+garastartok
+; Calculate block end address
+        ADD     lr,work,size ; End of user block
+        ADD     HpTemp,HpTemp,addr ; End of free block
+        SUBS    lr,HpTemp,lr ; Gap after user block
+        BLO     garaloop ; Not big enough
+
+; We have a suitable space to allocate from.
+        ADD     size,size,#4 ; Correct size to store
+        SUB     work,work,#4 ; Correct block start
+
+; Work out if we need a new free block afterwards
+        CMP     lr, #freblksize
+        ADDLT   size, size, lr ; Not enough space, so enlarge allocated block
+        BLT     %FT10
+
+; Create a new free block that will lie after our allocated block
+        SUB     HpTemp, HpTemp, lr
+        STR     lr, [HpTemp, #fresize]    ; Write size
+        LDR     lr, [addr, #frelink]
+        CMP     lr, #Nil
+        ADDNE   lr, lr, addr
+        SUBNE   lr, lr, HpTemp
+        STR     lr, [HpTemp, #frelink]    ; Write next ptr
+        SUB     HpTemp, HpTemp, addr
+        STR     HpTemp, [addr, #frelink]  ; Fix up link from previous block
+10
+
+; Shrink this free block to take up the space preceeding the allocated block.
+        SUBS    bp,work,addr
+        STRNE   bp, [addr, #fresize]
+        BNE     ResultIsWorkPlus4 
+
+; No space for an initial free block. Get rid of it.
+        ASSERT  frelink=0 ; otherwise LDR lr,[addr,#frelink]!
+        LDR     lr, [addr]
+        CMP     lr, #0
+        ADDNE   lr, lr, tp
+        STR     lr, [addr, -tp]
+        B       ResultIsWorkPlus4
+ 
+; Got no more free blocks of length >= size, so try to allocate more heap space
+; out of the block described by hpd
+
+garamore
+        LDR     work, hpdbase
+        ADD     work, work, hpd
+        ADD     tp, work, #4
+        ADD     tp, tp, bp
+garamoreloop
+        BIC     tp, tp, bp            ; tp = pointer to return to user
+
+; Make sure there's enough space for a free block if necessary
+        SUB     HpTemp, tp, work      ; HpTemp = tp-(hpd+hpdbase)
+        CMP     HpTemp, #4
+        BEQ     garamoreok
+        CMP     HpTemp, #freblksize+4
+        ADDLT   tp, tp, bp, LSL #1 ; Not enough space for free block
+        BLT     garamoreloop
+garamoreok
+        ADD     HpTemp, tp, size      ; New heap end
+        SUB     HpTemp, HpTemp, hpd   ; New heap size
+        LDR     lr, hpdend
+        CMP     HpTemp, lr
+        BGT     garfailed
+
+; Set up the block to return to the user
+        ADD     size, size, #4
+        STR     size, [tp, #-4]!
+
+; Grow the heap
+        STR     HpTemp, hpdbase
+
+; Create preceeding free block if necessary
+        SUBS    HpTemp, tp, work
+        BEQ     ResultIsTpPlus4
+
+; Write the free block
+        STR     HpTemp, [work, #fresize]
+        MOV     HpTemp, #Nil
+        STR     HpTemp, [work, #frelink]
+
+; Patch up the preceeding block
+        SUB     HpTemp, work, addr
+        STR     HpTemp, [addr, #frelink]
+
+ResultIsTpPlus4
+; Block size is already stored
+        ADD     r0, tp, #4
+        Pull    "tp,bp,ip,lr"
+        MSR     CPSR_c, ip
+        MOV     pc, lr
+        
+ResultIsWorkPlus4
+        STR     size, [work]           ; Store block size
+        ADD     r0, work, #4           ; Move to correct return reg & add offset
+        Pull    "tp,bp,ip,lr"
+        MSR     CPSR_c, ip
+        MOV     pc, lr
+
+
+; +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+;
+; FreeArea. Top level HeapEntry
+; ========
+;
+; Return an area of store to the heap
+
+; In : hpd -> heap descriptor, r1 -> block to free
+
+; The block to be freed is matched against those on the free list and inserted
+; in it's correct place, with the list being maintained in ascending address
+; order. If possible, the freed block is merged with contigous blocks above
+; and below it to give less fragmentation, and if contiguous with main memory,
+; is merged with that. If the latter, check to see if there is a block which
+; would be made contiguous with main memory by the former's freeing, and if so,
+; merge that with main memory too. Phew !
+
+HALHeap_FreeArea
+        MRS     ip, CPSR
+        MOV     addr, r1
+        Push    "tp,bp,ip,lr"
+        ORR     ip, ip, #I32_bit
+        MSR     CPSR_c, ip
+
+ [ debheap
+; HpTemp not critical
+ LDR HpTemp, hpddebug
+ CMP HpTemp, #0
+ BEQ %FT00
+ Push  "r0, link"
+ STRIM "FreeArea "
+ SUB r0, addr, hpd
+ SUB r0, r0, #4
+ BL PrintOffsetLine
+ BL iShowHeap
+ Pull "r0, link"
+00
+ ]
+        BL      FindHeapBlock
+        BLVC    FreeChunkWithConcatenation
+
+        Pull    "tp,bp,ip,lr"
+        MSR     CPSR_c, ip
+        MOV     pc, lr
+
+;**************************************************************************
+; Common routines for free/extend
+
+FindHeapBlock   ROUT
+; Convert addr to address
+; Validate heap
+; check block is an allocated block
+; return tp = free list entry before the block (hpdfree if none)
+;      work = free list before that (if exists)
+; corrupts HpTemp, bp
+
+        Push    lr
+
+        SUB     addr, addr, hpd     ; convert to offset
+        SUB     addr, addr, #4      ; real block posn
+
+; Find block in heap by chaining down freelist, stepping through blocks
+
+; TMD 01-Mar-89
+; no need to check explicitly for null free list, code drops thru OK
+
+ [ debheap
+ LDR HpTemp, hpddebug
+ CMP HpTemp, #0
+ BEQ %FT03
+ Push lr
+ WRLN "Scanning freelist"
+ Pull lr
+03
+ ]
+
+; step down free list to find appropriate chunk
+; get tp = free block before addr
+; HpTemp =  "     "   after   "
+;   work = block before tp
+
+        MOV     tp, #:INDEX: hpdfree
+StepDownFreeList
+        LDR     HpTemp, [hpd, tp]     ; link offset
+        CMP     HpTemp,#Nil
+        BEQ     ListEnded             ; EQ state used!
+        ADD     HpTemp, HpTemp, tp
+        CMP     HpTemp, addr
+        MOVLS   work, tp
+        MOVLS   tp, HpTemp
+        BLS     StepDownFreeList
+ListEnded
+        LDREQ   HpTemp, hpdbase      ; if EQ from CMP HpTemp, addr
+                                     ; then bad block anyway
+        CMP     tp, #:INDEX: hpdfree
+        MOVEQ   bp, #hpdsize         ; is this a fudge I see before me?
+        BEQ     ScanAllocForAddr
+        ADD     bp, tp, #fresize
+        LDR     bp, [hpd, bp]
+        ADD     bp, tp, bp
+
+ScanAllocForAddr
+; bp     -> start of allocated chunk
+; HpTemp -> end    "   "        "
+; scan to find addr, error if no in here
+
+       Push    work       ; keep prevlink ptr
+
+  [ debheap
+; HpTemp critical
+ Push "HpTemp, R0, link"
+ LDR HpTemp, hpddebug
+ CMP HpTemp, #0
+ BEQ %FT02
+ STRIM "Scan for addr from "
+ MOV   R0, bp
+ BL    PrintOffset
+ STRIM " to "
+ LDR   R0,[stack,#4]  ; HpTemp
+ BL    PrintOffsetLine
+02
+ Pull "HpTemp, r0, link"
+ ]
+        B       CheckForNullAllocn
+
+ScanAllocForAddrLoop
+        CMP     bp, addr
+        BEQ     ValidBlock
+        LDR     work, [bp, hpd]    ; get size
+        ADD     bp, bp, work
+CheckForNullAllocn
+        CMP     bp, HpTemp
+        BLT     ScanAllocForAddrLoop
+
+ [ debheap
+ Push lr
+ STRIM "Given pointer not a block"
+ Pull lr
+ ]
+       SETV
+       Pull   "work, pc"
+
+ValidBlock    ; tp = free link offset, addr = block offset
+       CLRV
+       Pull   "work, pc"
+
+;****************************************************************************
+
+FreeChunkWithConcatenation ROUT
+; in : addr -> block
+;      tp   -> preceding free list entry
+; out : block freed, concatenated with any free parts on either side,
+;       base reduced if can do
+; corrupts HpTemp, bp, size, addr
+
+; TMD 01-Mar-89: FindHeapBlock now never returns tp=Nil, only tp=hpdfree,
+; so no need for check, code will get there eventually!
+
+; attempt concatenation with free blocks on both/either side
+ [ debheap
+ Push "R0, lr"
+ LDR HpTemp, hpddebug
+ CMP HpTemp, #0
+ BEQ %FT04
+ STRIM "concatenation attempt with free ptr "
+ MOV   R0,tp
+ BL    PrintOffsetLine
+04
+ Pull  "R0, lr"
+ ]
+
+        LDR     size, [addr, hpd]      ; block size
+        ADD     bp, size, addr         ; eob offset
+        LDR     HpTemp, [tp, hpd]      ; Nil doesn't matter here!
+        ADD     HpTemp, HpTemp, tp     ; offset of free block after ours
+        CMP     HpTemp, bp             ; if tp was hpdfree then <> bp
+        BNE     NoConcatWithNext       ; so will take branch
+
+ [ debheap
+ Push lr
+ LDR bp, hpddebug
+ CMP bp, #0
+ BEQ %FT05
+ WRLN "concatenating with block after"
+05
+ Pull lr
+ ]
+        ADD    bp, hpd, HpTemp
+        LDR    bp, [bp, #fresize]
+        ADD    bp, bp, size
+        STR    bp, [addr, hpd]       ; enlarge our block
+        LDR    bp, [HpTemp, hpd]     ; offset in free list
+        CMP    bp, #Nil
+        ADDNE  bp, HpTemp, bp        ; offset from heap start
+        SUBNE  bp, bp, tp            ; free list offset
+        STR    bp, [tp, hpd]         ; free list updated, our block bigger
+                                     ; - but not in the free list yet!
+
+NoConcatWithNext  ; tp = free link offset, addr = block offset
+                  ; now try for concatenation with previous block
+        CMP    tp, #:INDEX: hpdfree  ; are we before any real free blocks?
+        BEQ    NoConcatenation       ; yup
+
+        ADD    HpTemp, tp, hpd
+        LDR    size, [HpTemp, #fresize]
+        ADD    bp, size, tp
+        CMP    bp, addr
+        BNE    NoConcatenation
+ [ debheap
+ Push lr
+ LDR bp, hpddebug
+ CMP bp, #0
+ BEQ %FT06
+ WRLN "concatenating with block before"
+ STRIM "prevfree = "
+ Push  R0
+ MOV   R0, work
+ BL    PrintOffsetLine
+ Pull  R0
+06
+ Pull lr
+ ]
+        LDR    bp, [addr, hpd]         ; get block size
+        ADD    size, bp, size          ; new free block size
+        STR    size, [HpTemp, #fresize]
+; now check for butts against base : work is still prevnode to tp
+        ADD    HpTemp, size, tp
+        LDR    bp, hpdbase
+        CMP    bp, HpTemp
+        BNE    %FT06                 ; all done : exit keeping IRQs off
+        SUB    bp, bp, size
+        STR    bp, hpdbase           ; step unused bit back
+        MOV    bp, #Nil              ; this MUST have been last free block!
+        STR    bp, [work, hpd]
+06
+        CLRV
+        MOV    PC, lr                ; Whew!
+
+NoConcatenation ; check if block butts against base
+; tp = previous freelink offset
+        LDR     size, [addr, hpd]
+        ADD     HpTemp, size, addr
+        LDR     bp, hpdbase
+        CMP     bp, HpTemp
+        BNE     AddToFreeList
+        SUB     bp, bp, size
+        STR     bp, hpdbase
+        CLRV
+        MOV     PC, lr
+
+AddToFreeList  ; block at addr, previous free at tp
+ [ debheap
+ Push "R0, lr"
+ LDR HpTemp, hpddebug
+ CMP HpTemp, #0
+ BEQ %FT07
+ STRIM "add to free list : free link "
+ MOV   R0,tp
+ BL    PrintOffset
+ STRIM ", block "
+ MOV   R0, addr
+ BL    PrintOffsetLine
+07
+ Pull "R0, lr"
+ ]
+        LDR    size, [addr, hpd]!
+        STR    size, [addr, #fresize]
+        SUB    addr, addr, hpd
+        LDR    size, [hpd, tp]      ; prevlink
+        CMP    size, #Nil
+        SUBNE  size, size, addr
+        ADDNE  size, size, tp       ; form offset if not eolist
+        STR    size, [addr, hpd]
+        SUB    size, addr, tp
+        STR    size, [tp, hpd]
+        CLRV
+        MOV    PC, lr
+
+; ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+        END
+

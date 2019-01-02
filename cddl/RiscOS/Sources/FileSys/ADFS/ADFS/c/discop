@@ -1,0 +1,407 @@
+/*
+ * CDDL HEADER START
+ *
+ * The contents of this file are subject to the terms of the
+ * Common Development and Distribution License (the "Licence").
+ * You may not use this file except in compliance with the Licence.
+ *
+ * You can obtain a copy of the licence at
+ * cddl/RiscOS/Sources/FileSys/ADFS/ADFS/LICENCE.
+ * See the Licence for the specific language governing permissions
+ * and limitations under the Licence.
+ *
+ * When distributing Covered Code, include this CDDL HEADER in each
+ * file and include the Licence file. If applicable, add the
+ * following below this CDDL HEADER, with the fields enclosed by
+ * brackets "[]" replaced with your own identifying information:
+ * Portions Copyright [yyyy] [name of copyright owner]
+ *
+ * CDDL HEADER END
+ */
+/*
+ * Copyright 2015 Ben Avison.  All rights reserved.
+ * Use is subject to license terms.
+ */
+
+/** \file discop.c
+ * Implementation of low-level disc operation handlers.
+ */
+
+#include <string.h>
+#include "swis.h"
+
+#include "Global/NewErrors.h"
+
+#include "Interface/FileCore.h"
+#include "Interface/FileCoreErr.h"
+#include "Interface/ADFSErr.h"
+#include "Interface/ATA.h"
+
+#include "ata.h"
+#include "discop.h"
+#include "globals.h"
+#include "message.h"
+
+/** Timeout to set on ATA commands (cs) */
+#define OP_TIMEOUT (1000)
+
+/** FileCore scatter list threshold */
+#define SCATTER_THRESHOLD (0xFFFF0000u)
+
+/** Move to the next scatter entry in an array; cope with FileCore-style looped lists */
+#define ADVANCE_SCATTER_POINTER(p)                                         \
+  do                                                                       \
+  {                                                                        \
+    (p)++;                                                                 \
+    if ((p)->length == 0 && (uintptr_t) (p)->address >= SCATTER_THRESHOLD) \
+      (p) = (scatter_t *) ((uintptr_t) (p) + (uintptr_t) (p)->address);    \
+  }                                                                        \
+  while (0)
+
+/** Round a 64-bit number down to a power-of-2 */
+#define ROUND_DOWN_64(number, bits) ((number) &~ ((1ull << (bits)) - 1))
+
+/** Round a 64-bit number up to a power-of-2 */
+#define ROUND_UP_64(number, bits) ROUND_DOWN_64(((number) + (1ull << (bits)) - 1), (bits))
+
+uint8_t discop_decode_disc_error(_kernel_oserror *e)
+{
+  /** Table mapping from offsets into SATADriver's error block to vaguely ST506-compatible disc error numbers */
+  static const uint8_t disc_error_lut[][2] = {
+      { ErrorNumber_ATA_CmdBusy   & 0xFF, 0x21 }, /* Drive busy when commanded ->     Drive busy when commanded */
+      { ErrorNumber_ATA_CmdNotRdy & 0xFF, 0x08 }, /* Drive not ready           -> NRY Ready signal has been negated */
+      { ErrorNumber_ATA_Busy      & 0xFF, 0x22 }, /* Drive busy                ->     Drive busy on command completion */
+      { ErrorNumber_ATA_WFT       & 0xFF, 0x07 }, /* Drive write fault         -> WFL Write fault */
+      { ErrorNumber_ATA_ICRC      & 0xFF, 0x26 }, /* Drive interface CRC error        */
+      { ErrorNumber_ATA_Packet    & 0xFF, 0x25 }, /* Packet drive error               */
+      { ErrorNumber_ATA_Unknown   & 0xFF, 0x24 }, /* Unknown code in error reg        */
+      { ErrorNumber_ATA_NDAM      & 0xFF, 0x18 }, /* No data address mark      -> NDA Missing address mark */
+      { ErrorNumber_ATA_NTK0      & 0xFF, 0x09 }, /* No track 0                -> NSC No seek complete */
+      { ErrorNumber_ATA_ABRT      & 0xFF, 0x02 }, /* Drive abort               -> IVC Invalid command */
+      { ErrorNumber_ATA_IDNF      & 0xFF, 0x16 }, /* Sector ID not found       -> TOV ID not found within timeout */
+      { ErrorNumber_ATA_UNC       & 0xFF, 0x13 }, /* Uncorrectable error       -> DFE Fatal ECC error in data area */
+      { ErrorNumber_ATA_BBK       & 0xFF, 0x17 }, /* Bad block                 -> NIA ID area started with an improper address mark */
+  };
+  if ((e->errnum &~ 0xFF) == ErrorBase_ATA)
+    for (size_t i = 0; i < sizeof disc_error_lut / sizeof *disc_error_lut; ++i)
+      if ((e->errnum & 0xFF) == disc_error_lut[i][0])
+        return disc_error_lut[i][1];
+  return 0;
+}
+
+static low_level_error_t transfer_with_retries(uint32_t reason,
+                                               uint32_t flags,
+                                               drive_t * restrict dr,
+                                               uint64_t * restrict disc_address,
+                                               block_or_scatter_t * restrict ptr,
+                                               size_t * restrict transfer_length)
+{
+  low_level_error_t e;
+  /* Old ADFS only used retries for floppies and ST506 hard discs. Let's try
+   * reintroducing them. */
+  int32_t retries = reason == DiscOp_Verify ? 0 : g_retries.type.winnie;
+  do
+  {
+    size_t transferred, not_transferred;
+    e.oserror = NULL;
+
+    static const uint8_t command[3][2][2] = {
+        { { ATACOMMAND_READ_VERIFY_SECTORS,     ATACOMMAND_READ_VERIFY_SECTORS     },
+          { ATACOMMAND_READ_VERIFY_SECTORS_EXT, ATACOMMAND_READ_VERIFY_SECTORS_EXT }, },
+        { { ATACOMMAND_READ_SECTORS,            ATACOMMAND_READ_DMA,               },
+          { ATACOMMAND_READ_SECTORS_EXT,        ATACOMMAND_READ_DMA_EXT,           }, },
+        { { ATACOMMAND_WRITE_SECTORS,           ATACOMMAND_WRITE_DMA,              },
+          { ATACOMMAND_WRITE_SECTORS_EXT,       ATACOMMAND_WRITE_DMA_EXT,          }, },
+    };
+    ataop_param_lba48_t p = {
+        .sector_count0 = (uint8_t) (*transfer_length >> dr->log2_sector_size),
+        .sector_count1 = (uint8_t) (*transfer_length >> (dr->log2_sector_size + 8)),
+        .lba0 = (uint8_t) (*disc_address >> dr->log2_sector_size),
+        .lba1 = (uint8_t) (*disc_address >> (dr->log2_sector_size + 8)),
+        .lba2 = (uint8_t) (*disc_address >> (dr->log2_sector_size + 16)),
+        .lba3 = (uint8_t) (*disc_address >> (dr->log2_sector_size + 24)),
+        .lba4 = (uint8_t) (*disc_address >> (dr->log2_sector_size + 32)),
+        .lba5 = (uint8_t) (*disc_address >> (dr->log2_sector_size + 36)),
+        .device = DEVICE_MAGIC | DEVICE_LBA,
+        .command = command[reason][dr->lba48][1]
+    };
+    if (!dr->lba48)
+    {
+      p.sector_count1 = 0;
+      p.lba3 = 0;
+      p.device |= (uint8_t) (*disc_address >> (dr->log2_sector_size + 24)) & 0xF;
+    }
+    flags |= ATAOp_DMA |
+        (dr->deviceid << ATAOp_DeviceIDShift) |
+        (dr->cpid << ATAOp_CPIDShift) |
+        (reason << ATAOp_TransShift);
+    dprintf("ATAOp: flags %08X, command %02X, ptr %p, len %u -> ",
+        flags, p.command, ptr->block, *transfer_length);
+    e.oserror = ata_op_fg_data(flags, 11, &p, ptr->block, *transfer_length, OP_TIMEOUT, &not_transferred);
+    if (e.oserror && e.oserror->errnum == ErrorNumber_TooComplex)
+    {
+      /* Special case: hit capability limit in controller, so recalculate */
+      dprintf("TooComplex: limit = %u\n", not_transferred);
+      *transfer_length = not_transferred;
+      break; /* No retries for this one */
+    }
+    dprintf("%s: not_transferred = %u\n", e.oserror ? e.oserror->errmess : "OK", not_transferred);
+
+    /* Advance buffer pointer or scatter list (as appropriate) according to
+     * however many bytes we successfully transferred */
+    transferred = *transfer_length - not_transferred;
+    *disc_address += transferred;
+    if (flags & ATAOp_Scatter)
+      while (transferred > 0)
+      {
+        size_t this_time = MIN(ptr->scatter->length, transferred);
+        ptr->scatter->address += this_time;
+        if ((ptr->scatter->length -= this_time) == 0)
+          ADVANCE_SCATTER_POINTER(ptr->scatter);
+        transferred -= this_time;
+      }
+    else
+      ptr->block += transferred;
+    *transfer_length = not_transferred;
+
+    if (e.oserror && e.oserror->errnum == ErrorNumber_Escape)
+    {
+      e.oserror = MESSAGE_ERRORLOOKUP(true, ExtEscape, 0);
+      break; /* No retries for this one */
+    }
+    else if (e.oserror && (e.oserror->errnum == ErrorNumber_ATA_CmdBusy ||
+                           e.oserror->errnum == ErrorNumber_ATA_CmdNotRdy))
+    {
+      /* With SATA, we need to kick the device to send us updated task file
+       * registers to enable us to recover from these error conditions. For
+       * this, we need a command with no side effects that is valid to issue
+       * when DRDY is not set; the only candidate valid for all types and
+       * generations of device is EXECUTE_DEVICE_DIAGNOSTIC. Throw away any
+       * errors returned from the kick command. */
+      ataop_param_lba28_t kick_p = {
+          .device = DEVICE_MAGIC,
+          .command = ATACOMMAND_EXECUTE_DEVICE_DIAGNOSTIC
+      };
+      uint32_t kick_flags = ATAOp_NoDRDY |
+          (dr->deviceid << ATAOp_DeviceIDShift) |
+          (dr->cpid << ATAOp_CPIDShift) |
+          ATAOp_TransNone |
+          (flags & ATAOp_DisableEscape);
+      ata_op_fg_nodata(kick_flags, 7, &kick_p, OP_TIMEOUT);
+    }
+    if (e.oserror && transferred)
+      ++retries; /* At least some data transferred, so it's not fair to decrement the retry count when we loop */
+  }
+  while (e.oserror != NULL && --retries >= 0);
+  return e;
+}
+
+static low_level_error_t buffered_transfer(uint32_t reason,
+                                           uint32_t flags,
+                                           drive_t *dr,
+                                           uint64_t * restrict disc_address,
+                                           block_or_scatter_t * restrict ptr,
+                                           size_t * restrict total_length)
+{
+  /* The buffer will in practice always be small enough that we don't have to
+   * worry about "Transfer too complex" errors from the driver. */
+  low_level_error_t e;
+  e.number = 0;
+  if (reason == DiscOp_WriteSecs)
+  {
+    /* First read the existing contents of the disc */
+    uint64_t buffer_disc_address = *disc_address;
+    uint8_t *buffer = dr->block_buffer;
+    size_t remaining = dr->sector_size;
+    e = transfer_with_retries(DiscOp_ReadSecs,
+                              flags &~ ATAOp_Scatter,
+                              dr,
+                              &buffer_disc_address,
+                              (block_or_scatter_t *) &buffer,
+                              &remaining);
+  }
+  if (e.number == 0)
+  {
+    if (reason == DiscOp_WriteSecs)
+    {
+      /* Partially overwrite the buffer with the new data (leave the scatter list entries untouched at this point) */
+      block_or_scatter_t from = *ptr;
+      uint8_t *to = dr->block_buffer;
+      int32_t count = *total_length;
+      if (flags & ATAOp_Scatter)
+        while (count > 0)
+        {
+          size_t this_time = MIN(from.scatter->length, count);
+          memcpy(to, from.scatter->address, this_time);
+          ADVANCE_SCATTER_POINTER(from.scatter); /* doesn't matter if we advance on last iteration */
+          to += this_time;
+          count -= this_time;
+        }
+      else
+        memcpy(to, from.block, count);
+    }
+    /* Do the main transfer */
+    uint64_t buffer_disc_address = *disc_address;
+    uint8_t *buffer = dr->block_buffer;
+    size_t remaining = dr->sector_size;
+    e = transfer_with_retries(reason,
+                              flags &~ ATAOp_Scatter,
+                              dr,
+                              &buffer_disc_address,
+                              (block_or_scatter_t *) &buffer,
+                              &remaining);
+    /* Irrespective of whether there was an error or not, update the scatter list etc
+     * according to how many bytes were successfully read/written. Note that we have
+     * to be able to cope with an error after the "interesting" region. */
+    uint8_t *from = dr->block_buffer;
+    int32_t count = buffer - from;
+    count = MIN(count, *total_length);
+    *disc_address += count;
+    *total_length -= count;
+    if (flags & ATAOp_Scatter)
+      while (count > 0)
+      {
+        size_t this_time = MIN(ptr->scatter->length, count);
+        if (reason == DiscOp_ReadSecs)
+        {
+          memcpy(ptr->scatter->address, from, count);
+          from += count;
+        }
+        ptr->scatter->address += this_time;
+        if ((ptr->scatter->length -= this_time) == 0)
+          ADVANCE_SCATTER_POINTER(ptr->scatter);
+        count -= this_time;
+      }
+    else
+    {
+      if (reason == DiscOp_ReadSecs)
+        memcpy(ptr->block, from, count);
+      ptr->block += count;
+    }
+  }
+  return e;
+}
+
+low_level_error_t discop(uint32_t reason,
+                         uint32_t flags,
+                         uint32_t drive,
+                         uint64_t * restrict disc_address,
+                         block_or_scatter_t * restrict ptr,
+                         size_t * restrict fg_length)
+{
+  low_level_error_t e;
+  e.number = 0;
+  spinrw_read_lock(&g_drive_lock);
+  drive_t *dr = g_drive[drive - 4 + NUM_FLOPPIES];
+
+  if (drive < 4 || dr == NULL)
+  {
+    dprintf("Bad drive number: %u\n", drive);
+    e.number = BadDriveErr;
+    goto exit;
+  }
+
+  if (*disc_address + *fg_length > dr->capacity || !IS_SECTOR_ALIGNED(*disc_address, dr->sector_size))
+  {
+    dprintf("Disc address range :%u/%016llX-%016llX, limit %016llX, %ssector aligned\n",
+        drive, *disc_address, *disc_address + *fg_length, dr->capacity, IS_SECTOR_ALIGNED(*disc_address, dr->sector_size) ? "is " : "not ");
+    e.number = BadParmsErr;
+    goto exit;
+  }
+
+#ifndef ENABLE_BACKGROUND_TRANSFERS
+  if (flags & ATAOp_Background)
+  {
+    dprintf("Background transfer not supported\n");
+    e.number = BadParmsErr;
+    goto exit;
+  }
+#endif
+
+//  if ((flags & ATAOp_Scatter) == 0)
+//  {
+//    uint32_t flags;
+//    _swix(OS_ValidateAddress, _INR(0,1)|_OUT(_FLAGS), ptr->block, ptr->block + *fg_length, &flags);
+//    dprintf("Validate flags 0x%X\n", flags);
+//    if (flags & _C)
+//      while (1);
+//    if (flags & _N) // should be C but I want to trap with JTAG
+//    {
+//      dprintf("No memory at address\n");
+//      e.oserror = (_kernel_oserror *) "\0\0\0\0No memory at address";
+//      goto exit;
+//    }
+//  }
+
+  if (*fg_length == 0)
+  {
+    dprintf("Foreground length 0\n");
+    goto exit;
+  }
+
+  e.oserror = _swix(ATA_Control, _INR(0,1), ATAControl_Lock, (dr->cpid << ATAControl_CPIDShift) | (dr->deviceid << ATAControl_DeviceIDShift));
+  if (e.oserror)
+  {
+    dprintf("Slot lock returned %s\n", e.oserror->errmess);
+    goto exit;
+  }
+
+  /* Now we need to subdivide the operation into chunks that are acceptable to
+   * the ATA command set. Some additional restrictions imposed by the controller
+   * may be present; most of these are passed back to us by ATA_Op returning the
+   * error "Transfer too complex". Constraints are:
+   * - must start on sector boundaries (DiscOps are allowed to fault any that
+   *     aren't though, so no additional action is needed here)
+   * - must end on word boundaries (may require read-modify-write)
+   * - must not exceed 256 sectors (LBA28 or CHS) or 65536 sectors (LBA48)
+   */
+  { /* remove warnings about jump past initialisation of variables */
+    uint64_t end_down = ROUND_DOWN_64(*disc_address + *fg_length, dr->log2_sector_size);
+    uint64_t end_up = ROUND_UP_64(*disc_address + *fg_length, dr->log2_sector_size);
+    uint32_t chunk_size = dr->lba48 ? 65536 << dr->log2_sector_size : 256 << dr->log2_sector_size;
+    dprintf("%016llX/%016llX/%016llX, chunk=%08X\n", *disc_address, end_down, end_up, chunk_size);
+    block_or_scatter_t ptr_for_verify_ops;
+    if (reason == DiscOp_Verify)
+    {
+      ptr = &ptr_for_verify_ops; /* so we don't corrupt R3 on exit */
+      flags &= ~ATAOp_Scatter; /* silly if it's set, but PRM allows it */
+    }
+
+    while (e.number == 0 && *disc_address < end_down)
+    {
+      size_t transfer_length = (size_t) MIN(chunk_size, end_down - *disc_address);
+      size_t remain = transfer_length;
+      e = transfer_with_retries(reason, flags, dr, disc_address, ptr, &remain);
+      while (e.oserror && e.oserror->errnum == ErrorNumber_TooComplex)
+      {
+        transfer_length = remain;
+        e = transfer_with_retries(reason, flags, dr, disc_address, ptr, &remain);
+      }
+      *fg_length -= transfer_length - remain;
+    }
+    if (e.number == 0 && *disc_address < end_up && *fg_length != 0)
+      e = buffered_transfer(reason, flags, dr, disc_address, ptr, fg_length);
+  }
+
+  if (e.oserror != 0)
+  {
+    /* Convert into a disc error if possible */
+    if ((e.oserror->errnum &~ 0xFF) == ErrorBase_ATA)
+    {
+      uint8_t disc_error = discop_decode_disc_error(e.oserror);
+      if (disc_error != 0)
+      {
+        dr->disc_error.drive = dr->drive;
+        dr->disc_error.disc_error = disc_error;
+        dr->disc_error.unused_MBZ = 0;
+        dr->disc_error.byte = *disc_address;
+        e.new_disc_error = &dr->disc_error;
+        e.flag.new_disc_error = true;
+      }
+    }
+  }
+  _swix(ATA_Control, _INR(0,1), ATAControl_Unlock,  (dr->cpid << ATAControl_CPIDShift) | (dr->deviceid << ATAControl_DeviceIDShift));
+exit:
+  spinrw_read_unlock(&g_drive_lock);
+  return e;
+}

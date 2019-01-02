@@ -1,0 +1,1138 @@
+/* Copyright 1998 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*---------------------------------------------------------------------------*/
+/* File:    c.main                                                           */
+/* Purpose: Main WIMP shell for Screen configuration                         */
+/* Author:  Richard Leggett                                                  */
+/* History: 17-Nov-97: RML: Begun.                                           */
+/*          20-Mar-98: RML: Minor updates.                                   */
+/*          24-Mar-98: RML: ScrSaver$Path is now ScrSaver$Dir.               */
+/*          25-Mar-98: RML: Added setting of ScrSaver$MinMem.                */
+/*          23-Apr-98: RML: Fixed bug with menu selections of resolutions.   */
+/*          03-Jun-98: RML: Added Info menu for screensavers.                */
+/*                                                                           */
+/* Copyright © 1998 Acorn Computers Ltd., Cambridge, UK.                     */
+/*---------------------------------------------------------------------------*/
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include "swis.h"
+#include "Global/CMOS.h"
+#include "Global/FileTypes.h"
+#include "Interface/HighFSI.h"
+#include "Interface/ScrModes.h"
+#include "toolbox.h"
+#include "menu.h"
+#include "colourdbox.h"
+#include "event.h"
+#include "common.h"
+#include "window.h"
+#include "wimplib.h"
+#include "defines.h"
+#include "screen.h"
+#include "monitor.h"
+
+#define BlankTimeBits     7<<3
+#define Flag_EscapeKey    7
+#define Flag_ReturnKey    7
+#define Flag_LeftButton   4
+#define Flag_RightButton  1
+
+
+static MessagesFD messages_desc;
+static IdBlock    idb;
+static char       messages_string[255];
+static char       orig_saver[1000];
+static int        settings_handle = 0;
+static int        blanktime = 0;
+static int        unblank_on_writes = 0;
+static int        current_montype_menu_id;
+static int        current_montype;
+int               main_window_id;
+int               dpms_window_id;
+int               montype_menu_id;
+int               montype_menu_entries;
+int               res_menu_id;
+int               col_menu_id;
+int               info_menu_id;
+int               main_menu_id;
+int               hz_menu_id;
+int               saver_info_id;
+int               current_res = 0;
+int               current_colours = -1;
+int               current_hz = -1;
+int               hz_menu_entries=1;
+bool              menus_are_grey = false;
+bool              support_edid = false;
+
+/*---------------------------------------------------------------------------*
+ * program_exit                                                              *
+ *                                                                           *
+ * Finished with this plug-in, so exit.                                      *
+ *---------------------------------------------------------------------------*/
+
+static void program_exit(void)
+{
+    /* Discard screenmodes instantiation */
+    discard_screenmodes_instantiation();
+
+    /* If there's a settings plug-in open, shut it down too. */
+    if (settings_handle!=0)
+    {
+        WimpMessage msg;
+
+        msg.hdr.size = 20;
+        msg.hdr.your_ref = 0;
+        msg.hdr.action_code = Wimp_MQuit;
+        error_trap(wimp_send_message(Wimp_EUserMessage, &msg, settings_handle, 0, 0), 0);
+    }
+
+    exit(0);
+}
+
+
+/*---------------------------------------------------------------------------*
+ * update_settings_icon                                                      *
+ *                                                                           *
+ * Grey or ungrey the 'Settings' icon according to if there is a settings    *
+ * app for the current screen blanker.                                       *
+ *---------------------------------------------------------------------------*/
+
+static void update_settings_icon(void)
+{
+    int index;
+
+    error_trap(stringset_get_selected(1, main_window_id, SaverTypeStringSet, &index), 0);
+
+    if (check_has_settings(index))
+    {
+        ungrey_gadget(main_window_id, SaverSettingsButton);
+    }
+    else
+    {
+        grey_gadget(main_window_id, SaverSettingsButton);
+    }
+}
+
+
+/*---------------------------------------------------------------------------*
+ * update_montype_tick                                                       *
+ *                                                                           *
+ * Tick the given monitor selection, and any menus higher up the heirarchy,  *
+ * untick the previous selection. Note this selection for next time.         *
+ *---------------------------------------------------------------------------*/
+
+void update_montype_tick(ObjectId menu, ComponentId entry)
+{
+    ObjectId parent = 0, group;
+    int      topentry;
+
+    /* Untick previous */
+    error_trap(menu_set_tick(0, current_montype_menu_id, current_montype, 0), 0);
+
+    /* Untick everything at the top level */
+    for (topentry = 0; topentry < montype_menu_entries; topentry++)
+    {
+        error_trap(menu_set_tick(0, montype_menu_id, topentry, 0), 0);
+
+        /* Is the new entry in a submenu too? */
+        error_trap(menu_get_sub_menu_show(0, montype_menu_id, topentry, &group), 0);
+        if ((group != 0) && (group == menu))
+        {
+            parent = topentry;
+        }
+    }
+
+    /* Tick the new one */
+    error_trap(menu_set_tick(0, menu, entry, 1), 0);
+    current_montype = entry;
+    current_montype_menu_id = menu;
+
+    /* Tick its parent */
+    if (parent != 0) error_trap(menu_set_tick(0, montype_menu_id, parent, 1), 0);
+}
+
+/*---------------------------------------------------------------------------*
+ * try_it                                                                    *
+ *                                                                           *
+ * Try the currently selected screen saver.                                  *
+ *---------------------------------------------------------------------------*/
+
+static void try_it(void)
+{
+    char command[1024];
+    int  selected;
+    int  time;
+    int  end_time;
+    int  min;
+    int  free_mem;
+
+    error_trap(stringset_get_selected(1, main_window_id, SaverTypeStringSet, &selected), 0);
+
+    /* Set MinMem */
+    if (selected)
+    {
+        /* Find the memory required for the saver */
+        sprintf(command, "%s.!Run", get_saver_filename(selected));
+        min = get_wimpslot_min(command);
+
+        /* Check we've enough free memory to try the saver */
+        _swix(Wimp_SlotSize, _INR(0,1)|_OUT(2), -1, -1, &free_mem);
+        if ( (free_mem / 1024) < (min + 16) )
+        {
+            warning_box(messages_lookup("SaverNoMemory"));
+            return;
+        }
+
+        sprintf(command, "SetEval ScrSaver$MinMem %d", min);
+        if (min) _swix(OS_CLI, _IN(0), command);
+    }
+
+    /* Set the screen blanker dir for the currently selected one */
+    if (selected==0) sprintf(command, "Unset ScrSaver$Dir");
+    else sprintf(command, "Set ScrSaver$Dir %s", get_saver_filename(selected));
+    error_trap(_swix(OS_CLI, _IN(0), command), 0);
+
+    /* Do a slight delay before starting the blanker (to allow for extra mouse movement) */
+    _swix(OS_ReadMonotonicTime, _OUT(0), &time);
+    end_time = time + 100;
+    while (time < end_time) _swix(OS_ReadMonotonicTime, _OUT(0), &time);
+
+    /* Now start the blanker */
+    error_trap(_swix(ScreenBlanker_Control, _IN(0), 0), 0);
+}
+
+
+/*---------------------------------------------------------------------------*
+ * restore_choices                                                           *
+ *                                                                           *
+ * Ensure we put stuff back to the way it was before this applet started.    *
+ *---------------------------------------------------------------------------*/
+
+static void restore_choices(void)
+{
+    char set_string[1024];
+
+    if (orig_saver[0])
+      sprintf(set_string, "Set ScrSaver$Dir %s", orig_saver);
+    else
+      sprintf(set_string, "Unset ScrSaver$Dir");
+    error_trap(_swix(OS_CLI, _IN(0), set_string), 0);
+}
+
+
+/*---------------------------------------------------------------------------*
+ * save_choices                                                              *
+ *                                                                           *
+ * Read the choices from the window and output a command file.               *
+ *---------------------------------------------------------------------------*/
+
+static void save_choices(void)
+{
+    char set_string[1024] = { 0 };
+    char blanktime_string[32] = { 0 };
+    char mem_string[64] = { 0 };
+    int  cmosvalue;
+    int  selected;
+    int  min;
+    static const int blanktime_to_seconds[8] = {0, 30, 60, 120, 300, 600, 900, 1800};
+
+    /* Write BlankTime CMOS bit */
+    cmosvalue = read_cmos_value(Misc1CMOS);
+    cmosvalue = cmosvalue &~ (BlankTimeBits);
+    cmosvalue = cmosvalue | (blanktime<<3);
+    write_cmos_value(Misc1CMOS, cmosvalue);
+
+    /* Issue a *Blanktime command so we're up to date */
+    sprintf(set_string, "Blanktime %d", blanktime_to_seconds[blanktime]);
+    error_trap(_swix(OS_CLI, _IN(0), set_string), 0);
+    error_trap(stringset_get_selected(1, main_window_id, SaverTypeStringSet, &selected), 0);
+
+    /* Deal with ScrSaver$Dir & ScrSaver$MinMem setting */
+    if (selected==0)
+    {
+        /* DPMS is always 0th entry */
+        sprintf(set_string, "Unset ScrSaver$Dir");
+        if (unblank_on_writes) sprintf(blanktime_string, "Blanktime -W");
+    }
+    else
+    {
+        sprintf(set_string, "%s.!Run", get_saver_filename(selected));
+        min = get_wimpslot_min(set_string);
+        if (min) sprintf(mem_string, "SetEval ScrSaver$MinMem %d", min);
+        sprintf(set_string, "Set ScrSaver$Dir %s", get_saver_filename(selected));
+    }
+
+    /* Write settings to screen choices file */
+    write_screen_choices(set_string, mem_string, blanktime_string);
+    set_monitor_choices(FTW_CONFIG);
+
+    /* Do the commands */
+    error_trap(_swix(OS_CLI, _IN(0), set_string), 0);
+    error_trap(_swix(OS_CLI, _IN(0), mem_string), 0);
+}
+
+
+/*---------------------------------------------------------------------------*
+ * set_default_choices                                                       *
+ *                                                                           *
+ * Fill in the default choices in the dialogue box.                          *
+ *                                                                           *
+ * Globals: blanktime                                                        *
+ *---------------------------------------------------------------------------*/
+
+static void set_default_choices(void)
+{
+    blanktime = 1;
+    error_trap(stringset_set_selected(0, main_window_id, SaverTypeStringSet, DPMSString), 0);
+    error_trap(displayfield_set_value(0, main_window_id, BlankDelayDisplay, messages_lookup("BTime1")), 0);
+    update_settings_icon();
+}
+
+
+/*---------------------------------------------------------------------------*
+ * parse_blanktime_command                                                   *
+ *                                                                           *
+ * What useful stuff can we get from the Blanktime command?                  *
+ *                                                                           *
+ * In: string -> *Blanktime command string.                                  *
+ *---------------------------------------------------------------------------*/
+
+static void parse_blanktime_command(char *string)
+{
+    char *switches = string+10;
+
+    if (strstr(switches, "-W")) unblank_on_writes=1;
+
+    optionbutton_set_state(0, dpms_window_id, DPMSUnblankButton, unblank_on_writes);
+}
+
+
+/*---------------------------------------------------------------------------*
+ * parse_set_command                                                         *
+ *                                                                           *
+ * Find the screensaver path from a Set ScrSaver$Dir command.                *
+ *---------------------------------------------------------------------------*/
+
+static void parse_set_command(char *string)
+{
+    char *path = string + 17;
+    char *name;
+
+    name = check_saver_path(path);
+
+    if (!name)
+    {
+        warning_box(messages_lookup("SaverNotRecognised"));
+    }
+    else
+    {
+        error_trap(stringset_set_selected(0, main_window_id, SaverTypeStringSet, name), 0);
+        error_trap(_swix(OS_CLI, _IN(0), string), 0);
+    }
+
+    update_settings_icon();
+}
+
+
+/*---------------------------------------------------------------------------*
+ * read_choices                                                              *
+ *                                                                           *
+ * Read the choices file.                                                    *
+ *---------------------------------------------------------------------------*/
+
+static void read_choices(void)
+{
+    FILE *fp;
+    char  string[1024];
+    int   more = 1;
+
+    /* Read in choices from file */
+    fp=fopen(ChoicesFileRO, "r");
+    if (fp)
+    {
+        while (more)
+        {
+            more=(int)fgets(string, sizeof(string), fp);
+            if (more)
+            {
+                if (strncmpa(string, "Set ScrSaver$Dir", 16)==0)
+                {
+                    parse_set_command(string);
+                }
+
+                else if (strncmpa(string, "Unset ScrSaver$Dir", 18)==0)
+                {
+                    error_trap(stringset_set_selected(0, main_window_id, SaverTypeStringSet, DPMSString), 0);
+                }
+
+                else if (strncmpa(string, "Blanktime", 9)==0)
+                {
+                    parse_blanktime_command(string);
+                }
+
+                else if (strncmpa(string, "Set ScrSaver$MinMem", 19)==0)
+                {
+                    error_trap(_swix(OS_CLI, _IN(0), string), 0);
+                }
+            }
+        }
+        fclose(fp);
+    }
+
+    blanktime = (read_cmos_value(Misc1CMOS) & BlankTimeBits) >> 3;
+    sprintf(string, "BTime%d", blanktime);
+    error_trap(displayfield_set_value(0, main_window_id, BlankDelayDisplay,
+                                      messages_lookup(string)), 0);
+}
+
+
+/*---------------------------------------------------------------------------*
+ * load_settings_app                                                         *
+ *                                                                           *
+ * User has clicked on 'Settings' - load the settings app.                   *
+ *---------------------------------------------------------------------------*/
+
+static void load_settings_app(void)
+{
+    WimpGetWindowStateBlock  block;
+    char                    *savername;
+    char                     pathname[960];
+    char                     command_string[1024];
+    int                      type;
+    int                      openx;
+    int                      openy;
+    int                      index;
+
+    /* Decide which openat to give to the settings app */
+    error_trap(window_get_wimp_handle(0, main_window_id, &block.window_handle), 0);
+    error_trap(wimp_get_window_state(&block),0);
+    openx=block.visible_area.xmin+200;
+    openy=block.visible_area.ymax-400;
+
+    /* Find out which blanker is selected */
+    error_trap(stringset_get_selected(1, main_window_id, SaverTypeStringSet, &index), 0);
+
+    /* DPMS blanker */
+    if (index==0)
+    {
+        error_trap(toolbox_show_object(0, dpms_window_id, 0, 0, 0, 0), 0);
+        return;
+    }
+
+    /* Something other than DPMS */
+    savername = get_saver_filename(index);
+    if (savername == NULL) return;
+    sprintf(pathname, "%s.!SvrSetup",savername);
+    _swix(OS_File, _INR(0,1)|_OUT(0), OSFile_ReadNoPath, pathname, &type);
+
+    /* Check the choices directory exists for the screensaver setup to write into */
+    error_trap(_swix(OS_File, _INR(0,1)|_IN(4), OSFile_CreateDir, ChoicesDir, 0), 0);
+
+    switch (type)
+    {
+        case 2:
+            sprintf(command_string, "Run %s -openat %d %d",pathname, openx, openy);
+            error_trap(wimp_start_task(command_string, &settings_handle), 0);
+            break;
+
+        case 1:
+            settings_handle = 0;
+            sprintf(command_string, "Filer_Run %s",pathname);
+            error_trap(_swix(OS_CLI, _IN(0), command_string), 0);
+            break;
+    }
+}
+
+/*---------------------------------------------------------------------------*
+ * try_display_settings                                                      *
+ *                                                                           *
+ * User has clicked on 'Try' in the display settings section.                *
+ *---------------------------------------------------------------------------*/
+
+#define NULL_MASK 0xE3FFE
+static void try_display_settings(void)
+{
+    int event, button;
+    int now, time;
+    char *message;
+    char wimp_blk[256];
+    char taskname[64];
+    char buttons[32];
+    _kernel_oserror err_blk = {0, ""};
+
+    /* Warn the user that the mode is about to change for a short period */
+    message = messages_lookup("DispPre");
+    strcpy(err_blk.errmess, message);
+    message = messages_lookup("_TaskName");
+    strcpy(taskname, message);
+    error_trap(_swix(Wimp_ReportError, _INR(0,5) | _OUT(1),
+                     &err_blk,
+                     Wimp_ReportError_Category(1) | Wimp_ReportError_UseCategory |
+                     Wimp_ReportError_NoBeep | Wimp_ReportError_NoAppName | Wimp_ReportError_NoPrompt |
+                     Wimp_ReportError_OK | Wimp_ReportError_Cancel,
+                     taskname, "co_screen", 1, NULL,
+                     &button), 1);
+    if (button == 2) return;
+
+    /* Change MDF and mode as specified, and save the settings to a temporary file */
+    if (!set_monitor_choices(FTW_SCRAP)) return;
+
+    /* Redraw the desktop at the new resolution */
+    do
+    {
+        error_trap(_swix(Wimp_PollIdle, _INR(0,3)|_OUT(0), NULL_MASK, wimp_blk, 0, 0, &event), 1);
+    } while (event);
+
+    /* Open a prompt to see if the user was happy with the new mode (timing out
+     * and cancelling in the case when they can't see anything any more!).
+     */
+    message = messages_lookup("DispPost");
+    strcpy(err_blk.errmess, message);
+    message = messages_lookup("DispBtn");
+    strcpy(buttons, message);
+    error_trap(_swix(OS_ReadMonotonicTime, _OUT(0), &time), 1);
+    time += DisplayTestDuration;
+    do
+    {
+        error_trap(_swix(Wimp_ReportError, _INR(0,5) | _OUT(1),
+                         &err_blk,
+                         Wimp_ReportError_Category(4) | Wimp_ReportError_UseCategory |
+                         Wimp_ReportError_NoBeep | Wimp_ReportError_NoAppName | Wimp_ReportError_NoPrompt |
+                         Wimp_ReportError_LeaveOpen,
+                         taskname, "co_screen", 1, buttons,
+                         &button), 1);
+        if (button != 0) break;
+        error_trap(_swix(OS_ReadMonotonicTime, _OUT(0), &now), 1);
+    } while (now < time);
+
+    /* Dispense with the prompt */
+    error_trap(_swix(Wimp_ReportError, _INR(0,5),
+                     &err_blk,
+                     Wimp_ReportError_Close,
+                     0, "", NULL, NULL), 1);
+
+    if (button == 3)
+    {
+        /* Go with the new settings */
+        read_current_mode_settings(FTR_SCRAP);
+    }
+    else
+    {
+        /* Restore the original settings */
+        read_current_mode_settings(FTR_CONFIG);
+    }
+
+    discard_screenmodes_instantiation();
+    create_screenmodes_instantiation();
+
+    /* Make sure our icons contain the right details (required for set_monitor_choices) */
+    create_resolutions_menu();
+    update_monitor_displayfields();
+
+    set_monitor_choices(FTW_NONE);
+    
+    /* Remove our temporary configuration file (if it exists) */
+    _swix(OS_File, _INR(0,1), OSFile_Delete, ScrapConfigFile);
+}
+
+
+/*-----------------------------------------------------------------------------------------------*/
+/*                                          Event handlers                                       */
+/*-----------------------------------------------------------------------------------------------*/
+
+/*---------------------------------------------------------------------------*
+ * toolbox_error                                                             *
+ *                                                                           *
+ * Handler for errors from toolbox.                                          *
+ *---------------------------------------------------------------------------*/
+
+static int toolbox_error(int event_code, ToolboxEvent *event, IdBlock *id_block, void *handle)
+{
+    ToolboxErrorEvent *error_event = (ToolboxErrorEvent *)event;
+    _kernel_oserror    err;
+
+    strcpy(err.errmess, error_event->errmess);
+    err.errnum=error_event->errnum;
+    wimp_report_error(&err, 0, "Configure", 0, 0, 0);
+
+    return 1;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * default_key_handler                                                       *
+ *                                                                           *
+ * Handler for key presses.                                                  *
+ *---------------------------------------------------------------------------*/
+
+static int default_key_handler(int event_code, WimpPollBlock *event, IdBlock *id_block, void *handle)
+{
+   int key_code = event->key_pressed.key_code;
+
+   wimp_process_key(key_code);
+
+   return 1;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * string_changed                                                            *
+ *                                                                           *
+ * Handle stringset changed events.                                          *
+ *---------------------------------------------------------------------------*/
+
+static int string_changed(int event_code, ToolboxEvent *event_block, IdBlock *id_block, void *handle)
+{
+    int gadget = id_block->self_component;
+
+    switch (gadget)
+    {
+        case SaverTypeStringSet:
+            update_settings_icon();
+            break;
+    }
+
+    return 1;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * menu_select                                                               *
+ *                                                                           *
+ * Handle menu selections.                                                   *
+ *---------------------------------------------------------------------------*/
+
+int montype_menu_select(int event_code, ToolboxEvent *event_block, IdBlock *id_block, void *handle)
+{
+    monitor_ref *rover;
+    char *name, origin[32], string[256];
+    int  namelen, originlen;
+    ComponentId gadget = id_block->self_component;
+    ObjectId    group, menu = id_block->self_id;
+
+    error_trap(menu_get_sub_menu_show(0, menu, gadget, &group), 0);
+    if (group != 0)
+    {
+        /* Pick the preferred entry in that group, like a font menu would */
+        menu = group;
+        gadget = 0;
+    }
+    
+    /* Update the displayfield to show the new choice */
+    error_trap(menu_get_entry_text(0, menu, gadget, string, sizeof(string), &namelen), 0);
+    originlen = sprintf(origin, "%s (", messages_lookup("Auto"));
+    name = string;
+    if ((strncmp(name, origin, originlen) == 0) && (name[namelen - 2] == ')'))
+    {
+        /* Origin was live data, matched on "Auto (Model)", reduce to "Model" */
+        name[namelen - 2] = '\0';
+        name = name + originlen;
+    }
+
+    /* Find the monitor that's just been selected in our array */
+    for (rover = monitors_list; rover; rover = rover->next)
+    {
+        if (strcmp(rover->monitor_name, name) == 0) break;
+    }
+
+    if (rover)
+    {
+        if (menus_are_grey)
+        {
+            ungrey_gadget(main_window_id, ColourMenu);
+            ungrey_gadget(main_window_id, ColourDisplay);
+            ungrey_gadget(main_window_id, ResolutionMenu);
+            ungrey_gadget(main_window_id, ResolutionDisplay);
+            ungrey_gadget(main_window_id, FrameRateMenu);
+            ungrey_gadget(main_window_id, FrameRateDisplay);
+        }
+    }
+    else
+    {
+        /* Auto */
+        grey_gadget(main_window_id, ColourMenu);
+        grey_gadget(main_window_id, ColourDisplay);
+        grey_gadget(main_window_id, ResolutionMenu);
+        grey_gadget(main_window_id, ResolutionDisplay);
+        grey_gadget(main_window_id, FrameRateMenu);
+        grey_gadget(main_window_id, FrameRateDisplay);
+        menus_are_grey = true;
+    }
+    
+    switch_monitor(rover);
+    update_montype_tick(menu, gadget);
+
+    return 1;
+}
+
+static int res_menu_select(int event_code, ToolboxEvent *event_block, IdBlock *id_block, void *handle)
+{
+    char string[256];
+    int  gadget = id_block->self_component;
+
+    /* Update the displayfield to show the new choice */
+    error_trap(menu_get_entry_text(0, res_menu_id, gadget, string, sizeof(string), 0), 0);
+    error_trap(displayfield_set_value(0, main_window_id, ResolutionDisplay, string), 0);
+    switch_resolution();
+    error_trap(menu_set_tick(0, res_menu_id, current_res, 0), 0);
+    error_trap(menu_set_tick(0, res_menu_id, gadget, 1), 0);
+
+    current_res = gadget;
+
+    return 1;
+}
+
+static int col_menu_select(int event_code, ToolboxEvent *event_block, IdBlock *id_block, void *handle)
+{
+    char string[256];
+    int  gadget = id_block->self_component;
+
+    /* Update the displayfield to show the new choice */
+    error_trap(menu_get_entry_text(0, col_menu_id, gadget, string, sizeof(string), 0), 0);
+    error_trap(displayfield_set_value(0, main_window_id, ColourDisplay, string), 0);
+    switch_colour(gadget);
+    error_trap(menu_set_tick(0, col_menu_id, current_colours, 0), 0);
+    error_trap(menu_set_tick(0, col_menu_id, gadget, 1), 0);
+
+    current_colours = gadget;
+
+    return 1;
+}
+
+static int hz_menu_select(int event_code, ToolboxEvent *event_block, IdBlock *id_block, void *handle)
+{
+    char string[256];
+    int  gadget = id_block->self_component;
+
+    /* Update the displayfield to show the new choice */
+    error_trap(menu_get_entry_text(0, hz_menu_id, gadget, string, sizeof(string), 0), 0);
+    error_trap(displayfield_set_value(0, main_window_id, FrameRateDisplay, string), 0);
+    current_hz = atoi(string);
+    for (int i=0; i<hz_menu_entries; i++)
+    {
+        error_trap(menu_set_tick(0, hz_menu_id, i, (i==gadget?1:0)), 0);
+    }
+
+    return 1;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * menu_submenu                                                              *
+ *                                                                           *
+ * Event raised before the screensaver info submenus are opened.             *
+ *---------------------------------------------------------------------------*/
+
+static int menu_submenu(int event_code, ToolboxEvent *event_block, IdBlock *id_block, void *handle)
+{
+    int gadget = id_block->self_component;
+
+    fill_in_saver_info(saver_info_id, gadget);
+
+    return 1;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * adjuster_clicked                                                          *
+ *                                                                           *
+ * Handle events caused by clicks on adjuster arrows.                        *
+ *---------------------------------------------------------------------------*/
+
+static int adjuster_clicked(int event_code, ToolboxEvent *event_block, IdBlock *id_block, void *handle)
+{
+    AdjusterClickedEvent *block = (AdjusterClickedEvent*) event_block;
+    int                   gadget = id_block->self_component;
+    char                  string[16];
+
+    if ((gadget!=TimeAdjusterDown) && (gadget!=TimeAdjusterUp)) return 1;
+
+    if (block->direction) blanktime++;
+    else blanktime--;
+
+    if (blanktime>7) blanktime = 7;
+    if (blanktime<0) blanktime = 0;
+
+    sprintf(string, "BTime%d", blanktime);
+    error_trap(displayfield_set_value(0, main_window_id, BlankDelayDisplay, messages_lookup(string)), 0);
+
+    return 1;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * action_selected                                                           *
+ *                                                                           *
+ * Handler for when action buttons are clicked on.                           *
+ *---------------------------------------------------------------------------*/
+
+static int action_selected(int event_code, ToolboxEvent *event_block, IdBlock *id_block, void *handle)
+{
+    ActionButtonSelectedEvent *block = (ActionButtonSelectedEvent*) event_block;
+    int                        gadget = id_block->self_component;
+
+    switch (gadget)
+    {
+        case SetButton:
+            save_choices();
+            if ( ((block->hdr.flags & Flag_ReturnKey)==0) || (block->hdr.flags & Flag_LeftButton) )
+            {
+                program_exit();
+            }
+            break;
+
+        case CancelButton:
+            restore_choices();
+            if ( ((block->hdr.flags & Flag_EscapeKey)==0) || (block->hdr.flags & Flag_LeftButton) )
+            {
+                program_exit();
+            }
+            else if (block->hdr.flags & Flag_RightButton)
+            {
+                /* Right click, so restore original settings */
+                read_choices();
+                read_current_mode_settings(FTR_CONFIG);
+                discard_screenmodes_instantiation();
+                create_screenmodes_instantiation();
+                create_resolutions_menu();
+                update_monitor_displayfields();
+                update_dpms_status();
+            }
+            break;
+
+        case DefaultButton:
+            set_default_choices();
+            break;
+
+        case DisplayTryButton:
+            try_display_settings();
+            break;
+
+        case SaverSettingsButton:
+            load_settings_app();
+            break;
+
+        case SaverTryButton:
+            try_it();
+            break;
+    }
+
+    return 1;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * dpms_action_selected                                                      *
+ *                                                                           *
+ * Handler for when action buttons are clicked on in the dpms saver settings *
+ * window.                                                                   *
+ *---------------------------------------------------------------------------*/
+
+static int dpms_action_selected(int event_code, ToolboxEvent *event_block, IdBlock *id_block, void *handle)
+{
+    ActionButtonSelectedEvent *block = (ActionButtonSelectedEvent*) event_block;
+    int                        gadget = id_block->self_component;
+
+    switch(gadget)
+    {
+        case DPMSDefaultButton:
+            error_trap(optionbutton_set_state(0, dpms_window_id, DPMSUnblankButton, 0), 0);
+            break;
+
+        case DPMSCancelButton:
+            if ( ((block->hdr.flags & Flag_EscapeKey)==0) || (block->hdr.flags & Flag_LeftButton) )
+            {
+                error_trap(toolbox_hide_object(0, dpms_window_id), 0);
+            }
+            else if (block->hdr.flags & Flag_RightButton)
+            {
+                error_trap(optionbutton_set_state(0, dpms_window_id, DPMSUnblankButton, unblank_on_writes), 0);
+            }
+            break;
+
+        case DPMSSetButton:
+            error_trap(optionbutton_get_state(0, dpms_window_id, DPMSUnblankButton, &unblank_on_writes), 0);
+            if (unblank_on_writes)
+            {
+                _swix(OS_CLI, _IN(0), "Blanktime -W");
+            }
+            else
+            {
+                _swix(OS_CLI, _IN(0), "Blanktime -O");
+            }
+            break;
+    }
+
+    return 1;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * message_quit                                                              *
+ *                                                                           *
+ * Called when wimp quit message received.                                   *
+ *---------------------------------------------------------------------------*/
+
+static int message_quit(WimpMessage *event, void *handler)
+{
+    program_exit();
+
+    return 1;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * message_reopen                                                            *
+ *                                                                           *
+ * Called when we receive a message from Configure telling us to reopen our  *
+ * window.                                                                   *
+ *---------------------------------------------------------------------------*/
+
+static int message_reopen(WimpMessage *event, void *handler)
+{
+    error_trap(toolbox_show_object(0, main_window_id, 0, 0, 0, 0), 0);
+
+    return 1;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * message_closedown                                                         *
+ *                                                                           *
+ * Handler for message_closedown, sent when a task exits. Check the exiting  *
+ * task isn't a screensaver settings plug-in.                                *
+ *---------------------------------------------------------------------------*/
+
+static int message_closedown(WimpMessage *event, void *handler)
+{
+    if (event->hdr.sender==settings_handle) settings_handle = 0;
+
+    return 1;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * close_window                                                              *
+ *                                                                           *
+ * Called when user has clicked on close icon of window.                     *
+ *---------------------------------------------------------------------------*/
+
+static int close_window(int event_code, WimpPollBlock *event, IdBlock *id_block, void *handle)
+{
+    program_exit();
+
+    return 1;
+}
+
+
+/*-----------------------------------------------------------------------------------------------*/
+/*                               Program startup & polling loop                                  */
+/*-----------------------------------------------------------------------------------------------*/
+
+/*---------------------------------------------------------------------------*
+ * open_configure_window                                                     *
+ *                                                                           *
+ * Called to open the configure window on screen and register handlers.      *
+ *---------------------------------------------------------------------------*/
+
+static void open_configure_window(int at_x, int at_y)
+{
+    int  screenx;
+    int  screeny;
+    int  flags;
+    ObjectTemplateHeader *objtemplate;
+    WindowTemplate       *wintemplate;
+    WimpWindow           *windef;
+
+    /* Read the window object in by hand */
+    error_trap(toolbox_template_lookup(0, "Window", (void **)&objtemplate), 1);
+    if (objtemplate->object_class != Window_ObjectClass)
+    {
+        error_trap(common_error(messages_lookup("BadClass")), 1);
+    }
+    wintemplate = objtemplate->body;
+    windef = &wintemplate->window;
+    if (common_read_screensize(&screenx, &screeny) == NULL)
+    {
+        /* Calculate the window height compared with the screen and
+         * turn the vertical scrollbar on if it doesn't fit
+         */
+        if ((windef->visible_area.ymax - windef->visible_area.ymin) >= screeny)
+        {
+            windef->flags |= WimpWindow_VScroll;
+        }
+        else
+        {
+            windef->flags &= ~WimpWindow_VScroll;
+        }
+    }
+    error_trap(toolbox_create_object(Toolbox_CreateObject_InCore, objtemplate, &main_window_id), 1);
+
+    /* Create sub-window/gadgets */
+    error_trap(toolbox_create_object(0, "Window", &main_window_id), 1);
+    error_trap(toolbox_create_object(0, "ColMenu", &col_menu_id), 1);
+    error_trap(toolbox_create_object(0, "MonTypeMenu", &montype_menu_id), 1);
+    error_trap(toolbox_create_object(0, "ResMenu", &res_menu_id), 1);
+    error_trap(toolbox_create_object(0, "InfoMenu", &info_menu_id), 1);
+    error_trap(toolbox_create_object(0, "SaverInfo", &saver_info_id), 1);
+    error_trap(toolbox_create_object(0, "MainMenu", &main_menu_id), 1);
+    error_trap(toolbox_create_object(0, "HzMenu", &hz_menu_id), 1);
+    error_trap(toolbox_create_object(0, "DPMS", &dpms_window_id), 1);
+    error_trap(popup_set_menu(0, main_window_id, MonitorTypeMenu, montype_menu_id), 1);
+    error_trap(popup_set_menu(0, main_window_id, ResolutionMenu, res_menu_id), 1);
+    error_trap(popup_set_menu(0, main_window_id, ColourMenu, col_menu_id), 1);
+    error_trap(popup_set_menu(0, main_window_id, FrameRateMenu, hz_menu_id), 1);
+    error_trap(window_set_menu(0, main_window_id, main_menu_id), 1);
+    error_trap(menu_set_sub_menu_show(0, main_menu_id, 0, info_menu_id), 1);
+
+    /* Register handlers */
+    error_trap(event_register_toolbox_handler(-1,Toolbox_Error,toolbox_error,NULL) ,0);
+    error_trap(event_register_toolbox_handler(main_window_id, ActionButton_Selected, action_selected, NULL), 0);
+    error_trap(event_register_toolbox_handler(main_window_id, Adjuster_Clicked, adjuster_clicked, NULL), 0);
+    error_trap(event_register_toolbox_handler(main_window_id, StringSet_ValueChanged, string_changed, NULL), 0);
+    error_trap(event_register_toolbox_handler(montype_menu_id, Menu_Selection, montype_menu_select, NULL), 0);
+    error_trap(event_register_toolbox_handler(res_menu_id, Menu_Selection, res_menu_select, NULL), 0);
+    error_trap(event_register_toolbox_handler(col_menu_id, Menu_Selection, col_menu_select, NULL), 0);
+    error_trap(event_register_toolbox_handler(hz_menu_id, Menu_Selection, hz_menu_select, NULL), 0);
+    error_trap(event_register_toolbox_handler(dpms_window_id, ActionButton_Selected, dpms_action_selected, NULL), 0);
+    error_trap(event_register_toolbox_handler(info_menu_id, Menu_SubMenu, menu_submenu, NULL), 0);
+    error_trap(event_register_message_handler(Wimp_MTaskCloseDown, message_closedown, NULL), 0);
+    error_trap(event_register_wimp_handler(-1, Wimp_EKeyPressed, default_key_handler, NULL), 0);
+    error_trap(event_register_wimp_handler(main_window_id, Wimp_ECloseWindow, close_window, NULL), 0);
+
+    /* Check OS support for EDID */
+    flags = 0; /* In case of error */
+    _swix(ScreenModes_Features, _OUT(0), &flags);
+    support_edid = (flags & ScreenModes_Features_EDID) != 0;
+
+    /* Make monitor choice invariant menus */
+    create_monitors_menu();
+    current_montype_menu_id = montype_menu_id; current_montype = 0; /* Auto */
+    create_savers_menu();
+    build_info_menu(main_menu_id, info_menu_id, saver_info_id);
+    update_settings_icon();
+    
+    /* Read in the choices, populate and show dialogue */
+    read_choices();
+    read_current_mode_settings(FTR_CONFIG);
+    create_screenmodes_instantiation();
+    create_resolutions_menu();
+    create_hz_menu();
+    update_monitor_displayfields();
+    update_dpms_status();
+    if ((at_x==-1) && (at_y==-1))
+    {
+        /* No position supplied in the command line, just centre it */
+        error_trap(toolbox_show_object(0, main_window_id, Toolbox_ShowObject_Centre, NULL, 0, 0), 0);
+    }
+    else
+    {
+        int  buffer[2];
+
+        buffer[0] = at_x;
+        buffer[1] = at_y;
+        error_trap(toolbox_show_object(0, main_window_id, Toolbox_ShowObject_TopLeft, buffer, 0, 0), 0);
+    }
+}
+
+
+/*---------------------------------------------------------------------------*
+ * main_initialise                                                           *
+ *                                                                           *
+ * Initialise toolbox etc.                                                   *
+ *                                                                           *
+ * In: Nothing.                                                              *
+ *                                                                           *
+ * Returns: 1 if everything went okay, 0 otherwise                           *
+ *---------------------------------------------------------------------------*/
+
+static int main_initialise(void)
+{
+    static int mess_wanted[] = {Wimp_MQuit,
+                                Wimp_MOpenConfigWindow,
+                                Wimp_MTaskCloseDown,
+                                0};
+    static int tbox_wanted[] = {Toolbox_Error,
+            	                ActionButton_Selected,
+            	                StringSet_ValueChanged,
+                                Adjuster_Clicked,
+                                Menu_Selection,
+                                Menu_SubMenu,
+                                0};
+    int        task_handle;
+
+    messages_register(&messages_desc, messages_string);
+    error_trap(toolbox_initialise(0, 310, mess_wanted, tbox_wanted,
+                                  "<ScrnSetup$Dir>", &messages_desc, &idb,
+                                  0, &task_handle, 0) ,1);
+
+
+    error_trap(event_initialise(&idb), 0);
+    error_trap(event_set_mask(Wimp_Poll_NullMask), 0);
+
+    error_trap(event_register_message_handler(Wimp_MQuit, message_quit, NULL), 0);
+    error_trap(event_register_message_handler(Wimp_MTaskCloseDown, message_closedown, NULL), 0);
+    error_trap(event_register_message_handler(Wimp_MOpenConfigWindow, message_reopen, NULL), 0);
+
+    return 1;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * main                                                                      *
+ *                                                                           *
+ * Main polling loop                                                         *
+ *---------------------------------------------------------------------------*/
+
+int main(int argc, char *argv[])
+{
+    WimpPollBlock wpb;
+    int           event_code;
+    int           openat_x = -1;
+    int           openat_y = -1;
+    char         *var;
+
+    /* Have we been passed any co-ordinates to open at? */
+    if ((argc >= 4) && (strcmp(argv[1], "-openat")==0))
+    {
+        openat_x = atoi(argv[2]);
+        openat_y = atoi(argv[3]);
+    }
+
+    /* Do main initialisation */
+    if (!main_initialise()) return 0;
+
+    /* Make a note of the current setting for ScrSaver$Dir */
+    var = getenv("ScrSaver$Dir");
+    if (!var)
+      orig_saver[0] = '\0';
+    else
+    {
+      if (sizeof(orig_saver) <= snprintf(orig_saver, sizeof(orig_saver), "%s", var)) return 0;
+    }
+
+    /* Open configure window */
+    open_configure_window(openat_x, openat_y);
+
+    /* Poll loop */
+    while (TRUE)
+    {
+        error_trap(event_poll(&event_code, &wpb, NULL), 0);
+    }
+
+    return 0;
+}

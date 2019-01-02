@@ -1,0 +1,815 @@
+/* Copyright 2013 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*---------------------------------------------------------------------------*/
+/* File:    loadtheme.c                                                      */
+/* Purpose: Inspect a theme and generate some internal structures from it    */
+/*---------------------------------------------------------------------------*/
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdint.h>
+#include "swis.h"
+#include "Global/FileTypes.h"
+#include "Global/Sprite.h"
+#include "Interface/HighFSI.h"
+#include "toolbox.h"
+#include "fontmenu.h"
+#include "menu.h"
+#include "wimplib.h"
+#include "window.h"
+#include "common.h"
+#include "defines.h"
+#include "main.h"
+#include "loadtheme.h"
+
+/* Global variables */
+int     *spritearea;
+theme_t *themehead = NULL;
+
+/* Local variables */
+static uint8_t dx, dy;
+
+
+/*---------------------------------------------------------------------------*
+ * parse_wimpvisflags                                                        *
+ *                                                                           *
+ * Interpret a set of WimpVisualFlags defaulting any that are missing.       *
+ *---------------------------------------------------------------------------*/
+
+static void parse_wimpvisflags(const char *string, wimpvisflags_t *result)
+{
+    struct
+    {
+        int   threedborders;
+        int   texturedmenus;
+        int   altmenutexture;
+        int   removeiconboxes;
+        int   noiconboxesintranswin;
+        int   threediconbar;
+        int   fontblend;
+        int   winoutlineover;
+        char *winborderface;
+        char *winborderopp;
+        char *menuborderface;
+        char *menuborderopp;
+        char *winoutline;
+        char  extras[5 * (2 * sizeof(int))];
+    } args;
+    static const wimpvisflags_t wvfdefault = { WIMPVISFLAGS_DEFAULT };
+    static const char *wvfsyntax = "3DWindowBorders=3DWB/S,TexturedMenus=TM/S,"
+                                   "UseAlternateMenuBg=UAMB/S,RemoveIconBoxes=RIB/S,"
+                                   "NoIconBoxesInTransWindows=NIBITW/S,Fully3DIconBar=F3DIB/S,"
+                                   "FontBlending=FB/S,WindowOutlineOver=WOO/S,"
+                                   "WindowBorderFaceColour=WBFC/E,WindowBorderOppColour=WBOC/E,"
+                                   "MenuBorderFaceColour=MBFC/E,MenuBorderOppColour=MBOC/E,"
+                                   "WindowOutlineColour=WOC/E";
+
+    /* Fill in some defaults then try to match the arguments */
+    *result = wvfdefault;
+    if (_swix(OS_ReadArgs, _INR(0,3), wvfsyntax, string,
+                                      &args, sizeof(args)) != NULL)
+    {
+        return;
+    }
+
+    /* Now go back and change any that actively differ from the default */
+    if (args.threedborders) result->threedborders = TRUE;
+    if (args.texturedmenus) result->texturedmenus = TRUE;
+    if (args.altmenutexture) result->altmenutexture = TRUE;
+    if (args.removeiconboxes) result->removeiconboxes = TRUE;
+    if (args.noiconboxesintranswin) result->noiconboxesintranswin = TRUE;
+    if (args.threediconbar) result->threediconbar = TRUE;
+    if (args.fontblend) result->fontblend = TRUE;
+    if (args.winoutlineover) result->winoutlineover = TRUE;
+
+    if ((args.winborderface != NULL) && (args.winborderface[0] == 0))
+    {
+        result->winborderface = WIMPVISFLAGS_RGB_COLOUR(args.winborderface);
+    }
+    if ((args.winborderopp != NULL) && (args.winborderopp[0] == 0))
+    {
+        result->winborderopp = WIMPVISFLAGS_RGB_COLOUR(args.winborderopp);
+    }
+
+    if ((args.menuborderface != NULL) && (args.menuborderface[0] == 0))
+    {
+        result->menuborderface = WIMPVISFLAGS_RGB_COLOUR(args.menuborderface);
+    }
+    if ((args.menuborderopp != NULL) && (args.menuborderopp[0] == 0))
+    {
+        result->menuborderopp = WIMPVISFLAGS_RGB_COLOUR(args.menuborderopp);
+    }
+
+    if ((args.winoutline != NULL) && (args.winoutline[0] == 0))
+    {
+        result->winoutline = WIMPVISFLAGS_RGB_COLOUR(args.winoutline);
+    }
+}
+
+
+/*---------------------------------------------------------------------------*
+ * theme_ifthere                                                             *
+ *                                                                           *
+ * See if a file of a given name and type exists.                            *
+ *---------------------------------------------------------------------------*/
+
+static BOOL theme_ifthere(const char *themename, const char *leafname, int type)
+{
+    int  object, load;
+    char element[64];
+    _kernel_oserror *e;
+
+    strcpy(element, ThemesDir ".");
+    strcat(element, themename);
+    strcat(element, ".");
+    strcat(element, leafname);
+
+    e = _swix(OS_File, _INR(0,1) | _OUT(0) | _OUT(2),
+                       OSFile_ReadNoPath, element,
+                       &object, &load);
+    type = type | 0xFFFFF000;
+    load = load >> 8;
+    
+    return (e == NULL) && (object == object_file) && (type == load);
+}
+
+
+/*---------------------------------------------------------------------------*
+ * get_sprite_info                                                           *
+ *                                                                           *
+ * Query various useful parameters of a sprite for later use.                *
+ *---------------------------------------------------------------------------*/
+
+static BOOL get_sprite_info(void *area, const char *name, spriteinfo_t *info)
+{
+    if (_swix(OS_SpriteOp, _INR(0,2) | _OUTR(3,4) | _OUT(6), SpriteReason_ReadSpriteSize + 256,
+              area, name,
+              &info->width, &info->height, &info->mode) != NULL) return FALSE;
+              
+    if (_swix(OS_ReadModeVariable, _INR(0,1) | _OUT(2),
+              info->mode, 4, &info->xeigen) != NULL) return FALSE;
+
+    if (_swix(OS_ReadModeVariable, _INR(0,1) | _OUT(2),
+              info->mode, 5, &info->yeigen) != NULL) return FALSE;
+
+    strcpy(info->name, name);
+    
+    return TRUE;
+}                  
+
+
+/*---------------------------------------------------------------------------*
+ * set_graphics_window                                                       *
+ *                                                                           *
+ * Set the graphics window.                                                  *
+ *---------------------------------------------------------------------------*/
+
+static void set_graphics_window(BBox *box)
+{
+    char vdu[9];
+
+    if (box == NULL)
+    {
+        _swix(OS_WriteI + 26 /* Restore */, 0);
+
+        return;
+    }
+    vdu[0] = 24; /* Set graphics window */
+    vdu[1] = box->xmin >> 0; vdu[2] = box->xmin >> 8;
+    vdu[3] = box->ymin >> 0; vdu[4] = box->ymin >> 8;
+    vdu[5] = box->xmax >> 0; vdu[6] = box->xmax >> 8;
+    vdu[7] = box->ymax >> 0; vdu[8] = box->ymax >> 8;
+    _swix(OS_WriteN, _INR(0,1), vdu, sizeof(vdu));
+}
+
+
+/*---------------------------------------------------------------------------*
+ * draw_untranslated_sprite                                                  *
+ *                                                                           *
+ * Plot source sprite without colour translation into a destination sprite.  *
+ *---------------------------------------------------------------------------*/
+
+static void draw_untranslated_sprite(const spriteinfo_t *dst, const spriteinfo_t *src,
+                                     void *area, int x, int y)
+{
+    struct
+    {
+        uint32_t xmul, ymul;
+        uint32_t xdiv, ydiv;
+    } factors;
+
+    factors.xmul = 1 << src->xeigen;
+    factors.xdiv = 1 << dst->xeigen;
+    factors.ymul = 1 << src->yeigen;
+    factors.ydiv = 1 << dst->yeigen;
+    _swix(OS_SpriteOp, _INR(0,7), SpriteReason_PutSpriteScaled + 256,
+          area, src->name, x, y, 8 /* Set with mask */, &factors, 0);
+}
+
+
+/*---------------------------------------------------------------------------*
+ * draw_background                                                           *
+ *                                                                           *
+ * Clear a background rectangle, optionally tiling with a sprite.            *
+ *---------------------------------------------------------------------------*/
+
+static void draw_background(BBox *box, uint32_t colour, const spriteinfo_t *dst,
+                            void *area, const spriteinfo_t *tile)
+{
+    set_graphics_window(box);
+    if (tile == NULL)
+    {
+        _swix(ColourTrans_SetGCOL, _IN(0) | _INR(3,4),
+              colour, 1<<7, 0);
+        _swix(OS_WriteI + 16 /* CLG */, 0);
+    }
+    else
+    {
+        int xoff, yoff;
+
+        for (xoff = 0; xoff <= (box->xmax - box->xmin); xoff += (tile->width << tile->xeigen))
+        {
+            for (yoff = 0; yoff <= (box->ymax - box->ymin); yoff += (tile->height << tile->yeigen))
+            {
+                draw_untranslated_sprite(dst, tile, area, box->xmin + xoff, box->ymin + yoff);
+            }
+        }
+    }
+    set_graphics_window(NULL);
+}
+
+
+/*---------------------------------------------------------------------------*
+ * draw_slabout_border                                                       *
+ *                                                                           *
+ * Do a 3D effect border, inclusive coordinates.                             *
+ *---------------------------------------------------------------------------*/
+
+static void draw_slabout_border(BBox *box, uint32_t face, uint32_t oppface)
+{
+    int bevel;
+
+    _swix(ColourTrans_SetGCOL, _IN(0) | _INR(3,4), face, 0, 0);
+    _swix(OS_Plot, _INR(0,2), 0 + 4  /* Move abs */, box->xmin, box->ymin);
+    _swix(OS_Plot, _INR(0,2), 96 + 5 /* Rect abs */, box->xmin + GAP_BEVEL_OSUNITS - 1, box->ymax);
+    _swix(OS_Plot, _INR(0,2), 96 + 5 /* Rect abs */, box->xmax, box->ymax - GAP_BEVEL_OSUNITS + 1);
+
+    _swix(ColourTrans_SetGCOL, _IN(0) | _INR(3,4), oppface, 0, 0);
+    for (bevel = 0; bevel < GAP_BEVEL_OSUNITS; bevel++)
+    {
+        _swix(OS_Plot, _INR(0,2), 0 + 4 /* Move abs */, box->xmin + 1 + bevel, box->ymin + bevel);
+        _swix(OS_Plot, _INR(0,2), 0 + 5 /* Line abs */, box->xmax - bevel, box->ymin + bevel);
+        _swix(OS_Plot, _INR(0,2), 0 + 5 /* Line abs */, box->xmax - bevel, box->ymax - bevel);
+    }
+}
+
+
+/*---------------------------------------------------------------------------*
+ * draw_frame_border                                                         *
+ *                                                                           *
+ * Plot a single OS unit rectangle, inclusive coordinates.                   *
+ *---------------------------------------------------------------------------*/
+
+static void draw_frame_border(BBox *box, uint32_t colour)
+{
+    _swix(ColourTrans_SetGCOL, _IN(0) | _INR(3,4), colour, 0, 0);
+    _swix(OS_Plot, _INR(0,2), 0 + 4 /* Move abs */, box->xmin, box->ymin);
+    _swix(OS_Plot, _INR(0,2), 0 + 5 /* Line abs */, box->xmax, box->ymin);
+    _swix(OS_Plot, _INR(0,2), 0 + 5 /* Line abs */, box->xmax, box->ymax);
+    _swix(OS_Plot, _INR(0,2), 0 + 5 /* Line abs */, box->xmin, box->ymax);
+    _swix(OS_Plot, _INR(0,2), 0 + 5 /* Line abs */, box->xmin, box->ymin);
+}
+
+
+/*---------------------------------------------------------------------------*
+ * draw_some_text                                                            *
+ *                                                                           *
+ * Plot a string.                                                            *
+ *---------------------------------------------------------------------------*/
+
+static void draw_some_text(int handle, const char *text, BOOL blend,
+                           uint32_t bg, uint32_t fg, int x, int y)
+{
+    if (handle)
+    {
+        /* Outline */
+        _swix(ColourTrans_SetFontColours, _INR(0,3), handle, bg, fg, 14);
+        _swix(Font_Paint, _INR(0,4), handle, text,
+              (1<<4) /* OS units */ | (1<<8) /* Handle */ |
+              (1<<9) /* Kern */ | (blend ? 1<<11 : 0),
+              x, y);
+    }
+    else
+    {
+        char vdu[10];
+
+        /* System */
+        memset(vdu, 0, sizeof(vdu));
+        vdu[0] = 23; /* Misc */
+        vdu[1] = 17; /* Misc */
+        vdu[2] = 7; vdu[3] = 6; /* Set VDU5 size & space */
+        vdu[4] = SYSFONT_XSIZE_OSUNITS / dx;
+        vdu[6] = SYSFONT_YSIZE_OSUNITS / dy;
+        _swix(OS_WriteN, _INR(0,1), vdu, sizeof(vdu));
+
+        _swix(ColourTrans_SetGCOL, _IN(0) | _INR(3,4), fg, 0, 0);
+        _swix(OS_WriteI + 5 /* Join text to graphics */, 0);
+        _swix(OS_Plot, _INR(0,2), 0 + 4 /* Move abs */,
+              x, y + SYSFONT_YSIZE_OSUNITS - 1 - dy /* Plotted from top inclusive */);
+        _swix(OS_Write0, _IN(0), text);
+    }
+}
+
+
+/*---------------------------------------------------------------------------*
+ * match_theme_by_name                                                       *
+ *                                                                           *
+ * Try to find a named theme in the list of known themes.                    *
+ *---------------------------------------------------------------------------*/
+
+const theme_t *match_theme_by_name(const char *name)
+{
+    const theme_t *list = themehead;
+
+    while (list != NULL)
+    {
+        if (strcmp(list->name, name) == 0)
+        {
+            return list;
+        }
+        list = list->next;
+    }
+    return NULL;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * render_theme_preview                                                      *
+ *                                                                           *
+ * Make a thumbnail of the selected theme if possible.                       *
+ *---------------------------------------------------------------------------*/
+
+void render_theme_preview(const theme_t *selection)
+{
+    WimpSetIconStateBlock reveal;
+    spriteinfo_t file, window, menu, wtile, mtile, render;
+    char font[FontNameLen];
+    int  fonthandle, fontadjust;
+    int  save[4];
+    int  titlewidth, menuwidth;
+    int  xoff, yoff;
+    int  state;
+    BOOL threedborders, texturedmenus, altmenutexture, texturedwindows;
+    BBox rect, clip;
+    struct
+    {
+        uint32_t xeigen;
+        uint32_t yeigen;
+        uint32_t end;
+    } modevar;
+
+    /* Hide the rendering to reveal the 'no preview' warning */
+    reveal.window_handle = wh_of_preview;
+    reveal.clear_word = WimpIcon_Deleted;
+    reveal.icon_handle = ih_of_rendering;
+    reveal.EOR_word = WimpIcon_Deleted;
+    error_trap(wimp_set_icon_state(&reveal), 0);
+    reveal.icon_handle = ih_of_unavailable;
+    reveal.EOR_word = 0;
+    error_trap(wimp_set_icon_state(&reveal), 0);
+    if (selection == NULL) return;
+    if (selection->previewarea == NULL) return;
+
+    /* User fiddlable options that affect the preview */
+    error_trap(optionbutton_get_state(0, main_window, CheckTexturedWindows, &state), 0);
+    texturedwindows = state != 0;
+    error_trap(optionbutton_get_state(0, main_window, Check3DWindows, &state), 0);
+    threedborders = state != 0;
+    error_trap(optionbutton_get_state(0, main_window, CheckTexturedMenus, &state), 0);
+    texturedmenus = state != 0;
+    error_trap(optionbutton_get_state(0, main_window, CheckDifferentMenuTexture, &state), 0);
+    altmenutexture = state != 0;
+
+    /* Get info on the primitive sprites */
+    if (!get_sprite_info(spritearea, "rendering", &render)) return;
+    if (!get_sprite_info(selection->previewarea, "wtitle", &window)) return;
+    if (!get_sprite_info(selection->previewarea, "mtitle", &menu)) return;
+    if (!get_sprite_info(selection->previewarea, "file_fff", &file)) return;
+    if (texturedwindows &&
+        !get_sprite_info(selection->previewarea, "tile_1", &wtile)) return;
+    if (texturedmenus &&
+        !get_sprite_info(selection->previewarea, altmenutexture ? "tile_m" : "tile_1", &mtile)) return;
+
+    /* Make an 8bpp desktop palette sprite to render into */
+    modevar.xeigen = 4;
+    modevar.yeigen = 5;
+    modevar.end = -1;
+    error_trap(_swix(OS_ReadVduVariables, _INR(0,1), &modevar, &modevar), 1);
+    error_trap(_swix(OS_SpriteOp, _INR(0,2), SpriteReason_DeleteSprite + 256,
+                     spritearea, "rendering"), 1);
+    render.width = PREVIEW_WIDTH_OSUNITS >> modevar.xeigen;
+    render.height = PREVIEW_HEIGHT_OSUNITS >> modevar.yeigen;
+    render.xeigen = modevar.xeigen;
+    render.yeigen = modevar.yeigen;
+    render.mode = (SpriteType_New8bpp << 27) |  
+                  ((180 >> modevar.yeigen) << 14) | ((180 >> modevar.xeigen) << 1) | 1;
+    if ((_swix(OS_SpriteOp, _INR(0,6), SpriteReason_CreateSprite + 256,
+               spritearea, "rendering", 0 /* No palette */,
+               render.width, render.height, render.mode) != NULL) ||
+        (_swix(OS_SpriteOp, _INR(0,3), SpriteReason_CreateRemovePalette + 256,
+               spritearea, "rendering", 1) != NULL))
+    {
+        error_trap(common_error(messages_lookup("PreviewOdd")), 0);
+        return;
+    }
+    dx = 1 << modevar.xeigen;
+    dy = 1 << modevar.yeigen;
+
+    /* Select the font */
+    error_trap(optionbutton_get_state(0, main_window, CheckUseOutlineFont, &state), 0);
+    if (state)
+    {
+        fontscan_t scan = { 0, 0, 0, 0, -1 };
+
+        error_trap(fontmenu_get_font(0, font_menu, font, FontNameLen, &state), 0);
+        if (_swix(Font_FindFont, _INR(1,5) | _OUT(0), font,
+                  DEFAULT_WIMP_FONT_SIZE, DEFAULT_WIMP_FONT_SIZE,
+                  180 >> render.xeigen, 180 >> render.yeigen,
+                  &fonthandle) != NULL) return;
+
+        /* Calculate adjustment to centre it */
+        if (_swix(Font_ReadInfo, _IN(0) | _OUT(4),
+                  fonthandle, &fontadjust) != NULL) return;
+        fontadjust = ((CEIL_DY((window.height - 1) << window.yeigen) + fontadjust) / 2) -
+                     SYSFONT_DESCENDER_OSUNITS;
+
+        /* Find how wide the sample menu needs to be in that font */
+        _swix(Font_ScanString, _INR(0,5), fonthandle, messages_lookup("Menu"),
+              (1<<5) /* Block */ | (1<<8) /* Handle */ |
+              (1<<9) /* Kern */ | (1<<18) /* Bbox */,
+              INT32_MAX, INT32_MAX, &scan);
+        titlewidth = scan.xmax - scan.xmin;
+        _swix(Font_ScanString, _INR(0,5), fonthandle, messages_lookup("Option"),
+              (1<<5) /* Block */ | (1<<8) /* Handle */ |
+              (1<<9) /* Kern */ | (1<<18) /* Bbox */,
+              INT32_MAX, INT32_MAX, &scan);
+        menuwidth = MAX(titlewidth, scan.xmax - scan.xmin);
+        _swix(Font_ConverttoOS, _IN(1) | _OUT(1), titlewidth, &titlewidth);
+        _swix(Font_ConverttoOS, _IN(1) | _OUT(1), menuwidth, &menuwidth);
+    }
+    else
+    {
+        fonthandle = 0; /* System */
+        titlewidth = SYSFONT_XSIZE_OSUNITS * strlen(messages_lookup("Menu")); 
+        menuwidth = MAX(titlewidth, SYSFONT_XSIZE_OSUNITS * strlen(messages_lookup("Option")));
+        fontadjust = ((CEIL_DY((window.height - 1) << window.yeigen) + SYSFONT_YMAX_OSUNITS) / 2);
+    }
+    menuwidth = menuwidth + INSET_MENU_TICK_OSUNITS + (2 * GAP_TEXT_OSUNITS) + INSET_MENU_ARROW_OSUNITS;
+    if (threedborders) menuwidth = menuwidth + (2 * GAP_BEVEL_OSUNITS);
+    menuwidth = (menuwidth + 3) & ~3; /* Keep a multiple of EX0/EX1/EX2 */
+
+    /* Switch to sprite */
+    if (_swix(OS_SpriteOp, _INR(0,3) | _OUTR(0,3), SpriteReason_SwitchOutputToSprite + 256,
+              spritearea, "rendering", 0,
+              &save[0], &save[1], &save[2], &save[3]) != NULL) return;
+
+    /* Default pinboard backdrop */
+    rect.xmin = 0;
+    rect.ymin = 0;
+    rect.xmax = INT32_MAX;
+    rect.ymax = INT32_MAX;
+    draw_background(&rect, PALETTE_OF_BACKDROP, NULL, NULL, NULL);
+
+    /* Window background */
+    rect.xmin = INSET_WINDOW_LEFT_OSUNITS;
+    rect.ymin = 0;
+    rect.xmax = (render.width << render.xeigen) - 1;
+    rect.ymax = (render.height << render.yeigen) - INSET_WINDOW_TOP_OSUNITS - 1;
+    draw_background(&rect, PALETTE_OF_WINDOW_BG, &render,
+                    selection->previewarea, texturedwindows ? &wtile : NULL);
+
+    /* Window 1 pixel frame */
+    rect.xmin -= dx;
+    rect.ymin--; /* Hide off bottom */
+    rect.xmax++; /* Hide off right */
+    rect.ymax += dy;
+    if (!selection->wvf.winoutlineover) draw_frame_border(&rect, selection->wvf.winoutline << 8);
+
+    /* Window titlebar */
+    xoff = rect.xmin;
+    yoff = (render.height << render.yeigen) - INSET_WINDOW_TOP_OSUNITS -
+           CEIL_DY((window.height - 1 /* Trim top border */) << window.yeigen);
+    clip.xmin = rect.xmin;
+    clip.ymin = 0;
+    clip.xmax = (render.width << render.xeigen) - 1;
+    clip.ymax = rect.ymax - 1;
+    set_graphics_window(&clip);
+    draw_untranslated_sprite(&render, &window, selection->previewarea, xoff, yoff);
+    set_graphics_window(NULL);
+    if (selection->wvf.winoutlineover) draw_frame_border(&rect, selection->wvf.winoutline << 8);
+    if (threedborders)
+    {
+        rect.xmin += dx;
+        rect.ymin -= GAP_BEVEL_OSUNITS; /* Hide off bottom */
+        rect.xmax += GAP_BEVEL_OSUNITS; /* Hide off right */
+        rect.ymax = rect.ymax - dy - CEIL_DY((window.height - 1) << window.yeigen);
+        draw_slabout_border(&rect, selection->wvf.winborderface << 8, selection->wvf.winborderopp << 8);
+    }
+
+    /* Window title text */
+    xoff = INSET_WINDOW_LEFT_OSUNITS +
+           (2 * (window.height << window.yeigen)) /* Square back & close */ +
+           GAP_TEXT_OSUNITS;
+    yoff = (render.height << render.yeigen) - INSET_WINDOW_TOP_OSUNITS - fontadjust;
+    draw_some_text(fonthandle, messages_lookup("Window"), selection->wvf.fontblend,
+                   PALETTE_OF_TITLE_FOCUS_BG, PALETTE_OF_TEXT_FG, xoff, yoff);
+
+    /* File icon */
+    xoff = INSET_FILE_LEFT_OSUNITS;
+    yoff = (render.height << render.yeigen) -
+            INSET_FILE_TOP_OSUNITS - (file.height << file.yeigen);
+    draw_untranslated_sprite(&render, &file, selection->previewarea, xoff, yoff);
+    
+    /* Menu background */
+    rect.xmin = INSET_MENU_LEFT_OSUNITS;
+    rect.ymin = 0;
+    rect.xmax = INSET_MENU_LEFT_OSUNITS + menuwidth - 1;
+    rect.ymax = (render.height << render.yeigen) - INSET_MENU_TOP_OSUNITS - 1;
+    draw_background(&rect, PALETTE_OF_MENU_BG, &render,
+                    selection->previewarea, texturedmenus ? &mtile : NULL);
+
+    /* Menu 1 pixel frame */
+    rect.xmin -= dx;
+    rect.ymin--; /* Hide off bottom */
+    rect.xmax += dx;
+    rect.ymax += dy;
+    if (!selection->wvf.winoutlineover) draw_frame_border(&rect, selection->wvf.winoutline << 8);
+
+    /* Menu titlebar */
+    xoff = rect.xmin;
+    yoff = (render.height << render.yeigen) - INSET_MENU_TOP_OSUNITS -
+           CEIL_DY((menu.height - 1 /* Trim top border */) << menu.yeigen);
+    clip.xmin = rect.xmin;
+    clip.ymin = 0;
+    clip.xmax = rect.xmax;
+    clip.ymax = rect.ymax - 1;
+    set_graphics_window(&clip);
+    draw_untranslated_sprite(&render, &menu, selection->previewarea, xoff, yoff);
+    set_graphics_window(NULL);
+    clip.xmin = clip.xmax - GAP_TBARRCAP_OSUNITS;
+    xoff = xoff - ((menu.width << menu.xeigen) - menuwidth) + dx + dx;
+    set_graphics_window(&clip);
+    draw_untranslated_sprite(&render, &menu, selection->previewarea, xoff, yoff);
+    set_graphics_window(NULL);
+    if (selection->wvf.winoutlineover) draw_frame_border(&rect, selection->wvf.winoutline << 8);
+    if (threedborders)
+    {
+        rect.xmin += dx;
+        rect.ymin -= GAP_BEVEL_OSUNITS; /* Hide off bottom */;
+        rect.xmax -= dx;
+        rect.ymax = rect.ymax - dy - CEIL_DY((menu.height - 1) << menu.yeigen);
+        draw_slabout_border(&rect, selection->wvf.menuborderface << 8, selection->wvf.menuborderopp << 8); 
+    }
+
+    /* Menu title text */
+    xoff = INSET_MENU_LEFT_OSUNITS + ((menuwidth - titlewidth) / 2);
+    yoff = (render.height << render.yeigen) - INSET_MENU_TOP_OSUNITS - fontadjust;
+    draw_some_text(fonthandle, messages_lookup("Menu"), selection->wvf.fontblend,
+                   PALETTE_OF_TITLE_BG, PALETTE_OF_TEXT_FG, xoff, yoff);
+
+    /* Menu entries */
+    xoff = INSET_MENU_LEFT_OSUNITS + INSET_MENU_TICK_OSUNITS + GAP_TEXT_OSUNITS;
+    if (threedborders) xoff = xoff + GAP_BEVEL_OSUNITS;
+    yoff -= MENU_ENTRY_YSTEP_OSUNITS;
+    if (threedborders) yoff = yoff - GAP_BEVEL_OSUNITS;
+    for (; yoff >= -MENU_ENTRY_YSTEP_OSUNITS; yoff = yoff - MENU_ENTRY_YSTEP_OSUNITS)
+    { 
+        draw_some_text(fonthandle, messages_lookup("Option"), selection->wvf.fontblend,
+                       PALETTE_OF_MENU_BG, PALETTE_OF_TEXT_FG, xoff, yoff);
+    }
+
+    /* All done, switch back to screen and reveal the ledgend */
+    _swix(OS_SpriteOp, _INR(0,3), save[0], save[1], save[2], save[3]);
+    if (fonthandle) error_trap(_swix(Font_LoseFont, _IN(0), fonthandle), 0);
+    reveal.icon_handle = ih_of_rendering;
+    reveal.EOR_word = 0;
+    error_trap(wimp_set_icon_state(&reveal), 0);
+    reveal.icon_handle = ih_of_unavailable;
+    reveal.EOR_word = WimpIcon_Deleted;
+    error_trap(wimp_set_icon_state(&reveal), 0);
+}
+
+
+/*---------------------------------------------------------------------------*
+ * select_and_merge_theme                                                    *
+ *                                                                           *
+ * Tick the named theme, optionally overriding its WimpVisualFlags.          *
+ *---------------------------------------------------------------------------*/
+
+void select_and_merge_theme(const char *theme, const char *flags)
+{
+    OptionButtonStateChangedEvent obsce;
+    wimpvisflags_t wvf;
+    const theme_t *selection;
+
+    selection = match_theme_by_name(theme);
+    if (flags == NULL)
+    {
+        /* Theme selected from internal list, so must exist */
+        wvf = selection->wvf;
+    }
+    else
+    {
+        /* One or more flags recovered from the choices */
+        parse_wimpvisflags(flags, &wvf);
+    }
+    if (selection == NULL)
+    {
+        /* The chosen theme is not in !ThemeDefs, it might
+         * well exist in ROM, but there's nothing extra to
+         * load off disc - so unselect loading and default to the first in the list.
+         */
+        error_trap(optionbutton_set_state(0, main_window, CheckLoadTheme, 0), 0);
+        obsce.new_state = 0;
+    }
+    else
+    {
+        const theme_t *list;
+        
+        /* Tick it in the menu */
+        list = themehead;
+        while (list != NULL)
+        {
+            error_trap(menu_set_tick(0, theme_menu, list->menuid,
+                                     (list->menuid == selection->menuid) ? 1 : 0), 0);
+            list = list->next;
+        }
+        obsce.new_state = 1;
+    }
+    obsce.hdr.event_code = OptionButton_StateChanged;
+    obsce.hdr.size = sizeof(OptionButtonStateChangedEvent);
+    error_trap(toolbox_raise_toolbox_event(0, main_window, CheckLoadTheme, (ToolboxEvent *)&obsce), 0);
+    displayfield_set_value(0, main_window, DisplayTheme, (char *)theme);
+
+    /* Reset the user editable theme elements from the theme definition */
+    error_trap(optionbutton_set_state(0, main_window, CheckTexturedMenus, wvf.texturedmenus ? 1 : 0), 0);
+    obsce.new_state = wvf.texturedmenus ? 1 : 0;
+    error_trap(toolbox_raise_toolbox_event(0, main_window, CheckTexturedMenus, (ToolboxEvent *)&obsce), 0);
+    error_trap(optionbutton_set_state(0, main_window, CheckDifferentMenuTexture, wvf.altmenutexture ? 1 : 0), 0);
+
+    error_trap(optionbutton_set_state(0, main_window, Check3DWindows, wvf.threedborders ? 1 : 0), 0);
+    obsce.new_state = wvf.threedborders ? 1 : 0;
+    error_trap(toolbox_raise_toolbox_event(0, main_window, Check3DWindows, (ToolboxEvent *)&obsce), 0);
+    error_trap(optionbutton_set_state(0, main_window, CheckFully3DIconbar, wvf.threediconbar ? 1 : 0), 0);
+}
+
+
+/*---------------------------------------------------------------------------*
+ * scan_installed_themes                                                     *
+ *                                                                           *
+ * Check within !ThemeDefs for any loadable themes.                          *
+ *---------------------------------------------------------------------------*/
+
+void scan_installed_themes(void)
+{
+    _kernel_oserror  *e = NULL;
+    int               num, pos = 0;
+    MenuTemplateEntry entry;
+    theme_t          *addition;
+    char              rawflags[256];
+    struct
+    {
+        int load; int exec;   int length;
+        int attr; int object;
+        char name[ThemeNameLen];
+    } info;
+
+    while ((e == NULL) && (pos != -1))
+    {
+        /* Get next entry from directory */
+        e = _swix(OS_GBPB, _INR(0,6) | _OUTR(3,4),
+                           OSGBPB_ReadDirEntriesInfo, ThemesDir, &info,
+                           1, pos, sizeof(info), 0,
+                           &num, &pos);
+
+        if ((e == NULL) && (num > 0) && (info.object == object_directory))
+        {
+            /* Check at least one thing is there */
+            if (!theme_ifthere(info.name, "Banner", FileType_Sprite) &&
+                !theme_ifthere(info.name, "Sprites", FileType_Sprite) &&
+                !theme_ifthere(info.name, "Tools", FileType_Sprite) &&
+                !theme_ifthere(info.name, "Draw", FileType_Sprite) &&
+                !theme_ifthere(info.name, "Paint", FileType_Sprite)) continue;
+
+            /* Add that to the list */
+            addition = (theme_t *)malloc(sizeof(theme_t));
+            if (addition == NULL)
+            {
+                error_trap(common_error(messages_lookup("NotEnoughMemory")), 0);
+                break;
+            }
+            addition->next = themehead;
+            themehead = addition;
+            strcpy(addition->name, info.name);
+
+            /* Look for and parse any WimpVisualFlags */
+            rawflags[0] = '\0';
+            if (theme_ifthere(addition->name, "CoFlags", FileType_Obey))
+            {
+                FILE *fp;
+                char  buffer[256];
+                char  element[64];
+                char *more = (char *)!NULL;
+
+                strcpy(element, ThemesDir ".");
+                strcat(element, addition->name);
+                strcat(element, ".CoFlags");
+
+                fp = fopen(element, "r");
+                if (fp != NULL)
+                {
+                    while (more != NULL)
+                    {
+                        /* Get the next line from the file */
+                        more = fgets(buffer, sizeof(buffer), fp);
+                        if (more != NULL)
+                        {
+                            /* Check for the flags command */
+                            if (strncmp(buffer, WimpVisFlagsTag, sizeof(WimpVisFlagsTag) - 1) == 0)
+                            {
+                                strcpy(rawflags, &buffer[sizeof(WimpVisFlagsTag) - 1]);
+                                break;
+                            }
+                        }
+                    }
+                    fclose(fp);
+                }
+            }
+            parse_wimpvisflags(rawflags, &addition->wvf);
+
+            /* Look for and cache any preview sprites */
+            addition->previewarea = NULL;
+            if (theme_ifthere(addition->name, "CoSprite", FileType_Sprite))
+            {
+                uint32_t size;
+                char    *area;
+                char     element[64];
+
+                strcpy(element, ThemesDir ".");
+                strcat(element, addition->name);
+                strcat(element, ".CoSprite");
+
+                _swix(OS_File, _INR(0,1) | _OUT(4), OSFile_ReadNoPath,
+                      element, &size);
+                area = malloc(size + SpriteAreaCBsize);
+                if (area != NULL)
+                {
+                    *(uint32_t *)&area[saEnd]    = size + SpriteAreaCBsize;
+                    *(uint32_t *)&area[saNumber] = 0;
+                    *(uint32_t *)&area[saFirst]  = SpriteAreaCBsize;
+                    *(uint32_t *)&area[saFree]   = SpriteAreaCBsize;
+                    if (_swix(OS_SpriteOp, _INR(0,2), SpriteReason_LoadSpriteFile + 256,
+                              area, element) != NULL)
+                    {
+                        /* Tidy up if failed to load */
+                        free(area);
+                        area = NULL;
+                    }
+                }
+                addition->previewarea = area;
+            }
+
+            /* Add that to the menu */
+            entry.flags = Menu_Entry_SubMenu | Menu_Entry_GenerateSubMenuEvent;
+            entry.component_id = -1;
+            entry.text = addition->name;
+            entry.max_text = sizeof(addition->name);
+            entry.click_show = entry.submenu_show = entry.help_message = NULL;
+            entry.click_event = entry.submenu_event = entry.max_entry_help = 0;
+            error_trap(menu_add_entry(0, theme_menu, Menu_AddEntryAtEnd, (char *)&entry, &addition->menuid), 0);
+            error_trap(menu_set_sub_menu_show(0, theme_menu, addition->menuid, preview_window), 0);
+        }
+    }            
+
+    /* No themes at all? Shade that option */
+    if (themehead == NULL)
+    {
+        error_trap(optionbutton_set_state(0, main_window, CheckLoadTheme, 0), 0);
+        enable_gadget(main_window, PopUpTheme, FALSE);
+        enable_gadget(main_window, DisplayTheme, FALSE);
+        enable_gadget(main_window, ButtonInstall, FALSE);
+        enable_gadget(main_window, CheckLoadTheme, FALSE);
+    }
+}

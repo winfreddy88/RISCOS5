@@ -1,0 +1,500 @@
+/* Copyright 2015 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*
+ * Name   : helpwin.c
+ * Desc   : help window control for the !allocate application
+ * Auther : James Bye
+ * Date   : 28-Jul-1994
+ *
+ *
+ */
+
+#include "wimp.h"        /*  access to WIMP SWIs                      */
+#include "wimpt.h"       /*  wimp task facilities                     */
+#include "win.h"         /*  registering window handlers              */
+#include "event.h"       /*  poll loops, etc                          */
+#include "baricon.h"     /*  putting icon on icon bar                 */
+#include "werr.h"        /*  error reporting                          */
+#include "res.h"         /*  access to resources                      */
+#include "resspr.h"      /*  sprite resources                         */
+#include "flex.h"        /*  dynamic mem alloc from WIMP              */
+#include "template.h"    /*  reading in template file                 */
+#include "dbox.h"        /*  dialogue box handling                    */
+#include "msgs.h"
+#include "saveas.h"
+#include "bbc.h"
+           
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include "swis.h"
+#include "kernel.h"
+
+#include "trace.h"
+
+#include "helpwin.h"
+#include "file.h"
+#include "guard.h"
+
+
+#define FixedYSize 32
+#define FixedGap   12
+
+
+static BOOL use_system_font_text = TRUE;
+
+/*********************************************************
+ * Static functions                                      *
+ *********************************************************/
+  
+  
+/*
+ * sets the colour of the text
+ */
+ 
+static void set_text_colour ( int rgb )
+{
+_kernel_swi_regs r;
+
+  r.r[0] = rgb;
+  r.r[3] = 0;
+  r.r[4] = 0;
+  
+  _kernel_swi(ColourTrans_SetGCOL,&r,&r);
+}
+
+
+/*
+ * sees if a bounding box falls into the redraw clipping rectangle
+ * (bbox is expected to be in work area coords)
+ */
+
+static BOOL needs_redrawing ( wimp_box *bbox, wimp_redrawstr *r )
+{
+int g_x0,g_y0,g_x1,g_y1;
+
+  /*-- convert graphics box into work area coords --*/
+  
+  g_x0 = r->g.x0 + (r->scx - r->box.x0);
+  g_y0 = r->g.y0 + (r->scy - r->box.y1);
+  g_x1 = r->g.x1 + (r->scx - r->box.x0);
+  g_y1 = r->g.y1 + (r->scy - r->box.y1);
+  
+  /*-- compare coords --*/
+  
+#if (0)
+  tracef4("clip x0 = %d y0 = %d x1 = %d y1 = %d\n",g_x0,g_y0,g_x1,g_y1);
+  tracef4("bbox x0 = %d y0 = %d x1 = %d y1 = %d\n",bbox->x0,bbox->y0,
+                                                    bbox->x1,bbox->y1);  
+#endif  
+                                        
+  if(g_x0 <= bbox->x1 && g_y0 <= bbox->y1 &&
+     g_x1 >= bbox->x0 && g_y1 >= bbox->y0)
+     return(TRUE);
+  
+  return(FALSE);
+}
+
+
+  
+/*
+ * plots the lines of text on the screen
+ */
+ 
+static void plot_lines ( HelpWinInfo *hwin, wimp_redrawstr *r )
+{
+int x,y;
+int i = 0;
+_kernel_swi_regs regs;
+
+  while(i < hwin->no_lines)
+  {
+#if (1)
+    if(needs_redrawing(&hwin->lines[i].bbox,r))
+    {
+#endif
+      /*-- calculate the screen coords to plot --*/
+    
+      x = hwin->lines[i].bbox.x0 - (r->scx - r->box.x0);
+      if(use_system_font_text)
+        y = hwin->lines[i].bbox.y1 - (r->scy - r->box.y1);
+      else
+        y = hwin->lines[i].bbox.y0 - (r->scy - r->box.y1);
+        
+      /*-- and plot the text --*/
+      
+      if(use_system_font_text)
+      {    
+        /*-- set the colour --*/
+    
+        set_text_colour(0x00000000);      
+        
+        bbc_move(x,y);
+    
+        regs.r[0] = (int)hwin->lines[i].start;
+        
+        _kernel_swi(OS_Write0,&regs,&regs);
+      }
+      else
+      {
+        /*-- set the text colour --*/
+        
+        regs.r[0] = 0;
+        regs.r[1] = 0x00000000;
+        regs.r[2] = 0xFFFFFFFF;
+        
+        wimpt_complain((os_error *)_kernel_swi(Wimp_TextOp,&regs,&regs));
+        
+        /*-- plot the text --*/
+        
+        regs.r[0] = 2;
+        regs.r[1] = (int)hwin->lines[i].start;
+        regs.r[2] = -1;
+        regs.r[3] = -1;
+        regs.r[4] = x;
+        regs.r[5] = y;
+        
+        wimpt_complain((os_error *)_kernel_swi(Wimp_TextOp,&regs,&regs));
+      }
+        
+     
+#if (0)
+      bbc_rectangle(x,hwin->lines[i].bbox.y0 - (r->scy - r->box.y1),
+                        hwin->lines[i].bbox.x1 - hwin->lines[i].bbox.x0,
+                        hwin->lines[i].bbox.y1 - hwin->lines[i].bbox.y0);
+#endif
+#if (1)
+    }
+#endif
+
+    /*-- move onto the next line --*/
+
+    i++;    
+  }
+}
+
+
+
+/*
+ * redraws the help window
+ */
+
+static void help_window_redraw ( HelpWinInfo *hwin )
+{
+wimp_redrawstr r;
+BOOL more;
+
+  r.w = hwin->w;
+  wimp_redraw_wind(&r,&more);
+  
+  while(more)
+  {
+    plot_lines(hwin,&r);
+    wimp_get_rectangle(&r,&more);
+  }
+}
+
+ 
+/*
+ * event handler for the help window
+ */
+ 
+static void help_window_events ( wimp_eventstr *e, void *handle )
+{
+HelpWinInfo *hwin = (HelpWinInfo *) handle;
+
+  switch(e->e)
+  {
+    case wimp_EOPEN   : wimp_open_wind(&e->data.o);
+                        break;
+    case wimp_ECLOSE  : helpwin_close(hwin);
+                        break;
+    case wimp_EREDRAW : help_window_redraw(hwin);
+                        break;
+  }
+}
+
+
+/*
+ * calculates how many lines there are in a buffer
+ */
+
+static int count_lines ( char *buffer, int size )
+{
+int x = 0;
+int lines = 0;
+
+  while(x++ <= size)
+  {
+    if(*buffer++ == '\n')
+      lines++;
+  }
+  
+  tracef1("Counted %d lines\n",lines);
+  
+  return(lines);
+}
+    
+    
+/*
+ * builds line pointers for the specified helpwin
+ */
+ 
+static void build_line_ptrs ( HelpWinInfo *hwin )
+{
+int i = 0;
+char *p = hwin->buffer;
+int x = 0;
+
+  while(x <= hwin->size)
+  {
+    /*-- store the start of line pointer --*/
+    
+    hwin->lines[i].start = p;
+    
+    /*-- loop until we find a carriage return --*/
+    
+    while(*p != '\n' && x <= hwin->size)
+    {
+      p++;
+      x++;
+    }
+    
+    /*-- replace new line in buffer with a null character --*/
+    /*-- (we are going to be rendering a line at a time   --*/
+    
+    *p = '\0';
+    
+    /*-- store the end of line pointer --*/
+    
+    hwin->lines[i].end = p++;
+    
+    /*-- increment indicies --*/
+    
+    i++;
+    x++;
+  }
+}
+
+
+/*
+ * calculates the width of a string
+ */    
+ 
+static int my_string_width ( HelpWinLine *line )
+{
+  if(use_system_font_text)
+  {
+    return(((int)(line->end-line->start))*16);
+  }
+  else
+  {
+  _kernel_swi_regs r;
+  
+    r.r[0] = 1;
+    r.r[1] = (int) line->start;
+    r.r[2] = 0;
+    
+    wimpt_complain((os_error *) _kernel_swi(Wimp_TextOp,&r,&r));
+    
+    return(r.r[0]);
+  }
+}
+  
+    
+/*
+ * calculates the bounding boxes for the lines
+ */
+ 
+static void build_line_bboxes ( HelpWinInfo *hwin )
+{
+wimp_wstate state;
+int i = 0;
+int y = -10;
+
+  /*-- get window state --*/
+  
+  wimp_get_wind_state(hwin->w,&state);
+  
+  /*-- calc the bboxes --*/
+  
+  while(i < hwin->no_lines)
+  {
+    hwin->lines[i].bbox.x0 = FixedGap;
+    hwin->lines[i].bbox.y1 = y;
+    hwin->lines[i].bbox.x1 = hwin->lines[i].bbox.x0 + 
+                               my_string_width(&hwin->lines[i]);
+    y -= FixedYSize;
+    hwin->lines[i++].bbox.y0 = y;
+  }
+}
+
+
+/*
+ * calculates the bounding box for the help window
+ */
+ 
+static void calc_window_bbox ( HelpWinInfo *hwin, wimp_box *bbox )
+{
+int i = 0;
+
+  bbox->x0 = 0;
+  bbox->x1 = 0;
+  bbox->y1 = 0;
+  bbox->y0 = -((hwin->no_lines * FixedYSize)+FixedYSize);
+  
+  /*-- calculate x1 by finding the maximum line length --*/
+  
+  while(i < hwin->no_lines)
+  {
+    if(hwin->lines[i].bbox.x1 > bbox->x1)
+      bbox->x1 = hwin->lines[i].bbox.x1;
+    i++;
+  }
+  
+  bbox->x1 += FixedGap;
+}
+
+  
+
+
+/*********************************************************
+ * External functions                                    *
+ *********************************************************/
+
+
+/*
+ * Name         : helpwin_close
+ * Description  : close a help window and frees any workspace
+ * Parms        : HelpWinInfo *hwin - pointer to info structure
+ * Returns      : none
+ */
+ 
+extern void helpwin_close ( HelpWinInfo *hwin )
+{
+  wimpt_complain(wimp_close_wind(hwin->w));
+  wimpt_complain(wimp_delete_wind(hwin->w));
+  if(hwin->buffer != NULL)
+  {
+    free(hwin->buffer);
+    hwin->buffer = NULL;
+  }
+  if(hwin->lines != NULL)
+  {
+    free(hwin->lines);
+    hwin->lines = NULL;
+  }
+  hwin->open = FALSE;
+}
+
+
+ 
+/*
+ * Name         : helpwin_show
+ * Description  : shows the help window with the specified text file
+ * Parms        : char *filename   - name of help file to show
+ *                HelpWinInfo *new - pointer to help window structure
+ * Returns      : True or False on result
+ */
+
+extern BOOL helpwin_show ( char *filename, HelpWinInfo *new )
+{
+int type;
+template *from;
+template *dest;
+wimp_wstate state;
+wimp_redrawstr r;
+
+  if(!new->open)
+  {
+    /*-- read the size of the file and allocate space --*/
+  
+    if((file_readcat(filename,&type,0,0,&new->size,0)) != NULL || type != 1)
+    {
+      return(FALSE);
+    }
+  
+    if((new->buffer = malloc(new->size+GUARD)) == NULL)
+    {
+      return(FALSE);
+    }
+  
+    /*-- load the file --*/
+  
+    file_load(filename,(int)new->buffer);
+    
+    /*-- calculate and store line pointers --*/
+  
+    new->no_lines = count_lines(new->buffer,new->size);
+    if((new->lines = malloc(new->no_lines*sizeof(HelpWinLine)+GUARD)) == NULL)
+    {
+      helpwin_close(new);
+      return(FALSE);
+    }
+    build_line_ptrs(new);
+  
+    /*-- build the bounding boxes for the lines --*/
+  
+    build_line_bboxes(new);
+  
+    /*-- create the window etc... --*/
+  
+    from = template_find("help");
+    dest = template_copy(from);
+    wimpt_complain(wimp_create_wind(&dest->window,&new->w));
+    wimpt_complain(wimp_get_wind_state(new->w,&state));
+    
+    /*-- find the real extent of the window --*/
+    
+    calc_window_bbox(new,&r.box);
+    r.w = new->w;
+    wimp_set_extent(&r);
+    
+    wimpt_complain(wimp_open_wind(&state.o));
+    new->open = TRUE;
+  
+    win_register_event_handler(new->w,help_window_events,new);
+  
+
+  }
+    
+  return(TRUE);
+}
+
+
+/*
+ * Name     : helpwin_init
+ * Desc     : inits helpwin
+ * Parms    : none
+ * Returns  : none
+ */
+ 
+extern void helpwin_init ( void )
+{
+_kernel_swi_regs r;
+
+  /*-- call Wimp_ReadSysInfo to find out if display should be --*/
+  /*-- in a fancy font                                        --*/
+  
+  r.r[0] = 7;
+  
+  _kernel_swi(Wimp_ReadSysInfo,&r,&r);
+  
+  if(r.r[0] > 329)
+    use_system_font_text = FALSE;
+}
+
+ 
+/*-- end --*/

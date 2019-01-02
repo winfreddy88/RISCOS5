@@ -1,0 +1,452 @@
+/* Copyright 2016 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#include        "PMInclude.h"
+#include        "Format.h"
+#include        "Diagnostic.h"
+#include        "asm.h"
+#include        "Global/CMOS.h"
+#include        "Global/FSNumbers.h"
+
+static _kernel_swi_regs rg;
+static char cdb[10];
+static _kernel_oserror *err;
+ // buffered sector read/write for use with formatting
+ BufferedSec* BufStart;
+
+
+// Read sector from scsi device
+// assume Length is multiple of SecSize
+_kernel_oserror * SecRead(int ID, unsigned int AccessKey, void *To, int Length, int LBA, int SecSize)
+{
+//  testprint("SecRead ID:%x LBA:%x To:%x Len:%x Secsize:%x\n",ID,LBA,(int)To,Length,SecSize);
+   rg.r[0] = 0x01000000 | ID;
+   rg.r[1] = 10;
+   rg.r[2] = (int)cdb;
+   cdb[0] = 0x28;
+   cdb[1] = 0;
+   cdb[2] = (LBA) >>24;
+   cdb[3] = (LBA) >>16;
+   cdb[4] = (LBA) >>8;
+   cdb[5] = (LBA) >>0;
+   cdb[6] = 0;
+   if(SecSize < Length)
+   {
+     cdb[7] = (Length/SecSize)>>8;
+     cdb[8] = Length/SecSize;
+   }
+   else
+   {
+     cdb[7] = 0;
+     cdb[8] = 1;
+   }
+   cdb[9] = 0;
+   rg.r[3] = (int)To;
+   rg.r[4] = Length;
+   rg.r[5] = 0;
+   rg.r[8] = AccessKey;
+   err=_kernel_swi(SCSI_Op,&rg,&rg);
+//   if(!err){testprint("\nRaw data:\n");testsave ("Readdata",To, Length);testprint("\n");}
+   if(err){wimp_error(err);}
+   return(err);
+}
+
+// write sector to scsi device
+// assume Length is multiple of SecSize
+_kernel_oserror * SecWrite(int ID, unsigned int AccessKey, void *buffer, int Length, int LBA, int SecSize)
+{
+
+testprint("SecWrite ID:%x addr:%x LBA:%x Len:%x\n",ID,(int)buffer,(int)LBA,Length);
+ testprint("\nRaw data:\n");testsave ("WriteData",buffer, Length);testprint("\n");
+
+
+
+   rg.r[0] = 0x02000000 | ID;
+   rg.r[1] = 10;
+   rg.r[2] = (int)cdb;
+   cdb[0] = 0x2a;
+   cdb[1] = 0;
+   cdb[2] = (LBA) >>24;
+   cdb[3] = (LBA) >>16;
+   cdb[4] = (LBA) >>8;
+   cdb[5] = (LBA) >>0;
+   cdb[6] = 0;
+   if(SecSize < Length)
+   {
+     cdb[7] = (Length/SecSize)>>8;
+     cdb[8] = Length/SecSize;
+   }
+   else
+   {
+     cdb[7] = 0;
+     cdb[8] = 1;
+   }
+   cdb[9] = 0;
+   rg.r[3] = (int)buffer;
+   rg.r[4] = Length;
+   rg.r[5] = 0;
+   rg.r[8] = AccessKey;
+   return(_kernel_swi(SCSI_Op,&rg,&rg));
+}
+
+// read disc capacity & sector size
+// set answers to 0 if error
+_kernel_oserror * ReadDiscCapacity(int ID, unsigned int AccessKey,int* capacity,int* sectorsize)
+{
+  AccessKey=AccessKey;
+  static int ans[10];         // up to 40 chars
+  char *dd;
+   _kernel_oserror * err=NULL;
+
+   cdb[0] = 0x0;
+   cdb[1] = 0;
+   cdb[2] = 0;
+   cdb[3] = 0;
+   cdb[4] = 0;
+   cdb[5] = 0;
+   testprint("tstrdy %x start\n",ID);
+
+   rg.r[0] = 0x01000000 | ID;
+   rg.r[1] = 10;
+   rg.r[2] = (int)cdb;
+   rg.r[3] = (int)ans;
+   rg.r[4] = cdb[4];
+   rg.r[5] = 75;   // .75 secs timeout (min usable on crucial is 50)
+   rg.r[8] = AccessKey;
+
+   err=_kernel_swi(SCSI_Op,&rg,&rg);
+   testprint("tstrdy %x enderr:%s left:%d\n",ID,err?err->errmess:"",cdb[4]-rg.r[4]);
+   if(!err)
+   {
+   cdb[0] = 0x25;
+   cdb[1] = 0;
+   cdb[2] = 0;
+   cdb[3] = 0;
+   cdb[4] = 0;
+   cdb[5] = 0;
+   cdb[6] = 0;
+   cdb[7] = 0;
+   cdb[8] = 8;
+   cdb[9] = 0;
+   testprint("Readdisc capacity %x start\n",ID);
+
+   rg.r[0] = 0x01000000 | ID;
+   rg.r[1] = 10;
+   rg.r[2] = (int)cdb;
+   rg.r[3] = (int)ans;
+   rg.r[4] = cdb[8];
+   rg.r[5] = 75;   // .75 secs timeout (min usable on crucial is 50)
+   rg.r[8] = AccessKey;
+
+   err=_kernel_swi(SCSI_Op,&rg,&rg);
+//  err = asm_ReadCapacity(ID, (volatile void*) ans);
+   testprint("Readdisc capacity %x enderr:%s left:%d\n",ID,err?err->errmess:"",cdb[8]-rg.r[4]);
+  }
+  if(!err)
+  {
+    dd=(char*)ans;
+    *capacity = (*(dd++)<<24);
+    *capacity += (*(dd++)<<16);
+    *capacity += (*(dd++)<<8);
+    *capacity += (*(dd++)<<0);
+    *sectorsize = (*(dd++)<<24);
+    *sectorsize += (*(dd++)<<16);
+    *sectorsize += (*(dd++)<<8);
+    *sectorsize += (*(dd)<<0);
+  }
+  else
+  {
+    *capacity = 0;
+    *sectorsize = 0;
+  }
+  testprint("ReadDiscCap done id:%x cap:%x secsiz:%x: ssaddr:%x err: %s\n",ID,*capacity,*sectorsize,(int)sectorsize,(err)?(int)err->errmess:(int)"no err");
+
+  return err;
+}
+
+// Inquiry command .. return device type from first byte of response
+// or  error
+_kernel_oserror * Inquiry(int ID, unsigned int AccessKey,int* type)
+{
+  AccessKey=AccessKey;
+  static int ans[10];         // up to 40 chars
+  char *dd;
+   _kernel_oserror * err=NULL;
+
+   cdb[0] = 0x12;
+   cdb[1] = 0;
+   cdb[2] = 0;
+   cdb[3] = 0;
+   cdb[4] = 36;
+   cdb[5] = 0;
+   testprint("tstrdy %x start\n",ID);
+
+   rg.r[0] = 0x01000000 | ID;
+   rg.r[1] = 10;
+   rg.r[2] = (int)cdb;
+   rg.r[3] = (int)ans;
+   rg.r[4] = cdb[4];
+   rg.r[5] = 75;   // .75 secs timeout (min usable on crucial is 50)
+   rg.r[8] = AccessKey;
+
+   err=_kernel_swi(SCSI_Op,&rg,&rg);
+   testprint("Inquiry %x enderr:%s left:%d\n",ID,err?err->errmess:"",cdb[4]-rg.r[4]);
+   if(!err)
+   {
+     dd=(char*)ans;
+     *type=*dd;
+   }
+   else
+   {
+     *type = 0xff;
+   }
+  testprint("Inquiry done id:%x type:%x  err: %s\n",ID,*type,(err)?(int)err->errmess:(int)"no err");
+
+  return err;
+}
+
+// called at program start
+void BufSecInit(void)
+{
+  BufStart = (BufferedSec*)-1;
+}
+
+// claim another BufferedSec.. return valid ptr or NULL in error
+BufferedSec* BufSecNext(int Length)
+{
+  BufferedSec *bs,*ns;
+  if(bs=(BufferedSec* )calloc(1,sizeof(BufferedSec)+Length),bs==(BufferedSec* )NULL) return bs;
+  if((BufStart== (BufferedSec* )NULL)||(BufStart== (BufferedSec* )-1))
+  {
+    BufStart=bs;
+  }
+  else
+  {
+  // append this to end of list
+    ns=BufStart;
+    while(ns->next!=NULL) ns=ns->next;
+    ns->next=bs;
+  }
+  bs->Length=Length;
+  bs->Changed=0;
+  bs->secbuf=(char*)((int)&(bs->next) + sizeof(BufferedSec*));
+//  testprint("allocated buffer @%x \n",(int)bs);
+  return bs;
+}
+
+// return to pool all BufferedSecs
+// called at 'format all marked', and at format window close
+void BufSecFlush(void)
+{
+  BufferedSec *ns,*bs;
+  ns=BufStart;
+  if(ns==(BufferedSec*)-1)ns=NULL;
+  while(ns!=NULL)
+  {
+   bs=ns->next;
+   free (ns);
+   ns=bs;
+  }
+  BufStart= (BufferedSec*)NULL;
+}
+
+// read data from local buffer if there, or from disc, filling local buffer
+// allow for multiple secs/buf if blocksize > 1k ( virtual 1k sectors)
+_kernel_oserror * BufSecRead(int ID, unsigned int AccessKey, void *To, int Length, int Where, int SecSize,int *changed)
+{
+ BufferedSec *ns;
+ int		bufseccount,buffoffset;
+ _kernel_oserror *err;
+
+ ns = BufStart;
+// testprint("\nBSR: to:%x where:%x secsize:%x ",(int)To,(int)Where,SecSize);
+
+// number of sectors (1k max size) held per buffer
+ bufseccount=(SecSize>0x400)?SecSize/0x400:1;
+ buffoffset=(bufseccount==1)?0:(Where & (bufseccount-1));
+
+ if(ns!=(BufferedSec*)-1)
+ {
+   while(ns!=NULL)
+   {
+     if(  (ID==ns->ID)
+        &&(bufseccount==ns->SecsPerBuf)
+        &&(Where==ns->Where+buffoffset)
+        &&(SecSize==ns->SecSize)
+         )
+     {
+       if((ns->Length/ns->SecsPerBuf)>=Length)
+       {
+//    testprint("\n data for ID:%x Where:%x SecSize:%x found in buf:%x ",ID,(int)Where,SecSize,(int)ns);
+         while(Length-->0)
+         {
+          *((char*)To+Length)=*((ns->secbuf)+Length+(0x400*buffoffset));
+         }
+         *changed = ns->Changed;
+         return NULL;
+       }
+       else
+       {
+//          testprint("\nPANIC have len %x in buf, wanted len %x ",ns->Length,Length);
+       }
+     }
+     ns=ns->next;
+   }
+ }
+ *changed=0;
+ if((ns!=(BufferedSec*)-1)&&(ns=BufSecNext((Length>SecSize)?Length:SecSize),ns!=NULL))
+ {
+   ns->SecsPerBuf=bufseccount;
+   err=SecRead(ID, AccessKey,ns->secbuf ,(Length>SecSize)?Length:SecSize, Where-buffoffset,SecSize);
+//    testprint("\nNewBuf:%x for ID:%x Where:%x SecSize:%x ",(int)ns,ID,(int)Where,SecSize);
+   if(err==NULL)
+   {
+     while(Length-->0)
+     {
+      *((char*)To+Length)=*((ns->secbuf)+Length+(0x400*buffoffset));
+     }
+     ns->ID=ID;
+     ns->Where=Where-buffoffset;
+     ns->SecSize=SecSize;
+     ns->AccessKey=AccessKey;
+   }
+   return err;
+ }
+ else
+ {    // assume here that there is part sec buffering elsewhere*************
+//    testprint("\nNo Buffer available or allowed for ID:%x Where:%x SecSize:%x ",ID,(int)Where,SecSize);
+   return SecRead(ID, AccessKey, To,Length, Where,SecSize);
+ }
+}
+
+// change contents of local buffered sector
+_kernel_oserror * BufSecChange(int ID, unsigned int AccessKey,void *From, int Length, int Where, int SecSize)
+{
+ IGNORE(AccessKey);
+ BufferedSec *ns;
+
+ ns = BufStart;
+ while(ns!=NULL)
+ {
+   if(  (ID==ns->ID)
+      &&(Where==ns->Where)
+      &&(SecSize==ns->SecSize)
+       )
+   {
+     if(ns->Length>=Length)
+     {
+//       testprint("\n data for ID:%x Where:%x SecSize:%x found in buf:%x Writing to buffer",ID,(int)Where,SecSize,(int)ns);
+       while(Length-->0)
+       {
+        *((ns->secbuf)+Length)=*((char*)From+Length);
+       }
+       ns->Changed=1; // flag this has been changed
+       return NULL;
+     }
+     else
+     {
+       // testprint("\nPANIC have len %x in buf, wanted to write len %x ",ns->Length,Length);
+     }
+   }
+   ns=ns->next;
+ }
+ return (_kernel_oserror *) NULL;
+}
+_kernel_oserror * BufSecWrite(void)
+{
+ BufferedSec *ns;
+ _kernel_oserror *err=NULL;
+
+ ns = BufStart;
+ while((ns!=NULL)&&(ns!=(BufferedSec *)-1))
+ {
+   if(ns->Changed>0)err=SecWrite(ns->ID, ns->AccessKey,ns->secbuf, ns->Length, ns->Where, ns->SecSize);
+   if(err!=NULL)return err;
+   ns=ns->next;
+ }
+ return err;
+}
+
+// write out Just the buffered boot sector
+_kernel_oserror * BufSecBootWrite(void)
+{
+ BufferedSec *ns;
+ _kernel_oserror *err=NULL;
+
+ ns = BufStart;
+ while(ns!=NULL)
+ {
+   if(ns->Where==(0xc00/ns->SecSize))err=SecWrite(ns->ID, ns->AccessKey,ns->secbuf, ns->Length, ns->Where, ns->SecSize);
+   if(err!=NULL)testprint("err = %x %x %s\n",(int)err,err->errnum,(int)err->errmess);
+   if(err!=NULL)return err;
+   ns=ns->next;
+ }
+ return err;
+}
+
+// Check if scsi ID and start offset is boot disc ID/partition
+// returns false if not boot disc,
+// returns true if partial and scsiid matches
+// returns true if its a complete match.
+bool CheckBootDiscID(int scsiid, int start, bool partial)
+{
+  char curboot[128],canbuf[128];
+  int DefaultSCSIFSDr, DefaultFSno;
+  int len,lenleft,discno,bootscsiid,bootstart;
+  *curboot=0; *canbuf=0;
+  testprint("CheckingBootDisc  SCSI Id %d, start %x, ",scsiid,start);
+  // read current boot dir
+  _swix(OS_ReadVarVal,_INR(0,4)|_OUT(2),"Boot$Dir",curboot,128,0,0,&len);
+  if(strstr(curboot,"$"))*(strstr(curboot,"$")+1)=0;
+
+  // read cmos default boot filesys and drive
+  _swix(OS_Byte,_INR(0,1)|_OUT(2),ReadCMOS,SCSIFSDrivesCMOS,&DefaultSCSIFSDr);
+  _swix(OS_Byte,_INR(0,1)|_OUT(2),ReadCMOS,FileLangCMOS,&DefaultFSno);
+  DefaultSCSIFSDr&=0x38;DefaultSCSIFSDr>>=3; // extract drive num
+  if(DefaultFSno!=fsnumber_SCSIFS)
+  {
+     testprint(" CMOS boot default isn't SCSI\n");
+     return false;
+  }
+
+  // we know it is booting from SCSI and we know disc num
+  _swix(SCSIFS_Partitions,_INR(0,1)|_OUTR(1,2),2,DefaultSCSIFSDr,&bootscsiid,&bootstart);
+  testprint("Boot disc uses scsi id %x start %x\n",bootscsiid, bootstart);
+  //check if we're only concerned wheter drive contains boot
+  if(partial && (scsiid==bootscsiid)) return true;
+
+  // We assume the boot disc is currently mounted.....
+  _swix(SCSIFS_Partitions,_INR(0,2)|_OUT(2),1,scsiid,start,&discno);
+  testprint(" gives discno %d,",discno);
+  if(discno==-1 ) return false;
+
+  sprintf(canbuf,"SCSI::%d.$",discno);
+  _swix(OS_FSControl,_INR(0,5)|_OUT(5),37,canbuf,canbuf,0,0,128,&lenleft);
+  testprint(" is it Bootdisc? %s\n",strcmp(curboot,canbuf)?"no":"yes");
+  return(strcmp(curboot,canbuf)?false:true);
+}
+
+// return SCSIFS mounted disc number for scsi ID & partition start address
+// or -1 if not currently mounted
+void MountedDiscNum(int scsiID, int partLBA, int *scsifsID)
+{
+  _swix(SCSIFS_Partitions,_INR(0,2)|_OUT(2),1,scsiID,partLBA,scsifsID);
+}
+
+// return SCSI ID & partition start address for SCSIFS mounted disc number
+// or -1 if not currently mounted
+void MountedDiscLoc(int scsifsID, int *scsiid, int *start)
+{
+  _swix(SCSIFS_Partitions,_INR(0,1)|_OUTR(1,2),2,scsifsID,scsiid,start);
+}

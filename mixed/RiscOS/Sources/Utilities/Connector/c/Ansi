@@ -1,0 +1,1137 @@
+/*
+ * Copyright (c) 1986, HIRANO Satoshi
+ * All rights reserved.
+ * 
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ * 
+ * 1. Redistributions of source code must retain the above copyright notice,
+ *    this list of conditions and the following disclaimer. 
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution. 
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+/*
+ * ansi.c: hterm escape sequence decoder
+ *
+ * Author: HIRANO Satoshi
+ * (C) 1989  Halca Computer Science Laboratory TM
+ *           University of Tokyo
+ *
+ * 1.1 86/10/17 Halca.Hirano
+ * 1.2 89/05/16 Halca.Hirano add RCS control
+ * 2.2 89/05/16 Halca.Hirano 
+ *	----- V2.2 distribution ----
+ * 2.3 89/07/20 Halca.Hirano 
+ *	add EUC/SJIS/JIS (Thank you ohta@ricoh)
+ *	add UOP_GRAPHICS (Thank you mik@uop)
+ *	tab editor
+ *	---- V2.3.-1 distribution ----
+ * 2.4 89/09/01 Halca.Hirano
+ *	extend UOP_GRAPHICS
+ * 2.5 89/09/14 Halca.Hirano
+ *	fix UOP_GRAPHICS label bug by mik@uop
+ *	fix binary logging bug
+ *     ---- V2.4.0 distribution ----
+ *
+ * $Header: /home/rool/cvsroot/mixed/RiscOS/Sources/Utilities/Connector/c/Ansi,v 1.3 2016/01/17 10:46:18 rsprowson Exp $"
+ */
+#include "Desk/Event.h"
+#include "Desk/Sound.h"
+#include "Desk/Window.h"
+
+#include "hterm.h"
+#include "console.h"
+#include "text.h"
+#include "console.h"
+#include "global.h"
+#include "event.h"
+#include "misc.h"
+#include "spool.h"
+#include "script.h"
+#include <stdio.h>
+#include <ctype.h>
+
+
+#define MAX_PARAM       20      /* number of parameter in escape seq.   */
+
+
+extern FILE *file;
+extern void check_data(char c);
+
+
+int kfirst;
+int kstate;
+int originMode;
+int     spaceTab;
+int     formfeed;
+unsigned int bottomLine;
+char tabTable[MAX_COLUMN];
+int     applKeypad;
+unsigned int upScrRegion;
+unsigned int lowScrRegion;
+int applCursor;
+unsigned int maxLine;
+unsigned int realMaxLine;
+unsigned int realBottomLine;
+unsigned int page;
+int lineMode=0;
+int blinkCursor;
+int blockCursor;
+int echoMode;
+int kanjiCode;
+int visibleBell;
+
+
+
+
+
+static short    ai;
+static short    val[MAX_PARAM]; /* parameter value                      */
+static int      state;          /* sequence state                       */
+static int      pageSaved;      /* page is saved flag for ESC [ ? 47 h  */
+
+static int def_attr_avatar=0x00070700;
+
+#define FMASK   0xfff0f0ff
+#define BMASK   0xff0f0fff
+
+
+/* function prototypes */
+
+void state1( unsigned int);
+void state2( unsigned int);
+void state3( unsigned int);
+void state5(int);
+void state8( unsigned int);
+void state10( unsigned int);
+void setAttribute(void);
+void eraseScreen(void);
+void eraseLine(void);
+void cursorPosition(void);
+void cursorPosition_avatar(int,int);
+void scrollRegion(void);
+void downLine(void);
+void upLine(void);
+void cursorReport(void);
+void clearAllTabs(void);
+void setTabs(int n);
+void editTabs(void);
+void dispTabs(void);
+void clear_area(int,int,int);
+void delete_char(void);
+void scroll_area_up(void);
+void scroll_area_down(void);
+
+/**********************************************/
+
+
+
+/**********************************************/
+
+int mgetchar(void)
+{
+  int c;
+  
+  if(spool_action==PLAY)
+  {
+    return(Desk_File_ReadChar(spool_file));
+  }
+  else
+  {
+    while( (*driver)(DRIVER_CHECKRX,portnumber,0,0)==0)
+      Desk_Event_Poll();
+    c=(*driver)(DRIVER_GETBYTE,portnumber,0,0);
+    //check_data((char)c);
+    if(spool_action==REC && !export_data_text)
+      spool_rec(c);
+    return(c);
+  }
+  /*return(fgetc(file));*/
+}
+
+void ansiInit(void)
+{
+        cursor_on=1;
+        //autowrap=wrap;
+        state = ai = kstate = kfirst = saveX = saveY = 0;
+        saveAttr = NORMAL;
+        spaceTab = pageSaved = originMode = NO;
+        setTabs(8);
+}
+
+void clearAnsi(void)
+{
+        kfirst = kstate = state = ai = 0;
+}
+
+void decodeAnsi( int c)
+{
+  int i,j,k;
+
+        /* short cut */
+        if (state == 0 && kstate == 0 && kfirst == 0 && c>=32) /*isAscii(c))*/
+        {
+                if(spool_action==REC && export_data_text)
+                {
+                  if(german_keyb)
+                    spool_rec(keyb_table2[c]);
+                  else
+                    spool_rec(c);
+                }
+                /*
+                if(german_keyb)
+                  c=keyb_table[c];
+                */
+                conWrite(c);
+                if(logon>0 /*&& online*/)
+                {
+                  for(i=0;i<19;i++)
+                    wsl[i]=wsl[i+1];
+                  wsl[19]=c;
+                  check_wait();
+                }
+                return;
+        }
+
+        switch(c)
+        {
+        case CR: //if(get_char(cursorX,cursorY)==0)
+                 //  putcharattr(cursorX,cursorY,0x0a,attrib);
+                 text_buffer[tb_above+cursorX+cursorY*80]|=EOL;
+                 locate(0, cursorY);
+                 if(crtocrlf)
+                   downLine();
+
+                 return;
+
+        case FF: if (formfeed == YES)
+                 {
+                        clearLine(0, bottomLine);
+                        locate(0, 0);
+                        return;
+                 } /* else avatar code */
+                 else
+                 {
+                   if(spool_action==PLAY && spool_frame)
+                   {
+                     clear_screen=2;
+                   }
+                   else
+                   {
+                     clear_screen=0;
+                     attrib= (attrib&0xff0000ff)|def_attr_avatar;
+                     clearLine(0, bottomLine);
+                     locate(0,0);
+                   }
+                   break;
+                 }
+        case VT:
+        case LF: //if(get_char(cursorX,cursorY)==0)
+                 //  putcharattr(cursorX,cursorY,c,attrib);
+                 //text_buffer[tb_above+cursorX+cursorY*80]|=EOL;
+                 downLine();
+                 if(lftocrlf)
+                   locate(0, cursorY);
+                 if(spool_action==REC && export_data_text)
+                 {
+                   if(german_keyb)
+                    spool_rec(keyb_table2[c]);
+                  else
+                    spool_rec(c);
+                 }
+                 return;
+        case BS: if (cursorX > 0) locate(cursorX-1, cursorY);
+                 return;
+        case BEL: Desk_Sound_SysBeep();
+                return;
+        case HT: if (cursorX >= LAST_COLUMN)
+                        return;
+                if (spaceTab) {
+                        int x = cursorX;
+                        conWrite(SPACE);
+                        cursorX = x;
+                }
+                for (cursorX++; cursorX < LAST_COLUMN && tabTable[cursorX] == 0; cursorX++)
+                        if (spaceTab) {
+                                int x = cursorX;
+                                conWrite(SPACE);
+                                locate(x, cursorY);
+                        }
+                locate(cursorX, cursorY);
+                if(spool_action==REC && export_data_text)
+                {
+                   if(german_keyb)
+                    spool_rec(keyb_table2[c]);
+                  else
+                    spool_rec(c);
+                }
+                return;
+        case NUL:
+        case DEL:
+                return;
+        case SI:
+        case SO:
+                return;                         /* ignored              */
+        case CAN:                               /* CAN                  */
+        case SUB:                               /* SUB                  */
+                state = 0;
+                return;
+        case ESC:
+                for (ai = 0; ai < MAX_PARAM; ai++) val[ai] = 0;
+                ai = 0;
+                state = 1;
+                return;
+
+        /**************************************************/
+        /*                   avatar-codes                 */
+        /**************************************************/
+        case 25 :
+          if(avatar)
+          {
+            c = mgetchar();                 /* ^Y */
+            j = mgetchar();
+            for (i = 0; i < j; i++)
+              conWrite(c);
+          }
+          else
+            goto mdefault;
+        break;
+
+        case 22 :
+          if(avatar)
+          {
+            switch(mgetchar())              /* ^V */
+            {
+              case 1 :
+                j=mgetchar()&0x7f;
+                attrib = (attrib&0xff0000ff)|(j<<8)|(j<<16);
+              break;
+              case 2 :
+                attrib = (attrib&0x00ffffff) | BLINK;
+              break;
+              case 3 :
+                moveCursor(UP,0);
+              break;
+              case 4 :
+                moveCursor(DOWN,0);
+              break;
+              case 5 :
+                moveCursor(LEFT,0);
+              break;
+              case 6 :
+                moveCursor(RIGHT,0);
+              break;
+              case 7 :
+                clearColumn(cursorX, MAX_COLUMN);
+              break;
+              case 8 :
+                i=mgetchar();
+                j=mgetchar();
+                cursorPosition_avatar(i,j);
+              break;
+              case 9 :  /* insert Mode on*/
+
+              break;
+              case 10: /* scroll up area */
+                scroll_area_up();
+              break;
+              case 11: /* scroll down area */
+                scroll_area_down();
+              break;
+              case 12: /* clear area, set attribute */
+               i=mgetchar()&0x7f;
+               j=mgetchar();
+               k=mgetchar();
+               clear_area(i,j,k);
+              break;
+              case 13: /* initialize area, set attribute */
+               i=mgetchar();
+               if ( (i&0x80)==0x80 )
+               {
+                 attrib = (attrib&0x00ffffff) | BLINK;
+                 i=i&0x7f;
+               }
+               j=mgetchar();
+               k=mgetchar();
+               clear_area(i,j,k);
+              break;
+              case 14: /* delete character, scroll rest of line left */
+                delete_char();
+              break;
+              case 25: /* repeat pattern */
+              break;
+            }
+          }
+          else
+            goto mdefault;
+        break;
+        /* avatar-code ende */
+
+        default:
+/*
+                if (c < SPACE)
+                {
+                  conWrite(32);
+                  return;
+                }
+*/
+	mdefault:
+                if (state == 0)
+                {
+                  if(c!=0)
+                    conWrite(c);
+                  return;
+                }
+
+        }
+        /* if in the state sequence and not controll character */
+
+        switch (state) {
+        case 1: /* ESC */
+                state1(c);
+                break;
+        case 2: /* ESC [ */
+                state2(c);
+                break;
+        case 3: /* ESC [ >      */
+                state3(c);
+                break;
+        case 5: /* ESC #        */
+                state5(c);
+                break;
+        case 8: /* ESC [ ? */
+                state8(c);
+                break;
+        case 10: /* ESC [ space */
+                state10(c);
+                break;
+        }
+}
+
+void state1( unsigned int c)
+{
+        switch(c) {
+                case '[':  state = 2; break;
+                case '#':  state = 5; break;
+                case '>':  state = 0; applKeypad = NO; break;
+                case '=':  state = 0; applKeypad = YES; break;
+                case '7':  saveCursor();        /* ESC 7        cursor save */
+                        state = 0;
+                        break;
+                case '8':  restCursor();        /* ESC 8        cursor restore */
+                        state = 0;
+                        break;
+                case 'H':  /*   ESC H set horizontal tab stop   */
+                        if (cursorX < MAX_COLUMN)
+                                tabTable[cursorX] = 1;
+                        state = 0;
+                        break;
+                case 'D':  downLine(); state = 0; break;        /* IND  */
+                case 'M':  upLine(); state = 0; break;          /* RI   */
+                case 'E':  locate(0, cursorY);                  /* NEL  */
+                        downLine();
+                        state = 0;
+                        break;
+                default: state = 0;     /* undefined sequence */
+                        conWrite(ESC); conWrite(c);
+        }
+}
+
+void state2( unsigned int c)
+{
+        if (isdigit(c)) {       /* ESC [ Pn             */
+                if (ai < MAX_PARAM)
+                        val[ai] = val[ai]*10+c-'0';
+                else
+                        state = 0;
+                return;
+        } else if (c == ';') {  /* ESC [ Pn ;           */
+                ai++;
+                return;
+        } else {
+                switch(c) {     /* ESC [ Pm ; Pn c      */
+                case '=':
+                case '?':
+                        state = 8;
+                        return;
+                case 'H':       /* Horizontal and vertical positioning (not recommended */
+                case 'f':       /* cursor position              */
+                        cursorPosition();
+                        break;
+                case 'm':               /* set attribute        */
+                        setAttribute();
+                        break;
+                case 'K':               /* erase within line    */
+                        eraseLine();
+                        break;
+                case 'J':               /* erase within screen  */
+                        if(spool_action==PLAY && spool_frame)
+                        {
+                          clear_screen=1;
+                        }
+                        else
+                        {
+                          clear_screen=0;
+                          eraseScreen();
+                        }
+                        break;
+                case 'M':               /* delete line          */
+                        /* if out of scroll region, ignore */
+                        if (cursorY < upScrRegion || cursorY > lowScrRegion)
+                                break;
+                        if (val[0] == 0) val[0] = 1;
+                        else if (val[0] > lowScrRegion - cursorY + 1)
+                                val[0] = lowScrRegion - cursorY + 1;
+                        deleteLine(val[0],lowScrRegion+1);
+                        locate(0, cursorY);
+                        break;
+                case 'L':               /* insert line          */
+                        /* if out of scroll region, ignore */
+                        if (cursorY < upScrRegion || cursorY > lowScrRegion)
+                                break;
+                        if (val[0] == 0) val[0]++;
+                        else if (val[0] > lowScrRegion - cursorY + 1)
+                                val[0] = lowScrRegion - cursorY + 1;
+                        insertLine(val[0],lowScrRegion+1);
+                        locate(0, cursorY);
+                        break;
+                case 's':               /* save cursor pos.     */
+                        saveCursor();
+                        break;
+                case 'S':               /* scroll up   */
+                        screentop=upScrRegion+1;
+                        screenbottom=lowScrRegion+1;
+                        scrollup(val[0]);
+                        break;
+                case 'T':               /* scroll down */
+                        screentop=upScrRegion+1;
+                        screenbottom=lowScrRegion+1;
+                        scrolldown(val[0]);
+                        break;
+                case 'u':               /* restore cursor position */
+                        restCursor();
+                        break;
+                case 'P':               /* ESC [ val P  del char        */
+                        if (val[0] == 0) val[0] = 1;
+                        deleteChar(val[0]);
+                        break;
+                case '@':               /* ESC [ val @   insert char    */
+                        if (val[0] == 0) val[0] = 1;
+                        insertChar(val[0]);
+                        break;
+                case 'A':               /* cursor up                    */
+                        moveCursor(UP, val[0]);
+                        break;
+                case 'B':               /* cursor down                  */
+                        moveCursor(DOWN, val[0]);
+                        break;
+                case 'C':               /* cursor right                 */
+                        moveCursor(RIGHT, val[0]);
+                        break;
+                case 'D':               /* cursor left                  */
+                        moveCursor(LEFT, val[0]);
+                        break;
+                case 'r':               /* set scrole region            */
+                case 'o':
+                        scrollRegion();
+                        break;
+                case '>':               /* set/reset mode       */
+                        val[0] = 0;
+                        state = 3;
+                        return;
+                case 'g':       /* clear tab stops              */
+                        if (val[0] == 0 && cursorX < MAX_COLUMN)
+                                tabTable[cursorX] = 0;
+                        else if (val[0] == 3)
+                                clearAllTabs();
+                        break;
+                case 'n':       /* cursor reporting function */
+
+                        cursorReport();
+                        break;
+                case ' ':
+                        state = 10;
+                        return;
+                        break;
+                default:
+                        conWrite(ESC); conWrite('['); conWrite(c);
+                }
+        }
+        state = 0;
+}
+
+void state3( unsigned int c)
+{
+        if (isdigit(c)) {
+                if (ai < MAX_PARAM)
+                        val[ai] = val[ai]*10+c-'0';
+                else
+                        state = 0;
+                return;
+        } else {
+                switch (val[0]) {
+                case 1:
+                        if (c == 'h')
+                        {
+                          lineMode=1;
+                          ansi_terminal_height=25;
+                          terminal_height=ansi_terminal_height;
+                          init_text_buffer(0);
+                          consoleSetup();
+                          if(Desk_Window_IsOpen(haupt_window))
+                          {
+                            open_haupt_window(2);
+                            Desk_Window_ForceWholeRedraw(haupt_window);
+                          }
+                        }
+                        else if (c == 'l')
+                             {
+                               lineMode=0;
+                               ansi_terminal_height=24;
+                               terminal_height=ansi_terminal_height;
+                               init_text_buffer(0);
+                               consoleSetup();
+                               if(Desk_Window_IsOpen(haupt_window))
+                               {
+                                 open_haupt_window(2);
+                                 Desk_Window_ForceWholeRedraw(haupt_window);
+                               }
+                             }
+
+                        break;
+                }
+        }
+        state = 0;
+}
+
+void state5(int c)
+/* ESC # */
+{
+        /* do nothing */
+        state = 0;
+}
+
+void state8( unsigned int c)
+{
+        if (isdigit(c)) {       /* ESC [ ? Pn                   */
+                if (ai < MAX_PARAM)
+                {
+                        val[ai] = val[ai]*10+c-'0';
+                }
+                else
+                        state = 0;
+                return;
+        } else {
+                switch (val[0]) {
+                case 1: if (c == 'h')                   /* ESC [ ? 1 h  */
+                                applCursor = YES;       /* appl. curosr mode    */
+                        else if (c == 'l')
+                                applCursor = NO;        /* normal curosr mode   */
+                        break;
+                /* case 2: vt52mode(); break;*/
+                /* case 3: 132/80column(); break;*/
+                case 4: switch (c) {            /* ESC [ ? 4 h */
+                        case 'h': smoothMode(YES); break; /* smooth scroll */
+                        case 'l': smoothMode(NO); break; /* jump scroll */
+                        /*case 'i': printMode = NO; break; */
+                        }
+                        break;
+                case 5: switch (c) {
+                        case 'h': /* reverseScreen(); */ break;
+                        case 'l': /* normalScreen(); */ break;
+                        /*case 'i': printMode = YES; break;*/ /* auto print mode */
+                        }
+                        break;
+                case 6: if (c == 'h')                   /* ESC [ ? 6 h */
+                                originMode = YES;
+                        else if (c == 'l')
+                                originMode = NO;
+                        break;
+                case 7: if (c == 'h')                   /* ESC [ ? 7 h */
+                                autowrap = YES;            /* auto wrap    */
+                        else if (c == 'l')
+                                autowrap = NO;             /* no auto wrap */
+                        break;
+                /* case 8: autoRepeatMode(); break;*/
+                case 25: if (c == 'h') {                /* ESC [ ? 25 h */
+                                cursor = YES;
+                                cursorOn();             /* cursor on    */
+                         } else if (c == 'l') {         /* ESC [ ? 25 l */
+                                cursor = NO;
+                                cursorOff();            /* cursor off   */
+                        }
+                        break;
+                case 47: if (c == 'h') {        /* ESC [ ? 47 h */
+                                /*
+                                if (pageSaved == NO)
+                                        savePage(0, ansiVramSave);
+                                */
+                                pageSaved = YES;
+                        } else if (c == 'l') {
+                                /*
+                                if (pageSaved)
+                                        restorePage(0, ansiVramSave);
+                                */
+                                pageSaved = NO;
+                        }
+                        break;
+                }
+        }
+        state = 0;
+}
+
+void state10(unsigned int c)
+/* ESC [ space */
+{
+  switch(c)
+  {
+    case '@':  /* scroll left  */
+      screentop=upScrRegion+1;
+      screenbottom=lowScrRegion+1;
+      scrollleft(val[0]);
+    break;
+    case 'A':  /* scroll roght */
+      screentop=upScrRegion+1;
+      screenbottom=lowScrRegion+1;
+      scrollright(val[0]);
+    break;
+  }
+  state = 0;
+}
+
+
+void setAttribute(void)
+{
+         int i, c;
+
+        //for (i = ai + 1, ai = 0; i > 0; --i) {
+          //attrib = (attrib&0x00ffffff);
+          for(i=0; i<=ai;i++)
+          {
+                switch(c = val[i])
+                {
+                case 0:
+                        attrib = (attrib&0x000000ff) | normal_attr;
+                        break;
+                case 1: /* high mode            */
+                          attrib|=HIGH;
+                        break;
+                case 4: /* underlined           */
+                          attrib|=UNDERLINED;
+                        break;
+                case 5: /* blink                */
+                          attrib|=BLINK;
+                        break;
+                case 7: /* reverse mode         */
+                         attrib = (attrib&0xff0000ff)|((attrib&0x0000f000)>>4)|
+                                  ((attrib&0x00000f00)<<4);
+                        break;
+                        case 22:
+                          attrib=(attrib&0x00ffffff)|((attrib&0xff000000)-HIGH);
+                        break;
+                        case 24:
+                          attrib=(attrib&0x00ffffff)|((attrib&0xff000000)-UNDERLINED);
+                        break;
+                        case 25:
+                          attrib=(attrib&0x00ffffff)|((attrib&0xff000000)-BLINK);
+                        break;
+                        case 27:
+                          //attrib=(attrib&0x00ffffff)|((attrib&0xff000000)-INVERT);
+                          attrib = (attrib&0xff0000ff)|((attrib&0x0000f000)>>4)|
+                                  ((attrib&0x00000f00)<<4);
+                        break;
+                default:
+                        if (30 <= c && c <= 37)
+                        { /* set foreground color */
+                          attrib &= FMASK;
+                          attrib |= ((c - 30)<<8);
+                          attrib |= ((c - 30)<<16);
+                          break;
+                        }
+                        if (40 <= c && c <= 47)
+                        { /* set background color */
+                          attrib &= BMASK;
+                          attrib |= ((c - 40)<<12);
+                          attrib |= ((c - 40)<<20);
+                          break;
+                        }
+                         break;
+                }
+        }
+}
+
+void eraseScreen(void)
+/* erase within screen */
+{
+         unsigned int tmpX, tmpY;
+
+        tmpX = cursorX;
+        tmpY = cursorY;
+        switch(val[0]) {
+        case 0:         /* erase from cursor to end of screen   */
+                clearColumn(cursorX, MAX_COLUMN);
+                if (cursorY < bottomLine)
+                        clearLine(cursorY+1, bottomLine);
+                break;
+        case 1:         /* erase from top of screen to cursor   */
+                if (cursorY > 0)
+                        clearLine(0, cursorY-1);
+                clearColumn(0, cursorX);
+                break;
+        case 2:         /* erase entire screen                  */
+                clearLine(0, bottomLine);
+                tmpX = tmpY = 0;
+                break;
+        }
+        locate(cursorX = tmpX, cursorY = tmpY);
+}
+
+void eraseLine(void)
+/* erase within line */
+{
+         unsigned int tmpX, tmpY;
+
+        tmpX = cursorX;
+        tmpY = cursorY;
+        if (cursorX > LAST_COLUMN)      /* VT type wrap */
+                cursorX = MAX_COLUMN;
+        switch(val[0]) {
+        case 0:         /* erase from cursor to end of line     */
+                clearColumn(cursorX, MAX_COLUMN);
+                break;
+        case 1:         /* erase from start of line to cursor   */
+                clearColumn(0, cursorX);
+                break;
+        case 2:         /* erase entire line                    */
+                clearColumn(0, MAX_COLUMN);
+                break;
+        }
+        locate(cursorX = tmpX, cursorY = tmpY);
+}
+
+void cursorPosition(void)
+/* set direct cursor position */
+{
+        int v0, v1;
+
+        if ((v1 = val[1]) <= 0)
+                v1 = 1;
+        else if (v1 > LAST_COLUMN + 1)
+                v1 = LAST_COLUMN + 1;
+        if ((v0 = val[0]) <= 0)
+                v0 = 1;
+        if (originMode) {
+                if ((v0 += upScrRegion) > lowScrRegion + 1)
+                        v0 = lowScrRegion + 1;
+        } else {
+                if (v0 >= bottomLine + 1)
+                        v0 = bottomLine + 1;
+        }
+        locate(--v1, --v0);
+}
+
+void cursorPosition_avatar(int v0,int v1)
+/* set direct cursor position */
+{
+        if (v1 <= 0)
+                v1 = 1;
+        else if (v1 > LAST_COLUMN + 1)
+                v1 = LAST_COLUMN + 1;
+        if (v0 <= 0)
+                v0 = 1;
+        if (originMode) {
+                if ((v0 += upScrRegion) > lowScrRegion + 1)
+                        v0 = lowScrRegion + 1;
+        } else {
+                if (v0 >= bottomLine + 1)
+                        v0 = bottomLine + 1;
+        }
+        locate(--v1, --v0);
+}
+
+void scrollRegion(void)
+/* set scroll region */
+{
+         short v0, v1;
+
+        if ((v0 = val[0]) <= 0) v0 = 1;
+        if ((v1 = val[1]) < v0 || v1 > maxLine)
+                v1 = maxLine;
+        upScrRegion = --v0; lowScrRegion = --v1;
+        if (originMode)
+          locate(upScrRegion, 0);
+        else
+          locate(0, 0);
+
+        /*setScrRegion(upScrRegion, lowScrRegion);*/
+}
+
+void downLine(void)
+{
+        if (cursorX >= MAX_COLUMN)
+            cursorX = 0;
+        if (cursorY < lowScrRegion)
+                cursorY++;
+        else if (cursorY == lowScrRegion)
+                scrollup_area(upScrRegion+1,lowScrRegion+1);
+                //scrlUp();
+        else if (cursorY < bottomLine)
+                cursorY++;
+        locate(cursorX, cursorY);
+}
+
+void upLine(void)
+{
+        if (cursorX > LAST_COLUMN)
+                cursorX = 0;
+        if (cursorY > upScrRegion)
+                cursorY--;
+        else if (cursorY == upScrRegion)
+        {
+                scrolldown_area(upScrRegion+1,lowScrRegion+1);
+                //insertLine(1);
+        } else if (cursorY > 0)
+                cursorY--;
+        locate(cursorX, cursorY);
+}
+
+void cursorReport(void)
+{
+        int i;
+
+        for (i = ai + 1, ai = 0; i > 0; --i) {
+                switch (val[ai++])
+                {
+                case 5:         /* are you OK? */
+                        out_ESC("[0n");  /* always OK */
+                        break;
+                case 6:         /* cursor position report */
+                        out_ESC("[%d;%dR", cursorY+1, cursorX+1);
+                        break;
+                }
+                /* else ignore */
+        }
+}
+
+void clearAllTabs(void)
+{
+        int i;
+        for (i = 0; i < MAX_COLUMN; i++)
+                tabTable[i] = 0;
+}
+
+void setTabs(int n)
+{
+        int i;
+
+        clearAllTabs();
+        for (i = n; i < MAX_COLUMN; i += n)
+                tabTable[i] = 1;
+}
+
+void editTabs(void)
+/*
+ * edit tab table
+ */
+{
+        int end = 0;
+        short key;
+        int x, y = SETUP_LINE+6;
+
+        x = 0;
+        /*helpSystem("edit tab");*/
+        /*conPrint("\x1b[7m");*/
+        cursorOn();
+        while (!end) {
+                locate(x, y);
+                while ((key = keyin()) == (-1))
+                        ;
+                switch (key) {
+                case TAB:
+                        if (++x > LAST_COLUMN) {
+                                x = LAST_COLUMN;
+                                break;
+                        }
+                        while (x < LAST_COLUMN && !tabTable[x])
+                                x++;
+                        break;
+                case RIGHT_KEY:
+                case 'l': case 'L': case CTRL('L'): case CTRL('F'):
+                        if (++x > LAST_COLUMN) x = LAST_COLUMN;
+                        break;
+                case LEFT_KEY: case 'H': case CTRL('B'):
+                case BS: case DEL:
+                        if (--x < 0) x = 0;
+                        break;
+                case 't': case 'T': case CR:
+                        conWrite('T');
+                        tabTable[x] = 1;
+                        if (++x > LAST_COLUMN) x = LAST_COLUMN;
+                        break;
+                case ' ':
+                        conWrite(' ');
+                        tabTable[x] = 0;
+                        if (++x > LAST_COLUMN) x = LAST_COLUMN;
+                        break;
+                case CTRL('A'): case HOME_KEY:
+                        x = 0; break;
+                case CTRL('E'): case END_KEY:
+                        x = LAST_COLUMN; break;
+                case UP_KEY:
+                case DOWN_KEY:  /* just ignore */
+                        break;
+                case ESC:
+                        end = 1;
+                        break;
+                default:
+                        bell();
+                }
+        }
+        /*clearCopyright();*/
+        cursorOff();
+}
+
+void dispTabs(void)
+{
+        int i, j, attrSave2 = attrib;
+
+        attrib = INVERT;
+        locate(0, SETUP_LINE+7);
+        for (i = MAX_COLUMN/10; i > 0; --i) {
+                for (j = 1; j <= 10; j++)
+                        conWrite(j == 10 ? '0' : ('0'+j));
+                attrib = (attrib==INVERT)?NORMAL:INVERT;
+        }
+        attrib = INVERT;
+        locate(0, SETUP_LINE+6);
+        for (i = 0; i < MAX_COLUMN; i++)
+                conWrite(tabTable[i] ? 'T' : SPACE);
+        attrib = attrSave2;
+}
+
+void clear_area(int attr,int n,int col)
+{
+  int tmpY;
+  int i;
+  attrib = (attrib&0xff0000ff)|(attr<<8)|(attr<<16);
+  tmpY=cursorY;
+  for(i=0;i<n;i++)
+  {
+    clearColumn(cursorX,cursorX+col);
+    cursorY++;
+  }
+  cursorY=tmpY;
+}
+
+void delete_char(void)
+{
+  int i;
+  int offset;
+
+  offset=tb_above+cursorY*80;
+  for(i=cursorX;i<LAST_COLUMN;i++)
+    text_buffer[offset+i]=text_buffer[offset+i+1];
+  text_buffer[offset+LAST_COLUMN]=(attrib&0xffffff00)|32;
+  update_text(0,cursorY,MAX_COLUMN,cursorY+1);
+}
+
+void scroll_area_up(void)
+{
+  int n,x0,y0,x1,y1;
+  int x,y,i;
+  int tmpY;
+
+  n=mgetchar();
+  y0=mgetchar()-1;
+  x0=mgetchar()-1;
+  y1=mgetchar()-1;
+  x1=mgetchar()-1;
+
+  if( n!=0 && n<(y1-y0) )
+  {
+    for(y=y0;y<=(y1-n);y++)
+      for(x=x0;x<=x1;x++)
+        text_buffer[tb_above+y*80+x]=text_buffer[tb_above+(y+n)*80+x];
+
+    tmpY=cursorY;
+    cursorY=y1-n+1;
+    for(i=0;i<n;i++)
+    {
+      clearColumn(x0,x1);
+      cursorY++;
+    }
+    cursorY=tmpY;
+  }
+  else
+  {
+    /* scroll area loeschen */
+    tmpY=cursorY;
+    cursorY=y0;
+    for(i=y0;i<=y1;i++)
+    {
+      clearColumn(x0,x1);
+      cursorY++;
+    }
+    cursorY=tmpY;
+  }
+
+    update_text(x0,y0,x1,y1);
+}
+
+
+void scroll_area_down(void)
+{
+  int n,x0,y0,x1,y1;
+  int x,y,i;
+  int tmpY;
+
+  n=mgetchar();
+  y0=mgetchar()-1;
+  x0=mgetchar()-1;
+  y1=mgetchar()-1;
+  x1=mgetchar()-1;
+
+  if( n!=0 && n<(y1-y0) )
+  {
+    for(y=y1;y>=(y0+n);y--)
+      for(x=x0;x<=x1;x++)
+        text_buffer[tb_above+y*80+x]=text_buffer[tb_above+(y-n)*80+x];
+
+    tmpY=cursorY;
+    cursorY=y0;
+    for(i=0;i<n;i++)
+    {
+      clearColumn(x0,x1);
+      cursorY++;
+    }
+    cursorY=tmpY;
+  }
+  else
+  {
+    /* scroll area loeschen */
+    tmpY=cursorY;
+    cursorY=y0;
+    for(i=y0;i<=y1;i++)
+    {
+      clearColumn(x0,x1);
+      cursorY++;
+    }
+    cursorY=tmpY;
+  }
+
+    update_text(x0,y0,x1,y1);
+}
+

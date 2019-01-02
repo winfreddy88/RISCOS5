@@ -1,0 +1,2475 @@
+/* Copyright 2003 Tematic Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*************************************************
+*                  MakeModes                     *
+*************************************************/
+
+
+/* MakeModes is a program for constructing mode files for Medusa
+RISC OS machines. It can read in a mode file and display the data
+for the modes defined therein. The data can be edited, and new
+modes can be defined. Various checks and computations are auto-
+matically carried out.
+
+Originally written by Philip Hazel
+Re-written and extended by Dean Murphy
+
+Update History:
+
+
+  Aug/Sep 93: Initial implementation.
+
+  30-Sep-93  0.04  Add support for reading a file of monitors and their
+                   characteristics, so as to be able to generate for them
+                   easily.
+                   Add the option for writing a null mode name, and
+                   preserving this when modes are loaded from file.
+  02-May-94  0.05  Add support for DPMS (display power management system) data.
+  03-May-94  0.05  Add support for alternate VESA/non-VESA base mode sets.
+  11-May-94  0.06  Add warning message at start up.
+                   Fix typo in VESA common base mode file.
+                   Add VESA 75Hz modes to VESA common base mode file.
+
+  **************** New version created by Dean Murphy *****************
+
+  18-Jul-94  0.07  Used existing version as basis for new application.
+  03-Aug-94        Implemented Tim Dobsons/Tudor Browns VIDC limitations
+  17-Aug-94  0.17  Added interactive help to windows and menus
+  17-Aug-94  0.17  Added option to generate a plain text mode list
+  18-Aug-94  0.18  Fixed save warning window handler
+  **********************************************************************/
+
+
+#include "makemodes.h"
+#include "IconDefs.h"
+#include "file.h"
+#include "math.h"
+#include "xferrecv.h"
+
+#include "DebugIt.h"
+
+#define trace 0
+
+#include "trace.h"
+
+
+extern int vram_fitted = ONE_VRAM_FITTED;
+extern int screen_memory = 1024;
+extern int current_monitor = -1;
+int vidc_bandwidth_limit[3];
+
+static int  mode_var(int);
+static void display_key(wimp_i icon, int key);
+static void generate_click(wimp_bbits butt, wimp_i icon);
+static void checksave_click(wimp_bbits butt, wimp_i icon);
+static void generate_key(wimp_i icon, int key);
+static void display_click(wimp_bbits butt, wimp_i icon);
+static BOOL save_proc(char *filename, void *handle);
+menu        alter_monitors_menu(void *handle);
+extern void modes_menu_handler(void *handle, char *items);
+static void caw(wimp_w handle);
+static void display_menu_handler(void *handle, char *items);
+static void bpp_menu_handler(void *handle, char *items);
+static void return_to_original_mode(void);
+void        make_new_monitors_menu(void);
+void        copy_generate_info(void);
+static void add_monitor_to_list(BOOL);
+void        check_mode_timings(void);
+
+/* RISCOS_Lib variables */
+
+wimp_w              window_info;
+wimp_w              window_generate;
+wimp_w              window_generate_o;
+wimp_w              window_display;
+wimp_w              window_checksave;
+wimp_w              window_save;
+wimp_w              window_display;
+wimp_w              window_warning;
+wimp_w              window_return;
+
+static wimp_wstate  state;
+
+/* Menu handles */
+
+static menu         iconbar_menu     = NULL;
+menu                menu_display     = NULL;
+menu                last_menu        = NULL;
+menu                menu_monitors    = NULL;
+menu                menu_modes       = NULL;
+menu                menu_bpp         = NULL;
+
+#define info_author_icon   2
+#define info_version_icon  3
+
+/******** Icon bar menu ********/
+
+#define m_iconbar_info 1
+#define m_iconbar_vesa 2
+#define m_iconbar_quit 3
+
+
+/******** Main display menu ********/
+
+#define display_save          1
+#define display_generate_list 2
+#define display_monitor_info  3
+#define display_newmode       4
+#define display_deletemode    5
+#define display_comments      6
+
+/******** BPP menu *********/
+
+#define one_bpp              1
+#define two_bpp              2
+#define four_bpp             3
+#define eight_bpp            4
+#define sixteen_bpp          5
+#define tt_bpp               6
+
+/* Table of per mode icons and what to do with keypresses in them. Each
+item has three entries: the icon number, the offset of the
+corresponding field in the mode structure, and the type of data. */
+
+key_icon keyicons[] = {
+  { icon_pixel_rate,     offsetof(mode, pixel_rate),     ki_number, NULL, NULL  },
+
+  { icon_h_sync_width,   offsetof(mode, h_sync_width),   ki_hnumber, NULL, NULL },
+  { icon_h_back_porch,   offsetof(mode, h_back_porch),   ki_hnumber, icon_h_front_porch, offsetof(mode, h_front_porch)},
+  { icon_h_left_border,  offsetof(mode, h_left_border),  ki_hnumber, icon_h_right_border, offsetof(mode, h_right_border)},
+  { icon_h_display,      offsetof(mode, h_display),      ki_hnumber, NULL, NULL },
+  { icon_h_right_border, offsetof(mode, h_right_border), ki_hnumber, icon_h_left_border, offsetof(mode, h_left_border)},
+  { icon_h_front_porch,  offsetof(mode, h_front_porch),  ki_hnumber, icon_h_back_porch, offsetof(mode, h_back_porch)},
+
+  { icon_v_sync_width,   offsetof(mode, v_sync_width),   ki_vnumber, NULL },
+  { icon_v_back_porch,   offsetof(mode, v_back_porch),   ki_vnumber, icon_v_front_porch, offsetof(mode, v_front_porch)},
+  { icon_v_top_border,   offsetof(mode, v_top_border),   ki_vnumber, icon_v_bottom_border, offsetof(mode, v_bottom_border)},
+  { icon_v_display,      offsetof(mode, v_display),      ki_vnumber, NULL, NULL },
+  { icon_v_bottom_border,offsetof(mode, v_bottom_border),ki_vnumber, icon_v_top_border, offsetof(mode, v_top_border)},
+  { icon_v_front_porch,  offsetof(mode, v_front_porch),  ki_vnumber, icon_v_back_porch, offsetof(mode, v_back_porch)}
+};
+
+int keyiconcount = sizeof(keyicons)/sizeof(key_icon);
+
+
+/* Table of incrementing and decrementing icons. Each entry has
+five fields: an icon number, the icon of the displayed value, the
+offset of the variable to change, plus or minus 1, and a type to
+control additional processing. */
+
+/* Two additional fields have been added now to facilitate some new features
+   bumpicons.opp_field
+   bumpicons.opp_offset */
+
+bump_icon bumpicons[] = {
+  { 16, icon_sync_pol,       offsetof(mode, sync_pol),       -1, bi_s, NULL, NULL },
+  { 17, icon_sync_pol,       offsetof(mode, sync_pol),       +1, bi_s, NULL, NULL },
+
+  { 24, icon_h_sync_width,   offsetof(mode, h_sync_width),   -2, bi_h, NULL, NULL },
+  { 27, icon_h_back_porch,   offsetof(mode, h_back_porch),   -2, bi_h, icon_h_front_porch, offsetof(mode, h_front_porch)},
+  { 30, icon_h_left_border,  offsetof(mode, h_left_border),  -2, bi_h, icon_h_right_border,offsetof(mode, h_right_border)},
+  { 33, icon_h_display,      offsetof(mode, h_display),      -2, bi_hd, NULL },
+  { 36, icon_h_right_border, offsetof(mode, h_right_border), -2, bi_h, icon_h_left_border,offsetof(mode, h_left_border)},
+  { 39, icon_h_front_porch,  offsetof(mode, h_front_porch),  -2, bi_h, icon_h_back_porch,offsetof(mode, h_back_porch)},
+
+  { 26, icon_h_sync_width,   offsetof(mode, h_sync_width),   +2, bi_h, NULL },
+  { 29, icon_h_back_porch,   offsetof(mode, h_back_porch),   +2, bi_h, icon_h_front_porch,offsetof(mode, h_front_porch)},
+  { 32, icon_h_left_border,  offsetof(mode, h_left_border),  +2, bi_h, icon_h_right_border,offsetof(mode, h_right_border)},
+  { 35, icon_h_display,      offsetof(mode, h_display),      +2, bi_hd, NULL },
+  { 38, icon_h_right_border, offsetof(mode, h_right_border), +2, bi_h, icon_h_left_border,offsetof(mode, h_left_border)},
+  { 41, icon_h_front_porch,  offsetof(mode, h_front_porch),  +2, bi_h, icon_h_back_porch,offsetof(mode, h_back_porch)},
+
+  { 44, icon_v_sync_width,   offsetof(mode, v_sync_width),   -1, bi_v, NULL },
+  { 47, icon_v_back_porch,   offsetof(mode, v_back_porch),   -1, bi_v, icon_v_front_porch,offsetof(mode, v_front_porch)},
+  { 50, icon_v_top_border,   offsetof(mode, v_top_border),   -1, bi_v, icon_v_bottom_border,offsetof(mode, v_bottom_border)},
+  { 53, icon_v_display,      offsetof(mode, v_display),      -1, bi_vd, NULL },
+  { 56, icon_v_bottom_border,offsetof(mode, v_bottom_border),-1, bi_v, icon_v_top_border,offsetof(mode, v_top_border)},
+  { 59, icon_v_front_porch,  offsetof(mode, v_front_porch),  -1, bi_v, icon_v_back_porch,offsetof(mode, v_back_porch)},
+
+  { 46, icon_v_sync_width,   offsetof(mode, v_sync_width),   +1, bi_v, NULL },
+  { 49, icon_v_back_porch,   offsetof(mode, v_back_porch),   +1, bi_v, icon_v_front_porch,offsetof(mode, v_front_porch)},
+  { 52, icon_v_top_border,   offsetof(mode, v_top_border),   +1, bi_v, icon_v_bottom_border,offsetof(mode, v_bottom_border)},
+  { 55, icon_v_display,      offsetof(mode, v_display),      +1, bi_vd, NULL },
+  { 58, icon_v_bottom_border,offsetof(mode, v_bottom_border),+1, bi_v, icon_v_top_border,offsetof(mode, v_top_border)},
+  { 61, icon_v_front_porch,  offsetof(mode, v_front_porch),  +1, bi_v, icon_v_back_porch,offsetof(mode, v_back_porch)}
+
+};
+
+int bumpiconcount = sizeof(bumpicons)/sizeof(bump_icon);
+
+/*************************************************
+*              Global variables                  *
+*************************************************/
+
+
+void (*menu_handler)(int *);
+
+char    *base_subdir = "NonVESA";
+int      checksave_open = FALSE;
+stringchain *comments = NULL;
+mode    *current_mode = NULL;
+int      display_open = FALSE;
+int      file_format;
+char     file_name[100];
+int      file_saved = TRUE;
+int      handle_checksave;
+int      handle_display;
+int      handle_generate;
+int      handle_generate_o;
+int      handle_info;
+int      handle_save;
+int      xfer_send;
+int      handle_warning;
+int      handle_return;
+int      hrequired_set;
+int      idle_wait = 0;
+mode    *last_mode;
+int      line_number;
+mode    *mode_chain;
+int      mode_count;
+int      mode_number;
+int      monitor_count = 0;
+monitor *monitors = NULL;
+int      monitor_dpms_state = 0;
+char     monitor_title[100];
+montype *montypes = NULL;
+montype *monitor_type = NULL;
+montype *mt = NULL;
+
+
+
+int      prequit_sender = 0;
+int      quit_after_checksave = FALSE;
+int      save_window_open = FALSE;
+int      vrequired_set;
+int      last_bpp_selected;
+int      global_l_min;
+int      global_l_max;
+int      global_f_min;
+int      global_f_max;
+int      global_dpms_state;
+int      global_tolerance;
+
+int      timings_window_line_number = 0;
+
+char     max_cols[6];
+
+int      cmode_xres;
+int      cmode_yres;
+int      cmode_bpp;
+int      cmode_xeig;
+int      cmode_yeig;
+
+int      bpp_selected = 8;
+
+char bandwidth_limit_path[] = "Boot:Utils.BandLimit";
+
+BOOL keep_totals = FALSE;
+BOOL waiting_to_return = FALSE;
+static BOOL close_window = FALSE;
+
+/************************************************
+*           Build a modes list table            *
+************************************************/
+
+static BOOL build_modes_list(char *filename, void *handle)
+{
+  mode *p;
+  int i, memory, tot;
+  BOOL dont_include;
+  char buff[6];
+  FILE *f = fopen(filename, "wr");
+
+  if (f == NULL)
+    {
+      werr(0,"%s",msgs_lookup("31"));
+      return FALSE;
+    }
+
+  fprintf(f,"Generated by !MakeModes %s\n\n", msgs_lookup("_Version"));
+  fprintf(f,"Monitor: %s\n\n",monitor_title);
+  fprintf(f,"Machine fitted with %dMB VRAM\n\n",vram_fitted);
+  fprintf(f,"Pixel\t\tOS Units\tLogical\tMem\tRefresh\tBand-\n");
+  fprintf(f,"resolution\tresolution\tcolours\tused\trate\twidth\n");
+
+  p = mode_chain;
+  for(i = 0; i<mode_count; i++)
+  {
+    strcpy(buff,"");
+
+    if(((int)(p->pixel_rate/1000) * (1.0 / 8.0)) <= vidc_bandwidth_limit[vram_fitted])
+    {
+      strcpy(buff, "2");
+      memory = (int)((int)(p->x_resolution * p->y_resolution) * (1.0 / 8.0));
+    }
+    else
+      dont_include = TRUE;
+
+    if(((int)(p->pixel_rate/1000) * (1.0 / 4.0)) <= vidc_bandwidth_limit[vram_fitted])
+    {
+      strcpy(buff, "4");
+      memory = (int)((int)(p->x_resolution * p->y_resolution) * (1.0 / 4.0));
+    }
+
+    if(((int)(p->pixel_rate/1000) * (1.0 / 2.0)) <= vidc_bandwidth_limit[vram_fitted])
+    {
+      strcpy(buff, "16");
+      memory = (int)((int)(p->x_resolution * p->y_resolution) * (1.0 / 2.0));
+    }
+
+    if(((int)(p->pixel_rate/1000) <= vidc_bandwidth_limit[vram_fitted]))
+    {
+      strcpy(buff, "256");
+      memory = (p->x_resolution * p->y_resolution);
+    }
+
+    if(((int)(p->pixel_rate/1000) * 2) <= vidc_bandwidth_limit[vram_fitted])
+    {
+      strcpy(buff, "32K");
+      memory = ((p->x_resolution * p->y_resolution) * 2);
+    }
+
+    if(((int)(p->pixel_rate/1000) * 4) <= vidc_bandwidth_limit[vram_fitted])
+    {
+      strcpy(buff, "16M");
+      memory = ((p->x_resolution * p->y_resolution) * 4);
+    }
+
+    if(vram_fitted == 0)
+     tot = 1024;
+    else
+     tot = 2048;
+
+    if((memory/1024) > tot)
+      dont_include = TRUE;
+
+    if(!dont_include)
+    fprintf(f,"%d x %d\t%d x %d\t%s\t%dK\t%d Hz\t%dM/s\n", p->x_resolution, p->y_resolution,
+                                                      ((p->x_resolution/p->y_resolution)>=2) ? p->x_resolution*2 : p->x_resolution,
+                                                      ((p->x_resolution/p->y_resolution)>=2) ? p->y_resolution*4 : p->y_resolution,
+                                                      buff, memory/1024,
+                                                      p->frame_rate, p->pixel_rate / 1000);
+
+    dont_include = FALSE;
+
+    p = p->next;
+  }
+  fclose(f);
+  return TRUE;
+}
+
+/*************************************************
+*           Clear the generate window            *
+*************************************************/
+
+static void empty_generate_window(void)
+{
+  set_icon_text(window_generate, icon_g_monitor_title, "");
+  set_icon_text(window_generate, icon_g_type, "");
+  set_icon_text(window_generate, icon_g_dpms, "");
+  set_icon_text(window_generate, icon_g_hrate_min, "");
+  set_icon_text(window_generate, icon_g_hrate_max, "");
+  set_icon_text(window_generate, icon_g_vrate_min, "");
+  set_icon_text(window_generate, icon_g_vrate_max, "");
+  set_icon_text(window_generate, icon_g_tolerance, "");
+}
+
+/*************************************************
+*            Open the display window             *
+*************************************************/
+
+static void oaw(wimp_w handle)
+{
+    wimpt_complain(wimp_get_wind_state(handle, &state));
+    state.o.w = handle;
+    state.o.behind = -1;
+    wimpt_complain(wimp_open_wind(&state.o));
+}
+
+static void open_window(void)
+{
+  oaw(window_display);
+  display_open = TRUE;
+  current_mode = mode_chain;
+
+  /* Discard the mode menu if it has been built previously. */
+
+  if(menu_modes != NULL)
+  {
+    menu_dispose(&menu_modes,0);
+    menu_modes = NULL;
+  }
+
+  make_modes_menu();
+  menu_setflags(menu_modes, 1, 1, NULL);
+  event_attachmenumaker(window_display, alter_monitors_menu, modes_menu_handler,NULL);
+
+  update_display();
+  update_my_display();
+  copy_generate_info();
+}
+
+static void open_wind(wimp_openstr * o)
+{
+  wimpt_noerr(wimp_open_wind(o));
+}
+
+static void oaw_centered(wimp_w handle)
+{
+  int width, height;
+  wimpt_complain(wimp_get_wind_state(handle, &state));
+  state.o.behind  = -1;
+  width  = state.o.box.x1 - state.o.box.x0;
+  height = state.o.box.y1 - state.o.box.y0;
+  state.o.box.x0 = ((mode_var(11) << mode_var(4)) - width)/2;
+  state.o.box.x1 = state.o.box.x0 + width;
+  state.o.box.y0 = ((mode_var(12) << mode_var(5)) - height)/2;
+  state.o.box.y1 = state.o.box.y0 + height;
+  wimpt_complain(wimp_open_wind(&state.o));
+}
+
+static BOOL create_window(char *name, wimp_w * handle)
+{
+  wimp_wind *window;		/* Pointer to window definition */
+
+  /* Find template for the window */
+
+  window = template_syshandle(name);
+    if (window == 0)
+     return FALSE;
+
+  /* Create the window, dealing with errors */
+   return (wimpt_complain(wimp_create_wind(window, handle)) == 0);
+}
+
+/* Event handler for unknown messages */
+
+static BOOL Help_Process(wimp_eventstr * event, void *handle)
+{
+    handle = handle;
+    return help_process(event);
+}
+
+static void event_handler(wimp_eventstr * e, void *handle)
+{
+  wimp_msgstr msg;
+  handle = handle;
+
+  if(!help_process(e))
+  {
+    switch (e->e)
+    {
+      case wimp_EOPEN:
+       open_wind(&e->data.o);
+      break;
+
+      case wimp_EKEY:
+
+      if(waiting_to_return)
+      {
+        return_to_original_mode();
+        return;
+      }
+
+      if (e->data.key.c.w == window_display)
+       display_key(e->data.key.c.i, e->data.key.chcode);
+
+      if (e->data.key.c.w == window_generate)
+       generate_key(e->data.key.c.i, e->data.key.chcode);
+
+      break;
+
+      case wimp_EBUT:
+
+      if(waiting_to_return)
+      {
+        return_to_original_mode();
+        return;
+      }
+
+      if (e->data.but.m.w == window_display)
+       display_click(e->data.but.m.bbits, e->data.but.m.i);
+
+      if (e->data.but.m.w == window_generate)
+      {
+        generate_click(e->data.but.m.bbits, e->data.but.m.i);
+        return;
+      }
+
+      /*
+      if (e->data.but.m.w == window_save)
+       save_click(e->data.but.m.bbits, e->data.but.m.i);
+       */
+
+      if (e->data.but.m.w == window_checksave)
+       checksave_click(e->data.but.m.bbits, e->data.but.m.i);
+
+      /** to do **/
+      break;
+
+      case wimp_ECLOSE:
+      if(e->data.o.w == window_display && !file_saved)
+      {
+        close_window = TRUE;
+        oaw(window_checksave);
+        return;
+      }
+
+      if(e->data.o.w == window_display)
+      {
+        display_open = FALSE;
+        discard_data();
+      }
+
+      close_window = FALSE;
+      wimpt_noerr(wimp_close_wind(e->data.o.w));
+      break;
+
+      case wimp_ESEND:
+      case wimp_ESENDWANTACK:
+
+      switch(e->data.msg.hdr.action)
+      {
+
+        case wimp_MHELPREQUEST:
+        {
+          wimp_mousestr m;
+
+          wimp_get_point_info(&m);
+
+          if(m.i == -1
+             &&
+             m.w == -4)
+            help_reply(msgs_lookup("MMHelp"));
+
+          if(m.w == window_generate)
+          {
+            switch(m.i)
+            {
+              case icon_g_monitor_title:help_reply(msgs_lookup("MGTitle"));break;
+              case icon_g_monitor_menu: help_reply(msgs_lookup("MGTitNM"));break;
+              case icon_g_type:         help_reply(msgs_lookup("MGType"));break;
+              case icon_g_typedown:
+              case icon_g_typeup:       help_reply(msgs_lookup("MGdpms"));break;
+              case icon_g_hrate_min:    help_reply(msgs_lookup("MGminh"));break;
+              case icon_g_hrate_max:    help_reply(msgs_lookup("MGmaxh"));break;
+              case icon_g_vrate_min:    help_reply(msgs_lookup("MGminv"));break;
+              case icon_g_vrate_max:    help_reply(msgs_lookup("MGmaxv"));break;
+              case icon_g_tolerance:    help_reply(msgs_lookup("MGtol"));break;
+              case icon_g_generate:     help_reply(msgs_lookup("MGgen"));break;
+            }
+          }
+
+          if(m.w == window_checksave)
+          {
+            switch(m.i)
+            {
+              case icon_discard:        help_reply(msgs_lookup("MChelp1"));break;
+              case icon_cancel:         help_reply(msgs_lookup("MChelp2"));break;
+              case icon_save:           help_reply(msgs_lookup("MChelp3"));break;
+            }
+          }
+
+          if(m.w == window_display)
+          {
+            switch(m.i)
+            {
+              case icon_monitor_title:  help_reply(msgs_lookup("MDhelp1"));break;
+              case icon_monitor_menu:   help_reply(msgs_lookup("MDhelp2"));break;
+              case icon_file_format:    help_reply(msgs_lookup("MDhelp3"));break;
+              case icon_mode_count:     help_reply(msgs_lookup("MDhelp4"));break;
+              case icon_dpms_state:     help_reply(msgs_lookup("MDhelp5"));break;
+              case icon_dpms_down:
+              case icon_dpms_up:        help_reply(msgs_lookup("MDhelp6"));break;
+              case icon_comments:       help_reply(msgs_lookup("MDhelp7"));break;
+              case icon_current_mode:   help_reply(msgs_lookup("MDhelp8"));break;
+              case icon_mode_name:      help_reply(msgs_lookup("MDhelp9"));break;
+              case icon_title:          help_reply(msgs_lookup("MDhelp10"));break;
+              case icon_x_resolution:   help_reply(msgs_lookup("MDhelp11"));break;
+              case icon_y_resolution:   help_reply(msgs_lookup("MDhelp12"));break;
+              case icon_test_mode:      help_reply(msgs_lookup("MDhelp13"));break;
+              case icon_pixel_rate:     help_reply(msgs_lookup("MDhelp14"));break;
+              case icon_sync_pol:       help_reply(msgs_lookup("MDhelp15"));break;
+              case icon_sync_pol_down:
+              case icon_sync_pol_up:    help_reply(msgs_lookup("MDhelp16"));break;
+              case icon_frame_rate:     help_reply(msgs_lookup("MDhelp17"));break;
+              case icon_line_rate:      help_reply(msgs_lookup("MDhelp18"));break;
+              case icon_0MB_VRAM:       help_reply(msgs_lookup("MDhelp19"));break;
+              case icon_1MB_VRAM:       help_reply(msgs_lookup("MDhelp20"));break;
+              case icon_2MB_VRAM:       help_reply(msgs_lookup("MDhelp21"));break;
+              case icon_bpp:            help_reply(msgs_lookup("MDhelp22"));break;
+              case icon_bpp_menu:       help_reply(msgs_lookup("MDhelp23"));break;
+              case icon_screen_memory:  help_reply(msgs_lookup("MDhelp24"));break;
+              case icon_bandwidth:      help_reply(msgs_lookup("MDhelp25"));break;
+              case icon_text_base:
+              case icon_text_base+1:
+              case icon_text_base+2:
+              case icon_text_base+3:    help_reply(msgs_lookup("MDhelp26"));break;
+              case icon_h_sync_width:   help_reply(msgs_lookup("MDhelp27"));break;
+              case icon_h_back_porch:   help_reply(msgs_lookup("MDhelp28"));break;
+              case icon_h_left_border:  help_reply(msgs_lookup("MDhelp29"));break;
+              case icon_h_display:      help_reply(msgs_lookup("MDhelp30"));break;
+              case icon_h_right_border: help_reply(msgs_lookup("MDhelp31"));break;
+              case icon_h_front_porch:  help_reply(msgs_lookup("MDhelp32"));break;
+              case icon_v_sync_width:   help_reply(msgs_lookup("MDhelp33"));break;
+              case icon_v_back_porch:   help_reply(msgs_lookup("MDhelp34"));break;
+              case icon_v_top_border:   help_reply(msgs_lookup("MDhelp35"));break;
+              case icon_v_display:      help_reply(msgs_lookup("MDhelp36"));break;
+              case icon_v_bottom_border:help_reply(msgs_lookup("MDhelp37"));break;
+              case icon_v_front_porch:  help_reply(msgs_lookup("MDhelp38"));break;
+              case icon_h_total:        help_reply(msgs_lookup("MDhelp39"));break;
+              case icon_v_total:        help_reply(msgs_lookup("MDhelp40"));break;
+              case icon_h_required:     help_reply(msgs_lookup("MDhelp41"));break;
+              case icon_v_required:     help_reply(msgs_lookup("MDhelp42"));break;
+              case icon_keep_totals:    help_reply(msgs_lookup("MDhelp43"));break;
+            }
+          }
+          break;
+        }
+
+        case wimp_MDATASAVE:
+            msg = e->data.msg;
+            msg.hdr.size = 256;
+            msg.data.datasaveok.estsize = -1;
+            msg.hdr.your_ref = e->data.msg.hdr.my_ref;
+            msg.hdr.action = wimp_MDATASAVEOK;
+            strcpy(msg.data.datasaveok.name,"<Wimp$Scrap>");
+            wimp_sendmessage(wimp_ESENDWANTACK,&msg, e->data.msg.hdr.task);
+            break;
+
+        case wimp_MDATAOPEN:
+        case wimp_MDATALOAD:
+
+        if(e->data.msg.data.dataload.type == 0xfff && e->data.msg.data.dataload.i == icon_comments)
+        {
+          BOOL load_comments = TRUE;
+          if(load_comments)
+          {
+            stringchain **cc = &comments;
+            FILE *f = fopen(e->data.msg.data.dataload.name, "r");
+            char buff[256];
+
+            if(f == NULL)
+            {
+              error_moan(6, e->data.msg.data.dataload.name);
+              break;
+            }
+
+            free_comments();
+
+            for (;;)
+            {
+              stringchain *c;
+              if (fgets(buff, sizeof(buff), f) == NULL) break;
+              if (buff[0] == '\n') continue;
+
+              c = malloc(sizeof(stringchain) + strlen(buff));
+              if (c == NULL)
+                {
+                werr(0,"%s",msgs_lookup("19"));
+                break;
+                }
+              *cc = c;
+              cc = &(c->next);
+              c->next = NULL;
+              strcpy(c->text, buff);
+            }
+
+          fclose(f);
+          file_saved = TRUE;
+          }
+
+          if(strcmp(e->data.msg.data.dataload.name, "<Wimp$Scrap>") == 0)
+           file_delete("<Wimp$Scrap>");
+
+          msg.hdr.action = wimp_MDATALOADOK;
+          msg.hdr.your_ref = e->data.msg.hdr.my_ref;
+          msg.hdr.size = sizeof(wimp_msghdr);
+          wimp_sendmessage(wimp_ESEND, &msg, e->data.msg.hdr.task);
+        }
+       break;
+      }
+    }
+  }
+}
+
+static void monitors_menu_handler(void *handle, char *items)
+{
+  int n;
+  monitor *mon;
+  monitor *mon1;
+  current_monitor = *items;
+  n = *items;
+  mon = monitors;
+  mon1 = monitors;
+
+  if(last_menu == menu_display)
+  {
+    display_menu_handler(handle, items);
+    return;
+  }
+  if(last_menu == menu_modes)
+  {
+    modes_menu_handler(handle, items);
+    return;
+  }
+  if(last_menu == menu_bpp)
+  {
+    bpp_menu_handler(handle, items);
+    return;
+  }
+
+  n--;
+
+  while (n-- > 0) mon = mon->next;
+
+  monitor_type = montypes;
+
+  while (monitor_type != NULL & strcmp(monitor_type->typename, mon->typename) != 0)
+    monitor_type = monitor_type->next;
+
+  if(monitor_type == NULL)
+  {
+    error_moan(31, mon->typename);
+    return;
+  }
+
+  set_icon_text(window_display, icon_monitor_title, mon->name);
+  strcpy(monitor_title, mon->name);
+
+  set_icon_text(window_generate, icon_g_monitor_title, mon->name);
+  set_icon_num(window_generate, icon_g_hrate_max,mon->max_h);
+  set_icon_num(window_generate, icon_g_hrate_min,mon->min_h);
+  set_icon_num(window_generate, icon_g_vrate_min, mon->min_v);
+  set_icon_num(window_generate, icon_g_vrate_max, mon->max_v);
+  set_icon_num(window_generate, icon_g_dpms, mon->dpms);
+  set_icon_text(window_generate, icon_g_type, mon->typename);
+
+  copy_generate_info();
+  if(current_mode != NULL)
+  {
+    /* Monitor change, recheck the timing (unless no modes have been generated yet) */
+    check_frame_rate();
+    check_line_rate();
+  }
+}
+
+static void info_about_program(void)
+{
+  dbox d;
+
+  if (d = dbox_new("Info"), d != NULL)
+  {
+    BOOL p = FALSE, m = FALSE;
+    _kernel_swi_regs r;
+    r.r[0] = 129;
+    r.r[1] = 205; /* 'D' */
+    r.r[2] = 0xff;
+    _kernel_swi(OS_Byte, &r,&r);
+    if((r.r[1] == 0xff) && (r.r[2] == 0xff))
+     p = TRUE;
+    r.r[0] = 129;
+    r.r[1] = 154; /* 'M' */
+    r.r[2] = 0xff;
+    _kernel_swi(OS_Byte,&r,&r);
+    if((r.r[1] == 0xff) && (r.r[2] == 0xff))
+     m = TRUE;
+    if(p && m)
+     dbox_setfield(d, info_author_icon, "Written by Dean Murphy");
+    else
+     dbox_setfield(d, info_author_icon, "© Acorn Computers Ltd, 1994");
+    /* Fill in the version number */
+    dbox_setfield(d, info_version_icon, msgs_lookup("_Version"));
+    /* Show the dialogue box */
+    dbox_show(d);
+    dbox_raw_eventhandler(d,&help_dboxrawevents,(void *)"InfoHelp");
+  }
+}
+
+static void iconbar_loader(wimp_eventstr * e, void *handle)
+{
+  handle = handle;
+
+  switch(e->e)
+  {
+    case wimp_ESEND:
+    case wimp_ESENDWANTACK:
+
+      switch(e->data.msg.hdr.action)
+      {
+        case wimp_MDATALOAD:
+        case wimp_MDATASAVE:
+        case wimp_MDATAOPEN:
+
+          if(e->data.msg.data.dataload.type == 0xfff)
+          {
+            if(display_open)
+            {
+              werr(0,msgs_lookup("7"));
+              return;
+            }
+            else
+            {
+              strcpy(file_name, e->data.msg.data.dataload.name);
+              data_init(TRUE);
+              if(load_file())
+              {
+                caw(window_generate);
+                caw(window_warning);
+                open_window();
+                update_my_display();
+              }
+            }
+          }
+      }
+  }
+}
+
+/*************************************************
+*            Iconbar menu handler                *
+*************************************************/
+
+static void iconbar_menu_handler(void *handle, char *hit)
+{
+  handle = handle;
+
+  switch(hit[0])
+  {
+    case m_iconbar_info:
+    info_about_program();
+    break;
+
+    case m_iconbar_vesa:
+    if (base_subdir[0] == 'N')
+    {
+      base_subdir = "VESA";
+      menu_setflags(iconbar_menu, m_iconbar_vesa, 1,NULL);
+    }
+    else
+    {
+      base_subdir = "NonVESA";
+      menu_setflags(iconbar_menu, m_iconbar_vesa, NULL, NULL);
+    }
+    break;
+
+    case m_iconbar_quit:
+    if (file_saved)
+     exit(0);
+    else
+    {
+      open_checksave();
+      quit_after_checksave = TRUE;
+    }
+    break;
+  }
+}
+
+static void open_save_dialog(void)
+{
+  saveas(0xfff,file_name,1024,save_proc,NULL,NULL,NULL);
+}
+
+static void open_save_list_dialog(void)
+{
+  saveas(0xfff,"ModeList",1024,build_modes_list,NULL,NULL,NULL);
+}
+
+static void open_monitor_info(void)
+{
+  dbox d;
+  if (d = dbox_new("Generate_o"), d != NULL)
+  {
+
+    /* Show the dialogue box */
+    dbox_show(d);
+
+    /* Keep it on the screen as long as needed */
+    dbox_fillin(d);
+
+    /* Dispose of the dialogue box */
+    dbox_dispose(&d);
+  }
+}
+
+
+
+
+static void bpp_menu_handler(void *handle, char *items)
+{
+  char buffer[20];
+  if(last_menu == menu_display)
+  {
+    display_menu_handler(handle, items);
+    return;
+  }
+
+  if(last_menu == menu_modes)
+  {
+    modes_menu_handler(handle, items);
+    return;
+  }
+  if(last_menu == menu_monitors)
+  {
+    monitors_menu_handler(handle, items);
+    return;
+  }
+
+  menu_setflags(menu_bpp, last_bpp_selected, 0, NULL);
+
+  switch(items[0])
+  {
+    case one_bpp:
+     bpp_selected = 1;
+    break;
+
+    case two_bpp:
+     bpp_selected = 2;
+    break;
+
+    case four_bpp:
+     bpp_selected = 4;
+    break;
+
+    case eight_bpp:
+     bpp_selected = 8;
+    break;
+
+    case sixteen_bpp:
+     bpp_selected = 16;
+    break;
+
+    case tt_bpp:
+     bpp_selected = 32;
+    break;
+
+  }
+  menu_setflags(menu_bpp, items[0], 1, NULL);
+  last_bpp_selected = items[0];
+  update_my_display();
+  sprintf(buffer, "%d bpp", bpp_selected);
+  set_icon_text(window_display, icon_bpp, buffer);
+
+}
+
+
+/*************************************************
+*            Display menu handler                *
+*************************************************/
+
+static void display_menu_handler(void *handle, char *items)
+{
+  if(last_menu == menu_bpp)
+  {
+    bpp_menu_handler(handle, items);
+    return;
+  }
+
+  if(last_menu == menu_modes)
+  {
+    modes_menu_handler(handle, items);
+    return;
+  }
+  if(last_menu == menu_monitors)
+  {
+    monitors_menu_handler(handle, items);
+    return;
+  }
+
+  switch(items[0])
+  {
+    case display_save:
+     open_save_dialog();
+     break;
+
+    case display_monitor_info:
+     open_monitor_info();
+     break;
+
+    case display_newmode:
+    {
+      mode *p = malloc(sizeof(mode));
+      if (p == NULL)
+      {
+        werr(0,"%s", msgs_lookup("16"));
+      }
+      else
+      {
+        memcpy(p, current_mode, sizeof(mode));
+        p->next = current_mode->next;
+        current_mode->next = p;
+        if (current_mode == last_mode) last_mode = p;
+        mode_count++;
+        mode_number++;
+        current_mode = p;
+        file_saved = FALSE;
+        update_display();
+        update_my_display();
+      }
+    make_modes_menu();
+    }
+    break;
+
+    case display_deletemode:
+    if (mode_chain->next != NULL)  /* Only if > 1 mode exists */
+    {
+      mode *p = mode_chain;
+      mode *pp = NULL;
+
+      while (p != current_mode)
+      {
+        pp = p;
+        p = p->next;
+      }
+
+      /* Deleting the first mode; it cannot also be the last, since
+         deleting the only mode is handled separately. */
+
+      if (pp == NULL)
+      {
+        mode_chain = p->next;
+        current_mode = mode_chain;
+      }
+
+      /* Not the first mode */
+
+      else
+      {
+        pp->next = p->next;
+        if (last_mode == p)
+        {
+          last_mode = pp;
+          current_mode = last_mode;
+          mode_number--;
+        }
+        else current_mode = pp->next;
+      }
+
+      free(p);
+      mode_count--;
+      file_saved = FALSE;
+      update_display();
+      update_my_display();
+    }
+    else werr(0,"%s",msgs_lookup("15"));
+    make_modes_menu();
+    break;
+
+    case display_comments:
+      {
+      stringchain *c = comments;
+      FILE *f = fopen("<Wimp$Scrap>", "w");
+      if (f == NULL)
+        {
+        error_moan(6, "<Wimp$Scrap>");
+        break;
+        }
+      while (c != NULL)
+        {
+        fprintf(f, "%s", c->text);
+        c = c->next;
+        }
+      fclose(f);
+      /* If an editor is present, it should pick up this file */
+      system("Filer_Run <Wimp$Scrap>");
+      }
+    break;
+
+    case display_generate_list:
+     open_save_list_dialog();
+    break;
+  }
+}
+
+/*************************************************
+*              Modes menu handler                *
+*************************************************/
+
+extern void modes_menu_handler(void *handle, char *items)
+{
+mode *p = mode_chain;
+int i = (items[0])-1;
+int old = mode_number;
+
+  if(last_menu == menu_display)
+  {
+    display_menu_handler(handle, items);
+    return;
+  }
+  if(last_menu == menu_monitors)
+  {
+    monitors_menu_handler(handle, items);
+    return;
+  }
+  if(last_menu == menu_bpp)
+  {
+    bpp_menu_handler(handle, items);
+    return;
+  }
+
+if(old == 0)
+ menu_setflags(menu_modes, 1, NULL,NULL);
+else
+ menu_setflags(menu_modes, old, NULL,NULL);
+
+while (i-- > 0)
+  {
+  if ((p = p->next) == NULL) break;
+  }
+
+if (p != NULL && p!= current_mode)
+  {
+  current_mode = p;
+  update_display();
+  update_my_display();
+  mode_number = items[0];
+  }
+  menu_setflags(menu_modes, mode_number, 1, NULL);
+}
+
+static void generate_key(wimp_i icon, int key)
+{
+  /* to do */
+}
+
+/*************************************************
+*           Handle keypress in the display       *
+*************************************************/
+
+static void display_key(wimp_i icon, int key)
+{
+int i;
+char *ss;
+
+/* We are only interested in printable key presses when the caret
+is in an icon, and there are no function keys. */
+
+if (icon < 0) return;
+if (key > 255)
+  {
+  SWI(Wimp_ProcessKey, 1, key);
+  return;
+  }
+
+/* Get a pointer to the icon's string */
+
+ss = get_icon_text(window_display, icon);
+
+file_saved = FALSE;
+
+/* Check for and handle the per-file fields */
+
+if (icon == icon_monitor_title)
+  {
+  sigstrcpy(monitor_title, ss);
+  file_saved = FALSE;
+  return;
+  }
+
+if (icon == icon_mode_name)
+{
+  sigstrcpy(current_mode->mode_name, ss);
+  if(key == 13)
+  {
+    current_mode->write_name = TRUE;
+    blip(window_display, icon_title, 1);
+  }
+  return;
+}
+
+/* Else check for and handle the per-mode fields */
+
+else for (i = 0; i < keyiconcount; i++)
+  {
+  key_icon *k = keyicons + i;
+  if (icon == k->number)
+    {
+    file_saved = FALSE;
+
+    /* Handle textual fields (actually there aren't any, now that
+    mode name has been made automatic, but why throw away good code?) */
+
+    if (k->type == ki_text)
+      {
+      char *field = (char *)current_mode + k->offset;
+      sigstrcpy(field, ss);
+      }
+
+    /* Handle numeric fields */
+
+    else
+      {
+      int *field = (int *)((char *)current_mode + k->offset);
+
+      *field = atoi(ss);
+
+      /* The resolution fields are slaved from the display timings */
+
+      if (icon == icon_h_display)
+        {
+        current_mode->x_resolution = *field;
+        set_icon_num(window_display, icon_x_resolution,
+          current_mode->x_resolution);
+        }
+      else if (icon == icon_v_display)
+        {
+        current_mode->y_resolution = *field;
+        set_icon_num(window_display, icon_y_resolution,
+          current_mode->y_resolution);
+        }
+
+      /* If any timings have changed, re-compute totals and the frame rate */
+
+      if (k->type == ki_hnumber) sum_horizontal(current_mode);
+        else if (k->type == ki_vnumber) sum_vertical(current_mode);
+          else if (icon == icon_pixel_rate) update_frame_rate(current_mode);
+      }
+    check_mode_timings();
+    break;
+    }
+  }
+}
+
+
+
+
+static void get_mode_info(void)
+{
+  cmode_xres = mode_var(11)+1;
+  cmode_yres = mode_var(12)+1;
+  cmode_bpp  = (int)pow(2,mode_var(9));
+  cmode_xeig = mode_var(4);
+  cmode_yeig = mode_var(5);
+}
+
+
+static void load_configured_mode_file(void)
+{
+  _kernel_oserror *e;
+  _kernel_swi_regs r;
+  char buffer[255];
+  int f;
+
+  r.r[0] = (int)"PreDesk$Configure";
+  r.r[1] = (int)buffer;
+  r.r[2] = -1;
+  r.r[4] = 3;
+  _kernel_swi(OS_ReadVarVal,&r,&r);
+
+  if(r.r[2] == 0)
+    e = file_open("Boot:Choices.Boot.PreDesk.Configure", &f, OPEN_EXIST_READ);
+  else
+    e = file_open ( "<PreDesk$Configure>", &f, OPEN_EXIST_READ);
+
+  if(e!=NULL)
+  {
+    werr(0,"%s",msgs_lookup("CONFAI"));
+    return;
+  }
+
+  for(;;)
+  {
+    if(file_readline(f, buffer, 255))
+    {
+      if(strncmp(buffer,"LoadModeFile",12) == NULL)
+      {
+        SWI(OS_CLI,1,buffer);
+        break;
+      }
+    }
+    else
+    break;
+  }
+  file_close(f);
+  return;
+}
+
+static void return_to_original_mode(void)
+{
+  char buffer[255];
+  char cols[5];
+  load_configured_mode_file();
+
+  switch(cmode_bpp)
+  {
+    case 1:
+     strcpy(cols, "G2");
+     break;
+    case 2:
+     strcpy(cols, "G4");
+     break;
+    case 4:
+     strcpy(cols, "C16");
+     break;
+    case 8:
+     strcpy(cols, "C256");
+     break;
+    case 16:
+     strcpy(cols,"C32K");
+     break;
+    case 32:
+     strcpy(cols,"C16M");
+     break;
+    default:
+     strcpy(cols, "C16");
+     break;
+  }
+  caw(window_return);
+  sprintf(buffer,"WimpMode X%d Y%d %s EX%d EY%d",cmode_xres,cmode_yres,cols,cmode_xeig,cmode_yeig);
+  SWI(OS_CLI,1,buffer);
+
+  waiting_to_return = FALSE;
+}
+
+static BOOL save_proc(char *filename, void *handle)
+{
+  strcpy(file_name, filename);
+  if(save_file())
+  {
+    file_saved = TRUE;
+    return(TRUE);
+  }
+  else
+  {
+    file_saved = FALSE;
+    return(FALSE);
+  }
+}
+
+static void update_timings_window(char *text)
+{
+  if(timings_window_line_number > 3)
+   return;
+
+  if(strlen(text)>45)
+   *(text + 44) = '\0';
+
+  set_icon_text(window_display, icon_text_base + timings_window_line_number++, text);
+
+  return;
+}
+
+
+
+void check_mode_timings(void)
+{
+  double Tl[3],Tm[3],Ts[3],Tn[3],bw[3];
+  int fifodepth[3],buswidth[3];
+  int maxpixdepth = 0, pixdepth, db, vb, vncneeded;
+  BOOL borderOK, dbOK, vncOK, allok, bplbOK, allallok = TRUE;
+  int bplbpixneeded,f, tmp;
+  float Tr_pix, Tl_pix;
+  double  tmpx, tmpy, tmpz;
+  char buffer[255];
+
+  timings_window_line_number = 0;
+
+  buswidth[0] = 128;
+  buswidth[1] = 128;
+  buswidth[2] = 256;
+
+  Tl[0] = 1500E-9;
+  Tl[1] = 1150E-9;
+  Tl[2] = 1150E-9;
+
+  Tm[0] = 1311E-9;
+  Tm[1] = 1107E-9;
+  Tm[2] = 1107E-9;
+
+  Ts[0] = 1500E-9;
+  Ts[1] = 1500E-9;
+  Ts[2] = 1500E-9;
+
+  Tn[0] = 1311E-9;
+  Tn[1] = 1107E-9;
+  Tn[2] = 1107E-9;
+
+  bw[0] = (double)vidc_bandwidth_limit[0] * 1000000;
+  bw[1] = (double)vidc_bandwidth_limit[1] * 1000000;
+  bw[2] = (double)vidc_bandwidth_limit[2] * 1000000;
+
+  fifodepth[0] = 28*4;
+  fifodepth[1] = 28*4;
+  fifodepth[2] = 32*4;
+
+  tmpx = (double)((current_mode->pixel_rate) << (maxpixdepth+1));
+  tmpy = bw[vram_fitted]*8/1000;
+  tracef1("tmpx = %f\n",tmpx);
+  tracef1("tmpy = %f\n",tmpy);
+
+  while(tmpx <= tmpy && maxpixdepth < 5)
+  {
+    maxpixdepth+=1;
+    tmpx = (double)((current_mode->pixel_rate) << (maxpixdepth+1));
+  }
+
+
+  tracef1("maxpixdepth = %d\n",maxpixdepth);
+
+  pixdepth = last_bpp_selected - 1;
+
+  /*for(pixdepth = 0; pixdepth <= maxpixdepth; pixdepth++)
+  {*/
+
+    if(current_mode->h_sync_width & 1)
+     update_timings_window("Hor. sync width must be a multiple of two");
+
+    if(current_mode->h_back_porch & 1)
+     update_timings_window("Back porch must be a multiple of two");
+
+    if(current_mode->h_left_border & 1)
+     update_timings_window("Left border must be a multiple of two");
+
+    if(current_mode->h_display & 1)
+     update_timings_window("Horizontal display must be a multiple of two");
+
+    if(current_mode->h_right_border & 1)
+     update_timings_window("Right border must be a multiple of two");
+
+    if(current_mode->h_front_porch & 1)
+     update_timings_window("Front porch must be a multiple of two");
+
+
+    tmpx = (double)((current_mode->x_resolution << pixdepth)-1);
+    tracef1("tmpx = %f\n",tmpx);
+    tmpy = (double)((buswidth[vram_fitted]) >> pixdepth);
+    tracef1("buswidth[vram_fitted]+1) >> pixdepth = %f\n",tmpy);
+
+    tmpz   = fmod(tmpx,tmpy);
+    tmpz++;
+    Tr_pix = (float)tmpz;
+    Tl_pix = (float)(Tl[vram_fitted] * (current_mode->pixel_rate * 1000));
+    tracef1("x res = %d\n", current_mode->x_resolution);
+    tracef1("pixel rate = %d\n",current_mode->pixel_rate);
+    tracef2("tmpx = %f, tmpy = %f\n",tmpx,tmpy);
+    tracef2("Tl_pix = %f, Tr_pix = %f\n",Tl_pix, Tr_pix);
+    db = (current_mode->pixel_rate << pixdepth) >> 3;
+    vb = (int)bw[vram_fitted];
+    vncneeded = 2*(int)((Ts[vram_fitted] * (current_mode->pixel_rate * 1000)+2)/2);
+    tracef1("vncneeded = %d\n",vncneeded);
+    if((current_mode->h_right_border >= Tl_pix-Tr_pix) || vram_fitted == 0)
+     borderOK = TRUE;
+    else
+     borderOK = FALSE;
+
+    dbOK = db <= vb;
+
+    if(current_mode->h_sync_width + current_mode->h_front_porch >= vncneeded)
+     vncOK = TRUE;
+    else
+     vncOK = FALSE;
+
+    /* The bplbpixneeded *+ 2 is not included on the line below as the
+       compiler will optimise the calculation out, which is in a sense,
+       the correct thing for it to do e.g. 2/2*2 = 2 */
+
+    bplbpixneeded = (int)(10+Tn[vram_fitted] * (current_mode->pixel_rate * 1000)+1) / 2;
+    bplbpixneeded *= 2;
+
+    if(current_mode->h_back_porch + current_mode->h_left_border < bplbpixneeded)
+     bplbOK = TRUE;
+    else
+     bplbOK = FALSE;
+
+    allok = borderOK && dbOK && vncOK && bplbOK;
+    if(bplbOK)
+    {
+      if((current_mode->h_back_porch + current_mode->h_left_border) < bplbpixneeded)
+      {
+        sprintf(buffer,"Back porch + left border needs to be %d\0",bplbpixneeded);
+        /*file_writealine(f,buffer,255);*/
+        update_timings_window(buffer);
+      }
+    }
+    else
+    {
+      if((current_mode->h_back_porch + current_mode->h_left_border) < bplbpixneeded)
+      {
+        sprintf(buffer,"Back porch + left border needs to be %d \0",bplbpixneeded);
+        /*file_writealine(f,buffer,255);*/
+        update_timings_window(buffer);
+      }
+    }
+
+    if(!allok)
+    {
+      if(allallok) /*file_writealine(f,"",255)*/;
+      allallok = FALSE;
+      sprintf(buffer,"pixel_depth:%d\n", pixdepth);
+      /*file_writealine(f,buffer,255);*/
+      if(!borderOK)
+      {
+        /* sprintf(buffer, " Tr= %f pixels\n",Tr_pix); set_icon_text(window_display, text_icon_number++, buffer); file_writealine(f,buffer,255);*/
+        /* sprintf(buffer, " Tl= %f pixels\n",Tl_pix); set_icon_text(window_display, text_icon_number++, buffer); file_writealine(f,buffer, 255);*/
+        tmp = 2*((int)((Tl_pix-Tr_pix+2))/2);
+        sprintf(buffer, "Right border required = %d pixels\0",tmp);
+        update_timings_window(buffer);
+        /*file_writealine(f,buffer,255);*/
+        /*set_icon_colours(window_display, icon_h_right_border, 11, 0);*/
+      }
+
+
+    }
+    if(!vncOK)
+    {
+      sprintf(buffer,"Front porch + sync pixels needed = %d \0",vncneeded);
+      terminate_string(buffer);
+      /*file_writealine(f,buffer,255);*/
+      update_timings_window(buffer);
+    }
+
+  /*timings_window_line_number = 0;*/
+
+  /* Clear any following lines */
+
+  if(timings_window_line_number == 0)
+   update_timings_window("Timings OKAY");
+
+  for(f = timings_window_line_number; f<=4;f++)
+   update_timings_window("");
+}
+
+/*************************************************
+*           Handle click in the display          *
+*************************************************/
+
+static void display_click(wimp_bbits butt, wimp_i icon)
+{
+int i;
+int dpms_up = FALSE, dpms_down = FALSE;
+
+if (icon == icon_current_mode)
+{
+  wimp_eventstr fake;
+  fake.e = wimp_EBUT;
+  fake.data.but.m.bbits = wimp_BMID;
+  fake.data.but.m.w     = window_display;
+  fake.data.but.m.i     = icon;
+  wimpt_fake_event(&fake);
+  make_modes_menu();
+  return;
+}
+
+if (icon == icon_monitor_menu || icon == icon_bpp_menu)
+{
+  wimp_eventstr fake;
+  fake.e = wimp_EBUT;
+  fake.data.but.m.bbits = wimp_BMID;
+  fake.data.but.m.w     = window_display;
+  fake.data.but.m.i     = icon;
+  wimpt_fake_event(&fake);
+  return;
+}
+
+if(icon == icon_keep_totals)
+{
+  if(keep_totals)
+  {
+    keep_totals = FALSE;
+    blip(window_display, icon_keep_totals, 0);
+  }
+  else
+  {
+    keep_totals = TRUE;
+    blip(window_display, icon_keep_totals, 1);
+  }
+}
+
+
+/* Clicking on the comments icon gives a message about dragging comments
+onto it. */
+
+if (icon == icon_comments)
+  {
+    werr(0,"%s",msgs_lookup("23"));
+    return;
+  }
+
+if(icon == icon_0MB_VRAM)
+{
+    blip(window_display, icon_0MB_VRAM, 1);
+    blip(window_display, icon_1MB_VRAM, 0);
+    blip(window_display, icon_2MB_VRAM, 0);
+    vram_fitted = NO_VRAM_FITTED;
+    screen_memory = 1024;
+    update_my_display();
+    return;
+}
+
+if(icon == icon_1MB_VRAM)
+{
+    blip(window_display, icon_0MB_VRAM, 0);
+    blip(window_display, icon_1MB_VRAM, 1);
+    blip(window_display, icon_2MB_VRAM, 0);
+    vram_fitted = ONE_VRAM_FITTED;
+    screen_memory = 1024;
+    update_my_display();
+    return;
+}
+
+if(icon == icon_2MB_VRAM)
+{
+    blip(window_display, icon_0MB_VRAM, 0);
+    blip(window_display, icon_1MB_VRAM, 0);
+    blip(window_display, icon_2MB_VRAM, 1);
+    vram_fitted = TWO_VRAM_FITTED;
+    screen_memory = 2048;
+    update_my_display();
+    return;
+}
+
+
+/* Handle up/down clicks on the DPMS arrows. If these had been there
+from the start, we might have included them in some generalized sub-
+routing for up/down. As it is, it is easiest just to add the code
+directly here - it's effectively the same as for the generate window. */
+
+if (icon == icon_dpms_up)
+  {
+    dpms_up = butt == 4;
+    dpms_down = !dpms_up;
+  }
+else if (icon == icon_dpms_down)
+  {
+    dpms_down = butt == 4;
+    dpms_up = !dpms_down;
+  }
+
+if (dpms_up)
+  {
+    char buff[20];
+    int dpms = atoi(get_icon_text(window_display, icon_dpms_state));
+    if (dpms < 3)
+    {
+      sprintf(buff, "%d", dpms+1);
+      set_icon_text(window_display, icon_dpms_state, buff);
+    }
+    return;
+  }
+if (dpms_down)
+  {
+  char buff[20];
+  int dpms = atoi(get_icon_text(window_display, icon_dpms_state));
+  if (dpms > 0)
+    {
+    sprintf(buff, "%d", dpms-1);
+    set_icon_text(window_display, icon_dpms_state, buff);
+    }
+  return;
+  }
+
+
+/* Clicking on the name/title icon changes the state of the flag
+controlling whether a mode name is written or not. The icon itself
+is changed by the wimp.
+
+It has been decided that the base mode files will control this,
+so we don't display the icon any more. Hence this code is never
+obeyed. */
+
+if (icon == icon_title)
+  {
+  char *p = current_mode->mode_name + strlen(current_mode->mode_name);
+  current_mode->write_name = !current_mode->write_name;
+  if (current_mode->write_name) p[-1] = 0;
+    else sprintf(p, "*");
+  return;
+  }
+
+
+/* Clicking on a required field updates it from the total and subsequently
+freezes it if not already frozen. */
+
+if (icon == icon_h_required)
+  {
+  current_mode->h_required = current_mode->h_total;
+  set_icon_text(window_display, icon_h_required,
+    get_icon_text(window_display, icon_h_total));
+  hrequired_set = TRUE;
+  set_icon_colours(window_display, icon_h_required,
+    colour_req_fore2, colour_req_back);
+  return;
+  }
+
+if (icon == icon_v_required)
+  {
+  current_mode->v_required = current_mode->v_total;
+  set_icon_text(window_display, icon_v_required,
+    get_icon_text(window_display, icon_v_total));
+  vrequired_set = TRUE;
+  set_icon_colours(window_display, icon_v_required,
+    colour_req_fore2, colour_req_back);
+  return;
+  }
+
+  if(icon == icon_test_mode && !waiting_to_return)
+  {
+    char buffer[255];
+    char tmp[255];
+    get_mode_info();
+    strcpy(tmp, file_name);
+    strcpy(file_name, "<Wimp$ScrapDir>.TmpMon");
+    save_a_definition(-1); /* Save the currently selected mode file */
+    strcpy(file_name, "ModeFile");
+
+    sprintf(buffer, "LoadModeFile <Wimp$ScrapDir>.TmpMon");
+    SWI(OS_CLI,1,buffer);
+
+    /*
+    sprintf(buffer, "Delete <Wimp$ScrapDir>.TmpMon");
+    SWI(OS_CLI,1,buffer);
+    */
+
+    sprintf(buffer, "WimpMode X%d Y%d %s", current_mode->x_resolution, current_mode->y_resolution, max_cols);
+    SWI(OS_CLI,1,buffer);
+
+    waiting_to_return = TRUE;
+    oaw_centered(window_return);
+    SWI(Wimp_SetCaretPosition, 2, window_return, 1);
+    strcpy(file_name, tmp);
+  }
+
+/* Clicking on one of the up/down arrows causes the appropriate
+field to be changed. Additional processing is needed for some
+fields. Clicking with adjust goes in the other direction. */
+
+for (i = 0; i < bumpiconcount; i++)
+  {
+  bump_icon *b = bumpicons + i;
+  if (icon == b->number)
+    {
+    int tmp;
+    BOOL modify_opposites = TRUE;
+    int *field     = (int *)((char *)current_mode + b->offset);
+    int *opp_field = (int *)((char *)current_mode + b->opp_offset);
+
+    int change = b->change;
+
+    if (butt == 1) change = -change;
+
+    tmp = -change;
+
+    file_saved = FALSE;
+
+    /* The sync polarity field can only take the values 0-4;
+    other fields can be any non-negative value. */
+
+    if (b->type == bi_s)
+      {
+      if (change > 0) { if (*field < 4) *field += 1; }
+        else if (*field > 0) *field -= 1;
+      }
+    else
+      {
+        if(keep_totals)
+        {
+          if((*opp_field) + tmp >= 0)
+          {
+            *field += change;
+            if (*field < 0)
+            {
+              *field = 0;
+              modify_opposites = FALSE;
+            }
+          }
+          else
+           modify_opposites = FALSE;
+        }
+        else
+        {
+          *field += change;
+          if (*field < 0) *field = 0;
+        }
+      }
+
+    /* Update the displayed value */
+
+    set_icon_num(window_display, b->display_icon, *field);
+
+    check_mode_timings();
+
+    if(keep_totals && (b->opp_field != NULL) && modify_opposites)
+    {
+      /* buf = *opp_field atoi(get_icon_text(handle_display, b->opp_field));*/
+      if(((*opp_field) + tmp) >= 0)
+       *opp_field += tmp;
+
+       set_icon_num(window_display, b->opp_field, *opp_field );
+
+       check_mode_timings();
+    }
+
+
+
+    /* Do any further processing that is needed */
+
+    switch(b->type)
+      {
+      case bi_hd:
+      current_mode->x_resolution = *field;
+      set_icon_num(window_display, icon_x_resolution,
+        current_mode->x_resolution);
+      /* fall through */
+
+      case bi_h:
+      if((current_mode->h_sync_width%2)!=0)
+      {
+        if(change<0)
+         current_mode->h_sync_width += current_mode->h_sync_width%2;
+        else
+         current_mode->h_sync_width -= current_mode->h_sync_width%2;
+
+        set_icon_num(window_display, icon_h_sync_width, current_mode->h_sync_width);
+      }
+       if((current_mode->h_back_porch%2)!=0)
+      {
+        if(change<0)
+         current_mode->h_back_porch += current_mode->h_back_porch%2;
+        else
+         current_mode->h_back_porch -= current_mode->h_back_porch%2;
+
+        set_icon_num(window_display, icon_h_back_porch, current_mode->h_back_porch);
+      }
+       if((current_mode->h_left_border%2)!=0)
+      {
+        if(change<0)
+         current_mode->h_left_border += current_mode->h_left_border%2;
+        else
+         current_mode->h_left_border -= current_mode->h_left_border%2;
+
+        set_icon_num(window_display, icon_h_left_border, current_mode->h_left_border);
+      }
+       if((current_mode->h_display%2)!=0)
+      {
+        if(change<0)
+         current_mode->h_display += current_mode->h_display%2;
+        else
+         current_mode->h_display -= current_mode->h_display%2;
+
+        set_icon_num(window_display, icon_h_display, current_mode->h_display);
+      }
+       if((current_mode->h_right_border%2)!=0)
+      {
+        if(change<0)
+         current_mode->h_right_border += current_mode->h_right_border%2;
+        else
+         current_mode->h_right_border -= current_mode->h_right_border%2;
+
+        set_icon_num(window_display, icon_h_right_border, current_mode->h_right_border);
+      }
+       if((current_mode->h_front_porch%2)!=0)
+      {
+        if(change<0)
+         current_mode->h_sync_width += current_mode->h_front_porch%2;
+        else
+         current_mode->h_sync_width -= current_mode->h_front_porch%2;
+
+        set_icon_num(window_display, icon_h_front_porch, current_mode->h_front_porch);
+      }
+      sum_horizontal(current_mode);
+      break;
+
+      case bi_vd:
+      current_mode->y_resolution = *field;
+      set_icon_num(window_display, icon_y_resolution,
+        current_mode->y_resolution);
+      /* fall through */
+
+      case bi_v:
+      sum_vertical(current_mode);
+      break;
+      }
+    return;
+    }
+  }
+}
+
+/*************************************************
+*        Handle click in the checksave window    *
+*************************************************/
+
+static void checksave_click(wimp_bbits butt, wimp_i icon)
+{
+  if (butt != 4)
+    return;
+
+  caw(window_checksave);
+
+  if (icon == icon_discard)
+    {
+    discard_data();
+    caw(window_display);
+
+    file_saved = TRUE;
+
+    if(quit_after_checksave)
+     exit(0);
+
+    return;
+    }
+
+  /*if (icon == icon_save && check_mode())*/
+  if (icon == icon_save)
+  {
+    if(saveas(0xfff,file_name,1024,save_proc,NULL,NULL,NULL) && file_saved)
+    {
+      discard_data();
+      caw(window_display);
+
+      if(quit_after_checksave)
+       exit(0);
+
+      close_window = FALSE;
+      return;
+    }
+    else
+      return;
+  }
+
+  if(icon == icon_cancel)
+    {
+    quit_after_checksave = FALSE;
+    close_window = FALSE;
+    prequit_sender = 0;
+    return;
+    }
+
+    /*caw(window_checksave);*/
+
+    if(quit_after_checksave)
+     exit(0);
+}
+
+/**************************************
+*     Generic close window routine    *
+**************************************/
+
+static void caw(wimp_w handle)
+{
+  wimpt_complain(wimp_close_wind(handle));
+}
+
+void copy_generate_info(void)
+{
+  set_icon_text(window_generate_o,icon_o_monitor_title, get_icon_text(window_generate, icon_g_monitor_title));
+  set_icon_num(window_generate_o, icon_o_hrate_max,atoi(get_icon_text(window_generate, icon_g_hrate_max)));
+  set_icon_num(window_generate_o, icon_o_hrate_min,atoi(get_icon_text(window_generate, icon_g_hrate_min)));
+  set_icon_num(window_generate_o, icon_o_vrate_min,atoi(get_icon_text(window_generate, icon_g_vrate_min)));
+  set_icon_num(window_generate_o, icon_o_vrate_max,atoi(get_icon_text(window_generate, icon_g_vrate_max)));
+  set_icon_num(window_generate_o, icon_o_dpms,atoi(get_icon_text(window_generate, icon_g_dpms)));
+  set_icon_text(window_generate_o, icon_o_type, get_icon_text(window_generate, icon_g_type));
+}
+
+static void add_monitor_to_list(BOOL save_it)
+{
+  _kernel_oserror *e;
+  int handle, ext;
+  char buffer[255];
+  char *ss;
+  char *monitor_type;
+  monitor *mm = monitors;
+  monitor *m;
+
+  ss                  = get_icon_text(window_generate, icon_g_monitor_title);
+  strcpy(monitor_title, ss);
+
+  global_l_min        = atoi(get_icon_text(window_generate, icon_g_hrate_min));
+  global_l_max        = atoi(get_icon_text(window_generate, icon_g_hrate_max));
+  global_f_min        = atoi(get_icon_text(window_generate, icon_g_vrate_min));
+  global_f_max        = atoi(get_icon_text(window_generate, icon_g_vrate_max));
+  global_dpms_state   = atoi(get_icon_text(window_generate, icon_g_dpms));
+  global_tolerance    = atoi(get_icon_text(window_generate, icon_g_tolerance));
+
+  monitor_type        = get_icon_text(window_generate, icon_g_type);
+
+  if(save_it)
+  {
+    e = file_open("<MakeModes$Dir>.MonList",&handle,OPEN_EXIST_READ_WRITE);
+
+    if(e!=NULL)
+    {
+      werr(0,msgs_lookup("MONFAI"));
+      return;
+    }
+
+    e = file_read_ext(handle, &ext);
+
+    /* Find the last line of the file */
+
+    for(;file_readline(handle, buffer, 255););
+
+    if(strncmp(buffer, "# End", strlen("# End")) == NULL)
+    {
+      e = file_write_seqptr(handle, ext - strlen("# End") - 1);
+    }
+
+    sprintf(buffer, "   %s     %d   %d %d    %d  %d     %s", monitor_type, global_dpms_state,
+                                                             global_l_min, global_l_max, global_f_min,
+                                                             global_f_max, monitor_title);
+    file_writealine(handle, buffer, 255);
+    file_writealine(handle, "# End",5);
+    e = file_close(handle);
+  }
+
+  /* Find last entry in linked list */
+
+  while(mm->next != NULL)
+   mm = mm->next;
+
+  /*werr(0,"%d",m->next);*/
+
+  m = malloc(sizeof(monitor));
+  if(m == NULL)
+  {
+    werr(0,"%s",msgs_lookup("26"));
+    exit(99);
+  }
+
+  strcpy(m->name, monitor_title);
+  strcpy(m->typename, monitor_type);
+
+  m->dpms  = global_dpms_state;
+  m->min_h = global_l_min;
+  m->max_h = global_l_max;
+  m->min_v = global_f_min;
+  m->max_v = global_f_max;
+
+  m->next  = NULL;
+  mm->next  = m;
+  monitor_count++;
+
+  current_monitor = monitor_count;
+
+  menu_dispose(&menu_monitors,0);
+  menu_monitors = NULL;
+  make_new_monitors_menu();
+  /*event_attachmenumaker(window_generate, alter_monitors_menu,monitors_menu_handler,NULL);*/
+}
+
+
+/*************************************************
+*       Handle click in the generate window      *
+*************************************************/
+
+/* This window is displayed only via a menu, and when
+there are no modes defined. This routine has grown. It should
+really be consolidated to save repeated code, but... */
+
+static void generate_click(wimp_bbits butt, wimp_i icon)
+{
+int tol_up = FALSE, tol_down = FALSE;
+int type_up = FALSE, type_down = FALSE;
+int dpms_up = FALSE, dpms_down = FALSE;
+
+if (butt == 2) return;
+
+if(icon == icon_g_monitor_menu)
+ {
+  wimp_eventstr fake;
+  fake.e = wimp_EBUT;
+  fake.data.but.m.bbits = wimp_BMID;
+  fake.data.but.m.w     = window_generate;
+  fake.data.but.m.i     = icon;
+  wimpt_fake_event(&fake);
+  return;
+ }
+
+/* Handle clicks on the up/down buttons for the tolerance */
+
+if (icon == icon_g_tolup)
+  {
+  tol_up = butt == 4;
+  tol_down = !tol_up;
+  }
+else if (icon == icon_g_toldown)
+  {
+  tol_down = butt == 4;
+  tol_up = !tol_down;
+  }
+
+if (tol_up)
+  {
+  char buff[20];
+  int tolerance = atoi(get_icon_text(window_generate, icon_g_tolerance));
+  sprintf(buff, "%d %%", tolerance+1);
+  set_icon_text(window_generate, icon_g_tolerance, buff);
+  return;
+  }
+
+if (tol_down)
+  {
+  char buff[20];
+  int tolerance = atoi(get_icon_text(window_generate, icon_g_tolerance));
+  if (tolerance > 0)
+    {
+    sprintf(buff, "%d %%", tolerance-1);
+    set_icon_text(window_generate, icon_g_tolerance, buff);
+    }
+  return;
+  }
+
+/* Handle clicks on the up/down buttons for the monitor type */
+
+if (icon == icon_g_typeup)
+  {
+   type_up = butt == 4;
+   type_down = !type_up;
+  }
+else if (icon == icon_g_typedown)
+  {
+   type_down = butt == 4;
+   type_up = !type_down;
+  }
+
+if (type_up)
+  {
+    DEBUG debug_output("generate_click","monitor type = %s\n",monitor_type->typename);
+    monitor_type = monitor_type->next;
+    if (monitor_type == NULL)
+     monitor_type = montypes;
+    set_icon_text(window_generate, icon_g_type, monitor_type->typename);
+    return;
+  }
+
+if (type_down)
+  {
+    montype *p = montypes;
+    while (p->next != NULL && p->next != monitor_type) p = p->next;
+    monitor_type = p;
+    set_icon_text(window_generate, icon_g_type, monitor_type->typename);
+    return;
+  }
+
+/* Handle clicks on the up/down buttons for the DPMS type */
+
+if (icon == icon_g_dpmsup)
+  {
+  dpms_up = butt == 4;
+  dpms_down = !dpms_up;
+  }
+else if (icon == icon_g_dpmsdown)
+  {
+  dpms_down = butt == 4;
+  dpms_up = !dpms_down;
+  }
+
+if (dpms_up)
+  {
+  char buff[20];
+  int dpms = atoi(get_icon_text(window_generate, icon_g_dpms));
+  if (dpms < 3)
+    {
+    sprintf(buff, "%d", dpms+1);
+    set_icon_text(window_generate, icon_g_dpms, buff);
+    }
+  return;
+  }
+
+if (dpms_down)
+  {
+  char buff[20];
+  int dpms = atoi(get_icon_text(window_generate, icon_g_dpms));
+  if (dpms > 0)
+    {
+    sprintf(buff, "%d", dpms-1);
+    set_icon_text(window_generate, icon_g_dpms, buff);
+    }
+  return;
+  }
+
+/* Handle click on the generate button */
+
+if (icon == icon_g_generate)
+  {
+    char *ss;
+
+    ss = get_icon_text(window_generate, icon_g_monitor_title);
+
+    if(strcmp(ss, "") == 0)
+     return;
+
+    if(!check_monitor_title(ss, FALSE))
+    {
+      _kernel_swi_regs r;
+      r.r[0] = (int)"    Do you wish to add this monitor to the monitor list?";
+      r.r[1] = wimp_ECAT_QUESTION + wimp_EUSECATEGORY;
+      r.r[2] = (int)"MakeModes";
+      r.r[3] = (int)"!MakeModes";
+      r.r[4] = (int)wimp_spritearea;
+      r.r[5] = (int)"Yes,No";
+      _kernel_swi(Wimp_ReportError,&r,&r);
+      if(r.r[1] == 3)
+        add_monitor_to_list(TRUE);
+      else
+        add_monitor_to_list(FALSE);
+    }
+
+    /*data_init(TRUE);*/
+    DEBUG debug_output("main","Got away from that!\n");
+
+    if (generate_modes_from_dialogue())
+    {
+      DEBUG debug_output("generate_click","generating modes from dialog\n");
+      caw(window_generate);
+      DEBUG debug_output("generate_click","generate window closed\n");
+      open_window();
+      DEBUG debug_output("generate_click","main window opened\n");
+      make_modes_menu();
+      DEBUG debug_output("generate_click","modes menu made\n");
+      menu_setflags(menu_modes, 1, 1, NULL);
+    }
+    return;
+  }
+}
+
+
+
+static void open_generate_window(void)
+{
+  oaw(window_generate);
+  current_mode = mode_chain;
+}
+
+
+
+/*************************************************
+*        Handle click on the icon bar            *
+*************************************************/
+
+static void iconbar_click_proc(wimp_i icon)
+{
+  if (!display_open)
+    {
+      /*data_init(FALSE);*/
+      empty_generate_window();
+      open_generate_window();
+    }
+    else
+    {
+      oaw(window_display);
+    }
+}
+
+static void get_vram(void)
+{
+  _kernel_swi_regs r;
+  r.r[0] = 8 | VRAM_WORD;
+  _kernel_swi(OS_Memory,&r,&r);
+  vram_fitted = (r.r[1] * r.r[2])/1024/1024;
+
+  switch(vram_fitted)
+  {
+    case NO_VRAM_FITTED:
+     blip(window_display, icon_0MB_VRAM, 1);
+     screen_memory = 1024;
+    break;
+    case ONE_VRAM_FITTED:
+     blip(window_display, icon_1MB_VRAM, 1);
+     screen_memory = 1024;
+     break;
+    case TWO_VRAM_FITTED:
+     blip(window_display, icon_2MB_VRAM, 1);
+     screen_memory = 2048;
+     break;
+    default :
+     error_moan(35);
+     break;
+  }
+}
+
+static void get_bandwidth_limits(void)
+{
+  int handle;
+  _kernel_oserror *e;
+  char line[256];
+  char tmp[256];
+
+  e = file_open(bandwidth_limit_path, &handle, OPEN_EXIST_READ);
+
+  if(e != NULL)
+  {
+    e = file_open("<MakeModes$Dir>.Limits", &handle, OPEN_EXIST_READ);
+    if(e != NULL)
+    {
+      error_moan(6,bandwidth_limit_path);
+      return;
+    }
+  }
+
+  file_readline(handle, line, sizeof(line));
+  sscanf(line, "%s %d %d %d", &tmp, &vidc_bandwidth_limit[0], &vidc_bandwidth_limit[1],&vidc_bandwidth_limit[2]);
+
+  /* Get bandwidth limits in MB/sec */
+
+  vidc_bandwidth_limit[0] = vidc_bandwidth_limit[0] / 1000000;
+  vidc_bandwidth_limit[1] = vidc_bandwidth_limit[1] / 1000000;
+  vidc_bandwidth_limit[2] = vidc_bandwidth_limit[2] / 1000000;
+
+  file_close(handle);
+}
+
+static int mode_var(int var)
+{
+    _kernel_swi_regs r;
+
+    r.r[0] = -1;
+    r.r[1] = var;
+
+    _kernel_swi(OS_ReadModeVariable,&r,&r);
+
+    return r.r[2];
+}
+
+static menu iconbar_menu_maker (void *handle)
+{
+  help_register_handler(help_simplehandler, (char *)"IBHelp");
+  return(iconbar_menu);
+}
+
+/*************************************************
+*                 Main Program                   *
+*************************************************/
+
+int main(void)
+{
+/* RISCOS_LIB Initialisation */
+
+  static wimp_msgaction Messages [] =
+    {
+      wimp_MDATASAVE,
+      wimp_MDATASAVEOK,
+      wimp_MDATALOAD,
+      wimp_MDATALOADOK,
+      wimp_MDATAOPEN,
+      wimp_MRAMFETCH,
+      wimp_MRAMTRANSMIT,
+      wimp_MPREQUIT,
+      wimp_MMENUWARN,
+      wimp_MMODECHANGE,
+      wimp_MHELPREQUEST,
+      wimp_MHELPREPLY,
+      wimp_MCLOSEDOWN
+    };
+
+  wimpt_wimpversion(350);
+  wimpt_messages (Messages);
+  msgs_readfile("<MakeModes$Dir>.Messages");
+  wimpt_init(msgs_lookup("TaskID"));
+  res_init("MakeModes");
+  resspr_init();
+  template_init();
+  dbox_init();
+
+  DEBUG debug_set_var_name("MakeModes$Debug");
+  DEBUG debug_output("main","Initialising\n");
+
+  event_setmask((wimp_emask)(wimp_EMPTRLEAVE | wimp_EMPTRENTER));
+
+  trace_on();
+
+  baricon("!MakeModes",(int) resspr_area(), iconbar_click_proc);
+
+  if (!create_window("Info", &window_info))
+    return FALSE;
+  win_register_event_handler(window_info, event_handler, 0);
+
+  if (!create_window("Generate", &window_generate))
+    return FALSE;
+  win_register_event_handler(window_generate, event_handler, 0);
+
+  if (!create_window("Generate_o", &window_generate_o))
+    return FALSE;
+  win_register_event_handler(window_generate_o, event_handler, 0);
+
+  if (!create_window("Display", &window_display))
+    return FALSE;
+  win_register_event_handler(window_display, event_handler, 0);
+
+  if (!create_window("Check_save", &window_checksave))
+    return FALSE;
+  win_register_event_handler(window_checksave, event_handler, 0);
+
+  if (!create_window("Warning", &window_warning))
+    return FALSE;
+  win_register_event_handler(window_warning, event_handler, 0);
+
+  if (!create_window("return", &window_return))
+    return FALSE;
+  win_register_event_handler(window_return, event_handler, 0);
+
+  iconbar_menu = menu_new(msgs_lookup("IBarMenuT"),
+                          msgs_lookup("IBarMenuH"));
+
+  event_attachmenumaker(win_ICONBAR,iconbar_menu_maker, iconbar_menu_handler,NULL);
+
+  /* Read in the montype file and create the list of montypes,
+  and likewise for the list of monitors. */
+
+  init_montypes();
+  monitor_type = montypes;
+  init_monitors();
+
+  get_bandwidth_limits();
+  get_vram();
+
+  /* Create the monitors menu */
+
+  make_new_monitors_menu();
+  event_attachmenumaker(window_generate, alter_monitors_menu, monitors_menu_handler,NULL);
+
+  menu_display = menu_new(msgs_lookup("DispMenuT"),
+                          msgs_lookup("DispMenuH"));
+
+  event_attachmenumaker(window_display, alter_monitors_menu, display_menu_handler, NULL);
+
+  menu_bpp = menu_new(msgs_lookup("BppMenuT"),
+                      msgs_lookup("BppMenuH"));
+  event_attachmenumaker(window_display, alter_monitors_menu, bpp_menu_handler,NULL);
+
+  menu_setflags(menu_bpp, eight_bpp, 1, NULL);
+  last_bpp_selected = eight_bpp;
+
+  oaw_centered(window_warning);
+
+  win_register_event_handler(window_display, event_handler, NULL);
+  win_register_event_handler(win_ICONBARLOAD, iconbar_loader,NULL);
+  /*win_register_event_handler(window_display, comments_loader,NULL);*/
+
+  win_add_unknown_event_processor(Help_Process, 0);
+
+  /****************************************************************************************
+  * icon_text_base is a valid icon number for the 'diagnostic' section of the main        *
+  * display. The following icons in that section should all increment in steps of one     *
+  * from that icon, if the following icons do not follow, the check_mode_timings function *
+  * will break                                                                            *
+  ****************************************************************************************/
+
+  set_icon_text(window_display, icon_text_base, "");
+  set_icon_text(window_display, icon_text_base+1, "");
+  set_icon_text(window_display, icon_text_base+2, "");
+  set_icon_text(window_display, icon_text_base+3, "");
+
+  set_icon_text(window_display, icon_bpp, "8 bpp");
+
+  event_setmask((wimp_emask)0);
+
+  dummy = dummy;
+
+  while(TRUE)
+  {
+    event_process();
+  }
+}
+
+/* End of makemodes.c */

@@ -1,0 +1,184 @@
+/*
+ * CDDL HEADER START
+ *
+ * The contents of this file are subject to the terms of the
+ * Common Development and Distribution License (the "Licence").
+ * You may not use this file except in compliance with the Licence.
+ *
+ * You can obtain a copy of the licence at
+ * cddl/RiscOS/Sources/FileSys/ADFS/ADFS/LICENCE.
+ * See the Licence for the specific language governing permissions
+ * and limitations under the Licence.
+ *
+ * When distributing Covered Code, include this CDDL HEADER in each
+ * file and include the Licence file. If applicable, add the
+ * following below this CDDL HEADER, with the fields enclosed by
+ * brackets "[]" replaced with your own identifying information:
+ * Portions Copyright [yyyy] [name of copyright owner]
+ *
+ * CDDL HEADER END
+ */
+/*
+ * Copyright 2015 Ben Avison.  All rights reserved.
+ * Use is subject to license terms.
+ */
+
+#include <stdlib.h>
+#include <string.h>
+
+#include "Global/CMOS.h"
+#include "Global/OsBytes.h"
+#include "Interface/ADFS.h"
+
+#include "drive.h"
+#include "globals.h"
+#include "swi.h"
+
+void drive_attached(uint32_t cpid, uint32_t deviceid, bool packet_device)
+{
+  dprintf("%sdevice attached: %u:%u -> ", packet_device ? "packet " : "", cpid, deviceid);
+  _kernel_oserror *e;
+  drive_t *dr = malloc(sizeof *dr);
+  if (dr == NULL)
+    return;
+
+  memset(dr, 0, sizeof *dr);
+  dr->drive = -1u;
+  dr->packet_device = packet_device;
+  dr->cpid = cpid;
+  dr->deviceid = deviceid;
+
+  uint32_t status, remain;
+  ataop_param_lba28_t params = {
+      .device = DEVICE_MAGIC,
+      .command = packet_device ? ATACOMMAND_IDENTIFY_PACKET_DEVICE : ATACOMMAND_IDENTIFY_DEVICE
+  };
+  e = swi_ide_user_op(ADFSIDEUserOp_NoDRDY |
+                      (deviceid << ADFSIDEUserOp_DeviceIDShift) |
+                      (cpid << ADFSIDEUserOp_CPIDShift) |
+                      ADFSIDEUserOp_TransRead,
+                      (uint8_t *) &params,
+                      (uint8_t *) dr->identify_info,
+                      sizeof dr->identify_info,
+                      0, &status, &remain);
+  if (e != NULL || status != 0)
+  {
+    dprintf("%s\n", e->errmess);
+    free(dr);
+    return;
+  }
+
+  spinrw_write_lock(&g_drive_lock);
+
+  if (!packet_device)
+  {
+    uint32_t i;
+    for (i = NUM_FLOPPIES; i < NUM_FLOPPIES + NUM_WINNIES; i++)
+    {
+      /* Find a spare drive slot */
+      if (g_drive[i] == NULL)
+        break;
+    }
+    if (i < NUM_FLOPPIES + NUM_WINNIES)
+    {
+      /* Interpret sector size */
+      if ((dr->identify_info[OFFSET_PHY_LOG_SSZ] &
+          (PHY_LOG_SSZ_MBZ | PHY_LOG_SSZ_MBO | PHY_LOG_SSZ_SIZE_NOT_512)) ==
+                            (PHY_LOG_SSZ_MBO | PHY_LOG_SSZ_SIZE_NOT_512))
+      {
+        uint32_t bit;
+        dr->sector_size = (dr->identify_info[OFFSET_SSZ_LO] |
+                          (dr->identify_info[OFFSET_SSZ_HI] << 16)) << 1;
+        __asm {
+          CLZ bit, dr->sector_size
+        }
+        dr->log2_sector_size = 31 - bit;
+      }
+      else
+      {
+        dr->sector_size = 1u << 9; 
+        dr->log2_sector_size = 9;
+      }
+      dr->block_buffer = malloc(dr->sector_size);
+      if (dr->block_buffer == NULL)
+      {
+        dprintf("fail to malloc block buffer\n");
+        free(dr);
+        spinrw_write_unlock(&g_drive_lock);
+        return;
+      }
+
+      /* No more errors possible, so put this drive in the global drive list */
+      g_drive[i] = dr;
+      dr->drive = i - NUM_FLOPPIES + 4;
+      uint32_t standby_timer = 0;
+      _swix(OS_Byte, _INR(0,1)|_OUT(2), OsByte_ReadCMOS, ADFSSpinDownCMOS, &standby_timer);
+      if (standby_timer)
+      {
+        ataop_param_lba28_t params = {
+            .device = DEVICE_MAGIC,
+            .sector_count = (uint8_t) standby_timer,
+            .command = ATACOMMAND_IDLE
+        };
+        /* Set the value in the drive, this could fail if the drive doesn't support
+         * power management. If it does, a default value of 0 remains. */
+        e = swi_ide_user_op(ADFSIDEUserOp_NoDRDY |
+                            (dr->cpid << ADFSIDEUserOp_CPIDShift) | (dr->deviceid << ADFSIDEUserOp_DeviceIDShift) |
+                            ADFSIDEUserOp_TransNone,
+                            (uint8_t *) &params,
+                            NULL, 0, 0, /* No data, default timeout */
+                            &status, &remain);
+        if (!e && (status == 0))
+        {
+          dr->standby_timer = (uint8_t) standby_timer;
+        }
+      }
+    }
+
+    /* Interpret identify blocks. Fortunately, sector count values are little-endian */
+    dr->lba48 = (dr->identify_info[OFFSET_COMMAND_SET] &
+                 (COMMAND_SET_MBZ | COMMAND_SET_MBO | COMMAND_SET_LBA48)) ==
+                                   (COMMAND_SET_MBO | COMMAND_SET_LBA48);
+    if (dr->lba48)
+      dr->capacity = dr->sector_size * *(uint64_t *)&dr->identify_info[OFFSET_MAX_LBA48];
+    else
+      dr->capacity = dr->sector_size * (uint64_t) *(uint32_t *)&dr->identify_info[OFFSET_MAX_LBA];
+    dprintf("assigned to drive %u\n", dr->drive);
+  }
+  else
+    dprintf("not assigned a drive\n");
+
+  if (g_drive_list_tail)
+    g_drive_list_tail->next = dr;
+  else
+    g_drive_list_head = dr;
+  g_drive_list_tail = dr;
+
+  spinrw_write_unlock(&g_drive_lock);
+}
+
+void drive_detached(uint32_t cpid, uint32_t deviceid, bool packet_device)
+{
+  IGNORE(packet_device);
+  spinrw_write_lock(&g_drive_lock);
+
+  drive_t *dr, *prev;
+  for (prev = NULL, dr = g_drive_list_head; dr != NULL; prev = dr, dr = dr->next)
+  {
+    if (dr->cpid == cpid && dr->deviceid == deviceid)
+      break;
+  }
+  if (dr != NULL)
+  {
+    if (prev == NULL)
+      g_drive_list_head = dr->next;
+    else
+      prev->next = dr->next;
+    if (dr->drive != -1u)
+      g_drive[dr->drive - 4 + NUM_FLOPPIES] = NULL;
+    free(dr->block_buffer);
+    free(dr);
+  }
+
+  spinrw_write_unlock(&g_drive_lock);
+}

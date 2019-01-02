@@ -1,0 +1,4634 @@
+REM >!Maestro.!RunImage
+
+REM Copyright 2012 Castle Technology Ltd
+REM
+REM Licensed under the Apache License, Version 2.0 (the "License");
+REM you may not use this file except in compliance with the License.
+REM You may obtain a copy of the License at
+REM
+REM     http://www.apache.org/licenses/LICENSE-2.0
+REM
+REM Unless required by applicable law or agreed to in writing, software
+REM distributed under the License is distributed on an "AS IS" BASIS,
+REM WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+REM See the License for the specific language governing permissions and
+REM limitations under the License.
+REM
+
+REM (c) Acorn Computers 1988
+
+Task_h%=0
+
+REM TRACE TO "serial:"
+
+DIM message_buffer% 256, err_block% 204
+Messages_h% = FNopen_messagefile("<Maestro$Dir>.Messages")
+maestro$ = FNmessage_lookup(Messages_h%, "Maestro")
+
+SPACE%=HIMEM-END :REM check enough space available. Nice friendly way to exit...
+IF SPACE%<100000 STOP
+
+ON ERROR PROCerror:END
+INITIALISED%=FNinitialise
+OSCLI ("Set Maestro$Running Yes")
+ON ERROR PROCerror
+
+REM get any filename passed as an argument
+SYS "OS_GetEnv" TO EnvStr$
+IF INSTR(EnvStr$," -quit ") THEN
+  I%=INSTR(EnvStr$,"""")
+  I%=INSTR(EnvStr$,"""",I%+1)
+  REPEATI%+=1:UNTILMID$(EnvStr$,I%,1)<>" "
+  f$=MID$(EnvStr$,I%)
+  IF f$ <> "" THEN
+    IF FNvalid_number_of_gates (f$) THEN
+      PROCload_music(f$)
+    ELSE
+      ret_code% = FNCheckOK (FNmessage_lookupN(Messages_h%, "TooBig", f$, "", "", ""), 1)
+    ENDIF
+  ENDIF
+ENDIF
+
+REPEAT
+  IF PLAYING% THEN PROCCheckQ
+  SYS "Wimp_Poll",(NOT(PLAYING% OR SCORING% OR AwaitingAck% OR SCROLLING%) AND 1),Block% TO reason%
+  REM Recheck since poll might have stayed away for a while
+  IF PLAYING% THEN PROCCheckQ 
+  CASE reason% OF
+    WHEN 0:REM Null Event
+      IF AwaitingAck% THEN
+        IF FNCheckOKTag("BadData",3) THEN
+          AwaitingAck%=FALSE
+          CHANGED%=wasCHANGED%
+        ENDIF
+      ENDIF
+      IF SCORING% THEN PROCsymbol_pointer
+      IF SCROLLING% THEN PROCCheckScroll
+    WHEN 1:REM Redraw Window
+      PROCredraw_window_request
+    WHEN 2:REM Open Window      
+      PROCOpenWindow(Block%)
+    WHEN 3:REM Close Window
+      PROCCloseWindow(Block%!0)
+    WHEN 4:REM Pointer Leaving Window
+      IF Block%!0=ScoreWind_h% THEN
+        PROCrelease
+        wasSCORING%=SCORING%
+        SCORING%=FALSE
+      ENDIF
+    WHEN 5:REM Pointer Entering Window
+      IF Block%!0=ScoreWind_h% THEN
+        SCORING%=(wasSCORING% AND NOT stopSCORING%)=TRUE
+      ENDIF
+    WHEN 6:REM Mouse Click
+      PROCmouse_button_click(Block%!12,Block%!16,Block%!8,Block%!0,Block%!4)
+    WHEN 7:REM User Drag Box
+      PROCUserDragBox
+    WHEN 8:REM Key Pressed
+      PROCKeyPressed(Block%!0,Block%!24)
+    WHEN 9:REM Menu Selection
+      PROCMenuSelect(Block%!0,Block%!4,Block%!8)
+    WHEN 10:REM Scroll Request
+      PROCScrollReq(Block%!32,Block%!36)
+    WHEN 17,18:REM User Message
+      PROCreceive
+  ENDCASE
+UNTIL FALSE
+END
+
+
+
+DEF PROCCheckQ
+  B1%=B2%: B2%=BEAT
+  IFB2%<B1% PROCplay_bar
+ENDPROC
+
+DEF PROCreceive
+LOCAL task%,ref%
+LOCAL f$,wx%,wy%
+task%=Block%!4
+ref%=Block%!8
+REM Ignore messages from this task
+IF task%=Task_h% THEN ENDPROC
+REM Process Messages
+CASE Block%!16 OF
+  WHEN 0:REM Quit
+    PROCterminate
+  WHEN 1:REM DataSave
+    IF NOT SAVING% THEN
+      doing_scrap_load%=TRUE
+      Block%!0=64
+      Block%!12=ref%  
+      Block%!16=2                   :REM DataSaveAck
+      Block%!36=-1                  :REM Unsafe data
+      Block%!40=&AF1                :REM Filetype
+      $(Block%+44)="<Wimp$Scrap>"   :REM Path
+      ?(Block%+44+13)=0
+      SYS "Wimp_SendMessage",17,Block%,task%
+    ENDIF
+  WHEN 8:REM PreQuit
+    IF CHANGED% THEN
+      IF (Block%!20 AND %1)=0 THEN
+        shutdown%=TRUE              :REM Flag for restarting quit
+      ELSE
+        shutdown%=FALSE
+      ENDIF
+      REM Acknowledge PreQuit message
+      Block%!0=20
+      Block%!12=ref%
+      Block%!16=0
+      quit_sender%=task%
+      SYS "Wimp_SendMessage",19,Block%,task%
+      PROCOpenDiscardCancelBox
+    ELSE
+      PROCterminate
+    ENDIF
+  WHEN 2:REM DataSaveAck
+    IF SAVING% THEN
+      wasCHANGED%=CHANGED%
+      PROCsave_music(FNGetStr(Block%+44))
+      SAVING%=FALSE
+      REM Send DataLoad message
+      Block%!0=256
+      Block%!12=my_ref%
+      Block%!16=3                   :REM DataLoad
+      Block%!36=-1                  :REM Unsafe data
+      SYS "Wimp_SendMessage",17,Block%,task%
+      AwaitingAck%=TRUE
+      SYS "Wimp_CreateMenu",,-1
+    ENDIF
+  WHEN 3:REM DataLoad
+    REM Check filetype
+    f$=FNGetStr(Block%+44)
+    IF FNvalid_file_type(f$) THEN   
+      PROCDataLoadAck(f$,ref%,task%)   
+    ELSE
+      ret_code%=FNCheckOK(FNmessage_lookupN(Messages_h%,"NotMusic",f$,"","",""),1)
+    ENDIF
+  WHEN 4:REM DataLoadAck
+    AwaitingAck%=FALSE
+  WHEN 5:REM DataOpen
+    f$=FNGetStr(Block%+44)
+    IF Block%!40=MusicFileType% THEN PROCDataLoadAck(f$,ref%,task%)
+  WHEN 10:REM SaveDesktop
+    desktop_save_handle%=Block%!20
+    SYS "OS_ReadVarVal","Maestro$Dir",Block%,256,0,0 TO ,,len%
+    Block%?len%=13
+    BPUT #desktop_save_handle%,"Run "+$Block%
+  WHEN 11:REM DeviceClaim
+    IF Block%!20=7 THEN
+      f$=FNmessage_lookup(Messages_h%,"SSIU")
+      Block%!0=(32+LEN(f$)) AND NOT(3)
+      Block%!12=0
+      Block%!16=12                  :REM DeviceInUse
+      $(Block%+28)=f$+CHR$(0)       :REM Text
+      SYS "Wimp_SendMessage",17,Block%,Block%!4
+    ENDIF
+  WHEN &502:REM HelpRequest
+    PROCHelp(Block%!32,Block%!36,ref%,task%)
+  WHEN &400C0:REM Menu Warning
+    wx%=Block%!24
+    wy%=Block%!28 
+    CASE Block%!20 OF
+      WHEN Bar_h%:       
+        PROCgoto_init
+        SYS "Wimp_CreateSubMenu",,Bar_h%,wx%,wy%
+      WHEN Print_h%:
+        PROCprint_init
+        SYS "Wimp_CreateSubMenu",,Print_h%,wx%,wy%
+    ENDCASE
+  WHEN &400C1:REM ModeChange
+    PROCgetmodeinfo(FALSE)
+ENDCASE
+ENDPROC
+
+DEF PROCDataLoadAck (f$,ref%,task%)
+IF FNvalid_number_of_gates(f$) THEN
+  IF CHANGED% THEN
+    load_pending%=TRUE
+    pending_filename$=f$
+    PROCOpenDiscardCancelBox
+  ELSE
+    PROCload_music(f$)
+  ENDIF
+  REM Acknowledge message
+  Block%!0=256
+  Block%!12=ref%
+  Block%!16=4    :REM DataLoadAck
+  SYS "Wimp_SendMessage",17,Block%,task% 
+  IF doing_scrap_load% THEN doing_scrap_load%=FALSE
+ELSE
+  ret_code%=FNCheckOK(FNmessage_lookupN(Messages_h%,"TooBig",f$,"","",""),1)
+ENDIF
+ENDPROC
+
+DEF FNvalid_number_of_gates (filename$)
+
+  LOCAL fhandle%,M$,loop%,ret%,gates%, bomb%
+  ret%=TRUE
+  M$=""
+  bomb%=FALSE
+REM  SYS "OS_Find", 79, filename$ TO fhandle%
+  fhandle% = OPENIN (filename$)
+  FOR loop% = 1 TO 8
+    IF NOT EOF#fhandle% THEN M$ += CHR$(BGET#fhandle%) ELSE CLOSE#fhandle%:=TRUE : REM This is an invalid file, load_music picks it up
+  NEXT loop%
+  IF M$ = "Maestro"+CHR$(10) THEN
+    IF BGET#fhandle% = 2 THEN
+      REPEAT
+        CASE BGET#fhandle% OF
+          WHEN 1
+            INPUT#fhandle%, gates%
+            IF gates% > Max_Gate% THEN
+              ret% = FALSE
+            ENDIF
+            bomb%=TRUE : REM Stop here, we've got what we want
+
+          WHEN 2
+            FOR loop%=1 TO 3
+              INPUT#fhandle%,gates%
+            NEXT loop%
+
+          WHEN 3
+            FOR loop%=1 TO 17
+              INPUT#fhandle%,gates%
+            NEXT loop%
+
+          WHEN 4, 5
+            FOR loop%=1 TO 9
+              INPUT#fhandle%,gates%
+            NEXT loop%
+
+          WHEN 6
+            FOR loop%=1 TO 2
+              INPUT#fhandle%,gates%
+            NEXT loop%
+
+          WHEN 7
+            INPUT#fhandle%, M$
+
+          WHEN 8
+            FOR loop%=1 TO 8
+              INPUT#fhandle%,M$
+            NEXT loop%
+
+          WHEN 9
+            FOR loop%=1 TO 8
+              INPUT#fhandle%,gates%
+            NEXT loop%
+
+          OTHERWISE : REM !!
+        ENDCASE
+      UNTIL bomb% OR EOF#fhandle%
+    ENDIF
+  ENDIF
+  CLOSE#fhandle%
+=ret%
+
+
+
+DEF FNvalid_file_type (filename$)
+
+  LOCAL laddr%, type%, ret_code%
+
+  IF filename$ <> "" THEN
+    SYS"OS_File",5,filename$ TO type%,,laddr%
+  ENDIF
+
+  CASE type% OF
+    WHEN 1
+      IF ((laddr%>>20)AND&FFF)=&FFF THEN
+        IF (laddr%>>8 AND &FFF) = MusicFileType% THEN
+          =TRUE
+        ELSE
+          =FALSE
+        ENDIF
+      ENDIF
+    WHEN 2
+      =FALSE
+  ENDCASE
+
+=FALSE
+
+DEF PROCHelp (window%,icon%,ref%,task%)
+LOCAL text$
+CASE window% OF
+  WHEN -2:
+    text$=FNmessage_lookup(Messages_h%,"IconHelp")
+  WHEN ScoreWind_h%:
+    IF SCORING% AND SCRIBE%(drawn%) THEN
+      text$=FNmessage_lookup(Messages_h%,"ScoreHelp0")
+    ELSE
+      text$=FNmessage_lookup(Messages_h%,"ScoreHelp1")
+    ENDIF
+  WHEN NotesPane_h%:
+    IF icon%>0 AND icon%<17 THEN
+      text$=FNmessage_lookup(Messages_h%,"NH"+STR$icon%)
+      text$=FNmessage_lookupN(Messages_h%,"SelectObject",text$,"","","")
+    ENDIF
+  WHEN SharpsPane_h%:
+    CASE icon% OF
+      WHEN 2,3,4,5,6,7,8,9,10,11,12,17,19:
+        text$=FNmessage_lookup(Messages_h%,"AH"+STR$icon%)
+        text$=FNmessage_lookupN(Messages_h%,"SelectObject",text$,"","","")
+      WHEN 14,16,18,20:
+        text$=FNmessage_lookup(Messages_h%,"AH"+STR$icon%)
+      WHEN 13:REM Barlines
+        text$=FNmessage_lookup(Messages_h%,"B"+STR$(BarlineType%))
+        text$=FNmessage_lookupN(Messages_h%,"SelectObject",text$,"","","")
+      WHEN 15:REM Clefs
+        text$=FNmessage_lookup(Messages_h%,"C"+STR$(ClefType%))
+        text$=FNmessage_lookupN(Messages_h%,"SelectObject",text$,"","","")
+    ENDCASE 
+  WHEN InstrWind_h%:
+    CASE icon% OF
+      WHEN 20,21,22,23,24,25,26,27:REM Instruments popup
+        text$=FNmessage_lookup(Messages_h%,"IH0")
+      WHEN 36,37,38,39,40,41,42,43:REM Volumes (down)
+        text$=FNmessage_lookup(Messages_h%,"IH1")
+      WHEN 44,45,46,47,48,49,50,51:REM Stereos
+        text$=FNmessage_lookup(Messages_h%,"IH2")
+      WHEN 62,63,64:text$=FNmessage_lookup(Messages_h%,"IH"+STR$icon%)
+      OTHERWISE:text$=FNmessage_lookup(Messages_h%,"IH")
+    ENDCASE
+  WHEN StaveWind_h%:
+    CASE icon% OF
+      WHEN 2,3,4,5:text$=FNmessage_lookup(Messages_h%,"SH1")
+      WHEN 6,7,8:text$=FNmessage_lookup(Messages_h%,"SH"+STR$icon%)
+      OTHERWISE:text$=FNmessage_lookup(Messages_h%,"SH")
+    ENDCASE
+  WHEN Save_h%:
+    CASE icon% OF
+      WHEN 0,1,2:text$=FNmessage_lookup(Messages_h%,"SVH"+STR$icon%)
+      OTHERWISE:text$=FNmessage_lookup(Messages_h%,"SVH")
+    ENDCASE 
+  WHEN QuitQuery_h%:
+    CASE icon% OF
+      WHEN 0,2:text$=FNmessage_lookup(Messages_h%,"QH"+STR$icon%)
+      OTHERWISE:text$=FNmessage_lookup(Messages_h%,"QH")
+    ENDCASE
+  WHEN ClearQuery_h%:
+    CASE icon% OF
+      WHEN 0,2,3:text$=FNmessage_lookup(Messages_h%,"CH"+STR$icon%)
+      OTHERWISE:text$=FNmessage_lookup(Messages_h%,"CH")
+     ENDCASE
+  WHEN Print_h%:
+    CASE icon% OF
+      WHEN 1,2:text$=FNmessage_lookup(Messages_h%,"PH"+STR$icon%)
+      OTHERWISE:text$=FNmessage_lookup(Messages_h%,"PH")
+    ENDCASE
+  WHEN TimeSig_h%:
+    CASE icon% OF
+      WHEN 2,3,4,5,6:text$=FNmessage_lookup(Messages_h%,"TS"+STR$icon%)
+      OTHERWISE:text$=FNmessage_lookup(Messages_h%,"TS")
+    ENDCASE 
+  OTHERWISE:
+    SYS "Wimp_GetMenuState",1,Block%,window%,icon%
+    CASE CurrentMenu% OF
+      WHEN MainMenu%:
+        IF Block%!0>-1 THEN
+          text$=STR$(Block%!0)
+          IF Block%!4>-1 THEN
+            text$=text$+"."+STR$(Block%!4)
+            IF Block%!8>-1 THEN text$=text$+".0"
+          ENDIF
+        ENDIF
+        IF text$<>"" THEN text$=FNmessage_lookup(Messages_h%,"MH"+text$)
+      WHEN IconMenu%:
+        IF Block%!0>-1 THEN
+          text$=FNmessage_lookup(Messages_h%,"ICH"+STR$(Block%!0))
+        ENDIF
+      OTHERWISE:text$=""
+    ENDCASE
+ENDCASE
+REM If HelpText found, send HelpReply message
+IF text$<>"" THEN
+  Block%!0=(((20+LEN(text$)+1) DIV 4)*4)+4
+  Block%!12=ref%
+  Block%!16=&503
+  $(Block%+20)=text$+CHR$(0)
+  SYS "Wimp_SendMessage",17,Block%,task%
+ENDIF
+ENDPROC
+
+DEF PROCredraw_window_request
+LOCAL R%
+SYS "Wimp_RedrawWindow",,Window%+handle% TO R%
+WHILE R%
+  IF Window%!handle% = ScoreWind_h% PROCdraw_staves:IF PLAYING% PROCCheckQ
+REM try to avoid interruptions in the music
+  SYS "Wimp_GetRectangle",,Window%+handle% TO R%
+  ENDWHILE
+ENDPROC
+
+DEF PROCmouse_button_click (window%,icon%,button%,mx%,my%)
+IF (window%<>QuitQuery_h%) AND shutdown% THEN shutdown%=FALSE
+IF button%=2 THEN
+  PROCStopScoring
+  IF window%=-2 THEN
+    SYS "Wimp_CreateMenu",,IconMenu%,mx%-64,96+44*3
+    CurrentMenu%=IconMenu%
+  ELSE
+    IF window%=ScoreWind_h% THEN
+      SYS "Wimp_CreateMenu",,MainMenu%,mx%-64,my%
+      CurrentMenu%=MainMenu% 
+    ENDIF
+  ENDIF
+ELSE
+  CASE window% OF
+    WHEN -2:REM Iconbar click
+      IF FirstOpen% THEN
+        PROCscore_init
+      ELSE
+        Block%!0=ScoreWind_h%
+        SYS "Wimp_GetWindowState",,Block%
+        Block%!28=-1
+        PROCOpenWindow(Block%)
+        ScoreClosed%=FALSE
+        IF PLAYING% THEN PROCCheckScroll
+      ENDIF      
+    WHEN QuitQuery_h%:
+      REM This window is used in a couple of circumstances:
+      REM 1. when we want to quit
+      REM 2. when we're about to overwrite a bit of music with a new piece
+      IF icon%=2 THEN
+        IF load_pending% THEN
+          PROCload_music(pending_filename$)
+        ELSE
+          IF shutdown% THEN
+            SYS "Wimp_GetCaretPosition",,Block%
+            REM Restart PreQuit, send CTRL-SHIFT-F12
+            Block%!24=&1FC                 
+            SYS "Wimp_SendMessage",8,Block%,quit_sender%
+          ENDIF
+          PROCterminate
+        ENDIF
+        SYS "Wimp_CreateMenu",,-1
+      ELSE
+        REM We've decided not to quit
+        IF shutdown% THEN shutdown%=FALSE
+        REM Cancel any impending load 
+        IF load_pending% THEN load_pending%=FALSE 
+        SYS "Wimp_CreateMenu",,-1
+      ENDIF
+    WHEN ClearQuery_h%:
+      CASE icon% OF
+        WHEN 2:REM Discard
+          PROCClearAllMusic
+          Block%!0=ScoreWind_h%
+          SYS "Wimp_GetWindowState",,Block%
+          Block%!20=0
+          LHBAR%=0
+          SYS "Wimp_OpenWindow",,Block%
+          SYS "Wimp_CreateMenu",,-1
+        WHEN 0:REM Save
+          SYS "Wimp_CreateMenu",,Save_h%,mx%,my%
+        WHEN 3:REM Cancel
+          SYS "Wimp_CreateMenu",,-1
+      ENDCASE
+    WHEN Print_h%:
+      PROCprint_click(icon%,button%)
+    WHEN NotesPane_h%,SharpsPane_h%,ScoreWind_h%:
+      PROCscore_click(window%,icon%,button%)
+    WHEN InstrWind_h%:
+      PROCinstruments_click(icon%,mx%,button%)
+    WHEN StaveWind_h%:
+      PROCstaves_click(icon%,button%)
+    WHEN Save_h%:
+      PROCStopScoring
+      IF icon%=0 THEN
+        PROCsave_music(FNwimp_geticontext(Save_h%,1))
+        PROCCloseWindow(window%)
+        SYS "Wimp_CreateMenu",,-1
+      ENDIF
+      IF icon%=2 THEN
+        LOCAL x%,y%                          : REM dragging icon
+        Window%!handle%=window%
+        SYS "Wimp_GetWindowState",,Window%+handle%
+        ysize%=Window%!y1%-Window%!y0%
+        x%=Window%!x0%
+        y%=Window%!y0%
+        !Window%=window%
+        Window%!4=icon%
+        SYS "Wimp_GetIconState",,Window% : REM returns icon box in right place for drag box
+        Window%!8  += x%
+        Window%!12 += y% + ysize%
+        Window%!16 += x%
+        Window%!20 += y% + ysize%
+    REM get size idan appropriate part of block: parent box=screen boundary
+        Window%!24 = 0
+        Window%!28 = 0
+        Window%!32 = S_Width%
+        Window%!36 = S_Height%
+        !Window%=0
+        Window%!4=5: REM fixed size drag box
+        SAVING%=TRUE
+        SYS "OS_Byte", 161, &1C TO ,,icon%
+        IF icon% AND 2 THEN
+           SYS "XDragASprite_Start", &C5, 1, "file_af1", Window% + 8 
+        ELSE
+           SYS "Wimp_DragBox",,Window%
+        ENDIF
+      ENDIF
+    WHEN TimeSig_h%:
+      PROCtimesig_click(icon%,button%)
+    WHEN Clef_h%:
+      CASE icon% OF
+        WHEN 0:REM Treble clef
+          PROCwimp_seticonval(SharpsPane_h%,15,"Sstreble")
+          ClefType%=icon%  
+        WHEN 1:REM Bass clef
+          PROCwimp_seticonval(SharpsPane_h%,15,"Ssbass")
+          ClefType%=icon% 
+      ENDCASE
+      REM Simulate click on icon to select the Clef tool
+      IF button%=4 THEN PROCCloseWindow(Clef_h%)      
+    WHEN Barline_h%:
+      CASE icon% OF
+        WHEN 0:REM Single barline
+          PROCwimp_seticonval(SharpsPane_h%,13,"Ssbarline")
+          BarlineType%=icon%
+        WHEN 1:REM Double barline
+          PROCwimp_seticonval(SharpsPane_h%,13,"Ssdbar")
+          BarlineType%=icon% 
+      ENDCASE
+      IF button%=4 THEN PROCCloseWindow(Barline_h%)      
+  ENDCASE
+ENDIF
+ENDPROC  
+
+REM // Instruments //
+
+DEF PROCinstruments_init (x%,y%)
+LOCAL i%,c%,text$
+REM Create Voices menu
+PROCCheckInstalledVoices
+FOR i%=0 TO NVoices%-1
+  PROCwimp_setmenutext(VoiceMenu%,i%,LEFT$(Voice$(i%+1),31))  
+NEXT
+VoiceMenu%!(28+(24*(NVoices%-1)))=128
+REM Set volume/stereo fields
+FOR c%=0 TO 7
+  text$=FNmessage_lookup(Messages_h%,"V"+STR$(Volumes%(c%)))
+  PROCwimp_seticontext(InstrWind_h%,c%+28,LEFT$(text$,3))
+  PROCinstruments_slider(c%+44,Stereo_Position%(c%))
+NEXT
+PROCinstruments_fill
+PROCwimp_opendialogue(InstrWind_h%,ScoreWind_h%,1)
+SYS "Wimp_SetCaretPosition",InstrWind_h%,-1
+ENDPROC
+
+DEF PROCinstruments_fill
+LOCAL text$,c%
+REM Set voice/MIDI channel fields
+text$="OT"+STR$(OutputType%)
+PROCwimp_seticontext(InstrWind_h%,61,FNmessage_lookup(Messages_h%,text$))
+FOR c%=0 TO 7
+  CASE OutputType% OF
+    WHEN 0:REM Internal sound system
+      text$=LEFT$(Voice$(Instrument%(c%,1)),20)
+    WHEN 1:REM MIDI device
+      text$=FNmessage_lookupN(Messages_h%,"MIDIvoice",STR$(MIDIChannel%(c%)),"","","")
+  ENDCASE
+  PROCwimp_seticontext(InstrWind_h%,c%+12,text$)
+NEXT
+ENDPROC
+
+DEF PROCinstruments_click (icon%,mx%,button%)
+LOCAL c%,v%,text$,inc%,wx%,ix%
+PROCStopScoring
+PROCChangedScore
+REM Voices
+IF icon%>19 AND icon%<28 THEN
+  REM Set tick in VoiceMenu/ChannelMenu
+  PopUpIcon%=icon%-8
+  CASE OutputType% OF
+    WHEN 0:REM Internal sound system
+      text$=FNwimp_geticontext(InstrWind_h%,icon%-8)
+      FOR i%=0 TO NVoices%-1
+        IF FNwimp_getmenutext(VoiceMenu%,i%)=text$ THEN
+          PROCwimp_radiotick(VoiceMenu%,i%)
+        ENDIF
+      NEXT
+      CurrentMenu%=FNwimp_popup(InstrWind_h%,VoiceMenu%,icon%)
+    WHEN 1:REM MIDI
+      PROCwimp_radiotick(ChannelMenu%,MIDIChannel%(icon%-20)-1)
+      CurrentMenu%=FNwimp_popup(InstrWind_h%,ChannelMenu%,icon%)
+  ENDCASE  
+ENDIF
+REM Volumes
+IF icon%>35 AND icon%<44 THEN
+  REM Set tick in VolumeMenu
+  v%=FNinstruments_getvol(FNwimp_geticontext(InstrWind_h%,icon%-8))
+  PROCwimp_radiotick(VolumeMenu%,v%)
+  PopUpIcon%=icon%-8   
+  CurrentMenu%=FNwimp_popup(InstrWind_h%,VolumeMenu%,icon%)
+ENDIF
+REM Stereo positions
+IF icon%>43 AND icon%<52 THEN
+  Block%!0=InstrWind_h%
+  SYS "Wimp_GetWindowState",,Block%
+  wx%=Block%!4
+  Block%!4=44
+  SYS "Wimp_GetIconState",,Block%
+  ix%=Block%!8
+  PROCinstruments_slider(icon%,(mx%-wx%-ix%) DIV 24)
+ENDIF
+REM Output PopUp
+IF icon%=62 THEN
+  PROCwimp_setmenustate(OutputMenu%,1,22,NOT MIDIpresent%)
+  FOR i%=0 TO 1
+    PROCwimp_setmenustate(OutputMenu%,i%,0,FALSE)
+  NEXT
+  PROCwimp_setmenustate(OutputMenu%,OutputType%,0,TRUE)
+  CurrentMenu%=FNwimp_popup(InstrWind_h%,OutputMenu%,icon%)
+ENDIF
+REM Cancel button
+IF icon%=63 AND button%=4 THEN PROCwimp_closedialogue(InstrWind_h%,ScoreWind_h%)
+REM Set button
+IF icon%=64 THEN
+  FOR c%=0 TO 7
+    REM Voices/MIDI channels
+    text$=FNwimp_geticontext(InstrWind_h%,c%+12)
+    CASE OutputType% OF
+      WHEN 0:REM Internal sound system
+        FOR i%=1 TO NVoices%
+          IF text$=Voice$(i%) THEN v%=i%
+        NEXT
+        PROCAttachVoice(c%,v%)
+      WHEN 1:REM MIDI device
+        text$=RIGHT$(text$,2)
+        IF LEFT$(text$,1)=" " THEN text$=RIGHT$(text$,1)
+        MIDIChannel%(c%)=VAL(text$)
+    ENDCASE
+    REM Set Volumes
+    text$=FNwimp_geticontext(InstrWind_h%,c%+28)
+    Volumes%(c%)=FNinstruments_getvol(text$)
+    REM Set Stereo positions
+    Block%!4=c%+44
+    SYS "Wimp_GetIconState",,Block%
+    ix%=Block%!8
+    Block%!4=c%+52
+    SYS "Wimp_GetIconState",,Block%
+    mx%=Block%!8+12
+    Stereo_Position%(c%)=(mx%-ix%) DIV 24
+    SYS "Sound_Stereo",c%+1,Stereo%(Stereo_Position%(c%))
+  NEXT 
+  IF button%=4 THEN PROCwimp_closedialogue(InstrWind_h%,ScoreWind_h%)
+ENDIF
+ENDPROC
+
+DEF FNinstruments_keypress (key%)
+LOCAL used%
+used%=TRUE
+CASE key% OF
+  WHEN &1B:REM Escape
+    PROCinstruments_click(63,0,4)  
+  WHEN &0D:REM Enter
+    PROCinstruments_click(64,0,4) 
+  WHEN &1A2:REM Ctrl-F2
+    PROCinstruments_click(63,0,4)
+  OTHERWISE:used%=FALSE
+ENDCASE
+=used%
+
+DEF FNinstruments_getvol (s$)
+LOCAL i%,v%
+FOR i%=0 TO 7
+  IF s$=FNmessage_lookup(Messages_h%,"V"+STR$(i%)) THEN v%=i%
+NEXT
+=v%
+
+DEF PROCinstruments_slider (icon%,pos%)
+REM We want to work on pre-RISC OS 3.5, so can't use Wimp_ResizeIcon
+REM to implement an 8-point slider. Delete and re-create icons instead
+LOCAL i%,x0%,x1%,y0%,y1%
+Block%!0=InstrWind_h%
+Block%!4=icon%
+SYS "Wimp_GetIconState",,Block%
+x0%=Block%!8  
+y0%=Block%!12
+x1%=Block%!16
+y1%=Block%!20
+Block%!4=icon%+8
+SYS "Wimp_GetIconState",,Block%
+SYS "Wimp_DeleteIcon",,Block%
+FOR i%=8 TO 40 STEP 4
+  Block%!i%=Block%!(i%+4)
+NEXT
+Block%!4=x0%+4+(pos%*22)
+Block%!12=x0%+4+(pos%*22)+24
+SYS "Wimp_CreateIcon",icon%+8,Block%
+SYS "Wimp_ForceRedraw",Block%!0,x0%,y0%,x1%,y1%
+ENDPROC
+
+REM // Staves //
+
+DEF PROCstaves_init (x%,y%)
+LOCAL i%
+FOR i%=2 TO 5
+  PROCwimp_seticonstate(StaveWind_h%,i%,21,FALSE)
+NEXT
+PROCwimp_seticonstate(StaveWind_h%,2+STAVE%,21,TRUE)
+IF PERC% THEN
+  PROCwimp_seticonstate(StaveWind_h%,6,21,TRUE)
+ELSE
+  PROCwimp_seticonstate(StaveWind_h%,6,21,FALSE)
+ENDIF
+PROCwimp_opendialogue(StaveWind_h%,ScoreWind_h%,1)
+SYS "Wimp_SetCaretPosition",StaveWind_h%,-1
+ENDPROC
+
+DEF PROCstaves_click (icon%,button%)
+CASE icon% OF
+  WHEN 7:REM Cancel
+    IF button%=4 THEN PROCwimp_closedialogue(StaveWind_h%,ScoreWind_h%)
+  WHEN 8:REM Set
+    FOR i%=2 TO 5
+      IF FNwimp_geticonstate(StaveWind_h%,i%,21) THEN
+        STAVE%=i%-2
+      ENDIF
+    NEXT
+    IF FNwimp_geticonstate(StaveWind_h%,6,21) THEN
+      PERC%=1
+    ELSE
+      PERC%=0
+    ENDIF
+    SYS "Hourglass_On"
+    PROCposition_staves
+    PROCSetExtent(S_Width%)
+    PROCscore_init
+    PROCSetDefaultChannels
+    PROCstart_music
+    PROCrescore(0)
+    SYS "Hourglass_Off"   
+    PROCChangedScore
+    IF button%=4 THEN PROCwimp_closedialogue(StaveWind_h%,ScoreWind_h%)
+ENDCASE
+ENDPROC
+
+DEF FNstaves_keypress (key%)
+LOCAL used%
+used%=TRUE
+CASE key% OF
+  WHEN &1B:REM Escape
+    PROCstaves_click(7,4)  
+  WHEN &0D:REM Enter
+    PROCstaves_click(8,4) 
+  WHEN &1A2:REM Ctrl-F2
+    PROCstaves_click(7,4) 
+  OTHERWISE:used%=FALSE
+ENDCASE
+=used%
+
+REM // TimeSig //
+
+DEF PROCtimesig_init (icon%)
+LOCAL n%,b%
+n%=TIME_SIG%(0)+1
+b%=2^(TIME_SIG%(1)-1)
+PROCwimp_seticontext(TimeSig_h%,0,STR$(n%))
+PROCwimp_seticontext(TimeSig_h%,1,STR$(b%))
+CurrentMenu%=FNwimp_popup(SharpsPane_h%,TimeSig_h%,icon%)
+ENDPROC
+
+DEF PROCtimesig_click (icon%,button%)
+REM Time signature held in TIME_SIG%() as (n+1) / 2^(d-1)
+REM To edit, we have to convert to the following range:
+REM n = 2-16; b = 2,4,8,16
+LOCAL n%,b%,v%
+n%=VAL(FNwimp_geticontext(TimeSig_h%,0))-1
+b%=SQR(VAL(FNwimp_geticontext(TimeSig_h%,1))+1)+1 
+CASE icon% OF
+  WHEN 2:REM Decrement n
+    IF button%=4 AND n%>1 THEN
+      v%=1+(n%+13) MOD 15
+      PROCwimp_seticontext(TimeSig_h%,0,STR$(v%+1))
+    ENDIF
+    IF button%=1 AND n%<15 THEN
+      v%=1+(n%+15) MOD 15
+      PROCwimp_seticontext(TimeSig_h%,0,STR$(v%+1))
+    ENDIF
+  WHEN 3:REM Increment n
+    IF button%=4 AND n%<15 THEN
+      v%=1+(n%+15) MOD 15
+      PROCwimp_seticontext(TimeSig_h%,0,STR$(v%+1))
+    ENDIF
+    IF button%=1 AND n%>1 THEN
+      v%=1+(n%+13) MOD 15
+      PROCwimp_seticontext(TimeSig_h%,0,STR$(v%+1))
+    ENDIF   
+  WHEN 4:REM Decrement b
+    IF button%=4 AND b%>2 THEN
+      v%=(b%+1) MOD 4+2
+      PROCwimp_seticontext(TimeSig_h%,1,STR$(2^(v%-1)))
+    ENDIF
+    IF button%=1 AND b%<5 THEN
+      v%=(b%-1) MOD 4+2
+      PROCwimp_seticontext(TimeSig_h%,1,STR$(2^(v%-1)))
+    ENDIF
+  WHEN 5:REM Increment b
+    IF button%=4 AND b%<5 THEN
+      v%=(b%-1) MOD 4+2
+      PROCwimp_seticontext(TimeSig_h%,1,STR$(2^(v%-1)))
+    ENDIF
+    IF button%=1 AND b%>2 THEN
+      v%=(b%+1) MOD 4+2
+      PROCwimp_seticontext(TimeSig_h%,1,STR$(2^(v%-1)))
+    ENDIF   
+  WHEN 6:REM Select a new time sig
+    PROCSetTimeSig(n%,b%)
+    IF button%=4 THEN PROCCloseWindow(TimeSig_h%)      
+ENDCASE
+ENDPROC
+
+DEF PROCattach_clef
+CASE ClefType% OF
+  WHEN 0:REM Treble
+    PROCattach(clef%,%100)
+  WHEN 1:REM Bass
+    PROCattach(clef%+3,%100)
+ENDCASE   
+ENDPROC  
+
+DEF PROCattach_barline
+CASE BarlineType% OF
+  WHEN 0:REM Single
+    PROCattach(bar%,%10010000)
+  WHEN 1:REM Double
+    PROCattach(bar%+1,%10010000)
+ENDCASE   
+ENDPROC 
+
+REM // Tool icons //
+
+DEF PROCtoolicon_click (window%,icon%)
+PROCrelease
+wasSCORING%=TRUE
+stopSCORING%=FALSE
+PROCtoolicon_clear
+PROCwimp_seticonstate(window%,icon%,2,TRUE)
+PROCwimp_seticonstate(window%,icon%,5,TRUE)
+SelW%=window%
+SelI%=icon%
+ENDPROC
+
+DEF PROCtoolicon_clear
+IF SelI%>-1 THEN
+  PROCwimp_seticonstate(SelW%,SelI%,2,FALSE)
+  PROCwimp_seticonstate(SelW%,SelI%,5,FALSE)
+ENDIF
+ENDPROC
+
+REM // Voice handling //
+
+DEF PROCCheckInstalledVoices
+    LOCAL NewVoice$, NewNVoices%, changedVoices%
+
+    changedVoices%=FALSE
+
+    SYS "Sound_InstallVoice" TO I$,NewNVoices%:NewNVoices% -= 1
+
+    IF FNassert(NVoices%>0,"NoVoices") STOP
+
+    IF NewNVoices% <> NVoices% THEN
+        changedVoices% = TRUE
+        NVoices% = NewNVoices%
+    ENDIF
+
+    IF NVoices%>MAX_VOICES% THEN NVoices%=MAX_VOICES%
+
+    FOR R% = 1 TO NVoices%
+        SYS "Sound_InstallVoice",2,R% TO ,,,NewVoice$
+        IF NewVoice$<>Voice$(R%) THEN
+            changedVoices%=TRUE
+            Voice$(R%)=NewVoice$
+        ENDIF
+    NEXT : REM find if instruments have changed
+
+    IF changedVoices% THEN
+        FOR R% = 0 TO 7
+            SYS "Sound_AttachVoice",R% + 1,0 TO L%,S%
+            IF S% < 1 OR S% > NVoices% THEN
+                S%=1:REM Make sure a voice is attached to all channels
+            ENDIF
+            SYS "Sound_AttachVoice",L%,S%
+            Instrument%(R%,0) = S_C%(R%)+1 : REM Instrument stave
+            Instrument%(R%,1) = S%:REM Instrument voice
+        NEXT : REM Get details of each channel
+        PROCSetDefaultChannels
+    ENDIF
+ENDPROC
+
+DEF PROCAttachVoice (c%,slot%)
+LOCAL v%
+PROCCheckInstalledVoices
+REM Find channel's previous voice
+SYS "Sound_AttachVoice",c%+1 TO ,v%
+REM Attach new voice
+IF v%=0 THEN v%=1
+IF slot%=0 THEN slot%=v%
+SYS "Sound_AttachVoice",c%+1,slot%
+Instrument%(c%,1)=slot%
+ENDPROC
+
+DEF PROCUserDragBox
+LOCAL filename$
+filename$=FNwimp_geticontext(Save_h%,1)
+IF SAVING% THEN
+  SYS "Wimp_GetPointerInfo",,Block%
+  Block%!32=Block%!4
+  Block%!28=Block%!0
+  Block%!24=Block%!16
+  Block%!20=Block%!12 :REM this is the destination window handle
+  Block%!16=1         :REM DataSave
+  Block%!12=0
+  Block%!36=-1        :REM don't know file size / unsafe?
+  Block%!40=MusicFileType%
+  $(Block%+44)=FNGetLeafName(filename$)+CHR$(0)
+  !Block%=64
+  SYS "Wimp_SendMessage",17,Block%,Block%!20,Block%!24
+  my_ref%=Block%!8
+  SYS "DragASprite_Stop"
+ENDIF
+ENDPROC
+
+DEF PROCMenuSelect (sel1%,sel2%,sel3%)
+LOCAL n%,SoundEnable%,mx%,my%,button%,text$,allowadjust%
+SYS "Wimp_GetPointerInfo",,Block%
+mx%=Block%!0
+my%=Block%!4
+button%=Block%!8
+allowadjust%=TRUE
+CASE CurrentMenu% OF
+  WHEN MainMenu%:
+    CASE sel1% OF
+      WHEN 0:REM File menu
+        CASE sel2% OF
+          WHEN 1:REM Save file
+            SYS "Wimp_CreateMenu",,Save_h%,mx%,my%
+            allowadjust%=FALSE 
+          WHEN 2:REM Print file
+            PROCprint_init
+            SYS "Wimp_CreateMenu",,Print_h%,mx%,my%
+            allowadjust%=FALSE          
+        ENDCASE   
+      WHEN 1:REM Edit menu
+        CASE sel2% OF
+          WHEN 0:REM Go to bar
+            PROCgoto_init
+            SYS "Wimp_CreateMenu",,Bar_h%,mx%,my%
+            allowadjust%=FALSE
+          WHEN 1:REM Clear file
+            IF CHANGED% THEN
+              PROCOpenSaveDiscardCancelBox
+            ELSE
+              PROCClearAllMusic
+              Block%!0=ScoreWind_h%
+              SYS "Wimp_GetWindowState",,Block%
+              Block%!20=0
+              LHBAR%=0
+              SYS "Wimp_OpenWindow",,Block%
+            ENDIF
+            allowadjust%=FALSE
+        ENDCASE 
+      WHEN 2:REM Score menu
+        CASE sel2% OF
+          WHEN 0:REM REM Staves
+            PROCstaves_init(mx%,my%)
+            allowadjust%=FALSE 
+          WHEN 1:REM Instruments
+            PROCinstruments_init(mx%,my%)
+            allowadjust%=FALSE 
+          WHEN 2:REM Volume menu
+            IF sel3%>=0 THEN
+              PROCSetVolume(sel3%)
+              PROCChangedScore
+            ENDIF
+          WHEN 3:REM Tempo menu
+            IF sel3%>=0 THEN
+              PROCSetTempo(sel3%)
+              PROCChangedScore
+            ENDIF
+        ENDCASE
+      WHEN 3:REM Play
+        SYS "Sound_Enable",0 TO SoundEnable%:REM dont pretend to be able to play if the sound system is disabled
+        IF SoundEnable%=2 THEN
+          SCORING%=FALSE
+          PLAYING%=NOT PLAYING%
+          SCROLLING%=PLAYING%
+          IF PLAYING% THEN PROCplay_start ELSE PROCplay_stop
+        ELSE
+          n%=FNCheckOKTag("NoSound",1)
+        ENDIF
+    ENDCASE
+  WHEN IconMenu%:
+    CASE sel1% OF
+      WHEN 1:REM Help
+        OSCLI("Filer_Run <Maestro$Dir>.!Help")
+      WHEN 2:REM Quit
+        IF CHANGED% THEN PROCOpenDiscardCancelBox ELSE PROCterminate
+    ENDCASE
+  WHEN KeyMenu%:
+    REM Key signature
+    PROCSetKeySig(sel1%,sel2%)
+  WHEN VoiceMenu%:
+    text$=Voice$(sel1%+1)     
+    PROCwimp_seticontext(InstrWind_h%,PopUpIcon%,text$)
+    PROCwimp_radiotick(VoiceMenu%,sel1%)
+  WHEN ChannelMenu%:
+    text$=FNmessage_lookupN(Messages_h%,"MIDIvoice",STR$(sel1%+1),"","","")
+    PROCwimp_seticontext(InstrWind_h%,PopUpIcon%,text$)
+    PROCwimp_radiotick(ChannelMenu%,sel1%)
+  WHEN VolumeMenu%:
+    REM This is when open over the Instruments dialogue as a pop-up
+    text$=FNmessage_lookup(Messages_h%,"V"+STR$(sel1%))
+    PROCwimp_seticontext(InstrWind_h%,PopUpIcon%,text$)
+    PROCwimp_radiotick(VolumeMenu%,sel1%)
+  WHEN OutputMenu%:
+    OutputType%=sel1%
+    PROCinstruments_fill   
+ENDCASE
+IF allowadjust% AND button%=1 THEN SYS "Wimp_CreateMenu",,CurrentMenu%
+ENDPROC
+
+DEF PROCKeyPressed (window%,key%)
+LOCAL used%
+used%=TRUE
+CASE window% OF
+  WHEN Save_h%:
+    CASE key% OF
+      WHEN &0D:REM Enter
+        PROCsave_music(FNwimp_geticontext(Save_h%,1))
+        PROCCloseWindow(window%)
+        SYS "Wimp_CreateMenu",,-1
+      OTHERWISE:used%=FALSE
+    ENDCASE
+  WHEN Bar_h%:
+    used%=FNgoto_keypress(key%)
+  WHEN StaveWind_h%:
+    used%=FNstaves_keypress(key%)
+  WHEN ScoreWind_h%:
+    used%=FNscore_keypress(key%)
+  WHEN InstrWind_h%:
+    used%=FNinstruments_keypress(key%)
+  OTHERWISE:used%=FALSE
+ENDCASE
+IF used%=FALSE THEN SYS "Wimp_ProcessKey",key%   
+ENDPROC
+
+DEF PROCScrollReq(x_scroll%, y_scroll%)
+IF Window%!handle%=ScoreWind_h% THEN
+  IF PLAYING%AND(x_scroll%<>0) ENDPROC
+  CASE ABS(x_scroll%) OF
+    WHEN 1:Window%!scx%+=x_scroll%*4*Pgap%
+    WHEN 2:Window%!scx%+=(x_scroll%/2)*(Window%!x1%-Window%!x0%)
+    ENDCASE
+  CASE ABS(y_scroll%) OF
+    WHEN 1:Window%!scy%+=y_scroll%*C_Height%
+    WHEN 2:Window%!scy%+=(y_scroll%/2)*(Window%!y1%-Window%!y0%)
+    ENDCASE
+  SYS "Wimp_OpenWindow",,Window%+handle%
+  ScoreClosed%=FALSE
+  LHBAR%=FNFindBar(Window%!scx%) :REM the bar number at the left of the window
+ENDIF
+ENDPROC
+
+DEF PROCOpenWindow (b%)
+LOCAL x0%,x1%,y0%,y1%,behind%,ox%
+IF b%!0=ScoreWind_h% THEN
+  IF PLAYING% THEN b%!20=OldX%
+  SYS "Wimp_OpenWindow",,b%
+  SYS "Wimp_GetWindowState",,b%
+  x0%=b%!4
+  y0%=b%!8
+  x1%=b%!12
+  y1%=b%!16
+  ox%=b%!20
+  behind%=b%!28 
+  REM Open Sharps Pane
+  Block%!0=SharpsPane_h%
+  Block%!4=x0%
+  Block%!8=y0%
+  Block%!12=x1%
+  Block%!16=y0%+PaneHeight%
+  Block%!20=0
+  Block%!24=0
+  Block%!28=behind%
+  SYS "Wimp_OpenWindow",,Block%
+  REM Open Notes Pane
+  Block%!0=NotesPane_h%
+  Block%!4=x0%
+  Block%!8=y1%-PaneHeight%
+  Block%!12=x1%
+  Block%!16=y1%  
+  Block%!20=0
+  Block%!24=0
+  Block%!28=SharpsPane_h%
+  SYS "Wimp_OpenWindow",,Block% 
+  IF PLAYING% THEN PROCCheckScroll
+  PROCrelease
+  LHBAR%=FNFindBar(ox%)
+ELSE
+  SYS "Wimp_OpenWindow",,b%
+ENDIF
+ENDPROC
+
+DEF PROCUpdateTitle (title$)
+LOCAL top%
+Block%!0=ScoreWind_h%
+SYS "Wimp_GetWindowInfo",,Block% OR 1
+$(Block%!76)=title$+CHR$(0)
+SYS "Wimp_GetWindowState",,Block%
+top%=Block%!16
+SYS "Wimp_GetWindowOutline",,Block%
+SYS "Wimp_ForceRedraw",-1,Block%!4,top%,Block%!12,Block%!16
+ENDPROC
+
+DEF PROCCloseWindow (handle%)
+Block%!0=handle%
+SYS "Wimp_CloseWindow",,Block%
+IF handle%=ScoreWind_h% THEN
+  Block%!0=NotesPane_h%
+  SYS "Wimp_CloseWindow",,Block%
+  Block%!0=SharpsPane_h%
+  SYS "Wimp_CloseWindow",,Block%
+  ScoreClosed%=TRUE
+ENDIF
+ENDPROC
+
+DEF PROCsymbol_pointer
+SYS "Wimp_GetPointerInfo",,Block%
+IF Block%!12=ScoreWind_h% THEN PROCscribe(Block%!0,Block%!4)
+ENDPROC
+
+DEF PROCStopScoring
+stopSCORING%=TRUE
+PROCrelease
+PROCtoolicon_clear
+ENDPROC
+
+DEF PROCChangedScore
+IF NOT CHANGED% THEN
+  CHANGED%=TRUE
+  PROCwimp_seticontext(FileInfo_h%,2,FNmessage_lookup(Messages_h%,"Yes"))
+  PROCUpdateTitle(ScoreTitle$+" *")
+ENDIF
+ENDPROC
+
+DEF PROCSetExtent (width%)
+Score_Width%=width%
+Block%!0=0
+Block%!4=-Score_Height%-PaneHeight%
+Block%!8=Score_Width%
+Block%!12=PaneHeight%
+SYS "Wimp_SetExtent",ScoreWind_h%,Block%
+ENDPROC
+
+DEF FNGetLeafName(name$)
+LOCAL ch$,n%
+IF ( (INSTR(name$,".")=0) AND (INSTR(name$,":")=0) ) THEN=name$
+n%=LEN(name$)
+REM scan string to find leaf name of file
+REPEAT
+  ch$= MID$(name$, n%, 1)
+  n%-=1
+  UNTIL (n%<=0 OR ch$="." OR ch$=":")
+IF n%>0 THEN
+    =RIGHT$(name$, LEN(name$)-n%-1)
+ELSE
+    = name$
+ENDIF
+= ""
+
+DEF FNGetStr(s%) : REM get string
+LOCAL n$
+WHILE?s%:n$+=CHR$?s%:s%+=1:ENDWHILE
+=n$
+
+DEF PROCSetDefaultChannels
+LOCAL s%,text$
+REM Only 1 percussion channel permitted
+REM Channel assignment changes if staves change
+FOR s%=0 TO 7
+  S_C%(s%)=Stave_Channels%(STAVE%,s%)
+NEXT
+REM Steal channel for percussion lines
+IF PERC% THEN S_C%(7)=STAVE%+1
+REM Instrument allocation
+FOR s%=0 TO 7
+  Instrument%(s%,0)=S_C%(s%)+1
+  REM Set up stave names in instrument window
+  text$="S"+STR$(Instrument%(s%,0)+(STAVE%-3)*((Instrument%(s%,0)-1)>STAVE%))
+  PROCwimp_seticontext(InstrWind_h%,s%+4,FNmessage_lookup(Messages_h%,text$)) 
+  PROCAttachVoice(s%,0)
+NEXT
+REM Steal 1 channel for percussion
+IF PERC% THEN
+  text$=FNmessage_lookup(Messages_h%,"S5")
+  PROCwimp_seticontext(InstrWind_h%,11,text$)
+ENDIF
+ENDPROC
+
+DEF FNGetFileInfo (file$)
+LOCAL type%,laddr%,eaddr%,len%,attr%
+IF file$<>"" AND file$<>FNmessage_lookup(Messages_h%,"Untitled") THEN
+  SYS "OS_File",5,file$ TO type%,,laddr%,eaddr%,len%,attr%
+ENDIF
+IF file$="" OR file$=FNmessage_lookup(Messages_h%,"Untitled") OR ((type%=1) AND (attr% AND 1) AND (len%>8))=0 THEN
+  PROCwimp_seticontext(FileInfo_h%,1,FNmessage_lookup(Messages_h%,"Untitled"))
+  PROCset_type_string(MusicFileType%)
+  PROCwimp_seticontext(FileInfo_h%,4,"")
+  ?ftime%=3
+  SYS "OS_Word",14,ftime%
+  SYS "Territory_ConvertStandardDateAndTime",-1,ftime%,Block%,255
+  PROCwimp_seticontext(FileInfo_h%,5,FNGetStr(Block%))
+  =FALSE
+ELSE
+  PROCwimp_seticontext(FileInfo_h%,1,file$)
+  PROCwimp_seticontext(FileInfo_h%,4,STR$(len%))
+  IF ((laddr%>>20) AND &FFF)=&FFF THEN
+    IF (laddr%>>8 AND &FFF)=MusicFileType% THEN
+      PROCset_type_string(MusicFileType%)
+    ELSE
+      PROCset_type_string(laddr%>>8 AND &FFF)
+    ENDIF
+    ftime%?4=laddr% AND &FF
+    ftime%?3=eaddr%>>24 AND &FF
+    ftime%?2=eaddr%>>16 AND &FF
+    ftime%?1=eaddr%>>8 AND &FF
+    ftime%?0=eaddr% AND &FF
+    SYS "OS_ConvertStandardDateAndTime",ftime%,Block%,255
+    PROCwimp_seticontext(FileInfo_h%,5,FNGetStr(Block%))
+  ENDIF
+ENDIF
+=TRUE
+
+DEF PROCset_type_string (type%)
+LOCAL s$,r2%,r3%,space$
+s$=""
+SYS "OS_FSControl",18,,type% TO ,,r2%,r3%
+s$=CHR$(r2% AND &FF)+CHR$((r2%>>8) AND &FF)
+s$+=CHR$((r2%>>16) AND &FF)+CHR$((r2%>>24) AND &FF)
+s$+=CHR$(r3% AND &FF)+CHR$((r3%>>8) AND &FF)
+s$+=CHR$((r3%>>16) AND &FF)+CHR$((r3%>>24) AND &FF)
+space$=STRING$(8-LEN(s$)," ")
+PROCwimp_seticontext(FileInfo_h%,3,s$+space$+"("+STR$~type%+")")
+ENDPROC  
+
+DEF PROCload_music(FF$)
+LOCAL F%,M$,ZZ%
+LOCAL ERROR
+T%=0
+SCORING%=FALSE
+IF PLAYING% PROCplay_stop
+SCROLLING%=FALSE
+IF LENFF$=0 THEN VDU7 : T%=FNCheckOKTag("BadName",1) : ENDPROC
+SYS "Hourglass_On"
+FILE%=OPENINFF$
+REM SYS "OS_Find", 79, FF$ TO FILE%
+
+ON ERROR LOCAL VDU7:OSCLI("FX 229,1"):PROCClearAllMusic:SYS "Hourglass_Off":T%=FNCheckOK(FNmessage_lookupN(Messages_h%, "IntErr", REPORT$, STR$(ERL), "", ""),1):ENDPROC
+
+M$=""
+FORR%=1TO7
+  IF NOT EOF#FILE% THEN M$+=CHR$BGET#FILE% ELSE SYS "Hourglass_Off":T%=FNCheckOK(FNmessage_lookup(Messages_h%,"BadFile"),1): ENDPROC
+NEXT
+OSCLI("FX 229,0") :REM enable escape key
+B%=BGET#FILE%
+IFM$="Maestro" THEN
+  IF NOT FNGetFileInfo(FF$) THEN VDU7 :OSCLI("FX 229,1") : SYS "Hourglass_Off" :T%=FNCheckOKTag("BadFile",1) : ENDPROC
+  T%=TRUE
+  NBars%=0
+  CASE BGET#FILE% OF
+    WHEN 0:T%=FALSE
+    WHEN 1
+      PROClTempo:PROClInstruments:PROClStaves:PROClMusic
+    OTHERWISE REM File id version 2 and above
+      A%=FALSE
+      REPEAT
+        REM Used to be an ON BGET#FILE% statement,
+        REM changed to allow exiting if music is too big.
+        CASE BGET#FILE% OF
+          WHEN 1:PROClMusic
+          WHEN 2:PROClStaves
+          WHEN 3:PROClInstruments
+          WHEN 4:PROClVolumes
+          WHEN 5:PROClStereos
+          WHEN 6:PROClTempo            
+          OTHERWISE:A%=TRUE
+        ENDCASE
+      UNTIL EOF#FILE% OR A%
+    ENDCASE
+  CLOSE#FILE%
+
+  FILE%=FALSE
+  OSCLI("FX 229,1")
+  PROCwimp_seticontext(FileInfo_h%,1,FNmessage_lookup(Messages_h%,FF$))
+  PROCwimp_seticontext(FileInfo_h%,2,FNmessage_lookup(Messages_h%,"No"))
+  SYS "Hourglass_Off"
+  SYS "Hourglass_On"
+  IF T% THEN
+    PROCposition_staves
+    PROCSetExtent(S_Width%)
+    PROCstart_music
+    PROCset_score(0)
+    PROCSetupBarStarts(0)
+    PROCscore_init
+    PROCSetDefaultChannels
+    PROCupdate_score(0,-Score_Height%,Score_Width%,0)
+    PROCStopScoring
+    CHANGED%=FALSE
+  ENDIF
+ELSE
+  OSCLI("FX 229,1")
+  T%=FALSE
+ENDIF
+IF NOT T% THEN ZZ%=FNCheckOKTag("InvMusic",1) : CLOSE#FILE%
+
+IF LEFT$(FF$, 12) = "<Wimp$Scrap>" THEN
+  FF$ = FNmessage_lookup (Messages_h%, "Untitled") 
+  PROCwimp_seticontext(Save_h%,1,FNmessage_lookup(Messages_h%,"MusicFile")+CHR$(0))
+  F$ = FF$
+ELSE
+  IF T% THEN
+    PROCwimp_seticontext(Save_h%,1,FF$+CHR$(0))
+  ENDIF
+ENDIF
+
+IF T% THEN
+    T% = FNGetFileInfo (FF$)
+    PROCUpdateTitle(FF$)
+ENDIF
+load_pending% = FALSE
+SYS "Hourglass_Off"
+ENDPROC
+
+DEF PROClMusic
+LOCALC%,B%,ret%
+INPUT#FILE%,GATE%
+GATE%+=MUSIC%
+FORC%=0TO7
+INPUT#FILE%,FINE%(C%):FINE%(C%)+=MUSIC%(C%): REM Sets up start and end pointers for data
+NEXT
+B%=MUSIC%:WHILEB%<GATE%:?B%=BGET#FILE%:B%+=1:ENDWHILE
+FORC%=0TO7
+    B%=MUSIC%(C%)
+    WHILEB%<FINE%(C%)
+        ?B%=BGET#FILE%
+        B%+=1
+    ENDWHILE
+NEXT
+PP%=MUSIC%:P%()=MUSIC%()
+ENDPROC
+
+DEF PROClStaves
+STAVE%=BGET#FILE%
+PERC%=BGET#FILE%
+ENDPROC
+
+DEF PROClInstruments
+LOCAL c%,chan%,v%
+FOR c%=0 TO 7
+  REM Get channel
+  chan%=BGET#FILE%
+  REM Write voice numbers allocated to each channel
+  v%=BGET#FILE% MOD (NVoices%+1)
+  IF v%=0 THEN v%=1
+  SYS "Sound_AttachVoice",chan%+1,v%
+  PROCAttachVoice(chan%,0)
+NEXT
+ENDPROC
+
+DEF PROClVolumes
+LOCAL c%
+FOR c%=0 TO 7
+  Volumes%(c%)=BGET#FILE%
+  IF Volumes%(c%)>7 THEN Volumes%(c%)=7
+  IF Volumes%(c%)<0 THEN Volumes%(c%)=0
+NEXT
+ENDPROC
+
+DEF PROClStereos
+LOCAL c%
+FOR c%=0 TO 7
+  Stereo_Position%(c%)=BGET#FILE%
+  SYS "Sound_Stereo",c%+1,Stereo%(Stereo_Position%(c%))
+NEXT
+ENDPROC
+
+DEF PROClTempo
+LOCAL t%
+t%=BGET#FILE%
+PROCSetTempo(t%)
+ENDPROC
+
+DEF PROCsave_init (x%,y%)
+F$=FNwimp_geticontext(Save_h%,1)
+IF (INSTR(F$,".")=0 AND INSTR(F$,":")=0) THEN
+  SYS "Wimp_CreateMenu",,Save_h%,x%,y%
+ELSE
+  PROCsave_music(F$)
+ENDIF            
+ENDPROC
+
+DEF PROCsave_music (FF$)
+LOCAL n%,tmp%,laddr%,eaddr%
+LOCAL ERROR
+T%=0
+REM simple check for pathname rather than local name
+IF (INSTR(FF$,".")=0 AND INSTR(FF$,":")=0 AND INSTR(FF$,"<")=0) THEN
+  n%=FNCheckOKTag("ToSave",1)
+  ENDPROC
+ENDIF
+SYS "Hourglass_On"
+ON ERROR LOCAL OSCLI("FX 229,1"):SYS "Hourglass_Off":T%=FNCheckOK(REPORT$,1):ENDPROC
+OSCLI("FX 229,0"):REM enable escape key
+SYS "OS_File",5,FF$ TO ,,laddr%,eaddr%
+IF CHANGED% OR (((laddr%>>20) AND &FFF)<>&FFF) THEN
+  REM file changed or wasn't timestamped
+  REM get current time
+  Block%?0=3:SYS "OS_Word",&0E,Block%
+  laddr%=Block%?4
+  eaddr%=Block%!0
+  ENDIF
+REM force music file type, and preserve timestamp
+laddr%=(laddr% AND &FF) OR (&FFF<<20) OR (MusicFileType%<<8)
+REM I don't know what the length will be, so use zero
+SYS "OS_File", &07, FF$, laddr%, eaddr%, 0, 0
+REM OPENUP, error if directory or not found
+SYS "OS_Find", &CC, FF$ TO FILE%
+REM timestamp is automatically updated on 1st byte write
+BPUT#FILE%,"Maestro"
+BPUT#FILE%,2
+PROCsMusic
+PROCsStaves
+PROCsInstruments
+PROCsVolumes
+PROCsStereos
+PROCsTempo
+CLOSE#FILE%:FILE%=FALSE
+IF (NOT CHANGED%) AND (((laddr%>>20) AND &FFF)=&FFF) THEN
+  REM file not changed and was timestamped
+  REM preserve original timestamp
+  SYS "OS_File",2,FF$,laddr% :REM re-stamp with old stamp
+  SYS "OS_File",3,FF$,,eaddr% :REM nb eaddr% in r3
+ENDIF
+OSCLI("FX 229,1")
+REM Twiddle the name we keep so that it doesn't ever get set to <Wimp$Scrap>
+REM Also, if a scrap transfer is done, the document should still be marked as
+REM having been altered - a scrap transfer isn't safe.
+IF LEFT$(FF$, 12) = "<Wimp$Scrap>" THEN
+  F$ = LEFT$(ScoreTitle$) : REM Preserve old title
+  IF CHANGED% THEN
+    PROCUpdateTitle(LEFT$(F$) + "*") : REM Will already have space on end
+  ENDIF
+ELSE
+  CHANGED%=FALSE
+  PROCwimp_seticontext(FileInfo_h%,2,FNmessage_lookup(Messages_h%,"No"))
+  F%=FNGetFileInfo(FF$)
+  PROCUpdateTitle(FF$)
+  PROCwimp_seticontext(Save_h%,1,FF$+CHR$(0))
+ENDIF
+SYS "Hourglass_Off"
+ENDPROC
+
+DEF PROCsMusic
+LOCALC%,B%
+BPUT#FILE%,1
+PRINT#FILE%,GATE%-MUSIC%
+FORC%=0TO7
+PRINT#FILE%,FINE%(C%)-MUSIC%(C%)
+NEXT
+B%=MUSIC%:WHILEB%<GATE%:BPUT#FILE%,?B%:B%+=1:ENDWHILE
+FORC%=0TO7
+B%=MUSIC%(C%):WHILEB%<FINE%(C%):BPUT#FILE%,?B%:B%+=1:ENDWHILE
+NEXT
+ENDPROC
+
+DEF PROCsStaves
+BPUT#FILE%,2
+BPUT#FILE%,STAVE%
+BPUT#FILE%,PERC%
+ENDPROC
+
+DEF PROCsInstruments
+LOCALC%
+BPUT#FILE%,3
+FORC%=0TO7
+BPUT#FILE%,C%
+BPUT#FILE%,Instrument%(C%,1)
+NEXT
+ENDPROC
+
+DEF PROCsVolumes
+LOCALC%
+BPUT#FILE%,4
+FORC%=0TO7
+BPUT#FILE%,Volumes%(C%)
+NEXT
+ENDPROC
+
+DEF PROCsStereos
+LOCALC%
+BPUT#FILE%,5
+FORC%=0TO7
+BPUT#FILE%,Stereo_Position%(C%)
+NEXT
+ENDPROC
+
+DEF PROCsTempo
+BPUT#FILE%,6
+BPUT#FILE%,Tempo%
+ENDPROC
+
+DEF PROCsprite(s%,X%,Y%) : REM plot sprite S%(s%) at X%,Y%
+SYS "OS_SpriteOp", SprPlot%, SprBlk%, S%(s%), X%-x%(s%),Y%-y%(s%), 8, factors%, pixtrans%
+REM overwrite screen colour, but using sprite mask
+ENDPROC
+
+DEF PROCfloat(s%,X%,Y%)
+LOCAL more%
+RedrawBlock%!0=ScoreWind_h%
+RedrawBlock%!12=X%+X%(s%)
+X%-=x%(s%)
+RedrawBlock%!4=X%
+RedrawBlock%!16=Y%+Y%(s%)
+Y%-=y%(s%)
+RedrawBlock%!8=Y%
+SYS "Wimp_UpdateWindow",,RedrawBlock% TO more%
+X%+=RedrawBlock%!4-RedrawBlock%!20
+Y%+=RedrawBlock%!16-RedrawBlock%!24
+ChSprite%=S%(s%)
+WHILE more%
+  CASE s% OF
+    WHEN key%:PROCfloat_key_sig(X%,Y%+y%(s%))
+    WHEN time%:PROCfloat_time_sig(X%,Y%)
+    OTHERWISE:
+      SYS "OS_SpriteOp",SprPlot%,SprBlk%,ChSprite%,X%,Y%,11,factors%,fpixtrans%
+  ENDCASE
+SYS "Wimp_GetRectangle",,RedrawBlock% TO more%
+ENDWHILE
+ENDPROC
+
+DEF PROCfloat_key_sig(X%,Y%)
+LOCALI%,A%,C%,W%
+IFKEY_SIG%(1) THEN
+C%=SCRIBE%(sclef%)
+A%=KEY_SIG%(0)
+I%=accidental%+2+A%
+W%=x%(I%)+X%(I%):Y%-=y%(I%)
+ChSprite%=S%(I%)
+FOR I%=0 TO KEY_SIG%(1)-1
+SYS "OS_SpriteOp", SprPlot%, SprBlk%, ChSprite%, X%, Y%+Li%*Key_Y%(C%,A%,I%), 3, factors%, fpixtrans%
+X%+=W%
+NEXT
+ELSE
+SYS "OS_SpriteOp", SprPlot%, SprBlk%, ChSprite%, X%, Y%-y%(s%), 3, factors%, fpixtrans%
+ENDIF
+ENDPROC
+
+DEF PROCfloat_time_sig(X%,Y%)
+LOCAL s%,x%,bar$,note$
+bar$=FNwimp_geticontext(TimeSig_h%,0)
+note$=FNwimp_geticontext(TimeSig_h%,1)
+IF LEN(bar$)<2 THEN x%=X%+14 ELSE x%=X%
+s%=time%+VAL(bar$)
+SYS "OS_SpriteOp",SprPlot%,SprBlk%,S%(s%),x%-4,Y%+36,3,factors%,fpixtrans%
+IF LEN(note$)<2 THEN x%=X%+14 ELSE x%=X%
+s%=time%+VAL(note$)
+SYS "OS_SpriteOp",SprPlot%,SprBlk%,S%(s%),x%-4,Y%+4,3,factors%,fpixtrans%
+ENDPROC
+
+REM *********************************************************************** REM
+REM                                                                         REM
+REM         M U S I C   T R A N S C R I P T I O N   R O U T I N E S         REM
+REM                                                                         REM
+REM *********************************************************************** REM
+::
+REM   PROCEDURE: start_music
+REM
+REM DESCRIPTION: Initialise to start of music
+:
+DEF PROCstart_music
+LOCAL n%
+BAR%=0 :REM current bar
+GP%=MUSIC%:REM Set current gate pointer to start of displayed music
+N%()=MUSIC%()
+CLEF%()=0:REM Start with base clefs (NOT BASS!)
+SIG%(0)=%01100111:REM (Default time sig of 4/4 time)
+SIG%(1)=%00000010:REM (Default of C Major) First displayed signatures attribute byte
+PX%=0
+PROCPutBarInfo(0)
+ENDPROC
+
+REM   PROCEDURE: note_type(Channel C%, Type T%)
+
+DEF PROCnote_type(C%,T%)
+N%(C%)?1=N%(C%)?1AND&1F ORT%<<5
+ENDPROC
+
+DEF PROCnote_dots(C%,D%)
+N%(C%)?1=N%(C%)?1AND&E7 ORD%<<3
+ENDPROC
+
+DEF PROCnote_accidental(C%,A%)
+N%(C%)?1=N%(C%)?1AND&F8 ORA%
+ENDPROC
+
+REM   PROCEDURE: note_line(Channel C%, Stave line L%)
+REM
+REM        NOTE: If a note's position is not defined or specified as -16, it is treated as a rest
+
+DEF PROCnote_line(C%,L%)
+?N%(C%)=?N%(C%)AND7 OR(16+L%)<<3
+ENDPROC
+
+DEF PROCnote_tie(C%,T%)
+?N%(C%)=?N%(C%)AND&FB OR(T%<>0)AND4
+ENDPROC
+
+DEF PROCnote_join(C%,J%)
+?N%(C%)=?N%(C%)AND&FD OR(J%<>0)AND2
+ENDPROC
+
+DEF PROCnote_stem(C%,D%)
+?N%(C%)=?N%(C%)AND&FE OR(D%<>0)AND%1
+ENDPROC
+
+DEF PROCnote_clear(C%)
+?N%(C%)=0:N%(C%)?1=0
+ENDPROC
+
+DEF PROCtime_sig(N%,B%)
+?GP%=0:GP%?1=Time%ORN%<<1ORB%<<5
+ENDPROC
+
+DEF PROCkey_sig (A%,N%)
+GP%?0=0
+GP%?1=Key%ORA%<<2ORN%<<3
+ENDPROC
+
+DEF PROCclef (S%,C%)
+GP%?0=0
+GP%?1=Clef% OR C%<<3 OR S%<<6
+ENDPROC
+
+DEF PROCbar
+GP%?0=0
+GP%?1=Bar% OR BarlineType%<<6
+ENDPROC
+
+DEF PROCinsert_gate(W%)
+LOCALG%
+IFGP%<GATE% THEN
+FORG%=GATE%-W%TOGP%STEP-4:G%!W%=!G%:NEXT:REM Shift up by W% from insertion
+G%+=3:REM Byte before last copied
+WHILEG%>=GP%:G%?W%=?G%:G%+=TRUE:ENDWHILE:REM Clear up in odd word
+ENDIF
+GATE%+=W%:REM Insert gate of size W% into gate queue
+EP%+=W%:REM This assumes gates will only be inserted below EP%
+?GP%=0:GP%?(W%-1)=0:REM Zeroise inserted gate
+ENDPROC
+
+DEF PROCinsert_note(C%)
+LOCALN%
+IFN%(C%)<FINE%(C%) THEN
+FORN%=FINE%(C%)-2TON%(C%)STEP-4:N%!2=!N%:NEXT:REM Shift up from insertion
+N%+=3:REM Last copied word
+WHILEN%>=N%(C%):N%?2=?N%:N%+=TRUE:ENDWHILE:REM Clear up in odd word
+ENDIF
+FINE%(C%)+=2:REM Insert a note word into this queue
+?GP%=?GP%OR%1<<C%:REM Mark in gate
+PROCnote_clear(C%)
+ENDPROC
+::
+DEF PROCdelete_gate(W%)
+LOCALG%
+GATE%-=W%
+IFGP%<GATE% FORG%=GP%TOGATE%STEP4:!G%=G%!W%:NEXT
+EP%-=W%:REM This assumes gates will only be deleted below EP%
+ENDPROC
+::
+DEF PROCdelete_note(C%)
+LOCALN%
+FINE%(C%)-=2
+IFN%(C%)<FINE%(C%) FORN%=N%(C%)TOFINE%(C%)STEP4:!N%=N%!2:NEXT
+?GP%=?GP%ANDNOT(%1<<C%)
+ENDPROC
+
+DEF FNallocate_channel(S%)
+LOCALC%,c%,G%
+G%=?GP%
+C%=-1:c%=7
+REPEAT
+WHILEc%>=0ANDG%AND%1<<c%:c%+=TRUE:ENDWHILE
+IFc%>=0 IFS_C%(c%)=S% C%=c%
+c%+=TRUE
+UNTILc%<0
+=C%
+
+DEF PROCarrange_stave(S%)
+LOCALC%,B%
+B%=TRUE:C%=TRUE
+IF?GP% ELSEREPEATGP%+=2:UNTIL?GP%ORGP%>=GATE%
+WHILEB%ANDGP%<GATE%
+C%=C%ORFNsort_gate
+PROCskip_notes(?GP%):GP%+=1
+IF?GP% ELSEB%=C%:C%=FALSE:REPEATGP%+=2:UNTIL?GP%ORGP%>=GATE%
+ENDWHILE
+ENDPROC
+
+DEF FNsort_gate
+LOCALC%,NC%,NN%,G%,g%,pg%,d%,shortest%,Gchanged%
+shortest%=255
+G%=?GP%
+g%=FNprevious_gate(GP%)
+pg%=FNpreceding_gate(GP%)
+NC%=-1
+NN%=-1
+FORC%=0TO7
+IFS_C%(C%)=S% THEN
+NC%+=1:n%(NC%)=C%:IFG%AND%1<<C% NN%+=1:C%(NN%)=C%
+IFpg%AND%1<<C% d%=N%(C%)?-1>>3EOR%11100:IFd%<shortest% shortest%=d%
+ENDIF
+NEXT
+shortest%=shortest%EOR%11100
+IFg%ANDNC%>0ANDNN%>=0 PROCsort
+=Gchanged%
+
+DEF PROCsort
+LOCALN%,M%
+c%()=-1
+FORM%=0TONC%
+FORN%=0TONN%
+IFFNsame_pitch(n%(M%),C%(N%)) c%(N%)=n%(M%)
+NEXT
+NEXT
+FORN%=0TONN%
+IFc%(N%)<0 c%(N%)=FNbest
+NEXT
+FORN%=0TONN%
+IFC%(N%)=c%(N%) ELSEGchanged%=TRUE:M%=FNin(c%(N%),C%()):IFM%>N% PROCswap_notes(N%,M%) ELSEPROCmove_note(N%)
+NEXT
+ENDPROC
+
+DEF PROCswap_notes(N%,M%)
+LOCALs%,d%
+s%=C%(N%):d%=c%(N%)
+SWAPC%(N%),C%(M%)
+SWAP?N%(s%),?N%(d%)
+SWAPN%(s%)?1,N%(d%)?1
+ENDPROC
+
+DEF PROCmove_note(N%)
+LOCALs%,d%
+s%=C%(N%):d%=c%(N%)
+PROCinsert_note(d%)
+?N%(d%)=?N%(s%)
+N%(d%)?1=N%(s%)?1
+PROCdelete_note(s%)
+ENDPROC
+
+DEF FNbest
+LOCALN%,C%
+LOCAL short%,free%,rest%,any%,tied%
+FOR N%=NC%TO0STEP-1
+C%=n%(N%)
+IFFNin(C%,c%())<0 THEN
+IFN%(C%)?-2AND4 THEN
+tied%=C%+1
+ELSE
+IFpg%AND%1<<C% THEN
+IF(N%(C%)?-1>>3)=shortest% short%=C%+1
+IFN%(C%)?-2AND&F8 ELSErest%=C%+1
+ELSE
+free%=C%+1
+ENDIF
+any%=C%+1
+ENDIF
+ENDIF
+NEXT
+IFshort% C%=short% ELSEIFfree% C%=free% ELSEIFrest% C%=rest% ELSEIFany% C%=any% ELSEC%=tied%
+=C%-1
+
+DEF FNin(U%,U%())
+LOCALI%:I%=NN%
+WHILEI%ANDU%<>U%(I%):I%-=1:ENDWHILE
+=I%+(U%<>U%(I%))
+
+DEF FNsame_pitch(c%,C%):LOCALR%,r%:R%=?N%(C%)AND&F8:r%=N%(c%)?-2AND&F8:=N%(c%)-2>=MUSIC%(c%)AND(g%OR(N%(c%)?-2AND4)=4)AND%1<<c%AND(R%EORr%)=FALSE AND(FALSE<>R%EORr%=FALSE)
+
+DEF FNpreceding_gate(gp%)
+LOCALC%,gm%
+FORC%=0TO7:IFS_C%(C%)=S% gm%=gm%OR%1<<C%
+NEXT
+REPEAT
+gp%-=1
+UNTILgm%AND?gp%ORgp%<MUSIC%+2ORgp%?-1=FALSE
+=?gp%ANDgp%>MUSIC%+1ANDgp%?-1<>FALSE
+
+DEF FNprevious_gate(gp%)
+LOCALC%,gm%
+FORC%=0TO7:IFS_C%(C%)=S% gm%=gm%OR%1<<C%
+NEXT
+REPEAT
+gp%-=1
+WHILEgp%>MUSIC%ANDgp%?-1=FALSE:gp%-=2:ENDWHILE
+UNTILgm%AND?gp%ORgp%<MUSIC%+2
+=?gp%ANDgp%>MUSIC%+1
+
+DEF FNconflict(T%,S%,L%)
+LOCALC%,co%
+L%+=16
+C%=7
+REPEAT
+co%=?GP%AND%1<<C%ANDS_C%(C%)=S%AND(?N%(C%)>>3)=L%
+C%+=TRUE
+UNTILco%ORC%<FALSE
+=C%-(co%<>0)
+
+REM *********************************************************************** REM
+REM                                                                         REM
+REM           M U S I C   T Y P E S E T T I N G   R O U T I N E S           REM
+REM                                                                         REM
+REM *********************************************************************** REM
+::
+REM   PROCEDURE: set_score(Starting position PX%)
+REM
+REM DESCRIPTION: Typeset music score from current bar to end of music/screen
+REM              No drawing is done as only the positions are calculated.
+REM
+REM     EFFECTS: Stores gate X positions & types in PX%() & PTYPE%()
+:
+DEF PROCset_score(PX%)
+WHILE GP%<GATE%
+IF?GP% PROCset_notes(?GP%):GP%+=1 ELSEPROCset_attribute(GP%?1):GP%+=2
+ENDWHILE:REM Until edge of screen or end of music
+EP%=GP%:REM Last GP%, pointer to first undrawn gate
+EX%=PX%:REM Last PX%, index to last position
+PX%(PX%+1)=PX%(PX%)+PW%(PX%)+Pgap%:REM Appendation position after last symbol
+IF PX%(PX%+1)>S_Width% PROCSetExtent(PX%(PX%+1)+100*Hi%) ELSE PROCSetExtent(S_Width%)
+PXn%(NBars%)=PX%
+PTYPE%(PX%+1)=Note%:REM Note type by default
+ENDPROC
+::
+REM NOTE: The key signature is the only attribute that must be kept track of in order to ensure correct setting.
+REM       This is because a naturalising signature consists of the same number of naturals as accidentals in the previous key signature
+:
+DEF PROCset_attribute(A%)
+IFA%ANDPTYPE%(PX%)+TRUE ELSEIFA%ANDPTYPE%(PX%) ENDPROC
+LOCALT%:T%=%1:IFA%AND%1 ELSEREPEATT%=T%<<1:UNTILA%ANDT%
+PX%(PX%+1)=PX%(PX%)+PW%(PX%)+Pgap%
+PX%+=1
+PTYPE%(PX%)=T%
+CASE T% OF
+WHENTime%:PW%(PX%)=20*Hi%
+WHENKey%
+IFA%AND56 T%=accidental%+(A%>>2AND%1)+2:SIG%(1)=A% ELSET%=accidental%+1:SWAPA%,SIG%(1):IFA%AND56 ELSEA%=8:T%+=1
+PW%(PX%)=(A%>>3AND7)*(x%(T%)+X%(T%))
+WHENClef%:PW%(PX%)=x%(clef%+3)+X%(clef%+3)
+WHENBar%:PW%(PX%)=Hi%*4
+ENDCASE
+ENDPROC
+
+DEF PROCset_notes(G%)
+LOCALlx0%,lx1%,ly0%,ly1%
+LOCALC%,P%,R%,s%:REM Channel, Note prefix & remainder widths, Sprite
+C%=-1
+REPEAT
+REPEATC%-=TRUE:UNTILG%AND%1<<C%
+PROCbound_note(!N%(C%))
+IFlx0%>P% P%=lx0%:REM Maximum prefix
+IFlx1%>R% R%=lx1%:REM Maximum remainder
+N%(C%)+=2:REM Pull from note queue
+UNTIL(2<<C%)>G%:REM Until no more notes (1 bits)
+PX%(PX%+1)=PX%(PX%)+PW%(PX%)+Pgap%+P%:REM Next position is previous position + width+gap+prefix of next note
+PX%+=1:REM next note position index
+PW%(PX%)=R%:REM Width of new note
+PTYPE%(PX%)=Note%:REM Note type
+ENDPROC
+
+DEF PROCbound_note(L%)
+LOCALH%,S%,s%
+H%=L%>>8AND&FF
+IFL%AND&F8 S%=H%>>5ORL%<<3AND8 ELSES%=rest%ORH%>>5:REM Note/rest sprite
+lx0%=x%(S%):REM Prefix width
+lx1%=X%(S%):REM Suffix width
+ly0%=y%(S%):REM Decender height
+ly1%=Y%(S%):REM Ascender height
+IFH%AND7 THEN
+s%=accidental%ORH%AND7
+lx0%+=x%(s%):REM Add accidental width
+IFy%(s%)>ly0% ly0%=y%(s%):REM Lower ?
+IFY%(s%)>ly1% ly1%=Y%(s%):REM Higher ?
+ENDIF
+IFH%AND24 s%=dot%+(H%>>3AND3):lx1%=x%(S%)+X%(s%):IFy%(s%)>ly0% ly0%=y%(s%):REM Dot adds suffix and may be lower
+ENDPROC
+
+DEF PROCposition_staves
+LOCAL y%,s%
+Score_Height%=(PERC%+1+3*(STAVE%+1)+1)*Stave_Height%
+y%=-Score_Height%-Stave_Height% DIV 2
+IF PERC% THEN
+  FOR s%=PERC% TO 1 STEP -1
+    y%+=Stave_Height%
+    Y_STAVE%(STAVE%+s%)=y%
+  NEXT
+ENDIF
+FOR s%=STAVE% TO 0 STEP -1
+  y%+=3*Stave_Height%
+  Y_STAVE%(s%)=y%
+NEXT
+ENDPROC
+
+REM // Score //
+
+DEF PROCscore_init
+LOCAL wy%
+REM Ensure visible height matches height of workarea
+Block%!0=ScoreWind_h%
+SYS "Wimp_GetWindowInfo",,(Block% OR 1)
+wy%=ABS(Block%!48)+PaneHeight%
+Block%!8=Block%!16-wy%
+PROCOpenWindow(Block%)
+LHBAR%=0
+ScoreClosed%=FALSE
+FirstOpen%=FALSE
+SYS "Wimp_SetCaretPosition",ScoreWind_h%,-1
+ENDPROC
+
+DEF PROCscore_click (window%,icon%,button%)
+CASE window% OF
+  WHEN NotesPane_h%:
+    IF icon%>0 THEN
+      PROCtoolicon_click(NotesPane_h%,icon%)
+      IF icon%<9 THEN PROCattach(note%+icon%-1,%111000)
+      IF icon%>8 THEN PROCattach(rest%+icon%-9,%11000)
+    ENDIF
+  WHEN SharpsPane_h%:
+    IF icon%>1 THEN
+      CASE icon% OF
+        WHEN 14,16,18,20:
+        OTHERWISE:
+          IF icon%=21 OR icon%=22 THEN icon%=19
+          PROCtoolicon_click(SharpsPane_h%,icon%)
+      ENDCASE      
+      IF icon%<9 THEN PROCattach(accidental%+icon%-1,%1100000)
+      IF icon%>8 AND icon%<12 THEN PROCattach(dot%+icon%-8,%1101000)
+      IF icon%=12 THEN PROCattach(tie%,%1101000)
+      IF icon%=13 THEN PROCattach_barline
+      IF icon%=14 THEN CurrentMenu%=FNwimp_popup(SharpsPane_h%,Barline_h%,icon%)
+      IF icon%=15 THEN PROCattach_clef
+      IF icon%=16 THEN CurrentMenu%=FNwimp_popup(SharpsPane_h%,Clef_h%,icon%)
+      IF icon%=17 THEN PROCattach(key%,%10)    :REM key signature
+      IF icon%=18 THEN CurrentMenu%=FNwimp_popup(SharpsPane_h%,KeyMenu%,icon%)
+      IF icon%=19 THEN PROCattach(time%,%1)    :REM time signature
+      IF icon%=20 THEN PROCtimesig_init(icon%)
+    ENDIF
+  WHEN ScoreWind_h%:
+    IF button%=4 THEN
+      IF SCORING% AND SCRIBE%(drawn%) THEN PROCput_down
+    ENDIF
+    SYS "Wimp_SetCaretPosition",ScoreWind_h%,-1
+ENDCASE
+ENDPROC
+
+DEF FNscore_keypress (key%)
+LOCAL used%,x%,y%,mx%,my%
+used%=TRUE
+SYS "Wimp_GetPointerInfo",,Block%
+mx%=Block%!0
+my%=Block%!4
+CASE key% OF
+  WHEN &181:REM F1 (Help)
+    OSCLI("Filer_Run <Maestro$Dir>.!Help")
+  WHEN &183:REM F3 (Save)
+    Block%!0=Save_h%
+    SYS "Wimp_GetWindowState",,Block%
+    x%=mx%-(Block%!12-Block%!4) DIV 2
+    y%=my%+(Block%!16-Block%!8) DIV 2
+    SYS "Wimp_CreateMenu",,Save_h%,x%,y%
+  WHEN &185:REM F5 (Goto)
+    Block%!0=Bar_h%
+    SYS "Wimp_GetWindowState",,Block%
+    x%=mx%-(Block%!12-Block%!4) DIV 2
+    y%=my%+(Block%!16-Block%!8) DIV 2
+    PROCgoto_init
+    SYS "Wimp_CreateMenu",,Bar_h%,x%,y%
+  WHEN &013:REM ^S (Staves)
+    Block%!0=StaveWind_h%
+    SYS "Wimp_GetWindowState",,Block%
+    x%=mx%-(Block%!12-Block%!4) DIV 2
+    y%=my%+(Block%!16-Block%!8) DIV 2
+    PROCstaves_init(x%,y%) 
+  WHEN &009:REM ^I (Instruments)
+    Block%!0=InstrWind_h%
+    SYS "Wimp_GetWindowState",,Block%
+    x%=mx%-(Block%!12-Block%!4) DIV 2
+    y%=my%+(Block%!16-Block%!8) DIV 2
+    PROCinstruments_init(x%,y%)
+  WHEN &180:REM Print
+    Block%!0=Print_h%
+    SYS "Wimp_GetWindowState",,Block%
+    x%=mx%-(Block%!12-Block%!4) DIV 2
+    y%=my%+(Block%!16-Block%!8) DIV 2
+    PROCprint_init
+    SYS "Wimp_CreateMenu",,Print_h%,x%,y%
+  WHEN &1A2:REM Ctrl-F2
+    PROCCloseWindow(ScoreWind_h%)
+  OTHERWISE:used%=FALSE
+ENDCASE
+=used%
+
+REM // Goto bar //
+
+DEF PROCgoto_init
+LOCAL bar%
+Block%!0=ScoreWind_h%
+SYS "Wimp_GetWindowState",,Block%
+bar%=FNFindBar(Block%!20)
+IF bar%<1 THEN bar%=1
+PROCwimp_seticontext(Bar_h%,0,STR$bar%)
+PROCwimp_seticontext(Bar_h%,2,STR$(NBars%-1))
+ENDPROC
+
+DEF FNgoto_keypress (key%)
+LOCAL used%
+used%=TRUE
+CASE key% OF
+  WHEN &0D:REM Enter
+    BAR%=VAL(FNwimp_geticontext(Bar_h%,0))
+    IF BAR%>NBars% THEN
+      BAR%=NBars%
+    ELSE
+      IF BAR%<0 THEN BAR%=0
+    ENDIF
+    Block%!0=ScoreWind_h%
+    SYS "Wimp_GetWindowState",,Block%
+    Block%!20=PX%(PXn%(BAR%))+4
+    REM Set scroll to requested bar number
+    SYS "Wimp_OpenWindow",,Block%
+    LHBAR%=FNFindBar(Block%!20)
+    PROCCloseWindow(Bar_h%)
+    SYS "Wimp_CreateMenu",,-1
+  WHEN &1A2:REM Ctrl-F2
+    PROCCloseWindow(Bar_h%)
+  OTHERWISE:used%=FALSE
+ENDCASE
+=used%
+
+DEF PROCupdate_score(Window%!x0%,Window%!y0%,Window%!x1%,Window%!y1%)
+Window%!handle%=ScoreWind_h%
+SYS "Wimp_UpdateWindow",,Window%+handle% TO R%
+WHILE R%
+CLG:PROCdraw_staves
+SYS "Wimp_GetRectangle",,Window%+handle% TO R%
+ENDWHILE
+ENDPROC
+
+REM   PROCEDURE: draw_staves
+REM
+REM DESCRIPTION: Draw current stave structure
+REM              1 stave for 1 voice
+REM              2 staves for keyboard
+REM              3 staves for 1 voice and keyboard
+REM              4 staves for 4 voice chorus
+:
+DEF PROCdraw_staves
+LOCAL Y%,T%,B%,S%,L%:REM Y%,T%,B%=Position & Y bounds of each stave, S%=Stave index, L%=Line position
+LOCAL x%,y%,lx1%:REM Virtual coordinates of bottom left & top right of score window
+LOCAL c%,t%,b%:REM Left edge of clip window and Y bounds
+y%=Window%!y1%-Window%!scy%
+x%=Window%!x0%-Window%!scx%
+lx1%=x%+Score_Width%:IF lx1%>Clip%!x1% lx1%=Clip%!x1%
+c%=Clip%!x0%:IFc%<x%+Hi% c%=x%+Hi%
+b%=Clip%!y0%:t%=Clip%!y1%
+B%=Score_Width%
+T%=Clip%!x1%-x%:IFT%<B% B%=T%:REM Right bound
+T%=Clip%!x0%-x%:IFT%<0 T%=0:REM Left bound
+PROCdraw_score(x%,y%,T%,B%):REM Draw symbols on stave
+IFPERC% THEN
+FOR S%=STAVE%+1TOSTAVE%+PERC%
+Y%=y%+Y_STAVE%(S%)
+IFb%<=Y%ANDt%>=Y% LINEc%,Y%,lx1%,Y%
+NEXT
+ENDIF
+FOR S%=0 TO STAVE%
+Y%=y%+Y_STAVE%(S%):T%=Y%+Stave_Height%DIV2:B%=T%-Stave_Height%
+IFb%<=T%ANDt%>=B% THEN
+LINEc%,Y%,lx1%,Y%:REM Plot centre bar line
+FORL%=Li%*2TOL%*2STEPL%
+  LINEc%,Y%+L%,lx1%,Y%+L%:REM Plot upper line
+  LINEc%,Y%-L%,lx1%,Y%-L%:REM Plot lower line
+NEXT
+
+ENDIF
+NEXT
+
+ENDPROC
+::
+REM   PROCEDURE: draw_score(Based X%,Y%, PX bounds A%,B%)
+REM
+REM DESCRIPTION: Write current section of music score that appears between A%
+REM              and B%
+:
+DEF PROCdraw_score(X%,Y%,A%,B%)
+LOCALPX%
+BAR%=0
+REM must be subtle about redrawing last note (or other item) of score to prevent picking up rubbish data after end
+IF A%>PX%(PXn%(NBars%)) THEN
+  IF A%>PX%(PXn%(NBars%))+2*Pgap% ENDPROC ELSE A%=PX%(PXn%(NBars%))
+  ENDIF
+REM ensure bar numbers are always completely updated; but don't lose 1st-note draw
+IF NBars%>2 THEN
+WHILE PX%(PXn%(BAR%+2))<A% AND BAR%<=NBars%-1
+ BAR%+=1
+ ENDWHILE  :REM get to drawstart quickly
+ IF BAR%>NBars% ENDPROC
+ PROCGetBarInfo(BAR%)
+ IF GP%>=GATE% ENDPROC
+ WHILEPX%(PX%+3)<A%ANDPX%<EX%
+  PROCskip_gate
+  ENDWHILE:REM Skip music until A%
+ELSE
+ PROCstart_music
+ENDIF
+WHILEPX%(PX%)<=B%ANDGP%<GATE%
+IF?GP% PROCdraw_notes(?GP%):GP%+=1 ELSEPROCdraw_attribute(GP%?1):GP%+=2:IF PLAYING% PROCCheckQ
+ENDWHILE
+ENDPROC
+
+REM   PROCEDURE: draw_notes(Gate G%)
+REM
+REM DESCRIPTION: Get notes from the indicated channel queues and draw the
+REM              particular types of note in the correct places on the stave.
+REM              One may be a rest, may have accidentals preceding it, may have
+REM              dots following it, may be tied
+REM
+REM ASSUMPTIONS: Gate is non-zero
+REM
+REM Join=?N%(C%)AND2
+:
+DEF PROCdraw_notes(G%)
+LOCAL C%,x%,y%,s%,l%,ly%,NC0%,NC1%,lasty%,checkstagger%
+PX%+=1:REM Move on to next position
+x%=X%+PX%(PX%):REM Calculate gate column X (convert from work- to screen-coord)
+checkstagger%=FALSE
+C%=-1
+REPEAT
+  REPEAT C%-=TRUE:UNTIL G% AND %1<<C%
+  NC0%=?N%(C%) : NC1%=N%(C%)?1 :REM fast local vars
+  y%=Y%+Y_STAVE%(S_C%(C%))
+  IF NC0% AND &F8 THEN
+    l%=(NC0%>>3)-16
+    ly%=y%
+    y%+=Li%*l%
+    s%=NC1%>>5 OR NC0%<<3 AND 8
+    IF checkstagger% THEN
+      REM stagger next note if too close to one below
+      REM stagger fails sometimes if channels of 2 adjacent notes
+      REM are not in draw order?
+      IF ABS(lasty%-y%)<2*Li% PROCsprite(s%,x%+Pgap%,y%):checkstagger%=FALSE ELSE PROCsprite(s%,x%,y%)
+    ELSE
+      PROCsprite(s%,x%,y%):checkstagger%=TRUE
+    ENDIF
+    IF ABSl%>5 PROCsprite(ledger%+l%DIV2,x%,ly%):REM Ledger lines
+    lasty%=y%
+    IF NC1% AND 7 PROCsprite(accidental% OR NC1% AND 7,x%-x%(s%),y%)
+  ELSE
+    s%=rest% OR NC1%>>5
+    PROCsprite(s%,x%,y%)
+  ENDIF
+  IF NC1% AND 24 PROCsprite(dot%+(NC1%>>3AND3),x%+x%(s%),y%)
+  IF NC0% AND 4 PROCsprite(tie%,x%,y%)
+  N%(C%)+=2:REM Pull from note queue
+UNTIL(2<<C%)>G%:REM Until no more notes (1 bits)
+ENDPROC
+::
+DEF PROCdraw_attribute(A%)
+LOCALx%,N%
+N%=TRUE:REPEATN%-=TRUE:UNTILA%AND%1<<N%
+IFPTYPE%(PX%)EOR%1<<N% PX%+=1
+x%=X%+PX%(PX%)
+ONN%+1 PROCdraw_time_sig(A%),PROCdraw_key_sig(A%),PROCdraw_clef(A%),PROCdraw_slur(A%),PROCdraw_octave(A%),PROCdraw_bar_line(A%)
+ENDPROC
+
+DEF PROCPutBarInfo(bar%)
+REM setup the various pointers to arrays at the start of this bar
+FOR n%=0 TO 7
+ BPn%(n%,bar%)=N%(n%)
+ NEXT
+PXn%(bar%)=PX%
+GPn%(bar%)=GP%
+FOR n%=0 TO Max_Stave%
+ CLEFn%(n%,bar%)=CLEF%(n%)
+ NEXT
+SIGn%(0,bar%)=SIG%(0)
+SIGn%(1,bar%)=SIG%(1)
+ENDPROC
+
+DEF PROCGetBarInfo(bar%)
+REM get the values of the data at the start of this bar
+FOR n%=0 TO 7
+ N%(n%)=BPn%(n%,bar%)
+ NEXT
+PX%=PXn%(bar%)
+GP%=GPn%(bar%)
+FOR n%=0 TO Max_Stave%
+ CLEF%(n%)=CLEFn%(n%,bar%)
+ NEXT
+SIG%(0)=SIGn%(0,bar%)
+SIG%(1)=SIGn%(1,bar%)
+ENDPROC
+
+DEF PROCSetupBarStarts(bar%)
+REM find pointers to various bits at the starts of all bars through
+REM the music. Start at bar%
+REM this is just to speed up redraw, avoiding all the note-skipping
+LOCAL last%
+BAR%=bar%
+IF bar%>0 PROCGetBarInfo(bar%) ELSE PROCstart_music
+last%=BAR%
+PROCPutBarInfo(BAR%)
+WHILE GP%<GATE%
+ IF?GP% THEN
+  PROCskip_notes(?GP%):GP%+=1
+ ELSE
+  PROCskip_attribute(GP%?1):GP%+=2
+  IF BAR%<>last% last%=BAR% : PROCPutBarInfo(BAR%)
+ ENDIF
+ ENDWHILE
+BAR%+=1
+PROCPutBarInfo(BAR%)
+NBars%=BAR%
+ENDPROC
+
+DEF PROCskip_gate
+IF?GP% PROCskip_notes(?GP%):GP%+=1 ELSEPROCskip_attribute(GP%?1):GP%+=2
+ENDPROC
+
+DEF PROCskip_notes(G%)
+PX%+=1
+LOCALC%
+C%=-1
+REPEAT
+  REPEAT
+    C%+=1
+  UNTILG%AND%1<<C%
+  N%(C%)+=2
+UNTIL(2<<C%)>G%
+ENDPROC
+
+DEF PROCskip_attribute(A%)
+LOCALT%
+T%=%1:IFA%AND%1 ELSEREPEATT%=T%<<%1:UNTILA%ANDT%
+CASET%OF
+WHENTime%,Key%:SIG%(T%-1)=A%
+WHENClef%:CLEF%(A%>>6)=A%>>3AND3
+WHENBar%:BAR%+=1
+ENDCASE
+IFT%EORPTYPE%(PX%) PX%+=1
+ENDPROC
+
+DEF PROCback_gate
+IFGP%?-2 GP%-=1:PROCback_notes(?GP%) ELSEGP%-=2:PROCback_attribute(GP%?1)
+ENDPROC
+
+DEF PROCback_notes(G%)
+PX%-=1
+LOCALC%:C%=TRUE
+REPEATREPEATC%-=TRUE:UNTILG%AND%1<<C%:N%(C%)-=2:UNTIL(2<<C%)>G%
+ENDPROC
+
+DEF PROCback_attribute(A%)
+IFA%=Bar% BAR%-=1
+IFA%ANDPTYPE%(PX%+1)+TRUE ELSEIFA%ANDPTYPE%(PX%+1) ENDPROC
+PX%-=1
+ENDPROC
+
+DEF PROCdraw_time_sig (a%)
+LOCAL i%,b$,d$,w%
+SIG%(0)=a%
+b$=STR$((a%>>1 AND 15)+1)
+d$=STR$(%1<<(a%>>5)-1)
+w%=x%
+IF LEN(b$)<2 THEN w%+=14
+IF LEN(d$)<2 THEN x%+=14
+FOR i%=0 TO STAVE%+PERC%
+  PROCsprite(time%+VAL(b$),w%,Y%+Y_STAVE%(i%))
+  PROCsprite(time%+VAL(d$),x%,Y%+Y_STAVE%(i%)-32)
+NEXT
+ENDPROC  
+
+DEF PROCdraw_key_sig(A%)
+LOCALS%,C%,N%,a%,W%
+IFA%AND56 SIG%(1)=A% ELSESWAPA%,SIG%(1):a%=accidental%+1:REM Change to C Major uses naturals in old key sig positions
+N%=(A%>>3AND7)-1
+IFN%>=0 THEN
+A%=A%>>2AND%1:REM 0-Sharp or 1-flat signature
+IFa% ELSEa%=accidental%+2+A%
+W%=x%(a%)+X%(a%)
+x%+=x%(a%)
+FOR C%=0 TO N%
+FOR S%=0TOSTAVE%
+PROCsprite(a%,x%,Y%+Y_STAVE%(S%)+Li%*Key_Y%(CLEF%(S%),A%,C%))
+NEXT
+x%+=W%
+NEXT
+ENDIF
+ENDPROC
+
+DEF PROCdraw_clef(A%)
+LOCALS%
+S%=A%>>6
+CLEF%(S%)=A%>>3AND3
+IFS%<=STAVE% PROCsprite(clef%+CLEF%(S%),x%,Y%+Y_STAVE%(S%))
+ENDPROC
+
+DEF PROCdraw_slur(A%)
+ENDPROC
+
+DEF PROCdraw_octave(A%)
+ENDPROC
+
+DEF PROCdraw_bar_line (a%)
+LOCAL type%,y%
+REM Draw barline sprite
+type%=a%>>6
+BAR%+=1
+FOR S%=0 TO STAVE%+PERC%
+  PROCsprite(bar%+type%,x%,Y%+Y_STAVE%(S%))
+NEXT
+REM Print bar number
+IF BAR% MOD 5=0 THEN
+  MOVE x%+Hi%,Y%+Y_STAVE%(0)+Stave_Height%+20*Vi%
+  PRINT STR$(BAR%)
+ENDIF
+REM Connect keyboard staves
+IF (STAVE%+1) AND 2 THEN
+  MOVE x%+Hi%,Y%+Y_STAVE%(STAVE%)+Stave_Height% DIV 2
+  y%=Y_STAVE%(STAVE%-1)-Y_STAVE%(STAVE%)-Stave_Height%
+  DRAW BY 0,y%
+  IF type%=1 THEN
+    RECTANGLE FILL x%+6+Hi%,Y%+Y_STAVE%(STAVE%)+Stave_Height% DIV 2,4,y% 
+  ENDIF
+ENDIF
+ENDPROC
+
+DEF PROCput_down
+LOCALC%,PX%,X%,Y%,S%,s%
+SYS "Hourglass_On"
+GP%=SCRIBE%(sgp%)
+FORC%=0TO7:N%(C%)=SCRIBE%(C%):NEXT
+PX%=SCRIBE%(posx%)
+X%=SCRIBE%(sx%)
+Y%=SCRIBE%(sy%)
+s%=SCRIBE%(sprite%)
+S%=SCRIBE%(stave%)
+C%=SCRIBE%(sc%)
+PROCrelease:REM undraw sprite being dragged
+IF s%<accidental% THEN PROCput_note
+IF s%>=accidental% AND s%<clef% THEN PROCput_accidental
+IF s%>=clef% AND s%<=clef%+3 THEN PROCput_clef
+IF s%>dot% AND s%<=dot%+3 THEN PROCput_dot
+IF s%>=bar% AND s%<=bar%+3 THEN PROCput_bar
+IF s%>=tie% AND s%<=tie%+1 THEN PROCput_tie
+IF s%=time% THEN PROCput_time
+IF s%=key% THEN PROCput_key
+GP%=SCRIBE%(sgp%)
+FORC%=0TO7:N%(C%)=SCRIBE%(C%):NEXT
+PROCarrange_stave(SCRIBE%(stave%))
+IF PX%(EX%)+200*Hi%>S_Width% PROCSetExtent(PX%(EX%)+200*Hi%)
+PROCChangedScore
+SYS "Hourglass_Off"
+ENDPROC
+
+DEF PROCput_note
+LOCALL%,E%
+L%=SCRIBE%(line%)
+IFX%=PX%(PX%+1) THEN
+IFs%>=rest% L%=-16
+E%=GP%=EP%
+IFE% PROCinsert_gate(1) ELSEC%=FNconflict(Note%,S%,L%)
+IFE%ORC%=TRUE THEN
+C%=FNallocate_channel(S%)
+IFC%>=0 THEN
+PROCinsert_note(C%)
+PROCnote_type(C%,s%AND7)
+IFs%<rest% PROCnote_line(C%,L%):PROCnote_stem(C%,s%AND8)
+s%=!N%(C%)
+IFE% PROCset_score(PX%):X%=PX%(PX%+1)
+PROCupdate_note(S%,s%,X%,Y%)
+ENDIF
+ELSE
+s%=!N%(C%)
+PROCdelete_note(C%)
+IF?GP% THEN
+PROCupdate_note(S%,s%,X%,Y%)
+ELSE
+PROCdelete_gate(1)
+IFGP%?-2=0 WHILE?GP%=0ANDGP%<EP%:PROCdelete_gate(2):ENDWHILE
+PROCrescore(PX%)
+ENDIF
+ENDIF
+ELSE
+IFX%>PX%(PX%+1) PROCskip_gate
+PROCinsert_gate(1)
+C%=FNallocate_channel(S%)
+PROCinsert_note(C%)
+PROCnote_type(C%,s%AND7)
+IFs%<rest% PROCnote_line(C%,L%):PROCnote_stem(C%,s%AND8)
+PROCrescore(PX%)
+ENDIF
+ENDPROC
+
+DEF PROCput_tie
+IF?N%(C%)AND4 THEN
+PROCnote_tie(C%,FALSE)
+PROCupdate_score(X%+24,Y%+12,X%+70,Y%+24)
+ELSE
+LOCALI%
+PROCnote_tie(C%,TRUE)
+PROCskip_notes(?GP%):GP%+=1
+PROCarrange_stave(S%)
+GP%=SCRIBE%(sgp%)
+FORI%=0TO7:N%(I%)=SCRIBE%(I%):NEXT
+IFN%(C%)+2>=FINE%(C%)OR(?N%(C%)EORN%(C%)?2)AND&F8 PROCnote_tie(C%,FALSE) ELSEPROCupdate_score(X%+24,Y%+12,X%+70,Y%+24)
+ENDIF
+ENDPROC
+
+DEF PROCput_accidental
+LOCALA%,a%
+a%=N%(C%)?1AND7
+A%=s%AND7
+IFA%=a% A%=0
+PROCnote_accidental(C%,A%)
+IFA%*a% PROCupdate_score(X%-34,Y%-24,X%+16,Y%+52) ELSEPROCrescore(PX%)
+ENDPROC
+
+DEF PROCput_dot
+LOCALD%,d%
+d%=N%(C%)?1>>3AND3
+D%=s%AND3
+IFD%=d% D%=0
+PROCnote_dots(C%,D%)
+IFD%*d% THEN
+s%=N%(C%)?1>>5OR?N%(C%)<<3AND8:IF?N%(C%)AND&F8 ELSEs%=s%ORrest%
+X%+=x%(s%)
+PROCupdate_score(X%+24,Y%-8,X%+50,Y%)
+ELSE
+PROCrescore(PX%)
+ENDIF
+ENDPROC
+
+DEF PROCput_clef
+LOCALc%
+c%=s%AND3
+IFGP%=EP%OR?GP%OR(GP%?1AND%111)<>Clef% THEN
+PROCinsert_gate(2)
+PROCclef(S%,c%)
+ELSE
+WHILE ?GP%=0AND(GP%?1AND%111)=Clef%AND(GP%?1>>6)<>S%ANDGP%<EP%
+PROCskip_gate
+ENDWHILE
+IFGP%<EP%AND?GP%=0AND(GP%?1AND%111)=Clef%AND(GP%?1>>6)=S% THEN
+IF(GP%?1>>3AND3)<>c% PROCclef(S%,c%) ELSEPROCdelete_gate(2)
+ELSE
+PROCinsert_gate(2)
+PROCclef(S%,c%)
+ENDIF
+ENDIF
+PROCrescore(PX%)
+ENDPROC
+
+DEF PROCput_key
+IFGP%=EP%OR?GP%OR(GP%?1AND%11)<>Key% THEN
+PROCinsert_gate(2)
+PROCkey_sig(KEY_SIG%(0),KEY_SIG%(1))
+ELSE
+IFKEY_SIG%(1)>0AND(GP%?1>>2AND%1)<>KEY_SIG%(0)OR(GP%?1>>3)<>KEY_SIG%(1) PROCkey_sig(KEY_SIG%(0),KEY_SIG%(1)) ELSEPROCdelete_gate(2)
+ENDIF
+PROCrescore(PX%)
+ENDPROC
+
+DEF PROCput_time
+IFGP%=EP%OR?GP%OR(GP%?1AND%1)<>Time% THEN
+PROCinsert_gate(2)
+PROCtime_sig(TIME_SIG%(0),TIME_SIG%(1))
+PROCrescore(PX%)
+ELSE
+IF(GP%?1>>1AND15)<>TIME_SIG%(0)OR(GP%?1>>5)<>TIME_SIG%(1) THEN
+PROCtime_sig(TIME_SIG%(0),TIME_SIG%(1))
+PROCupdate_score(X%,-Score_Height%,X%+48,0)
+ELSE
+PROCdelete_gate(2)
+PROCrescore(PX%)
+ENDIF
+ENDIF
+ENDPROC
+
+DEF PROCput_bar
+IF (?GP% OR (GP%?1 AND %111111)<>Bar%) AND X%>PX%(PX%+1) AND GP%<EP% THEN
+  PROCskip_gate
+ELSE
+  IF GP%?-2=0 AND (GP%?-1 AND %111111)=Bar% THEN PROCback_gate
+ENDIF
+IF GP%>MUSIC% THEN
+  IF GP%<EP% AND ?GP%=0 AND (GP%?1 AND %111111)=Bar% THEN
+    PROCdelete_gate(2)
+    NBars%-=1
+    WHILE ?GP%=0 AND GP%<EP%
+      PROCdelete_gate(2)
+    ENDWHILE
+    PROCrescore(PX%)
+  ELSE
+    IF GP%?-2 THEN
+      PROCinsert_gate(2)
+      PROCbar
+      NBars%+=1
+      PROCrescore(PX%)
+    ENDIF
+  ENDIF
+ENDIF
+ENDPROC
+
+DEF PROCrescore(px%)
+IFpx% ELSEPROCstart_music:REM Bar position assumed set, but reset if px%=0
+PROCset_score(px%)
+IF px%=0 PROCSetupBarStarts(0) ELSE PROCSetupBarStarts(FNFindBar(px%))
+PROCupdate_score(PX%(px%),-Score_Height%,Score_Width%,0)
+ENDPROC
+
+DEF PROCupdate_note(S%,N%,X%,Y%)
+LOCALlx0%,lx1%,ly0%,ly1%
+PROCbound_note(N%):REM Get minimum bounding rectangle of note
+IFN%AND4 lx1%=X%(tie%):IFY%(tie%)>ly1% ly1%=Y%(tie%):REM Tie sets suffix and may be higher (Tie bounds only apply to updating)
+IFABS(Y%-Y_STAVE%(S%))>Li%*5 THEN
+IFx%(dot%)>lx0% lx0%=x%(dot%)
+IFX%(dot%)>lx1% lx1%=X%(dot%):REM Extend to ledger extent
+ENDIF
+ly1%+=Y%:Y%-=ly0%:ly0%=Y_STAVE%(S%):REM Stave position
+IFly1%<ly0%-Li%*5 ly1%=ly0%-Li%*5 ELSEIFY%>ly0%+Li%*5 Y%=ly0%+Li%*5:REM If ledger lines will be drawn increase vertical update space
+PROCupdate_score(X%-lx0%,Y%,X%+lx1%+Pgap%,ly1%):REM Update symbol space
+ENDPROC
+
+DEF PROCattach(s%,V%)
+SCRIBE%(sx%)=TRUE:REM New position (Maintain Y for orientation maintainance)
+SCRIBE%(drawn%)=FALSE
+IFs%<rest%ANDSCRIBE%(sprite%)<rest% s%=s%AND7ORSCRIBE%(sprite%)AND8:REM Maintain note orientation
+SCRIBE%(sprite%)=s%
+SCRIBE%(valid%)=V%
+SCORING%=TRUE
+ENDPROC
+
+DEF PROCrelease
+IF SCORING% AND SCRIBE%(drawn%) THEN
+  REM Undraw sprite
+  PROCfloat(SCRIBE%(sprite%),SCRIBE%(sx%),SCRIBE%(sy%))
+  IF SCRIBE%(sprite%)<rest% THEN
+    IF ABSSCRIBE%(line%)>5 THEN
+      REM Undraw ledger lines
+      PROCfloat(ledger%+SCRIBE%(line%)DIV2,SCRIBE%(sx%),Y_STAVE%(SCRIBE%(stave%)))
+    ENDIF
+  ENDIF
+  SCRIBE%(sx%)=TRUE:REM Continue drawing of symbol
+  SCRIBE%(drawn%)=FALSE
+ENDIF
+ENDPROC
+
+REM   PROCEDURE: scribe(At X%,Y%)
+REM
+REM DESCRIPTION: Draw current music symbol at position over score window
+:
+DEF PROCscribe(X%,Y%)
+LOCALS%,L%,C%
+Window%!handle%=ScoreWind_h%
+SYS "Wimp_GetWindowState",,Window%+handle%
+X%-=Window%!x0%-Window%!scx%
+Y%-=Window%!y1%-Window%!scy%
+PROCproximate(SCRIBE%(valid%))
+IFX%<>SCRIBE%(sx%)ORY%<>SCRIBE%(sy%) THEN
+LOCALA%
+A%=TRUE
+IF(SCRIBE%(valid%)AND112)=96 A%=FALSE:IFC%>=0 A%=SCRIBE%(valid%)AND8ORS%<=STAVE%AND?N%(C%)AND&F8
+IFA% THEN
+IFSCRIBE%(drawn%) THEN
+PROCfloat(SCRIBE%(sprite%),SCRIBE%(sx%),SCRIBE%(sy%))
+IFSCRIBE%(sprite%)<rest% IFABSSCRIBE%(line%)>5 PROCfloat(ledger%+SCRIBE%(line%)DIV2,SCRIBE%(sx%),Y_STAVE%(SCRIBE%(stave%)))
+ELSE
+SCRIBE%(drawn%)=TRUE
+ENDIF
+IFSCRIBE%(sprite%)<rest% THEN
+IFABSL%>5 PROCfloat(ledger%+L%DIV2,X%,Y_STAVE%(S%))
+IFY%<>SCRIBE%(sy%) SCRIBE%(sprite%)=SCRIBE%(sprite%)AND7OR8ANDY%>SCRIBE%(sy%)
+ENDIF
+SCRIBE%(sx%)=X%
+SCRIBE%(sy%)=Y%
+SCRIBE%(stave%)=S%
+IFS%<=Max_Stave% SCRIBE%(sclef%)=CLEF%(S%) ELSESCRIBE%(sclef%)=CLEF%(Max_Stave%)
+SCRIBE%(line%)=L%
+SCRIBE%(posx%)=PX%
+SCRIBE%(sgp%)=GP%
+SCRIBE%(sc%)=C%
+FORC%=0TO7:SCRIBE%(C%)=N%(C%):NEXT
+PROCfloat(SCRIBE%(sprite%),X%,Y%)
+ENDIF
+ENDIF
+ENDPROC
+::
+REM   PROCEDURE: proximate(Positions valid mask V%)
+REM
+REM DESCRIPTION: Will set X%,Y% to be the nearest valid position to the point
+REM              X%,Y% supplied (all in stave coordinates) and return the
+REM              associated position index PX%.
+REM
+REM              A mask is supplied to indicate the valid positions:
+REM              V% bit  0 -> Valid Time signature positions
+REM                      1 -> Valid Key signature positions
+REM                      2 -> Valid Clef positions
+REM                      3 -> At note positions
+REM                      4 -> In between notes
+REM                      5 -> To nearest stave line (else nearest stave)
+REM                      6 -> To nearest symbol present
+REM                      7 -> On bar line if near
+REM
+REM   EFFECTS: Sets S%=Stave, L%=Line(-15..15), C%=Channel of note, GP%,N%()=Gate & note pointers, PX%=PX%() index, X%,Y% position
+:
+DEF PROCproximate(V%):REM (V%, var X%,Y%) = (S%,L%,PX%)
+LOCALd%,D%:REM Distance previous&current
+LOCALpx%,x%:REM Previous PX%, Between note X position
+LOCALgp%:REM Previous gate pointer, key sig
+IF NBars%>4 THEN BAR%=LHBAR% ELSE BAR%=0
+PROCGetBarInfo(BAR%) : REM Start from start of page
+D%=4*S_Width%:REM A suitably excessive distance
+IF V%AND7 THEN
+LOCALT%:REM Type mask
+X%-=X%(clef%)>>1:REM Pointer points to centre of Clef/Key/Time
+T%=-V%<<1AND6:REM Valid Clef/Key/Time: Work out types to ignore after bars
+REPEAT
+PROCsavp:REM Save previous distance, pointers etc
+REPEATPROCskip_gate:UNTILPTYPE%(PX%)ANDBar%ORGP%=EP%:REM Move to next bar PX%
+IFPTYPE%(PX%)ANDBar% THEN
+WHILEPTYPE%(PX%+1)ANDT%ANDGP%<EP%
+REPEATPROCskip_gate:UNTILGP%=EP%ORGP%?1AND%111EOR%100:REM Skip ALL clefs
+ENDWHILE:REM Skipping any T% types
+D%=ABS(X%-PX%(PX%+1)):REM Calculate distance to this position
+ELSE
+D%=2*S_Width%:REM No more bars
+ENDIF
+UNTILD%>d%ORGP%=EP%:REM Until distance increases or no more positions
+IFd%<D% PROCrstp:REM Previous position may be closer
+X%=PX%(PX%+1):REM Set as position
+ELSE
+X%-=X%(2)>>1:REM Pointer points to centre of note
+REPEAT
+PROCsavp:REM Save previous distance, pointers etc
+PROCskip_gate:REM Next symbol
+WHILEPTYPE%(PX%+1)ANDGP%<EP%:PROCskip_gate:ENDWHILE:REM Skip any attribute types
+D%=ABS(X%-PX%(PX%+1)):REM Calculate distance to this note position
+UNTILD%>d%ORGP%=EP%:REM Until distance increases or no more notes
+IFd%<D%ORGP%=EP%ANDV%AND64 PROCrstp:REM Previous position may be closer (or the last valid note position for an accidental/dot to appear)
+IFV%AND16ANDGP%<EP% THEN
+REM Valid between notes (if before last position)
+IFX%<PX%(PX%+1)ORX%>PX%(EX%) THEN
+IFPTYPE%(PX%) x%=PX%(PX%)+PW%(PX%)-X%(2) ELSEx%=PX%(PX%):REM Before current: between previous. (also if after last note)
+x%=x%+PX%(PX%+1)>>1
+IFV%AND128 x%+=Hi%*4:IFPTYPE%(PX%)=Bar% x%=PX%(PX%)
+ELSE
+x%=PX%(PX%+1)+PX%(PX%+2)>>1:REM After current: between next.
+IFV%AND128 x%+=Hi%*4:IFPTYPE%(PX%+2)=Bar% x%=PX%(PX%+2)
+ENDIF
+IFV%AND8ANDABS(PX%(PX%+1)-X%)<ABS(x%-X%) X%=PX%(PX%+1) ELSEX%=x%:REM If on notes also valid then find closest position
+ELSE
+X%=PX%(PX%+1):REM Only at notes valid: closest position
+ENDIF
+ENDIF
+C%=-1:REM Initially no channel
+L%=0:REM Initially centre line
+IFV%AND64AND?GP%>0 THEN
+REM To nearest symbol at gate (just note at the moment !!)
+LOCALG%,c%:REM Gate mask copy, Previous channel counter
+c%=C%
+d%=2*S_Height%:REM A suitably excessive distance
+G%=?GP%
+REPEAT
+REPEATC%-=TRUE:UNTILG%AND%1<<C%
+D%=Y%-Y_STAVE%(S_C%(C%))
+IF?N%(C%)AND&F8 D%=ABS(D%-Li%*((?N%(C%)>>3)-16)) ELSED%=ABSD%:REM Distance to note/rest
+IFD%<d% d%=D%:c%=C%
+UNTIL(2<<C%)>G%
+C%=c%:REM Nearest note
+S%=S_C%(C%)
+IF?N%(C%)AND&F8 L%=(?N%(C%)>>3)-16
+ELSE
+LOCALMS%:REM Highest stave number
+MS%=STAVE%:IFV%AND6 ELSEMS%+=PERC%:REM Clef & Key not on percussion.
+S%=-1:REM Before first stave
+D%=2*S_Height%:REM A suitably excessive distance
+REPEAT
+d%=D%:REM Copy previous distance
+S%+=1:REM Next stave
+D%=ABS(Y%-Y_STAVE%(S%)):REM Distance between point and current stave
+UNTILD%>d%ORS%=MS%:REM Until distance increases or no more staves
+S%+=d%<D%:REM Previous stave was closest unless last&current stave is nearer
+IFV%AND32THEN
+IFS%=STAVE%+1 S%+=Y%>=Y_STAVE%(STAVE%)-Li%*16:REM Ledger lines take priority over percussion lines
+IFS%<=STAVE% THEN
+L%=(Y%-Y_STAVE%(S%))/Li%+16.75:L%-=16:REM Y% is L% Lines away from centre stave
+IFABSL%>15 L%=15*SGNL%:REM No further than 15 lines away
+ENDIF
+ENDIF
+ENDIF
+Y%=Y_STAVE%(S%)+L%*Li%:REM Centre line + offset
+ENDPROC
+::
+
+DEF PROCsavp:n%()=N%():d%=D%:px%=PX%:gp%=GP%:clef%()=CLEF%():sig%()=SIG%():ENDPROC
+
+DEF PROCrstp:N%()=n%():PX%=px%:GP%=gp%:CLEF%()=clef%():SIG%()=sig%():ENDPROC
+
+DEF PROCSetTempo (t%)
+Tempo%=t%
+SYS "Sound_QTempo",Tempo%(t%)*128*4096 DIV 6000
+PROCwimp_radiotick(TempoMenu%,t%)
+ENDPROC
+
+DEF PROCSetVolume (v%)
+SYS "Sound_Volume",Volume%(v%)
+PROCwimp_radiotick(VolumeMenu%,v%)
+ENDPROC
+
+DEF PROCSetKeySig (m%,k%)
+LOCAL n%
+KEY_SIG%(0)=(k%>=7)+1
+KEY_SIG%(1)=ABS(k%-7)    
+IF KEY_SIG%(1) THEN
+  n%=accidental%+2+KEY_SIG%(0)
+  X%(key%)=(x%(n%)+X%(n%))*KEY_SIG%(1)
+ELSE
+  X%(key%)=x%(accidental%+2)+X%(accidental%+2)
+ENDIF
+PROCwimp_radiotick(KeyMenu%,m%)
+CASE m% OF
+  WHEN 0:REM Major menu      
+    PROCwimp_radiotick(MajorMenu%,k%)
+    PROCwimp_radiotick(MinorMenu%,-1)
+  WHEN 1:REM Minor menu
+    PROCwimp_radiotick(MajorMenu%,-1)
+    PROCwimp_radiotick(MinorMenu%,k%)
+ENDCASE
+ENDPROC  
+
+DEF PROCSetTimeSig (n%,b%)
+TIME_SIG%(0)=n%
+TIME_SIG%(1)=b%
+PROCwimp_seticonval(SharpsPane_h%,21,"S"+STR$(TIME_SIG%(0)+1))
+PROCwimp_seticonval(SharpsPane_h%,22,"S"+STR$(2^(TIME_SIG%(1)-1)))
+ENDPROC
+
+REM given x position, return number of bar
+DEF FNFindBar(xpos%)
+LOCAL bar%
+bar%=0
+WHILE PX%(PXn%(bar%))<xpos% AND bar%<=NBars%:bar%+=1:ENDWHILE
+IF bar%>0 bar%-=1
+=bar%
+
+REM // Play //
+
+DEF PROCplay_start
+LOCALC%,n%
+SYS "Sound_Configure",8
+REM set play start bar PBAR% to start of currently displayed window (scx%)
+Window%!handle%=ScoreWind_h%
+SYS "Wimp_GetWindowState",,Window%+handle%
+PBAR%=FNFindBar(Window%!scx%)
+PP%=GPn%(PBAR%)
+FOR n%=0 TO 7
+ P%(n%)=BPn%(n%,PBAR%)
+ NEXT
+FORC%=0TO3
+PCLEF%(C%)=Clef%(CLEFn%(C%,PBAR%))
+NEXT
+PROCplay_key_sig(SIGn%(1,PBAR%))
+PLAYING%=TRUE
+SCROLLING%=TRUE
+Beats%=((SIGn%(0,PBAR%)>>1AND&F)+1)*Length%(SIGn%(0,PBAR%)>>3AND%11100)
+Q%()=Beats%
+TIE%=&FF
+B2%=&10000
+SYS "Sound_QBeat",Beats%
+SYS "Sound_QSchedule",Beats%,Sch% OR Sound_QTempo%,Tempo%(Tempo%)*128*4096DIV6000
+C%=Beats%/50*&1000:IFC%>&7FFF C%=&7FFF
+SYS "Sound_QTempo",C%
+MIDI_OFF%(0,0) = -1
+MIDI_OFF%(1,0) = -1
+PROCwimp_setmenustate(MainMenu%,3,0,TRUE)
+PROCwimp_setmenustate(EditMenu%,0,22,TRUE)
+ENDPROC
+
+REM flush sound queue and ensure note_offs are sent to midi channels
+DEFPROCplay_stop
+LOCAL note%, n%
+PLAYING%=FALSE
+SYS "Sound_QInit"
+REM Handle MIDI
+IF OutputType%=1 THEN
+ FOR n%=0 TO 1
+  note%=0
+  WHILE (MIDI_OFF%(n%,note%) > 0)
+   SYS MIDI_TxCommand%, MIDI_OFF%(n%,note%)
+   note%+=1
+   ENDWHILE
+  NEXT
+ REM reset end markers
+ MIDI_OFF%(0,0) = -1
+ MIDI_OFF%(1,0) = -1
+ENDIF
+PROCwimp_setmenustate(MainMenu%,3,0,FALSE)
+PROCwimp_setmenustate(EditMenu%,0,22,FALSE)
+ENDPROC
+
+REM This should give a reasonable approximation to a smooth scroll
+DEF PROCCheckScroll
+LOCAL PosX%, WindowWidth%, BarPos%, LastScroll%,ThisScroll%
+IF ScoreClosed% THEN
+ IF NOT PLAYING% SCROLLING%=FALSE
+ ENDPROC
+ ENDIF
+IF PBAR%<=2 ENDPROC
+IF PLAYING% PROCCheckQ
+IF PLAYING% SBAR%=PBAR%-2 ELSE B1%=B2%:B2%=BEAT:IFB2%<B1%:SBAR%+=1
+IF SBAR%>=NBars% OR SBAR%>PBAR%+2 SCROLLING%=FALSE:PROCplay_stop:ENDPROC
+Block%!0=ScoreWind_h%
+SYS "Wimp_GetWindowState",,Block%
+WindowWidth%=Block%!12-Block%!4
+LastScroll%=Block%!20
+PosX%=PX%(PXn%(SBAR%))
+BarPos%=(PX%(PXn%(SBAR%+1))-PosX%)*BEAT DIV Beats%
+IF BarPos%*2<Pgap% ENDPROC :REM if small amount into bar can scroll to wrong bar (sync with play)
+PosX%+=BarPos%
+ThisScroll% = PosX%-WindowWidth%DIV2
+IF ThisScroll%<=0 ENDPROC
+IF ThisScroll%<>LastScroll% THEN
+ REM auto-scroll
+ REM divide scroll into small bits to make it appear smooth
+ Block%!20=(LastScroll%+ThisScroll%)/2
+ SYS "Wimp_OpenWindow",,Block%
+ Block%!20=ThisScroll%
+ OldX%=ThisScroll%
+ SYS "Wimp_OpenWindow",,Block%
+ LHBAR%=FNFindBar(ThisScroll%)-1 :REM the bar number at the left of the window
+ IF PLAYING%=FALSE THEN
+   REM stop scrolling at end of music
+   IF Block%!20<=LastScroll% THEN SCROLLING%=FALSE   
+ ENDIF
+ENDIF
+ENDPROC
+
+DEF PROCplay_bar
+LOCALC%,L%,I%,D%,S%,Q%,T%,B%,A%:REM Vars for play_bar & play_notes
+LOCAL f
+MIDI_Notenum%=0
+Q%()=Beats%:REM Reset stave queue counters for next bar
+B%=PBAR%
+Accidental%()=0:REM No incidental accidentals initially
+First%=TRUE
+WHILEB%=PBAR%ANDPP%<GATE%
+IF?PP% PROCplay_notes(?PP%):PP%+=1 ELSEPROCplay_attribute(PP%?1):PP%+=2
+First%=FALSE
+ENDWHILE
+IFPP%>=GATE% THEN
+  PLAYING%=FALSE:SBAR%+=1
+  PROCwimp_setmenustate(MainMenu%,3,0,FALSE)
+  PROCwimp_setmenustate(EditMenu%,0,22,FALSE)
+ENDIF
+ENDPROC
+
+REM Notes for each gate start playing at Q%; the latest Q%() of the staves on
+REM which notes are to play. This is because all notes in a gate play at the
+REM same time and cannot start before the shortest of the notes preceding them
+REM have finished.
+REM Q% is the time at which the notes in the gate are played
+REM Q%(S%) is the time at the end of the shortest note played on stave S%.
+REM QI%(S%) is the current shortest note beats interval on stave S%
+
+DEF PROCplay_notes(G%)
+LOCAL note%, packed%, Qoff%,xtraVol,tempo
+tempo = 5 * 128 * Tempo%(Tempo%) / 6000
+Q%=FALSE:C%=TRUE
+REPEATREPEATC%-=TRUE:UNTILG%AND%1<<C%
+IFQ%(S_C%(C%))>Q% Q%=Q%(S_C%(C%))
+UNTIL(2<<C%)>G%
+QI%()=&10000:C%=TRUE
+REPEAT
+  IF First% xtraVol=1.01 ELSE xtraVol=1.0 :REM a little dynamics. stress 1st beat in bar very slightly
+  REPEATC%-=TRUE:UNTILG%AND%1<<C%
+  IF INT(xtraVol*Volume%(Volumes%(C%)))>&7F xtraVol=1.0  :REM ensure no overflow
+  T%=?P%(C%):D%=P%(C%)?1:I%=D%>>3:S%=S_C%(C%):L%=T%>>3:A%=0
+  IFL%ANDS%<=STAVE% THEN
+    IFD%AND7 Accidental%(S%,L%)=D%AND7
+    A%=Accidental%(S%,L%):L%+=PCLEF%(S%):IFA% ELSEA%=Key%(L%MOD7):REM If no accidental then revert to key signature
+  ENDIF
+  IFTIE%AND%1<<C% THEN
+    D%=Duration%(Tempo%)?I%:IFT%AND4 TIE%=TIE%ANDNOT(%1<<C%):T%=P%(C%)+1:REPEATT%+=2:D%+=Duration%(Tempo%)?(?T%>>3):UNTILT%>FINE%(C%)OR4ANDNOTT%?TRUE:IFD%>254 D%=254
+    IFL% THEN
+      REM Internal sound system
+      IF OutputType%=0 THEN
+        SOUNDC%+1,INT(xtraVol*Volume%(Volumes%(C%)))OR&100,Line(L%)+Aoff(A%),D%,Q%
+      ENDIF
+      REM MIDI
+      IF OutputType%=1 THEN
+        note% = 12 + INT(((Line(L%)+Aoff(A%))/&1000) * 12)
+        packed% = (MIDIChannel%(C%)-1) OR (note%<<8) OR INT(xtraVol*(Volume%(Volumes%(C%)))<<16)
+        MIDI_OFF%(PBAR%MOD2,MIDI_Notenum%) = M_NoteOff% OR packed%
+        MIDI_Notenum% += 1
+        MIDI_OFF%(PBAR%MOD2,MIDI_Notenum%) = -1 :REM end marker
+        REM D% = no. of 5 centisecs
+        Qoff% = Q% + D% * tempo
+        IF Qoff% > Q% + 15 Qoff% -= 10  :REM ensure note is off after start and before next note start
+        SYS "Sound_QSchedule",Q%,    Sch% OR MIDI_TxCommand%, M_NoteOn%  OR packed%
+        SYS "Sound_QSchedule",Qoff%, Sch% OR MIDI_TxCommand%, M_NoteOff% OR packed%
+      ENDIF
+    ENDIF
+  ELSE
+    IF4ANDNOTT% TIE%=TIE%OR%1<<C%
+  ENDIF
+  P%(C%)+=2:IFLength%(I%)<QI%(S%) QI%(S%)=Length%(I%):Q%(S%)=Q%+QI%(S%)
+UNTIL(2<<C%)>G%
+ENDPROC
+
+DEF PROCplay_attribute(A%)
+C%=TRUE:REPEATC%-=TRUE:UNTILA%AND%1<<C%
+ONC%+1 PROCplay_time_sig(A%),PROCplay_key_sig(A%),PROCplay_clef(A%),PROCplay_slur(A%),PROCplay_octave(A%),PROCplay_bar_line(A%)
+ENDPROC
+
+DEF PROCplay_time_sig(A%)
+A%=((A%>>1AND&F)+1)*Length%(A%>>3AND%11100)
+SYS "Sound_QSchedule",Beats%,Sch% OR Sound_QBeat%,A%
+Beats%=A%
+ENDPROC
+
+DEF PROCplay_key_sig(A%)
+LOCALN%:A%=A%>>2
+FORN%=0TO6:Key%(N%)=Key_Sig%(A%,N%):NEXT
+ENDPROC
+
+DEF PROCplay_clef(A%)
+PCLEF%(A%>>6)=Clef%(A%>>3AND3)
+ENDPROC
+
+DEF PROCplay_slur(A%)
+ENDPROC
+
+DEF PROCplay_octave(A%)
+ENDPROC
+
+DEF PROCplay_bar_line(A%)
+PBAR%+=1
+ENDPROC
+
+DEF FNinitialise
+LOCAL SoundEnable%
+PROCEnumerateSWIs
+PROCinitialise_miscellany
+PROCinitialise_screen
+PROCinitialise_sprites
+PROCinitialise_music
+PROCinitialise_wimp
+PROCinitialise_menu
+SoundEnable%=FNinitialise_sound
+IF SoundEnable%=1 IF NOT FNCheckOKTag("NoSoundQuit", 3) PROCterminate
+REM Set up the defaults for an empty score: Cmaj, 4/4, FF, Moderato
+PROCClearAllMusic
+PROCSetKeySig(0,7)
+PROCSetTimeSig(3,3)
+PROCSetVolume(6)
+PROCSetTempo(8)
+REM Set Toolbar defaults
+ClefType%=0     :REM Treble clef
+BarlineType%=0  :REM Single barline
+REM Set up channels
+PROCSetDefaultChannels
+=TRUE
+
+DEF PROCEnumerateSWIs
+Sch%=&0F000000 : REM SWI number mask for QSchedule SWI
+Sound_QTempo%=&401C5
+Sound_QBeat%=&401C6
+LOCAL M%
+LOCAL ERROR
+ON ERROR LOCAL MIDIpresent%=FALSE : ENDPROC
+SYS "OS_SWINumberFromString",0,"MIDI_SoundEnable" TO M%
+M_NoteOff% = &80
+M_NoteOn%  = &90
+MIDI_SoundEnable%        = M%
+MIDI_SetTxChannel%       = M% + 2
+MIDI_SetTxActiveSensing% = M% + 3
+MIDI_TxCommand%          = M% + 10
+MIDI_TxLocalControl%     = M% + 15
+MIDI_TxOmniModeOff%      = M% + 17
+MIDI_TxOmniModeOn%       = M% + 18
+MIDI_TxMonoModeOn%       = M% + 19
+MIDI_TxPolyModeOn%       = M% + 20
+MIDI_TxProgramChange%    = M% + 21
+MIDI_TxSystemReset%      = M% + 30
+MIDIpresent%=TRUE : REM Disable untested MIDI bits
+ENDPROC
+
+DEF PROCinitialise_miscellany
+DIM Block% 255
+TIME=0
+AwaitingAck%=FALSE
+SAVING%=FALSE
+load_pending% = FALSE
+pending_filename$ = ""
+ret_code% = -1
+doing_scrap_load%=FALSE : REM Used to indicate that we're loading from another application
+INITIALISED%=FALSE
+shutdown% = FALSE
+quit_sender% = 0
+my_ref% = -1 : REM unset
+CHANGED%=FALSE
+FILE%=FALSE
+REM File attributes
+F$=FNmessage_lookup(Messages_h%,"Untitled")
+MusicFileType%=&AF1
+DIM ftime% 5
+ENDPROC
+
+DEF PROCinitialise_screen
+DIM modeblockin  40
+DIM modeblockout 40
+PROCgetmodeinfo(TRUE)
+ENDPROC
+
+DEF PROCgetmodeinfo(new%)
+
+  LOCAL S_Rows%, S_Columns%
+
+  modeblockin!0=0 : REM ModeFlags
+  modeblockin!4=1 : REM ScrRCol
+  modeblockin!8=2 : REM ScrBCol
+  modeblockin!12=3 : REM NColour
+  modeblockin!16=4 : REM XEigFactor
+  modeblockin!20=5 : REM YEigFactor
+  modeblockin!24=11 : REM XWindLimit
+  modeblockin!28=12 : REM YWindLimit
+  modeblockin!32=-1 : REM terminate list
+
+  SYS "OS_ReadVduVariables",modeblockin, modeblockout
+  REM no point in reading sizes since they are fixed by the wimp
+  Hi%=1<<(modeblockout!16)
+  Vi%=1<<(modeblockout!20)
+  S_Width%=Hi% * ((modeblockout!24)+1)
+  S_Height%=Vi% * ((modeblockout!28)+1)
+  Hi%=2: Vi%=4
+  C_Width%=8*Hi% : C_Height%=8*Vi%
+
+  IF new%=FALSE THEN
+    SYS "Wimp_ReadPixTrans",&200,SprBlk%,S%(0),,,,factors%,pixtrans%
+    j%=7
+    FOR i%=0 TO 15
+      fpixtrans%?i%=pixtrans%?j%
+      IF i%>6 THEN j%-=1
+    NEXT
+  ENDIF  
+  
+ENDPROC
+
+DEF PROCinitialise_sprites
+LOCAL path$,size%,file%,yeig%
+path$="<Maestro$Dir>.Sprites"
+SYS "OS_ReadModeVariable",-1,5 TO ,,yeig%
+IF yeig%=1 THEN path$=path$+"22"
+IF yeig%=0 THEN path$=path$+"11"
+file%=OPENIN path$
+size%=EXT#file%+16
+CLOSE#file%
+
+DIM SprBlk% size%
+SprBlk%!0=size%
+SprBlk%!8=16
+SYS "OS_SpriteOp",&109,SprBlk%
+SYS "OS_SpriteOp",&10A,SprBlk%,path$
+
+SprPlot% = &234  : REM sprite plot code
+LOCAL I%,x%,y%,W%,H%
+RESTORE
+Num%=-1
+READS$
+WHILES$<>""
+READx%,y%,W%,H%,S$
+Num%+=1
+ENDWHILE
+IFFNassert(Num%>=0,"SpriteLoad") STOP
+DIM S$(Num%),x%(Num%),y%(Num%),X%(Num%),Y%(Num%), S%(Num%) : REM S%() are sprite pointers
+RESTORE
+FORI%=0TONum%
+READ S$(I%),x%,y%,W%,H%
+SYS "OS_SpriteOp", 256+24, SprBlk%, S$(I%) TO ,,S%(I%) : REM get pointer to sprite
+x%(I%)=x%*Hi%
+y%(I%)=y%*Vi%
+X%(I%)=(W%-x%)*Hi%
+Y%(I%)=(H%-y%)*Vi%
+NEXT
+note%=0
+rest%=16
+accidental%=24
+clef%=32
+dot%=40
+ledger%=43
+tie%=44
+bar%=51
+time%=55
+key%=56
+SCORING%=FALSE:REM Flag indicating a sprite is to be drawn under the pointer
+wasSCORING%=FALSE
+stopSCORING%=TRUE
+DIM SCRIBE%(18):REM Details of symbol under pointer
+REM 0-7 Channel pointers into N%()
+sx%=8:REM Current sprite X position
+sy%=9:REM Current sprite Y position
+drawn%=10:REM Flag indicating sprite presence
+sprite%=11:REM Sprite number
+valid%=12:REM Valid stave positions
+stave%=13:REM Current stave symbol is on
+sclef%=14:REM Current clef applying to symbol (used for key sigs)
+line%=15:REM Current stave line symbol is on
+posx%=16:REM X music position
+sgp%=17:REM Symbol gate pointer
+sc%=18:REM Channel number if symbol specified close to note
+REM Set up sprite colours for fixed and floating objects
+DIM factors% 15
+DIM pixtrans% 15
+DIM fpixtrans% 15
+PROCgetmodeinfo(FALSE)
+ENDPROC
+REM name, x, y, w, h
+DATA B,7,3,24,6,SB,0,2,13,5,Mu,0,2,12,17,Cu,0,2,12,17
+DATA Qu,0,2,19,17,SQu,0,2,20,17,DSQu,0,2,20,17,SDSQu,0,2,20,17
+DATA B,7,3,24,6,SB,0,2,13,5,Md,0,14,12,17,Cd,0,14,12,17
+DATA Qd,0,14,12,17,SQd,0,14,12,17,DSQd,0,14,12,17,SDSQd,0,14,12,17
+DATA Rest,-1,0,8,8,Rest1,-1,-2,16,4,Rest2,-1,0,16,4,Rest4,-2,5,9,13
+DATA Rest8,-1,4,9,9,Rest16,0,6,12,13,Rest32,1,7,15,16,Rest64,2,9,18,19
+DATA Natural,8,6,7,12,Natural,8,6,7,12,Sharp,10,6,9,13,Flat,8,3,8,11
+DATA Sharp2,9,2,10,5,Flat2,14,3,16,11,NSharp,17,6,17,12,NFlat,15,6,16,14
+DATA Treble,0,14,23,31,Alto,0,8,23,17,Alto,0,4,23,17,Bass,0,5,24,14
+DATA ldg5,2,28,16,17,ldg4,2,24,16,13,ldg3,2,20,16,9,ldg2,2,16,16,5,ldg1,2,12,16,1
+DATA Dot1,-14,1,6,2,Dot2,-14,1,10,2,Dot3,-14,1,14,2,Tie,-12,-3,23,3,Tie,-12,-3,23,3
+DATA ldg1,2,-12,16,1,ldg2,2,-12,16,5,ldg3,2,-12,16,9,ldg4,2,-12,16,13,ldg5,2,-12,16,17
+DATA Bar,-1,8,1,17,DBar,-1,8,6,17,Bar,-1,8,1,17,Bar,-1,8,1,17
+DATA Time,1,9,25,19,Key,0,13,0,30
+DATA 2,3,0,14,8,3,3,0,14,8,4,3,0,14,8,5,3,0,14,8,6,3,0,14,8
+DATA 7,3,0,14,8,8,3,0,14,8,9,3,0,14,8,10,3,0,26,8,11,3,0,26,8
+DATA 12,3,0,26,8,13,3,0,26,8,14,3,0,26,8,15,3,0,26,8,16,3,0,26,8
+DATA ""
+
+DEF PROCinitialise_wimp
+PROCenumerate_wimp_offsets
+Block%!0=2
+Block%!4=3
+Block%!8=4
+Block%!12=5
+Block%!16=10
+Block%!20=&502
+Block%!24=&400C1
+Block%!28=11
+Block%!32=12
+Block%!36=8
+Block%!40=1
+Block%!44=&400C0
+Block%!48=0
+SYS "Wimp_Initialise",300,&4B534154,maestro$,Block% TO wimpversion%,Task_h%
+message_buffer%!0 = (32 + LEN(maestro$)) AND NOT(3)
+message_buffer%!12 = 0
+message_buffer%!16 = 11
+message_buffer%!20 = 7
+message_buffer%!24 = 0
+$(message_buffer%+28)=maestro$+CHR$(0)
+SYS "Wimp_SendMessage",17,message_buffer%,0
+REPEAT
+  SYS "Wimp_Poll",&1972,message_buffer% TO R%
+  IF R% = 17 OR R% = 18 OR R% = 19 THEN
+    IF message_buffer%!16 = 12 AND message_buffer%!20 = 7 THEN
+      R% = FNCheckOK($(message_buffer% + 28), 1)
+      PROCterminate
+    ENDIF
+  ENDIF
+UNTIL R% = 0
+DIM SpriteName% 14
+$SpriteName%=FNmessage_lookup (Messages_h%, "SpriteName")
+REM Create icon bar icon
+Block%!0=-1
+Block%!4=0
+Block%!8=0
+Block%!12=64
+Block%!16=68
+Block%!20=(&311A OR (0<<24) OR (7<<28))
+Block%!24=SpriteName%
+Block%!28=1
+Block%!32=12
+SYS "Wimp_CreateIcon",,Block% TO Maestro_h%
+PROCload_templates
+REM Block used for redrawing
+DIM RedrawBlock% 44
+REM Initialise various window settings
+OldX%=0
+FirstOpen%=TRUE
+PopUpIcon%=0
+null%=FNGetFileInfo("")
+ScoreClosed%=TRUE
+PROCUpdateTitle(F$)
+ScoreTitle$=F$
+PROCwimp_seticontext(ProgInfo_h%,3,FNmessage_lookup(Messages_h%,"_Version"))
+Block%!0=NotesPane_h%
+SYS "Wimp_GetWindowState",,Block%
+PaneHeight%=Block%!16-Block%!8
+SelW%=-1
+SelI%=-1
+PROCwimp_seticontext(Save_h%,1,FNmessage_lookup(Messages_h%,"MusicFile")+CHR$(0))
+ENDPROC
+
+DEF PROCenumerate_wimp_offsets
+Window%=Block%+4
+handle%=-4
+x0%=0:y0%=4:x1%=8:y1%=12
+scx%=16:scy%=20
+Clip%=Window%+24
+ENDPROC
+
+DEF PROCload_templates
+wblock%=FNwimp_opentemplates("<Maestro$Dir>.Templates")
+  ProgInfo_h%=FNwimp_loadtemplate("ProgInfo",wblock%,FALSE)
+  QuitQuery_h%=FNwimp_loadtemplate("query",wblock%,FALSE)
+  FileInfo_h%=FNwimp_loadtemplate("FileInfo",wblock%,FALSE)
+  TimeSig_h%=FNwimp_loadtemplate("TimeSigW",wblock%,FALSE) 
+  Bar_h%=FNwimp_loadtemplate("BarW",wblock%,FALSE)
+  ClearQuery_h%=FNwimp_loadtemplate("close",wblock%,FALSE)
+  ScoreWind_h%=FNwimp_loadtemplate("ScoreWind",wblock%,SprBlk%)
+  Print_h%=FNwimp_loadtemplate("print_db",wblock%,FALSE)
+  Save_h%=FNwimp_loadtemplate("xfer_send",wblock%,FALSE)
+  InstrWind_h%=FNwimp_loadtemplate("InstrWind",wblock%,SprBlk%)
+  SharpsPane_h%=FNwimp_loadtemplate("SharpsPane",wblock%,SprBlk%)
+  NotesPane_h%=FNwimp_loadtemplate("NotesPane",wblock%,SprBlk%)
+  Clef_h%=FNwimp_loadtemplate("ClefW",wblock%,SprBlk%)
+  Barline_h%=FNwimp_loadtemplate("BarLineW",wblock%,SprBlk%)
+  StaveWind_h%=FNwimp_loadtemplate("StaveWind",wblock%,FALSE)
+SYS "Wimp_CloseTemplate"
+ENDPROC  
+
+DEF PROCinitialise_menu
+LOCAL i%,f%
+VolumeMenu%=FNwimp_makemenu(FNmessage_lookup(Messages_h%,"Volume"),8)
+FOR i%=0 TO 7
+  IF i%<7 THEN f%=0 ELSE f%=128
+  PROCwimp_additem(VolumeMenu%,i%,f%,-1,FNmessage_lookup(Messages_h%,"V"+STR$(i%)))
+NEXT
+TempoMenu%=FNwimp_makemenu(FNmessage_lookup(Messages_h%,"Tempo"),15)
+FOR i%=0 TO 14
+  IF i%<14 THEN f%=0 ELSE f%=128
+  PROCwimp_additem(TempoMenu%,i%,f%,-1,FNmessage_lookup(Messages_h%,"T"+STR$(i%)))
+NEXT
+FileMenu%=FNwimp_makemenu(FNmessage_lookup(Messages_h%,"File"),3)
+PROCwimp_additem(FileMenu%,0,0,FileInfo_h%,FNmessage_lookup(Messages_h%,"FInfo"))
+PROCwimp_additem(FileMenu%,1,0,Save_h%,FNmessage_lookup(Messages_h%,"Save"))
+PROCwimp_additem(FileMenu%,2,136,Print_h%,FNmessage_lookup(Messages_h%,"Print"))
+EditMenu%=FNwimp_makemenu(FNmessage_lookup(Messages_h%,"Edit"),2)
+PROCwimp_additem(EditMenu%,0,8,Bar_h%,FNmessage_lookup(Messages_h%,"Goto"))
+PROCwimp_additem(EditMenu%,1,128,-1,FNmessage_lookup(Messages_h%,"Clear"))
+ScoreMenu%=FNwimp_makemenu(FNmessage_lookup(Messages_h%,"Score"),4)
+PROCwimp_additem(ScoreMenu%,0,0,-1,FNmessage_lookup(Messages_h%,"Staves"))
+PROCwimp_additem(ScoreMenu%,1,0,-1,FNmessage_lookup(Messages_h%,"Instruments"))
+PROCwimp_additem(ScoreMenu%,2,0,VolumeMenu%,FNmessage_lookup(Messages_h%,"Volume"))
+PROCwimp_additem(ScoreMenu%,3,128,TempoMenu%,FNmessage_lookup(Messages_h%,"Tempo"))
+MainMenu%=FNwimp_makemenu(FNmessage_lookup(Messages_h%,"Maestro"),4)
+PROCwimp_additem(MainMenu%,0,0,FileMenu%,FNmessage_lookup(Messages_h%,"File"))
+PROCwimp_additem(MainMenu%,1,0,EditMenu%,FNmessage_lookup(Messages_h%,"Edit"))
+PROCwimp_additem(MainMenu%,2,2,ScoreMenu%,FNmessage_lookup(Messages_h%,"Score"))
+PROCwimp_additem(MainMenu%,3,128,-1,FNmessage_lookup(Messages_h%,"Play"))
+IconMenu%=FNwimp_makemenu(FNmessage_lookup(Messages_h%,"Maestro"),3)
+PROCwimp_additem(IconMenu%,0,0,ProgInfo_h%,FNmessage_lookup(Messages_h%,"Info"))
+PROCwimp_additem(IconMenu%,1,0,-1,FNmessage_lookup(Messages_h%,"Help"))
+PROCwimp_additem(IconMenu%,2,128,-1,FNmessage_lookup(Messages_h%,"Quit"))
+ChannelMenu%=FNwimp_makemenu(FNmessage_lookup(Messages_h%,"Channel"),16)
+FOR i%=0 TO 15
+  IF i%<15 THEN f%=0 ELSE f%=128
+  PROCwimp_additem(ChannelMenu%,i%,f%,-1,STR$(i%+1))
+NEXT
+VoiceMenu%=FNwimp_makemenu(FNmessage_lookup(Messages_h%,"Voices"),MAX_VOICES%-2)
+FOR i%=0 TO MAX_VOICES%-3
+  IF i%<MAX_VOICES%-3 THEN f%=0 ELSE f%=128
+  PROCwimp_additem(VoiceMenu%,i%,f%,-1,STRING$(32,"X"))
+NEXT
+OutputMenu%=FNwimp_makemenu(FNmessage_lookup(Messages_h%,"Output"),2)
+PROCwimp_additem(OutputMenu%,0,0,-1,FNmessage_lookup(Messages_h%,"OT0"))
+PROCwimp_additem(OutputMenu%,1,128,-1,FNmessage_lookup(Messages_h%,"OT1"))
+MajorMenu%=FNwimp_makemenu(FNmessage_lookup(Messages_h%,"Major"),15)
+FOR i%=0 TO 14
+  IF i%<14 THEN f%=0 ELSE f%=128
+  IF i%=6 OR i%=7 THEN f%=2
+  PROCwimp_additem(MajorMenu%,i%,f%,-1,FNmessage_lookup(Messages_h%,"MJ"+STR$(i%)))
+NEXT
+MinorMenu%=FNwimp_makemenu(FNmessage_lookup(Messages_h%,"Minor"),15)
+FOR i%=0 TO 14
+  IF i%<14 THEN f%=0 ELSE f%=128
+  IF i%=6 OR i%=7 THEN f%=2
+  PROCwimp_additem(MinorMenu%,i%,f%,-1,FNmessage_lookup(Messages_h%,"MN"+STR$(i%)))
+NEXT
+KeyMenu%=FNwimp_makemenu(FNmessage_lookup(Messages_h%,"KeySig"),2)
+PROCwimp_additem(KeyMenu%,0,0,MajorMenu%,FNmessage_lookup(Messages_h%,"Major"))
+PROCwimp_additem(KeyMenu%,1,128,MinorMenu%,FNmessage_lookup(Messages_h%,"Minor"))
+ENDPROC
+
+DEF FNinitialise_sound
+LOCAL SoundEnable%
+SYS "Sound_Configure",8 TO OldConfigure
+SYS "Sound_Enable",0 TO SoundEnable%
+REM disconnect midi interpreter
+IF MIDIpresent% THEN SYS MIDI_SoundEnable%,0
+=SoundEnable%
+
+DEF PROCClearAllMusic
+FINE%()=MUSIC%()
+PP%=MUSIC%:P%()=MUSIC%()
+NBars%=0 :REM number of bars
+BAR%=0:REM Current bar number
+PBAR%=0:REM Playing bar counter
+SBAR%=0:REM scrolling bar number
+PROCstart_music:REM Set pointers to start of music store
+EP%=GP%
+REM Set BarlineType to single
+BarlineType%=0
+PROCwimp_seticonval(SharpsPane_h%,13,"Ssbarline")
+PROCbar:REM Music always starts off with a bar
+GATE%=MUSIC%+2:REM End of minimum score
+PX%(0)=0:REM Score starts at left window edge
+PXn%(BAR%)=0
+PW%(0)=4*Hi%:REM Bar width
+PTYPE%(0)=Bar%:REM Score starts with a bar
+GP%=MUSIC%:REM Reset gate pointer for set score
+GPn%(BAR%)=GP%
+PROCrescore(0)
+PROCSetExtent(S_Width%)
+PROCrelease
+wasSCORING%=FALSE
+stopSCORING%=TRUE
+SCORING%=FALSE
+CHANGED%=FALSE
+PROCwimp_seticontext(FileInfo_h%,2,FNmessage_lookup(Messages_h%,"No"))
+PROCUpdateTitle(FNmessage_lookup(Messages_h%, "Untitled"))
+PROCwimp_seticontext(Save_h%,1,FNmessage_lookup(Messages_h%,"MusicFile")+CHR$(0))
+n=FNGetFileInfo("") :REM clear file info stuff
+ENDPROC
+
+REM   PROCEDURE: initialise_music
+REM
+REM  STRUCTURES: Queue of Gate;
+REM              Queue of Music;
+REM
+REM       TYPES:  Gate= byte0>0 -> Gate_Mask
+REM                     byte0=0 -> Music_Attribute
+REM
+REM          Gate_Mask= byte; bitn=1 -> gate 1 note/rest from music queue n (n=0-7)
+REM
+REM    Music_Attribute= word; bit0_7=0
+REM                             bit8=1 -> Time signature bit12_9 No. beats-1
+REM                                                      bit15_13 Beat type
+REM                             bit9=1 -> Key signature bit10 0-#, 1-b
+REM                                                     bit13_11 0-7
+REM                            bit10=1 -> Clef bit12_11 Treble,Alto,Tenor,Bass
+REM                                            bit15_14 Stave 1-4
+REM                            bit11=1 -> Slur switch bit12 on/off
+REM                                                   bit15_14 Stave 1-4
+REM                            bit12=1 -> Octave shift bit13 0-up,1-down
+REM                                                    bit15_14 Stave 1-4
+REM                            bit13=1 -> bar
+REM                         (bit13_0=0 -> Reserved)
+REM
+REM              Music= word; bit7_3>0 -> Note
+REM                           bit7_3=0 -> Rest
+REM
+REM               Note= word; bit0=     Stem orientation: 0-up,1-down
+REM                           bit1=1 -> Join barbs to next note
+REM                           bit2=1 -> Tie with next note
+REM                         bit7_3>0    Note stave line position 1 to 31 (16=centre line)
+REM                        bit10_8>0 -> Accidental N,#,b,X,bb,N#,Nb
+REM                       bit12_11=     Number of dots 0 to 3
+REM                       bit15_13=     Type: Breve to Semi-demi-semiquaver
+REM
+REM               Rest= word; bit0=0    NB If a rest coincides with a note, its
+REM                           bit1=0       position is determined by the
+REM                           bit2=0       following note on the same channel.
+REM                         bit7_3=0
+REM                        bit10_8=0
+REM                       bit12_11=     Number of dots 0 to 3
+REM                       bit15_13=     Type: Breve rest to Semi-demi-semiquaver rest
+REM
+REM      Position_type= 0 -> Note
+REM                     1 -> Time Signature
+REM                     2 -> Key Signature
+REM                     3 -> Clef
+REM                     4 -> Slur
+REM                     5 -> Octave shift
+REM                     6 -> Bar
+:
+DEF PROCinitialise_music
+LOCALN%,C%:REM Note,channel
+PROCinitialise_options
+Note%=0:Time%=1:Key%=2:Clef%=4:Slur%=8:Octave%=16:Bar%=32:REM Stave attribute enumerators
+DIM Ninc%(6),Line(42),Aoff(7),Clef%(3),Key%(6),Key_Sig%(15,6),Length%(31),Duration%(NTempos%),Accidental%(3,31)
+FORN%=0TO6:Ninc%(N%)=ASCMID$("024579;",N%+1)AND15:NEXT:REM Note increment
+LOCALST:ST=&1000/12:REM Semitone increment
+FORN%=0TO42
+Line(N%)=(1+N%DIV7<<12)+Ninc%(N%MOD7)*ST+.49
+NEXT:REM Notes corresponding to stave lines (C octave 1 TO C octave 7)
+Aoff(2)=ST:Aoff(3)=-ST:Aoff(4)=ST*2:Aoff(5)=-ST*2:Aoff(6)=ST:Aoff(7)=-ST:REM Accidental offsets
+Clef%(0)=11:Clef%(1)=5:Clef%(2)=3:Clef%(3)=-1:REM Line offsets for each clef
+FORC%=2TO15
+FORN%=0TO(C%>>1)-1
+Key_Sig%(C%,(7+Key_Y%(1,C%AND%1,N%))MOD7)=C%MOD2+2
+NEXT
+NEXT:REM Set up note offsets for each key signature
+FORC%=0TO31
+Length%(C%)=(%1<<7-(C%>>2))*(%1111000>>(C%AND3)AND%1111):REM Length of each possible note/rest (dotted) in tempo beats
+NEXT
+LOCALD%:REM Duration
+FORN%=0TONTempos%
+DIM C% 32:Duration%(N%)=C%:REM Reserve space for each tempo
+FORC%=0TO31
+D%=75/Tempo%(N%)*Length%(C%)/8+.5:REM Durations of note+dot combinations in 20ths of a second for each tempo (Max 22.5 Seconds)
+IFD%>254 D%=254:REM Limit to maximum possible duration (12.7 Seconds)
+Duration%(N%)?C%=D%
+NEXT
+NEXT
+TIE%=&FF:REM Tie state of channels - Each bit corresponds to a channel, 0 if tied
+SPACE%=HIMEM-END :REM find available space to tailor allocation
+IFFNassert(SPACE%>1024,"OutMem3") STOP
+
+Max_Gate%=SPACE%/100 :REM max no. of gates (events, chords)
+REM Me thinks this is a hatchet job. Let's try and be more accurate...
+REM But there again, all space reserved is USED. Inefficiency alert!
+REM 400K odd used for a 26K tune. Whew!
+Max_Bar%=Max_Gate%/4 :REM maximum number of bars
+
+PLAYING%=FALSE:REM Flag indicating play in process
+SCROLLING%=FALSE:REM Flag indicating auto-scrolling while playing
+
+DIM Q%(Max_Stave%+2):REM Time positions of next notes on each stave
+DIM QI%(Max_Stave%+2):REM Time increments of Q%() for each stave
+
+B1%=0:B2%=0:REM Alternate beat counters used to detect zero wrap
+::
+DIM GPn%(Max_Bar%) :REM GP% at the start of each bar
+DIM PX%(Max_Gate%),PW%(Max_Gate%),PTYPE%(Max_Gate%):REM Notation screen positions, widths & types
+REM PX% is PX%() index to screen positions & types - Always refers to the note/attribute just passed
+DIM PXn%(Max_Bar%) :REM PX% at start of each bar
+DIM BPn%(7,Max_Bar%):REM Indices to (8) note queues at the start of each bar
+DIM MUSIC%(7),FINE%(7):REM Pointers delimiting music storage
+DIM N%(7),n%(7):REM Pointers to current notes (n%()=copy, cf PROCproximate)
+DIM C%(7),c%(7):REM Indexes of gate channels used in sorting
+DIM CLEF%(Max_Stave%),clef%(Max_Stave%):REM Current clef on each stave (& clef copy)
+DIM CLEFn%(Max_Stave%,Max_Bar%) :REM CLEF% at start of each bar
+DIM SIG%(1),sig%(1):REM Base bar key & time sigs, current and copy
+DIM SIGn%(1,Max_Bar%) :REM SIG% at the start of each bar
+DIM P%(7),PCLEF%(3):REM Playing note pointers, clef
+
+MaxNotesInBar%=128
+REM while one half of draw q is being filled, the other half is being used for scrolling.
+
+LOCAL n%
+n%=MaxNotesInBar%*4
+
+DIM MIDI_OFF%(1,n%) :REM an array of MIDI noteoffs if playing is stopped in the middle of a bar
+MIDI_OFF%(0,0)=-1
+MIDI_OFF%(1,0)=-1
+MIDI_Notenum%=0
+
+SPACE%=HIMEM-END
+SPACE%-=&6000:REM Leave a few K for the program and Basic stack (was &4000 before printing)
+
+IFFNassert(SPACE%>1024,"OutMem3") STOP
+DIM MUSIC% SPACE%+8:REM Allocate main music space (+8: Extra bytes in case of overrun)
+
+FINE%=MUSIC%+SPACE%:REM End of music memory
+GATE%=MUSIC%:REM No gate space used as yet
+
+FORC%=0TO7
+  MUSIC%(C%)=MUSIC%+(C%+1)*SPACE%/9
+NEXT:REM Share out storage (NB No bounds checking ever occurs!)
+
+FINE%()=MUSIC%():REM No music defined yet
+
+Pgap%=X%(2)DIV2+1:REM Symbol spacing (half note blob width)
+ENDPROC
+
+DEF PROCinitialise_options
+REM Tempo
+NTempos%=14
+DIM Tempo%(NTempos%)
+Tempo%(0)=40
+Tempo%(1)=50
+Tempo%(2)=60
+Tempo%(3)=65
+Tempo%(4)=70
+Tempo%(5)=80
+Tempo%(6)=90
+Tempo%(7)=100
+Tempo%(8)=115
+Tempo%(9)=130
+Tempo%(10)=145
+Tempo%(11)=160
+Tempo%(12)=175
+Tempo%(13)=190
+Tempo%(14)=210
+
+REM Time signatures
+DIM TIME_SIG%(1)   :REM Current time signature numerator(0) and denominator(1)
+
+REM Key signatures
+DIM KEY_SIG%(1)    :REM Current key signature (0: 0/1 flats/sharps; 1: 0-7)
+DIM Key_Y%(3,1,6)  :REM Key signature 0-sharp/1-flat stave line positions
+LOCAL C%,A%,P%     :REM Indices
+FOR C%=0 TO 3      :REM For each clef
+  FOR A%=0 TO 1    :REM For each accidental type
+    FOR P%=0 TO 6  :REM For each accidental position
+      REM Position offsets of key signature accidentals from centre stave line
+      Key_Y%(C%,1-A%,P%)=3*(P%AND%1)-P%DIV2+(P%-3)*A%+(A%ANDC%<>2AND(P%AND5)=0)*7-1-(C%-1>>1)-2*(C%=2)
+    NEXT
+  NEXT
+NEXT
+
+REM Volumes
+NVolumes%=7
+DIM Volume%(NVolumes%),Volumes%(7)
+FOR R%=0 TO NVolumes%
+  REM don't permit full volume so that dynamics are possible
+  Volume%(R%)=(R%+1)*120/(NVolumes%+1)-1
+NEXT
+SYS "Sound_Volume" TO R%
+RestoreVolume=R%
+REM don't permit full volume. This is reserved for dynamics
+Volume%=R%*(NVolumes%+1)/120-.5
+IF Volume%<0 THEN Volume%=0
+SYS "Sound_Volume",Volume%(Volume%)
+FOR R%=0 TO 7
+  Volumes%(R%)=6
+NEXT
+
+REM Staves
+Max_Stave%=3
+Li%=2*Vi%
+Stave_Height%=Li%*8
+DIM Y_STAVE%(Max_Stave%+2)
+STAVE%=0   :REM means 1 stave
+PERC%=0    :REM means no percussion
+Score_Width%=S_Width%
+PROCposition_staves
+LOCALS%
+DIM Stave_Channels%(Max_Stave%+2,7):REM Primary stave allocation of channels 0-7 for each stave structure
+FOR S%=0 TO Max_Stave%
+FOR R%=0 TO 7
+Stave_Channels%(S%,R%)=(S%+1)*R%DIV8:REM Close formula to desired data
+NEXT
+NEXT
+Stave_Channels%(2,1)=1
+Stave_Channels%(2,2)=1
+Stave_Channels%(2,5)=2:REM Correct the exceptions to formula
+DIM S_C%(7):REM Current stave allocation
+FORR%=0TO7
+S_C%(R%)=Stave_Channels%(STAVE%,R%):REM Initialise channel allocation (Also reset each time stave structure is changed)
+NEXT
+
+REM Voices
+LOCALI$,L%,M%:REM Instrument name, Number of instruments, Instrument name length, Max
+MAX_VOICES%=32+1           :REM 1-32 Voice slots + MIDI
+DIM Voice$(MAX_VOICES%)    :REM Names of available voices
+DIM RestoreVoice%(7)       :REM Table of original voice/channel allocation
+DIM Instrument%(7,1)       :REM Instrument information: 0=Stave,1=Voice
+REM Get number of voices available
+SYS "Sound_InstallVoice" TO I$,NVoices%
+NVoices%-=1
+IF FNassert(NVoices%>0,"NoVoices") STOP
+REM Get names of available voices
+FOR R%=1 TO NVoices%
+  SYS "Sound_InstallVoice",2,R% TO ,,,Voice$(R%)
+NEXT
+REM Get voice allocation for each channel
+FOR R%=0 TO 7
+  SYS "Sound_AttachVoice",R%+1,0 TO L%,S%
+  RestoreVoice%(R%)=S%
+  REM Make sure a voice is attached to all channels
+  IF S%<1 OR S%>NVoices% THEN S%=1
+  SYS "Sound_AttachVoice",L%,S%
+  REM Create instrument information (stave and voice)
+  Instrument%(R%,0)=S_C%(R%)+1
+  Instrument%(R%,1)=S%
+NEXT
+
+REM Stereo positions
+NStereos%=6
+DIM Stereo%(NStereos%),Stereo_Position%(7)
+FOR R%=0 TO NStereos%
+  Stereo%(R%)=(2*R%/NStereos%-1)*127
+NEXT
+FOR R%=0 TO 7
+  Stereo_Position%(R%)=NStereos% DIV 2
+  SYS "Sound_Stereo",R%+1,Stereo%(Stereo_Position%(R%))
+NEXT
+
+REM Audio output
+REM 0=Internal sound system
+REM 1=MIDI device
+OutputType%=0
+
+REM MIDI options
+NMIDIChannels%=16
+DIM MIDIChannel%(7)
+FOR c%=0 TO 7
+  MIDIChannel%(c%)=c%+1
+NEXT
+ENDPROC
+
+DEF PROCrestore
+REMOSCLI("audio off")
+FORR%=0TO7    :REM restore channel/voice allocation
+  SYS "Sound_AttachVoice",R%+1,RestoreVoice%(R%)
+NEXT
+SYS "Sound_Volume", RestoreVolume :REM restore volume
+SYS "Sound_Configure",OldConfigure
+ENDPROC
+
+DEF PROCexit
+PROCCloseWindow(ScoreWind_h%)
+PROCrestore
+ENDPROC
+
+DEF PROCterminate
+IF INITIALISED% IF PLAYING% PROCplay_stop
+*UnSet Maestro$Running
+PROCclose_messagefile(Messages_h%)
+IF Task_h%>0 THEN
+ ON ERROR SYS "Wimp_CloseDown", Task_h%, "TASK" : END
+ELSE
+ ON ERROR END
+ENDIF
+IF INITIALISED% PROCexit :PROCCloseWindow(QuitQuery_h%)
+ON ERROR END
+IF Task_h%>0 THEN SYS "Wimp_CloseDown", Task_h%, "TASK"
+END
+ENDPROC
+
+DEF FNassert(E%,A$)
+LOCAL e%
+A$=FNmessage_lookup(Messages_h%, A$)
+IFE% THEN=FALSE ELSE e%=FNCheckOK(FNmessage_lookupN(Messages_h%, "Fatal", A$, "", "", ""),1)
+PROCterminate
+=TRUE
+
+
+DEF PROCerror
+
+  LOCAL e%
+  LOCAL ERROR
+  ON ERROR LOCAL PROCterminate: STOP
+  SYS "Hourglass_Smash"
+  E$=FNmessage_lookupN(Messages_h%, "IntErr", REPORT$, STR$ERL, "", "")
+
+  FILE%=FILE%:IF FILE% CLOSE#FILE% : FILE%=FALSE
+  IF INITIALISED% THEN
+    E$+=" "+FNmessage_lookup (Messages_h%, "ExProg")
+    IF FNCheckOK(E$,3) PROCterminate
+  ELSE
+    e%=FNCheckOK(E$,1) : PROCterminate
+  ENDIF
+
+ENDPROC
+
+
+DEF PROCOpenDiscardCancelBox
+
+  REM Dbox saying "Blah edited", Discard, Cancel
+
+  LOCAL c%,d%
+  LOCAL mc_dx%,mc_dy%,mc_sw%,mc_sh%,scrx%,scry%
+
+  Window%!handle%=QuitQuery_h%
+  SYS "Wimp_GetWindowState", ,Window%+handle%
+
+  SYS"OS_ReadModeVariable",-1,4 TO ,,mc_dx%:mc_dx%=1<<mc_dx%
+  SYS"OS_ReadModeVariable",-1,5 TO ,,mc_dy%:mc_dy%=1<<mc_dy%
+  SYS"OS_ReadModeVariable",-1,11 TO ,,mc_sw%:mc_sw%+=1
+  SYS"OS_ReadModeVariable",-1,12 TO ,,mc_sh%:mc_sh%+=1
+  scrx%=mc_sw%*mc_dx%
+  scry%=mc_sh%*mc_dy%
+  c%=(scrx%-(Window%!8 - Window%!0 )) DIV 2
+  d%=(scry%-(Window%!4 - Window%!12)) DIV 2
+  SYS "Wimp_CreateMenu",,QuitQuery_h%,c%,d%
+
+ENDPROC
+
+
+DEF PROCOpenSaveDiscardCancelBox
+
+  REM Dbox saying "Blah not saved", Save, Discard, Cancel
+
+  LOCAL c%,d%
+  LOCAL mc_dx%,mc_dy%,mc_sw%,mc_sh%,scrx%,scry%
+
+  Window%!handle%=ClearQuery_h%
+  SYS "Wimp_GetWindowState", ,Window%+handle%
+
+  SYS"OS_ReadModeVariable",-1,4 TO ,,mc_dx%:mc_dx%=1<<mc_dx%
+  SYS"OS_ReadModeVariable",-1,5 TO ,,mc_dy%:mc_dy%=1<<mc_dy%
+  SYS"OS_ReadModeVariable",-1,11 TO ,,mc_sw%:mc_sw%+=1
+  SYS"OS_ReadModeVariable",-1,12 TO ,,mc_sh%:mc_sh%+=1
+  scrx%=mc_sw%*mc_dx%
+  scry%=mc_sh%*mc_dy%
+  c%=(scrx%-(Window%!8 - Window%!0 )) DIV 2
+  d%=(scry%-(Window%!4 - Window%!12)) DIV 2
+  SYS "Wimp_CreateMenu",,ClearQuery_h%,c%,d%
+
+ENDPROC
+
+
+DEF FNCheckOK(E$, boxes%)
+LOCAL E%
+FILE%=FILE%:IF FILE% CLOSE#FILE% : FILE%=FALSE
+!err_block%=0
+$(err_block%+4)=LEFT$(E$,200)+CHR$0
+SYS "Wimp_ReportError", err_block%, boxes%, maestro$ TO ,E%
+=E%=1 :  REM return TRUE if OK pressed
+
+DEF FNCheckOKTag(E$, boxes%)
+=FNCheckOK(FNmessage_lookup(Messages_h%, E$), boxes%)
+
+DEF FNopen_messagefile(name$)
+LOCAL type%,len%
+SYS "OS_File",17,name$ TO type%,,,,len%
+IF type%<>1 SYS "OS_File",19,name$,type%
+DIM message_data% (len% + 19) AND &FFFFFFFC
+SYS "MessageTrans_OpenFile", message_data%, name$, message_data%+16
+=message_data%
+
+DEF PROCclose_messagefile(mh%)
+SYS "MessageTrans_CloseFile", mh%
+ENDPROC
+
+DEF FNmessage_lookup(mh%, tag$)
+LOCAL s$
+SYS "MessageTrans_Lookup", mh%, tag$, 0, 0, 0, 0, 0, 0 TO ,,s$
+=s$
+
+DEF FNmessage_lookupN(mh%, tag$, ss0$, ss1$, ss2$, ss3$)
+LOCAL s$
+SYS "MessageTrans_Lookup", mh%, tag$, message_buffer%, 256, ss0$, ss1$, ss2$, ss3$ TO ,,s$
+=s$
+
+REM // Print //
+
+DEF PROCprint_init
+LOCAL pname$
+LOCAL ERROR
+ON ERROR LOCAL:RESTORE ERROR:PROCwimp_seticontext(Print_h%,1,FNmessage_lookup(Messages_h%,"NoPrinter")):PROCwimp_seticonstate(Print_h%,2,22,TRUE):ENDPROC 
+SYS "PDriver_Info" TO ,,,,pname$
+PROCwimp_seticontext(Print_h%,1,pname$)
+PROCwimp_seticonstate(Print_h%,2,22,FALSE)
+ENDPROC
+
+DEF PROCprint_click (icon%,button%)
+CASE icon% OF
+  WHEN 2:REM Print
+    IF FNwimp_geticontext(Print_h%,1)<>FNmessage_lookup(Messages_h%,"NoPrinter") THEN
+      PROCprint
+    ELSE
+      icon%=FNCheckOKTag("NoPrinter",1)
+    ENDIF
+    IF button%=1 THEN SYS "Wimp_CreateMenu",,-1
+ENDCASE
+ENDPROC
+
+DEF PROCprint
+    LOCAL Hi%, Vi%
+    LOCAL f%, e%, h%
+    LOCAL page_x%, page_y%, margin%
+    LOCAL score_height%, staves_per_page%
+    LOCAL p%, gp%
+    LOCAL y1%, y2%, y3%
+    LOCAL x1%, x2%
+    LOCAL s%
+    LOCAL l%, i%
+    LOCAL page%, last_page%
+    LOCAL title$
+    LOCAL r0%
+    LOCAL lx0%, lx1%, ly0%, ly1% : REM returned by bound_note
+    LOCAL C%, P%, R%             : REM Channel, Max prefix, Max width
+    LOCAL G%, A%, a%, W%                 : REM Note, Attribute
+    LOCAL N%()                   : REM Note indices for each channel
+    LOCAL n_start%(), n%()       : REM Local copy of N%
+    LOCAL SIG%(), sig%()
+    LOCAL clef%()
+    LOCAL nbars%
+    LOCAL NC0%, NC1%
+    LOCAL x%, y%, lasty%, checkstagger%
+    LOCAL N%
+    LOCAL note_factors% :REMfactors%
+    LOCAL bars_plotted%
+    LOCAL on_page%, last_pos%, index%, last_x_offset%
+    LOCAL current_gate%, n_bars%, multiplier, w1, xs
+    LOCAL events%, events_start%
+    LOCAL bar_at_front%, bar_at_front_start%
+    LOCAL x_res%, y_res%, ptr%, features%
+
+    DIM note_factors% 16 :REMfactors% 16
+    DIM N%(7)
+    DIM n_start%(7), n%(7)
+    DIM SIG%(1), sig%(1)
+    DIM clef%(Max_Stave%)
+    DIM PrintRectangle%16, PrintTransform%16, PrintPos%8
+
+    SYS "PDriver_Info" TO ,x_res%,y_res%, features%
+    IF x_res% < 120 OR y_res% < 144 THEN
+        REM Keep the above resolutions in step with the error in the messages file
+        IF NOT FNCheckOK(FNmessage_lookupN(Messages_h%,"LoRes",FNwimp_geticontext(Print_h%,1),STR$(x_res%),STR$(y_res%),""),3) THEN ENDPROC
+    ENDIF
+
+    Hi% = 2
+    Vi% = 2
+
+    x_mul_scale% = 3
+    y_mul_scale% = 3
+    x_div_scale% = 4
+    y_div_scale% = 4
+
+    SYS "Hourglass_On"
+    note_factors%!0  = factors%!0 * x_mul_scale%
+    note_factors%!4  = factors%!4 * y_mul_scale%
+    note_factors%!8  = (factors%!8) * x_div_scale%
+    note_factors%!12 = (factors%!12) * y_div_scale%
+
+    clef%() = CLEF%()
+    clef%() = 0
+    N%() = MUSIC%()
+    SIG%(0)=%01100111
+    SIG%(1)=%00000010
+    title$=FNwimp_geticontext(Save_h%,1)
+    l% = LEN(title$)
+    s% = 1
+    FOR i% = 1 TO l% - 1
+        c$ = MID$(title$, i%, 1)
+        IF (c$ = ":" OR c$ = ".") THEN s% = i% + 1
+    NEXT i%
+    title$ = MID$(title$, s%)
+
+    LOCAL ERROR
+    ON ERROR LOCAL: RESTORE ERROR:e%=FNCheckOK (REPORT$, 1):ENDPROC
+
+    f% = OPENOUT("printer:")
+    SYS "PDriver_SelectJob", f%, title$
+
+    SYS "PDriver_CurrentJob" TO h%
+
+REM    IF (h% = 0) THEN
+REM        e% = FNCheckOK (FNmessage_lookup (Messages_h%, "JobFailed"), 3)
+REM        SYS "Hourglass_Off"
+REM        ENDPROC
+REM    ENDIF
+
+    IF (features% AND (1 << 29)) <> 0 THEN
+        SYS "PDriver_DeclareFont", 0, 0, 0 : REM We don't want to use any
+    ENDIF
+
+    ON ERROR LOCAL: RESTORE ERROR: SYS "PDriver_AbortJob", f%: CLOSE#f%:e%=FNCheckOK (REPORT$, 1):ENDPROC
+    SYS "PDriver_PageSize" TO ,page_x%,page_y%, l_edge%, b_edge%, r_edge%, t_edge%
+
+    page_x% = page_x% / 400: page_y% = page_y% / 400
+    REM  l_edge% = 0: r_edge% = page_x%
+    l_edge% = l_edge% / 400: r_edge% = r_edge% / 400
+    b_edge% = b_edge% / 400: t_edge% = t_edge% / 400
+    r_edge% -= (Hi% * 12)
+
+    SYS "ColourTrans_SetGCOL", &00000000,,,0,0
+
+    score_height%=(PERC%+1+3*(STAVE%+1))*Stave_Height%
+    margin% = Stave_Height%
+    staves_per_page% = (page_y% - 2 * margin%) / score_height%
+
+    gp% = MUSIC%
+    page% = 0
+    last_page% = 0
+    p% = gp%
+    index% = 0
+    last_x_offset% = 0
+    x2% = 0
+    last_pos% = 0
+    current_bar% = 0
+    current_gate% = 0
+    n%() = N%()
+    events% = 0
+    bar_at_front% = TRUE
+
+    bars_plotted% = 0
+
+    WHILE gp% < GATE%
+        last_page% = page%
+        page% += 1
+        PrintRectangle%!0 = 0
+        PrintRectangle%!4 = 0
+        PrintRectangle%!8 = page_x%
+        PrintRectangle%!12 = page_y%
+        PrintTransform%!0 = &10000
+        PrintTransform%!4 = &00000
+        PrintTransform%!8 = &00000
+        PrintTransform%!12 = &10000
+        PrintPos%!0 = 0
+        PrintPos%!4 = 0
+        SYS "PDriver_GiveRectangle", 0, PrintRectangle%, PrintTransform%, PrintPos%, &ffffffff
+        SYS "PDriver_DrawPage", 1, PrintRectangle%, page%, STR$(page%) TO r0%
+
+        p% = gp%
+        index_start% = index%
+        last_x_offset_start% = last_x_offset%
+        x2_start% = x2%
+        last_pos_start% = last_pos%
+        current_gate_start% = current_gate%
+        current_bar_start% = current_bar%
+        n_start%() = n%()
+        events_start% = events%
+        bar_at_front_start% = bar_at_front%
+        sig%() = SIG%()
+
+        WHILE r0%
+
+            IF last_page% = page% THEN
+                index% = index_start%
+                last_x_offset% = last_x_offset_start%
+                x2% = x2_start%
+                last_pos% = last_pos_start%
+                current_gate% = current_gate_start%
+                current_bar% = current_bar_start%
+                gp% = p%
+                n%() = n_start%()
+                events% = events_start%
+                bar_at_front% = bar_at_front_start%
+                SIG%() = sig%()
+            ENDIF
+
+            y1% = page_y% - margin% + Stave_Height%
+            y3% = page_y% - margin%
+            IF PERC% THEN
+                y3% -= Stave_Height%
+            ENDIF
+
+            stave_n% = 0
+            WHILE stave_n% < staves_per_page% AND gp% < GATE%
+
+                y2% = (y3% - score_height% + Stave_Height% / 2)
+                IF PERC% THEN
+                    y2% -= ((stave_n%+1) * Stave_Height%)
+                ENDIF
+                FOR s% = 0 TO STAVE%+PERC%
+                    IF (PERC%) AND (s% = 0) THEN
+                        LINE l_edge%, y2%, r_edge%, y2%
+                    ELSE
+                        LINE l_edge%, y2% - Li% * 4, r_edge%, y2% - Li% * 4
+                        LINE l_edge%, y2% - Li% * 2, r_edge%, y2% - Li% * 2
+                        LINE l_edge%, y2%, r_edge%, y2%
+                        LINE l_edge%, y2% + Li% * 2, r_edge%, y2% + Li% * 2
+                        LINE l_edge%, y2% + Li% * 4, r_edge%, y2% + Li% * 4
+                    ENDIF
+                    y2% = y2% + 3 * Stave_Height%
+                NEXT s%
+                y3% = y3% - score_height%
+                y2% = y1% - Stave_Height%
+                IF NOT PERC% THEN
+                    y2% -= Stave_Height%
+                ELSE
+                    y3% = y3% : REM- (2 * Stave_Height%)
+                ENDIF
+
+                IF bar_at_front% AND GP% < GATE% THEN
+                    FOR S% = 0 TO STAVE% + PERC%
+                        PROCprint_sprite(bar%, l_edge%-1, y2% + Y_STAVE%(S%), factors%)
+                    NEXT
+                    IF (STAVE% + 1) AND 2 THEN
+                        MOVE l_edge%-1+Hi%,y2%+Y_STAVE%(STAVE%)+Stave_Height% DIV 2
+                        y% = Y_STAVE%(STAVE%-1)-Y_STAVE%(STAVE%)-Stave_Height%
+                        DRAW BY 0, y%
+                    ENDIF
+                ENDIF
+
+                x1% = l_edge% : REM + (Hi% * 13):
+                on_page% = TRUE
+                n_bars% = 0
+                x% = 0
+                xs = l_edge%
+                multiplier = 1
+                bars_plotted% = 0
+
+                IF gp% < GATE% THEN
+                    PROCfind_last_bar_on_stave (last_pos%, index%, events%, last_x_offset%, n_bars%, r_edge%, l_edge%)
+                    multiplier = (r_edge% - 35) / (last_pos%)
+                ELSE
+                    FOR S% = 0 TO STAVE% + PERC%
+                        PROCprint_sprite(bar%, r_edge%-1, y2% + Y_STAVE%(S%), factors%)
+                    NEXT
+                    IF (STAVE% + 1) AND 2 THEN
+                        MOVE r_edge%-1+Hi%,y2%+Y_STAVE%(STAVE%)+Stave_Height% DIV 2
+                        y% = Y_STAVE%(STAVE%-1)-Y_STAVE%(STAVE%)-Stave_Height%
+                        DRAW BY 0, y%
+                    ENDIF
+                ENDIF
+
+                WHILE gp% < GATE% AND on_page%
+                    IF gp%?0 THEN
+                        G% = gp%?0
+                        x% = FNnote_posn(current_bar%, current_gate%, x2%) : REM Extract pre-calulated positions
+                        IF x% > last_pos% AND n_bars% = 0 THEN on_page% = FALSE
+                        xs = x% * multiplier
+                        checkstagger% = FALSE
+                        C% = -1
+                        P% = 0
+                        R% = 0
+                        REPEAT
+                            REPEAT
+                                C% += 1
+                            UNTIL G% AND %1 << C%
+                            PROCbound_note(!n%(C%))
+                            IF lx0% > P% THEN P% = lx0%
+                            IF lx1% > R% THEN R% = lx1%
+                            NC0% = n%(C%)?0: NC1% = n%(C%)?1
+                            y% = y2% + Y_STAVE%(S_C%(C%))
+                            IF NC0% AND &f8 THEN
+                                l% = (NC0% >> 3) - 16
+                                IF ABS(l%) > 5 PROCprint_sprite(ledger% + l% DIV 2, xs, y%, factors%)
+                                y% += Li%*l%
+                                s% = NC1% >> 5 OR NC0% << 3 AND 8
+                                IF checkstagger% THEN
+                                    IF ABS(lasty% - y%) < 2 * Li% THEN
+                                        PROCprint_sprite(s%,xs+Pgap%, y%, note_factors%)
+                                        checkstagger% = FALSE
+                                        IF NC1% AND 24 PROCprint_sprite(dot%+(NC1%>>3 AND 3), xs + x%(s%) + Pgap%, y%, note_factors%)
+                                        IF NC0% AND 4  PROCprint_sprite(tie%, xs + Pgap%, y%, note_factors%)
+                                    ELSE
+                                        PROCprint_sprite(s%, xs, y%, note_factors%)
+                                        IF NC1% AND 24 PROCprint_sprite(dot%+(NC1%>>3 AND 3), xs + x%(s%), y%, note_factors%)
+                                        IF NC0% AND 4  PROCprint_sprite(tie%, xs, y%, note_factors%)
+                                    ENDIF
+                                ELSE
+                                    PROCprint_sprite(s%, xs, y%, note_factors%)
+                                    IF NC1% AND 24 PROCprint_sprite(dot%+(NC1%>>3 AND 3), xs + x%(s%), y%, note_factors%)
+                                    IF NC0% AND 4  PROCprint_sprite(tie%, xs, y%, note_factors%)
+                                    checkstagger%=TRUE
+                                ENDIF
+                                lasty% = y%
+                                IF NC1% AND 7 PROCprint_sprite(accidental% OR NC1% AND 7, xs - x%(s%), y%, note_factors%)
+                            ELSE
+                                s% = rest% OR NC1% >> 5
+                                PROCprint_sprite(s%, xs, y%, factors%)
+                                IF NC1% AND 24 PROCprint_sprite(dot%+(NC1%>>3 AND 3), xs + x%(s%), y%, note_factors%)
+                                IF NC0% AND 4  PROCprint_sprite(tie%, xs, y%, note_factors%)
+                            ENDIF
+                            n%(C%) += 2
+                        UNTIL (2 << C%) > G%
+                        gp% += 1
+                        current_gate% += 1
+                        IF x% >= last_pos% THEN
+                            on_page% = FALSE
+                            bar_at_front% = FALSE
+                        ELSE
+                            bar_at_front% = TRUE
+                        ENDIF
+                    ELSE
+                        A% = gp%?1
+                        N% = -1: REPEAT N% += 1: UNTIL A% AND %1 << N%
+                        CASE N% OF
+                            WHEN 0
+                                REM Time Sig
+                                sig%(0) = A%
+                                B$ = STR$((A% >> 1 AND 15) + 1)
+                                D$ = STR$(%1 << (A% >> 5) - 1)
+                                x% = FNtime_posn(current_bar%, x2%)
+                                xs = x% * multiplier
+                                w1 = xs
+                                IF LEN B$ < 2 THEN w1 += 5 * Hi%
+                                IF LEN D$ < 2 THEN xs += 5 * Hi%
+                                FOR S% = 0 TO STAVE%+PERC%
+                                    PROCprint_sprite(time%+VAL(B$),w1,y2% + Y_STAVE%(S%), note_factors%)
+                                    PROCprint_sprite(time%+VAL(D$),w1,y2% + Y_STAVE%(S%)-32, note_factors%)
+                                NEXT S%
+                            WHEN 1
+                                REM Key Sig
+                                x% = FNkey_posn(current_bar%, x2%)
+                                xs = x% * multiplier
+                                IF A% AND 56 sig%(1)=A% ELSE SWAP A%,sig%(1):a%=accidental%+1
+                                N%=(A%>>3AND7)-1
+                                IF N% >= 0 THEN
+                                    A%=A%>>2AND%1
+                                    IF a% ELSE a%=accidental%+2+A%
+                                    W%=x%(a%)+X%(a%)
+                                    x%+=x%(a%)
+                                    xs = x% * multiplier
+                                    FOR C%=0 TO N%
+                                        FOR S%=0TOSTAVE%
+                                            PROCprint_sprite(a%,xs,y2%+Y_STAVE%(S%)+Li%*Key_Y%(clef%(S%),A%,C%), note_factors%)
+                                        NEXT
+                                    x%+=W%
+                                    xs = x% * multiplier
+                                    NEXT
+                                ENDIF
+
+                            WHEN 2
+                                REM Clef
+                                sig%(0) = A%  : REM Hack
+                                S% = A% >> 6
+                                x% = FNclef_posn(current_bar%, x2%)
+                                xs = x% * multiplier
+                                clef%(S%) = (A% >> 3) AND 3
+                                IF S% <= STAVE% PROCprint_sprite(clef% + (A% >> 3 AND 3), xs, y2% + Y_STAVE%(S%), factors%)
+                            WHEN 3
+                                REM Slur
+
+                            WHEN 4
+                                REM Octave Shift
+
+                            WHEN 5
+                                x% = FNbar_posn(current_bar%, x2%)
+                                IF x% >= last_pos% THEN
+                                    FOR S% = 0 TO STAVE% + PERC%
+                                        PROCprint_sprite(bar%, r_edge%-2-1, y2% + Y_STAVE%(S%), factors%)
+                                    NEXT
+                                    IF (STAVE% + 1) AND 2 THEN
+                                        MOVE r_edge%-2+Hi%,y2%+Y_STAVE%(STAVE%)+Stave_Height% DIV 2
+                                        y% = Y_STAVE%(STAVE%-1)-Y_STAVE%(STAVE%)-Stave_Height%
+                                        DRAW BY 0, y%
+                                    ENDIF
+                                    on_page% = FALSE
+                                    IF (current_bar% + 1) MOD 5 = 0 THEN
+                                        MOVE r_edge%-2-((1+LEN(STR$(current_bar%+1))-1)*16),y2% + (Y_STAVE%(0) / 2): REM ***
+                                        PRINT STR$(current_bar%+1)
+                                    ENDIF
+                                ELSE
+                                    IF x% = l_edge% THEN
+                                        xs = x% - 7: REM &&&
+                                    ELSE
+                                        xs = x% * multiplier
+                                    ENDIF
+
+                                    FOR S% = 0 TO STAVE% + PERC%
+                                        PROCprint_sprite(bar%, xs-1, y2% + Y_STAVE%(S%), factors%)
+                                    NEXT
+                                    IF (STAVE% + 1) AND 2 THEN
+                                        MOVE xs+Hi% ,y2%+Y_STAVE%(STAVE%)+Stave_Height% DIV 2
+                                        y% = Y_STAVE%(STAVE%-1)-Y_STAVE%(STAVE%)-Stave_Height%
+                                        DRAW BY 0, y%
+                                    ENDIF
+                                    IF (current_bar% + 1) MOD 5 = 0 THEN
+                                        MOVE xs-1-((LEN(STR$(current_bar%+1)))*16),y2% + (Y_STAVE%(0) / 2): REM ***
+                                        PRINT STR$(current_bar%+1)
+                                    ENDIF
+                                ENDIF
+
+                                current_bar% += 1
+                                bars_plotted% += 1
+                        ENDCASE
+                        gp% += 2
+                    ENDIF               : REM gp%?0
+                ENDWHILE                : REM on_page%
+                IF gp% >= GATE% THEN
+                    FOR S% = 0 TO STAVE% + PERC%
+                        PROCprint_sprite(bar%, r_edge%-2, y2% + Y_STAVE%(S%), factors%)
+                    NEXT
+                    IF (STAVE% + 1) AND 2 THEN
+                        MOVE r_edge%-2+Hi%,y2%+Y_STAVE%(STAVE%)+Stave_Height% DIV 2
+                        y% = Y_STAVE%(STAVE%-1)-Y_STAVE%(STAVE%)-Stave_Height%
+                        DRAW BY 0, y%
+                    ENDIF
+                ENDIF
+                x2% += (last_pos% - l_edge%)
+                y1% = y1% - score_height%
+                IF PERC% THEN
+                    y1% = y1% - margin%
+                ENDIF
+                stave_n% += 1
+            ENDWHILE
+            last_page% = page%
+            SYS "PDriver_GetRectangle", ,PrintRectangle% TO r0%
+        ENDWHILE
+    ENDWHILE
+    RESTORE ERROR
+    SYS "PDriver_EndJob", f%
+    CLOSE#f%
+    SYS "Hourglass_Off"
+ENDPROC
+
+
+DEF PROCprint_sprite(s%, X%, Y%, scale_factors%) : REM plot sprite S%(s%) at X%,Y%
+
+  LOCAL spr_y, scaled_y, y_add, x_add
+
+  spr_y = ((S%(s%)!20) + 1) * (2 / 4)    : REM actual height
+  scaled_y = spr_y * (2 / 4) : REM scaled height
+
+  x_add = 0
+
+REM Below are various hack factors to deal with the fact that the sprites are scaled down.
+
+  CASE S$(s%) OF
+    WHEN "Md", "Cd","Qd", "SQd", "DSQd", "SDSQd"
+       x_add = 6
+    WHEN "Mu", "Cu", "Qu", "SQu", "DSQu", "SDSQu", "M", "SB", "Natural", "Sharp", "Flat", "Sharp2", "Flat2", "NSharp", "NFlat", "Tie", "Dot1", "Dot2", "Dot3"
+      y_add = 2 : x_add = 6
+    WHEN "B"
+      y_add = 2.5 : x_add = 6
+    WHEN "Bar"
+      y_add = -0.5
+    OTHERWISE
+      y_add = 0 : x_add = 6
+  ENDCASE
+
+  SYS "OS_SpriteOp", SprPlot%, SprBlk%, S%(s%), X%-(x%(s%)) + x_add, Y% - y%(s%) + y_add, 8, factors%, pixtrans%
+ENDPROC
+
+
+
+DEF PROCfind_last_bar_on_stave (RETURN last_pos%, RETURN index%, RETURN events%, RETURN last_x_offset%, RETURN n_bars%, r_edge%, l_edge%)
+
+    LOCAL loop%, x%, last_x%
+
+    x% = l_edge% + PX%(index%) - x2%
+
+    WHILE ((index% < (GATE% - MUSIC%)) AND x% < (r_edge% - 35))
+
+        CASE PTYPE%(index%) OF
+            WHEN 0
+                IF n_bars% = 0 THEN
+                    last_pos% = x%
+                ENDIF
+                events% += 1
+            WHEN 32
+                IF x% <> l_edge% THEN
+                    last_pos% = x%
+                    n_bars% += 1
+                ENDIF
+                events% += 2
+            OTHERWISE
+                IF n_bars% = 0 THEN
+                    last_pos% = x%
+                ENDIF
+                events% += 2
+        ENDCASE
+
+        index% += 1
+        x% = l_edge% + PX%(index%) - x2%
+
+    ENDWHILE
+
+    IF index% >= GATE% - MUSIC% THEN
+         last_pos% = r_edge% - 35
+    ENDIF
+ENDPROC
+
+
+
+DEF FNnote_posn(bar%, gate%, x2%)
+
+    LOCAL loop%, enc%, x%, events%
+
+    enc% = 0
+    loop% = 0
+    events% = 0
+
+    REPEAT
+        IF PTYPE%(loop%) = 0 THEN
+            enc% += 1
+            x% = l_edge% + PX%(loop%) - x2%
+        ENDIF
+        loop% += 1
+    UNTIL (enc% > gate% OR loop% > GATE% - MUSIC%)
+
+= x%
+
+DEF FNclef_posn(bar%, x2%)
+
+    LOCAL loop%, enc%, x%, events%
+
+    enc% = 0
+    loop% = 0
+    events% = 0
+
+    REPEAT
+        IF PTYPE%(loop%) = 4 THEN
+            enc% += 1
+            x% = l_edge% + PX%(loop%) - x2%
+        ENDIF
+        loop% += 1
+    UNTIL (enc% >= bar% OR loop% > GATE% - MUSIC%)
+
+= x%
+
+
+DEF FNkey_posn(bar%, x2%)
+
+    LOCAL loop%, enc%, x%, events%
+
+    enc% = 0
+    loop% = 0
+    events% = 0
+
+    REPEAT
+        IF PTYPE%(loop%) = 2 THEN
+            enc% += 1
+            x% = l_edge% + PX%(loop%) - x2%
+        ENDIF
+        loop% += 1
+    UNTIL (enc% >= bar% OR loop% > GATE% - MUSIC%)
+
+= x%
+
+
+DEF FNbar_posn(bar%, x2%)
+
+    LOCAL loop%, enc%, x%, events%
+
+    enc% = 0
+    loop% = 0
+    events% = 0
+
+    REPEAT
+        IF PTYPE%(loop%) = 32 THEN
+            enc% += 1
+            x% = l_edge% + PX%(loop%) - x2%
+        ENDIF
+        loop% += 1
+    UNTIL (enc% > bar% OR loop% > GATE% - MUSIC%)
+
+= x%
+
+
+DEF FNtime_posn(bar%, x2%)
+
+    LOCAL loop%, enc%, x%, events%
+
+    enc% = 0
+    loop% = 0
+    events% = 0
+
+    REPEAT
+        IF PTYPE%(loop%) = 1 THEN
+            enc% += 1
+            x% = l_edge% + PX%(loop%) - x2%
+        ENDIF
+        loop% += 1
+    UNTIL (enc% >= bar% OR loop% > GATE% - MUSIC%)
+
+
+= x%
+
+REM  DEF PROCdebug (a$)
+REM
+REM      LOCAL a%, i%, l%
+REM
+REM      i% = LENa$
+REM      a% = TRACE
+REM      IF i% = 0 THEN ENDPROC
+REM
+REM      FOR l% = 1 TO i%
+REM          BPUT#a%, ASC(MID$(a$, l%, 1))
+REM      NEXT
+REM      BPUT#a%, 10
+REM      BPUT#a%, 13
+REM
+REM
+REM  ENDPROC
+REM
+
+REM // Wimp //
+
+DEF FNwimp_opentemplates (path$)
+REM Opens a Template file and returns buffer for largest definition
+LOCAL size%,largest%,next%,w%,s$
+SYS "Wimp_OpenTemplate",,path$
+largest%=0
+s$="*"+STRING$(11,CHR$(0))
+SYS "Wimp_LoadTemplate",,0,,,,s$,0 TO ,size%,,,,,next%
+WHILE next%
+  IF size%>largest% THEN largest%=size%
+  s$="*"+STRING$(11,CHR$(0))
+  SYS "Wimp_LoadTemplate",,0,,,,s$,next% TO ,size%,,,,,next%
+ENDWHILE
+DIM w% largest%+16
+=w%
+
+DEF FNwimp_loadtemplate (name$,buffer%,sprites%)
+REM Loads a window definition from a Template file
+LOCAL indarea%,indsize%,s$,window%
+s$=name$+CHR$(13)+STRING$(12-LEN(name$)+1,CHR$(0))
+SYS "Wimp_LoadTemplate",,0,,,,s$ TO ,,indsize%
+DIM indarea% indsize%
+SYS "Wimp_LoadTemplate",,buffer%,indarea%,indarea%+indsize%,-1,s$
+IF sprites% THEN buffer%!64=sprites%
+SYS "Wimp_CreateWindow",,buffer% TO window%
+=window%
+
+DEF FNwimp_geticontext (window%,icon%)
+REM Gets indirected text from an icon
+Block%!0=window%
+Block%!4=icon%
+SYS "Wimp_GetIconState",,Block%
+=$(Block%!28)
+
+DEF PROCwimp_seticontext (window%,icon%,text$)
+REM Sets the indirected text in an icon
+Block%!0=window%
+Block%!4=icon%
+SYS "Wimp_GetIconState",,Block%
+$(Block%!28)=text$
+Block%!8=0
+Block%!12=0
+SYS "Wimp_SetIconState",,Block%
+ENDPROC
+
+DEF FNwimp_geticonstate (window%,icon%,bit%)
+REM Returns TRUE if bit is set, FALSE if not
+Block%!0=window%
+Block%!4=icon%
+SYS "Wimp_GetIconState",,Block%
+IF (Block%!24 AND (1<<bit%)) THEN =TRUE ELSE =FALSE
+
+DEF PROCwimp_seticonstate (window%,icon%,bit%,action%)
+REM Sets an icon state bit
+Block%!0=window%
+Block%!4=icon%
+SYS "Wimp_GetIconState",,Block%
+IF action% THEN Block%!8=1<<bit%:Block%!12=1<<bit%
+IF NOT action% THEN Block%!8=0:Block%!12=1<<bit%
+SYS "Wimp_SetIconState",,Block%
+ENDPROC
+
+DEF PROCwimp_seticonval (window%,icon%,text$)
+REM Sets the validation string in an indirected icon
+Block%!0=window%
+Block%!4=icon%
+SYS "Wimp_GetIconState",,Block%
+$(Block%!32)=text$
+Block%!8=0
+Block%!12=0
+SYS "Wimp_SetIconState",,Block%
+ENDPROC
+
+DEF FNwimp_makemenu (title$,items%)
+REM Create a menu
+LOCAL buffer%,tbuffer%
+DIM buffer% 28+(24*items%)
+IF LEN(title$)>12 THEN
+  DIM tbuffer% LEN(title$)+1
+  buffer%!0=tbuffer%
+  buffer%!4=0
+  buffer%!8=LEN(title$)+1
+  $(tbuffer%)=title$
+ELSE
+  $(buffer%)=title$
+ENDIF
+buffer%!12=&00070207
+buffer%!16=80
+buffer%!20=44
+buffer%!24=0
+=buffer%
+
+DEF PROCwimp_additem (menu%,item%,flags%,link%,text$)
+REM Add a menu item
+LOCAL buffer%
+menu%!(28+(item%*24))=flags%
+menu%!(28+(item%*24)+4)=link%
+IF LEN(text$)>12 THEN
+  DIM buffer% LEN(text$)+1
+  menu%!(28+(item%*24)+8)=&07000121
+  menu%!(28+(item%*24)+12)=buffer%
+  menu%!(28+(item%*24)+16)=0
+  menu%!(28+(item%*24)+20)=LEN(text$)+1
+  $(buffer%)=text$
+ELSE
+  menu%!(28+(item%*24)+8)=&07000021
+  $(menu%+28+(item%*24)+12)=text$
+ENDIF
+ENDPROC
+
+DEF FNwimp_getmenutext (menu%,item%)
+REM Gets indirected text from a menu item
+LOCAL menuptr%,indarea%,text$
+menuptr%=menu%+28
+menuptr%+=item%*24
+indarea%=menuptr%!12
+text$=$(indarea%)
+=text$
+
+DEF PROCwimp_setmenutext (menu%,item%,text$)
+REM Sets the indirected text in an menu item
+LOCAL menuptr%,indarea%
+menuptr%=menu%+28
+menuptr%+=item%*24
+indarea%=menuptr%!12
+$(indarea%)=text$
+ENDPROC
+
+DEF FNwimp_getmenustate (menu%,item%,bit%)
+REM Gets a menu item's flag state
+LOCAL menuptr%
+menuptr%=menu%+28+(item%*24)
+IF ?menuptr% AND (1<<bit%) THEN =TRUE ELSE =FALSE
+
+DEF PROCwimp_setmenustate (menu%,item%,bit%,state%)
+REM Sets a menu item's flags
+LOCAL menuptr%
+menuptr%=menu%+28+(item%*24)
+CASE bit% OF
+  WHEN 0,1,2,3,4,7,8:
+    IF state% THEN menuptr%!0=menuptr%!0 OR (1<<bit%)
+    IF NOT state% THEN menuptr%!0=menuptr%!0 AND NOT (1<<bit%)
+  WHEN 22:
+    IF state% THEN menuptr%!8=menuptr%!8 OR (1<<bit%)
+    IF NOT state% THEN menuptr%!8=menuptr%!8 AND NOT (1<<bit%)
+ENDCASE
+ENDPROC
+
+DEF PROCwimp_radiotick (menu%,item%)
+REM Ticks one menu item and unticks the rest
+LOCAL menuptr%,i%
+menuptr%=menu%+4
+REPEAT
+  menuptr%+=24
+  IF i%=item% THEN
+    menuptr%!0=menuptr%!0 OR (1<<0)
+  ELSE
+    menuptr%!0=menuptr%!0 AND NOT (1<<0)
+  ENDIF
+  i%+=1
+UNTIL menuptr%!0 AND &80
+ENDPROC
+
+DEF PROCwimp_opendialogue (dialogue%,window%,type%)
+REM Opens a dialogue box centred over a window/over iconbar
+REM type%=0 transient; type%=1 persistent
+LOCAL x%,y%,dwidth%,dheight%,width%,height%
+Block%!0=dialogue%
+SYS "Wimp_GetWindowState",,Block%
+dwidth%=Block%!12-Block%!4
+dheight%=Block%!16-Block%!8
+IF window%=-2 THEN
+  Block%!0=window%
+  Block%!4=IconHandle%
+  SYS "Wimp_GetIconState",,Block%
+  x%=Block%!8-64    :REM Same x-offset as default menu
+  y%=dheight%+136   :REM Iconbar height + 40
+ELSE
+  Block%!0=window%
+  SYS "Wimp_GetWindowState",,Block%
+  x%=Block%!4
+  y%=Block%!16
+  width%=Block%!12-x%
+  height%=y%-Block%!8  
+  x%=x%+(width% DIV 2)-(dwidth% DIV 2)
+  y%=y%-(height% DIV 2)+(dheight% DIV 2)
+ENDIF
+CASE type% OF
+  WHEN 0:REM Open transient dialogue box
+    SYS "Wimp_CreateMenu",,dialogue%,x%,y%
+  WHEN 1:REM Open persistent dialogue box
+    Block%!0=dialogue%
+    Block%!4=x%
+    Block%!8=y%-dheight%
+    Block%!12=x%+dwidth%
+    Block%!16=y%
+    Block%!20=0
+    Block%!24=0
+    Block%!28=-1
+    SYS "Wimp_OpenWindow",,Block%
+ENDCASE
+ENDPROC
+
+DEF PROCwimp_closedialogue (dialogue%,window)
+REM Closes a persistent dialogue box and returns focus to window
+Block%!0=dialogue%
+SYS "Wimp_CloseWindow",,Block%
+Block%!0=window%
+SYS "Wimp_GetWindowState",,Block%
+IF Block%!32 AND (1<<16) THEN
+  SYS "Wimp_SetCaretPosition",window%,-1
+ENDIF 
+ENDPROC
+
+DEF FNwimp_popup (window%,menu%,icon%)
+REM Opens a popup menu and returns menu handle
+LOCAL x%,y%
+Block%!0=window%
+SYS "Wimp_GetWindowState",,Block%
+x%=Block%!4
+y%=Block%!16
+Block%!4=icon%
+SYS "Wimp_GetIconState",,Block%
+x%=x%+Block%!16
+y%=y%+Block%!20
+SYS "Wimp_CreateMenu",,menu%,x%,y%
+=menu%

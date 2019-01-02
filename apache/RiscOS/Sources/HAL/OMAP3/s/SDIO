@@ -1,0 +1,1256 @@
+;
+; Copyright (c) 2012, RISC OS Open Ltd
+; All rights reserved.
+;
+; Redistribution and use in source and binary forms, with or without
+; modification, are permitted provided that the following conditions are met: 
+;     * Redistributions of source code must retain the above copyright
+;       notice, this list of conditions and the following disclaimer.
+;     * Redistributions in binary form must reproduce the above copyright
+;       notice, this list of conditions and the following disclaimer in the
+;       documentation and/or other materials provided with the distribution.
+;     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+;       may be used to endorse or promote products derived from this software
+;       without specific prior written permission.
+; 
+; THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+; AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+; IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+; ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+; LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+; CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+; SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+; INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+; CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+; ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+; POSSIBILITY OF SUCH DAMAGE.
+;
+
+        EXPORT  SDIO_InitDevices
+        IMPORT  memcpy
+        IMPORT  TPSRead
+        IMPORT  TPSWrite
+        IMPORT  HAL_CounterDelay
+        EXPORT  PBias1Write
+
+        ; KEEP ; for debugging
+
+        GET     Hdr:ListOpts
+        GET     Hdr:CPU.Arch
+        GET     Hdr:Macros
+        GET     Hdr:OSEntries
+        GET     hdr.omap3530
+        GET     hdr.GPIO
+        GET     hdr.StaticWS
+
+        ; The Pandora developers have stated that the write protect circuitry
+        ; isn't very reliable, for this reason it's recommended to ignore it
+        ; (as per the official Linux distro)
+        ; http://www.riscosopen.org/forum/forums/5/topics/166?page=18#posts-19848
+        GBLL    EnablePandoraWriteProtect
+EnablePandoraWriteProtect SETL {FALSE}
+
+sb      RN      9
+
+; Timings
+
+; Maximum time bus power is allowed to take to ramp up or down.
+; MMC and SD agree this is 35 ms max ramp up, but nothing is said about ramp down so I'm assuming it's the same.
+BUS_POWER_RAMP  *       35000 ; in us
+
+; Number of reads of SYSSTATUS before we give up waiting for reset to complete
+RESET_TIMEOUT   *       100
+
+; Number of reads of SYSCTL before we give up waiting for SDCLK to stabilise
+CLOCKSET_TIMEOUT *      1000
+
+; Time to leave initialisation procedure to execute
+INIT_PROCEDURE_TIME *   1000 ; in us
+
+; Frequency of the clock which we divide to produce SDCLK
+FCLK_FREQ       *       96000 ; in kHz
+
+
+; Physical addresses of pin mux registers
+L4_PadConf_GPIO23  * L4_Core + 0x25EE
+L4_PadConf_GPIO26  * L4_Core + 0x25F4
+L4_PadConf_GPIO27  * L4_Core + 0x25F6
+L4_PadConf_GPIO29  * L4_Core + 0x25FA
+L4_PadConf_GPIO126 * L4_Core + 0x2150
+L4_PadConf_GPIO127 * L4_Core + 0x2152
+L4_PadConf_GPIO128 * L4_Core + 0x2154
+L4_PadConf_GPIO129 * L4_Core + 0x2156
+L4_PadConf_GPIO130 * L4_Core + 0x2158
+L4_PadConf_GPIO131 * L4_Core + 0x215A
+L4_PadConf_GPIO132 * L4_Core + 0x215C
+L4_PadConf_GPIO133 * L4_Core + 0x215E
+L4_PadConf_GPIO134 * L4_Core + 0x2160
+L4_PadConf_GPIO135 * L4_Core + 0x2162
+L4_PadConf_GPIO136 * L4_Core + 0x2164
+L4_PadConf_GPIO137 * L4_Core + 0x2166
+L4_PadConf_GPIO138 * L4_Core + 0x2168
+L4_PadConf_GPIO139 * L4_Core + 0x216A
+L4_PadConf_GPIO149 * L4_Core + 0x217E
+L4_PadConf_GPIO150 * L4_Core + 0x2180
+L4_PadConf_GPIO163 * L4_Core + 0x219A
+L4_PadConf_GPIO164 * L4_Core + 0x219C
+
+; Selected bits from PadConf registers (7.6.3 of spruf98b)
+PADCONF_MASK           * &FFFF
+PADCONF_INPUTENABLE    * 1 :SHL: 8
+PADCONF_PULLTYPESELECT * 1 :SHL: 4
+PADCONF_PULLUDENABLE   * 1 :SHL: 3
+PADCONF_MUXMODE_GPIO   * 4 :SHL: 0
+
+; Bits within the PBIAS register (7.6.4.102 of spruf98b)
+PBIASLITESUPPLYHIGH1 * 1 :SHL: 15
+PBIASLITEVMODEEROR1  * 1 :SHL: 11
+PBIASLITESPEEDCTRL1  * 1 :SHL: 10
+PBIASLITEPWRDNZ1     * 1 :SHL: 9
+PBIASLITEVMODE1      * 1 :SHL: 8
+PBIASLITESUPPLYHIGH0 * 1 :SHL: 7
+PBIASLITEVMODEEROR0  * 1 :SHL: 3
+PBIASLITESPEEDCTRL0  * 1 :SHL: 2
+PBIASLITEPWRDNZ0     * 1 :SHL: 1
+PBIASLITEVMODE0      * 1 :SHL: 0
+
+; Bits within the CONTROL_WKUP_CTRL register (DM37x specific, sprugn4o)
+WKUPCTRL_GPIO_IO_PWRDNZ * 1 :SHL: 6 ; Must be kept in sync with PBIASLITEPWRDNZ1
+
+; Physical addresses of clock setup registers
+L4_ClockMan_FCLKEN1_CORE * L4_ClockMan + &A00
+L4_ClockMan_ICLKEN1_CORE * L4_ClockMan + &A10
+
+; Bits within clock setup registers
+EN_MMC1 * 1 :SHL: 24
+EN_MMC2 * 1 :SHL: 25
+EN_MMC3 * 1 :SHL: 30
+
+; Physical address of DEVCONF1 register
+L4_Core_DEVCONF1 * L4_Core + &22D8
+
+; Bits within DEVCONF1 register
+MMCSDIO2ADPCLKISEL * 1 :SHL: 6
+
+; RISC OS device numbers for each controller's IRQ line
+MMC1_IRQ * 83
+MMC2_IRQ * 86
+MMC3_IRQ * 94
+
+; GPIO pin assignments
+        GBLS    BBREVC_WP
+        GBLS    IGEP_GREEN
+        GBLS    IGEP_RED
+        GBLS    BBREVB_WP
+        GBLS    PANDORA_WP1
+        GBLS    PANDORA_WP2
+        GBLS    PANDORA_LED1
+        GBLS    PANDORA_LED2
+        GBLS    MMC2_CLK
+        GBLS    MMC2_CMD
+        GBLS    MMC2_DAT0
+        GBLS    MMC2_DAT1
+        GBLS    MMC2_DAT2
+        GBLS    MMC2_DAT3
+        GBLS    MMC2_DIR_DAT0
+        GBLS    MMC2_DIR_DAT1
+        GBLS    MMC2_DIR_CMD
+        GBLS    MMC2_CLKIN
+        GBLS    BB_USER0
+        GBLS    BB_USER1
+        GBLS    DK_LED2
+        GBLS    DK_LED3
+BBREVC_WP       SETS    "23"
+IGEP_GREEN      SETS    "26"
+IGEP_RED        SETS    "27"
+BBREVB_WP       SETS    "29"  ; also WP on DevKit
+PANDORA_WP1     SETS    "126"
+PANDORA_WP2     SETS    "127"
+PANDORA_LED1    SETS    "128"
+PANDORA_LED2    SETS    "129"
+MMC2_CLK        SETS    "130"
+MMC2_CMD        SETS    "131"
+MMC2_DAT0       SETS    "132"
+MMC2_DAT1       SETS    "133"
+MMC2_DAT2       SETS    "134"
+MMC2_DAT3       SETS    "135"
+MMC2_DIR_DAT0   SETS    "136"
+MMC2_DIR_DAT1   SETS    "137"
+MMC2_DIR_CMD    SETS    "138"
+MMC2_CLKIN      SETS    "139"
+BB_USER0        SETS    "149" ; right LED
+BB_USER1        SETS    "150" ; left LED
+DK_LED2         SETS    "163" ; second-from-right LED, labelled LED2 (SYSLED3)
+DK_LED3         SETS    "164" ; far right LED, labelled LED3 (SYSLED4)
+
+        MACRO
+$name   DeclareTPSReg $group, $offset
+TPSRegGroup_$name * $group
+TPSRegOffset_$name * $offset
+        MEND
+
+GPIODATAIN1     DeclareTPSReg &49, &98
+GPIODATADIR1    DeclareTPSReg &49, &9B
+GPIO_DEBEN1     DeclareTPSReg &49, &A7
+GPIOCTRL        DeclareTPSReg &49, &AA
+DCDC_GLOBAL_CFG DeclareTPSReg &4B, &61
+VMMC1_DEV_GRP   DeclareTPSReg &4B, &82
+VMMC1_DEDICATED DeclareTPSReg &4B, &85
+VMMC2_DEV_GRP   DeclareTPSReg &4B, &86
+VMMC2_DEDICATED DeclareTPSReg &4B, &89
+VSIM_DEV_GRP    DeclareTPSReg &4B, &92
+VSIM_DEDICATED  DeclareTPSReg &4B, &95
+
+; Bits in TWL4030/TPS65950 registers
+
+GPIO0IN         *       1 :SHL: 0
+GPIO1IN         *       1 :SHL: 1
+
+GPIOCTRL_CD1    *       1 :SHL: 0
+GPIOCTRL_CD2    *       1 :SHL: 1
+GPIOCTRL_ON     *       1 :SHL: 2
+
+DEV_GRP_P3              *       1 :SHL: 7
+DEV_GRP_P2              *       1 :SHL: 6
+DEV_GRP_P1              *       1 :SHL: 5
+DEV_GRP_WARM_CFG        *       1 :SHL: 4
+DEV_GRP_STATE_MASK      *      &F :SHL: 0
+
+VMMC1_DEDICATED_TRIEN           *       1 :SHL: 6
+VMMC1_DEDICATED_TRIM_MASK       *       3 :SHL: 4
+VMMC1_DEDICATED_VSEL_1_85V      *       0 :SHL: 0
+VMMC1_DEDICATED_VSEL_2_85V      *       1 :SHL: 0
+VMMC1_DEDICATED_VSEL_3_00V      *       2 :SHL: 0
+VMMC1_DEDICATED_VSEL_3_15V      *       3 :SHL: 0
+VMMC1_DEDICATED_VSEL_MASK       *       3 :SHL: 0
+
+VMMC2_DEDICATED_TRIEN           *       1 :SHL: 6
+VMMC2_DEDICATED_TRIM_MASK       *       3 :SHL: 4
+VMMC2_DEDICATED_VSEL_1_00V      *       0 :SHL: 0
+VMMC2_DEDICATED_VSEL_1_20V      *       2 :SHL: 0
+VMMC2_DEDICATED_VSEL_1_30V      *       3 :SHL: 0
+VMMC2_DEDICATED_VSEL_1_50V      *       4 :SHL: 0
+VMMC2_DEDICATED_VSEL_1_80V      *       5 :SHL: 0
+VMMC2_DEDICATED_VSEL_1_85V      *       6 :SHL: 0
+VMMC2_DEDICATED_VSEL_2_50V      *       7 :SHL: 0
+VMMC2_DEDICATED_VSEL_2_60V      *       8 :SHL: 0
+VMMC2_DEDICATED_VSEL_2_80V      *       9 :SHL: 0
+VMMC2_DEDICATED_VSEL_2_85V      *      &A :SHL: 0
+VMMC2_DEDICATED_VSEL_3_00V      *      &B :SHL: 0
+VMMC2_DEDICATED_VSEL_3_15V      *      &C :SHL: 0
+VMMC2_DEDICATED_VSEL_MASK       *      &F :SHL: 0
+
+VSIM_DEDICATED_TRIEN            *       1 :SHL: 6
+VSIM_DEDICATED_TRIM_MASK        *       3 :SHL: 4
+VSIM_DEDICATED_VSEL_1_0V        *       0 :SHL: 0
+VSIM_DEDICATED_VSEL_1_2V        *       1 :SHL: 0
+VSIM_DEDICATED_VSEL_1_3V        *       2 :SHL: 0
+VSIM_DEDICATED_VSEL_1_8V        *       3 :SHL: 0
+VSIM_DEDICATED_VSEL_2_8V        *       4 :SHL: 0
+VSIM_DEDICATED_VSEL_3_0V        *       5 :SHL: 0
+VSIM_DEDICATED_VSEL_MASK        *       7 :SHL: 0
+
+; Selected SD controller registers and bits
+SYSCONFIG               *       &010
+SYSCONFIG_SOFTRESET     *       1:SHL:1
+SYSSTATUS               *       &014
+SYSSTATUS_RESETDONE     *       1:SHL:0
+CON                     *       &02C
+CON_OD                  *       1 :SHL: 0
+CON_INIT                *       1 :SHL: 1
+CON_DW8                 *       1 :SHL: 5
+CMD                     *       &10C
+HCTL                    *       &128
+HCTL_DTW                *       1 :SHL: 1
+HCTL_SDBP               *       1 :SHL: 8
+HCTL_SDVS_1_8V          *       5 :SHL: 9
+HCTL_SDVS_3_0V          *       6 :SHL: 9
+SYSCTL                  *       &12C
+SYSCTL_ICE              *       1 :SHL: 0
+SYSCTL_ICS              *       1 :SHL: 1
+SYSCTL_CEN              *       1 :SHL: 2
+SYSCTL_CLKD_SHIFT       *       6
+SYSCTL_CLKD_MASK        *       &3FF :SHL: SYSCTL_CLKD_SHIFT
+STAT                    *       &130
+STAT_CC                 *       1 :SHL: 0
+CAPA                    *       &140
+CAPA_VS33               *       1:SHL:24
+CAPA_VS30               *       1:SHL:25
+CAPA_VS18               *       1:SHL:26
+
+
+        AREA    |Asm$$Code|, CODE, READONLY, PIC
+
+        MACRO
+$class  HALDeviceField $field, $value
+        LCLS    myvalue
+      [ "$value" = ""
+myvalue SETS    "$field"
+      |
+myvalue SETS    "$value"
+      ]
+        ASSERT  . - %A0 = HALDevice_$class$field
+      [ ?HALDevice_$class$field = 2
+        DCW     $myvalue
+   ELIF ?HALDevice_$class$field = 4
+        DCD     $myvalue
+      |
+        %       ?HALDevice_$class$field
+      ]
+        MEND
+
+; Template for device blocks
+
+Template
+0
+        HALDeviceField Type,               HALDeviceType_ExpCtl + HALDeviceExpCtl_SDIO
+        HALDeviceField ID,                 HALDeviceID_SDIO_SDHCI
+        HALDeviceField Location,           HALDeviceBus_Peri + HALDevicePeriBus_Sonics3220
+        HALDeviceField Version,            0
+        HALDeviceField Description
+        HALDeviceField Address,            0 ; patched up at initialisation
+        HALDeviceField Reserved1,          0
+        HALDeviceField Activate,           0 ; patched up at initialisation
+        HALDeviceField Deactivate
+        HALDeviceField Reset
+        HALDeviceField Sleep
+        HALDeviceField Device,             MMC1_IRQ ; overridden in some cases
+        HALDeviceField TestIRQ
+        HALDeviceField ClearIRQ,           0
+        HALDeviceField Reserved2,          0
+SDHCI   HALDeviceField Flags,              HALDeviceSDHCI_Flag_32bit + HALDeviceSDHCI_Flag_R2bug
+SDHCI   HALDeviceField Slots,              1
+SDHCI   HALDeviceField SlotInfo,           0 ; patched up at initialisation
+SDHCI   HALDeviceField WriteRegister,      0
+SDHCI   HALDeviceField GetCapabilities,    0
+SDHCI   HALDeviceField GetVddCapabilities, 0 ; overridden in some cases
+SDHCI   HALDeviceField SetVdd              ; overridden in some cases
+SDHCI   HALDeviceField SetBusMode
+SDHCI   HALDeviceField PostPowerOn
+SDHCI   HALDeviceField SetBusWidth
+SDHCI   HALDeviceField GetMaxCurrent       ; overridden in some cases
+SDHCI   HALDeviceField SetSDCLK
+SDHCI   HALDeviceField GetTMCLK
+SDHCI   HALDeviceField SetActivity,        0 ; patched up at initialisation
+SDHCI   HALDeviceField GetCardDetect       ; overridden in some cases
+SDHCI   HALDeviceField GetWriteProtect,    0 ; patched up at initialisation
+        %       %A0 + HALDevice_SDHCISize - .
+        ASSERT  . - %A0 = SDHCISB
+        DCD     0                          ; patched up at initialisation
+        ASSERT  . - %A0 = SDHCISlotInfo + HALDeviceSDHCI_SlotInfo_Flags
+        DCD     0                          ; patched up at initialisation
+        ASSERT  . - %A0 = SDHCISlotInfo + HALDeviceSDHCI_SlotInfo_StdRegs
+        DCD     0                          ; patched up at initialisation
+        ASSERT  . - %A0 = SDHCISize
+
+
+        ; Init the SDHCI HAL device(s)
+        ; a1 = BoardType value
+        ; a2 = BoardRevision value
+SDIO_InitDevices ROUT
+        Push    "a1-a2,lr"
+        MOV     a3, #0
+        ADRL    a4, SDIOWS
+        BL      InitDevice
+        Pull    "a1-a2"
+        TEQ     a1, #BoardType_OMAP3_IGEPv2 ; IGEPv2 has 2 controllers
+        TEQNE   a1, #BoardType_OMAP3_Pandora ; Pandora has 3
+        Pull    "pc", NE
+        Push    "a1-a2"
+        MOV     a3, #1
+        ADRL    a4, SDIOWS + SDHCISize
+        BL      InitDevice
+        Pull    "a1-a2"
+        TEQ     a1, #BoardType_OMAP3_Pandora ; only Pandora uses 3 controllers
+        Pull    "pc", NE
+        MOV     a3, #2
+        ADRL    a4, SDIOWS + 2 * SDHCISize
+        BL      InitDevice
+        Pull    "pc"
+
+        ; Init one SDHCI HAL device
+        ; a1 = BoardType value
+        ; a2 = BoardRevision value
+        ; a3 = device number
+        ; a4 -> workspace for this device
+InitDevice ROUT
+        Push    "a1-a4,lr"
+        MOV     a1, a4
+        ADR     a2, Template
+        MOV     a3, #SDHCISize
+        BL      memcpy
+        
+        Pull    "a1-a4"
+        
+        ; Address and SlotInfo_StdRegs
+        LDR     ip, L4_Core_Log
+        CMP     a3, #1
+        ADDLO   lr, ip, #L4_MemCard1 - L4_Core
+        ADDEQ   lr, ip, #L4_MemCard2 - L4_Core
+        ADDHI   lr, ip, #L4_MemCard3 - L4_Core
+        STR     lr, [a4, #HALDevice_Address]
+        ADD     lr, lr, #&100
+        STR     lr, [a4, #SDHCISlotInfo + HALDeviceSDHCI_SlotInfo_StdRegs]
+
+        ; Device
+        MOVEQ   lr, #MMC2_IRQ
+        MOVHI   lr, #MMC3_IRQ
+        STRHS   lr, [a4, #HALDevice_Device]
+
+        ; SlotInfo
+        ADD     lr, a4, #SDHCISlotInfo
+        STR     lr, [a4, #HALDevice_SDHCISlotInfo]
+        
+        ; SDHCISB
+        STR     sb, [a4, #SDHCISB]
+        
+        TEQEQ   a1, #BoardType_OMAP3_IGEPv2
+        TEQNE   a3, #2
+        BEQ     %F30
+        BCS     %F20
+        
+        ; Card slot 1 case
+        ; ----------------
+        
+        ; Activate
+        ADR     lr, Activate_MMC1_BeagleboardxM
+        TEQ     a1, #BoardType_OMAP3_BeagleBoard
+        TEQEQ   a2, #BoardRevision_BeagleBoard_AB
+        ADREQ   lr, Activate_MMC1_BeagleboardRevB
+        TEQ     a2, #BoardRevision_BeagleBoard_C123
+        TEQNE   a2, #BoardRevision_BeagleBoard_C4
+        TEQEQ   a1, #BoardType_OMAP3_BeagleBoard
+        ADREQ   lr, Activate_MMC1_BeagleboardRevC
+        TEQ     a1, #BoardType_OMAP3_IGEPv2
+        ADREQ   lr, Activate_MMC1_IGEPv2
+        TEQ     a1, #BoardType_OMAP3_DevKit8000
+        ADREQ   lr, Activate_MMC1_DevKit8000
+        TEQ     a1, #BoardType_OMAP3_Pandora
+        ADREQL  lr, Activate_MMC1_Pandora
+        STR     lr, [a4, #HALDevice_Activate]
+        
+        ; SetActivity
+        TEQ     a1, #BoardType_OMAP3_BeagleBoard
+        TEQNE   a1, #BoardType_OMAP3_TouchBook
+        ADREQL  lr, SetActivity_Beagleboard ; LEDs are same on original and xM
+        TEQ     a1, #BoardType_OMAP3_IGEPv2
+        ADREQL  lr, SetActivity_IGEPv2
+        TEQ     a1, #BoardType_OMAP3_DevKit8000
+        ADREQL  lr, SetActivity_DevKit8000
+        TEQ     a1, #BoardType_OMAP3_Pandora
+        ADREQL  lr, SetActivity_Pandora_MMC1
+        STR     lr, [a4, #HALDevice_SDHCISetActivity]
+
+        ; GetWriteProtect
+        ADRL    lr, GetWriteProtect_Unimplemented
+        TEQ     a1, #BoardType_OMAP3_BeagleBoard
+        TEQEQ   a2, #BoardRevision_BeagleBoard_AB
+        TEQNE   a1, #BoardType_OMAP3_DevKit8000
+        ADREQL  lr, GetWriteProtect_BeagleboardRevB_DevKit8000
+        TEQ     a2, #BoardRevision_BeagleBoard_C123
+        TEQNE   a2, #BoardRevision_BeagleBoard_C4
+        TEQEQ   a1, #BoardType_OMAP3_BeagleBoard
+        ADREQL  lr, GetWriteProtect_BeagleboardRevC
+      [ EnablePandoraWriteProtect
+        TEQ     a1, #BoardType_OMAP3_Pandora
+        ADREQL  lr, GetWriteProtect_Pandora_MMC1
+      ]
+        STR     lr, [a4, #HALDevice_SDHCIGetWriteProtect]
+        
+        ; SlotInfo_Flags
+        ADRL    ip, GetWriteProtect_Unimplemented
+        TEQ     lr, ip ; EQ => microSD slot
+        TEQNE   a1, #BoardType_OMAP3_Pandora ; only 4 bits on Pandora even though full size
+        MOVNE   lr, #HALDeviceSDHCI_SlotFlag_Bus8Bit
+        MOVEQ   lr, #HALDeviceSDHCI_SlotFlag_Bus4Bit
+        TEQ     a1, #BoardType_OMAP3_TouchBook
+        ORREQ   lr, lr, #HALDeviceSDHCI_SlotFlag_NoCardDetect ; The card detect line doesn't appear to work, so ignore it
+        STR     lr, [a4, #SDHCISlotInfo + HALDeviceSDHCI_SlotInfo_Flags]
+        
+        B       %F40
+        
+20      ; Card slot 2 case (Pandora only)
+        ; -------------------------------
+
+        ; Activate
+        ADRL    lr, Activate_MMC2_Pandora
+        STR     lr, [a4, #HALDevice_Activate]
+        
+        ; GetVddCapabilities
+        ; Only Pandora uses an external level shifter, and only on MMC2
+        ADRL    lr, GetVddCapabilities_Pandora_MMC2
+        STR     lr, [a4, #HALDevice_SDHCIGetVddCapabilities]
+        
+        ; SetVdd
+        ; Only MMC1 supports variable voltages in the OMAP. Without more details
+        ; of the level shifter on Pandora MMC2 and/or some hardware to test, I'm
+        ; reluctant to implement voltage control for it, so just treat MMC2 as
+        ; fixed voltage in all cases (and assume the bootloader has already
+        ; configured the voltages correctly). We do still need to turn on the
+        ; power internal to the controller, though.
+        ADRL    lr, SetVdd_MMC2_LevelShifted
+        STR     lr, [a4, #HALDevice_SDHCISetVdd]
+        
+        ; GetMaxCurrent
+        ; Pandora uses the TPS VMMC2 power rail for MMC2.
+        ADRL    lr, GetMaxCurrent_MMC2
+        STR     lr, [a4, #HALDevice_SDHCIGetMaxCurrent]
+        
+        ; SetActivity
+        ADRL    lr, SetActivity_Pandora_MMC2
+        STR     lr, [a4, #HALDevice_SDHCISetActivity]
+        
+        ; GetCardDetect
+        ADRL    lr, GetCardDetect_MMC2
+        STR     lr, [a4, #HALDevice_SDHCIGetCardDetect]
+        
+        ; GetWriteProtect
+      [ EnablePandoraWriteProtect
+        ADRL    lr, GetWriteProtect_Pandora_MMC2
+      |
+        ADRL    lr, GetWriteProtect_Unimplemented
+      ]
+        STR     lr, [a4, #HALDevice_SDHCIGetWriteProtect]
+        
+        ; SlotInfo_Flags
+        MOV     lr, #HALDeviceSDHCI_SlotFlag_Bus4Bit
+        STR     lr, [a4, #SDHCISlotInfo + HALDeviceSDHCI_SlotInfo_Flags]
+        
+        B       %F40
+        
+30      ; SDIO WiFi chip (IGEPv2 and Pandora)
+        ; -----------------------------------
+
+        ; Activate
+        TEQ     a1, #BoardType_OMAP3_IGEPv2
+        ADREQL  lr, Activate_MMC2_IGEPv2
+        ADRNEL  lr, Activate_MMC3_Pandora
+        STR     lr, [a4, #HALDevice_Activate]
+        
+        ; SetVdd
+        ; There is no level shifter between the OMAP and the WiFi chip, and no
+        ; possibility to change the voltage in the OMAP on either MMC2 or MMC3.
+        ; Default SDHCI handler will do in this case.
+        MOV     lr, #0
+        STR     lr, [a4, #HALDevice_SDHCISetVdd]
+        
+        ; GetMaxCurrent
+        ; IGEPv2 uses a mixture of 1.8V and 3.3V supplies for its WiFi/Bluetooth
+        ; chip on MMC2. Pandora has a WiFi chip on MMC3, though its details are
+        ; sketchy at the moment; assume it's the same as the IGEPv2.
+        ADRL    lr, GetMaxCurrent_LBEE1USJYC
+        STR     lr, [a4, #HALDevice_SDHCIGetMaxCurrent]
+        
+        ; SetActivity
+        ADR     lr, NOPEntry
+        STR     lr, [a4, #HALDevice_SDHCISetActivity]
+        
+        ; GetCardDetect
+        ADRL    lr, GetCardDetect_NonRemovable
+        STR     lr, [a4, #HALDevice_SDHCIGetCardDetect]
+        
+        ; GetWriteProtect
+        ADRL    lr, GetWriteProtect_Unimplemented
+        STR     lr, [a4, #HALDevice_SDHCIGetWriteProtect]
+        
+        ; SlotInfo_Flags
+        MOV     lr, #HALDeviceSDHCI_SlotFlag_Bus4Bit :OR: HALDeviceSDHCI_SlotFlag_Integrated
+        STR     lr, [a4, #SDHCISlotInfo + HALDeviceSDHCI_SlotInfo_Flags]
+        
+        ; drop through...
+        
+40      ; The three cases rejoin here
+        MOV     a1, #0 ; flags
+        MOV     a2, a4
+        Pull    "lr"
+        LDR     pc, OSentries+4*OS_AddDevice ; tail call
+
+Description DATA
+        =       "TI OMAP3 SD host controller", 0
+        ALIGN
+
+NOPEntry ROUT
+        MOV     pc, lr
+
+        MACRO
+        EnableClocks $ctrlr
+        ; 22.6.1.3.1.1 MMCHS Controller Interface and Functional Clocks Enabling
+        ADD     a4, a4, #L4_ClockMan_FCLKEN1_CORE - L4_Core
+        LDR     a3, [a4]
+        ORR     a3, a3, #EN_$ctrlr
+        STR     a3, [a4]
+        LDR     a3, [a4, #L4_ClockMan_ICLKEN1_CORE - L4_ClockMan_FCLKEN1_CORE]
+        ORR     a3, a3, #EN_$ctrlr
+        STR     a3, [a4, #L4_ClockMan_ICLKEN1_CORE - L4_ClockMan_FCLKEN1_CORE]
+        SUB     a4, a4, #L4_ClockMan_FCLKEN1_CORE - L4_Core
+        MEND
+        
+        MACRO
+        MakeGPIOPin $num, $input
+        LDR     a3, [a4, #(L4_PadConf_GPIO$num :AND::NOT: 3) - L4_PadConf]
+    [ L4_PadConf_GPIO$num :AND: 2 = 0
+        MOVW    a2, #PADCONF_MASK
+        BIC     a3, a3, a2
+      [ "$input" = "input"
+        ORR     a3, a3, #PADCONF_INPUTENABLE :OR: PADCONF_MUXMODE_GPIO
+      |
+        ORR     a3, a3, #PADCONF_MUXMODE_GPIO
+      ]
+    |
+        UXTH    a3, a3
+      [ "$input" = "input"
+        ORR     a3, a3, #(PADCONF_INPUTENABLE :OR: PADCONF_MUXMODE_GPIO) :SHL: 16
+      |
+        ORR     a3, a3, #PADCONF_MUXMODE_GPIO :SHL: 16
+      ]
+    ]
+        STR     a3, [a4, #(L4_PadConf_GPIO$num :AND::NOT: 3) - L4_PadConf]
+        GPIO_PrepareC a1, a2, $num
+      [ "$input" = "input"
+        GPIO_SetAsInput a1, a2, a3
+      |
+        GPIO_SetAsOutput a1, a2, a3
+      ]
+        MEND
+
+        MACRO
+        MakeMMCPin $num, $type, $input
+        LDR     a3, [a4, #(L4_PadConf_GPIO$num :AND::NOT: 3) - L4_PadConf]
+    [ L4_PadConf_GPIO$num :AND: 2 = 0
+        MOVW    a2, #PADCONF_MASK
+        BIC     a3, a3, a2
+      [ "$input" = "input"
+        ORR     a3, a3, #$type :OR: PADCONF_PULLUDENABLE :OR: PADCONF_PULLTYPESELECT :OR: PADCONF_INPUTENABLE
+      |
+        ORR     a3, a3, #$type :OR: PADCONF_PULLUDENABLE :OR: PADCONF_PULLTYPESELECT
+      ]
+    |
+        UXTH    a3, a3
+      [ "$input" = "input"
+        ORR     a3, a3, #($type :OR: PADCONF_PULLUDENABLE :OR: PADCONF_PULLTYPESELECT) :SHL: 16
+        ORR     a3, a3, #PADCONF_INPUTENABLE :SHL: 16
+      |
+        ORR     a3, a3, #($type :OR: PADCONF_PULLUDENABLE :OR: PADCONF_PULLTYPESELECT) :SHL:16
+      ]
+    ]
+        STR     a3, [a4, #(L4_PadConf_GPIO$num :AND::NOT: 3) - L4_PadConf]
+        MEND
+
+        MACRO
+        MyTPSWrite $reg, $value
+        LDR     lr, =$value
+        STR     lr, [sp]
+        MOV     a1, #TPSRegGroup_$reg * 2
+        MOV     a4, #TPSRegOffset_$reg
+        BL      TPSWrite
+        MEND
+        
+Activate_MMC1_BeagleboardRevB ROUT
+        Push    "sb,lr"
+        LDR     sb, [a1, #SDHCISB]
+        LDR     a4, L4_Core_Log
+        EnableClocks MMC1
+        LDR     lr, =L4_PadConf - L4_Core
+        ADD     a4, a4, lr
+        MakeGPIOPin $BB_USER0, output
+        MakeGPIOPin $BB_USER1, output
+        MakeGPIOPin $BBREVB_WP, input
+        MOV     a1, #1
+        Pull    "sb,pc"
+
+Activate_MMC1_BeagleboardRevC ROUT
+        Push    "sb,lr"
+        LDR     sb, [a1, #SDHCISB]
+        LDR     a4, L4_Core_Log
+        EnableClocks MMC1
+        LDR     lr, =L4_PadConf - L4_Core
+        ADD     a4, a4, lr
+        MakeGPIOPin $BB_USER0, output
+        MakeGPIOPin $BB_USER1, output
+        MakeGPIOPin $BBREVC_WP, input
+        MOV     a1, #1
+        Pull    "sb,pc"
+
+Activate_MMC1_BeagleboardxM ROUT ; Also TouchBook
+        Push    "sb,lr"
+        LDR     sb, [a1, #SDHCISB]
+        LDR     a4, L4_Core_Log
+        EnableClocks MMC1
+        LDR     lr, =L4_PadConf - L4_Core
+        ADD     a4, a4, lr
+        MakeGPIOPin $BB_USER0, output
+        MakeGPIOPin $BB_USER1, output
+        MOV     a1, #1
+        Pull    "sb,pc"
+
+Activate_MMC1_IGEPv2 ROUT
+        Push    "sb,lr"
+        LDR     sb, [a1, #SDHCISB]
+        LDR     a4, L4_Core_Log
+        EnableClocks MMC1
+        LDR     lr, =L4_PadConf - L4_Core
+        ADD     a4, a4, lr
+        MakeGPIOPin $IGEP_GREEN, output
+        MakeGPIOPin $IGEP_RED, output
+        MOV     a1, #1
+        Pull    "sb,pc"
+
+Activate_MMC1_DevKit8000 ROUT
+        Push    "sb,lr"
+        LDR     sb, [a1, #SDHCISB]
+        LDR     a4, L4_Core_Log
+        EnableClocks MMC1
+        LDR     lr, =L4_PadConf - L4_Core
+        ADD     a4, a4, lr
+        MakeGPIOPin $DK_LED2, output
+        MakeGPIOPin $DK_LED3, output
+        MakeGPIOPin $BBREVB_WP, input
+        MOV     a1, #1
+        Pull    "sb,pc"
+
+Activate_MMC1_Pandora ROUT
+        Push    "sb,lr"
+        LDR     sb, [a1, #SDHCISB]
+        LDR     a4, L4_Core_Log
+        EnableClocks MMC1
+        LDR     lr, =L4_PadConf - L4_Core
+        ADD     a4, a4, lr
+        MakeGPIOPin $PANDORA_LED1, output
+        MakeGPIOPin $PANDORA_WP1, input
+        MOV     a1, #1
+        Pull    "sb,pc"
+
+Activate_MMC2_IGEPv2 ROUT
+        Push    "sb,lr"
+        LDR     sb, [a1, #SDHCISB]
+        LDR     a4, L4_Core_Log
+        EnableClocks MMC2
+        MOV     a1, #1
+        Pull    "sb,pc"
+
+Activate_MMC2_Pandora ROUT
+        Push    "v1,sb,lr"
+        LDR     sb, [a1, #SDHCISB]
+        LDR     a4, L4_Core_Log
+        LDR     lr, =L4_Core_DEVCONF1 - L4_Core
+        LDR     ip, [a4, lr]
+        BIC     ip, ip, #MMCSDIO2ADPCLKISEL
+        STR     ip, [a4, lr]
+        EnableClocks MMC2
+        LDR     lr, =L4_PadConf - L4_Core
+        ADD     a4, a4, lr
+        MakeGPIOPin $PANDORA_LED2, output
+        MakeGPIOPin $PANDORA_WP2, input
+        MakeMMCPin $MMC2_CLK, 0
+        MakeMMCPin $MMC2_CMD, 0, input
+        MakeMMCPin $MMC2_DAT0, 0, input
+        MakeMMCPin $MMC2_DAT1, 0, input
+        MakeMMCPin $MMC2_DAT2, 0, input
+        MakeMMCPin $MMC2_DAT3, 0, input
+        MakeMMCPin $MMC2_DIR_DAT0, 1
+        MakeMMCPin $MMC2_DIR_DAT1, 1
+        MakeMMCPin $MMC2_DIR_CMD, 1
+        MakeMMCPin $MMC2_CLKIN, 1, input
+        SUB     sp, sp, #4
+        MOV     a2, sp
+        MOV     a3, #1
+        LDR     v1, OSentries+4*OS_IICOpV
+        MyTPSWrite VMMC2_DEDICATED, VMMC2_DEDICATED_VSEL_3_00V
+        MyTPSWrite VMMC2_DEV_GRP, DEV_GRP_P1
+        MyTPSWrite GPIOCTRL, GPIOCTRL_ON
+        ADD     sp, sp, #4
+        MOV     a1, #1
+        Pull    "v1,sb,pc"
+
+Activate_MMC3_Pandora ROUT
+        Push    "sb,lr"
+        LDR     sb, [a1, #SDHCISB]
+        LDR     a4, L4_Core_Log
+        EnableClocks MMC3
+        MOV     a1, #1
+        Pull    "sb,pc"
+
+Deactivate * NOPEntry
+
+Reset ROUT
+        Push    "sb,lr"
+        LDR     sb, [a1, #SDHCISB]
+        LDR     a4, [a1, #HALDevice_Address]
+        ; 22.6.1.3.1.2 MMCHS Controller Software Reset
+        MOV     a2, #SYSCONFIG_SOFTRESET
+        STR     a2, [a4, #SYSCONFIG]
+        MOV     a3, #RESET_TIMEOUT
+00      SUBS    a3, a3, #1
+        Pull    "sb,pc", EQ ; timed out
+        LDR     a2, [a4, #SYSSTATUS]
+        TST     a2, #SYSSTATUS_RESETDONE
+        BEQ     %B00
+        
+        ; 22.6.1.3.1.3 MMCHS Controller Voltage Capabilities Initialization
+        ADRL    a2, SDIOWS ; = device for MMC1
+        TEQ     a2, a1
+        MOVEQ   a2, #CAPA_VS18 :OR: CAPA_VS30
+        MOVNE   a2, #CAPA_VS18
+        STR     a2, [a4, #CAPA]
+        Pull    "sb,pc"
+
+Sleep ROUT
+        ; Could probably turn clock to controller on/off to
+        ; save power, but for now don't support power saving
+        MOV     a1, #0
+        MOV     pc, lr
+
+TestIRQ ROUT
+        ; Not a shared interrupt, so it must be our fault
+        MOV     a1, #1
+        MOV     pc, lr
+
+GetVddCapabilities_Pandora_MMC2
+        ; The TPS can't generate 3.3V, so by deduction this must be 3.0V.
+        MOV     a1, #CAPA_VS30 / CAPA_VS33 ; flags start at bit 0
+        MOV     pc, lr
+
+SetVdd ROUT ; MMC1 case
+        Push    "v1,sb,lr"
+        LDR     sb, [a1, #SDHCISB]
+        SUB     sp, sp, #4 ; buffer for TPS register contents
+        
+        ; Use separate code branches for each voltage to keep ordering correct
+        TEQ     a3, #0
+        BEQ     %F00
+        LDR     a1, =1800
+        TEQ     a3, a1
+        BEQ     %F18
+        LDR     a1, =3000
+        TEQ     a3, a1
+        BEQ     %F30
+        B       %F90 ; shouldn't happen
+
+00      ; Set to 0V
+
+        ; Set the pads to high impedance to protect the GPIO controller from ramping reference voltages
+        MOV     a1, #0
+        BL      PBiasWriteAuto
+        
+        ; Turn off the power in the TWL4030/TPS65950
+        MOV     a2, sp
+        MOV     a3, #1
+        LDR     v1, OSentries+4*OS_IICOpV
+        MyTPSWrite VMMC1_DEV_GRP, 0
+        ; VSIM only used with 8bit interfaces
+        LDR     ip, =:INDEX:SDIOWS+SDHCISlotInfo+HALDeviceSDHCI_SlotInfo_Flags
+        LDR     ip, [sb, ip]
+        TST     ip, #HALDeviceSDHCI_SlotFlag_Bus8Bit
+        BEQ     %FT05
+        MyTPSWrite VSIM_DEV_GRP, 0
+05
+        
+        ; Turn off the power internal to the SD controller
+        ADRL    a1, SDIOWS
+        LDR     a1, [a1, #HALDevice_Address]
+        MOV     a2, #0
+        STR     a2, [a1, #HCTL]
+        
+        ; Wait for the power to ramp before returning
+        MOV     r0, #BUS_POWER_RAMP
+        BL      HAL_CounterDelay
+        
+        B       %F90
+        
+18      ; Set to 1.8V
+
+        ; Turn on the power in the TWL4030/TPS65950
+        MOV     a2, sp
+        MOV     a3, #1
+        LDR     v1, OSentries+4*OS_IICOpV
+        MyTPSWrite VMMC1_DEDICATED, VMMC1_DEDICATED_VSEL_1_85V
+        MyTPSWrite VMMC1_DEV_GRP, DEV_GRP_P1
+        ; VSIM only used with 8bit interfaces
+        LDR     ip, =:INDEX:SDIOWS+SDHCISlotInfo+HALDeviceSDHCI_SlotInfo_Flags
+        LDR     ip, [sb, ip]
+        TST     ip, #HALDeviceSDHCI_SlotFlag_Bus8Bit
+        BEQ     %FT20
+        MyTPSWrite VSIM_DEDICATED, VSIM_DEDICATED_VSEL_1_8V
+        MyTPSWrite VSIM_DEV_GRP, DEV_GRP_P1
+20
+        
+        ; Turn on the power internal to the SD controller
+        ADRL    a1, SDIOWS
+        LDR     a1, [a1, #HALDevice_Address]
+        MOV     a2, #HCTL_SDVS_1_8V
+        STR     a2, [a1, #HCTL]
+        MOV     a2, #HCTL_SDVS_1_8V :OR: HCTL_SDBP
+        STR     a2, [a1, #HCTL] ; needs to be two separate writes, the SDBP bit won't latch on the first write
+        
+        ; Wait for the power to ramp up
+        MOV     r0, #BUS_POWER_RAMP
+        BL      HAL_CounterDelay
+        
+        ; Configure the GPIO controller for the new reference voltage
+        MOV     a1, #PBIASLITESPEEDCTRL1 :OR: PBIASLITEPWRDNZ1 :OR: PBIASLITESPEEDCTRL0 :OR: PBIASLITEPWRDNZ0
+        BL      PBiasWriteAuto
+        
+        B       %F90
+        
+30      ; Set to 3.0V
+
+        ; Turn on the power in the TWL4030/TPS65950
+        MOV     a2, sp
+        MOV     a3, #1
+        LDR     v1, OSentries+4*OS_IICOpV
+        MyTPSWrite VMMC1_DEDICATED, VMMC1_DEDICATED_VSEL_3_00V
+        MyTPSWrite VMMC1_DEV_GRP, DEV_GRP_P1
+        ; VSIM only used with 8bit interfaces
+        LDR     ip, =:INDEX:SDIOWS+SDHCISlotInfo+HALDeviceSDHCI_SlotInfo_Flags
+        LDR     ip, [sb, ip]
+        TST     ip, #HALDeviceSDHCI_SlotFlag_Bus8Bit
+        BEQ     %FT35
+        MyTPSWrite VSIM_DEDICATED, VSIM_DEDICATED_VSEL_3_0V
+        MyTPSWrite VSIM_DEV_GRP, DEV_GRP_P1
+35
+        
+        ; Turn on the power internal to the SD controller
+        ADRL    a1, SDIOWS
+        LDR     a1, [a1, #HALDevice_Address]
+        MOV     a2, #HCTL_SDVS_3_0V
+        STR     a2, [a1, #HCTL]
+        MOV     a2, #HCTL_SDVS_3_0V :OR: HCTL_SDBP
+        STR     a2, [a1, #HCTL] ; needs to be two separate writes, the SDBP bit won't latch on the first write
+        
+        ; Wait for the power to ramp up
+        MOV     r0, #BUS_POWER_RAMP
+        BL      HAL_CounterDelay
+        
+        ; Configure the GPIO controller for the new reference voltage
+        MOV     a1, #PBIASLITESPEEDCTRL1 :OR: PBIASLITEPWRDNZ1 :OR: PBIASLITEVMODE1 :OR: PBIASLITESPEEDCTRL0 :OR: PBIASLITEPWRDNZ0 :OR: PBIASLITEVMODE0
+        BL      PBiasWriteAuto
+        
+        ; Drop through
+        
+90      ADD     sp, sp, #4
+        Pull    "v1,sb,pc"
+
+PBiasWriteAuto ROUT
+        ; Write a new value to the PBIAS register, avoiding updating the configuration for PBIAS1 if we only have a 4 bit interface (for 4 bit interfaces we leave VSIM alone, so we should leave the PBIAS1 configuration alone as well)
+        LDR     ip, =:INDEX:SDIOWS+SDHCISlotInfo+HALDeviceSDHCI_SlotInfo_Flags
+        LDR     ip, [sb, ip]
+        TST     ip, #HALDeviceSDHCI_SlotFlag_Bus8Bit
+        BEQ     PBias0Write
+PBiasWriteFull
+        LDR     a2, L4_Core_Log
+        LDR     a3, =L4_PBiasLite - L4_Core
+50
+        STR     a1, [a2, a3]!
+        ; We also need to update CONTROL_WKUP_CTRL.GPIO_IO_PWRDNZ
+        ; The GPIO_IO_PWRDNZ bit only exists on AM/DM37xx chips, but writing to
+        ; it on OMAP35xx should be safe.
+        LDR     a3, [a2, #L4_CtrlWkupCtrl-L4_PBiasLite]!
+        ASSERT  PBIASLITEPWRDNZ1 = 1 :SHL: 9
+        UBFX    a1, a1, #9, #1
+        ASSERT  WKUPCTRL_GPIO_IO_PWRDNZ = 1 :SHL: 6
+        BFI     a3, a1, #6, #1
+        STR     a3, [a2]        
+        MOV     pc, lr
+
+PBias1Write
+        ; Write to just PBIAS1 control bits
+        LDR     a2, L4_Core_Log
+        LDR     a3, =L4_PBiasLite - L4_Core
+        LDR     ip, [a2, a3]
+        BFI     ip, a1, #8, #8
+        B       %BT50
+
+PBias0Write
+        ; Write to just PBIAS0 control bits
+        LDR     a2, L4_Core_Log
+        LDR     a3, =L4_PBiasLite - L4_Core
+        LDR     ip, [a2, a3]
+        BFI     ip, a1, #0, #8
+        STR     ip, [a2, a3]
+        MOV     pc, lr
+
+
+SetVdd_MMC2_LevelShifted ROUT
+        Push    "sb,lr"
+        LDR     sb, [a1, #SDHCISB]
+        LDR     a1, [a1, #HALDevice_Address]
+        MOV     a2, #HCTL_SDVS_1_8V
+        STR     a2, [a1, #HCTL]
+        MOV     a2, #HCTL_SDVS_1_8V :OR: HCTL_SDBP
+        STR     a2, [a1, #HCTL] ; needs to be two separate writes, the SDBP bit won't latch on the first write
+        
+        ; Wait for the power to ramp up
+        MOV     r0, #BUS_POWER_RAMP
+        BL      HAL_CounterDelay
+        Pull    "sb,pc"
+
+SetBusMode ROUT
+        Push    "sb,lr"
+        LDR     a4, [a1, #HALDevice_Address]
+        LDR     ip, [a4, #CON]
+        TEQ     a3, #0
+        ORRNE   ip, ip, #CON_OD
+        BICEQ   ip, ip, #CON_OD
+        STR     ip, [a4, #CON]
+        Pull    "sb,pc"
+
+PostPowerOn ROUT
+        Push    "v1,sb,lr"
+        LDR     sb, [a1, #SDHCISB]
+        MOV     v1, a1
+
+        ; 22.6.1.3.1.5 MMCHS Controller INIT Procedure Start
+        ; We can't set SDCLK as slow as 80 kHz as suggested - and using the the
+        ; 150 kHz set twice doesn't seem to work. Use the procedure described in
+        ; figure 22-27 instead.
+        MOV     a3, #150
+        BL      SetSDCLK ; doesn't work without this
+        
+        LDR     a4, [v1, #HALDevice_Address]
+        LDR     a1, [a4, #CON]
+        ORR     a1, a1, #CON_INIT
+        STR     a1, [a4, #CON]
+        
+        MOV     a1, #0
+        STR     a1, [a4, #CMD] ; dummy command - value doesn't matter because CMD line is held at 1
+        
+        MOV     a1, #INIT_PROCEDURE_TIME
+        BL      HAL_CounterDelay
+
+        LDR     a4, [v1, #HALDevice_Address]
+        LDR     a1, [a4, #STAT]
+        ORR     a1, a1, #STAT_CC
+        STR     a1, [a4, #STAT] ; acknowledge command complete interrupt
+
+        LDR     a1, [a4, #CON]
+        BIC     a1, a1, #CON_INIT
+        STR     a1, [a4, #CON] ; end initialisation sequence
+        
+        MOV     a1, #-1
+        STR     a1, [a4, #STAT] ; acknowledge all interrupts
+        
+        Pull    "v1,sb,pc"
+
+SetBusWidth ROUT
+        LDR     a4, [a1, #HALDevice_Address]
+        LDR     ip, [a4, #CON]
+        TEQ     a3, #8
+        ORREQ   ip, ip, #CON_DW8
+        BICNE   ip, ip, #CON_DW8
+        STR     ip, [a4, #CON]
+        LDR     ip, [a4, #HCTL]
+        TEQ     a3, #4
+        ORREQ   ip, ip, #HCTL_DTW
+        BICNE   ip, ip, #HCTL_DTW
+        STR     ip, [a4, #HCTL]
+        MOV     pc, lr
+
+GetMaxCurrent ROUT ; MMC1 case
+        ; TWL4030/TPS65950 supplies 220 mA on VMMC1
+        ; VSIM isn't used as a power line so it doesn't matter
+        MOV     a1, #220
+        MOV     pc, lr
+
+GetMaxCurrent_MMC2 ROUT
+        ; TWL4030/TPS65950 supplies 100 mA on VMMC2
+        MOV     a1, #100
+        MOV     pc, lr
+
+GetMaxCurrent_LBEE1USJYC ROUT
+        ; The highest current listed in the LBEE1USJYC datasheet is for when
+        ; it is operating in IEEE802.11b TX mode - a figure of 380 mA.
+        ; I'm assuming the board can supply this? I also can't immediately see
+        ; any reference to whether this is the threshold used in the SDIO
+        ; negotiation - please check this if you are implementing a driver.
+        MOV     a1, #380
+        MOV     pc, lr
+
+SetSDCLK ROUT
+        LDR     a1, [a1, #HALDevice_Address]
+        
+        LDR     ip, =FCLK_FREQ
+        ADD     a2, ip, a3
+        SUB     a2, a2, #1 ; round divider up so we round frequency down
+        DivRem  a4, a2, a3, ip
+        CMP     a4, #(SYSCTL_CLKD_MASK :SHR: SYSCTL_CLKD_SHIFT) + 1
+        MOVHS   a4, #SYSCTL_CLKD_MASK :SHR: SYSCTL_CLKD_SHIFT
+        ; a4 = divider
+        LDR     a2, [a1, #SYSCTL]
+        BIC     a2, a2, #SYSCTL_CEN
+        STR     a2, [a1, #SYSCTL] ; stop clock going to card
+        BIC     a2, a2, #SYSCTL_ICE
+        STR     a2, [a1, #SYSCTL] ; stop clock
+        LDR     a3, =SYSCTL_CLKD_MASK
+        BIC     a2, a2, a3
+        ORR     a2, a2, a4, LSL #SYSCTL_CLKD_SHIFT
+        STR     a2, [a1, #SYSCTL] ; set divider
+        ORR     a2, a2, #SYSCTL_ICE
+        STR     a2, [a1, #SYSCTL] ; start clock
+        
+        MOV     a3, #CLOCKSET_TIMEOUT
+00      SUBS    a3, a3, #1
+        MOVEQ   pc, lr ; timed out
+        LDR     a2, [a1, #SYSCTL]
+        TST     a2, #SYSCTL_ICS
+        BEQ     %B00
+        
+        ORR     a2, a2, #SYSCTL_CEN
+        STR     a2, [a1, #SYSCTL] ; provide clock to card
+        
+        LDR     ip, =FCLK_FREQ
+        DivRem  a1, ip, a4, a2
+        MOV     pc, lr
+
+GetTMCLK ROUT
+        ; Verified experimentally that the OMAP reuses SDCLK for TMCLK
+        LDR     a1, [a1, #HALDevice_Address]
+        LDR     a2, [a1, #SYSCTL]
+        LDR     a3, =SYSCTL_CLKD_MASK
+        AND     a2, a2, a3
+        MOV     a2, a2, LSR #SYSCTL_CLKD_SHIFT
+        LDR     ip, =FCLK_FREQ
+        DivRem  a1, ip, a2, a3
+        MOV     pc, lr
+
+SetActivity_Beagleboard ROUT ; including xM & TouchBook
+        Push    "sb,lr"
+        LDR     sb, [a1, #SDHCISB]
+        GPIO_PrepareC a1, a2, $BB_USER1
+        TEQ     a3, #HALDeviceSDHCI_ActivityOff
+        GPIO_SetOutput0 a1, a2, EQ
+        GPIO_SetOutput1 a1, a2, NE
+        GPIO_PrepareC a1, a2, $BB_USER0
+        TEQ     a3, #HALDeviceSDHCI_ActivityWrite
+        GPIO_SetOutput1 a1, a2, EQ
+        GPIO_SetOutput0 a1, a2, NE
+        Pull    "sb,pc"
+
+SetActivity_IGEPv2 ROUT
+        Push    "sb,lr"
+        LDR     sb, [a1, #SDHCISB]
+        GPIO_PrepareC a1, a2, $IGEP_GREEN
+        TEQ     a3, #HALDeviceSDHCI_ActivityRead
+        GPIO_SetOutput1 a1, a2, EQ
+        GPIO_SetOutput0 a1, a2, NE
+        GPIO_PrepareC a1, a2, $IGEP_RED
+        TEQ     a3, #HALDeviceSDHCI_ActivityWrite
+        GPIO_SetOutput1 a1, a2, EQ
+        GPIO_SetOutput0 a1, a2, NE
+        Pull    "sb,pc"
+
+SetActivity_DevKit8000 ROUT
+        Push    "sb,lr"
+        LDR     sb, [a1, #SDHCISB]
+        GPIO_PrepareC a1, a2, $DK_LED2
+        TEQ     a3, #HALDeviceSDHCI_ActivityOff
+        GPIO_SetOutput0 a1, a2, EQ
+        GPIO_SetOutput1 a1, a2, NE
+        GPIO_PrepareC a1, a2, $DK_LED3
+        TEQ     a3, #HALDeviceSDHCI_ActivityWrite
+        GPIO_SetOutput1 a1, a2, EQ
+        GPIO_SetOutput0 a1, a2, NE
+        Pull    "sb,pc"
+
+SetActivity_Pandora_MMC1 ROUT
+        Push    "sb,lr"
+        LDR     sb, [a1, #SDHCISB]
+        GPIO_PrepareC a1, a2, $PANDORA_LED1
+        TEQ     a3, #HALDeviceSDHCI_ActivityOff
+        GPIO_SetOutput0 a1, a2, EQ
+        GPIO_SetOutput1 a1, a2, NE
+        Pull    "sb,pc"
+
+SetActivity_Pandora_MMC2 ROUT
+        Push    "sb,lr"
+        LDR     sb, [a1, #SDHCISB]
+        GPIO_PrepareC a1, a2, $PANDORA_LED2
+        TEQ     a3, #HALDeviceSDHCI_ActivityOff
+        GPIO_SetOutput0 a1, a2, EQ
+        GPIO_SetOutput1 a1, a2, NE
+        Pull    "sb,pc"
+
+GetCardDetect ROUT
+        Push    "v1,sb,lr"
+        LDR     sb, [a1, #SDHCISB]
+        SUB     sp, sp, #4 ; buffer for TPS register contents
+        MOV     a1, #TPSRegGroup_GPIODATAIN1 * 2
+        MOV     a2, sp
+        MOV     a3, #1
+        MOV     a4, #TPSRegOffset_GPIODATAIN1
+        LDR     v1, OSentries+4*OS_IICOpV
+        BL      TPSRead
+        Pull    "a1" ; value read from register
+        TST     a1, #GPIO0IN ; line is active low
+        MOVEQ   a1, #1
+        MOVNE   a1, #0
+        Pull    "v1,sb,pc"
+
+GetCardDetect_MMC2 ROUT
+        Push    "v1,sb,lr"
+        LDR     sb, [a1, #SDHCISB]
+        SUB     sp, sp, #4 ; buffer for TPS register contents
+        MOV     a1, #TPSRegGroup_GPIODATAIN1 * 2
+        MOV     a2, sp
+        MOV     a3, #1
+        MOV     a4, #TPSRegOffset_GPIODATAIN1
+        LDR     v1, OSentries+4*OS_IICOpV
+        BL      TPSRead
+        Pull    "a1" ; value read from register
+        TST     a1, #GPIO1IN ; line is active low
+        MOVEQ   a1, #1
+        MOVNE   a1, #0
+        Pull    "v1,sb,pc"
+
+GetCardDetect_NonRemovable ROUT
+        MOV     a1, #1
+        MOV     pc, lr
+
+GetWriteProtect_BeagleboardRevB_DevKit8000 ROUT
+        Push    "sb,lr"
+        LDR     sb, [a1, #SDHCISB]
+        ; When the WP tab is slid back (activated) the switch is open, and the
+        ; external resistor pulls the line high, which is read as a set bit
+        GPIO_PrepareC a1, a2, $BBREVB_WP
+        GPIO_GetInput a1, a1, a2
+        TEQ     a1, #0
+        MOVNE   a1, #1
+        Pull    "sb,pc"
+
+GetWriteProtect_BeagleboardRevC ROUT
+        Push    "sb,lr"
+        LDR     sb, [a1, #SDHCISB]
+        ; When the WP tab is slid back (activated) the switch is open, and the
+        ; external resistor pulls the line high, which is read as a set bit
+        GPIO_PrepareC a1, a2, $BBREVC_WP
+        GPIO_GetInput a1, a1, a2
+        TEQ     a1, #0
+        MOVNE   a1, #1
+        Pull    "sb,pc"
+
+ [ EnablePandoraWriteProtect
+GetWriteProtect_Pandora_MMC1 ROUT
+        Push    "sb,lr"
+        LDR     sb, [a1, #SDHCISB]
+        ; Guess that the polarity is the same as the beagleboard (schematic is vague)
+        GPIO_PrepareC a1, a2, $PANDORA_WP1
+        GPIO_GetInput a1, a1, a2
+        TEQ     a1, #0
+        MOVNE   a1, #1
+        Pull    "sb,pc"
+
+GetWriteProtect_Pandora_MMC2 ROUT
+        Push    "sb,lr"
+        LDR     sb, [a1, #SDHCISB]
+        ; Guess that the polarity is the same as the beagleboard (schematic is vague)
+        GPIO_PrepareC a1, a2, $PANDORA_WP2
+        GPIO_GetInput a1, a1, a2
+        TEQ     a1, #0
+        MOVNE   a1, #1
+        Pull    "sb,pc"
+ ]
+
+GetWriteProtect_Unimplemented ROUT ; because it's a microSD slot
+        MOV     a1, #0 ; permit writes
+        MOV     pc, lr
+
+        END

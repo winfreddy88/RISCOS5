@@ -1,0 +1,884 @@
+/* Copyright 2012 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*---------------------------------------------------------------------------*/
+/* File:    main.c                                                           */
+/* Purpose: Configure plugin main loop and event handling                    */
+/*---------------------------------------------------------------------------*/
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
+#include "Global/OsWords.h"
+#include "Global/CMOS.h"
+#include "Global/FileTypes.h"
+#include "Global/Variables.h"
+#include "Interface/NetTime.h"
+#include "AsmUtils/osvarlen.h"
+#include "swis.h"
+#include "toolbox.h"
+#include "wimplib.h"
+#include "event.h"
+#include "common.h"
+#include "window.h"
+#include "menu.h"
+#include "fillers.h"
+#include "calpopup.h"
+#include "defines.h"
+#include "VersionNum"
+
+/* Global variables */
+ObjectId main_window;
+ObjectId calendar_window;
+BOOL     newenough_readtz;
+BOOL     newenough_nettime;
+
+/* Local variables */
+static IdBlock        idb;
+static MessagesFD     messages_desc;
+static int64_t        pending_time;
+static char           messages_string[255];
+static const uint16_t minutes[] = { 15, 30, 60, 1440 / 2, 1440, 7 * 1440 };
+static int            openat_x = -1, openat_y = -1;
+
+/*---------------------------------------------------------------------------*
+ * program_exit                                                              *
+ *                                                                           *
+ * Finished with this plug-in, so exit.                                      *
+ *---------------------------------------------------------------------------*/
+
+static void program_exit(void)
+{
+    exit(0);
+}
+
+
+/*---------------------------------------------------------------------------*
+ * save_choices                                                              *
+ *                                                                           *
+ * Read the choices from the window and output a command file.               *
+ *---------------------------------------------------------------------------*/
+
+static void save_choices(void)
+{
+    FILE       *fp;
+    char       *transform;
+    char        string[256];
+    char        buffer[MAX(StringSetLocalityLen, WriteableServerLen)];
+    ComponentId dummy;
+    int         state, setbynet;
+
+    /* Ensure choices directory exists */
+    error_trap(_swix(OS_File, _INR(0,1) | _IN(4), 8, ChoicesDir, 0), 0);
+
+    /* Open the joint commands/choices file */
+    fp = fopen(ConfigFile, "w");
+    if (fp == NULL)
+    {
+        error_trap(common_error(messages_lookup("ChoicesFileNotOpen")), 0);
+        return;
+    }
+    fputs(HeaderTag, fp);
+    fputc(NewLine, fp);
+
+    /* Format version incase we change our minds later */
+    sprintf(string, "%s:%u", VersionTag, Module_Version);
+    fputs(string, fp);
+    fputc(NewLine, fp);
+
+    /* There may be several regions with the same timezone, so it's not
+     * sufficient to select the menu entry later based only on the CMOS
+     */
+    error_trap(stringset_get_selected(0, main_window, StringSetLocality,
+                                      buffer, StringSetLocalityLen, &state), 0);
+    transform = buffer;
+    while (*transform)
+    {
+        /* Simplify parsing */
+        if (*transform == ' ') *transform = '_';
+        transform++;
+    }
+    sprintf(string, "%s:%s", LocalityTag, buffer);
+    fputs(string, fp);
+    fputc(NewLine, fp);
+
+    error_trap(radiobutton_get_state(0, main_window, RadioNet, &setbynet, &dummy), 0);
+    if (setbynet)
+    {
+        using_t chosen;
+
+        /* Remember how the server was selected, as there are 4 origins of
+         * only one piece of data
+         */
+        chosen = fill_time_server_used(NULL, USING_MAX, 0);
+        sprintf(string, "%s:%u", ServerTag, chosen);
+        fputs(string, fp);
+        fputc(NewLine, fp);
+        fputc(NewLine, fp);
+
+        /* Choose a server */
+        if ((chosen == USING_INETTIME) || (chosen == USING_INETNTP))
+        {
+            strcpy(string, NetUnsetTag);
+        }
+        else
+        {
+            error_trap(writablefield_get_value(0, main_window, WriteableServer,
+                                               buffer, WriteableServerLen, &state), 0);
+            sprintf(string, "%s %s", NetSetTag, buffer);
+        }
+        fputs(string, fp);
+        fputc(NewLine, fp);
+
+        /* Make sure it's loaded */
+        fputs(NetRMEns1Tag, fp);
+        fputs(NetRMEns2Tag, fp);
+        fputs(NetRMEns3Tag, fp);
+
+        /* Choose how often */
+        error_trap(stringset_get_selected(1, main_window, StringSetPeriod, &state), 0);
+        sprintf(string, "%s %u", NetPollTag, 60 * minutes[state]);
+        fputs(string, fp);
+        fputc(NewLine, fp);
+    }
+    fclose(fp);
+    error_trap(_swix(OS_File, _INR(0,2), 18, ConfigFile, FileType_Obey), 0);
+
+    /* Enact the time */
+    if (setbynet)
+    {
+        _swix(OS_CLI, _IN(0), "RUN " ConfigFileRO);
+    }
+    else
+    {
+        error_trap(_swix(Territory_SetTime, _IN(0), &pending_time), 0);
+    }
+
+    /* Note the carefully ordered configuration commands so that it works
+     * on old versions of TerritoryManager that don't do automatic DST
+     */
+    error_trap(stringset_get_selected(0, main_window, StringSetLocality,
+                                      buffer, StringSetLocalityLen, &state), 0);
+    sprintf(string, "CONFIGURE TIMEZONE %s", &buffer[StringSetTZSignIndex]);
+    _swix(OS_CLI, _IN(0), string);
+
+    error_trap(optionbutton_get_state(0, main_window, CheckDSTActive, &state), 0);
+    sprintf(string, "CONFIGURE %sDST", state ? "" : "NO");
+    _swix(OS_CLI, _IN(0), string);
+
+    error_trap(optionbutton_get_state(0, main_window, CheckDSTAuto, &state), 0);
+    if (state) _swix(OS_CLI, _IN(0), "CONFIGURE AUTODST");
+}
+
+
+/*---------------------------------------------------------------------------*
+ * set_default_choices                                                       *
+ *                                                                           *
+ * Fill in the default choices in the dialogue box.                          *
+ *---------------------------------------------------------------------------*/
+
+static void set_default_choices(void)
+{
+    uint8_t *request;
+
+    /* Read the real time clock as UTC rounded down to the nearest minute */
+    request = (uint8_t *)&pending_time;
+    request[0] = OWReadRTC_5ByteInt;
+    _swi(OS_Word, _INR(0,1), OsWord_ReadRealTimeClock, request);
+    pending_time = (pending_time / 6000) * 6000;
+    fill_manual_time_date(1, (const uint8_t *)&pending_time);
+
+    /* Defaults: set manually, timezone from CMOS, auto DST */
+    fill_network_setting(0);
+    fill_best_timezone("-!-");
+    fill_locality_setting(1);
+    fill_nettime_state();
+}
+
+
+/*---------------------------------------------------------------------------*
+ * read_options                                                              *
+ *                                                                           *
+ * Read the help config file.                                                *
+ *---------------------------------------------------------------------------*/
+
+static void read_options(void)
+{
+    FILE    *fp;
+    char     buffer[256];
+    char     server[WriteableServerLen], timezone[StringSetLocalityLen];
+    int      chosen, autodst;
+    uint32_t interval;
+    char    *more = (char *)!NULL;
+
+    /* Prefill incase the tags are not found */
+    timezone[0] = '\0';
+    server[0] = '\0';
+    chosen = -1;
+    interval = 0;
+    autodst = (read_cmos_value(DBTBCMOS) & AutoDSTCMOSBit) ? 1 : 0;
+
+    /* Open configuration file */
+    fp = fopen(ConfigFileRO, "r");
+    if (fp != NULL)
+    {
+        while (more != NULL)
+        {
+            /* Get the next line from the file */
+            more = fgets(buffer, sizeof(buffer), fp);
+            if (more != NULL)
+            {
+                /* Check for starting with a known tag */
+                if (strncmp(buffer, LocalityTag, strlen(LocalityTag)) == 0)
+                {
+                    sscanf(buffer, LocalityTag ":%s", timezone);
+                }
+                if (strncmp(buffer, ServerTag, sizeof(ServerTag) - 1) == 0)
+                {
+                    sscanf(buffer, ServerTag ":%u", &chosen);
+                    if (chosen >= USING_MAX) chosen = USING_WRITEABLE;
+                }
+                if (strncmp(buffer, NetSetTag, sizeof(NetSetTag) - 1) == 0)
+                {
+                    sscanf(buffer, NetSetTag " %s", server);
+                }
+                if (strncmp(buffer, NetPollTag, sizeof(NetPollTag) - 1) == 0)
+                {
+                    sscanf(buffer, NetPollTag " %u", &interval);
+                    interval = interval / 60;
+                }
+            }
+        }
+        fclose(fp);
+
+        /* Stuff into dialogue box */
+        if (strlen(timezone))
+        {
+            char *transform;
+
+            transform = timezone;
+            while (*transform)
+            {
+                /* Unmangle for human reading */
+                if (*transform == '_') *transform = ' ';
+                transform++;
+            }
+            fill_best_timezone(timezone);
+            fill_locality_setting(autodst);
+        }
+        if (chosen != -1)
+        {
+            uint32_t limit;
+            uint8_t  index;
+
+            /* Clamp then find the nearest menu entry */
+            limit = sizeof(minutes) / sizeof(uint16_t);
+            interval = MIN(interval, minutes[limit - 1]);
+            for (index = 0; index < limit; index++)
+            {
+                if (minutes[index] >= interval) break;
+            }
+            fill_time_server_used(server, (using_t)chosen, index);
+            fill_network_setting(1);
+            fill_manual_setting(0);
+        }
+    }
+
+    /* Possibly go back to manual option after all */
+    if (!newenough_nettime) fill_no_network_setting();
+}
+
+
+/*---------------------------------------------------------------------------*
+ * open_configure_window                                                     *
+ *                                                                           *
+ * Called to open the configure window on screen and register handlers.      *
+ *---------------------------------------------------------------------------*/
+
+static void open_configure_window(int at_x, int at_y)
+{
+    /* Create timezone list */
+    fill_timezone_menu();
+
+    /* Default anything that can't be read from the options */
+    set_default_choices();
+    read_options();
+    if ((at_x == -1) && (at_y == -1))
+    {
+        /* No position supplied in the command line, just centre it */
+        error_trap(toolbox_show_object(0, main_window, Toolbox_ShowObject_Centre, NULL, 0, 0), 0);
+    }
+    else
+    {
+        int   buffer[2];
+
+        buffer[0] = at_x;
+        buffer[1] = at_y;
+        error_trap(toolbox_show_object(0, main_window, Toolbox_ShowObject_TopLeft, buffer, 0, 0), 0);
+    }
+}
+
+
+/*---------------------------------------------------------------------------*
+ * toolbox_error                                                             *
+ *                                                                           *
+ * Handler for errors from toolbox.                                          *
+ *---------------------------------------------------------------------------*/
+
+static int toolbox_error(int event_code, ToolboxEvent *event, IdBlock *id_block, void *handle)
+{
+    ToolboxErrorEvent *error_event = (ToolboxErrorEvent *)event;
+    _kernel_oserror err;
+
+    strcpy(err.errmess, error_event->errmess);
+    err.errnum=error_event->errnum;
+    wimp_report_error(&err, 0, "Configure", 0, 0, 0);
+
+    return 1;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * null_poll                                                                 *
+ *                                                                           *
+ * Nothing happening at all.                                                 *
+ *---------------------------------------------------------------------------*/
+
+static int null_poll(int event_code, WimpPollBlock *event, IdBlock *id_block, void *handle)
+{
+    calpopup_button_poll();
+ 
+    return 1;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * key_handler                                                               *
+ *                                                                           *
+ * Handler for key presses.                                                  *
+ *---------------------------------------------------------------------------*/
+
+static int key_handler(int event_code, WimpPollBlock *event, IdBlock *id_block, void *handle)
+{
+    int key_code = event->key_pressed.key_code;
+ 
+    wimp_process_key(key_code);
+ 
+    return 1;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * mouse_clicked                                                             *
+ *                                                                           *
+ * Handler for mouse clicks.                                                 *
+ *---------------------------------------------------------------------------*/
+
+static int mouse_clicked(int event_code, WimpPollBlock *event, IdBlock *id_block, void *handle)
+{
+    WimpGetWindowInfoBlock w;
+    WimpGetIconStateBlock  i;
+    int  ix, iy, absx, absy;
+    BOOL hit;
+
+    if (id_block->self_id != calendar_window) return 1;
+    if (id_block->self_component != SpriteMap) return 1;
+    if (event->mouse_click.buttons & Wimp_MouseButtonMenu) return 1;
+    
+    /* Find out where everything is */
+    w.window_handle = event->mouse_click.window_handle;
+    error_trap(wimp_get_window_info_no_icon_data(&w), 0);
+    i.window_handle = event->mouse_click.window_handle;
+    i.icon_handle = event->mouse_click.icon_handle;
+    error_trap(wimp_get_icon_state(&i), 0); 
+
+    /* Icon area within screen */
+    ix = i.icon.bbox.xmin - w.window_data.extent.xmin + w.window_data.visible_area.xmin;
+    iy = i.icon.bbox.ymin - w.window_data.extent.ymin + w.window_data.visible_area.ymin;
+
+    /* Mouse within icon */
+    absx = event->mouse_click.mouse_x - ix;
+    absy = event->mouse_click.mouse_y - iy;
+    
+    hit = calpopup_picked(absx, absy, &pending_time);
+    if (hit)
+    {
+        fill_manual_time_date(TRUE, (const uint8_t *)&pending_time);
+        if (event->mouse_click.buttons & Wimp_MouseButtonSelect)
+        {
+            error_trap(toolbox_hide_object(0, calendar_window), 0);
+        }
+        if (event->mouse_click.buttons & Wimp_MouseButtonAdjust)
+        {
+            calpopup_open(pending_time);
+        }
+    }
+    return 1;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * action_selected                                                           *
+ *                                                                           *
+ * Handler for when action buttons are clicked on.                           *
+ *---------------------------------------------------------------------------*/
+
+static int action_selected(int event_code, ToolboxEvent *event_block, IdBlock *id_block, void *handle)
+{
+    ActionButtonSelectedEvent *block = (ActionButtonSelectedEvent *) event_block;
+    int     icon = id_block->self_component;
+    using_t chosen;
+    BOOL    exists = FALSE;
+
+    switch (icon)
+    {
+        case ButtonSet:
+            save_choices();
+            if ((block->hdr.flags & 7)==0) program_exit(); /* Return pressed */
+            if (block->hdr.flags & 4) program_exit();      /* Left button */
+            break;
+
+        case ButtonCancel:
+            if ((block->hdr.flags & 7)==0) program_exit(); /* Escape pressed */
+            if (block->hdr.flags & 1)                      /* Right button */
+            {
+                 read_options();      
+            }
+            if (block->hdr.flags & 4) program_exit();      /* Left button */
+            break;
+            
+        case ButtonDefault:
+            set_default_choices();
+            break;
+
+        case ButtonTry:
+            /* Backup the former NetTime$Server and try setting the chosen
+             * one. If the !Internet ones were chosen then these take
+             * precedence so there's nothing to do.
+             */
+            chosen = fill_time_server_used(NULL, USING_MAX, 0);
+            if ((chosen == USING_WRITEABLE) || (chosen = USING_AUTO))
+            {
+                char string[256];
+                char buffer[WriteableServerLen];
+                int  dummy;
+
+                exists = (osvarlen("NetTime$Server", VarType_Expanded) != -1);
+                if (exists) _swix(OS_CLI, _IN(0), "SET NetTime$OldServer <NetTime$Server>");
+
+                error_trap(writablefield_get_value(0, main_window, WriteableServer,
+                                                   buffer, WriteableServerLen, &dummy), 0);
+                sprintf(string, "SET NetTime$Server %s", buffer); 
+                _swix(OS_CLI, _IN(0), string);
+            }
+            
+            /* Kick off a resync */
+            if (_swix(OS_CLI, _IN(0), "NETTIME_KICK") == NULL)
+            {
+                uint32_t start, now;
+                int      state;
+
+                _swix(OS_ReadMonotonicTime, _OUT(0), &now);
+                start = now;
+                _swix(Hourglass_On, 0);
+                while ((now - start) < 1000)
+                {
+                    _swix(OS_ReadMonotonicTime, _OUT(0), &now);
+                    _swix(NetTime_States, _OUT(0), &state);
+                    state = state & NetTime_Current_Mask; 
+                    if ((state == NetTime_Current_PrerequisitesMissing) ||
+                        (state == NetTime_Current_Asleep))
+                    {
+                        /* Get out early */
+                        break;
+                    }
+                    _swix(Hourglass_Percentage, _IN(0), (now - start) / 10);
+                }
+                _swix(Hourglass_Off, 0);
+            }
+            fill_nettime_state();
+
+            /* Restore the world from before the try */
+            if (exists)
+            {
+                _swix(OS_CLI, _IN(0), "SET NetTime$Server <NetTime$OldServer>");
+                _swix(OS_SetVarVal, _IN(0) | _IN(2), "NetTime$OldServer", -1);
+            }
+            else
+            {
+                _swix(OS_SetVarVal, _IN(0) | _IN(2), "NetTime$Server", -1);
+            }
+            break;
+    }
+
+    return 1;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * option_changed                                                            *
+ *                                                                           *
+ * Handler for when option buttons are ticked or unticked.                   *
+ *---------------------------------------------------------------------------*/
+
+static int option_changed(int event_code, ToolboxEvent *event_block, IdBlock *id_block, void *handle)
+{
+    OptionButtonStateChangedEvent *block = (OptionButtonStateChangedEvent *)event_block;
+    int state;
+    
+    switch (id_block->self_component)
+    {
+        case CheckAutoPick:
+            error_trap(stringset_get_selected(1, main_window, StringSetPeriod, &state), 0);
+            if (block->new_state)
+            {
+                fill_time_server_used("", USING_MAX, (uint8_t)state);
+            }
+            else
+            {
+                char buffer[WriteableServerLen];
+                int  dummy;
+
+                error_trap(writablefield_get_value(0, main_window, WriteableServer,
+                                                   buffer, WriteableServerLen, &dummy), 0);
+                fill_time_server_used(buffer, USING_WRITEABLE, (uint8_t)state);
+            }            
+            break;
+
+        case CheckDSTActive:
+            /* Nothing to do until 'Set' pressed */
+            break;
+
+        case CheckDSTAuto:
+            fill_locality_setting(-1);
+            break;
+    }
+
+    return 1;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * radio_changed                                                             *
+ *                                                                           *
+ * Handler for when radio icons swap.                                        *
+ *---------------------------------------------------------------------------*/
+
+static int radio_changed(int event_code, ToolboxEvent *event_block, IdBlock *id_block, void *handle)
+{
+    RadioButtonStateChangedEvent *block = (RadioButtonStateChangedEvent *)event_block;
+    int state, index;
+
+    switch (id_block->self_component)
+    {
+        case RadioManually:
+            if (block->state)
+            {
+                fill_manual_setting(1);
+                fill_network_setting(0);
+            }
+            break;
+
+        case RadioNet:
+            if (block->state)
+            {
+                char buffer[WriteableServerLen];
+                int  dummy;
+
+                fill_manual_setting(0);
+                error_trap(stringset_get_selected(1, main_window, StringSetPeriod, &index), 0);
+                error_trap(optionbutton_get_state(0, main_window, CheckAutoPick, &state), 0);
+                if (!state)
+                {
+                    /* Start with the current contents, but may get trumped by !Internet */
+                    error_trap(writablefield_get_value(0, main_window, WriteableServer,
+                                                       buffer, WriteableServerLen, &dummy), 0);
+                }
+                fill_time_server_used(state ? "" : buffer,
+                                      state ? USING_AUTO : USING_WRITEABLE, (uint8_t)index);
+            }
+            break;
+    }
+
+    return 1;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * object_created                                                            *
+ *                                                                           *
+ * A new window is born.                                                     *
+ *---------------------------------------------------------------------------*/
+
+static int object_created(int event_code, ToolboxEvent *event_block, IdBlock *id_block, void *handle)
+{
+    const char *name;
+
+    name = ((ToolboxObjectAutoCreatedEvent *)event_block)->template_name;
+
+    if (strcmp(name, "TimeDate") == 0)
+    {
+        /* Open configure window */
+        main_window = id_block->self_id;
+        open_configure_window(openat_x, openat_y);
+    }
+    if (strcmp(name, "Calendar") == 0)
+    {
+        /* Prepare calendar popup */
+        calendar_window = id_block->self_id;
+    }
+
+    return 1;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * setstring_value                                                           *
+ *                                                                           *
+ * The value within a stringset was chosen.                                  *
+ *---------------------------------------------------------------------------*/
+
+static int setstring_value(int event_code, ToolboxEvent *event_block, IdBlock *id_block, void *handle)
+{
+    switch (id_block->self_component)
+    {
+        case StringSetPeriod:
+            /* Nothing to do until 'Set' pressed */
+            break;
+
+        case StringSetLocality:
+            fill_locality_setting(-1);
+            break;
+    }
+
+    return 1;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * window_hidden                                                             *
+ *                                                                           *
+ * A window has been hidden.                                                 *
+ *---------------------------------------------------------------------------*/
+
+static int window_hidden(int event_code, ToolboxEvent *event_block, IdBlock *id_block, void *handle)
+{
+    if (id_block->self_id == calendar_window) calpopup_release();
+    return 1;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * popup_preshow                                                             *
+ *                                                                           *
+ * About to open a popup menu.                                               *
+ *---------------------------------------------------------------------------*/
+
+static int popup_preshow(int event_code, ToolboxEvent *event_block, IdBlock *id_block, void *handle)
+{
+    if (id_block->self_component == PopUpCalendar) calpopup_open(pending_time);
+    return 1;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * adjuster_clicked                                                          *
+ *                                                                           *
+ * Handler for when arrows are pressed.                                      *
+ *---------------------------------------------------------------------------*/
+
+static int adjuster_clicked(int event_code, ToolboxEvent *event_block, IdBlock *id_block, void *handle)
+{
+    AdjusterClickedEvent *block = (AdjusterClickedEvent *)event_block;
+    int     icon = id_block->self_component;
+    int64_t newtime = pending_time;
+
+    switch (icon)
+    {
+        case AdjusterHoursU:
+        case AdjusterHoursD:
+            if (block->direction == Adjuster_Clicked_Up)
+                newtime = newtime + 360000;
+            else
+                newtime = newtime - 360000;
+            break;
+
+        case AdjusterMinutesU:
+        case AdjusterMinutesD:
+            if (block->direction == Adjuster_Clicked_Up)
+                newtime = newtime + 6000;
+            else
+                newtime = newtime - 6000;
+            break;
+
+        case AdjusterLastYear:
+        case AdjusterNextYear:
+            calpopup_adjust(block->direction, TRUE);
+            break;
+
+        case AdjusterLastMonth:
+        case AdjusterNextMonth:
+            calpopup_adjust(block->direction, FALSE);
+            break;
+    }
+
+    if ((newtime != pending_time) && (newtime > 0) && (newtime <= 0xFFFFFFFFFFLL))
+    {
+        pending_time = newtime;
+        fill_manual_time_date(1, (const uint8_t *)&pending_time);
+    }
+    
+    return 1;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * message_quit                                                              *
+ *                                                                           *
+ * Called when wimp quit message received.                                   *
+ *---------------------------------------------------------------------------*/
+ 
+static int message_quit(WimpMessage *event, void *handler)
+{
+    program_exit();
+    
+    return 1;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * message_reopen                                                            *
+ *                                                                           *
+ * Called when we receive a message from Configure telling us to reopen our  *
+ * window.                                                                   *
+ *---------------------------------------------------------------------------*/
+
+static int message_reopen(WimpMessage *event, void *handler)
+{
+    error_trap(toolbox_show_object(0, main_window, 0, 0, 0, 0), 0);
+
+    return 1;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * main_initialise                                                           *
+ *                                                                           *
+ * Initialise toolbox etc. Returns: 1 if everything went okay, 0 otherwise   *
+ *---------------------------------------------------------------------------*/
+
+static int main_initialise(void)
+{
+    static int mess_wanted[] = {Wimp_MQuit,
+                                Wimp_MOpenConfigWindow,
+                                0};
+    static int tbox_wanted[] = {Toolbox_Error,
+                                ActionButton_Selected,
+                                RadioButton_StateChanged,
+                                OptionButton_StateChanged,
+                                PopUp_AboutToBeShown,
+                                Window_HasBeenHidden,
+                                Adjuster_Clicked,
+                                StringSet_ValueChanged,
+                                Toolbox_ObjectAutoCreated,
+                                0};
+    int        task_handle;
+    int        territory, cmos;
+    void      *area;
+
+    error_trap(toolbox_initialise(0, 310, mess_wanted, tbox_wanted,
+                                  "<TimeSetup$Dir>", &messages_desc, &idb,
+                                  0, &task_handle, &area), 1);
+    spritearea = (int *)area;                              
+    error_trap(event_initialise(&idb), 1);
+    error_trap(event_set_mask(Wimp_Poll_NullMask), 0);
+    messages_register(&messages_desc, messages_string);
+
+    /* Register handlers for the configure window */
+    error_trap(event_register_toolbox_handler(-1, Toolbox_Error, toolbox_error, NULL) ,0);
+    error_trap(event_register_toolbox_handler(-1, ActionButton_Selected, action_selected, NULL), 0);
+    error_trap(event_register_toolbox_handler(-1, RadioButton_StateChanged, radio_changed, NULL), 0);
+    error_trap(event_register_toolbox_handler(-1, OptionButton_StateChanged, option_changed, NULL), 0);
+    error_trap(event_register_toolbox_handler(-1, PopUp_AboutToBeShown, popup_preshow, NULL), 0);
+    error_trap(event_register_toolbox_handler(-1, Window_HasBeenHidden, window_hidden, NULL), 0);
+    error_trap(event_register_toolbox_handler(-1, Adjuster_Clicked, adjuster_clicked, NULL), 0);
+    error_trap(event_register_toolbox_handler(-1, StringSet_ValueChanged, setstring_value, NULL), 0);
+    error_trap(event_register_toolbox_handler(-1, StringSet_ValueChanged, setstring_value, NULL), 0);
+    error_trap(event_register_toolbox_handler(-1, Toolbox_ObjectAutoCreated, object_created, NULL), 0);
+    error_trap(event_register_wimp_handler(-1, Wimp_EKeyPressed, key_handler, NULL), 0);
+    error_trap(event_register_wimp_handler(-1, Wimp_EMouseClick, mouse_clicked, NULL), 0);
+    error_trap(event_register_wimp_handler(-1, Wimp_ENull, null_poll, NULL), 0);
+    error_trap(event_register_message_handler(Wimp_MQuit, message_quit, NULL), 0);
+    error_trap(event_register_message_handler(Wimp_MOpenConfigWindow, message_reopen, NULL), 0);
+
+    /* Want a NetTime that doesn't fiddle with DST */
+    newenough_nettime = (_swix(OS_CLI, _IN(0), "RMENSURE NetTime 0.40") == NULL);
+
+    /* Figure out if this territory just uses the CMOS value when
+     * asked to enumerate its territories, in which case don't ask again
+     */
+    newenough_readtz = TRUE;
+    cmos = read_cmos_value(TimeZoneCMOS);
+    for (territory = 0; territory < 0x400; territory++)
+    {
+        if (_swix(Territory_UpperCaseTable, _IN(0), territory) == NULL)
+        {
+            int useroffset, testoffset;
+            _kernel_oserror *err1, *err2;
+            
+            /* It exists, but is it silly? */
+            write_cmos_value(TimeZoneCMOS, cmos + 1);
+            err1 = _swix(Territory_ReadTimeZones, _IN(0) | _OUT(2), territory, &testoffset);
+            write_cmos_value(TimeZoneCMOS, cmos);
+            err2 = _swix(Territory_ReadTimeZones, _IN(0) | _OUT(2), territory, &useroffset);
+            if ((useroffset != testoffset) || (err1 != NULL) || (err2 != NULL))
+            {
+                newenough_readtz = FALSE;
+                break;
+            }
+        }
+    }
+
+    return 1;
+}
+                                  
+
+/*---------------------------------------------------------------------------*
+ * main                                                                      *
+ *                                                                           *
+ * Main polling loop                                                         *
+ *---------------------------------------------------------------------------*/
+
+int main(int argc, char *argv[])
+{
+    WimpPollBlock wpb;
+    int           event_code;
+
+    /* Have we been passed any co-ordinates to open at? */
+    if ((argc >= 4) && (strcmp(argv[1], "-openat") == 0))
+    {
+        openat_x = atoi(argv[2]);
+        openat_y = atoi(argv[3]);
+    }
+
+    /* Do main initialisation */
+    if (!main_initialise()) return 0;
+
+    /* Poll loop */
+    while (TRUE)
+    {
+        error_trap(event_poll(&event_code, &wpb, NULL), 0);
+    }
+}         
+

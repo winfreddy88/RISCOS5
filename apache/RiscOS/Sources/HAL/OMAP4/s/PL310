@@ -1,0 +1,148 @@
+; Copyright 2015 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        $GetIO
+        GET     Hdr:OSEntries
+        GET     Hdr:HALEntries
+        GET     Hdr:HALDevice
+        GET     Hdr:PL310
+
+        GET     hdr.omap4430
+        GET     hdr.StaticWS
+        GET     hdr.omap4_reg
+
+        EXPORT  PL310_InitDevice
+        EXPORT  dmb_st
+
+        IMPORT  memcpy
+
+; Basic PL310 HAL device
+
+        AREA    |Asm$$Code|, CODE, READONLY, PIC
+
+        MACRO
+        PL310Sync $regs, $temp
+        ; Errata 753970 requires us to write to a different location when
+        ; performing a sync operation for r3p0
+        LDR     $temp, [$regs, #PL310_REG0_CACHE_ID]
+        AND     $temp, $temp, #&3f
+        TEQ     $temp, #PL310_R3P0
+        MOV     $temp, #0
+        STREQ   $temp, [$regs, #PL310_REG7_CACHE_SYNC_753970]
+        STRNE   $temp, [$regs, #PL310_REG7_CACHE_SYNC]
+10
+        LDR     $temp, [$regs, #PL310_REG7_CACHE_SYNC]
+        TST     $temp, #1
+        BNE     %BT10
+        MEND
+
+PL310_InitDevice ROUT
+        Push    "lr"
+
+        ADRL    a1, PL310Device
+        ADR     a2, PL310Template
+        MOV     a3, #HALDeviceSize
+        BL      memcpy
+
+        LDR     a2, L4_Per_Log
+        LDR     a3, =MPU_PL310-L4_Per
+        ADD     a2, a2, a3
+        STR     a2, [a1, #HALDevice_Address]
+
+        ; Register the device
+        MOV     a2, a1
+        MOV     a1, #0
+        CallOS  OS_AddDevice
+
+        ; Leave the OS to decide when to enable it - it will need to be ready
+        ; to start performing maintenance ops
+
+        Pull    "pc"
+
+PL310Template
+        DCW     HALDeviceType_SysPeri + HALDeviceSysPeri_CacheC
+        DCW     HALDeviceID_CacheC_PL310
+        DCD     HALDeviceBus_Sys + HALDeviceSysBus_AXI
+        DCD     0                       ; API version
+        DCD     PL310Desc
+        DCD     0                       ; Address - Filled in at runtime
+        %       12                      ; Reserved
+        DCD     PL310Activate
+        DCD     PL310Deactivate
+        DCD     PL310Reset
+        DCD     PL310Sleep
+        DCD     OMAP44XX_IRQ_L2_CACHE
+        DCD     0
+        %       8
+        ASSERT  (.-PL310Template) = HALDeviceSize
+          
+PL310Desc
+        DCB     "PL310 L2 cache controller", 0
+        ALIGN
+
+PL310Activate
+        Push    "v1-v5, sb, v7-v8, lr"
+        ; The PL310 L2CC control registers aren't writable from non secure
+        ; modes, so call the OMAP4 HLOS support function (see TRM 27.5.1) to
+        ; get it enabled
+        LDR     ip, =0x102      ; write control register
+        MOV     a1, #1          ; L2 cache enable
+        DSB     SY
+        SMC     #0
+        MOV     a1, #1
+        Pull    "v1-v5, sb, v7-v8, pc"
+
+PL310Deactivate
+PL310Reset
+        Push    "v1-v5, sb, v7-v8, lr"
+        ; Clean cache before disabling it
+        LDR     a2, [a1, #HALDevice_Address]
+        LDR     a1, [a2, #PL310_REG1_AUX_CONTROL]
+        TST     a1, #1<<16
+        MOV     a1, #&FF
+        ORRNE   a1, a1, #&FF00          ; Mask of all ways
+        STR     a1, [a2, #PL310_REG7_CLEAN_WAY]
+10
+        LDR     a1, [a2, #PL310_REG7_CLEAN_WAY]
+        TEQ     a1, #0
+        BNE     %BT10
+        PL310Sync a2, a1
+        ; Now disable the cache        
+        LDR     ip, =0x102      ; write control register
+        MOV     a1, #0          ; L2 cache disable
+        DSB     SY
+        SMC     #0
+        Pull    "v1-v5, sb, v7-v8, pc"
+
+PL310Sleep
+        MOV     a1, #0                  ; Previously at full power
+        MOV     pc, lr
+
+dmb_st
+        Push    "a1, lr"
+        ; Perform an ARM + PL310 DMB ST
+        ADRL    a1, PL310Device
+        LDR     a1, [a1, #HALDevice_Address]
+        TEQ     a1, #0 ; Just in case we're called before PL310_InitDevice
+        DMB     ST
+        BEQ     %FT10
+        PL310Sync a1, lr
+10
+        Pull    "a1, pc"
+
+        END
+

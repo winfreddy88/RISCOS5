@@ -1,0 +1,879 @@
+/* Copyright 2005 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#include <string.h> // for memset
+#include <stdarg.h> // for va_list
+#include <stdio.h>  // for printf
+
+#define HAL
+
+#ifdef HAL
+//#define DEBUGLIB
+#endif
+
+#include "OHCI.h"
+#include "debuglib/debuglib.h"
+#include "USBHAL.h"
+#include "pci.h"
+
+/*  choose whether to interrogate the keyboard using the interrupt pipe
+    or the control pipe, the latter seems not to work, always returning
+    no keys pressed */
+#define INTERRUPT_PIPE 1
+#undef  INTERRUPT_PIPE
+
+__global_reg(6) void *sb;
+
+/* types from usb.h */
+typedef uint8_t uByte;
+typedef uint8_t uWord[2];
+#define UGETW(w) ((w)[0] | ((w)[1] << 8))
+
+typedef struct {
+	uByte		bLength;
+	uByte		bDescriptorType;
+	uByte		bDescriptorSubtype;
+} usb_descriptor_t;
+
+typedef struct {
+	uByte		bLength;
+	uByte		bDescriptorType;
+	uWord		wTotalLength;
+	uByte		bNumInterface;
+	uByte		bConfigurationValue;
+	uByte		iConfiguration;
+	uByte		bmAttributes;
+	uByte		bMaxPower; /* max current in 2 mA units */
+} usb_config_descriptor_t;
+
+typedef struct {
+	uByte		bLength;
+	uByte		bDescriptorType;
+	uByte		bInterfaceNumber;
+	uByte		bAlternateSetting;
+	uByte		bNumEndpoints;
+	uByte		bInterfaceClass;
+	uByte		bInterfaceSubClass;
+	uByte		bInterfaceProtocol;
+	uByte		iInterface;
+} usb_interface_descriptor_t;
+
+#define  UDESC_INTERFACE	0x04
+
+#define  UICLASS_HID		0x03
+#define  UISUBCLASS_BOOT	1
+#define  UIPROTO_BOOT_KEYBOARD	1
+
+#define USB_DELAY_RESET   100 // delay from power to reset
+#define USB_DELAY_ADDRESS 20  // delay from end of reset to Set Address (nom 10ms)
+#define USB_DELAY_CONFIG  20  // wait this long before attempting configuration
+#define USB_DELAY_REPORT  150 // wait this long for a report
+#define USB_TIMEOUT       350 // give up and go home after this long
+
+/* internal structures */
+enum state {
+    port_detached,
+    port_powered,
+    port_default,
+    port_address,
+    port_devdesc,
+    port_confdesc,
+    port_configured,
+    port_protocolset,
+    port_report,
+    port_finished,
+    port_MAX_STATE
+};
+
+#if 0
+static const char* port_state_str[port_MAX_STATE] =
+{
+    "Port Detached",
+    "Port Powered",
+    "Port Default",
+    "Port Address",
+    "Port DevDesc",
+    "Port ConfDesc",
+    "Port Configured",
+    "Port Protocol set",
+    "Port Report"
+};
+#endif
+
+#ifdef DEBUGLIB
+const char* completion_code(int c)
+{
+    switch (c)
+    {
+        case  0: return "NoError (0)";
+        case  1: return "CRC (1)";
+        case  2: return "BitStuffing (2)";
+        case  3: return "DataToggleMismatch (3)";
+        case  4: return "Stall (4)";
+        case  5: return "DeviceNotResponding (5)";
+        case  6: return "PIDCheckFailure (6)";
+        case  7: return "UnexpectedPID (7)";
+        case  8: return "DataOverRun (8)";
+        case  9: return "DataUnderrun (9)";
+        case 10: return "Reserved (10)";
+        case 11: return "Reserved (11)";
+        case 12: return "BufferOverrun (12)";
+        case 13: return "BufferUnderrun (13)";
+        case 14: return "Not Accessed (14)";
+        case 15: return "Not Accessed (15)";
+        default: return "?";
+    }
+}
+#endif
+
+struct Request {
+    uint8_t     requestType;
+    uint8_t     request;
+    uint16_t    value;
+    uint16_t    index;
+    uint16_t    length;
+};
+
+typedef struct usbhal
+{
+    enum state port_state;
+    volatile int *ohci_base;
+#define OREAD(ADDRESS) (uh->ohci_base[ADDRESS / 4])
+#define OWRITE(ADDRESS,VALUE) (uh->ohci_base[ADDRESS / 4] = (int) VALUE)
+
+    int result;
+
+#define NKEYCODE 6
+    struct {
+        uint8_t modifiers;
+        uint8_t reserved;
+        uint8_t keycode[NKEYCODE];
+    } data;
+
+    char *desc;
+
+    /* host controller communications area must be 256 byte aligned */
+    OHCI_Hcca* hccap;
+
+    /* we'll need 2 endpoints and 3 transfer descriptors */
+    OHCI_ED* edp;
+    OHCI_ED* iedp;
+    OHCI_TD* tdp;
+    void* tda[3]; /* physical addresses */
+    void* buffer;
+
+    volatile int sofs;
+
+    int pci_device;
+    int irq_device;
+    int portno_max;
+    int portno;
+    int address;
+    int interfaceno;
+
+    int delay_time;
+    int enabled;
+} usbhal;
+
+#ifdef DEBUGLIB
+#define dumptds() \
+    dprintf (("", "td0.nexttd = %p, td0.cc = %s\n",        \
+        uh->tdp[0].nextTD,                                 \
+        completion_code(uh->tdp[0].conditionCode)));      \
+    dprintf (("", "td1.nexttd = %p, td1.cc = %s\n",        \
+        uh->tdp[1].nextTD,                                 \
+        completion_code(uh->tdp[1].conditionCode)));      \
+    dprintf (("", "td2.nexttd = %p, td2.cc = %s\n",        \
+        uh->tdp[2].nextTD,                                 \
+        completion_code(uh->tdp[2].conditionCode)));      \
+    dprintf (("", "buf=%p\n", uh->tdp[2].currentBuffer));  \
+    dprintf (("", "end=%p\n", uh->tdp[2].bufferEnd));      \
+    ddumpbuf ("", uh->desc, 8, 0);                         \
+    ddumpbuf ("", tdp, 48, 0);
+#else
+#define dumptds()
+#endif
+
+extern volatile int*  hal_find_usb_base ( int* );
+extern int  hal_find_usb_irq  ( int  );
+extern void  hal_ack_usb_irq  ( int  );
+extern void  hal_usb_power  ( int port, int state  );
+extern void hal_done_with_controller( int );
+
+static int find_controller (usbhal* uh)
+{
+    int w;
+    uh->enabled = 0;
+    uh->ohci_base = hal_find_usb_base ( &uh->pci_device);
+    if (uh->pci_device == 0) return 0;
+    dprintf (("", "Found device %d\n", uh->pci_device));
+
+    OWRITE(OHCI_HCCA, vtophys (uh->hccap));
+
+    /* To ensure <1ms start-up */
+#ifdef DEBUGLIB
+//    _kernel_irqs_off();
+#endif
+
+    uh->irq_device = hal_find_usb_irq(uh->pci_device);
+
+    /* reset */
+    OWRITE(OHCI_CONTROL, OHCI_HCFS_RESET);
+    delay (100000);
+
+    /* Reset the controller, and turn on global power */
+    OWRITE(OHCI_COMMAND_STATUS, OHCI_HCR);
+    for (int i = 0; i < 10; i++)
+    {
+        delay (10);
+        w = OREAD(OHCI_COMMAND_STATUS);
+        if (!w) break;
+    }
+    hal_usb_power  ( 1, 1  );
+    
+    if (w)
+    {
+        dprintf (("", "reset timeout\n"));
+        return 0;
+    }
+
+    /* Now in SUSPEND state */
+    OWRITE(OHCI_HCCA, vtophys (uh->hccap));
+
+    OWRITE(OHCI_CONTROL_HEAD_ED, vtophys (uh->edp));
+    OWRITE(OHCI_FM_INTERVAL, OHCI_FSMPS(11999) | 11999);
+
+    /* clear writeback done head to fix bus bug */
+    OWRITE(OHCI_DONE_HEAD, 0);
+
+    OWRITE(OHCI_PERIODIC_START, OHCI_PERIODIC(11999));
+
+    /* enable hc interrupts */
+    OWRITE(OHCI_INTERRUPT_DISABLE, OHCI_ALL_INTRS);
+    OWRITE(OHCI_INTERRUPT_ENABLE, OHCI_MIE |  OHCI_WDH | OHCI_RHSC | OHCI_SF);
+
+    /* put the controller into operational mode */
+    OWRITE(OHCI_CONTROL, OHCI_HCFS_OPERATIONAL | OHCI_CLE);
+
+#ifdef DEBUGLIB
+//    _kernel_irqs_on();
+#endif
+
+    HAL_IRQEnable(uh->irq_device);
+
+    uh->portno_max = OHCI_GET_NDP(OREAD(OHCI_RH_DESCRIPTOR_A));
+    dprintf (("", "%d ports\n", uh->portno_max));
+    uh->address = 3;
+
+    uh->sofs = 0;
+
+    OWRITE(OHCI_RH_STATUS, OHCI_LPSC);
+    for (int i = 1; i <= uh->portno_max; ++i)
+    {
+        OWRITE(OHCI_RH_PORT_STATUS(i), UPS_PORT_POWER);
+    }
+    dprintf (("", "power on\n"));
+    w = OREAD(OHCI_FM_NUMBER);
+    while (w == OREAD(OHCI_FM_NUMBER))
+    {
+        /* do nothing */
+    }
+    dprintf (("", "ticked over\n"));
+    dprintf (("", "IRQ enabled: %X\n", OREAD(OHCI_INTERRUPT_ENABLE)));
+    uh->enabled = 1;
+
+    return uh->pci_device;
+}
+
+static void closedown_controller (usbhal* uh)
+{
+    uh->enabled = 0;
+    dprintf (("", "closedown at %d\n", uh->sofs));
+    int w = OREAD(OHCI_CONTROL);
+    OWRITE(OHCI_CONTROL, w & ~(OHCI_PLE | OHCI_CLE | OHCI_BLE));
+
+    OWRITE(OHCI_INTERRUPT_DISABLE, OHCI_MIE);
+    w = OREAD(OHCI_INTERRUPT_DISABLE); // read to flush the write
+
+    /* wait until the next frame */
+    w = OREAD(OHCI_FM_NUMBER);
+    while (w == OREAD(OHCI_FM_NUMBER))
+    {
+        /* do nothing */
+    }
+
+    /* Leave power on during handover to main driver
+    OWRITE(OHCI_RH_STATUS, OHCI_LPS); // Clear Global Power
+    for (int i = 1; i <= uh->portno_max; i++)
+    {
+        OWRITE(OHCI_RH_PORT_STATUS(i), UPS_LOW_SPEED); // Clear Port Power
+    }
+    */
+
+    /* turn off the controller when we exit */
+    OWRITE(OHCI_COMMAND_STATUS, OHCI_HCR);
+    for (int i = 0; i < 10; ++i) {
+        delay (100);
+        w = OREAD(OHCI_COMMAND_STATUS);
+        if (!w) break;
+    }
+    if (w) dprintf (("", "timed out resetting\n"));
+    OWRITE(OHCI_CONTROL, OHCI_HCFS_RESET);
+    hal_done_with_controller(uh->pci_device);
+}
+
+void HAL_KbdScanSetup (void)
+{
+    usbhal* uh = alloc_usbhal (sizeof *uh);
+    /* HCCA must be 256 byte aligned */
+    uh->hccap = alloc_contig(sizeof *uh->hccap, 256);
+    uh->edp = alloc_contig(sizeof *uh->edp, 16);
+    uh->iedp = alloc_contig(sizeof *uh->iedp, 16);
+    uh->tdp = alloc_contig(3 * sizeof *uh->tdp, 16);
+    uh->tda[0] = vtophys (uh->tdp);
+    uh->tda[1] = vtophys (uh->tdp + 1);
+    uh->tda[2] = vtophys (uh->tdp + 2);
+    uh->buffer = alloc_contig(128, 4);
+    uh->desc = alloc_contig(256, 4);
+    dprintf (("", "tds: %p, %p, %p\n", uh->tda[0], uh->tda[1], uh->tda[2]));
+
+    if (find_controller (uh) == 0)
+    {
+        uh->result |= HAL_KbdScan_Complete;
+    }
+}
+
+unsigned int HAL_KbdScan (void)
+{
+    usbhal* uh = get_usbhal ();
+#ifdef DEBUGLIB
+//    int w = OREAD(OHCI_FM_NUMBER);
+//    while (w == OREAD(OHCI_FM_NUMBER))
+//    {
+//        /* do nothing */
+//    }
+//    dprintf (("", "ticked over %d\n", w));
+#endif
+    //printf ("KbdScan returning %.8X\n", uh->result);
+    //uh->result = 0xC0000000;
+    return uh->result;
+}
+
+void HAL_KbdScanFinish (void)
+{
+    usbhal* uh = get_usbhal ();
+    //dumptds ();
+
+    if (uh->pci_device) closedown_controller (uh);
+
+    free_contig(uh->hccap);
+}
+
+static void setup_request (usbhal* uh, const void* req, int address)
+{
+    int w;
+
+    uh->edp->functionAddress = address;
+    uh->edp->endpointNumber = 0;
+    uh->edp->direction = 0;
+    uh->edp->speed = 1;
+    uh->edp->skip = 0;
+    uh->edp->format = 0;
+    uh->edp->tailPointer = 0;
+    uh->edp->head.pointer.normal = uh->tda[0];
+    uh->edp->nextED = 0;
+
+    uh->tdp[0].nextTD = uh->tda[1];
+    uh->tdp[0].bufferRounding = 0;
+    uh->tdp[0].direction = 0;  /* SETUP */
+    uh->tdp[0].delayInterrupt = 7;
+    uh->tdp[0].dataToggle = 2; /* force DATA0 */
+    uh->tdp[0].conditionCode = OHCI_CC_NOT_ACCESSED;
+    uh->tdp[0].errorCount = 0;
+    uh->tdp[0].currentBuffer = vtophys(uh->buffer);
+    uh->tdp[0].bufferEnd = uh->tdp[0].currentBuffer + 7;
+    memcpy(uh->buffer, req, 8);
+
+    uh->tdp[1].nextTD = 0;
+    uh->tdp[1].bufferRounding = 0;
+    uh->tdp[1].direction = 2;  /* IN */
+    uh->tdp[1].delayInterrupt = 0;
+    uh->tdp[1].dataToggle = 3; /* force DATA1 */
+    uh->tdp[1].conditionCode = OHCI_CC_NOT_ACCESSED;
+    uh->tdp[1].errorCount = 0;
+    uh->tdp[1].currentBuffer = 0;
+    uh->tdp[1].bufferEnd = 0;
+
+    //dumptds ();
+    dprintf (("", "setup_request\n"));
+    ddumpbuf("", uh->buffer, 8, 0);
+
+    w = OREAD(OHCI_COMMAND_STATUS);
+    OWRITE(OHCI_COMMAND_STATUS, w | OHCI_CLF);
+
+    return;
+}
+
+static void setup_request_read (usbhal* uh, const void* req, int address)
+{
+    int w;
+    dprintf (("", "address %d\n", address));
+
+    uh->edp->functionAddress = address;
+    uh->edp->endpointNumber = 0;
+    uh->edp->direction = 0;
+    uh->edp->speed = 1;
+    uh->edp->skip = 0;
+    uh->edp->format = 0;
+    dprintf (("", "maxpacket = %d\n", uh->edp->maxPacketSize));;
+    uh->edp->tailPointer = 0;
+    uh->edp->head.pointer.normal = uh->tda[0];
+    uh->edp->nextED = 0;
+
+    uh->tdp[0].nextTD = uh->tda[2];
+    uh->tdp[0].bufferRounding = 0;
+    uh->tdp[0].direction = 0;  /* SETUP */
+    uh->tdp[0].delayInterrupt = 7;
+    uh->tdp[0].dataToggle = 2; /* force DATA0 */
+    uh->tdp[0].conditionCode = OHCI_CC_NOT_ACCESSED;
+    uh->tdp[0].errorCount = 0;
+    uh->tdp[0].currentBuffer = vtophys(uh->buffer);
+    uh->tdp[0].bufferEnd = uh->tdp[0].currentBuffer + 7;
+    memcpy(uh->buffer, req, 8);
+
+    uh->tdp[2].nextTD = uh->tda[1];
+    uh->tdp[2].bufferRounding = 1;
+    uh->tdp[2].direction = 2;  /* IN */
+    uh->tdp[2].delayInterrupt = 7;
+    uh->tdp[2].dataToggle = 3; /* force DATA1 */
+    uh->tdp[2].conditionCode = OHCI_CC_NOT_ACCESSED;
+    uh->tdp[2].errorCount = 0;
+    uh->tdp[2].currentBuffer = vtophys (uh->desc);
+    uh->tdp[2].bufferEnd = uh->tdp[2].currentBuffer
+                           + ((struct Request*) req)->length - 1;
+
+    uh->tdp[1].nextTD = 0;
+    uh->tdp[1].bufferRounding = 0;
+    uh->tdp[1].direction = 1;  /* OUT */
+    uh->tdp[1].delayInterrupt = 0;
+    uh->tdp[1].dataToggle = 3; /* force DATA1 */
+    uh->tdp[1].conditionCode = OHCI_CC_NOT_ACCESSED;
+    uh->tdp[1].errorCount = 0;
+    uh->tdp[1].currentBuffer = 0;
+    uh->tdp[1].bufferEnd = 0;
+
+    //dumptds ();
+    ddumpbuf("", uh->buffer, 8, 0);
+
+    w = OREAD(OHCI_COMMAND_STATUS);
+    OWRITE(OHCI_COMMAND_STATUS, w | OHCI_CLF);
+
+    return;
+}
+
+static void setup_report_read (usbhal* uh)
+{
+#ifdef INTERRUPT_PIPE
+    int w;
+    void *ieda = vtophys(uh->iedp);
+
+    uh->iedp->functionAddress = uh->address;
+    uh->iedp->endpointNumber = 1;
+    uh->iedp->direction = 2;
+    uh->iedp->speed = 1;
+    uh->iedp->skip = 0;
+    uh->iedp->format = 0;
+    uh->iedp->maxPacketSize = 8;
+    uh->iedp->tailPointer = 0;
+    uh->iedp->head.pointer.normal = uh->tda[1];
+    uh->iedp->nextED = 0;
+    uh->tdp[1].nextTD = 0;
+    uh->tdp[1].bufferRounding = 1;
+    uh->tdp[1].direction = 2; // IN
+    uh->tdp[1].delayInterrupt = 0;
+    uh->tdp[1].dataToggle = 2; // we're just doing one in
+    uh->tdp[1].conditionCode = OHCI_CC_NOT_ACCESSED;
+    uh->tdp[1].errorCount = 0;
+    uh->tdp[1].currentBuffer = vtophys (uh->desc);
+    uh->tdp[1].bufferEnd = uh->tdp[1].currentBuffer + 256 - 1;
+
+    //dumptds ();
+
+    for (int i=0; i<OHCI_NUM_INTERRUPTS; i++)
+        uh->hccap->interruptTable[i] = ieda;
+
+    w = OREAD(OHCI_CONTROL);
+    OWRITE(OHCI_CONTROL, w | OHCI_PLE);
+    //w = OREAD(OHCI_COMMAND_STATUS);
+    //OWRITE(OHCI_COMMAND_STATUS, w | OHCI_CLF);
+#else
+    struct Request getReport;
+    getReport.requestType = 0xA1;
+    getReport.request = 1;
+    getReport.value = 0;
+    getReport.index = uh->interfaceno;
+    getReport.length = 8;
+    setup_request_read (uh, &getReport, uh->address);
+#endif
+}
+
+static void reset_report_read (usbhal* uh)
+{
+#ifdef INTERRUPT_PIPE
+    uh->tdp[1].nextTD = 0;
+    uh->tdp[1].conditionCode = OHCI_CC_NOT_ACCESSED;
+    uh->tdp[1].currentBuffer = vtophys (uh->desc);
+    uh->iedp->skip = 1;
+    uh->iedp->tailPointer = 0;
+    uh->iedp->head.pointer.normal = uh->tda[1];
+    uh->iedp->skip = 0;
+#else
+    setup_report_read (uh);
+#endif
+}
+
+static int find_keyboard (usb_descriptor_t* d)
+{
+    dprintf (("", "find keyboard...\n"));
+    usb_config_descriptor_t* cf = (usb_config_descriptor_t*) d;
+    int l = UGETW(cf->wTotalLength);
+    void* end = ((char*) d) + l;
+    while (d < end)
+    {
+        d = (usb_descriptor_t*) ((char*) d + d->bLength);
+        dprintf (("", "descriptor type %d\n", d->bDescriptorType));
+        if (d->bDescriptorType == UDESC_INTERFACE)
+        {
+            usb_interface_descriptor_t* ifc =
+                (usb_interface_descriptor_t*) d;
+            if (ifc->bInterfaceClass == UICLASS_HID &&
+                ifc->bInterfaceSubClass == UISUBCLASS_BOOT &&
+                ifc->bInterfaceProtocol == UIPROTO_BOOT_KEYBOARD)
+            {
+                return ifc->bInterfaceNumber;
+            }
+        }
+    }
+
+    return -1;
+}
+
+int HAL_KbdScanInterrupt (void)
+{
+    int w, intr;
+    OHCI_TD* dh;
+    usbhal* uh = get_usbhal ();
+    if (uh == 0)
+    {
+        dprintf (("", "Interrupt called out of context\n"));
+        return 0;
+    }
+
+    intr = OREAD(OHCI_INTERRUPT_STATUS);
+    int enable = OREAD(OHCI_INTERRUPT_ENABLE);
+    intr &= enable;
+    dh = (OHCI_TD*) ((unsigned int) uh->hccap->donehead.pointer & ~1);
+    if (intr & OHCI_WDH) uh->hccap->donehead.pointer = 0;
+
+    if (intr & OHCI_WDH) {
+        OWRITE(OHCI_INTERRUPT_STATUS, OHCI_WDH);
+        dprintf (("", "%4d wdh dh = %p\n", uh->sofs, dh));
+        //dumptds ();
+        /* don't allow the condition where tda[1] completed when this
+           wdh is actually for tda[0] */
+        if (dh != uh->tda[0] && uh->tdp[1].conditionCode == OHCI_CC_NO_ERROR)
+        {
+            switch (uh->port_state) {
+            case port_default:
+                uh->port_state = port_address;
+                /* configure device */
+                uh->delay_time = uh->sofs + USB_DELAY_CONFIG + 1;
+                dprintf (("", " done.(state = %d, d = %d)\n",
+                    uh->port_state, uh->delay_time));
+                break;
+            case port_address:
+                dprintf (("", " done.\nReading config descriptor... "));
+                uh->edp->maxPacketSize = uh->desc[7];
+                {
+                    struct Request getConfDesc;
+                    getConfDesc.requestType = 0x80;
+                    getConfDesc.request = 6;
+                    getConfDesc.value = 0x200;
+                    getConfDesc.index = 0;
+                    getConfDesc.length = 256;
+                    setup_request_read (uh, &getConfDesc, uh->address);
+                }
+                uh->port_state = port_confdesc;
+                break;
+            case port_confdesc:
+                dprintf (("", "  done.\n"));
+                uh->interfaceno = find_keyboard ((usb_descriptor_t*) uh->desc);
+                if (uh->interfaceno >= 0)
+                {
+                    dprintf (("", "keyboard found\n"));
+                    uh->result |= HAL_KbdScan_Present;
+                    /* set config */
+                    uh->delay_time = uh->sofs + USB_DELAY_CONFIG + 1;
+                }
+                else
+                {
+                    uh->port_state = port_detached;
+                    intr |= OHCI_RHSC; /* force fall through */
+                }
+                break;
+            case port_configured:
+                uh->delay_time = uh->sofs + USB_DELAY_CONFIG + 1;
+                break;
+            case port_protocolset:
+                dprintf (("", "done.\n%4d Reading report... ", uh->sofs));
+                uh->port_state = port_report;
+                setup_report_read (uh);
+                uh->delay_time = uh->sofs + USB_DELAY_REPORT;
+                break;
+            case port_report:
+                dprintf (("", " done. %4d\n", uh->sofs));
+                memcpy (&uh->data, uh->desc, 8);
+                ddumpbuf ("", &uh->data, sizeof uh->data, 0);
+
+                /* we've finished */
+                if (uh->data.modifiers & ((1<<0) | (1<<4)))
+                    uh->result |= HAL_KbdScan_Ctrl;
+                if (uh->data.modifiers & ((1<<1) | (1<<5)))
+                    uh->result |= HAL_KbdScan_Shift;
+
+                for (int i = 0; i < NKEYCODE; ++i)
+                {
+                    switch (uh->data.keycode[i])
+                    {
+                    case 0x15: uh->result |= HAL_KbdScan_R; break;
+                    case 0x17: uh->result |= HAL_KbdScan_T; break;
+                    case 0x4c: uh->result |= HAL_KbdScan_Delete; break;
+                    case 0x4d: uh->result |= HAL_KbdScan_End; break;
+                    case 0x28: uh->result |= HAL_KbdScan_Return; break;
+                    }
+                }
+
+                uh->result |= HAL_KbdScan_Complete;
+#if 1
+                reset_report_read (uh);
+#else
+                uh->port_state = port_detached;
+#endif
+                break;
+            }
+        }
+    }
+
+root_change:
+    if (intr & OHCI_RHSC) {
+        int w = 0;
+
+        /* find out what's happened */
+        for (uh->portno = 1; uh->portno <= uh->portno_max; uh->portno++)
+        {
+            w = OREAD(OHCI_RH_PORT_STATUS(uh->portno));
+            dprintf (("", "Port (%d) status: %X\n", uh->portno, w));
+            if (w & 0xffff0000) break;
+        }
+
+        dprintf (("", "Port (%d) status changed: %X\n", uh->portno, w));
+        /* turn off the interrupt in case we cause any more */
+        OWRITE(OHCI_INTERRUPT_STATUS, OHCI_RHSC);
+
+        /* Reset port (to enable it) if we've connected to a low speed device */
+        if ((w & UPS_C_CONNECT_STATUS) && uh->port_state == port_detached)
+        {
+            if (w & UPS_LOW_SPEED)
+            {
+                dprintf (("", "Port powered\n"));
+                uh->port_state = port_powered;
+                uh->delay_time = uh->sofs + USB_DELAY_RESET + 1;
+            }
+
+            OWRITE(OHCI_RH_PORT_STATUS(uh->portno), w & UPS_C_CONNECT_STATUS);
+        }
+
+
+        /* Once we've finished resetting, address it */
+        if ((w & UPS_C_PORT_RESET) && uh->port_state == port_powered) {
+            dprintf (("", "Port reset\n"));
+            uh->address++;
+            uh->port_state = port_default;
+            uh->delay_time = uh->sofs + USB_DELAY_ADDRESS + 1;
+
+            OWRITE(OHCI_RH_PORT_STATUS(uh->portno), w & UPS_C_PORT_RESET);
+        }
+    }
+
+    if (intr & OHCI_SF) {
+        OWRITE(OHCI_INTERRUPT_STATUS, OHCI_SF);
+        uh->sofs++;
+        //dprintf (("", "%d ", uh->sofs));
+        if (uh->delay_time && uh->sofs > uh->delay_time)
+        {
+            dprintf (("", "delay time, state = %d\n", uh->port_state));
+            switch (uh->port_state)
+            {
+            case port_powered:
+                dprintf (("", "%4d Resetting\n", uh->sofs));
+                OWRITE(OHCI_RH_PORT_STATUS(uh->portno), UPS_RESET);
+                break;
+
+            case port_default:
+                dprintf (("", "%4d Setting address... ", uh->sofs));
+                uh->edp->maxPacketSize = 8;
+                {
+                    struct Request setAddress;
+                    setAddress.requestType = 0;
+                    setAddress.request = 5;
+                    setAddress.value = uh->address;
+                    setAddress.index = 0;
+                    setAddress.length = 0;
+                    setup_request (uh, &setAddress, 0);
+                }
+                break;
+
+            case port_address:
+                dprintf (("", "%4d Reading device descriptor... ", uh->sofs));
+                {
+                    struct Request getDevDesc;
+                    getDevDesc.requestType = 0x80;
+                    getDevDesc.request = 6;
+                    getDevDesc.value = 0x100;
+                    getDevDesc.index = 0;
+                    getDevDesc.length = 8;
+                    setup_request_read (uh, &getDevDesc, uh->address);
+                }
+                break;
+
+            case port_confdesc:
+                dprintf (("", "%4d Setting config... ", uh->sofs));
+                uh->port_state = port_configured;
+                {
+                    struct Request setConfig;
+                    setConfig.requestType = 0;
+                    setConfig.request = 9;
+                    setConfig.value = 1;
+                    setConfig.index = 0;
+                    setConfig.length = 0;
+                    setup_request (uh, &setConfig, uh->address);
+                }
+                break;
+
+            case port_configured:
+                dprintf (("", "%4d Setting protocol... ", uh->sofs));
+                uh->port_state = port_protocolset;
+                {
+                    struct Request setProtocol;
+                    setProtocol.requestType = 0x21;
+                    setProtocol.request = 0x0B;
+                    setProtocol.value = 0;
+                    setProtocol.index = uh->interfaceno;
+                    setProtocol.length = 0;
+                    setup_request (uh, &setProtocol, uh->address);
+                }
+                break;
+            case port_report:
+                dprintf (("", "%4d Timed out waiting for report\n", uh->sofs));
+                uh->port_state = port_detached;
+                goto root_change;
+                break;
+            }
+            uh->delay_time = 0;
+        }
+
+        if (uh->sofs > USB_TIMEOUT)
+        {
+            dprintf (("", "%4d timed out...\n", uh->sofs));
+            uh->sofs = 0;
+            closedown_controller (uh);
+            if (find_controller (uh) == 0)
+            {
+                uh->result |= HAL_KbdScan_Complete;
+            }
+            return !intr;
+        }
+    }
+
+    w = OREAD(OHCI_INTERRUPT_STATUS); /* Flushes any writes */
+
+    hal_ack_usb_irq(uh->irq_device);
+
+    return !intr;
+}
+
+#if defined(HAL) && defined(DEBUGLIB)
+extern int HAL_CounterDelay(int);
+void _dprintf(const char *area_level, const char *format, ...)
+{
+    #if 0
+    HAL_CounterDelay(10000);
+    #else
+    va_list p;
+    va_start(p, format);
+    vprintf(format, p);
+    va_end(p);
+    #endif
+}
+
+void ddumpbuf (const char *area_level, const void *buffer, size_t size, size_t offset)
+{
+    #if 0
+    HAL_CounterDelay(50000);
+    #else
+    const size_t width = 16;
+    const size_t end = ((size + width - 1) / width) * width;
+    const char *membuf = buffer;
+
+    size_t i = 0, j;
+
+    while (i < end)
+    {
+      if ((i % width) == 0)
+      {
+        if (i)
+        {
+          printf (": ");
+          for (j = i - width; j != i; ++j)
+          {
+            printf ("%c", (membuf[j]>=32 && membuf[j] != 0x7f) ? membuf[j] : '.');
+          }
+          printf ("\n");
+        }
+        printf ("%04x: ", i + offset);
+      }
+
+      if (i>=size)
+      {
+        printf ("   ");
+      }
+      else
+      {
+        printf ("%02x ", membuf[i]);
+      }
+      ++i;
+    }
+
+    if (i)
+    {
+      for (printf (": "), j = i - width; j != i; ++j)
+      {
+        printf ("%c", j>=size ? ' ' : (membuf[j]>=32 && membuf[j] != 0x7f) ? membuf[j] : '.');
+      }
+      printf ("\n");
+    }
+    #endif
+}
+#endif
+

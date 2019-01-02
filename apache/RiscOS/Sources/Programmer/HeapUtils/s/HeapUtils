@@ -1,0 +1,820 @@
+; Copyright 2005 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+; >s.HeapUtils
+; Copyright © Castle Technology ltd, 2005
+; All rights reserved.
+
+
+		GET	Hdr:ListOpts
+		GET	Hdr:Macros
+		GET	Hdr:System
+		GET	Hdr:ModHand
+		GET	Hdr:MsgTrans
+		GET	Hdr:Proc
+		GET	VersionASM
+
+
+; Some useful constants
+TAB			*	9
+LF			*	10
+CR			*	13
+CallEvery_Delay		*	9	; Call our routine twice a second
+HeapUtils_ErrorBlk	*	&81D600	; Our error block base
+XTerritory_Collate	*	&6305D	; This is a pain to get from header files
+HEAP_MAGIC		*	&70616548
+
+; Module workspace format
+			^	0
+WS_HeapList		#	4	; Pointer to head node in heap list
+WS_PageSize		#	4	; Size (bytes) of a machine page
+WS_Buffer		#	256-@	; Buffer for doing things like OS_ReadArgs
+WS_SIZE			*	@
+
+; Heap list node format
+			^	0
+HL_Next			#	4	; Pointer to next node
+HL_Area			#	4	; Dynamic area number
+HL_Base			#	4	; Pointer to base of dynamic area
+HL_Request		#	4	; Temporary free space request
+HL_SIZE			*	@
+
+;; Client list node format
+;			^	0
+;CL_Next			#	4	; Pointer to next node
+;CL_Area			#	4	; Dynamic area number for heap
+;CL_Required		#	4	; Number of free bytes required on heap
+;CL_SIZE			*	@
+
+; Format of an OS_Heap - PRM 1-349
+			^	0
+Heap_Magic		#	4	; Magic word "Heap"
+Heap_FreeList		#	4	; Offset (minus four) to start of free list
+Heap_Base		#	4	; Offset to base of heap (byte following all allcated and free blocks)
+Heap_End		#	4	; Offset to end of heap (byte following end of heap structure)
+
+
+ [ No32bitCode
+ ! 0, "Warning: This is not a 32-bit compatible build!"
+ ]
+
+
+	AREA	|Asm$$Code|, CODE, READONLY, PIC
+
+
+Mod_Start	; Not required
+Mod_Service	; Not required
+;Mod_SWIHandler	; Not required
+;Mod_SWITable	; Not required
+Mod_SWIDecode	; Not required
+Mod_Messages	; Not required
+Module_BaseAddr
+	DCD	Mod_Start	-Module_BaseAddr	; Module start entry point offset
+	DCD	Mod_Init	-Module_BaseAddr	; Module intialisation entry point offset
+	DCD	Mod_Die		-Module_BaseAddr	; Module finalisation entry point offset
+	DCD	Mod_Service	-Module_BaseAddr	; Module service call entry point offset
+	DCD	Mod_Title	-Module_BaseAddr	; Module title string offset
+	DCD	Mod_HelpStr	-Module_BaseAddr	; Module version info string offset
+	DCD	Mod_HC_Table	-Module_BaseAddr	; Help and command keyword table offset
+	DCD	&58240					; SWI chunk
+	DCD	Mod_SWIHandler	-Module_BaseAddr	; Module SWI handler entry point offset
+	DCD	Mod_SWITable	-Module_BaseAddr	; Module SWI table offset
+	DCD	Mod_SWIDecode	-Module_BaseAddr	; No swi name decode entry
+	DCD	Mod_Messages	-Module_BaseAddr	; No messages file
+	DCD	Mod_Flags	-Module_BaseAddr	; Module flags word offset
+
+
+; ************************************************************
+; *
+; *  Module title string.
+; *
+Mod_Title
+	DCB	"$Module_ComponentName", 0
+	ALIGN
+
+
+; ************************************************************
+; *
+; * Module version, date (and copyright) string.
+; *
+Mod_HelpStr
+	DCB	"$Module_ComponentName", TAB, TAB
+	DCB	"$Module_MajorVersion ($Module_Date)"
+ [ Module_MinorVersion <> ""
+	DCB	" $Module_MinorVersion"
+ ]
+	DCB	0
+	ALIGN
+
+
+; ************************************************************
+; *
+; * Module flags word.
+; *
+Mod_Flags
+ [ No32bitCode
+	DCD	0
+ |
+	DCD	ModuleFlag_32bit
+ ]
+
+
+; ************************************************************
+; *
+; * Module help and command keyword table.
+; *
+Mod_HC_Table
+	Command	HeapUtils_Status, 0, 0
+	Command	HeapUtils_Watch, 1, 1
+	Command	HeapUtils_Forget, 1, 1
+	DCB	0
+HeapUtils_Status_Help
+	DCB	"*HeapUtils_Status outputs status information for any heaps currently monitored.", CR
+HeapUtils_Status_Syntax
+	DCB	"*HeapUtils_Status", 0
+	ALIGN
+HeapUtils_Watch_Help
+	DCB	"*HeapUtils_Watch adds a dynamic area containing an OS_Heap to the list of those monitored."
+	DCB	" HeapUtils will ensure that at least two pages are kept free at the end of the heap's"
+	DCB	" dynamic area.", CR
+HeapUtils_Watch_Syntax
+	DCB	"*HeapUtils_Watch <dynamic area name>", 0
+	ALIGN
+HeapUtils_Forget_Help
+	DCB	"*HeapUtils_Forget removes a dynamic area containing an OS_Heap from the list of those monitored.", CR
+HeapUtils_Forget_Syntax
+	DCB	"*HeapUtils_Forget <dynamic area name>", 0
+	ALIGN
+
+
+; ************************************************************
+; *
+; *  Module SWI decoding table
+; *
+Mod_SWITable
+	DCB	"$Module_ComponentName", 0
+	DCB	"Request", 0	; &58240
+;	DCB	"Register", 0	; &58241
+;	DCB	"Deregister", 0	; &58242
+	DCB	0
+	ALIGN
+
+
+; ************************************************************
+; *
+; * Module initialisation entry point.
+; *
+; * In...
+; *   R10	= pointer to environment string
+; *   R11	= I/O base or instantiation number
+; *   R12	= private word pointer
+; *   R13	= full-descending stack pointer
+; *   R14	= return address
+; * Out...
+; *   R0-R6	= can be corrupted
+; *   R7-R11	= must be preserved
+; *   R12	= can be corrupted
+; *   R13	= must be preserved
+; *   R14	= can be corrupted
+; *   V flag	= set if R0 is a pointer to an error block
+; *
+Mod_Init Entry "R8-R9"
+	; Claim workspace
+	MOV	R0, #ModHandReason_Claim
+	LDR	R3, =WS_SIZE
+	SWI	XOS_Module
+	EXIT	VS
+	STR	R2, [R12]
+	MOV	R12, R2
+	; Initialise the module workspace
+	MOV	R0, #0
+	STR	R0, [R12, #WS_HeapList]
+	SWI	XOS_ReadMemMapInfo
+	MOVVS	R0, #32*1024
+	STR	R0, [R12, #WS_PageSize]
+	; Add some dynamic areas to the list of those to check (ignore any
+	; which aren't found in the DA list because they can change name over
+	; different OS releases)
+	ADR	R8, ErrBlk0
+	ADR	R9, %FT10
+	BL	AddHeapToList
+	BVC	%FT02
+	TEQ	R0, R8
+	BNE	%FT08
+02	ADR	R9, %FT15
+	BL	AddHeapToList
+	BVC	%FT04
+	TEQ	R0, R8
+	BNE	%FT08
+04	ADR	R9, %FT20
+	BL	AddHeapToList
+	BVC	%FT06
+	TEQ	R0, R8
+	BNE	%FT08
+06	ADR	R9, %FT25
+	BL	AddHeapToList
+	BVC	%FT07
+	TEQ	R0, R8
+	BNE	%FT08
+07	; Add the CallEvery which checks the heaps
+	BL	AddCallEvery
+08	; May return an error
+	EXIT
+10	;
+	DCB	"Module area", 0
+15	;
+	DCB	"System heap/stack", 0
+20	;
+	DCB	"PCI shared memory", 0
+25	;
+	DCB	"System heap", 0
+	ALIGN
+
+
+; ************************************************************
+; *
+; * Module finalisation entry point.
+; *
+; * In...
+; *   R10	= fatality indication: 0 is non-fatal, 1 is fatal
+; *   R11	= instantiation number
+; *   R12	= private word pointer
+; *   R13	= full-descending stack pointer
+; *   R14	= return address
+; * Out...
+; *   R0-R6	= can be corrupted
+; *   R7-R11	= must be preserved
+; *   R12	= can be corrupted
+; *   R13	= must be preserved
+; *   R14	= can be corrupted
+; *   V flag	= set if R0 is a pointer to an error block
+; *
+Mod_Die	Entry
+	LDR	R12, [R12]
+	; Remove our CallEvery (ignore any error)
+	BL	RemoveCallEvery
+	; Free the heap list nodes
+	MOV	R0, #ModHandReason_Free
+	LDR	R2, [R12, #WS_HeapList]
+05	LDR	R1, [R2, #HL_Next]
+	SWI	XOS_Module
+	BVS	%FT10
+	MOVS	R2, R1
+	BNE	%BT05
+10	;
+	EXIT
+
+
+; ************************************************************
+; *
+; * *HeapUtils_Status command code.
+; *
+; * In...
+; *   R0	= pointer to command tail
+; *   R1	= number of parameters
+; *   R12	= private word pointer
+; *   R13	= full-descending stack pointer
+; *   R14	= return address
+; * Out...
+; *   R0-R6	= may be corrupted
+; *   R7-R11	= must be preserved
+; *   R12	= may be corrupted
+; *   R13	= must be preserved
+; *   R14	= can be corrupted
+; *   V flag	= set if R0 is a pointer to an error block
+; *
+HeapUtils_Status_Code Entry "R7-R10"
+	LDR	R12, [R12]
+	SWI	XOS_WriteS
+	DCB	"Area num:   Tail bytes: Name:", LF, CR, 0
+	ALIGN
+	; Enumerate the heap list
+	LDR	R9, [R12, #WS_HeapList]
+	TEQ	R9, #0
+	BEQ	%FT20
+05	LDR	R1, [R9, #HL_Area]
+	LDR	R10, [R9, #HL_Next]
+	; Read heap name string
+	MOV	R0, #2
+	SWI	XOS_DynamicArea
+	BVS	%FT20
+	; Output dynamic area number
+	SUB	SP, SP, #12
+	MOV	R0, R1
+	MOV	R1, SP
+	MOV	R2, #16
+	SWI	XOS_ConvertCardinal4
+	SWIVC	XOS_Write0
+	ADD	SP, SP, #12
+	BVS	%FT20
+	; Pad with some spaces
+	MOV	R0, #" "
+	CMP	R1, SP
+	BHI	%FT08
+07	SWI	XOS_WriteC
+	ADD	R1, R1, #1
+	CMP	R1, SP
+	BLO	%BT07
+08	; Output the number of bytes between heap_base and heap_end
+	LDR	R1, [R9, #HL_Base]
+	SUB	SP, SP, #12
+	LDR	R0, [R1, #Heap_Base]
+	LDR	R1, [R1, #Heap_End]
+	MOV	R2, #12
+	SUB	R0, R1, R0
+	MOV	R1, SP
+	SWI	XOS_ConvertCardinal4
+	SWIVC	XOS_Write0
+	ADD	SP, SP, #12
+	BVS	%FT20
+	; Pad with some spaces
+	MOV	R0, #" "
+	CMP	R1, SP
+	BHI	%FT10
+09	SWI	XOS_WriteC
+	ADD	R1, R1, #1
+	CMP	R1, SP
+	BLO	%BT09
+10	; Output dynamic area name
+	MOV	R0, R8
+	SWI	XOS_Write0
+	SWIVC	XOS_NewLine
+	BVS	%FT20
+	MOVS	R9, R10
+	BNE	%BT05
+20	;
+	EXIT
+
+
+; ************************************************************
+; *
+; * *HeapUtils_Watch command code.
+; *
+; * In...
+; *   R0	= pointer to command tail
+; *   R1	= number of parameters
+; *   R12	= private word pointer
+; *   R13	= full-descending stack pointer
+; *   R14	= return address
+; * Out...
+; *   R0-R6	= may be corrupted
+; *   R7-R11	= must be preserved
+; *   R12	= may be corrupted
+; *   R13	= must be preserved
+; *   R14	= can be corrupted
+; *   V flag	= set if R0 is a pointer to an error block
+; *
+HeapUtils_Watch_Code Entry "R9"
+	LDR	R12, [R12]
+	; Parse the parameters (simple way of zero-terminating the strings)
+	MOV	R1, R0
+	ADR	R0, %FT30
+	ADD	R2, R12, #WS_Buffer
+	MOV	R3, #?WS_Buffer
+	SWI	XOS_ReadArgs
+	; Add the named dynamic area to the list of heaps to watch
+	LDRVC	R9, [R12, #WS_Buffer]
+	BLVC	AddHeapToList
+	EXIT
+30	;
+	DCB	"da", 0
+	ALIGN
+
+
+; ************************************************************
+; *
+; * *HeapUtils_Forget command code.
+; *
+; * In...
+; *   R0	= pointer to command tail
+; *   R1	= number of parameters
+; *   R12	= private word pointer
+; *   R13	= full-descending stack pointer
+; *   R14	= return address
+; * Out...
+; *   R0-R6	= may be corrupted
+; *   R7-R11	= must be preserved
+; *   R12	= may be corrupted
+; *   R13	= must be preserved
+; *   R14	= can be corrupted
+; *   V flag	= set if R0 is a pointer to an error block
+; *
+HeapUtils_Forget_Code Entry "R9"
+	LDR	R12, [R12]
+	; Parse the parameters (simple way of zero-terminating the strings)
+	MOV	R1, R0
+	ADR	R0, %FT30
+	ADD	R2, R12, #WS_Buffer
+	MOV	R3, #?WS_Buffer
+	SWI	XOS_ReadArgs
+	; Add the named dynamic area to the list of heaps to watch
+	LDRVC	R9, [R12, #WS_Buffer]
+	BLVC	RemoveHeapFromList
+	EXIT
+30	;
+	DCB	"da", 0
+	ALIGN
+
+
+; ************************************************************
+; *
+; * Module SWI handler entry point
+; *
+; * In...
+; *   R0-R9	= passed in from caller
+; *   R11	= SWI number offset from SWI chunk base
+; *   R12	= private word pointer
+; *   R13	= full-descending stack pointer
+; *   R14	= return address
+; * Out...
+; *   R0-R9	= values to return to caller
+; *   R10-R12	= can be corrupted
+; *   R13	= must be preserved
+; *   R14	= can be corrupted
+; *   V flag	= set if R0 is a pointer to an error block
+; *
+BadSWI	Entry	"R1-R4"
+	ADR	R0, %FT00
+	MOV	R1, #0
+	MOV	R2, #0
+	MOV	R3, #0
+	ADR	R4, Mod_SWITable
+	SWI	XMessageTrans_ErrorLookup
+	SETV
+	EXIT
+00	;
+	DCD	&1E6
+	DCB	"BadSWI", 0
+	ALIGN
+Mod_SWIHandler
+	LDR	R12, [R12]
+	RSBS	R11, R11, #(%FT01 - %FT00) :SHR: 2
+	ADDGE	PC, PC, R11, LSL #2
+	B	BadSWI
+00;	B	SWI_Deregister		; SWI 2
+;	B	SWI_Register		; SWI 1
+01;	B	SWI_Request		; SWI 0
+
+
+; ************************************************************
+; *
+; * SWI HeapUtils_Request (&58240)  - this SWI is reentrant
+; *
+; * Ask for a specific amount of memory to be made available on the
+; * specified heap. If we're already maintaining that heap with more,
+; * we ignore this request (other than setting our callback to ensure
+; * that we check the free space as soon as possible).
+; *
+; * Once we've done it, we can forget the request and go back to
+; * maintaining the level which we were using before the request
+; * came in.
+; *
+; * In...
+; *   R0	= flags (reserved, should be zero)
+; *   R1	= pointer to heap (base of dynamic area)
+; *   R3	= number of bytes to ensure
+; *   R12	= module workspace pointer
+; *   R13	= full descending stack pointer
+; *   R14	= return address
+; * Out...
+; *   R0	= corrupted (or error pointer)
+; *   R1-R13	= preserved
+; *   R14	= corrupted
+; *   V set if R0 is error pointer
+; *
+SWI_Request Entry "R2, R4"
+	; Look for a heap in the list with the required base address
+	LDR	R2, [R12, #WS_HeapList]
+	TEQ	R2, #0
+	BEQ	%FT20
+10	LDR	R0, [R2, #HL_Base]
+	LDR	R14, [R2, #HL_Next]
+	TEQ	R0, R1
+	BEQ	%FT30
+	MOVS	R2, R14
+	BNE	%BT10
+20	ADR	R0, ErrBlk3
+	SETV
+	EXIT
+ErrBlk3	DCD	HeapUtils_ErrorBlk+3
+	DCB	"HeapUtils: no watched heap at that address", 0
+	ALIGN
+30	; Disable interrupts
+	SCPSR	I_bit, 0, R14,, R4
+	; Compare the requested amount against the space we were going to ensure
+	LDR	R0, [R2, #HL_Request]
+	CMP	R0, R3
+	; If it's more, increase the request amount
+	STRLO	R3, [R2, #HL_Request]
+	; Restore interrupts (if they were enabled before)
+	RestPSR	R4
+	; Set our CallBack to happen immediately because someone clearly wants memory
+	BL	CallEvery_Handler
+	EXIT
+
+
+; ************************************************************
+; *
+; * Given a name string pointer for a dynamic area which contains an OS_Heap,
+; * check that the dynamic area exists and that it contains what looks like a
+; * valid heap. If so, add the dynamic area to our list of heaps to watch (or
+; * ignore this call if the heap is already being watched).
+; *
+; * In...
+; *   R9	= pointer to name of dynamic area of heap to monitor
+; *   R12	= module workspace pointer
+; *   R13	= full-descending stack pointer
+; *   R14	= return address
+; * Out...
+; *   R0	= corrupted or error block pointer
+; *   R1-R13	= preserved
+; *   R14	= corrupted
+; *
+AddHeapToList Entry "R1-R6"
+	; Look for a dynamic area with the specified name
+	BL	LookupHeap
+	BVS	%FT08
+	; If lookup failed, exit with a suitable message
+	CMP	R1, #-1
+	BEQ	%FT10
+	; Check that the dynamic area is of non-zero size
+	TEQ	R6, #0
+	BEQ	%FT20
+	; Check the magic word in the heap descriptor
+	LDR	R14, =HEAP_MAGIC
+	LDR	R0, [R4, #Heap_Magic]
+	TEQ	R0, R14
+	BNE	%FT30
+	; Scan the heap list for this dynamic area (exit if found)
+	LDR	R0, [R12, #WS_HeapList]
+02	TEQ	R0, #0
+	BEQ	%FT05
+	LDMIA	R0, {R0, R14}
+	TEQ	R14, R1
+	BNE	%BT02
+	EXIT
+05	; Not found in the list, add it
+	MOV	R0, #ModHandReason_Claim
+	MOV	R3, #HL_SIZE
+	SWI	XOS_Module
+	LDRVC	R0, [R12, #WS_HeapList]
+	BVS	%FT08
+	MOV	R5, #0
+	ASSERT	(HL_Area = 4) :LAND: (HL_Next = 0) :LAND: (HL_Base = 8) :LAND: (HL_Request = 12)
+	STMIA	R2, {R0, R1, R4, R5}
+	STR	R2, [R12, #WS_HeapList]
+08	;
+	EXIT
+10	; No match for DA name
+	SETV
+	ADR	R0, ErrBlk0
+	EXIT
+ErrBlk0	DCD	HeapUtils_ErrorBlk+0
+	DCB	"HeapUtils: no dynamic area with that name", 0
+	ALIGN
+20	; Dynamic area is of zero bytes in size
+	SETV
+	ADR	R0, ErrBlk1
+	EXIT
+ErrBlk1	DCD	HeapUtils_ErrorBlk+1
+	DCB	"HeapUtils: dynamic area is empty", 0
+	ALIGN
+30	; Contents of DA don't look like a heap
+	SETV
+	ADR	R0, ErrBlk2
+	EXIT
+ErrBlk2	DCD	HeapUtils_ErrorBlk+2
+	DCB	"HeapUtils: heap descriptor not found", 0
+	ALIGN
+
+
+; ************************************************************
+; *
+; * Given a dynamic area name string pointer, look for a corresponding entry in
+; * our heap list. If found, remove that entry and free any associated memory.
+; *
+; * In...
+; *   R9	= pointer to name of dynamic area of heap to remove
+; *   R12	= module workspace pointer
+; *   R13	= full-descending stack pointer
+; *   R14	= return address
+; * Out...
+; *   R0	= corrupted or error block pointer
+; *   R1-R13	= preserved
+; *   R14	= corrupted
+; *
+RemoveHeapFromList Entry "R1-R4, R6"
+	; Look for a dynamic area with the specified name
+	BL	LookupHeap
+	BVS	%FT20
+	; Scan the heap list for this dynamic area
+	MOV	R3, #0
+	LDR	R2, [R12, #WS_HeapList]
+	TEQ	R2, #0
+	BEQ	%FT20
+10	LDMIA	R2, {R4, R14}		; R2 = this node, R3 = previous node, R4 = next node
+	TEQ	R14, R1
+	BEQ	%FT30
+	MOV	R3, R2
+	MOVS	R2, R4
+	BNE	%BT10
+20	; No match found, exit
+	EXIT
+30	; Found in the list, delink it
+	TEQ	R3, #0
+	STREQ	R4, [R12, #WS_HeapList]
+	STRNE	R4, [R3, #HL_Next]
+	; and free the node
+	MOV	R0, #ModHandReason_Free
+	SWI	XOS_Module
+	EXIT
+
+
+; ************************************************************
+; *
+; * Given a dynamic area name string, look for that area in the list of
+; * current active areas. Return the area number and some other useful
+; * information if found, else return -1 as the area number.
+; *
+; * In...
+; *   R9	= pointer to name of dynamic area
+; *   R13	= full-descending stack pointer
+; *   R14	= return address
+; * Out...
+; *   R0	= corrupted or error block pointer
+; *   R1	= dynamic area number (-1 for not found)
+; *   R2-R3	= preserved
+; *   R4	= pointer to base of area (if found)
+; *   R5	= preserved
+; *   R6	= current size of dynamic area (if found)
+; *   R7-R13	= preserved
+; *   R14	= corrupted
+; *
+LookupHeap Entry "R2-R3, R5, R7-R8"
+	MOV	R1, #-1
+05	; Enumerate dynamic areas
+	MOV	R0, #3
+	SWI	XOS_DynamicArea
+	BVS	%FT10
+	CMP	R1, #-1
+	BEQ	%FT10
+	; Read info on this area
+	MOV	R0, #2
+	SWI	XOS_DynamicArea
+	BVS	%FT10
+	; Preserve some registers
+	MOV	R4, R3
+	MOV	R5, R1
+	MOV	R6, R2
+	; Compare area name strings
+	MOV	R0, #-1
+	MOV	R1, R8
+	MOV	R2, R9
+	MOV	R3, #0
+	SWI	XTerritory_Collate
+	BVS	%FT10
+	MOV	R1, R5
+	; If no match, continue enumeration
+	TEQ	R0, #0
+	BNE	%BT05
+10	; We're done
+	EXIT
+
+
+; ************************************************************
+; *
+; * Register our CallEvery handler to be called a couple of times a second.
+; *
+; * In...
+; *   R12	= module workspace pointer
+; *   R13	= full-descending stack pointer
+; *   R14	= return address
+; * Out...
+; *   R0	= corrupted or pointer to error
+; *   R1-R13	= preserved
+; *   R14	= corrupted
+; *
+AddCallEvery Entry "R1-R2"
+	MOV	R0, #CallEvery_Delay
+	ADR	R1, CallEvery_Handler
+	MOV	R2, R12
+	SWI	XOS_CallEvery
+	EXIT
+
+
+; ************************************************************
+; *
+; * Remove our CallEvery handler (and any pending CallBack).
+; *
+; * In...
+; *   R12	= module workspace pointer
+; *   R13	= full-descending stack pointer
+; *   R14	= return address
+; * Out...
+; *   R0	= corrupted or pointer to error
+; *   R1-R13	= preserved
+; *   R14	= corrupted
+; *
+RemoveCallEvery Entry "R1"
+	; Remove the CallBack
+	ADR	R0, CallBack_Handler
+	MOV	R1, R12
+	SWI	XOS_RemoveCallBack
+	; Remove the CallEvery
+	ADRVC	R0, CallEvery_Handler
+	SWIVC	XOS_RemoveTickerEvent
+	EXIT
+
+
+; ************************************************************
+; *
+; * This routine is entered a few times a second. We register our CallBack here
+; * handler and then return.
+; *
+; * In...
+; *   R12	= module workspace pointer
+; *   R13	= full-descending stack pointer
+; *   R14	= return address
+; * Out...
+; *   R0	= corrupted
+; *   R1-R13	= preserved
+; *   R14	= corrupted
+; *
+CallEvery_Handler Entry "R1"
+	ADR	R0, CallBack_Handler
+	MOV	R1, R12
+	SWI	XOS_AddCallBack
+	EXIT
+
+
+; ************************************************************
+; *
+; * This routine is called from our CallEvery and its job is to check the amount
+; * of free space at the end of each heap in the heap list. If it finds that there
+; * is less than two machine pages free, it attempts to grow the relevant dynamic
+; * area and then grow the heap within that.
+; *
+; * In...
+; *   R12	= module workspace pointer
+; *   R13	= full-descending stack pointer
+; *   R14	= return address
+; * Out...
+; *   R0-R13	= preserved
+; *   R14	= corrupted
+; *
+CallBack_Handler Entry "R0-R7"
+	; Grow dynamic area by two pages
+	LDR	R0, [R12, #WS_HeapList]
+	TEQ	R0, #0
+	BEQ	%FT20
+05	; Load machine page size
+	LDR	R4, [R12, #WS_PageSize]
+	; Load heap list node
+	LDMIB	R0, {R1, R2}		; R1 = area number, R2 = area base
+	LDR	R5, [R0, #HL_Next]	; R5 = next heap list node
+	; Override default ensure size (with interrupts disabled)
+	SCPSR	I_bit, 0, R14,, R7
+	LDR	R6, [R0, #HL_Request]	; R6 = temporary request for heap space (if any)
+	MOV	R4, R4, LSL #1		; R4 = 2 * page_size
+	CMP	R4, R6
+	MOVLO	R4, R6
+	MOVLO	R14, #0
+	STRLO	R14, [R0, #HL_Request]
+	; Restore interrupt state...
+	RestPSR	R7
+	; Calculate how much space is at the end of the heap
+	LDR	R14, [R2, #Heap_End]
+	LDR	R0, [R2, #Heap_Base]
+	SUB	R0, R14, R0		; R0 = end - base
+	; Is it less than requested amount?
+	SUBS	R14, R4, R0		; R14 = request_size - free_space_at_end
+	BMI	%FT10			; If result is -ve, skip this heap
+	; Yes. Try to grow the heap
+	MOV	R0, R1
+	MOV	R1, R14
+	SWI	XOS_ChangeDynamicArea
+	MOVVC	R0, #5
+	MOVVC	R3, R1
+	MOVVC	R1, R2
+	SWIVC	XOS_Heap
+	BVS	%FT20
+10	;
+	MOVS	R0, R5
+	BNE	%BT05
+20	;
+	CLRV
+	EXIT
+
+
+	END

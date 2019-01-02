@@ -1,0 +1,385 @@
+/* Copyright 2003 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*
+ * SaveAs - implements a singly-instantiated SaveAs dialogue
+ */
+
+#include "resed.h"
+
+static WindowPtr window;
+static SaveAsCallback callback = NULL;
+static Bool standalone;
+static Bool pendingdelete;
+static int filetype;
+static char *addr;
+static int size;
+static Bool dragasprite, dragging;
+
+#define I_SAVEAS_FILENAME 2
+#define I_SAVEAS_OK 0
+#define I_SAVEAS_SPRITE 3
+
+
+static void settype (char *filename, int filetype)
+{
+    char buf[256];
+    sprintf (buf, "%%settype %s %x", filename, filetype);
+    system (buf);
+}
+
+
+static void delete (char *filename)
+{
+    char buf[256];
+    sprintf (buf, "%%delete %s", filename);
+    dprintf("******** calling system (%s)\n" _ buf);
+    system (buf);
+}
+
+
+/*
+ * Load templates, etc.
+ */
+
+error * saveas_load_prototypes ()
+{
+   ER ( wimp_load_template("SaveAs", &window) );
+   ER ( _swix(Wimp_CreateWindow, _IN(1) | _OUT(0),
+              &window->visarea,
+              &window->handle) );
+   return registry_register_window (window->handle, SaveAs, (void *) window);
+}
+
+
+/* Attempt to save under the given absolute path */
+
+static error * save_absolute (char *path, void *closure)
+{
+    error *err = NULL;
+    FILE *f = NULL;
+
+    addr = NULL;
+    size = 0;
+
+    if (strchr(path, '.') == NULL && strcmp(path, "<Wimp$Scrap>") != 0)
+        return error_lookup ("PleaseDrag");
+
+    f = fopen (path, "w");
+    if (!f)
+    {
+        EG ( finish, error_lookup ("CantWrite", path) );
+    }
+
+    EG ( finish, (*callback) (SaveAsGetSize, &addr, &size, closure) );
+    EG ( finish, (*callback) (SaveAsGetBlock, &addr, &size, closure) );
+
+    if (fwrite ((void *) addr, 1, size, f) < size)
+    {
+        EG ( finish, error_lookup ("CantWrite", path) );
+    }
+    fclose (f);
+    f = NULL;
+    (void) settype (path, filetype);
+
+finish:
+    if (f)
+        fclose (f);
+    if (addr)
+        (void) (*callback) (SaveAsFreeBlock, &addr, &size, closure);
+    return err;
+}
+
+
+
+
+/*
+ * Interactor for the saveas window.  Expects to be pushed on top of the
+ * menu.c interactor, so needs to be careful about popping itself correctly.
+ */
+
+static error * saveas_interactor (unsigned int event, int *buf, void *closure, Bool *consumed)
+{
+    MouseClickPtr mouse = (MouseClickPtr) buf;
+    WindowPtr win = (WindowPtr) buf;         /* only half there */
+#if 0
+    CaretPositionPtr caret = (CaretPositionPtr) buf;
+#endif
+    MessagePtr mess = (MessagePtr) buf;
+    MessageDataSavePtr save = (MessageDataSavePtr) buf;
+    MessageDataLoadPtr load = (MessageDataLoadPtr) buf;
+    KeyPressPtr key = (KeyPressPtr) buf;
+    error *err = NULL;
+
+    if (buf == NULL)                     /* we are being asked to cancel */
+    {
+        if (dragging)
+        {
+            if (dragasprite)
+                _swix(DragASprite_Stop, 0);
+            else
+                _swix(Wimp_DragBox, _IN(1),
+                      0);
+            dragging = FALSE;
+        }
+        if (standalone)
+            _swix(Wimp_CreateMenu, _IN(1),
+                  -1);
+        return NULL;
+    }
+
+dprintf("in saveas_interactor %d\n" _ event);
+
+    switch (event)
+    {
+    case EV_OPEN_WINDOW_REQUEST:
+        if (win->handle == window->handle)
+        {
+            *consumed = TRUE;
+            window->visarea = win->visarea;
+            window->scrolloffset = win->scrolloffset;
+            window->behind = win->behind;
+            return _swix(Wimp_OpenWindow, _IN(1),
+                         window);
+        }
+        break;
+
+#if 0
+        /* The following hack is required because the WIMP does not deliver
+         * Message_WindowClosed on menu-tree windows.
+         */
+
+        /* It has the flaw that
+         * dragging into Edit loses you the caret, so the saveas interactor is
+         * popped prematurely, and the menu does not go away.  I have therefore
+         * commented it out.  In fact the interactor will be removed pretty soon
+         * anyway, either by interactor_cancel() or else by saveas_interactor
+         * being installed for another saveas box.
+         */
+
+    case EV_LOSE_CARET:
+        if (caret->windowhandle == window->handle && caret->iconhandle == I_SAVEAS_FILENAME)
+        {
+            dprintf("Popping");
+            interactor_pop (saveas_interactor);
+            *consumed = TRUE;
+        }
+        break;
+#endif
+
+    case EV_KEY_PRESSED:
+        if (key->caret.windowhandle == window->handle &&
+            key->code == 0x0d)
+        {
+            char *path = dbox_getstring (window, I_SAVEAS_FILENAME);
+            *consumed = TRUE;
+            err = save_absolute (path, closure);
+            if (err)
+                error_box (err);
+            else
+            {
+                (void) (*callback) (SaveAsSuccess, &path, &size, closure);
+                if (pendingdelete)
+                    (void) (*callback) (SaveAsDelete, &path, &size, closure);
+                interactor_cancel ();
+            }
+        }
+        break;
+
+    case EV_MOUSE_CLICK:
+        if (mouse->windowhandle == window->handle)
+        {
+            *consumed = TRUE;
+            switch (mouse->iconhandle)
+            {
+            case I_SAVEAS_OK:
+                if (mouse->buttons == MB_CLICK(MB_SELECT) ||
+                    mouse->buttons == MB_CLICK(MB_ADJUST))
+                {
+                    char *path = dbox_getstring (window, I_SAVEAS_FILENAME);
+                    err = save_absolute (path, closure);
+                    if (err)
+                        error_box (err);
+                    else
+                    {
+                        (void) (*callback) (SaveAsSuccess, &path, &size, closure);
+                        if (pendingdelete)
+                            (void) (*callback) (SaveAsDelete, &path, &size, closure);
+                        if (pendingdelete || mouse->buttons == MB_CLICK(MB_SELECT))
+                            interactor_cancel ();
+                    }
+                }
+                break;
+            case I_SAVEAS_SPRITE:
+                if (mouse->buttons == MB_DRAG(MB_SELECT))
+                {
+                    /* Start the drag */
+                    int cmos;
+                    dragasprite = (_swix(OS_Byte, _INR(0,1) | _OUT(2),
+                                        161, 0x1C,
+                                        &cmos) == NULL && (cmos & BIT(1)));
+                    _swix(Wimp_GetWindowState, _IN(1),
+                          window);
+
+                    if (dragasprite)
+                    {
+                        RectRec bbox;
+                        wimp_convert_rect (WorkToScreen, window, &window->icons[I_SAVEAS_SPRITE].bbox, &bbox);
+                        ER ( _swix(DragASprite_Start, _INR(0,3),
+                                   BIT(7), 1, dbox_getstring (window, I_SAVEAS_SPRITE), &bbox) );
+                    }
+                    else
+                    {
+                        DragBoxRec drag;
+                        drag.type = 5;
+                        drag.initial = window->icons[I_SAVEAS_SPRITE].bbox;
+                        drag.constrain.minx = drag.constrain.miny = -1000000;
+                        drag.constrain.maxx = drag.constrain.maxy = 1000000;
+                        wimp_convert_rect (WorkToScreen, window, &drag.initial, &drag.initial);
+                        ER ( _swix(Wimp_DragBox, _IN(1),
+                                   &drag) );
+                    }
+                    dragging = TRUE;
+                }
+                break;
+            }
+        }
+        break;
+
+    case EV_USER_DRAG_BOX:
+        dprintf("Dropped!\n");
+        *consumed = TRUE;
+        block
+        {
+            PointerInfoRec pointer;
+            char *name = dbox_getstring (window, I_SAVEAS_FILENAME);
+            char *leaf = strrchr (name, '.');
+            if (dragasprite)
+                _swix(DragASprite_Stop, 0);
+            dragging = FALSE;
+            _swix(Wimp_GetPointerInfo, _IN(1),
+                  &pointer);
+            if (pointer.windowhandle == window->handle)
+                return NULL;    /* ignore drops on our own window */
+            ER ( (*callback) (SaveAsGetSize, &addr, &size, closure) );
+            save->header.size = sizeof(MessageDataSaveRec);
+            save->header.yourref = 0;
+            save->header.messageid = MESSAGE_DATA_SAVE;
+            save->windowhandle = pointer.windowhandle;
+            save->iconhandle = pointer.iconhandle;
+            save->position = pointer.position;
+            save->estsize = size;
+            save->filetype = filetype;
+            sprintf (save->leafname, "%.*s", sizeof(save->leafname) - 1, leaf ? leaf + 1 : name);
+            return _swix(Wimp_SendMessage, _INR(0,3),
+                         EV_USER_MESSAGE_RECORDED, save, save->windowhandle, save->iconhandle);
+        }
+        break;
+        
+    case EV_USER_MESSAGE:
+    case EV_USER_MESSAGE_RECORDED:
+        if (mess->code == 0x400c9)
+        {
+            if (buf[5] == window->handle && standalone)
+            {
+                interactor_cancel();
+                *consumed = TRUE;
+            }
+        }
+        else if (save->header.messageid == MESSAGE_DATA_SAVE_ACK)
+        {
+            dprintf("Data Save Ack\n");
+            *consumed = TRUE;
+            ER ( save_absolute (save->leafname, closure) );
+            load->header.yourref = save->header.myref;
+            load->header.messageid = MESSAGE_DATA_LOAD;
+            return _swix(Wimp_SendMessage, _INR(0,2),
+                         EV_USER_MESSAGE_RECORDED, load, save->header.taskhandle);
+        }
+        else if (load->header.messageid == MESSAGE_DATA_LOAD_ACK)
+        {
+            if (load->estsize != -1)
+            {
+                char *path = load->filename;
+                (void) (*callback) (SaveAsSuccess, &path, &size, closure);
+                if (pendingdelete)
+                    (void) (*callback) (SaveAsDelete, &path, &size, closure);
+            }
+            *consumed = TRUE;
+            interactor_cancel();
+        }
+        break;
+
+    case EV_USER_MESSAGE_ACKNOWLEDGE:
+        dprintf("CODE %d\n" _ save->header.messageid);
+        if (save->header.messageid == MESSAGE_DATA_SAVE)
+        {
+            dprintf("Message bounced: %d; datasave cancelled\n" _ save->header.messageid);
+            *consumed = TRUE;
+            interactor_cancel();             /* fail quietly */
+        }
+        else if (load->header.messageid == MESSAGE_DATA_LOAD)
+        {
+            dprintf("Message bounced: %d; datasave cancelled\n" _ save->header.messageid);
+            delete (load->filename);
+            return error_lookup ("XferFailed"); /* fail noisily */
+        }
+        break;
+    }
+
+    return NULL;
+}
+
+
+
+/*
+ * Open saveas window in specified location.
+ */
+
+error * saveas_open (Bool stand,             /* TRUE if not a submenu */
+                     Bool delete,            /* Deliver SaveAsDelete reason to cb */
+                     PointPtr position,
+                     char *filename,         /* initial filename */
+                     int type,               /* filetype */
+                     SaveAsCallback cb,
+                     void *cls)              /* passed to callback */
+{
+    char spritename[40];
+    standalone = stand;
+    pendingdelete = delete;
+    filetype = type;
+    sprintf (spritename, "file_%x", filetype);
+    dbox_setstring (window, I_SAVEAS_FILENAME, filename);
+    dbox_setstring (window, I_SAVEAS_SPRITE, spritename);
+    callback = cb;
+
+dprintf("In saveas_open, cb=%x\n" _ (int) cb);
+
+    dragging = FALSE;
+
+    if (standalone)
+    {
+        interactor_install (saveas_interactor, cls);
+        ER ( _swix(Wimp_CreateMenu, _INR(1,3),
+                   window->handle, position->x, position->y) );
+    }
+    else
+    {
+        ER ( _swix(Wimp_CreateSubMenu, _INR(1,3),
+                   window->handle, position->x, position->y) );
+        interactor_push (saveas_interactor, cls);
+    }
+
+    return NULL;
+}

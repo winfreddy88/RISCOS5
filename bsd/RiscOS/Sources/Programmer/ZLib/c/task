@@ -1,0 +1,242 @@
+/*
+ * Copyright (c) 2012, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include "swis.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stddef.h>
+#include <stdbool.h>
+
+#include "Global/RISCOS.h"
+#include "Global/Services.h"
+
+#include "DebugLib/DebugLib.h"
+
+#include "task.h"
+
+/* For now keep things simple and assume there won't be large numbers of tasks/streams active at once */
+
+#define STREAMS_PER_BLOCK 16 /* Must be power of two! */
+
+typedef struct {
+    int handle; /* Task handle */
+    z_streamp strm; /* Stream */
+    bool isdeflate; /* Whether this was an inflate or deflate stream (there's no way of determining which is which using the zlib API!) */
+    bool isactive; /* Whether this association is active (must keep inactive associations so we can remember if they were inflate or deflate) */
+} task_stream;
+
+typedef struct stream_block_t {
+    task_stream streams[STREAMS_PER_BLOCK];
+    struct stream_block_t *next,*prev;
+} stream_block;
+
+static stream_block *streams = NULL;
+static stream_block *last = NULL;
+static int numstreams = 0;
+
+static void task_dump(void)
+{
+#ifdef DEBUGLIB
+    stream_block *cur = streams;
+    int i=0,j=0;
+    dprintf(("","task_dump: %d streams, list=%08x, last=%08x\n",numstreams,streams,last));
+    while(i<numstreams)
+    {
+        if(!j)
+          dprintf((""," block %08x: next %08x prev %08x\n",cur,cur->next,cur->prev));
+        dprintf(("","  task %08x strm %08x isdeflate %d isactive %d\n",cur->streams[j].handle,cur->streams[j].strm,cur->streams[j].isdeflate,cur->streams[j].isactive));
+        i++;
+        if(++j == STREAMS_PER_BLOCK)
+        {
+            j = 0;
+            cur = cur->next;
+        }
+    }
+#endif
+}
+
+static int get_task_handle(void)
+{
+    int handle;
+    if(_swix(Wimp_ReadSysInfo,_IN(0)|_OUT(0),5,&handle))
+        return 0;
+    return handle;
+}
+
+static void task_remove(stream_block *block,int i)
+{
+    /* Swap with the last entry to keep the list contiguous */
+    int lastidx = (--numstreams) & (STREAMS_PER_BLOCK-1);
+    block->streams[i] = last->streams[lastidx];
+    /* Remove last block if it's now empty */
+    if(!lastidx)
+    {
+        stream_block *empty = last;
+        last = last->prev;
+        if(last)
+            last->next = NULL;
+        else
+            streams = NULL;
+        free(empty);
+    }
+}
+
+void task_strmcreate(z_streamp strm,bool isdeflate)
+{
+    int handle = get_task_handle();
+    if(!handle || !strm)
+        return;
+    /* Walk the list to make sure this stream isn't already listed */
+    dprintf(("","task_strmcreate: task %08x strm %08x isdeflate %d\n",handle,strm,isdeflate));
+    stream_block *cur = streams;
+    int i=0,j=0;
+    while(i<numstreams)
+    {
+        if((cur->streams[j].handle == handle) && (cur->streams[j].strm == strm))
+        {
+            cur->streams[j].isdeflate = isdeflate;
+            cur->streams[j].isactive = true;
+            dprintf((""," -> updating existing stream\n"));
+            return;
+        }
+        i++;
+        if(++j == STREAMS_PER_BLOCK)
+        {
+            j = 0;
+            cur = cur->next;
+        }
+    }
+    if(!last || !j)
+    {
+        stream_block *newblock = malloc(sizeof(stream_block));
+        if(!newblock)
+        {
+            /* Give up? */
+            return;
+        }
+        newblock->next = NULL;
+        newblock->prev = last;
+        if(last)
+            last->next = newblock;
+        last = newblock;
+        if(!streams)
+            streams = last;
+    }
+    last->streams[j].handle = handle;
+    last->streams[j].strm = strm;
+    last->streams[j].isdeflate = isdeflate;
+    last->streams[j].isactive = true;
+    numstreams++;
+    dprintf((""," -> adding new stream\n"));
+    task_dump();
+}
+
+void task_associate(z_streamp strm,bool isactive)
+{
+    int handle = get_task_handle();
+    if(!handle || !strm)
+        return;
+    /* Walk the list and update any reference to this stream */
+    dprintf(("","task_associate: task %08x strm %08x isactive %d\n",handle,strm,isactive));
+    stream_block *cur = streams;
+    int i=0,j=0;
+    while(i<numstreams)
+    {
+        if((cur->streams[j].handle == handle) && (cur->streams[j].strm == strm))
+        {
+            cur->streams[j].isactive = isactive;
+            return;
+        }
+        i++;
+        if(++j == STREAMS_PER_BLOCK)
+        {
+            j = 0;
+            cur = cur->next;
+        }
+    }
+}
+
+void task_strmdestroy(z_streamp strm)
+{
+    int handle = get_task_handle();
+    if(!handle || !strm)
+        return;
+    /* Walk the list and forget any reference to this stream */
+    dprintf(("","task_strmdestroy: task %08x strm %08x\n",handle,strm));
+    stream_block *cur = streams;
+    int i=0,j=0;
+    while(i<numstreams)
+    {
+        if((cur->streams[j].handle == handle) && (cur->streams[j].strm == strm))
+        {
+            dprintf((""," -> found stream\n"));
+            task_remove(cur,j);
+            task_dump();
+            return;
+        }
+        i++;
+        if(++j == STREAMS_PER_BLOCK)
+        {
+            j = 0;
+            cur = cur->next;
+        }
+    }
+}
+
+void task_close(int handle)
+{
+    dprintf(("","task_close: task %08x\n",handle));
+    stream_block *cur = streams;
+    int i=0,j=0;
+    while(i<numstreams)
+    {
+        if(cur->streams[j].handle == handle)
+        {
+            dprintf((""," -> found strm %08x isdeflate %d isactive %d\n",cur->streams[j].strm,cur->streams[j].isdeflate,cur->streams[j].isactive));
+            if(cur->streams[j].isactive)
+            {
+                cur->streams[j].isactive = false; /* Prevent recursive crash if we crash while freeing this one */
+                if(cur->streams[j].isdeflate)
+                    deflateEnd(cur->streams[j].strm);
+                else
+                    inflateEnd(cur->streams[j].strm);
+            }
+            task_remove(cur,j);
+        }
+        else
+        {
+            i++;
+            if(++j == STREAMS_PER_BLOCK)
+            {
+                j = 0;
+                cur = cur->next;
+            }
+        }
+    }
+    task_dump();
+}

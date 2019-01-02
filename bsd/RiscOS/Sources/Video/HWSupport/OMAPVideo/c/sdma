@@ -1,0 +1,243 @@
+/*
+ * Copyright (c) 2010, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stddef.h>
+#include "sdma.h"
+#include "regs.h"
+#include "utils.h"
+#include "consts.h"
+
+#include "DebugLib/DebugLib.h"
+#include "SyncLib/spin.h"
+
+#ifdef DEBUGLIB
+static int sdma_stats[4];
+#endif
+
+static spinlock_t lock = SPIN_INITIALISER;
+
+void sdma_sync(void)
+{
+	/* Note no lock really needed here - the result of this sync only really makes sense if the caller already has a lock of some kind */
+	while(sdmachan->ccr & (DMA4_CCR_ENABLE | DMA4_CCR_RD_ACTIVE | DMA4_CCR_WR_ACTIVE)) {}; /* TODO - Timeout/error checking */
+	dmb(); /* Note that this sync has a dual purpose - syncing for the end of a transter, and syncing for the start of a transfer (since we call sdma_sync before each transfer) */
+}
+
+bool sdma_copyrect(const overlaycfg_t *o, const copyrect_params_t *r, uint32_t baseaddr)
+{
+#ifdef DEBUGLIB
+	if((r->src_left >= o->buf_w) || (r->src_bottom >= o->buf_h) || (r->src_left + r->width + 1 > o->buf_w) || (r->src_bottom + r->height + 1 > o->buf_h) || (r->dest_left >= o->buf_w) || (r->dest_bottom >= o->buf_h) || (r->dest_left + r->width + 1 > o->buf_w) || (r->dest_bottom + r->height + 1 > o->buf_h))
+		dprintf(("","Bad copy rect? src %d,%d dest %d,%d size %d,%d overlay %d,%d\n",r->src_left,r->src_bottom,r->dest_left,r->dest_bottom,r->width+1,r->height+1,o->buf_w,o->buf_h));
+#endif
+	/* Calculate line length & start pos, in bits */
+	uint8_t bpp = pixel_format_bpp[o->format];
+	uint32_t src_x = r->src_left*bpp;
+	uint32_t dest_x = r->dest_left*bpp;
+	uint32_t width = (r->width+1)*bpp;
+	/* Calculate element size from alignment */
+	uint32_t csdp;
+	uint32_t temp = src_x | dest_x | width;
+	if(temp & 7)
+		return false; /* Not byte aligned; abort */
+	if(temp & 8)
+		csdp = DMA4_CSDP_DATA_TYPE_8;
+	else if(temp & 16)
+		csdp = DMA4_CSDP_DATA_TYPE_16;
+	else
+		csdp = DMA4_CSDP_DATA_TYPE_32;
+	/* Convert to bytes */
+	src_x = src_x >> 3;
+	dest_x = dest_x >> 3;
+	width = width >> 3;
+	/* Calculate start/end addresses */
+	uint32_t src_y = baseaddr + o->stride*((o->buf_h-r->src_bottom)-(r->height+1));
+	uint32_t dest_y = baseaddr + o->stride*((o->buf_h-r->dest_bottom)-(r->height+1));
+	src_y += src_x;
+	dest_y += dest_x;
+
+	spin_lock(&lock);
+
+	/* Make sure previous is complete */
+	sdma_sync();
+	/* Start programming registers */
+	sdmachan->cen = width >> csdp; /* Relies on assumption about CSDP location & values! */
+	sdmachan->cfn = r->height+1;
+	if(dest_y <= src_y)
+	{
+		/* Copy in forwards direction, top to bottom */
+		sdmachan->cssa = src_y;
+		sdmachan->cdsa = dest_y;
+		sdmachan->csei = sdmachan->cdei = 1;
+		sdmachan->csfi = sdmachan->cdfi = (o->stride-width)+1;
+#ifdef DEBUGLIB
+		sdma_stats[1]++;
+#endif
+	}
+	else if(src_y+width <= dest_y)
+	{
+		/* Copy in forwards direction, bottom to top */
+		sdmachan->cssa = src_y + o->stride*r->height;
+		sdmachan->cdsa = dest_y + o->stride*r->height;
+		sdmachan->csei = sdmachan->cdei = 1;
+		sdmachan->csfi = sdmachan->cdfi = -width-o->stride+1;
+#ifdef DEBUGLIB
+		sdma_stats[2]++;
+#endif
+	}
+	else
+	{
+#if 1
+		/* Leave this code disabled for now since it's so slow! */
+		spin_unlock(&lock);
+		return false;
+#else
+		/* Copy in backwards direction - this will be slow due to lack of burst transfers */
+		/* Splitting into multiple vertical strips might help, but for that we'd really need a nicer way of chaining channels other than stalling for completion of each strip */
+		sdmachan->cssa = src_y + width-(1<<csdp);
+		sdmachan->cdsa = dest_y + width-(1<<csdp);
+		sdmachan->csei = sdmachan->cdei = 1-(2<<csdp);
+		sdmachan->csfi = sdmachan->cdfi = o->stride+width+1-(2<<csdp);
+#ifdef DEBUGLIB
+		sdma_stats[3]++;
+#endif
+#endif
+	}
+	sdmachan->csdp = csdp | DMA4_CSDP_SRC_PACKED | DMA4_CSDP_SRC_BURST_EN_64BYTES | DMA4_CSDP_DST_PACKED | DMA4_CSDP_DST_BURST_EN_64BYTES | DMA4_CSDP_WRITE_MODE_LAST_NONPOSTED;
+	sdmachan->ccr = DMA4_CCR_ENABLE | DMA4_CCR_SRC_AMODE_DOUBLEINDEX | DMA4_CCR_DST_AMODE_DOUBLEINDEX | DMA4_CCR_PREFETCH;
+
+	spin_unlock(&lock);
+
+	return true;
+}
+
+bool sdma_fillrect(const overlaycfg_t *o, const fillrect_params_t *r, uint32_t baseaddr)
+{
+	uint32_t *oraeor = r->oraeor;
+#ifdef DEBUGLIB
+	if((r->left >= o->buf_w) || (r->top >= o->buf_h) || (r->right >= o->buf_w) || (r->bottom >= o->buf_h) || (r->left > r->right) || (r->bottom > r->top))
+		dprintf(("","Bad fill rect? %d,%d -> %d,%d overlay %d,%d\n",r->left,r->top,r->right,r->bottom,o->buf_w,o->buf_h));
+	if(((uint32_t)oraeor) & 63)
+		dprintf(("","Hmm, oraeor isn't 64 byte aligned\n"));
+#endif
+	uint32_t col = oraeor[1];
+	int row;
+	/* Verify that it's a solid fill
+	   We could handle *some* non-solid fills (e.g. fill every other scanline or every other pixel), but it would be a bit of a hassle to check for that */
+	for(row=0;row<8;row++)
+	{
+		if((oraeor[0] != 0xFFFFFFFF) || (oraeor[1] != col))
+			return false;
+		oraeor += 2;
+	}
+	col = ~col;
+	/* Calculate line length & start pos, in bits */
+	uint8_t bpp = pixel_format_bpp[o->format];
+	uint32_t left = r->left*bpp;
+	uint32_t width = (1+r->right-r->left)*bpp;
+	/* Calculate element size from alignment */
+	uint32_t csdp;
+	uint32_t temp = left | width;
+	bool pattern_16bit = ((col ^ (col<<16)) < 65536); /* True if left halfword == right halfword */
+	bool pattern_8bit = pattern_16bit && ((col ^ (col<<8)) < 0x1000000); /* True if all bytes are identical */
+	if(temp & 7)
+		return false; /* Not byte aligned; abort */
+	if(temp & 8)
+	{
+		if(!pattern_8bit) /* Byte alignment but not byte-size pattern */
+			return false;
+		csdp = DMA4_CSDP_DATA_TYPE_8;
+	}
+	else if((temp & 16) || ((col & 0xFF000000) && ((bpp != 32) || (o->format == PIXELFORMAT_8888_ABGR) || (o->format == PIXELFORMAT_8888_ARGB)))) /* COLOR is a 24bit register, with the top byte treated as zero when performing a 32bit constant fill. So only allow promotion to 32bit data type if top byte is zero, or we're in a non-alpha 32bpp mode */
+	{
+		if(!pattern_16bit) /* Halfword alignment but not halfword-size pattern */
+			return false;
+		csdp = DMA4_CSDP_DATA_TYPE_16;
+	}
+	else
+		csdp = DMA4_CSDP_DATA_TYPE_32;
+
+	spin_lock(&lock);
+
+	/* Make sure previous is complete */
+	sdma_sync();
+	/* Start programming registers */
+	sdmachan->color = col;
+	sdmachan->cen = width>>(3+csdp);
+	sdmachan->cfn = (r->top-r->bottom)+1;
+	sdmachan->cdsa = (left>>3)+baseaddr+o->stride*(o->buf_h-1-r->top);
+	sdmachan->cdei = 1;
+	sdmachan->cdfi = (o->stride-(width>>3))+1;
+	sdmachan->csdp = csdp | DMA4_CSDP_SRC_PACKED | DMA4_CSDP_SRC_BURST_EN_64BYTES | DMA4_CSDP_DST_PACKED | DMA4_CSDP_DST_BURST_EN_64BYTES | DMA4_CSDP_WRITE_MODE_LAST_NONPOSTED;
+	sdmachan->ccr = DMA4_CCR_ENABLE | DMA4_CCR_DST_AMODE_DOUBLEINDEX | DMA4_CCR_CONST_FILL_ENABLE;
+#ifdef DEBUGLIB
+	sdma_stats[0]++;
+#endif
+
+	spin_unlock(&lock);
+
+	return true;
+}
+
+#ifdef DEBUGLIB
+void sdma_dump_sdmaregs(void)
+{
+	DUMPREG(sdma,irqstatus[0]);
+	DUMPREG(sdma,irqstatus[1]);
+	DUMPREG(sdma,irqstatus[2]);
+	DUMPREG(sdma,irqstatus[3]);
+	DUMPREG(sdma,irqenable[0]);
+	DUMPREG(sdma,irqenable[1]);
+	DUMPREG(sdma,irqenable[2]);
+	DUMPREG(sdma,irqenable[3]);
+	DUMPREG(sdma,sysstatus);
+	DUMPREG(sdma,ocp_sysconfig);
+	DUMPREG(sdma,gcr);
+	DUMPREG(sdmachan,ccr);
+	DUMPREG(sdmachan,clnk_ctrl);
+	DUMPREG(sdmachan,cicr);
+	DUMPREG(sdmachan,csr);
+	DUMPREG(sdmachan,csdp);
+	DUMPREG(sdmachan,cen);
+	DUMPREG(sdmachan,cfn);
+	DUMPREG(sdmachan,cssa);
+	DUMPREG(sdmachan,cdsa);
+	DUMPREG(sdmachan,csei);
+	DUMPREG(sdmachan,csfi);
+	DUMPREG(sdmachan,cdei);
+	DUMPREG(sdmachan,cdfi);
+	DUMPREG(sdmachan,csac);
+	DUMPREG(sdmachan,cdac);
+	DUMPREG(sdmachan,ccen);
+	DUMPREG(sdmachan,ccfn);
+	DUMPREG(sdmachan,color);
+	printf("%d fills\n%d copy 1\n%d copy 2\n%d copy 3\n",sdma_stats[0],sdma_stats[1],sdma_stats[2],sdma_stats[3]);
+	memset(sdma_stats,0,sizeof(sdma_stats));
+}
+#endif

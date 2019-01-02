@@ -1,0 +1,99 @@
+Background
+==========
+The HAL is responsible for probing all the buses and assigning memory windows as required by the devices/functions found on the bus. It writes the BAR values in each of the configuration headers to lay out the PCI devices/functions in the physical memory map. Bridges are assigned increasing bus numbers in the order that they are found, and may in theory be nested.
+
+The PCI manager module scans all buses/devices/functions on startup. It's not trying to repeat the assignments, but uses this recursive bus scan to read back all the BAR values and build its own table of information that can be queried with PCI_ReadInfo.
+
+The PCI manager asks the HAL for the offsets to adjust between ARM physical addresses and PCI addresses for memory and IO accesses. This is required because the PCI bus will often be zero based (to cater for the crusty ISA legacy registers at 0x3F8 et al) as seen by the PCI peripherals, but that window onto the PCI is sitting somewhere else in the ARM's memory map (because the ARM's vectors are at zero) which in turn is probably moved elsewhere in the logical memory map.
+
+Thus, the action of performing an IO write for example is one of
+
+  PCI_IOWrite SWI + offset to IO window in ARM logical address space
+  ARM logical address -> ARM MMU -> ARM physical address
+  ARM physical address -> PCI ATU -> PCI physical address
+  PCI physical address -> PCI bus/device/function
+
+the ATU is an address translation unit of some sort, in essence a very cut down MMU to translate offsets within the outgoing PCI window.
+The action of performing an outgoing memory write is similar.
+Inbound memory reads (ie. from a bus master) require an inbound memory window setting up in the ATU so the PCI bus/device/function can target some actual memory somewhere in the system.
+
+PCIe
+====
+As PCIe is a point to point protocol, unlike the shared signals in normal PCI, there is only ever 1 device on each root complex and each device must be number 0. Only once a switch is encountered do more than 1 devices appear per bus.
+
+This is probably the reason why in PCIe an alternative addressing scheme is available, ARI. Instead of a device being called by
+  bus[7:0]:device[4:0]:function[2:0]
+it is called using the ARI
+  bus[7:0]:function[7:0]
+with an implicit device number of 0. This allows multi function devices to present the theoretical maximum 256 functions that would previously have been available when presented as 32 devices each with 8 functions. 
+
+This HAL
+========
+There are two root complexes, implemented as two instances of the Synopsis DesignWare PCIe controller. However RISC OS assumes everything eminates from a single bus (bus 0) as it did on Tungsten and the PCI manager module doesn't have APIs to deal with more than one.
+
+To resolve this problem we apply some cunning.
+
+The HAL pretends there's an on chip switch and presents that to RISC OS instead, and bit 0 of the device number is used as a proxy for which root complex it's really on.
+
+Conveniently the two 256MB windows for the PCI controller are adjacent so addresses can be allocated by the HAL to make it look like one big (fake) bus.
+Because the HAL_PCIAddresses passes only one value for the IO and memory offsets these will be relative to the lower of the two regions.
+
+Because memory and IO addresses must be unique the ATU will be set up to fiddle the outbound addresses to be offset. Thus, from RISC OS' point of view it's one big window, but the devices on the PCIe bus will see distinct addresses.
+
+For configuration accesses, PCIe spec section 7.3.1 says the device number is ignored, so it's safe to recycle those bits for bus 0, further out buses (via switches) can simply number the buses so that the original controller can be derived by bit masking (eg. odd buses all assigned to controller 1, even numbered ones to controller 2).
+
+The following diagram might illustrate this better.
+
+Reality
+-------
+   root complex #1 is PCIE_SS1 (0x20000000-0x2FFFFFFF)
+   bus0 dev0 fn0
+   |
+   v
+   device bus1 dev0 fn0
+   BAR0 set to 0x00001000
+
+   root complex #2 is PCIE_SS2 (0x30000000-0x3FFFFFFF)
+   bus0 dev0 fn0
+   |
+   v
+   device bus1 dev0 fn0
+   BAR0 set to 0x00001000
+
+eg. Outbound write to the device on root complex #1 typically involves
+    writing to ARM physical address 0x20001000 which is translated to
+    0x00001000 on that PCI link. Similarly writing to 0x30001000 would
+    correspond to 0x00001000 to the device on root complex #2 as they are
+    two different buses.
+
+Presentation
+------------
+    root complex #0 is PCIE_SS0 (0x20000000-0x3FFFFFFF)
+    |
+    v
+    switch #1               and switch #2
+    |                           |
+    v                           v
+    device bus0 dev0 fn0        device bus0 dev1 fn0
+    BAR0 set to 0x00001000      BAR0 set to 0x10001000
+
+Such that
+
+    *PCIDevices
+      No. Bus Dev Fun  Description
+        1   0   0   0  Intel Doodah             } On PCIE_SS1
+        2   0   1   0  Winbond USB3 4 port hub  } On PCIE_SS2
+
+Note that the BAR for the device on switch #2 must be set up with the extra 256MB offset so that when referred from 0x20000000 it ends up writing to the correct controller's outbound window. This would ordinarily be mapped to 0x00001000 which would miss its target, however the ATU can be set with the same offset so that a write at +0x1000 ends up on that bus as 0x10001000.
+
+The HAL's allocator needs to be careful to set aside some of the 256MB for configuration space and IO space. IO space is generally deprecated in PCIe so can be pretty miserly. Configuration space might need to cater for up to 128 buses by 32 devices by 8 functions at 256 bytes each, or 8MB. In reality 128 buses is probably impractical and for allocation purposes a much smaller number supported. 1MB worth of configuration and IO space would fit with the ARM's section size, favouring to set aside as much as possible of the 256MB outbound window for memory space.
+
+Configuration read and write operations become a simple matter of hooking out the real root complex number (1 or 2) from the composite bus/dev/fn that RISC OS thinks it is using.
+
+There are generous numbers of ATU windows, though initially these will mostly be unused to keep the code simple. Using more ATU windows allows more concurrent transactions and improves throughput, but some scheme based on the configuration header contents would need to be decided to fairly dish out the windows - simply allocating them on a per target basis might end up wasting windows on rarely used low bandwidth targets like a parallel port and starving higher bandwidth targets like a TV card.
+
+Initially, actual bridges & switches will not be supported, but in theory this just extends the scheme. The PCI Manager would need to be extended to understand what a switch means for enumeration as it currently only knows about bridges in the multi drop bus sense from original PCI, and PCIe-PCIe bridges aren't that useful in a point to point protocol.
+
+64 bit inbound/outbound addressing is not currently used.
+
+The extended 4k configuration headers are not currently used.

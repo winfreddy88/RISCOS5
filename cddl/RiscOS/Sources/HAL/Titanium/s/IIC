@@ -1,0 +1,577 @@
+;
+; CDDL HEADER START
+;
+; The contents of this file are subject to the terms of the
+; Common Development and Distribution License (the "Licence").
+; You may not use this file except in compliance with the Licence.
+;
+; You can obtain a copy of the licence at
+; cddl/RiscOS/Sources/HAL/Titanium/LICENCE.
+; See the Licence for the specific language governing permissions
+; and limitations under the Licence.
+;
+; When distributing Covered Code, include this CDDL HEADER in each
+; file and include the Licence file. If applicable, add the
+; following below this CDDL HEADER, with the fields enclosed by
+; brackets "[]" replaced with your own identifying information:
+; Portions Copyright [yyyy] [name of copyright owner]
+;
+; CDDL HEADER END
+;
+;
+; Copyright 2014 Elesar Ltd.  All rights reserved.
+; Use is subject to license terms.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:OSEntries
+        GET     Hdr:HALEntries
+
+        GET     hdr.RegMap
+        GET     hdr.StaticWS
+                
+        AREA    |IIC$$Code|, CODE, READONLY, PIC
+
+        EXPORT  IICInit
+        EXPORT  HAL_IICBuses
+        EXPORT  HAL_IICDevice
+        EXPORT  HAL_IICMonitorTransfer
+        EXPORT  HAL_IICTransfer
+        EXPORT  HAL_IICType
+        IMPORT  HAL_CounterDelay
+
+L4PERClockMHz     * 96                  ; MHz
+IPUClockMHz       * 96                  ; MHz
+IICSampleClockMHz * 12                  ; MHz
+IICTimeOut        * 1+10+1+1            ; Start + address + stop + ACK
+
+                ^ 0                     ; Internal state
+TxfrCurrent     # 4
+TxfrFirst       # 4
+TxfrLast        # 4
+TxfrProgress    # 4
+TxfrStateSize   * @
+
+                ^ 0                     ; Transfer descriptor
+DescAddrFlags   # 4
+DescAddrShift   * 0
+DescAddrMask    * &FF:SHL:DescAddrShift
+DescFlagRetry   * 1:SHL:29              ; Not the HAL's problem
+DescFlagSumOnly * 1:SHL:30
+DescFlagNoStart * 1:SHL:31
+DescData        # 0
+DescCheckSum    # 4
+DescLength      # 4
+DescSize        * @
+
+; There are 5 IIC controllers assigned as
+; IIC1 => bus 0 => TFP410 panelbus, TLV320 codec, RTC, EEPROM, PCIe, TPS659039 PMIC
+; IIC2 = unused
+; IIC3 = unused
+; IIC4 => bus 1 => DVI2 EDID
+; IIC5 => bus 2 => DVI1 EDID
+IICDevices
+        ASSERT  IRQCount < 256
+        DCB     DevNoIIC0, DevNoIIC1, DevNoIIC2
+        ALIGN
+IICClocks
+        DCD     CM_L4PER_I2C1_CLKCTRL
+        DCD     CM_L4PER_I2C4_CLKCTRL
+        DCD     CM_IPU_I2C5_CLKCTRL + 1 ; Odd one out clock
+IICBases
+        DCD     IIC1_PhysBase
+        DCD     IIC4_PhysBase
+        DCD     IIC5_PhysBase
+IICCount        * (. - IICBases):SHR:2
+        ASSERT  ?IIC_LogBase = (4 * IICCount)        
+
+; IICInit
+IICInit ROUT
+        Push    "v1-v5, lr"
+
+        ; Map in the source clocks
+        MOV     a1, #0
+        LDR     a2, =CMCoreIPU_PhysBase
+        MOV     a3, #CMCoreIPU_PhysSize
+        CallOS  OS_MapInIO
+        STR     a1, CMCoreIPU_LogBase
+        MOV     v4, a1                  ; Keep IPU clock base
+        LDR     v5, CMCoreL4PER_LogBase ; Set up earlier
+
+        ; Request IPU clock, this is used for I2C5
+        MOV     a1, #CM_IPU_CLKSTCTRL_CLKTRCTRL_SW_WKUP
+        STR     a1, [v4, #CM_IPU_CLKSTCTRL]
+        MOV     a1, #50                 ; Steady now
+        BL      HAL_CounterDelay
+        
+        MOV     v1, #0
+        ADR     v2, IICBases
+        ADR     v3, IIC_LogBase
+10
+        ; Map in the IIC controller
+        MOV     a1, #0
+        LDR     a2, [v2, v1, LSL #2]
+        MOV     a3, #IIC_PhysSize
+        CallOS  OS_MapInIO
+        STR     a1, [v3, v1, LSL #2]    ; Assigned logical base
+
+        ; Turn on the clock
+        MOV     a3, #CM_CLKCTRL_MODULEMODE_ENABLED
+        ADR     a2, IICClocks
+        LDR     a2, [a2, v1, LSL #2]    ; Respective CLKCTRL offset
+        TST     a2, #1
+        BICNE   a2, a2, #1
+        STRNE   a3, [v4, a2]            ; IPU clock domain
+        STREQ   a3, [v5, a2]            ; L4PER clock domain
+
+        ; Reset controller
+        LDRH    a2, [a1, #I2C_CON]
+        BIC     a2, a2, #I2C_CON_I2C_EN
+        STRH    a2, [a1, #I2C_CON]
+
+        LDR     a3, =I2C_SYSC_CLKACTIVITY_BOTH_ON :OR: I2C_SYSC_IDLEMODE_NOIDLE :OR: \
+                     I2C_SYSC_SRST
+        STRH    a3, [a1, #I2C_SYSC]
+
+        ORR     a2, a2, #I2C_CON_I2C_EN
+        STRH    a2, [a1, #I2C_CON]
+20
+        LDRH    a3, [a1, #I2C_SYSS]
+        TST     a3, #I2C_SYSS_RDONE
+        BEQ     %BT20
+
+        ; Halt again while fiddling with baud settings
+        BIC     a2, a2, #I2C_CON_I2C_EN
+        STRH    a2, [a1, #I2C_CON]
+        
+        ; Prescale to get sampling clock, and again to get ~100kHz
+        ASSERT  L4PERClockMHz = IPUClockMHz
+        LDR     a3, =(L4PERClockMHz / IICSampleClockMHz) - 1
+        STRH    a3, [a1, #I2C_PSC]
+        LDR     a3, =((IICSampleClockMHz * 1000000) / 200000) - 7
+        STRH    a3, [a1, #I2C_SCLL]     ; 5us low (200kHz equivalent)
+        LDR     a3, =((IICSampleClockMHz * 1000000) / 200000) - 5
+        STRH    a3, [a1, #I2C_SCLH]     ; 5us high (200kHz equivalent)
+
+        ; No FIFOs or DMA thanks
+        MOV     a3, #0
+        STRH    a3, [a1, #I2C_BUF]
+
+        ; Bring out of reset
+        ORR     a2, a2, #I2C_CON_I2C_EN
+        STRH    a2, [a1, #I2C_CON]
+        
+        ADD     v1, v1, #1
+        TEQ     v1, #IICCount
+        BNE     %BT10
+
+        Pull    "v1-v5, pc"
+
+; IICControllerLaunch
+; => a1 = controller logical address
+;    a2 = bus transfer state address
+;    a3 = pointer to transfer descriptor
+; <= a1 = iic status value
+IICControllerLaunch ROUT
+        Push    "v1-v4, lr"
+
+IICControllerLaunchInt                  ; For tail calling
+        STR     a3, [a2, #TxfrCurrent]
+        MOV     a4, #0
+        STR     a4, [a2, #TxfrProgress]
+
+        ; See what needs launching
+        LDR     v1, [a3, #DescAddrFlags]
+        TST     v1, #DescFlagSumOnly
+        TSTNE   v1, #1
+        STRNE   a4, [a3, #DescCheckSum] ; Zero checksum when checksum read
+
+        MOV     v3, #IICTimeOut
+10
+        ; The ARDY bit is used to conclude the last transfer has completed (ie. I2C_CNT=0),
+        ; but more specifically it says the registers are free to setup a follow up
+        ; transaction while the last few bits might still be going out of the shifter.
+        ; Wait for the start-stop pair to definitely go before writing the control register.
+        LDRH    a4, [a1, #I2C_CON]
+        TST     a4, #I2C_CON_STT :OR: I2C_CON_STP
+        BEQ     %FT20
+        SUBS    v3, v3, #1
+        MOVEQ   a3, a1
+        MOVEQ   a1, #IICStatus_Busy     ; Timed out
+        BEQ     IICControllerUncertain
+        Push    "a1-a3, ip"
+        MOV     a1, #10                 ; Single bit time at 100kHz
+        BL      HAL_CounterDelay
+        Pull    "a1-a3, ip"
+        B       %BT10
+20
+        ; Prep control register for a standard mode master transfer
+        LDR     ip, =I2C_CON_I2C_EN :OR: \
+                     I2C_CON_OPMODE_STANDARD :OR: I2C_CON_MST
+        TST     v1, #1                  ; Check read (not write)
+        ORREQ   ip, ip, #I2C_CON_TRX
+        STRH    ip, [a1, #I2C_CON]
+
+        ; Configure slave target address
+        UBFX    a4, v1, #1, #10 - 1
+        STRH    a4, [a1, #I2C_SA]
+
+        ; Configure relevant interrupts
+        MOV     a4, #-1
+        STRH    a4, [a1, #I2C_IRQENABLE_CLR]
+        LDRH    a4, [a1, #I2C_IRQSTATUS_RAW]
+        STRH    a4, [a1, #I2C_IRQSTATUS]; Definitely clear now
+
+        LDREQ   a4, =I2C_IRQ_ARDY_IT_FLAG :OR: I2C_IRQ_XRDY_IT_FLAG :OR: \
+                     I2C_IRQ_NACK_IT_FLAG :OR: I2C_IRQ_AL_IT_FLAG
+        LDRNE   a4, =I2C_IRQ_ARDY_IT_FLAG :OR: I2C_IRQ_RRDY_IT_FLAG :OR: \
+                     I2C_IRQ_NACK_IT_FLAG :OR: I2C_IRQ_AL_IT_FLAG
+        STRH    a4, [a1, #I2C_IRQENABLE_SET]
+
+        ; Byte sum up until the next start-stop pair
+        ; to be sure not to break the controller with 0 byte transfers
+        MOV     v4, a3
+        LDR     lr, [a2, #TxfrLast]     ; Exclusive descriptor end address
+        MOV     v3, #0                  ; Bytes so far
+        B       %FT40
+30
+        TEQ     v4, lr
+        ORREQ   ip, ip, #I2C_CON_STP    ; Definitely a stop bit at the end
+        LDRNE   a4, [v4, #DescAddrFlags]
+        TSTNE   a4, #DescFlagNoStart    ; Continuation?
+        BEQ     %FT50
+40
+        LDR     a4, [v4, #DescLength]
+        ADD     v3, v3, a4
+        ADD     v4, v4, #DescSize       ; Next
+        B       %BT30
+50
+        STRH    v3, [a1, #I2C_CNT]
+
+        ; On commencement, ensure bus isn't busy
+        LDR     a4, [a2, #TxfrFirst]
+        TEQ     a4, a3
+        BNE     %FT70
+
+        MOV     v3, #IICTimeOut
+60
+        LDRH    a4, [a1, #I2C_IRQSTATUS_RAW]
+        TST     a4, #I2C_IRQ_BB_IT_FLAG
+        BEQ     %FT70
+        SUBS    v3, v3, #1
+        MOVEQ   a3, a1
+        MOVEQ   a1, #IICStatus_Busy     ; Timed out
+        BEQ     IICControllerUncertain
+        Push    "a1-a3, ip"
+        MOV     a1, #10                 ; Single bit time at 100kHz
+        BL      HAL_CounterDelay
+        Pull    "a1-a3, ip"
+        B       %BT60
+70
+        ; Prod the start bit and relax while HAL_IICMonitorTransfer works
+        ORR     ip, ip, #I2C_CON_STT
+        STRH    ip, [a1, #I2C_CON]
+
+        MOV     a1, #IICStatus_InProgress
+        Pull    "v1-v4, pc"
+
+; IIC[NAck | LostArb | AccessRdy | TxRdy | IICRxRdy]
+; => a2 = bus transfer state address
+;    a3 = controller logical address
+;    a4 = status register
+; <= via either IICController[Handled | Final | Uncertain | Launch]
+IICNAck ROUT
+        MOV     a1, #IICStatus_NoACK
+        B       IICControllerUncertain
+
+IICLostArb ROUT
+        STRH    a4, [a3, #I2C_IRQSTATUS]
+        MOV     a1, a3
+        LDR     a3, [a2, #TxfrFirst]
+        B       IICControllerLaunchInt  ; Let's go round again
+
+IICAccessRdy ROUT
+        LDR     v1, [a2, #TxfrCurrent]
+        LDR     v2, [a2, #TxfrProgress]
+        LDR     v3, [v1, #DescLength]
+        TEQ     v3, v2
+        MOVNE   a1, #IICStatus_Error
+        BNE     IICControllerUncertain  ; Wrong number of bytes went past
+
+        LDR     v4, [a2, #TxfrLast]
+        B       %FT20
+10
+        LDR     v2, [v1, #DescAddrFlags]
+        TST     v2, #DescFlagNoStart
+        STREQH  a4, [a3, #I2C_IRQSTATUS]
+        MOVEQ   a1, a3
+        MOVEQ   a3, v1
+        BEQ     IICControllerLaunchInt  ; Launch next descriptor
+
+        LDR     v3, [v1, #DescLength]
+        TEQ     v3, #0                  ; Silently swallow NoStart=1 Length=0
+        MOVNE   a1, #IICStatus_Error    ; Continuation requests get merged together by the launcher
+        BNE     IICControllerUncertain  ; but found a straggler, suggests controller has underdelivered!       
+20                                      
+        ADD     v1, v1, #DescSize
+        TEQ     v1, v4
+        MOVEQ   a1, #IICStatus_Completed
+        BEQ     IICControllerFinal      ; Consumed all descriptors
+        B       %BT10
+        
+IICTxRdy ROUT
+        LDR     v1, [a2, #TxfrCurrent]
+        LDR     v2, [a2, #TxfrProgress]
+        LDR     v3, [v1, #DescAddrFlags]
+10
+        ; v1 = descriptor address
+        ; v2 = bytes so far this descriptor
+        ; v3 = iic flags
+        LDR     v4, [v1, #DescLength]
+        TEQ     v2, v4
+        BEQ     %FT20                   ; Current descriptor full, step to next
+
+        LDR     ip, [v1, #DescData]
+        LDRB    ip, [ip, v2]
+        STRB    ip, [a3, #I2C_DATA]
+        ADD     v2, v2, #1
+        STR     v2, [a2, #TxfrProgress]
+
+        ; Another byte done
+        MOV     a1, #IICStatus_InProgress
+        B       IICControllerHandled
+20
+        ADD     v1, v1, #DescSize
+        LDR     v2, [a2, #TxfrLast]
+        TEQ     v1, v2
+        MOVEQ   a1, #IICStatus_Error
+        BEQ     IICControllerUncertain  ; We need data but have no more descriptors
+
+        ; Crack open a new descriptor
+        STR     v1, [a2, #TxfrCurrent]
+        MOV     v2, #0
+        STR     v2, [a2, #TxfrProgress]
+        LDR     v3, [v1, #DescAddrFlags]
+        TST     v3, #DescFlagNoStart
+        BNE     %BT10
+        MOV     a1, #IICStatus_Error
+        B       IICControllerUncertain  ; A new start-stop pair when this one isn't done
+
+IICRxRdy ROUT
+        LDR     v1, [a2, #TxfrCurrent]
+        LDR     v2, [a2, #TxfrProgress]
+        LDR     v3, [v1, #DescAddrFlags]
+10
+        ; v1 = descriptor address
+        ; v2 = bytes so far this descriptor
+        ; v3 = iic flags
+        LDR     v4, [v1, #DescLength]
+        TEQ     v2, v4
+        BEQ     %FT20                   ; Current descriptor full, step to next
+
+        LDRB    a1, [a3, #I2C_DATA]
+        ASSERT  DescCheckSum = DescData
+        LDR     ip, [v1, #DescCheckSum]
+        TST     v3, #DescFlagSumOnly
+        ADDNE   ip, ip, a1              ; Add to checksum
+        STRNE   ip, [v1, #DescCheckSum]
+        STREQB  a1, [ip, v2]            ; Store to buffer
+        ADD     v2, v2, #1
+        STR     v2, [a2, #TxfrProgress]
+
+        ; Another byte done
+        MOV     a1, #IICStatus_InProgress
+        B       IICControllerHandled
+20
+        ADD     v1, v1, #DescSize
+        LDR     v2, [a2, #TxfrLast]
+        TEQ     v1, v2
+        MOVEQ   a1, #IICStatus_Error
+        BEQ     IICControllerUncertain  ; We've got data but no more descriptors
+
+        ; Crack open a new descriptor
+        STR     v1, [a2, #TxfrCurrent]
+        MOV     v2, #0
+        STR     v2, [a2, #TxfrProgress]
+        LDR     v3, [v1, #DescAddrFlags]
+        TST     v3, #DescFlagSumOnly
+        STRNE   v2, [v1, #DescCheckSum]
+        B       %BT10
+
+; IICController[Handled | Final | Uncertain]
+; => a1 = iic status value
+;    a2 = bus transfer state address
+;    a3 = controller logical address
+;    a4 = status register
+; <= a1 = iic status value
+IICControllerFinal ROUT
+        ; Last one in the transfer
+        MOV     ip, #0
+        STRH    ip, [a3, #I2C_CNT]
+        STR     ip, [a2, #TxfrFirst]
+
+        MOV     ip, #-1
+        STRH    ip, [a3, #I2C_IRQENABLE_CLR]
+        ; Fall through
+
+IICControllerHandled ROUT
+        ; Good exit, clear the IRQ cause
+        STRH    a4, [a3, #I2C_IRQSTATUS]
+        Pull    "v1-v4, pc"
+
+IICControllerUncertain
+        ; Bad exit, reset the controller
+        MOV     a4, #0
+        STRH    a4, [a3, #I2C_CON]
+        STRH    a4, [a3, #I2C_CNT]
+        STR     a4, [a2, #TxfrFirst]
+
+        MOV     a4, #-1
+        STRH    a4, [a3, #I2C_IRQENABLE_CLR]
+        LDRH    a4, [a3, #I2C_IRQSTATUS_RAW]
+        STRH    a4, [a3, #I2C_IRQSTATUS]; Definitely clear now
+
+        MOV     a4, #I2C_CON_I2C_EN
+        STRH    a4, [a3, #I2C_CON]
+
+        Pull    "v1-v4, pc"
+
+; HAL_IICBuses
+; <= a1 = number of buses
+HAL_IICBuses
+        MOV     a1, #IICCount
+        MOV     pc, lr
+
+; HAL_IICDevice
+; => a1 = bus number
+; <= a1 = IRQ device number 
+HAL_IICDevice
+        CMP     a1, #IICCount
+        MOVCS   a1, #-1                 ; No such bus
+        ADRCCL  a2, IICDevices
+        LDRCCB  a1, [a2, a1]
+        MOV     pc, lr
+        
+; HAL_IICType
+; => a1 = bus number
+; <= a1 = type flags
+HAL_IICType
+        LDR     a1, =IICFlag_HighLevel :OR: IICFlag_Background :OR: \
+                     (210:SHL:IICFlag_ProtocolVersionShift)
+        MOV     pc, lr
+
+; HAL_IICTransfer
+; => a1 = bus number
+;    a2 = number of transfers
+;    a3 = pointer to array of transfer descriptors
+; <= a1 = iic status value
+HAL_IICTransfer
+        Push    "v1-v3, lr"
+
+        ; Vet - valid bus with at least one transfer
+        CMP     a1, #IICCount
+        BCS     %FT80
+        CMP     a2, #0
+        BEQ     %FT80
+
+        ; Vet - must start with a start bit
+        LDR     a4, [a3, #DescAddrFlags]
+        TST     a4, #DescFlagNoStart
+        BNE     %FT80
+
+        ; Vet - longest transfer must fit in 16 bit I2C_CNT register
+        MOV     a4, #DescSize
+        MLA     v3, a4, a2, a3          ; End of descriptors
+        MOV     v1, a3                  ; Current descriptor
+10
+        MOV     v2, #0                  ; Byte sum up until the next start-stop pair
+20
+        LDR     a4, [v1, #DescLength]
+        ADD     v2, v2, a4
+        LDR     a4, [v1, #DescAddrFlags]
+        ADD     v1, v1, #DescSize
+        TEQ     v1, v3                  ; No more descriptors?
+        TSTNE   a4, #DescFlagNoStart    ; No start flag, keep counting
+        BNE     %BT20
+30
+        TEQ     v2, #0                  ; No bytes => bad
+        BEQ     %FT80
+        MOVS    v2, v2, LSR #16         ; Doesn't fit I2C_CNT => bad
+        BNE     %FT80
+        TEQ     v1, v3                  ; No more descriptors?
+        BNE     %BT10
+
+        ; Vet - check not already doing one else claim
+        ASSERT  ?IICTxfrStates = (TxfrStateSize * IICCount)
+        ADR     v2, IICTxfrStates
+        MOV     a4, #TxfrStateSize
+        MLA     v1, a4, a1, v2          ; State block for this bus
+        MRS     ip, CPSR
+        ORR     a4, ip, #I32_bit        ; IRQs off while claiming
+        MSR     CPSR_c, a4
+        LDR     a4, [v1, #TxfrFirst]
+        TEQ     a4, #0                  ; In use?
+        STREQ   a3, [v1, #TxfrFirst]
+        MSR     CPSR_c, ip
+        STREQ   v3, [v1, #TxfrLast]
+        MOVNE   a1, #IICStatus_Busy
+        Pull    "v1-v3, pc", NE
+
+        ; Kick off a transfer on the controller
+        ADR     v3, IIC_LogBase
+        LDR     a1, [v3, a1, LSL #2]
+        MOV     a2, v1
+        BL      IICControllerLaunch
+        Pull    "v1-v3, pc"
+80
+        MOV     a1, #IICStatus_Error
+        Pull    "v1-v3, pc"
+
+; HAL_IICMonitorTransfer
+; => a1 = bus number
+; <= a1 = iic status value
+HAL_IICMonitorTransfer
+        Push    "v1-v4, lr"
+        ADR     v2, IICTxfrStates
+        MOV     a4, #TxfrStateSize
+        MLA     a2, a4, a1, v2
+        ADR     v2, IIC_LogBase
+        LDR     a3, [v2, a1, LSL #2]
+        LDR     ip, [a2, #TxfrFirst]
+        TEQ     ip, #0                  ; In use?
+        MOVEQ   a4, #-1
+        STREQH  a4, [a3, #I2C_IRQENABLE_CLR]
+        LDRH    a4, [a3, #I2C_IRQSTATUS_RAW]
+        STREQH  a4, [a3, #I2C_IRQSTATUS]; Definitely clear now
+
+        ; Knock out non-IRQ generating status bits to see if anything happened
+        BICNES  a4, a4, #I2C_IRQ_BB_IT_FLAG :OR: I2C_IRQ_ROVR_IT_FLAG :OR: \
+                         I2C_IRQ_XUDF_IT_FLAG :OR: I2C_IRQ_BF_IT_FLAG
+        MOVEQ   a1, #IICStatus_Completed
+        Pull    "v1-v4, pc", EQ
+
+        ; There was a transfer going on and it has interrupted
+        ; For interrupt driven master transmit mode see Fig 24-22 of TRM.
+        ; For interrupt driven master receive mode see Fig 24-23 of TRM.
+        TST     a4, #I2C_IRQ_NACK_IT_FLAG
+        BNE     IICNAck
+
+        TST     a4, #I2C_IRQ_AL_IT_FLAG
+        BNE     IICLostArb
+
+        TST     a4, #I2C_IRQ_ARDY_IT_FLAG
+        BNE     IICAccessRdy
+
+        TST     a4, #I2C_IRQ_XRDY_IT_FLAG
+        BNE     IICTxRdy
+
+        TST     a4, #I2C_IRQ_RRDY_IT_FLAG
+        BNE     IICRxRdy
+
+        ; One of the bits we never enable is set!
+        MOV     a1, #IICStatus_Error
+        B       IICControllerUncertain
+        
+        END

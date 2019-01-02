@@ -1,0 +1,136 @@
+/*
+ * Copyright (c) 2010, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include "Global/RISCOS.h"
+#include "Global/HALEntries.h"
+#include "swis.h"
+
+#include "DebugLib/DebugLib.h"
+
+#include "regs.h"
+#include "consts.h"
+
+volatile struct dss_regs      *dss;
+volatile struct dispc_regs    *dispc;
+volatile struct rfbi_regs     *rfbi;
+volatile struct venc_regs     *venc;
+volatile struct dsi_regs      *dsi;
+volatile struct dsi_phy_regs  *dsi_phy;
+volatile struct dsi_pll_regs  *dsi_pll;
+volatile struct sdma_regs     *sdma;
+volatile struct sdmachan_regs *sdmachan; /* Only using 1 channel */
+
+uint32_t ban_hardware_update = BHUB_OFF;
+
+#ifdef DEBUGLIB
+static int failedupdates=0;
+#endif
+
+/* Atomic update of ban flags */
+void set_ban(uint32_t flags)
+{
+	int irqs = _kernel_irqs_disabled();
+	if(!irqs)
+		_kernel_irqs_off();
+	ban_hardware_update |= flags;
+	if(!irqs)
+		_kernel_irqs_on();
+}
+
+void clear_ban(uint32_t flags)
+{
+	int irqs = _kernel_irqs_disabled();
+	if(!irqs)
+		_kernel_irqs_off();
+	ban_hardware_update &= ~flags;
+#ifdef DEBUGLIB
+	if(!ban_hardware_update && failedupdates)
+		dprintf(("","clear_ban: %d updates failed due to ban\n",failedupdates));
+	failedupdates = 0;
+#endif
+	if(!irqs)
+		_kernel_irqs_on();
+}
+
+bool begin_quick_hardware_update(int *irqstate)
+{
+	*irqstate = _kernel_irqs_disabled();
+	if(!*irqstate)
+		_kernel_irqs_off();
+	if(ban_hardware_update)
+	{
+#ifdef DEBUGLIB
+		failedupdates++;
+#endif
+		if(!*irqstate)
+			_kernel_irqs_on();
+		return false;
+	}
+	return true;
+}
+
+void end_quick_hardware_update(int irqstate)
+{
+	if(!irqstate)
+		_kernel_irqs_on();
+}
+
+bool begin_slow_hardware_update(int *irqstate)
+{
+	int irqs = _kernel_irqs_disabled();
+	if(!irqs)
+		_kernel_irqs_off();
+	if(ban_hardware_update)
+	{
+#ifdef DEBUGLIB
+		failedupdates++;
+#endif
+		if(!irqs)
+			_kernel_irqs_on();
+		return false;
+	}
+	/* Else we're free to update; disable video IRQ and re-enable global IRQs */
+	/* This is a bit naughty, really we should properly handle the case where it's a shared IRQ */
+	_kernel_oserror *e = _swix(OS_Hardware, _IN(0) | _INR(8,9) | _OUT(0), dev->dev.devicenumber&~(1u<<31), OSHW_CallHAL, EntryNo_HAL_IRQDisable, irqstate);
+#ifdef DEBUGLIB
+	if(e)
+		failedupdates++;
+#endif
+	if(!irqs)
+		_kernel_irqs_on();
+#ifdef DEBUGLIB
+	else
+		dprintf(("","begin_slow_hardware_update: Warning, IRQs disabled!\n")); /* Warn if IRQs were disabled all entry - slow updates could be too slow to allow IRQs to be off globally */
+#endif
+	return (e?false:true);
+}
+
+void end_slow_hardware_update(int irqstate)
+{
+	if(irqstate)
+		_swix (OS_Hardware, _IN(0) | _INR(8,9), dev->dev.devicenumber&~(1u<<31), OSHW_CallHAL, EntryNo_HAL_IRQEnable);
+}

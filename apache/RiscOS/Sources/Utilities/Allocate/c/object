@@ -1,0 +1,1808 @@
+/* Copyright 2015 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*
+ * Name   : object.c
+ * Desc   : object control for the !allocate application
+ * Auther : James Bye
+ * Date   : 18-Jul-1994
+ *
+ *
+ */
+
+#include "wimp.h"        /*  access to WIMP SWIs                      */
+#include "wimpt.h"       /*  wimp task facilities                     */
+#include "win.h"         /*  registering window handlers              */
+#include "event.h"       /*  poll loops, etc                          */
+#include "baricon.h"     /*  putting icon on icon bar                 */
+#include "werr.h"        /*  error reporting                          */
+#include "res.h"         /*  access to resources                      */
+#include "resspr.h"      /*  sprite resources                         */
+#include "flex.h"        /*  dynamic mem alloc from WIMP              */
+#include "template.h"    /*  reading in template file                 */
+#include "dbox.h"        /*  dialogue box handling                    */
+#include "msgs.h"
+#include "fileicon.h"
+#include "xfersend.h"
+
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+
+#include "kernel.h"
+
+#include "Global/FileTypes.h"
+
+#include "trace.h"
+
+#include "object.h"
+#include "file.h"
+#include "guard.h"
+#include "helpwin.h"
+
+#include "swis.h"
+
+/********************************************************
+ * Icon definitions                                     *
+ ********************************************************/
+
+#define i_Messages_BlockRequired   2
+#define i_Messages_Description     6
+#define i_Messages_Help            5
+#define i_Messages_Cancel          7
+#define i_Messages_Add             3
+
+#define i_SWIChunk_Prefix          4
+#define i_SWIChunk_Description     6
+#define i_SWIChunk_Help            7
+#define i_SWIChunk_Cancel          5
+#define i_SWIChunk_Add             3
+
+#define i_Reservation_Text         9
+#define i_Reservation_Type         6
+#define i_Reservation_PopUp        8
+#define i_Reservation_Help         7
+#define i_Reservation_Cancel       3
+#define i_Reservation_Add          2
+
+#define i_FileType_AppName         2
+#define i_FileType_FName           5
+#define i_FileType_DoubleClick     7
+#define i_FileType_Sprite         11
+#define i_FileType_ProdDesc       15
+#define i_FileType_Format          3
+#define i_FileType_Help           14
+#define i_FileType_Cancel         12
+#define i_FileType_Add            10
+
+#define i_ErrorBlock_BlockRequired  2
+#define i_ErrorBlock_Description    6
+#define i_ErrorBlock_Help           5
+#define i_ErrorBlock_Cancel         7
+#define i_ErrorBlock_Add            3
+
+#define i_Podule_ManfId       8
+#define i_Podule_Allocate    10
+#define i_Podule_Name         9
+#define i_Podule_Description  3
+#define i_Podule_Help         4
+#define i_Podule_Cancel      11
+#define i_Podule_Add          7
+
+#define i_DrawTags_BaseRequired  2
+#define i_DrawTags_Description   6
+#define i_DrawTags_Help          5
+#define i_DrawTags_Cancel        7
+#define i_DrawTags_Add           3
+
+#define i_DrawObjects_BaseRequired  2
+#define i_DrawObjects_Description   6
+#define i_DrawObjects_Help          5
+#define i_DrawObjects_Cancel        7
+#define i_DrawObjects_Add           3
+
+#define i_FilingSystem_Name         2
+#define i_FilingSystem_Select       3
+#define i_FilingSystem_Help        14
+#define i_FilingSystem_Cancel      12
+#define i_FilingSystem_Add         10
+
+#define i_Services_BlockRequired    2
+#define i_Services_Description      6
+#define i_Services_Help             5
+#define i_Services_Cancel           7
+#define i_Services_Add              3
+
+#define i_Devices_Name              4
+#define i_Devices_Description       6
+#define i_Devices_Help              7
+#define i_Devices_Cancel            5
+#define i_Devices_Add               3
+
+/********************************************************
+ * Static Variables                                     *
+ ********************************************************/
+
+static char *reserve_types;
+static menu reserve_menu;
+static menu last_menu;
+
+/*-- dummy menu structure --*/
+
+typedef struct main__menu_str
+{
+  wimp_menuhdr *m;
+  int nitems;
+  void *entryspace;
+  int nbytes;
+  int maxentrywidth;
+} main__menu_str;
+
+static main__menu_str dummy;
+
+
+/********************************************************
+ * Function prototypes                                  *
+ ********************************************************/
+
+static void swichunk_set_fields ( dbox, ObjectBlock *, void * );
+static BOOL swichunk_get_fields ( dbox, ObjectBlock *, void * );
+static int  swichunk_describe_fields ( ObjectBlock *, char *, int );
+
+static void messages_set_fields ( dbox, ObjectBlock *, void * );
+static BOOL messages_get_fields ( dbox, ObjectBlock *, void * );
+static int  messages_describe_fields ( ObjectBlock *, char *, int );
+
+static void reservation_set_fields ( dbox, ObjectBlock *, void * );
+static BOOL reservation_get_fields ( dbox, ObjectBlock *, void * );
+static int  reservation_describe_fields ( ObjectBlock *, char *, int );
+static BOOL reservation_buttons    ( dbox, wimp_eventstr *, ObjectBlock *, void * );
+
+static void filetype_set_fields ( dbox, ObjectBlock *, void * );
+static BOOL filetype_get_fields ( dbox, ObjectBlock *, void * );
+static int  filetype_describe_fields ( ObjectBlock *, char *, int );
+static BOOL filetype_messages   ( dbox, wimp_eventstr *, ObjectBlock *, void * );
+static BOOL filetype_buttons    ( dbox, wimp_eventstr *, ObjectBlock *, void * );
+
+static void errorblock_set_fields ( dbox, ObjectBlock *, void * );
+static BOOL errorblock_get_fields ( dbox, ObjectBlock *, void * );
+static int  errorblock_describe_fields ( ObjectBlock *, char *, int );
+
+static void podule_set_fields ( dbox, ObjectBlock *, void * );
+static BOOL podule_get_fields ( dbox, ObjectBlock *, void * );
+static BOOL podule_buttons ( dbox, wimp_eventstr *, ObjectBlock *, void * );
+static int  podule_describe_fields ( ObjectBlock *, char *, int );
+
+static void drawtags_set_fields ( dbox, ObjectBlock *, void * );
+static BOOL drawtags_get_fields ( dbox, ObjectBlock *, void * );
+static int  drawtags_describe_fields ( ObjectBlock *, char *, int );
+
+static void drawobjects_set_fields ( dbox, ObjectBlock *, void * );
+static BOOL drawobjects_get_fields ( dbox, ObjectBlock *, void * );
+static int  drawobjects_describe_fields ( ObjectBlock *, char *, int );
+
+static void filingsystem_set_fields ( dbox, ObjectBlock *, void * );
+static BOOL filingsystem_get_fields ( dbox, ObjectBlock *, void * );
+static int  filingsystem_describe_fields ( ObjectBlock *, char *, int );
+
+static void services_set_fields ( dbox, ObjectBlock *, void * );
+static BOOL services_get_fields ( dbox, ObjectBlock *, void * );
+static int  services_describe_fields ( ObjectBlock *, char *, int );
+
+static void devices_set_fields ( dbox, ObjectBlock *, void * );
+static int  devices_describe_fields ( ObjectBlock *, char *, int );
+static BOOL devices_get_fields ( dbox, ObjectBlock *, void * );
+
+/********************************************************
+ * internal function/icon table for the objects         *
+ ********************************************************/
+
+typedef void (*object_set_fields)      ( dbox d, ObjectBlock *o, void *handle );
+typedef BOOL (*object_get_fields)      ( dbox d, ObjectBlock *o, void *handle );
+typedef int (*object_describe_fields)  ( ObjectBlock *o, char *memory, int size );
+typedef BOOL (*object_extra_buttons)   ( dbox d, wimp_eventstr *e, ObjectBlock *o, void *handle );
+typedef BOOL (*object_extra_messages)  ( dbox d, wimp_eventstr *e, ObjectBlock *o, void *handle );
+typedef void (*object_help)            ( void *handle );
+
+typedef struct
+{
+  /*-- id for object --*/
+
+  int id;
+
+  /*-- icons --*/
+
+  wimp_i add;
+  wimp_i cancel;
+  wimp_i help;
+
+  /*-- functions --*/
+
+  object_set_fields      set_fields;
+  object_get_fields      get_fields;
+  object_describe_fields describe_fields;
+  object_extra_buttons   extra_buttons;
+  object_extra_messages  extra_messages;
+} OTable;
+
+
+static OTable table[] = {
+  Object_SWIChunk, i_SWIChunk_Add, i_SWIChunk_Cancel, i_SWIChunk_Help,
+  swichunk_set_fields, swichunk_get_fields, swichunk_describe_fields,
+  NULL, NULL,
+
+  Object_Messages, i_Messages_Add, i_Messages_Cancel, i_Messages_Help,
+  messages_set_fields, messages_get_fields, messages_describe_fields,
+  NULL, NULL,
+
+  Object_Reservation, i_Reservation_Add, i_Reservation_Cancel, i_Reservation_Help,
+  reservation_set_fields, reservation_get_fields, reservation_describe_fields,
+  reservation_buttons, NULL,
+
+  Object_FileType, i_FileType_Add, i_FileType_Cancel, i_FileType_Help,
+  filetype_set_fields, filetype_get_fields, filetype_describe_fields,
+  filetype_buttons, filetype_messages,
+
+  Object_ErrorBlock, i_ErrorBlock_Add, i_ErrorBlock_Cancel, i_ErrorBlock_Help,
+  errorblock_set_fields, errorblock_get_fields, errorblock_describe_fields,
+  NULL, NULL,
+
+  Object_Podule, i_Podule_Add, i_Podule_Cancel, i_Podule_Help,
+  podule_set_fields, podule_get_fields, podule_describe_fields,
+  podule_buttons, NULL,
+
+  Object_DrawTags, i_DrawTags_Add, i_DrawTags_Cancel, i_DrawTags_Help,
+  drawtags_set_fields, drawtags_get_fields, drawtags_describe_fields,
+  NULL, NULL,
+
+  Object_DrawObjects, i_DrawObjects_Add, i_DrawObjects_Cancel, i_DrawObjects_Help,
+  drawobjects_set_fields, drawobjects_get_fields, drawobjects_describe_fields,
+  NULL, NULL,
+
+  Object_FilingSystem, i_FilingSystem_Add, i_FilingSystem_Cancel, i_FilingSystem_Help,
+  filingsystem_set_fields, filingsystem_get_fields, filingsystem_describe_fields,
+  NULL, NULL,
+
+  Object_Services, i_Services_Add, i_Services_Cancel, i_Services_Help,
+  services_set_fields, services_get_fields, services_describe_fields,
+  NULL, NULL,
+
+  Object_Devices, i_Devices_Add, i_Devices_Cancel, i_Devices_Help,
+  devices_set_fields, devices_get_fields, devices_describe_fields,
+  NULL, NULL
+                        };
+
+
+
+/***********************************************
+ * Info block for an object window             *
+ ***********************************************/
+
+typedef struct
+{
+  dbox d;
+
+  /*-- add function and handle passed to object_show --*/
+
+  ObjectAddFunc  add_func;
+  void          *add_handle;
+
+  /*-- pointer to relevant table object --*/
+
+  OTable *tab;
+
+  /*-- pointer to object block --*/
+
+  ObjectBlock *object;
+  BOOL new;
+
+  /*-- help window struct --*/
+
+  HelpWinInfo hwin;
+
+} ObjectShowBlock;
+
+
+
+/***********************************************
+ * SWI Chunk object functions                  *
+ ***********************************************/
+
+/*
+ * sets fields for the swi chunk object
+ */
+
+static void swichunk_set_fields ( dbox d, ObjectBlock *object, void *handle )
+{
+  handle = handle;
+
+  dbox_setfield(d,i_SWIChunk_Prefix,object->data.swichunk.prefix);
+  dbox_setfield(d,i_SWIChunk_Description,object->data.swichunk.description);
+}
+
+/*
+ * describes fields for the swi chunk object
+ */
+
+static int swichunk_describe_fields ( ObjectBlock *object, char *buffer, int size )
+{
+  int writ=0;
+
+  writ += sprintf(buffer,"SWI chunk:\n"
+                         "  Prefix: %s\n"
+                         "  Description: %s\n",
+                         object->data.swichunk.prefix,
+                         object->data.swichunk.description);
+
+  return writ;
+}
+
+
+/*
+ * gets the fields for the swi chunk object
+ */
+
+static BOOL swichunk_get_fields ( dbox d, ObjectBlock *object, void *handle )
+{
+  handle = handle;
+
+  /*-- get fields --*/
+
+  dbox_getfield(d,i_SWIChunk_Prefix,object->data.swichunk.prefix,20);
+  dbox_getfield(d,i_SWIChunk_Description,object->data.swichunk.description,100);
+
+  /*-- validate the input --*/
+
+  if(!strlen(object->data.swichunk.prefix) ||
+               !strlen(object->data.swichunk.description))
+    return(FALSE);
+
+  return(TRUE);
+}
+
+
+/***********************************************
+ * Messages object functions                   *
+ ***********************************************/
+
+/*
+ * sets fields for the messages object
+ */
+
+static void messages_set_fields ( dbox d, ObjectBlock *object, void *handle )
+{
+  handle = handle;
+
+  dbox_setfield(d,i_Messages_Description,object->data.messages.description);
+  dbox_setnumeric(d,i_Messages_BlockRequired,1);
+}
+
+
+/*
+ * describes fields for the messages object
+ */
+
+static int messages_describe_fields ( ObjectBlock *object, char *buffer, int size )
+{
+  int writ=0;
+
+  writ += sprintf(buffer,"Messages:\n"
+                         "  Description: %s\n",
+                         object->data.messages.description);
+
+  return writ;
+}
+
+
+/*
+ * gets the fields for the messages object
+ */
+
+static BOOL messages_get_fields ( dbox d, ObjectBlock *object, void *handle )
+{
+  handle = handle;
+
+  dbox_getfield(d,i_Messages_Description,object->data.messages.description,100);
+
+  if(!dbox_getnumeric(d,i_Messages_BlockRequired) || !strlen(object->data.messages.description))
+    return(FALSE);
+
+  return(TRUE);
+}
+
+
+/***********************************************
+ * Services object functions                   *
+ ***********************************************/
+
+/*
+ * sets fields for the services object
+ */
+
+static void services_set_fields ( dbox d, ObjectBlock *object, void *handle )
+{
+  handle = handle;
+
+  dbox_setfield(d,i_Services_Description,object->data.services.description);
+  dbox_setnumeric(d,i_Services_BlockRequired,1);
+}
+
+
+/*
+ * describes fields for the services object
+ */
+
+static int services_describe_fields ( ObjectBlock *object, char *buffer, int size )
+{
+  int writ=0;
+
+  writ += sprintf(buffer,"Service block:\n"
+                         "  Description: %s\n",
+                         object->data.services.description);
+
+  return writ;
+}
+
+
+/*
+ * gets the fields for the services object
+ */
+
+static BOOL services_get_fields ( dbox d, ObjectBlock *object, void *handle )
+{
+  handle = handle;
+
+  dbox_getfield(d,i_Services_Description,object->data.services.description,100);
+
+  if(!dbox_getnumeric(d,i_Services_BlockRequired) || !strlen(object->data.services.description))
+    return(FALSE);
+
+  return(TRUE);
+}
+
+
+/***********************************************
+ * Filing System object functions              *
+ ***********************************************/
+
+/*
+ * sets fields for the filing system object
+ */
+
+static void filingsystem_set_fields ( dbox d, ObjectBlock *object, void *handle )
+{
+  handle = handle;
+
+  dbox_setfield(d,i_FilingSystem_Name,object->data.filingsystem.name);
+  dbox_setfield(d,i_FilingSystem_Select,object->data.filingsystem.select);
+}
+
+
+/*
+ * describes fields for the filing system object
+ */
+
+static int filingsystem_describe_fields ( ObjectBlock *object, char *buffer, int size )
+{
+  int writ=0;
+
+  writ += sprintf(buffer,"Filing system:\n"
+                         "  Name: %s\n"
+                         "  Select: %s\n",
+                         object->data.filingsystem.name,
+                         object->data.filingsystem.select);
+
+  return writ;
+}
+
+
+/*
+ * gets the fields for the filing system object
+ */
+
+static BOOL filingsystem_get_fields ( dbox d, ObjectBlock *object, void *handle )
+{
+  handle = handle;
+
+  dbox_getfield(d,i_FilingSystem_Name,object->data.filingsystem.name,20);
+  dbox_getfield(d,i_FilingSystem_Select,object->data.filingsystem.select,20);
+
+  if(!strlen(object->data.filingsystem.name) || !strlen(object->data.filingsystem.select))
+    return(FALSE);
+
+  return(TRUE);
+}
+
+
+
+/***********************************************
+ * Devices object functions                     *
+ ***********************************************/
+
+/*
+ * sets fields for the devices object
+ */
+
+static void devices_set_fields ( dbox d, ObjectBlock *object, void *handle )
+{
+  handle = handle;
+
+  dbox_setfield(d,i_Devices_Name,object->data.devices.name);
+  dbox_setfield(d,i_Devices_Description,object->data.devices.description);
+}
+
+
+/*
+ * describes fields for the devices object
+ */
+
+static int devices_describe_fields ( ObjectBlock *object, char *buffer, int size )
+{
+  int writ=0;
+
+  writ += sprintf(buffer,"Devices:\n"
+                         "  Name: %s\n"
+                         "  Description: %s\n",
+                         object->data.devices.name,
+                         object->data.devices.description);
+
+  return writ;
+}
+
+
+/*
+ * gets the fields for the devices object
+ */
+
+static BOOL devices_get_fields ( dbox d, ObjectBlock *object, void *handle )
+{
+  handle = handle;
+
+  dbox_getfield(d,i_Devices_Name,object->data.devices.name,20);
+  dbox_getfield(d,i_Devices_Description,object->data.devices.description,100);
+
+  if(!strlen(object->data.devices.name) || !strlen(object->data.devices.description))
+    return(FALSE);
+
+  return(TRUE);
+}
+
+
+/***********************************************
+ * Reservation object functions                *
+ ***********************************************/
+
+/*
+ * does some menu calculations
+ */
+
+static menu menu_calc ( menu mn, wimp_mousestr *m )
+{
+wimp_eventstr *e = wimpt_last_event();
+int x,y;
+wimp_icon icon;
+wimp_wstate state;
+
+
+  wimpt_complain(wimp_get_icon_info(m->w,m->i,&icon));
+  wimp_get_wind_state(m->w,&state);
+  x = state.o.x + state.o.box.x0 + icon.box.x1 + 50;
+  y = -state.o.y + state.o.box.y1 + icon.box.y1 - 2;
+  if(e->data.but.m.x != x || e->data.but.m.y != y)
+  {
+     e->data.but.m.x = x;
+     e->data.but.m.y = y;
+     wimpt_fake_event(e);
+     return((menu)&dummy);
+  }
+
+  return(mn);
+}
+
+
+
+/*
+ * menu maker function
+ */
+
+static menu reserve_menu_maker ( void *handle )
+{
+ObjectShowBlock *show_block = (ObjectShowBlock *) handle;
+wimp_mousestr m;
+BOOL rebuild = event_is_menu_being_recreated();
+
+  dummy.m = 0;
+
+  /*-- return the last menu that was created if we --*/
+  /*-- are doing a rebuild                         --*/
+
+  if(rebuild)
+    return(last_menu);
+
+  /*-- calculate which menu to return --*/
+
+  wimp_get_point_info(&m);
+
+  switch(m.i)
+  {
+    case i_Reservation_PopUp :  last_menu = reserve_menu;
+                                return(menu_calc(reserve_menu,&m));
+                                break;
+  }
+
+  return((menu)&dummy);
+}
+
+
+/*
+ * menu handler function
+ */
+
+static void reserve_menu_events ( void *handle, char *hit )
+{
+char x = 1;
+int  i = 0;
+char temp[20];
+int  t = 0;
+ObjectShowBlock *show_block = (ObjectShowBlock *) handle;
+
+  /*-- we need to extract the the text for the menu hit --*/
+  /*-- from the file buffer 				--*/
+
+  while(x < hit[0])
+  {
+    if(reserve_types[i] == ',')
+      x++;
+    i++;
+  }
+
+  /*-- copy out the relevant part of buffer --*/
+
+  while(reserve_types[i] != ',' && reserve_types[i] != '\0')
+  {
+    temp[t] = reserve_types[i];
+    i++;
+    t++;
+  }
+  temp[t] = '\0';
+  tracef1("Found string '%s'\n",temp);
+
+  /*-- set text in the icon --*/
+
+  dbox_setfield(show_block->d,i_Reservation_Type,temp);
+}
+
+
+/*
+ * sets fields for the reservation object
+ */
+
+static void reservation_set_fields ( dbox d, ObjectBlock *object, void *handle )
+{
+  handle = handle;
+
+  dbox_setfield(d,i_Reservation_Text,object->data.reservation.text);
+  dbox_setfield(d,i_Reservation_Type,object->data.reservation.type);
+}
+
+
+/*
+ * gets the fields for the reservation object
+ */
+
+static BOOL reservation_get_fields ( dbox d, ObjectBlock *object, void *handle )
+{
+  handle = handle;
+
+  dbox_getfield(d,i_Reservation_Text,object->data.reservation.text,40);
+  dbox_getfield(d,i_Reservation_Type,object->data.reservation.type,20);
+
+  if(!strlen(object->data.reservation.text) || !strlen(object->data.reservation.type))
+    return(FALSE);
+
+  return(TRUE);
+}
+
+
+/*
+ * describes fields for the reservation object
+ */
+
+static int reservation_describe_fields ( ObjectBlock *object, char *buffer, int size )
+{
+  int writ=0;
+
+  writ += sprintf(buffer,"Reservation (%s): %s\n",
+                         object->data.reservation.type,
+                         object->data.reservation.text);
+
+  return writ;
+}
+
+
+/*
+ * 'extra' button handler for the reservation object
+ */
+
+static BOOL reservation_buttons ( dbox d, wimp_eventstr *e, ObjectBlock *object, void *handle )
+{
+  d = d;
+  object = object;
+  handle = handle;
+
+  if(e->data.but.m.i == i_Reservation_PopUp)
+  {
+  wimp_eventstr fake;
+
+     if (e->data.but.b != wimp_BMID)
+     {
+       fake.e = wimp_EBUT;
+       fake.data.but.m.bbits = wimp_BMID;
+       fake.data.but.m.w = e->data.but.m.w;
+       fake.data.but.m.i = e->data.but.m.i;
+       tracef0("passing new event to wimpt\n");
+       wimpt_fake_event(&fake);
+       return(TRUE);
+     }
+  }
+
+  return(FALSE);
+}
+
+
+/***********************************************
+ * FileType object functions                   *
+ ***********************************************/
+
+/*
+ * does the same as fileicon from RISC_OSLib, except that
+ * its preserves the state of the other parts of the validation
+ * string
+ */
+
+static void my_fileicon ( wimp_w w, wimp_i i, int file_type )
+{
+char *validstring;
+char *p;
+int   valid_size = 0;
+char  filetype[5];
+wimp_icon icon;
+
+  /*-- convert filetype number to text --*/
+
+  sprintf(filetype,"%x",file_type);
+
+  /*-- get icon information and copy out valid string --*/
+
+  wimp_get_icon_info(w,i,&icon);
+
+  /*-- find out the length of the validation string --*/
+
+  p = icon.data.indirecttext.validstring;
+
+  while(*p >= 32)
+  {
+    p++;
+    valid_size++;
+  }
+
+  validstring = malloc(GUARD+ ++valid_size);
+
+  /*-- check that we have space in our valid string --*/
+
+  if(validstring == NULL)
+  {
+    werr(0,"%s",msgs_lookup("MallocFail"));
+    return;
+  }
+
+  /*-- copy out the validation string from the icon --*/
+
+  memcpy(validstring,icon.data.indirecttext.validstring,valid_size);
+
+  /*-- find where _xxx is in the icon and replace the text --*/
+
+  p = strstr(validstring,"_xxx");
+  if(p != NULL)
+  {
+    *(p++) = '_';
+    *(p++) = filetype[0];
+    *(p++) = filetype[1];
+    *(p++) = filetype[2];
+    *(p++) = '\0';
+    tracef1("Build valid string '%s'\n",validstring);
+
+    /*-- now we update the icon --*/
+
+    memcpy(icon.data.indirecttext.validstring,validstring,valid_size);
+    wimp_set_icon_state(w,i,0,0);
+  }
+
+  /*-- free our validation buffer --*/
+
+  free(validstring);
+}
+
+
+
+/*
+ * sets fields for the filetype object
+ */
+
+static void filetype_set_fields ( dbox d, ObjectBlock *object, void *handle )
+{
+  handle = handle;
+
+  dbox_setfield(d,i_FileType_AppName,object->data.filetype.appname);
+  dbox_setfield(d,i_FileType_FName,object->data.filetype.fname);
+  dbox_setnumeric(d,i_FileType_DoubleClick,object->data.filetype.double_clicking);
+  if(object->data.filetype.sprite.size)
+    my_fileicon(dbox_syshandle(d),i_FileType_Sprite,FileType_Sprite);
+  if(object->data.filetype.prod_desc.size)
+    my_fileicon(dbox_syshandle(d),i_FileType_ProdDesc,FileType_Text);
+  if(object->data.filetype.format.size)
+    my_fileicon(dbox_syshandle(d),i_FileType_Format,FileType_Text);
+}
+
+
+/*
+ * gets the fields for the filetype object
+ */
+
+static BOOL filetype_get_fields ( dbox d, ObjectBlock *object, void *handle )
+{
+  handle = handle;
+
+  dbox_getfield(d,i_FileType_AppName,object->data.filetype.appname,12);
+  dbox_getfield(d,i_FileType_FName,object->data.filetype.fname,9);
+  object->data.filetype.double_clicking = dbox_getnumeric(d,i_FileType_DoubleClick);
+
+  if(!strlen(object->data.filetype.appname) || !strlen(object->data.filetype.fname) ||
+     !object->data.filetype.sprite.size || !object->data.filetype.prod_desc.size ||
+     !object->data.filetype.format.size)
+     return(FALSE);
+
+  return(TRUE);
+}
+
+
+/*
+ * describes fields for the filetype object
+ */
+
+static int filetype_describe_fields ( ObjectBlock *object, char *buffer, int size )
+{
+  int writ=0;
+
+  writ += sprintf(buffer,"Filetype:\n"
+                         "  Application: %s\n"
+                         "  Typename: %s\n"
+                         "  Double-click: %s\n",
+                         object->data.filetype.appname,
+                         object->data.filetype.fname,
+                         object->data.filetype.double_clicking ? "yes" : "no");
+
+  return writ;
+}
+
+
+
+/*
+ * message handling for the filetype object
+ */
+
+static BOOL filetype_messages ( dbox d, wimp_eventstr *e, ObjectBlock *object, void *handle )
+{
+int ftype;
+FileData *fdata;
+wimp_mousestr m;
+wimp_msgstr msg;
+
+  handle = handle;
+
+  switch(e->data.msg.hdr.action)
+  {
+    case wimp_MDATASAVE   :
+
+      /*-- force load via a scrap file --*/
+
+      msg = e->data.msg;
+      msg.hdr.size = 256;
+      msg.data.datasaveok.estsize = -1;
+      msg.hdr.your_ref = e->data.msg.hdr.my_ref;
+      msg.hdr.action = wimp_MDATASAVEOK;
+      strcpy(msg.data.datasaveok.name,"<Wimp$Scrap>");
+      wimp_sendmessage(wimp_ESEND,&msg,e->data.msg.hdr.task);
+      break;
+
+    case wimp_MDATALOAD   :
+    case wimp_MDATAOPEN   :
+
+      /*-- find out which icon the file was dropped on --*/
+
+      wimp_get_point_info(&m);
+
+      if(m.i == i_FileType_Sprite || m.i == i_FileType_ProdDesc ||
+         m.i == i_FileType_Format)
+      {
+        /*-- check the type of file to look for --*/
+
+        switch(m.i)
+        {
+          case i_FileType_Sprite   : ftype = FileType_Sprite;
+                                     fdata = &object->data.filetype.sprite;
+                                     break;
+          case i_FileType_ProdDesc : ftype = FileType_Text;
+                                     fdata = &object->data.filetype.prod_desc;
+                                     break;
+          case i_FileType_Format   : ftype = FileType_Text;
+                                     fdata = &object->data.filetype.format;
+                                     break;
+        }
+
+        /*-- check the type of the file --*/
+
+        if(e->data.msg.data.dataload.type != ftype)
+        {
+          werr(0,"%s",msgs_lookup("WrongType"));
+          return(FALSE);
+        }
+
+        /*-- see if we need to free any memory --*/
+        if(fdata->size)
+        {
+          fdata->size = 0;
+          free(fdata->data);
+        }
+
+        /*-- find file size, allocate memory and load file --*/
+
+        file_readcat(e->data.msg.data.dataload.name,0,0,0,&fdata->size,0);
+        if((fdata->data = malloc(GUARD+ fdata->size)) == NULL)
+        {
+          fdata->size = 0;
+          werr(0,"%s",msgs_lookup("MallocFail"));
+          return(FALSE);
+        }
+        file_load(e->data.msg.data.dataload.name,(int)fdata->data);
+
+        /*-- set the icons file type --*/
+
+        my_fileicon(dbox_syshandle(d),m.i,ftype);
+
+        /*-- acknowledge that the file has been loaded --*/
+
+        msg.hdr.action = wimp_MDATALOADOK;
+        msg.hdr.your_ref = e->data.msg.hdr.my_ref;
+        msg.hdr.size = sizeof(wimp_msghdr);
+        wimp_sendmessage(wimp_ESEND,&msg,e->data.msg.hdr.task);
+
+        return(TRUE);
+      }
+      break;
+  }
+
+  return(FALSE);
+}
+
+
+static int filetype_save_type;
+
+/*
+ * save handler for the filetype object
+ */
+
+static BOOL filetype_do_save ( char *filename, void *handle )
+{
+FileData *data = (FileData *) handle;
+_kernel_oserror *e = NULL;
+
+  if(!data->size)
+  {
+    werr(0,"%s",msgs_lookup("NoSave"));
+    return(FALSE);
+  }
+
+  if((e = file_memdump(filename,filetype_save_type,data->data,data->size)) != NULL)
+  {
+    werr(0,"%s",e->errmess);
+    return(FALSE);
+  }
+
+  return(TRUE);
+}
+
+
+
+/*
+ * button handler for the filetype object
+ * (deals with icon dragging)
+ */
+
+static BOOL filetype_buttons ( dbox d, wimp_eventstr *e, ObjectBlock *object, void *handle )
+{
+FileData *data = NULL;
+char filename[12];
+
+  handle = handle;
+  d = d;
+
+  /*-- check for a drag --*/
+
+  if(e->e == wimp_EBUT && e->data.but.m.bbits == wimp_BDRAGLEFT)
+  {
+    switch(e->data.but.m.i)
+    {
+      case i_FileType_Sprite   : data = &object->data.filetype.sprite;
+                                 filetype_save_type = FileType_Sprite;
+                                 strcpy(filename,"Sprite");
+                                 break;
+      case i_FileType_ProdDesc : data = &object->data.filetype.prod_desc;
+                                 filetype_save_type = FileType_Text;
+                                 strcpy(filename,"ProdDesc");
+                                 break;
+      case i_FileType_Format   : data = &object->data.filetype.format;
+                                 filetype_save_type = FileType_Text;
+                                 strcpy(filename,"Format");
+                                 break;
+    }
+
+    /*-- and do the save --*/
+
+    if(data != NULL)
+    {
+      tracef1("Saving file '%s'\n",filename);
+
+      xfersend(filetype_save_type,filename,1024,filetype_do_save,NULL,NULL,e,data);
+      return(TRUE);
+    }
+  }
+
+  return(FALSE);
+}
+
+
+
+
+/***********************************************
+ * Error Block object functions                *
+ ***********************************************/
+
+/*
+ * sets fields for the errorblock object
+ */
+
+static void errorblock_set_fields ( dbox d, ObjectBlock *object, void *handle )
+{
+  handle = handle;
+
+  dbox_setfield(d,i_ErrorBlock_Description,object->data.errorblock.description);
+  dbox_setnumeric(d,i_ErrorBlock_BlockRequired,1);
+}
+
+
+/*
+ * describes fields for the devices object
+ */
+
+static int errorblock_describe_fields ( ObjectBlock *object, char *buffer, int size )
+{
+  int writ=0;
+
+  writ += sprintf(buffer,"Error block:\n"
+                         "  Description: %s\n",
+                         object->data.errorblock.description);
+
+  return writ;
+}
+
+
+/*
+ * gets the fields for the errorblock object
+ */
+
+static BOOL errorblock_get_fields ( dbox d, ObjectBlock *object, void *handle )
+{
+  handle = handle;
+
+  dbox_getfield(d,i_ErrorBlock_Description,object->data.errorblock.description,100);
+
+  if(!dbox_getnumeric(d,i_ErrorBlock_BlockRequired) ||
+          !strlen(object->data.errorblock.description))
+    return(FALSE);
+
+  return(TRUE);
+}
+
+
+/***********************************************
+ * Podule object functions                     *
+ ***********************************************/
+
+/*
+ * sets fields for the podule object
+ */
+
+static void podule_set_fields ( dbox d, ObjectBlock *object, void *handle )
+{
+  handle = handle;
+
+  dbox_setnumeric(d,i_Podule_Allocate,object->data.podule.allocate_manf);
+  if(object->data.podule.allocate_manf)
+    dbox_fadefield(d,i_Podule_ManfId);
+  else
+      dbox_unfadefield(d,i_Podule_ManfId);
+  dbox_setnumeric(d,i_Podule_ManfId,object->data.podule.manf);
+  dbox_setfield(d,i_Podule_Name,object->data.podule.podule_name);
+  dbox_setfield(d,i_Podule_Description,object->data.podule.description);
+}
+
+
+/*
+ * gets the fields for the podule object
+ */
+
+static BOOL podule_get_fields ( dbox d, ObjectBlock *object, void *handle )
+{
+  handle = handle;
+
+  object->data.podule.allocate_manf = dbox_getnumeric(d,i_Podule_Allocate);
+  object->data.podule.manf = dbox_getnumeric(d,i_Podule_ManfId);
+  dbox_getfield(d,i_Podule_Name,object->data.podule.podule_name,20);
+  dbox_getfield(d,i_Podule_Description,object->data.podule.description,100);
+
+  if(!strlen(object->data.podule.podule_name) || !strlen(object->data.podule.description) ||
+     (!object->data.podule.allocate_manf && !object->data.podule.manf))
+    return(FALSE);
+
+  return(TRUE);
+}
+
+
+/*
+ * describes fields for the devices object
+ */
+
+static int podule_describe_fields ( ObjectBlock *object, char *buffer, int size )
+{
+  char manf[8];
+  int writ=0;
+
+  sprintf(manf,"%i",object->data.podule.manf);
+
+  writ += sprintf(buffer,"Podule:\n"
+                         "  Name: %s\n"
+                         "  Description: %s\n"
+                         "  Manufacturer ID: %s\n",
+                         object->data.podule.podule_name,
+                         object->data.podule.description,
+                         object->data.podule.allocate_manf ?
+                            "required" : manf);
+
+  return writ;
+}
+
+
+/*
+ * extra button handler for podule object
+ */
+
+static BOOL podule_buttons ( dbox d, wimp_eventstr *e, ObjectBlock *object, void *handle )
+{
+  object = object;
+  handle = handle;
+
+  if(e->data.but.m.i == i_Podule_Allocate)
+  {
+    if(dbox_getnumeric(d,i_Podule_Allocate))
+      dbox_fadefield(d,i_Podule_ManfId);
+    else
+      dbox_unfadefield(d,i_Podule_ManfId);
+    return(TRUE);
+  }
+
+  return(FALSE);
+}
+
+
+
+
+/***********************************************
+ * Draw Tags object functions                  *
+ ***********************************************/
+
+/*
+ * sets fields for the drawtags object
+ */
+
+static void drawtags_set_fields ( dbox d, ObjectBlock *object, void *handle )
+{
+  handle = handle;
+
+  dbox_setfield(d,i_DrawTags_Description,object->data.drawtag.description);
+  dbox_setnumeric(d,i_DrawTags_BaseRequired,1);
+}
+
+
+/*
+ * gets the fields for the drawtags object
+ */
+
+static BOOL drawtags_get_fields ( dbox d, ObjectBlock *object, void *handle )
+{
+  handle = handle;
+
+  dbox_getfield(d,i_DrawTags_Description,object->data.drawtag.description,100);
+
+  if(!dbox_getnumeric(d,i_DrawTags_BaseRequired) ||
+          !strlen(object->data.drawtag.description))
+    return(FALSE);
+
+  return(TRUE);
+}
+
+
+/*
+ * describes fields for the draw tags object
+ */
+
+static int drawtags_describe_fields ( ObjectBlock *object, char *buffer, int size )
+{
+  int writ=0;
+
+  writ += sprintf(buffer,"Draws tag block:\n"
+                         "  Description: %s\n",
+                         object->data.drawtag.description);
+
+  return writ;
+}
+
+
+/***********************************************
+ * Draw Objects object functions               *
+ ***********************************************/
+
+/*
+ * sets fields for the drawobjects object
+ */
+
+static void drawobjects_set_fields ( dbox d, ObjectBlock *object, void *handle )
+{
+  handle = handle;
+
+  dbox_setfield(d,i_DrawObjects_Description,object->data.drawobject.description);
+  dbox_setnumeric(d,i_DrawObjects_BaseRequired,1);
+}
+
+
+/*
+ * gets the fields for the drawobjects object
+ */
+
+static BOOL drawobjects_get_fields ( dbox d, ObjectBlock *object, void *handle )
+{
+  handle = handle;
+
+  dbox_getfield(d,i_DrawObjects_Description,object->data.drawobject.description,100);
+
+  if(!dbox_getnumeric(d,i_DrawObjects_BaseRequired) ||
+          !strlen(object->data.drawobject.description))
+    return(FALSE);
+
+  return(TRUE);
+}
+
+
+/*
+ * describes fields for the draw object object
+ */
+
+static int drawobjects_describe_fields ( ObjectBlock *object, char *buffer, int size )
+{
+  int writ=0;
+
+  writ += sprintf(buffer,"Draws object block:\n"
+                         "  Description: %s\n",
+                         object->data.drawobject.description);
+
+  return writ;
+}
+
+
+/*
+ * works out the space for an object, allocates it and sets up
+ * any variables
+ */
+
+static ObjectBlock *create_object ( int id )
+{
+int size;
+ObjectBlock *object;
+
+  /*-- calculate the objects size --*/
+
+  switch(id)
+  {
+    case Object_SWIChunk     : size = sizeof(SWIChunk); break;
+    case Object_Messages     : size = sizeof(Messages); break;
+    case Object_Reservation  : size = sizeof(Reservation); break;
+    case Object_FileType     : size = sizeof(FileType); break;
+    case Object_ErrorBlock   : size = sizeof(ErrorBlock); break;
+    case Object_Podule       : size = sizeof(Podule); break;
+    case Object_DrawTags     : size = sizeof(DrawTags); break;
+    case Object_DrawObjects  : size = sizeof(DrawObjects); break;
+    case Object_FilingSystem : size = sizeof(FilingSystem); break;
+    case Object_Services     : size = sizeof(Services); break;
+    case Object_Devices      : size = sizeof(Devices); break;
+    default                  : return(NULL);
+  }
+
+  /*-- allocate some space --*/
+
+  if((object = malloc(GUARD+ size)) == NULL)
+    return(FALSE);
+
+  /*-- init the variables --*/
+
+  memset(object,'\0',size);
+  object->id = id;
+  object->size = size;
+
+  if(id == Object_FileType)
+  {
+    object->data.filetype.sprite.size = 0;
+    object->data.filetype.prod_desc.size = 0;
+    object->data.filetype.format.size = 0;
+    object->data.filetype.double_clicking = TRUE;
+  }
+
+  return(object);
+}
+
+
+/*
+ * closes an object and free's any workspace that is associated
+ */
+
+static void close_object ( ObjectShowBlock *show_block, BOOL free_block )
+{
+  /*-- detach the menu if we have to --*/
+
+  if(show_block->object->id == Object_Reservation)
+    event_attachmenumaker(dbox_syshandle(show_block->d),0,0,show_block);
+
+  /*-- close the dbox --*/
+
+  dbox_hide(show_block->d);
+  dbox_dispose(&show_block->d);
+
+  /*-- free the object data (if it is a new one) --*/
+
+  if(show_block->new && free_block)
+  {
+    object_free(show_block->object);
+  }
+
+  /*-- and free the show block --*/
+
+  free(show_block);
+}
+
+
+
+/*
+ * event handler for object events
+ */
+
+static BOOL object_events ( dbox d, void *event, void *handle )
+{
+wimp_eventstr *e = (wimp_eventstr *) event;
+ObjectShowBlock *show_block = (ObjectShowBlock *) handle;
+BOOL more_buttons = TRUE;
+
+  switch(e->e)
+  {
+    case wimp_EOPEN   : wimp_open_wind(&e->data.o);
+                        return(TRUE);
+                        break;
+    case wimp_ECLOSE  : close_object(show_block,TRUE);
+                        return(TRUE);
+                        break;
+    case wimp_EKEY    :
+       if (e->data.key.chcode == 13)
+         goto trigger_add;
+       else if (e->data.key.chcode == 27)
+         goto trigger_cancel;
+       break;
+
+    case wimp_EBUT    :
+
+       if(show_block->tab->extra_buttons != NULL)
+         more_buttons = !show_block->tab->extra_buttons(d,e,show_block->object,show_block);
+
+       if(more_buttons)
+       {
+         if(e->data.but.m.i == show_block->tab->add)
+         {
+trigger_add:
+           /*-- process adding here --*/
+
+           if(!show_block->tab->get_fields(d,show_block->object,show_block))
+           {
+             werr(0,"%s",msgs_lookup("NoFields"));
+           }
+           else
+           {
+             /*-- call user function to add object --*/
+
+             show_block->add_func(show_block->new,show_block->object,show_block->add_handle);
+
+             /*-- and close the window --*/
+
+             close_object(show_block,FALSE);
+           }
+         }
+         else
+         {
+           if(e->data.but.m.i == show_block->tab->cancel)
+           {
+trigger_cancel:
+             close_object(show_block,TRUE);
+           }
+           else
+           {
+             if(e->data.but.m.i == show_block->tab->help)
+             {
+             char help_path[100];
+
+               /*-- show help here --*/
+
+               sprintf(help_path,"Allocate:Resources.Help.%d",
+                              show_block->object->id);
+
+               if(!helpwin_show(help_path,&show_block->hwin))
+                 werr(0,"%s",msgs_lookup("NoHelp"));
+             }
+           }
+         }
+       }
+       return(TRUE);
+       break;
+
+    case wimp_ESEND        :
+    case wimp_ESENDWANTACK :
+
+      if(show_block->tab->extra_messages != NULL)
+        show_block->tab->extra_messages(d,e,show_block->object,show_block);
+      return(TRUE);
+      break;
+  }
+
+  return(FALSE);
+}
+
+
+/*
+ * sets the caret in the first writable icon in a window
+ */
+
+static void set_caret ( wimp_w w )
+{
+wimp_icon icon;
+wimp_i i = 0;
+BOOL done = FALSE;
+wimp_caretstr c;
+
+  while(wimp_get_icon_info(w,i,&icon) == NULL && !done)
+  {
+    if((icon.flags & (wimp_BWRITABLE * wimp_IBTYPE)) == (wimp_BWRITABLE * wimp_IBTYPE))
+    {
+      c.w = w;
+      c.i = i;
+      c.x = c.y = 0;
+      c.height = c.index = -1;
+      wimp_set_caret_pos(&c);
+      done = TRUE;
+    }
+    else
+     i++;
+  }
+}
+
+
+
+/*
+ * does the actual showing of an object
+ */
+
+static BOOL do_show ( int id, ObjectShowBlock *show_block )
+{
+char tname[20];
+
+  /*-- find the template name from the object id --*/
+
+  switch(id)
+  {
+    case Object_SWIChunk     : strcpy(tname,"swichunk"); break;
+    case Object_Messages     : strcpy(tname,"messages"); break;
+    case Object_Reservation  : strcpy(tname,"reserve"); break;
+    case Object_FileType     : strcpy(tname,"filetype"); break;
+    case Object_ErrorBlock   : strcpy(tname,"errorblock"); break;
+    case Object_Podule       : strcpy(tname,"podule"); break;
+    case Object_DrawTags     : strcpy(tname,"drawtag"); break;
+    case Object_DrawObjects  : strcpy(tname,"drawobj"); break;
+    case Object_FilingSystem : strcpy(tname,"fs"); break;
+    case Object_Devices      : strcpy(tname,"devices"); break;
+    case Object_Services     : strcpy(tname,"services"); break;
+    default                  : return(FALSE);
+  }
+
+  /*-- create and show the dbox --*/
+
+  if((show_block->d = dbox_new(tname)) == NULL)
+    return(FALSE);
+  dbox_showstatic(show_block->d);
+
+  /*-- set the fields --*/
+
+  if(show_block->tab->set_fields != NULL)
+    show_block->tab->set_fields(show_block->d,show_block->object,show_block);
+
+  /*-- attach an event handler --*/
+
+  dbox_raw_eventhandler(show_block->d,object_events,show_block);
+
+  /*-- set the caret --*/
+
+  set_caret(dbox_syshandle(show_block->d));
+
+  /*-- if we are showing the reserve type then we need to do --*/
+  /*-- some menu attaching                                   --*/
+
+  if(id == Object_Reservation)
+    event_attachmenumaker(dbox_syshandle(show_block->d),
+                    reserve_menu_maker,reserve_menu_events,show_block);
+
+  return(TRUE);
+}
+
+
+
+/****************************************************
+ * External functions                               *
+ ****************************************************/
+
+
+/*
+ * Name     : object_free
+ * Desc     : free's an object and any data associated with in
+ * Parms    : ObjectBlock *object
+ * Returns  : none
+ */
+
+extern void object_free ( ObjectBlock *object )
+{
+  /*-- if it is a filetype object then we need to --*/
+  /*-- free any files that have been loaded       --*/
+
+  if(object->id == Object_FileType)
+  {
+    if(object->data.filetype.sprite.size)
+      free(object->data.filetype.sprite.data);
+    if(object->data.filetype.prod_desc.size)
+      free(object->data.filetype.prod_desc.data);
+    if(object->data.filetype.format.size)
+      free(object->data.filetype.format.data);
+  }
+
+  /*-- free the object --*/
+
+  free(object);
+}
+
+
+/*
+ * Name     : object_describe
+ * Desc     : describes's an object into a buffer
+ * Parms    : ObjectBlock *object
+ *            buffer-> the buffer to write to
+ *            size = the length of the buffer
+ * Returns  : size written
+ */
+
+extern int object_describe ( ObjectBlock *object, char *buffer, int size )
+{
+  OTable *tab = &table[object->id];
+  if ( tab->describe_fields )
+  {
+    /* _swix(0x104,0); printf("object_describe... describe_fields = %p\n",tab->describe_fields);    return 0;
+ */
+    return tab->describe_fields(object, buffer,size);
+  }
+  else
+    return 0;
+}
+
+
+
+/*
+ * Name     : object_build_description
+ * Desc     : builds a description string for a specified object
+ * Parms    : ObjectBlock *object  - pointer to allocated object
+ *            char        *desc    - destination for description string
+ *            int          size    - size of description string
+ * Returns  : none
+ */
+
+extern void object_build_description ( ObjectBlock *object, char *desc, int size )
+{
+char *buffer = malloc(GUARD+ size);
+
+  /*-- check that we have space for our temp buffer --*/
+
+  if(buffer == NULL)
+  {
+    werr(0,"%s",msgs_lookup("MallocFail"));
+  }
+  else
+  {
+    /*-- fill in the buffer depending on the type of object --*/
+
+    switch(object->id)
+    {
+      case Object_SWIChunk : sprintf(buffer,"SWI Chunk (Prefix = '%s')",
+                                      object->data.swichunk.prefix);
+                             break;
+      case Object_Messages : sprintf(buffer,"Message block");
+                             break;
+      case Object_Reservation : sprintf(buffer,"Reservation (Text = '%s' Type = '%s')",
+                                   object->data.reservation.text,
+                                       object->data.reservation.type);
+                                break;
+      case Object_FileType : sprintf(buffer,"FileType (App Name = '%s' Desired prefix = '%s')",
+                                object->data.filetype.appname,object->data.filetype.fname);
+                             break;
+      case Object_ErrorBlock : sprintf(buffer,"Error Block");
+                               break;
+      case Object_Podule : if(!object->data.podule.allocate_manf)
+                             sprintf(buffer,"Podule Id (Podule Name = '%s' Manf Id = &%x)",
+                               object->data.podule.podule_name,object->data.podule.manf);
+                           else
+                             sprintf(buffer,"Podule Id and Manufacturers Id (Podule Name = '%s')",
+                               object->data.podule.podule_name);
+                           break;
+      case Object_DrawTags : sprintf(buffer,"Draw Tag block");
+                             break;
+      case Object_DrawObjects : sprintf(buffer,"Draw Object block");
+                                break;
+      case Object_FilingSystem : sprintf(buffer,"Filing System (Name = '%s')",
+                                   object->data.filingsystem.name);
+                                 break;
+      case Object_Devices      : sprintf(buffer,"Device (Name = '%s')",
+                                   object->data.devices.name);
+                                 break;
+      case Object_Services     : sprintf(buffer,"Service Call block");
+                                 break;
+    }
+
+    /*-- copy data across and free buffer --*/
+
+    memcpy(desc,buffer,size);
+    free(buffer);
+  }
+}
+
+
+/*
+ * Name     : object_show
+ * Desc     : shows a window for the specified object type
+ * Parms    : int id                   - object id for the type of object
+ *            ObjectBlock *object      - pointer to object data to show (can be NULL
+ *                                       if a new object is being shown )
+ *            ObjectAddFunc update     - add function
+ *            void *handle             - user defined handle
+ * Returns  : True or False on result
+ */
+
+extern BOOL object_show ( int id, ObjectBlock *object, ObjectAddFunc add, void *handle )
+{
+ObjectShowBlock *show_block;
+
+  /*-- allocate some space for the show block --*/
+
+  if((show_block = malloc(GUARD+ sizeof(ObjectShowBlock))) == NULL)
+    return(FALSE);
+
+  /*-- set up show block --*/
+
+  show_block->add_func   = add;
+  show_block->add_handle = handle;
+  show_block->hwin.open = FALSE;
+  show_block->hwin.buffer = NULL;
+  show_block->hwin.lines = NULL;
+
+  if(object == NULL)
+  {
+    /*-- allocate and set up the object --*/
+
+    show_block->object = create_object(id);
+
+    if(show_block->object == NULL)
+    {
+      free(show_block);
+      return(FALSE);
+    }
+
+    show_block->new = TRUE;
+  }
+  else
+  {
+    show_block->object = object;
+    show_block->new = FALSE;
+  }
+
+  show_block->tab = &table[id];
+
+  /*-- and show the object --*/
+
+  return(do_show(id,show_block));
+}
+
+
+/*
+ * Name     : object_init
+ * Desc     : init's various stuff for the object module
+ * Parms    : none
+ * Returns  : True or FALSE on result
+ */
+
+extern BOOL object_init ( void )
+{
+int size;
+_kernel_oserror *e;
+
+  /*-- build the reservation types menu --*/
+
+  if((e = file_readcat("Allocate:Resources.ResTypes",0,0,0,&size,0)) != NULL)
+    goto finish;
+
+  size++;
+
+  if((reserve_types = malloc(GUARD+ size)) == NULL)
+  {
+    werr(0,"%s",msgs_lookup("MallocFail"));
+    goto finish;
+  }
+
+  if((e = file_load("Allocate:Resources.ResTypes",(int)reserve_types)) != NULL)
+    goto finish;
+
+  reserve_types[size] = '\0';
+
+  reserve_menu = menu_new(msgs_lookup("RMTitle"),reserve_types);
+
+finish:
+
+  if(e != NULL)
+  {
+    werr(0,"%s",e->errmess);
+    return(FALSE);
+  }
+
+  return(TRUE);
+}
+
+
+/*-- end --*/
+

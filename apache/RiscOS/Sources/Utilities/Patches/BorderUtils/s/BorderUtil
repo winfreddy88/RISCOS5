@@ -1,0 +1,190 @@
+; Copyright 2017 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+;;-----------------------------------------------------------------------------
+;; Son of Wimp Utils
+;;              
+;; Fix border type 5 and 6 so when an application quits and it has a button
+;; depressed the desktop is not blown away.
+;;
+;; This is done by watching for SVC_WimpCloseDown, if the task closing
+;; down is the same as the one attached to the Window, which has the button
+;; depressed then flag as no active button.
+;;
+;; The module first performs a checksum to ensure that it is dealing with
+;; the correct version of the module.  The private word of the module
+;; is set to the workspace pointer for the Window Manager if the checksums
+;; match, and the sevice handler looks to see if this value is non-zero,
+;; if it is then the fixes are applied.
+;;
+;; The die entry of the module must clear the private word, if it
+;; doesn't the Window Managers workspace will be released bringing
+;; the desktop crashing down.
+;; 
+;; HISTORY
+;; =======
+;;       2-Dec-92 DDV 0.01 Created
+;;       3-Dec-92 DDV      Changed silly name to another.
+;;       3-Dec-92 DDV 0.02 Watches for all types of Wimp_CloseDown.
+;;
+;;-----------------------------------------------------------------------------
+
+        GET     hdr:ListOpts
+        GET     hdr:Macros
+        GET     hdr:System
+        GET     hdr:ModHand
+        GET     hdr:Services
+        GET     hdr:Proc
+        GET     VersionASM
+        
+;;-----------------------------------------------------------------------------
+;; Define the workspace layout
+;;-----------------------------------------------------------------------------
+
+;; Constants
+            
+bignum                  *       &0FFFFFFF
+nullptr                 *       -1
+nullptr2                *       -2
+
+wimpsize                *       &1A2AC  ; size of Wimp module
+wimpchecksum            *       &680F   ; checksum of WindowManager 3.16 (30 Apr 1992)
+
+;; Our workspace (private word addresses)
+
+                        ^ 0,WP
+
+wimp_workspace          # 4             ; pointer to the Window Managers workspace
+apply_fixes             # 4             ; if non-zero then apply the fix for buttons
+
+ws_required             * :INDEX: @
+
+                         
+;; Indexs into the Window Managers workpspace
+
+Wimp_BorderWindow       * &688          ; window which currently has a border active / nullptr if none
+Wimp_BorderIcon         * &684          ; icon within window                         / nullptr if none
+
+w_taskhandle            * 4             ; task handle lives at this offset
+
+        AREA    |BorderUtil$$Code|, CODE, READONLY, PIC
+
+;;-----------------------------------------------------------------------------
+;; Module header
+;;-----------------------------------------------------------------------------
+
+module_base
+        & 0                             ; not an application
+        & init -module_base             
+        & die -module_base
+        & service -module_base
+
+        & title -module_base
+        & help -module_base
+        & 0                             ; no commands
+
+title   = "BorderUtils",0
+help    = "Border Utils",9,Module_HelpVersion,0
+        ALIGN
+
+
+
+;;-----------------------------------------------------------------------------
+;; Find the Window Manager module and its workspace, ensure that it is the
+;; right version and we are off.
+;;-----------------------------------------------------------------------------
+
+init    Entry   "R1-R5,WP"
+
+        MOV     R0,#ModHandReason_LookupName
+        ADR     R1,wimp_name
+        SWI     XOS_Module              ; attempt to find the Window Manager module
+
+        MOVVC   R0,#0
+        MOVVC   R1,R3                   ; pointer to code area
+        LDRVC   R2,[R1,#-4]             
+        SUBVC   R2,R2,#4
+        ADDVC   R2,R2,R1                ; pointer to end of module
+        MOVVC   R3,#1                   ; increment through the code
+        SWIVC   XOS_CRC
+        EXIT    VS                      ; either failed to find the module / crc
+
+        LDR     R1,=wimpchecksum
+        TEQ     R0,R1                   ; are the checksums the same?
+        STREQ   R4,[WP]                 ;   if they are then the private word is the Wimp's workspace pointer
+
+        EXITS
+
+wimp_name
+        = "WindowManager",0
+        ALIGN
+              
+
+                          
+;; On die we must clear our private word, because if all is well it will
+;; contain the Window Managers workspace pointer - aaarggghh and if it
+;; is non-zero then the Module handler will release the block and
+;; then things become kinda messy.
+
+die     Entry   
+        MOV     LR,#0
+        STR     LR,[WP]                 ; mark as not having any workspace
+        EXITS                           ;   and return without a care in the world...
+
+
+
+;;-----------------------------------------------------------------------------
+;; Service handler used to watch for tasks disappearing, if the fixes must be
+;; applied then it will peek/poke the Window Managers workspace to 
+;; fix the buttons flags.
+;;-----------------------------------------------------------------------------
+           
+service
+        Push    "LR"
+        TEQ     R1,#Service_WimpCloseDown
+        LDRNE   LR,=Service_WindowDeleted
+        TEQNE   R1,LR
+        Pull    "PC",NE,^
+
+        Push    "R0-R2"
+    
+        LDR     WP,[WP]
+        TEQ     WP,#0                   ; is the workspace pointer non-zero?
+        Pull    "R0-R2,PC",EQ,^         ;   if not then ignore the request
+
+        TEQ     R1,LR
+        LDR     R1,[WP,#Wimp_BorderWindow]
+        BNE     %FT10
+
+        SUB     R0,R0,#1                ; which window is being deleted?
+        TEQ     R0,R1
+        Pull    "R0-R2,PC",NE,^
+10
+        LDR     R0,[WP,#Wimp_BorderIcon]
+        CMP     R1,#nullptr 
+        CMPEQ   R0,#nullptr             ; is the border active?
+        Pull    "R0-R2,PC",EQ,^         ;   if not then ignore the call
+              
+        LDR     LR,[R1,#w_taskhandle]
+        MOV     R2,R2,LSL #16
+        TEQ     LR,R2,LSR #16           ; is it the right task owning the window?
+        MOVEQ   LR,#nullptr             ;   if so then return back to the task
+        STREQ   LR,[WP,#Wimp_BorderIcon]
+        STREQ   LR,[WP,#Wimp_BorderWindow]
+
+        Pull    "R0-R2,PC",,^
+
+
+
+        END

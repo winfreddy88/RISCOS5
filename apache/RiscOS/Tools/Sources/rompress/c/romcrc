@@ -1,0 +1,302 @@
+/* Copyright 2012 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*
+ * ROM footer/checksum code borrowed from romlinker
+ *
+ * Copyright (C) Pace Micro Technology plc. 2001
+ *
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>
+#include <errno.h>
+#include <stdint.h>
+#include <stdbool.h>
+
+/* CLX headers */
+#include "CLX/err.h"
+
+/* Local headers */
+#include "romcrc.h"
+#include "rompress.h"
+
+/* Whether to calculate the (unused) 16-bit CRC */
+//#define DO_16BIT_CRC
+
+/* Some useful constants */
+enum {
+  crc_magic = 0xA001,                       /* CRC algorithm magic number */
+  crc_table_size = 1<<8                     /* Do not change this one */
+};
+
+/* This structure holds all the local state for a CRC job */
+typedef struct {
+  /* Footer data */
+  romfooter_params *params;
+  /* ROM data */
+  uint8_t *rom;
+  uint32_t rom_length;
+  /* CRC state */
+  uint32_t rom_position;               /* Where we are in the ROM */
+  uint32_t neg_checksum;               /* The negative checksum */
+#ifdef DO_16BIT_CRC
+  uint32_t crc_16;                     /* 16-bit CRC */
+#endif
+  uint32_t crc_64[4];                  /* 64-bit CRC */
+} romfooter_state;
+
+static uint32_t crc_table[crc_table_size];  /* Speeds up CRC calculation */
+
+static void init_crc_table(void)
+{
+  int i, j;
+  uint32_t crc;
+  static bool init=false;
+
+  if(init)
+    return;
+  init = true;
+
+  for (i=0; i<crc_table_size; ++i) {
+    crc = i;
+    for (j=0; j < 8; ++j) {
+      const uint32_t eor = (crc & 1) ? crc_magic : 0;
+      crc = (crc >> 1) ^ eor;
+    }
+    crc_table[i] = crc;
+  }
+}
+
+static void romcrc_init(romfooter_state *state,romfooter_params *params,char *rom,uint32_t len)
+{
+  memset(state,0,sizeof(romfooter_state));
+  state->params = params;
+  state->rom = (uint8_t *) rom;
+  state->rom_length = len;
+  init_crc_table();
+}
+
+/* CRC check/calculation functions */
+
+static void romcrc_byte(romfooter_state *state,uint32_t c)
+{
+  uint32_t index, crc;
+
+  c &= 0xff;
+
+  index = state->rom_position & 3;
+
+  state->rom_position++;
+
+  /* Update total checksum */
+  state->neg_checksum -= c << (index * 8UL);
+#ifdef DO_16BIT_CRC
+  /* Update 16-bit checksum */
+  crc = state->crc_16 ^ c;
+  state->crc_16 = (crc >> 8UL) ^ crc_table[crc & 0xFF];
+#endif
+  /* Update 64-bit checksum */
+  crc = state->crc_64[index] ^ c;
+  state->crc_64[index] = (crc >> 8UL) ^ crc_table[crc & 0xFF];
+}
+
+static void romcrc_block(romfooter_state *state,uint32_t len)
+{
+  while(len--)
+  {
+    romcrc_byte(state,state->rom[state->rom_position]);
+  }
+}
+
+/* Reading from ROM image and updating CRC */
+
+static uint32_t romcrc_readbyte(romfooter_state *state)
+{
+  uint32_t c = state->rom[state->rom_position];
+  romcrc_byte(state,c);
+  return c;
+}
+
+static uint32_t romcrc_readword(romfooter_state *state)
+{
+  while(state->rom_position & 3)
+  {
+    romcrc_readbyte(state);
+  }
+
+  uint32_t word = 0;
+  for(int i=0;i<4;i++)
+  {
+    word |= romcrc_readbyte(state) << (i<<3);
+  }
+  return word;
+}
+
+/* Reading from ROM image *without* updating CRC */
+
+static uint32_t romcrc_peekbyte(romfooter_state *state)
+{
+  return state->rom[state->rom_position];
+}
+
+static uint32_t romcrc_peekword(romfooter_state *state)
+{
+  uint32_t offset = (state->rom_position+3)>>2;
+  return ((uint32_t *) state->rom)[offset];
+}
+
+/* Writing to ROM image and updating CRC */
+
+static void romcrc_writebyte(romfooter_state *state,uint32_t c)
+{
+  state->rom[state->rom_position] = c;
+  romcrc_byte(state,c);
+}
+
+static void romcrc_writeword(romfooter_state *state,uint32_t word)
+{
+  while(state->rom_position & 3)
+  {
+    romcrc_writebyte(state,0xff);
+  }
+
+  for(int i=0;i<4;i++)
+  {
+    romcrc_writebyte(state,word);
+    word >>= 8;
+  }
+}
+
+/* Main functions */  
+
+uint32_t romcrc_getfootersize(romfooter_params *params)
+{
+  return 20+(params->ext_footer_len?params->ext_footer_len+4:0);
+}
+
+void romcrc_addfooter(char *rom,uint32_t len,romfooter_params *params)
+{
+  uint32_t footer_size;
+  romfooter_state state;
+
+  romcrc_init(&state,params,rom,len);
+
+  footer_size = romcrc_getfootersize(params);
+
+  if((len & 3) || (len < footer_size))
+    err_fail("romcrc_addfooter: Bad ROM length");
+
+  romcrc_block(&state,len-footer_size);
+
+  if(params->ext_footer_len)
+  {
+    if (params->ext_footer_len > 65534) { /* 65535 could be confused with padding */
+      err_fail("Extended footer too long (%d bytes)",params->ext_footer_len);
+    }
+    uint32_t crc=0;
+    /* Write extended footer, and calculate CRC */
+    for(int i = 0; i < params->ext_footer_len; ++i) {
+      romcrc_writebyte(&state, params->ext_footer[i]);
+      crc ^= params->ext_footer[i];
+      crc = (crc >> 8) ^ crc_table[crc & 0xFF];
+    }
+    /* Write CRC & length */
+    romcrc_writeword(&state, (crc << 16UL) | params->ext_footer_len);
+  }
+    
+
+  romcrc_writeword(&state, 0);                       /* Write POST zero word */
+  romcrc_writeword(&state, state.params->signature); /* ROM signature */
+  romcrc_writeword(&state, state.neg_checksum);      /* Negative checksum */
+  for (int i = 0; i < 8; ++i) {                      /* 64-bit checksum */
+    romcrc_writebyte(&state, state.crc_64[i & 3]);   /* XXX - this looks wrong? */
+  }
+}
+
+bool romcrc_getfooter(char *rom,uint32_t len,romfooter_params *params)
+{
+  uint32_t footer_size = 20;
+  uint32_t temp;
+  romfooter_state state;
+  bool valid = true;
+
+  memset(params,0,sizeof(romfooter_params));
+  romcrc_init(&state,params,rom,len);
+
+  if((len & 3) || (len < footer_size))
+    err_fail("romcrc_addfooter: Bad ROM length");
+
+  romcrc_block(&state,len-footer_size);
+
+  /* Read POST word */
+  temp = romcrc_readword(&state);
+  if(temp != 0)
+     fprintf(stderr,"Warning: POST word nonzero (%08x)\n",temp);
+
+  /* Read signature */
+  params->signature = romcrc_readword(&state);
+
+  /* Read negative checksum */
+  params->neg_checksum = romcrc_peekword(&state);
+  if(params->neg_checksum != state.neg_checksum)
+  {
+    valid = false;
+    fprintf(stderr,"Warning: ROM negative checksum doesn't match (ROM says %08x, I say %08x)\n",params->neg_checksum,state.neg_checksum);
+  }
+  romcrc_block(&state,4);
+
+  /* Read 64-bit checksum */
+  for(int i=0;i<8;i++)
+  {
+    uint32_t index = i & 3;
+    temp = romcrc_peekbyte(&state);
+    if(temp != (state.crc_64[index] & 0xff))
+    {
+      valid = false;
+      fprintf(stderr,"Warning: Byte %d of 64bit checksum doesn't match (ROM says %02x, I say %02x)\n",i,temp,state.crc_64[index] & 0xff);
+    }
+    romcrc_byte(&state,temp);
+  }
+
+  /* Regardless of whether the above was valid, attempt to extract the extended footer
+     Since this is optional, we can't complain if we don't find it (or it looks corrupt) */
+  uint32_t ext_footer_len = rom[len-(footer_size+4)] | (rom[len-(footer_size+3)]<<8);
+  uint32_t crc = rom[len-(footer_size+2)] | (rom[len-(footer_size+1)]<<8);
+  if(ext_footer_len && (ext_footer_len <= 65534) && (ext_footer_len+footer_size+4 < len))
+  {
+    char *ext_footer = rom+len-footer_size-4-ext_footer_len;
+    uint32_t crc2 = 0;
+    uint32_t next_len = 1;
+    for(int i=0;i<ext_footer_len;i++)
+    {
+      crc2 ^= ext_footer[i];
+      crc2 = (crc2 >> 8) ^ crc_table[crc2 & 0xFF];
+      if(i == next_len)
+      {
+        /* Make sure the data in the footer doesn't overrun the footer itself */
+        next_len = i+ext_footer[i]+2;
+      }
+    }
+    if((crc == crc2) && (next_len == ext_footer_len+1))
+    {
+      params->ext_footer = safemalloc(ext_footer_len);
+      params->ext_footer_len = ext_footer_len;
+      memcpy(params->ext_footer,ext_footer,ext_footer_len);
+    }
+  }
+
+  return valid;
+}

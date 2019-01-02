@@ -1,0 +1,523 @@
+/*
+ * Copyright (c) 2010, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include "modhead.h"
+#include "swis.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stddef.h>
+
+#include "Global/RISCOS.h"
+#include "Global/Services.h"
+#include "Global/HALDevice.h"
+#include "Global/HALEntries.h"
+#include "Global/GraphicsV.h"
+
+#include "DebugLib/DebugLib.h"
+
+#include "globals.h"
+#include "graphicsv.h"
+#include "dss.h"
+#include "venc.h"
+#include "sdma.h"
+
+void *private_word;
+int instance;
+
+vdu_device *dev = 0;
+uint8_t graphicsv_driver_number = 0;
+const boardconfig *hwconfig = 0;
+
+overlay overlays[OVERLAY_MAX];
+uint32_t vdu_init = ~0;
+uint32_t dsi_pll_current_pixel_rate = 0;
+lcdtimings current_timings;
+int current_lcd = 0;
+tvmode current_tvmode = TVMODE_NTSC_601;
+tvouttype current_tvtype = TVOUT_NONE;
+bool testcard = false;
+transparencycfg current_transparencycfgs[TARGET_MAX] =
+{TRANSPARENCY_TCK_VIDSRC,TRANSPARENCY_TCK_VIDSRC};
+overlayidx overlay_desktop = OVERLAY_GFX;
+overlayidx overlay_pointer = OVERLAY_VID2;
+overlaytarget default_display = TARGET_LCD;
+bool blanked = false;
+
+uint32_t *gfx_palette_l;
+uint32_t gfx_palette_p;
+uint32_t gfx_palette_ro[256];
+palette_func gfx_palette_func = NULL;
+uint32_t mouse_palette_soft[4];
+bool mouse_dirty;
+uint32_t *mouse_image_l;
+uint32_t mouse_image_p;
+uint8_t mouse_image_soft[32*32/4];
+uint32_t mouse_palette_ro[4];
+palette_func mouse_palette_func = NULL;
+
+const uint8_t overlay_format_bpp[16] = {1,2,4,8,16,16,16,16,32,24,16,16,32,32,32,16};
+const uint32_t fifo_preload_for_lcd[LCD_MAX] = {0, 0x100, 0x72, 0xE0, 0xE0};
+const uint32_t transparency_lut[TARGET_MAX][TRANSPARENCY_MAX] =
+{
+	{
+		0,
+		DISPC_CONFIG_TCKLCDENABLE | DISPC_CONFIG_TCKLCDSELECTION,
+		DISPC_CONFIG_TCKLCDENABLE,
+		DISPC_CONFIG_TCKLCDENABLE | DISPC_CONFIG_LCDALPHABLENDERENABLE,
+		DISPC_CONFIG_LCDALPHABLENDERENABLE,
+	},
+	{
+		0,
+		DISPC_CONFIG_TCKTVENABLE | DISPC_CONFIG_TCKTVSELECTION,
+		DISPC_CONFIG_TCKTVENABLE,
+		DISPC_CONFIG_TCKTVENABLE | DISPC_CONFIG_TVALPHABLENDERENABLE,
+		DISPC_CONFIG_TVALPHABLENDERENABLE,
+	},
+};
+
+int exp_synclost_count = 0;
+
+_kernel_oserror *module_init(const char *cmd_tail, int podule_base, void *pw)
+{
+	_kernel_oserror* e = 0;
+	uint32_t mask = 0;
+
+	(void)cmd_tail;
+
+	/* set up debugging */
+	debug_initialise(Module_Title, "", "");
+	debug_set_device(HAL_OUTPUT);
+	debug_set_unbuffered_files(TRUE);
+
+	instance = podule_base;
+
+	private_word = pw;
+
+	/* Hunt for the HAL device */
+	int pos = 0;
+	do
+	{
+		e = _swix(OS_Hardware, _INR(0,1) | _IN(8) | _OUTR(1,2),
+				  HALDeviceType_Video + HALDeviceVideo_VDU, pos, 4, &pos, &dev);
+		if (e)
+			goto error;
+		if (pos == -1)
+		{
+			return (_kernel_oserror *)"\0\0\0\0No OMAP video devices found";
+		}
+	} while (dev->dev.id != HALDeviceID_VDU_OMAP4);
+
+	/* Call the Activate entry to turn on the clocks and make sure everything's OK */
+	if (!(dev->dev.Activate)(&dev->dev))
+	{
+		return (_kernel_oserror *)"\0\0\0\0Video device failed to activate";
+	}
+
+	/* Get boardconfig/hwconfig struct */
+	hwconfig = (boardconfig *)dev->devicespecificfield;
+
+	/* Turn all the displays off */
+	for (int i = 0; i < hwconfig->num_lcds; i++)
+		(hwconfig->lcd_configs[i].power)(dev, 0);
+
+	/* Make sure overlays are marked as disabled */
+	for (int i = 0; i < OVERLAY_MAX; i++)
+	{
+		memset(&overlays[i], 0, sizeof(overlay));
+		overlays[i].target = TARGET_NONE;
+	}
+
+	/* Get hardware addresses */
+	dss		= (dss_regs_t *)dev->dev.address;
+	dispc	= (dispc_regs_t *)(((uint32_t)dev->dev.address) + DISPC_BASE);
+	rfbi	= (rfbi_regs_t *)(((uint32_t)dev->dev.address) + RFBI_BASE);
+	venc	= (venc_regs_t *)(((uint32_t)dev->dev.address) + VENC_BASE);
+	dsi		= (dsi_regs_t *)(((uint32_t)dev->dev.address) + DSI2_PROTOCOL_ENGINE);
+	dsi_phy	= (dsi_phy_regs_t *)(((uint32_t)dev->dev.address) + DSI2_PHY);
+	dsi_pll	= (dsi_pll_regs_t *)(((uint32_t)dev->dev.address) + DSI2_PLLCTRL);
+	sdma = hwconfig->dma_ptr;
+
+	/* Get address of the sole DMA channel we use */
+	mask = hwconfig->dma_chans;
+	if (mask)
+	{
+		sdmachan = &sdma->chans[0];
+		while (!(mask & 1))
+		{
+			sdmachan++;
+			mask = mask >> 1;
+		}
+		dprintf(("", "Using DMA channel at %08x\n", (uint32_t)sdmachan));
+		/* Make sure channel is in a sane state */
+		sdma_sync();
+		sdmachan->clnk_ctrl = 0;
+		sdmachan->cicr = 0;
+	}
+	else
+		sdmachan = 0;
+
+	/* Perform a reset so that we can safely enable IRQs */
+	e = dss_reset();
+
+	if (e)
+		goto error2;
+
+	/* Get some workspace from the PCI module */
+	e = _swix(PCI_RAMAlloc, _INR(0,2) | _OUTR(0,1), 4*256+32*32*4, 32, 0,
+			  &gfx_palette_l, &gfx_palette_p);
+
+	if (e)
+		goto error2;
+
+	mouse_image_l = gfx_palette_l + 256;
+	mouse_image_p = gfx_palette_p + 256*4;
+
+	/* Pick our initial palette func */
+	select_palette_func(OVERLAY_ATTRIBUTES_FORMAT_BMP1, true);
+
+	/* Claim & enable */
+	e = _swix(OS_ClaimDeviceVector, _INR(0,4), dev->dev.devicenumber,
+			  dispc_irq_entry, pw, 0, 0);
+
+	if (e)
+		goto error3;
+
+	e = _swix(OS_Hardware, _IN(0) | _INR(8,9), dev->dev.devicenumber & ~(1u << 31), 0,
+			  EntryNo_HAL_IRQEnable);
+
+	if (e)
+		goto error4;
+
+	/* Get on GraphicsV! */
+	e = _swix(OS_Claim, _INR(0,2), GraphicsV, graphicsv_entry, pw);
+
+	if (e)
+		goto error4;
+
+	dprintf(("", "Finished module initialisation, DSS regs=%08x\n", (uint32_t)dss));
+
+	return 0;
+
+error4:
+	/* Release IRQ */
+	_swix(OS_ReleaseDeviceVector, _INR(0,4), dev->dev.devicenumber, dispc_irq_entry, pw, 0, 0);
+error3:
+	/* Release memory */
+	_swix(PCI_RAMFree, _IN(0), gfx_palette_l);
+	gfx_palette_l = mouse_image_l = NULL;
+	gfx_palette_p = mouse_image_p = 0;
+error2:
+	/* Deactivate */
+	(dev->dev.Deactivate)(&dev->dev);
+	dev = 0;
+error:
+	dprintf(("", "Failed initialisation: %s\n", e->errmess));
+	return e;
+}
+
+_kernel_oserror *module_final(int fatal, int podule, void *pw)
+{
+	_kernel_oserror *e = 0;
+
+	(void)fatal;
+	(void)podule;
+
+	_swix(OS_Release, _INR(0,2), GraphicsV, graphicsv_entry, pw);
+
+	if (dev)
+	{
+		/* Disable displays */
+		for (int i = 0; i < hwconfig->num_lcds; i++)
+			(hwconfig->lcd_configs[i].power)(dev, 0);
+
+		e = _swix(OS_ReleaseDeviceVector, _INR(0,4), dev->dev.devicenumber,
+				  dispc_irq_entry, pw, 0, 0);
+		if (e)
+			return e;
+		(dev->dev.Deactivate)(&dev->dev);
+		dev = 0;
+	}
+
+	if (gfx_palette_l)
+	{
+		e = _swix(PCI_RAMFree, _IN(0), gfx_palette_l);
+		if (e)
+			return e;
+		gfx_palette_l = mouse_image_l = NULL;
+		gfx_palette_p = mouse_image_p = 0;
+	}
+
+	return NULL;
+}
+
+#ifdef DEBUGLIB
+#define DUMPREG(BANK,REG) printf("%08x: %08x %s.%s\n", (uint32_t)&(BANK->REG), BANK->REG, #BANK, #REG)
+
+_kernel_oserror *module_commands(const char *arg_string, int argc, int cmd_no, void *pw)
+{
+	(void)argc;
+	(void)pw;
+#ifndef SUPPORT_TV_MODE
+	(void)arg_string;
+#endif /* !SUPPORT_TV_MODE */
+
+	switch (cmd_no)
+	{
+		case CMD_VideoRegs:
+			DUMPREG(dss, sysstatus);
+			DUMPREG(dss, ctrl);
+			DUMPREG(dss, status);
+			DUMPREG(dispc, sysconfig);
+			DUMPREG(dispc, sysstatus);
+			DUMPREG(dispc, irqstatus);
+			DUMPREG(dispc, irqenable);
+			DUMPREG(dispc, control1);
+			DUMPREG(dispc, config1);
+			DUMPREG(dispc, control2);
+			DUMPREG(dispc, config2);
+//			DUMPREG(dispc, default_color[0]);
+			DUMPREG(dispc, default_color[1]);
+			DUMPREG(dispc, default_color2);
+//			DUMPREG(dispc, trans_color[0]);
+			DUMPREG(dispc, trans_color[1]);
+			DUMPREG(dispc, trans_color2);
+			DUMPREG(dispc, line_status);
+			DUMPREG(dispc, line_number);
+			DUMPREG(dispc, timing_h2);
+			DUMPREG(dispc, timing_v2);
+			DUMPREG(dispc, pol_freq2);
+			DUMPREG(dispc, divisor2);
+			DUMPREG(dispc, global_alpha);
+			DUMPREG(dispc, size_tv);
+			DUMPREG(dispc, size_lcd2);
+			DUMPREG(dispc, gfx.ba[0]);
+			DUMPREG(dispc, gfx.ba[1]);
+			DUMPREG(dispc, gfx.position);
+			DUMPREG(dispc, gfx.size);
+			DUMPREG(dispc, gfx.attributes);
+			DUMPREG(dispc, gfx.buf_threshold);
+			DUMPREG(dispc, gfx.buf_size_status);
+			DUMPREG(dispc, gfx.row_inc);
+			DUMPREG(dispc, gfx.pixel_inc);
+			DUMPREG(dispc, gfx.window_skip);
+			DUMPREG(dispc, gfx.table_ba);
+			DUMPREG(dispc, vid1.ba[0]);
+			DUMPREG(dispc, vid1.ba[1]);
+			DUMPREG(dispc, vid1.position);
+			DUMPREG(dispc, vid1.size);
+			DUMPREG(dispc, vid1.attributes);
+			DUMPREG(dispc, vid1.buf_threshold);
+			DUMPREG(dispc, vid1.buf_size_status);
+			DUMPREG(dispc, vid1.row_inc);
+			DUMPREG(dispc, vid1.pixel_inc);
+			DUMPREG(dispc, vid1.fir);
+			DUMPREG(dispc, vid1.picture_size);
+//			DUMPREG(dispc, vid1.accui[0]);
+//			DUMPREG(dispc, vid1.accui[1]);
+//			DUMPREG(dispc, vid1.fir_coef[0].h);
+//			DUMPREG(dispc, vid1.fir_coef[0].hv);
+//			DUMPREG(dispc, vid1.fir_coef[1].h);
+//			DUMPREG(dispc, vid1.fir_coef[1].hv);
+//			DUMPREG(dispc, vid1.fir_coef[2].h);
+//			DUMPREG(dispc, vid1.fir_coef[2].hv);
+//			DUMPREG(dispc, vid1.fir_coef[3].h);
+//			DUMPREG(dispc, vid1.fir_coef[3].hv);
+//			DUMPREG(dispc, vid1.fir_coef[4].h);
+//			DUMPREG(dispc, vid1.fir_coef[4].hv);
+//			DUMPREG(dispc, vid1.fir_coef[5].h);
+//			DUMPREG(dispc, vid1.fir_coef[5].hv);
+//			DUMPREG(dispc, vid1.fir_coef[6].h);
+//			DUMPREG(dispc, vid1.fir_coef[6].hv);
+//			DUMPREG(dispc, vid1.fir_coef[7].h);
+//			DUMPREG(dispc, vid1.fir_coef[7].hv);
+//			DUMPREG(dispc, vid1.conv_coef[0]);
+//			DUMPREG(dispc, vid1.conv_coef[1]);
+//			DUMPREG(dispc, vid1.conv_coef[2]);
+//			DUMPREG(dispc, vid1.conv_coef[3]);
+//			DUMPREG(dispc, vid1.conv_coef[4]);
+			DUMPREG(dispc, vid2.ba[0]);
+			DUMPREG(dispc, vid2.ba[1]);
+			DUMPREG(dispc, vid2.position);
+			DUMPREG(dispc, vid2.size);
+			DUMPREG(dispc, vid2.attributes);
+			DUMPREG(dispc, vid2.buf_threshold);
+			DUMPREG(dispc, vid2.buf_size_status);
+			DUMPREG(dispc, vid2.row_inc);
+			DUMPREG(dispc, vid2.pixel_inc);
+			DUMPREG(dispc, vid2.fir);
+			DUMPREG(dispc, vid2.picture_size);
+//			DUMPREG(dispc, vid2.accui[0]);
+//			DUMPREG(dispc, vid2.accui[1]);
+//			DUMPREG(dispc, vid2.fir_coef[0].h);
+//			DUMPREG(dispc, vid2.fir_coef[0].hv);
+//			DUMPREG(dispc, vid2.fir_coef[1].h);
+//			DUMPREG(dispc, vid2.fir_coef[1].hv);
+//			DUMPREG(dispc, vid2.fir_coef[2].h);
+//			DUMPREG(dispc, vid2.fir_coef[2].hv);
+//			DUMPREG(dispc, vid2.fir_coef[3].h);
+//			DUMPREG(dispc, vid2.fir_coef[3].hv);
+//			DUMPREG(dispc, vid2.fir_coef[4].h);
+//			DUMPREG(dispc, vid2.fir_coef[4].hv);
+//			DUMPREG(dispc, vid2.fir_coef[5].h);
+//			DUMPREG(dispc, vid2.fir_coef[5].hv);
+//			DUMPREG(dispc, vid2.fir_coef[6].h);
+//			DUMPREG(dispc, vid2.fir_coef[6].hv);
+//			DUMPREG(dispc, vid2.fir_coef[7].h);
+//			DUMPREG(dispc, vid2.fir_coef[7].hv);
+//			DUMPREG(dispc, vid2.conv_coef[0]);
+//			DUMPREG(dispc, vid2.conv_coef[1]);
+//			DUMPREG(dispc, vid2.conv_coef[2]);
+//			DUMPREG(dispc, vid2.conv_coef[3]);
+//			DUMPREG(dispc, vid2.conv_coef[4]);
+			DUMPREG(dispc, data2_cycle[0]);
+			DUMPREG(dispc, data2_cycle[1]);
+			DUMPREG(dispc, data2_cycle[2]);
+			DUMPREG(dispc, cpr2_coef_r);
+			DUMPREG(dispc, cpr2_coef_g);
+			DUMPREG(dispc, cpr2_coef_b);
+			DUMPREG(dispc, gfx_preload);
+			DUMPREG(dispc, vid_preload[0]);
+			DUMPREG(dispc, vid_preload[1]);
+			DUMPREG(dsi, sysconfig);
+			DUMPREG(dsi, sysstatus);
+			DUMPREG(dsi, ctrl);
+			DUMPREG(dsi, clk_ctrl);
+			DUMPREG(dsi_pll, control);
+			DUMPREG(dsi_pll, status);
+//			DUMPREG(dsi_pll, go);
+			DUMPREG(dsi_pll, configuration1);
+			DUMPREG(dsi_pll, configuration2);
+			DUMPREG(dsi_pll, configuration3);
+			DUMPREG(dsi_pll, configuration4);
+			printf("Ban state: %08x\n", ban_hardware_update);
+			break;
+		case CMD_TVMode:
+#ifdef SUPPORT_TV_MODE
+			{
+				char *str;
+				int mode = (int)strtoul(arg_string, &str, 10);
+				int type = (int)strtoul(str, &str, 10);
+				int testmode = (int)strtoul(str, 0, 10);
+				venc_set_tvmode((tvmode)mode, (tvouttype)type, (bool)testmode);
+			}
+#endif /* SUPPORT_TV_MODE */
+			break;
+		case CMD_TVRegs:
+			DUMPREG(venc, status);
+			DUMPREG(venc, f_control);
+			DUMPREG(venc, vidout_ctrl);
+			DUMPREG(venc, sync_ctrl);
+			DUMPREG(venc, llen);
+			DUMPREG(venc, flens);
+			DUMPREG(venc, hfltr_ctrl);
+			DUMPREG(venc, cc_carr_wss_carr);
+			DUMPREG(venc, c_phase);
+			DUMPREG(venc, gain_u);
+			DUMPREG(venc, gain_y);
+			DUMPREG(venc, gain_v);
+			DUMPREG(venc, black_level);
+			DUMPREG(venc, blank_level);
+			DUMPREG(venc, x_color);
+			DUMPREG(venc, m_control);
+			DUMPREG(venc, bstamp_wss_data);
+			DUMPREG(venc, s_carr);
+			DUMPREG(venc, line21);
+			DUMPREG(venc, ln_sel);
+			DUMPREG(venc, l21_wc_ctl);
+			DUMPREG(venc, htrigger_vtrigger);
+			DUMPREG(venc, savid_eavid);
+			DUMPREG(venc, flen_fal);
+			DUMPREG(venc, lal_phase_reset);
+			DUMPREG(venc, hs_int_start_stop_x);
+			DUMPREG(venc, hs_ext_start_stop_x);
+			DUMPREG(venc, vs_int_start_x);
+			DUMPREG(venc, vs_int_stop_x_vs_int_start_y);
+			DUMPREG(venc, vs_int_stop_y_vs_ext_start_x);
+			DUMPREG(venc, vs_ext_stop_x_vs_ext_start_y);
+			DUMPREG(venc, vs_ext_stop_y);
+			DUMPREG(venc, avid_start_stop_x);
+			DUMPREG(venc, avid_start_stop_y);
+			DUMPREG(venc, fid_int_start_x_fid_int_start_y);
+			DUMPREG(venc, fid_int_offset_y_fid_ext_start_x);
+			DUMPREG(venc, fid_ext_start_y_fid_ext_offset_y);
+			DUMPREG(venc, tvdetgp_int_start_stop_x);
+			DUMPREG(venc, tvdetgp_int_start_stop_y);
+			DUMPREG(venc, gen_ctrl);
+			DUMPREG(venc, output_control);
+			DUMPREG(venc, output_test);
+			DUMPREG(dispc, control1);
+			DUMPREG(dss, ctrl);
+			break;
+		case CMD_TVOut:
+#ifdef SUPPORT_TV_MODE
+			{
+				int mode = (int)strtoul(arg_string, 0, 10);
+				default_display = (mode ? TARGET_TV : TARGET_LCD);
+				/* Don't bother with hardware update for now */
+			}
+#endif /* SUPPORT_TV_MODE */
+			break;
+		case CMD_SDMARegs:
+			DUMPREG(sdma, irqstatus[0]);
+			DUMPREG(sdma, irqstatus[1]);
+			DUMPREG(sdma, irqstatus[2]);
+			DUMPREG(sdma, irqstatus[3]);
+			DUMPREG(sdma, irqenable[0]);
+			DUMPREG(sdma, irqenable[1]);
+			DUMPREG(sdma, irqenable[2]);
+			DUMPREG(sdma, irqenable[3]);
+			DUMPREG(sdma, sysstatus);
+			DUMPREG(sdma, ocp_sysconfig);
+			DUMPREG(sdma, gcr);
+			DUMPREG(sdmachan, ccr);
+			DUMPREG(sdmachan, clnk_ctrl);
+			DUMPREG(sdmachan, cicr);
+			DUMPREG(sdmachan, csr);
+			DUMPREG(sdmachan, csdp);
+			DUMPREG(sdmachan, cen);
+			DUMPREG(sdmachan, cfn);
+			DUMPREG(sdmachan, cssa);
+			DUMPREG(sdmachan, cdsa);
+			DUMPREG(sdmachan, csei);
+			DUMPREG(sdmachan, csfi);
+			DUMPREG(sdmachan, cdei);
+			DUMPREG(sdmachan, cdfi);
+			DUMPREG(sdmachan, csac);
+			DUMPREG(sdmachan, cdac);
+			DUMPREG(sdmachan, ccen);
+			DUMPREG(sdmachan, ccfn);
+			DUMPREG(sdmachan, color);
+			printf("%d fills\n%d copy 1\n%d copy 2\n%d copy 3\n",
+				   sdma_stats[0], sdma_stats[1], sdma_stats[2], sdma_stats[3]);
+			memset(sdma_stats, 0, sizeof(sdma_stats));
+			break;
+	}
+
+	return 0;
+}
+#endif

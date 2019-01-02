@@ -1,0 +1,691 @@
+/** @file
+
+...
+
+  */
+/* Created 22.06.2010 T. Milius
+   Changed 10.05.2012 T. Milius adapted to work with USB stack versions newer than V0.49 */
+/* Copyright (c) 2010-2012 by Thomas Milius Stade, Germany
+* All rights reserved.
+*
+* Redistribution and use in source and binary forms, with or without
+* modification, are permitted provided that the following conditions are met:
+*     * Redistributions of source code must retain the above copyright
+*       notice, this list of conditions and the following disclaimer.
+*     * Redistributions in binary form must reproduce the above copyright
+*       notice, this list of conditions and the following disclaimer in the
+*       documentation and/or other materials provided with the distribution.
+*     * Neither the name of Thomas Milius Stade, Germany nor the
+*       names of its contributors may be used to endorse or promote products
+*       derived from this software without specific prior written permission.
+*
+* THIS SOFTWARE IS PROVIDED BY Thomas Milius Stade, Germany ``AS IS'' AND ANY
+* EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+* WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+* DISCLAIMED. IN NO EVENT SHALL Thomas Milius Stade, Germany BE LIABLE FOR ANY
+* DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+* (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+* LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+* ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+* (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+* SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE. */
+/* RISC OS */
+
+/* !!!!!!!!!! libraries !!!!!!!!!! */
+/* ------------ RISC OS ------------ */
+#include "kernel.h"
+#include "swis.h"
+
+/* ------------ Own ------------ */
+#include "ftdimodhead.h"
+#ifdef DEBUG
+#include "debug.h"
+#endif
+#include "callback.h"
+
+/* !!!!!!!!!!! definitions !!!!!!!!!! */
+
+/* !!!!!!!!!! data structures !!!!!!!!!! */
+struct callback_request_structure {
+struct risc_os_ftdi_structure *risc_os_ftdi;
+int io_info;
+};
+
+struct callback_request_list_structure {
+int no_of_requests;
+struct callback_request_structure request[FTDI_MAX_NUMBER_CALLBACK_REQUESTS];
+};
+
+struct callback_request_list_structure callback_requests={.no_of_requests=0};
+
+/* !!!!!!!!!! support functions !!!!!!!!!! */
+/* ---------- DeviceFS Buffer handling ---------- */
+/** Inline Assembler adapter to perform RISC OS buffer operations.
+    Registers are filled on one side from given register set and on the other
+    side with buffer informations stored inside given buffer info structure. */
+_kernel_oserror *perform_risc_os_buffer_operation(_kernel_swi_regs *regs,
+                                                  struct risc_os_buffer_info_structure *risc_os_buffer_info)
+{
+
+/* ARM ADS */
+__asm
+  {
+  MOV R0,regs->r[0]
+  MOV R1,risc_os_buffer_info->id
+  MOV R2,regs->r[2]
+  MOV R3,regs->r[3]
+  MOV R12, risc_os_buffer_info->ws
+  /* Format: registers input output corrupted
+     BLX is only useable from ARMv5 onwards */
+  BLX risc_os_buffer_info->routine, {R0-R3,R12}, {R2,R3}, {LR,PSR}
+  MOV regs->r[2],R2
+  MOV regs->r[3],R3
+  }
+return NULL;
+}
+
+_kernel_oserror *callback_teof(struct risc_os_ftdi_structure *risc_os_ftdi,
+                               int *external_transfer_result)
+{
+int bytes_to_transfer;
+unsigned int bytes_in_buffer;
+int transfer_result;
+_kernel_swi_regs regs;
+_kernel_oserror *error_os;
+
+/* Check whether buffer is full which indicates a successful transfer.
+   This can be done in non exclusive mode because the used
+   space becomes larger and larger from USB side and the
+   USB routine is the only filler. */
+regs.r[0]=6;
+if ((error_os=perform_risc_os_buffer_operation(&regs,
+                                               &risc_os_ftdi->input.risc_os_buffer_info)) != NULL) {
+  risc_os_ftdi->input.bytes_requested=0;
+  risc_os_ftdi->input.bytes_buffered=0;
+  return error_os;
+  }
+bytes_in_buffer=regs.r[2];
+/* Also check transmission state for abort or successful transfer. */
+regs.r[0]=(int) 0x80000006;
+/* ??? use faster reference. */
+regs.r[1]=(int) risc_os_ftdi->device_name;
+regs.r[2]=risc_os_ftdi->input.usb_stream_handle;
+if ((error_os=_kernel_swi(DeviceFS_CallDevice, &regs, &regs)) != NULL) {
+  risc_os_ftdi->input.bytes_requested=0;
+  risc_os_ftdi->input.bytes_buffered=0;
+  return error_os;
+  }
+transfer_result=regs.r[3];
+if (external_transfer_result) {
+  *external_transfer_result=transfer_result;
+  }
+if (transfer_result == -1) {
+  /* Transfer aborted. */
+#ifdef DEBUG
+  debug_write(DEBUG_LEVEL_TRANSMISSION,
+              "Transfer aborted\n");
+#endif
+  risc_os_ftdi->input.bytes_buffered=0;
+  risc_os_ftdi->input.bytes_requested=0;
+  return generate_error(FTDI_ERROR_USB_TRANSFER_ABORTED);
+  }
+if ((transfer_result == 1) ||
+    ((bytes_in_buffer + risc_os_ftdi->input.bytes_buffered) >= risc_os_ftdi->input.bytes_requested)) {
+  if (transfer_result == 1) {
+    /* read buffer size again for it may have changed since last check */
+    regs.r[0]=6;
+    if ((error_os=perform_risc_os_buffer_operation(&regs,
+                                                   &risc_os_ftdi->input.risc_os_buffer_info)) != NULL) {
+      risc_os_ftdi->input.bytes_requested=0;
+      risc_os_ftdi->input.bytes_buffered=0;
+      return error_os;
+      }
+    bytes_in_buffer=regs.r[2];
+    }
+#ifdef DEBUG
+  debug_writef(DEBUG_LEVEL_TRANSMISSION,
+               "%d Bytes in buffer teof\n",
+               bytes_in_buffer);
+#endif
+  bytes_to_transfer=risc_os_ftdi->input.bytes_requested - risc_os_ftdi->input.bytes_buffered;
+  /* Transfer completed even USB may not tell us.
+     The fetch clears the buffer and may introduce the next one. */
+#ifdef DEBUG
+  debug_writef(DEBUG_LEVEL_TRANSMISSION,
+               "%d Bytes (%d - %d) to fetch teof\n",
+               bytes_to_transfer,
+               risc_os_ftdi->input.usb_buffer_size,
+               risc_os_ftdi->input.bytes_buffered);
+#endif
+  regs.r[0]=4;
+  regs.r[1]=risc_os_ftdi->input.file_handle;
+  regs.r[2]=(int) ((char *) risc_os_ftdi->input.buffer + risc_os_ftdi->input.bytes_buffered);
+  regs.r[3]=bytes_to_transfer;
+  if ((error_os=_kernel_swi(OS_GBPB, &regs, &regs)) != NULL) {
+    risc_os_ftdi->input.bytes_requested=0;
+    risc_os_ftdi->input.bytes_buffered=0;
+    return error_os;
+    }
+  risc_os_ftdi->input.bytes_buffered+=(bytes_to_transfer - regs.r[3]);
+  /* This transfer is finished. */
+  risc_os_ftdi->input.bytes_requested=0;
+  /* Processed must be resetted before evaluation. */
+  risc_os_ftdi->input.bytes_processed=0;
+#ifdef DEBUG
+  debug_writef(DEBUG_LEVEL_TRANSMISSION,
+               "%d Bytes finally in buffer teof\n",
+               risc_os_ftdi->input.bytes_buffered);
+#endif
+/*      risc_os_ftdi->input.bytes_requested=0;
+      risc_os_ftdi->input.bytes_buffered=0;
+      return  generate_error(FTDI_ERROR_USB_TRANSFER_ABORTED); */
+  }
+return NULL;
+}
+
+/* !!!!!!!!!! functions !!!!!!!!!! */
+_kernel_oserror *get_buffer_info(int buffer_handle,
+                                 struct risc_os_buffer_info_structure *risc_os_buffer_info)
+{
+_kernel_swi_regs regs;
+_kernel_oserror *error_os;
+
+risc_os_buffer_info->handle=buffer_handle;
+if (risc_os_buffer_info->handle != -1) {
+  regs.r[0]=risc_os_buffer_info->handle;
+  if ((error_os=_kernel_swi(Buffer_InternalInfo, &regs, &regs)) != NULL) {
+    return error_os;
+    }
+  risc_os_buffer_info->id=regs.r[0];
+  risc_os_buffer_info->routine=(void *) regs.r[1];
+  risc_os_buffer_info->ws=(void *) regs.r[2];
+  }
+return NULL;
+}
+
+_kernel_oserror *callback_generate(struct risc_os_ftdi_structure *risc_os_ftdi,
+                                   int io_info,
+                                   void *pw)
+{
+_kernel_swi_regs regs;
+_kernel_oserror *error_os;
+
+#ifdef DEBUG
+debug_writef(DEBUG_LEVEL_TRANSMISSION,
+             "Callback generate RISC OS FTDI %x %d\n", risc_os_ftdi, io_info);
+#endif
+/* IRQs must have been deactivated before calling this procedure */
+if (((io_info == FTDI_UPCALL_IO_I) &&
+     (!risc_os_ftdi->input.callback_requested)) ||
+    ((io_info == FTDI_UPCALL_IO_O) &&
+     (!risc_os_ftdi->output.callback_requested))) {
+  if (callback_requests.no_of_requests >= FTDI_MAX_NUMBER_CALLBACK_REQUESTS) {
+    /* ??? Find a better handling to show that stream has a problem. ??? */
+    return generate_error(FTDI_ERROR_NO_CALLBACKS);
+    }
+  /* Must be evaluated */
+  callback_requests.request[callback_requests.no_of_requests].risc_os_ftdi=risc_os_ftdi;
+  callback_requests.request[callback_requests.no_of_requests].io_info=io_info;
+  callback_requests.no_of_requests++;
+  /* Just first entry entered. */
+  if (callback_requests.no_of_requests == 1) {
+    /* No callback running in the moment so create one for evaluation. */
+    regs.r[0]=(int) callback_handler_entry;
+    regs.r[1]=(int) pw;
+    if ((error_os=_kernel_swi(OS_AddCallBack, &regs, &regs)) != NULL) {
+      return error_os;
+      }
+#ifdef DEBUG
+    debug_write(DEBUG_LEVEL_TRANSMISSION,
+                "Callback launched\n");
+#endif
+    }
+  /* Note that there is a callback pending. */
+  if (io_info == FTDI_UPCALL_IO_I) {
+    risc_os_ftdi->input.callback_requested=true;
+    }
+  else {
+    risc_os_ftdi->output.callback_requested=true;
+    }
+  }
+return NULL;
+}
+
+_kernel_oserror *callback_handler(_kernel_swi_regs *regs_ignore,
+                                  void *pw)
+{
+int irq_state;
+int io_info;
+bool eval_flag;
+int actual_port;
+int start_port;
+int bytes_loaded;
+unsigned int available_space;
+int bytes_to_transfer;
+int transfer_result;
+struct risc_os_ftdi_structure *risc_os_ftdi;
+_kernel_swi_regs regs;
+_kernel_oserror *error_os;
+
+#ifdef DEBUG
+debug_writef(DEBUG_LEVEL_TRANSMISSION,
+             "Callback handler PW %x\n",
+             pw);
+#endif
+if ((irq_state=_kernel_irqs_disabled()) == 0) _kernel_irqs_off;
+while(callback_requests.no_of_requests > 0) {
+  /* Note Buffer to process */
+  callback_requests.no_of_requests--;
+  risc_os_ftdi=callback_requests.request[callback_requests.no_of_requests].risc_os_ftdi;
+  io_info=callback_requests.request[callback_requests.no_of_requests].io_info;
+#ifdef DEBUG
+  debug_writef(DEBUG_LEVEL_TRANSMISSION,
+               "Eval RISC OS FTDI %x %d\n",
+               risc_os_ftdi,
+               io_info);
+#endif
+  /* Reenable buffer for new call back.
+     This must be done here to ensure that a new callback is recorded
+     even just in the moment the buffer is used again. In worst case
+     there is an additional superflous examination but nothing would
+     be lost. */
+  if (io_info == FTDI_UPCALL_IO_I) {
+    risc_os_ftdi->input.callback_requested=false;
+    }
+  else {
+    risc_os_ftdi->output.callback_requested=false;
+    }
+  if (irq_state == 0) _kernel_irqs_on;
+  if (io_info == FTDI_UPCALL_IO_I) {
+    /* Fetch from FTDI device. */
+    /* The channel is shared between the various ports.
+       So even a connection has been closed the data
+       for it has to be processed to free the buffer
+       for further transmissions. */
+    if (risc_os_ftdi->input.bytes_requested > 0) {
+#ifdef DEBUG
+  debug_writef(DEBUG_LEVEL_TRANSMISSION,
+               "Trying to get %d Bytes\n",
+               risc_os_ftdi->input.bytes_requested);
+#endif
+      if ((error_os=callback_teof(risc_os_ftdi,
+                                  NULL)) != NULL) {
+        /* stream handling performed inside function. */
+        return error_os;
+        }
+      }
+    if ((risc_os_ftdi->input.bytes_requested == 0) &&
+        (risc_os_ftdi->input.bytes_buffered > 0)) {
+      /* Evaluate and distribute buffer data. */
+      eval_flag=true;
+      do {
+        /* Blocks of 64 Bytes. First 2 Bytes are status Bytes and are
+           determining to which stream data must be transfered.
+           Either a block can be delivered/ignored or not not.
+           If not evaluation stops here and waits dormant until it
+           can proceed. */
+        actual_port=(risc_os_ftdi->input.buffer[risc_os_ftdi->input.bytes_processed]&0x03) - 1;
+        bytes_to_transfer=risc_os_ftdi->input.bytes_buffered - risc_os_ftdi->input.bytes_processed - 2;
+        if (bytes_to_transfer > 62) {
+          bytes_to_transfer=62;
+          }
+#ifdef DEBUG
+  debug_writef(DEBUG_LEVEL_TRANSMISSION,
+               "Result position %d Bytes %d Port %d\n",
+               risc_os_ftdi->input.bytes_processed,
+               bytes_to_transfer,
+               actual_port);
+#endif
+/* ??? Check status Byte for transmission trouble on adapter side. */
+        if ((bytes_to_transfer > 0) &&
+            (actual_port >= 0) &&
+            (actual_port < risc_os_ftdi->ftdi.number_of_ports) &&
+            /* Important: Devices may not be present. */
+            (risc_os_ftdi->devices[actual_port] != NULL) &&
+            (risc_os_ftdi->devices[actual_port]->input.stream_valid)) {
+          /* Check for free space. */
+          regs.r[0]=7;
+          if ((error_os=perform_risc_os_buffer_operation(&regs,
+                                                         &risc_os_ftdi->devices[actual_port]->input.risc_os_buffer_info)) != NULL) {
+            risc_os_ftdi->input.bytes_processed+=bytes_to_transfer + 2;
+/* ??? invalidate stream and check consequences. */
+            return error_os;
+            }
+          if (regs.r[2] >= bytes_to_transfer) {
+            /* Send data to Application.
+               R1/R12 filled by function. */
+            regs.r[0]=1;
+            regs.r[2]=(int) ((char *) risc_os_ftdi->input.buffer + risc_os_ftdi->input.bytes_processed + 2);
+            regs.r[3]=bytes_to_transfer;
+#ifdef DEBUG
+            for (int i=0; i < (bytes_to_transfer + 2); i++) {
+              if (i < 2) {
+                debug_writef(DEBUG_LEVEL_TRANSMISSION,
+                             "FTDI Status %d %x\n",
+                             i,
+                             risc_os_ftdi->input.buffer[risc_os_ftdi->input.bytes_processed + i]);
+                }
+              else {
+                debug_writef(DEBUG_LEVEL_TRANSMISSION,
+                             "Data %d %x %c\n",
+                             i,
+                             risc_os_ftdi->input.buffer[risc_os_ftdi->input.bytes_processed + i],
+                             risc_os_ftdi->input.buffer[risc_os_ftdi->input.bytes_processed + i]);
+                }
+              }
+#endif
+            /* Proceed to next information in every case. */
+            risc_os_ftdi->input.bytes_processed+=bytes_to_transfer + 2;
+#ifdef DEBUG
+            debug_writef(DEBUG_LEVEL_TRANSMISSION,
+                         "Put %d Bytes to application\n",
+                         bytes_to_transfer);
+#endif
+            if ((error_os=perform_risc_os_buffer_operation(&regs,
+                                                           &risc_os_ftdi->devices[actual_port]->input.risc_os_buffer_info)) != NULL) {
+/* ??? invalidate stream */
+              return error_os;
+              }
+            if (regs.r[3] != 0) {
+/* ??? invalidate stream */
+              return generate_error(FTDI_ERROR_FETCH_PROBLEMS);
+              }
+            /* Update the actual request information.
+               It is only used to determine whether all requested data has been fetched. */
+            if (risc_os_ftdi->devices[actual_port]->input.bytes_requested <= bytes_to_transfer) {
+              risc_os_ftdi->devices[actual_port]->input.bytes_requested=0;
+              }
+            else {
+              risc_os_ftdi->devices[actual_port]->input.bytes_requested-=bytes_to_transfer;
+              }
+            }
+          else {
+            /* Data can't be delivered so stop. */
+            eval_flag=false;
+            }
+          }
+        else {
+          /* Ignore data */
+          risc_os_ftdi->input.bytes_processed+=bytes_to_transfer + 2;
+          }
+        if (risc_os_ftdi->input.bytes_processed >= risc_os_ftdi->input.bytes_buffered) {
+          risc_os_ftdi->input.bytes_buffered=0;
+          eval_flag=false;
+          }
+        }
+      while(eval_flag);
+      }
+    if ((risc_os_ftdi->input.bytes_requested == 0) &&
+        (risc_os_ftdi->input.bytes_buffered == 0)) {
+      /* Set up new transfer at least to fetch the status Bytes. */
+      /* Strange effects inside USB driver. In case that only a fraction of the buffer is used
+         transfer will block after the first one. However if using the whole size everything
+         is fine. So the first implemented alternative only to fetch a minimum of Bytes to
+         fetch status bytes and requested Bytes don't work.
+         Reset after transfer termination in which way ever. */
+#ifdef DEBUG
+      debug_write(DEBUG_LEVEL_TRANSMISSION,
+                  "Trying to fetch new data\n");
+#endif
+      risc_os_ftdi->input.bytes_requested=risc_os_ftdi->input.usb_buffer_size;
+      /* Try to see whether something can be fetched from older transmissions. */
+      if ((error_os=callback_teof(risc_os_ftdi,
+                                  &transfer_result)) != NULL) {
+        if (transfer_result != -1) {
+           /* stream handling performed inside function. */
+           return error_os;
+           }
+        else {
+          /* Ignore former transmissiom aborts here. */
+          risc_os_ftdi->input.bytes_requested=risc_os_ftdi->input.usb_buffer_size;
+          }
+        }
+      if ((risc_os_ftdi->input.bytes_buffered == 0) &&
+          (transfer_result != 0)) {
+        /* Initiate new transfer in case that no transfer is active and no
+           data has been fetched. */
+        regs.r[0]=4;
+        regs.r[1]=risc_os_ftdi->input.file_handle;
+        regs.r[2]=(int) risc_os_ftdi->input.buffer;
+        regs.r[3]=risc_os_ftdi->input.bytes_requested;
+#ifdef DEBUG
+        debug_writef(DEBUG_LEVEL_TRANSMISSION,
+                     "Initiating read File Handle %x Bytes %d\n",
+                     regs.r[1],
+                     regs.r[3]);
+#endif
+        if ((error_os=_kernel_swi(OS_GBPB, &regs, &regs)) != NULL) {
+#ifdef DEBUG
+          debug_writef(DEBUG_LEVEL_TRANSMISSION,
+                       "Read shit happens %x %x %s\n",
+                       error_os,
+                       error_os->errnum,
+                       error_os->errmess);
+#endif
+          risc_os_ftdi->input.bytes_requested=0;
+          risc_os_ftdi->input.bytes_buffered=0;
+          return error_os;
+          }
+        /* Warning: It may be a fraction of requested Bytes! */
+        risc_os_ftdi->input.bytes_buffered=(risc_os_ftdi->input.bytes_requested - regs.r[3]);
+        regs.r[0]=(int) 0x80000006;
+        /* ??? use faster reference. */
+        regs.r[1]=(int) risc_os_ftdi->device_name;
+        regs.r[2]=risc_os_ftdi->input.usb_stream_handle;
+        if ((error_os=_kernel_swi(DeviceFS_CallDevice, &regs, &regs)) != NULL) {
+          risc_os_ftdi->input.bytes_requested=0;
+          risc_os_ftdi->input.bytes_buffered=0;
+          return error_os;
+          }
+        transfer_result=regs.r[3];
+        if (transfer_result == -1) {
+          /* Transfer aborted. */
+#ifdef DEBUG
+          debug_write(DEBUG_LEVEL_TRANSMISSION,
+                      "Transfer aborted\n");
+#endif
+          risc_os_ftdi->input.bytes_buffered=0;
+          risc_os_ftdi->input.bytes_requested=0;
+          return generate_error(FTDI_ERROR_USB_TRANSFER_ABORTED);
+          }
+        if ((transfer_result == 1) ||
+            (risc_os_ftdi->input.bytes_buffered >= risc_os_ftdi->input.usb_buffer_size)) {
+          /* Transfer completed even USB may not tell us.
+             The fetch clears the buffer and may introduce the next one. */
+          if (transfer_result == 1) {
+            /* read buffer size again for it may have changed since last check */
+            regs.r[0]=6;
+            if ((error_os=perform_risc_os_buffer_operation(&regs,
+                                                           &risc_os_ftdi->input.risc_os_buffer_info)) != NULL) {
+              risc_os_ftdi->input.bytes_requested=0;
+              risc_os_ftdi->input.bytes_buffered=0;
+              return error_os;
+              }
+            risc_os_ftdi->input.bytes_buffered=regs.r[2];
+            }
+          /* This transfer is finished. */
+          risc_os_ftdi->input.bytes_requested=0;
+          /* Processed must be reseted before evaluation. */
+          risc_os_ftdi->input.bytes_processed=0;
+#ifdef DEBUG
+          debug_writef(DEBUG_LEVEL_TRANSMISSION,
+                       "%d Bytes finally in buffer\n",
+                       risc_os_ftdi->input.bytes_buffered);
+#endif
+          }
+        }
+      /* In case that a transfer is pending we can expect a new callback through buffer
+         fill. So we don't have to do anything in such a case. */
+      if (risc_os_ftdi->input.bytes_requested == 0) {
+        /* Evaluation of buffer is required.
+           Simply put this entry into callback list again. */
+        if ((irq_state=_kernel_irqs_disabled()) == 0) _kernel_irqs_off;
+        if ((error_os=callback_generate(risc_os_ftdi,
+                                        io_info,
+                                        pw)) != NULL) {
+          if (irq_state == 0) _kernel_irqs_on;
+          return error_os;
+          }
+        if (irq_state == 0) _kernel_irqs_on;
+        }
+      }
+    }
+  else {
+#ifdef DEBUG
+    debug_write(DEBUG_LEVEL_TRANSMISSION,
+                "Try to send data\n");
+#endif
+    /* Send to FTDI device. */
+    /* The channel is shared between the various ports.
+       So even a connection has been closed the data
+       for it has to be processed if it is in buffer
+       until the buffer is empty. */
+    actual_port=0;
+    do {
+      eval_flag=false;
+      /* Check for free Bytes inside outgoing buffer.
+         This can be done in non exclusive mode because the free
+         space becomes larger and larger from USB side and the
+         routine is the only filler. */
+      regs.r[0]=7;
+      if ((error_os=perform_risc_os_buffer_operation(&regs,
+                                                     &risc_os_ftdi->output.risc_os_buffer_info)) != NULL) {
+        return error_os;
+        }
+      available_space=regs.r[2];
+#ifdef DEBUG
+      debug_writef(DEBUG_LEVEL_TRANSMISSION,
+                   "%d Bytes available in USB output buffer.\n",
+                   available_space);
+#endif
+      if (available_space > 0) {
+        /* If output buffer is empty then fill it. */
+        if (risc_os_ftdi->output.bytes_buffered == 0) {
+          /* Check the ports one after the other for pending
+             outgoing data. */
+          start_port=actual_port;
+          do {
+            /* Check whether port open. */
+            if (/* Important: Devices may not be present. */
+                (risc_os_ftdi->devices[actual_port] != NULL) &&
+                (risc_os_ftdi->devices[actual_port]->output.stream_valid)) {
+              /* Check for pending data.
+                 The buffer is filled with data from exactly one port. */
+              regs.r[0]=6;
+              if ((error_os=perform_risc_os_buffer_operation(&regs,
+                                                             &risc_os_ftdi->devices[actual_port]->output.risc_os_buffer_info)) != NULL) {
+                return error_os;
+                }
+              risc_os_ftdi->output.bytes_buffered=regs.r[2];
+              if (risc_os_ftdi->output.bytes_buffered > 0) {
+#ifdef DEBUG
+                debug_writef(DEBUG_LEVEL_TRANSMISSION,
+                             "%d Bytes to be prepared Port %d.\n",
+                             risc_os_ftdi->output.bytes_buffered,
+                             actual_port);
+#endif
+                /* Different FTDI device handling. */
+                if (risc_os_ftdi->ftdi.number_of_ports > 1) {
+                  /* Multi port device. Fill up the first port which has data.
+                     but fill up only availble size/2 or at least 64 Bytes.
+                     this allows a certain parallel process but doesn´t protect
+                     from blocking ports by one other.
+                     data has to be packed into max 64 byte blocks incl. one
+                     info Byte. Info based on FTDI_SIO. It may be wrong. */
+                  bytes_loaded=0;
+                  while((risc_os_ftdi->output.bytes_buffered > 0) && ((bytes_loaded + 64) <= available_space)) {
+                    bytes_to_transfer=risc_os_ftdi->output.bytes_buffered;
+                    /* Length is 63 maximum */
+                    if (bytes_to_transfer > 63) {
+                      bytes_to_transfer=63;
+                      }
+                    /* Fetch data to send.
+                       R1/R12 filled by function. */
+                    regs.r[0]=3;
+                    regs.r[2]=(int) ((char *) risc_os_ftdi->output.buffer + bytes_loaded + 1);
+                    regs.r[3]=bytes_to_transfer;
+                    if ((error_os=perform_risc_os_buffer_operation(&regs,
+                                                                   &risc_os_ftdi->devices[actual_port]->output.risc_os_buffer_info)) != NULL) {
+                      risc_os_ftdi->output.bytes_buffered=0;
+                      return error_os;
+                      }
+                    bytes_to_transfer-=regs.r[3];
+                    risc_os_ftdi->output.bytes_buffered-=bytes_to_transfer;
+                    /* If not able to use full size then stop loop. */
+                    if (regs.r[3] > 0) {
+                      risc_os_ftdi->output.bytes_buffered=0;
+                      }
+                    /* Prepare one byte FTDI internal information. */
+                    *((char *) risc_os_ftdi->output.buffer + bytes_loaded)=((unsigned char) bytes_to_transfer<<2) | ((unsigned char) actual_port + 1);
+                    bytes_loaded+=bytes_to_transfer + 1;
+                    }
+                  risc_os_ftdi->output.bytes_buffered=bytes_loaded;
+                  }
+                else {
+                  if (risc_os_ftdi->output.bytes_buffered > risc_os_ftdi->output.usb_buffer_size) {
+                    /* Limit to buffer size */
+                    risc_os_ftdi->output.bytes_buffered=risc_os_ftdi->output.usb_buffer_size;
+                    }
+                  /* Single port. All data can be transfered. */
+                  /* Fetch data to send.
+                     R1/R12 filled by function. */
+                  regs.r[0]=3;
+                  regs.r[2]=(int) risc_os_ftdi->output.buffer;
+                  regs.r[3]=risc_os_ftdi->output.bytes_buffered;
+                  if ((error_os=perform_risc_os_buffer_operation(&regs,
+                                                                 &risc_os_ftdi->devices[0]->output.risc_os_buffer_info)) != NULL) {
+                    risc_os_ftdi->output.bytes_buffered=0;
+                    return error_os;
+                    }
+                  risc_os_ftdi->output.bytes_buffered-=regs.r[3];
+                  }
+                risc_os_ftdi->output.bytes_processed=0;
+                /* There have been activity. */
+                eval_flag=true;
+                }
+              }
+            /* Next port. Independently whether the actual port
+               got data. This ensures parallel transmission. */
+            actual_port++;
+            if (actual_port >= risc_os_ftdi->ftdi.number_of_ports) {
+              actual_port=0;
+              }
+            }
+          while((!eval_flag) && (start_port != actual_port));
+          }
+        if (risc_os_ftdi->output.bytes_buffered > 0) {
+          /* Send the data to USB. */
+          bytes_to_transfer=risc_os_ftdi->output.bytes_buffered - risc_os_ftdi->output.bytes_processed;
+          if (bytes_to_transfer > available_space) {
+            bytes_to_transfer=available_space;
+            }
+          regs.r[0]=2;
+          regs.r[1]=risc_os_ftdi->output.file_handle;
+          regs.r[2]=(int) ((char *) risc_os_ftdi->output.buffer + risc_os_ftdi->output.bytes_processed);
+          regs.r[3]=bytes_to_transfer;
+          if ((error_os=_kernel_swi(OS_GBPB, &regs, &regs)) != NULL) {
+            return error_os;
+            }
+#ifdef DEBUG
+          debug_writef(DEBUG_LEVEL_TRANSMISSION,
+                       "%d Bytes send to USB.\n",
+                       bytes_to_transfer);
+#endif
+          risc_os_ftdi->output.bytes_processed+=(bytes_to_transfer - regs.r[3]);
+          risc_os_ftdi->output.bytes_buffered-=(bytes_to_transfer - regs.r[3]);
+          /* There have been activity. */
+          eval_flag=true;
+          }
+        }
+      }
+    while(eval_flag);
+    }
+  if ((irq_state=_kernel_irqs_disabled()) == 0) _kernel_irqs_off;
+  }
+if (irq_state == 0) _kernel_irqs_on;
+#ifdef DEBUG
+  debug_write(DEBUG_LEVEL_TRANSMISSION,
+              "Callback end\n");
+#endif
+return NULL;
+}

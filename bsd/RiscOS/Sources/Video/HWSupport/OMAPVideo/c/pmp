@@ -1,0 +1,375 @@
+/*
+ * Copyright (c) 2017, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include <stdlib.h>
+#include <string.h>
+#include "kernel.h"
+#include "swis.h"
+
+#include "Global/OSMem.h"
+
+#include "DebugLib/DebugLib.h"
+
+#include "pmp.h"
+#include "modhead.h"
+#include "consts.h"
+#include "gvoverlay.h"
+
+static int da = -1; /* Dynamic area number we've been assigned */
+static uint8_t *da_base = NULL; /* Logical base of DA */
+static uint16_t *pmp_page_association = NULL; /* Array containing linked lists of PMP page associations; 16 bit index range allows the PMP to grow to ~256MB physical size, which should be more than enough for the display resolutions & overlay counts we're dealing with. */
+#define END_OF_LIST 65535
+static uint16_t free_chain = END_OF_LIST; /* Index within pmp_page_association of the free chain */
+
+/* Largest display we can support is 2K*2K*32bpp = 16MB
+   Assuming programs are sensible with logical mapping of their overlays, we shouldn't need more than twice that amount (to allow for two to be mapped at once)
+ */
+static const uint32_t max_log_size = 32<<20; /* (in bytes) */
+
+static const uint16_t max_phys_size = END_OF_LIST; /* (in pages) */
+
+static uint16_t current_phys_size = 0; /* (in pages) */
+
+#define MAX_BLOCKS (GVOVERLAY_MAX * GVBANK_MAX)
+static pmp_block_t blocks[MAX_BLOCKS];
+
+#define MAX_STACK_PAGES 128 /* Max page list size to place on the stack */
+
+/* Bare-bones DA handler */
+extern void da_handler(void);
+
+_kernel_oserror *pmp_init(void)
+{
+	return _swix(OS_DynamicArea,_INR(0,9)|_OUT(1)|_OUT(3),DAReason_Create,-1,0,-1,DynAreaFlags_NotUserDraggable+DynAreaFlags_NeedsSpecificPages+DynAreaFlags_PMP,max_log_size,da_handler,-1,Module_Title,0,&da,&da_base);
+}
+
+void pmp_shutdown(void)
+{
+	if(da == -1)
+	{
+		return;
+	}
+	/* Destroy DA */
+	_kernel_oserror *e = _swix(OS_DynamicArea,_INR(0,1),DAReason_Remove,da);
+	if (e)
+	{
+		dprintf(("","Warning: PMP destroy failed, err %08x %s\n",e->errnum,e->errmess));
+	}
+	da = -1;
+	da_base = NULL;
+	/* Free/reset other associated memory */
+	if (pmp_page_association)
+	{
+		free(pmp_page_association);
+		pmp_page_association = NULL;
+	}
+	free_chain = END_OF_LIST;
+	current_phys_size = 0;
+	memset(blocks,0,sizeof(blocks));
+}
+
+typedef struct {
+	int pmp_page_index;
+	int phys_page_num;
+	int pageflags;
+} pmp_physop_t;
+
+typedef struct {
+	int da_page_num;
+	int pmp_page_index;
+	int pageflags;
+} pmp_logop_t;
+
+_kernel_oserror *pmp_alloc(uint32_t size,pmp_block_t **out_block)
+{
+	/* Round size up to page multiple for ease of allocation */
+	size = (size+4095)&~4095;
+	/* Find a spare block slot */
+	pmp_block_t *block = NULL;
+	for(int i=0;i<MAX_BLOCKS;i++)
+	{
+		if (!blocks[i].size)
+		{
+			block = &blocks[i];
+			break;
+		}
+	}
+	if (block == NULL)
+	{
+		/* Shouldn't happen */
+		return (_kernel_oserror *)"\0\0\0\0No spare PMP blocks!";
+	}
+	/* Find a block of memory we can use */
+	uint32_t pagenum;
+	_kernel_oserror *e = _swix(OS_Memory,_INR(0,2)|_OUT(3),OSMemReason_RecommendPage,size,12,&pagenum);
+	if (e)
+	{
+		return e;
+	}
+	/* Get base phys addr */
+	{
+		int mem0[3] = { pagenum, 0, 0 };
+		e = _swix(OS_Memory,_INR(0,2),OSMemReason_Convert+(1<<8)+(1<<13),mem0,1);
+		if (e)
+		{
+			return e;
+		}
+		block->pa = mem0[2];
+	}
+	/* OK, now add pages to the PMP */
+	block->chain = END_OF_LIST;
+	uint16_t end_of_chain = END_OF_LIST;
+	while (block->size < size)
+	{
+		if (free_chain == END_OF_LIST)
+		{
+			/* Resize PMP to allow us to add more pages */
+			int required_pages = (size - block->size)>>12;
+			if (required_pages + current_phys_size > max_phys_size)
+			{
+				pmp_free(block);
+				return (_kernel_oserror *)"\0\0\0\0PMP full";
+			}
+			uint16_t *new_list = realloc(pmp_page_association,(current_phys_size+required_pages)*sizeof(uint16_t));
+			if (!new_list)
+			{
+				pmp_free(block);
+				return (_kernel_oserror *)"\0\0\0\0Failed to grow page list";
+			}
+			pmp_page_association = new_list;
+			/* Leave free_chain alone until we've actually added the pages */
+			_kernel_swi_regs r;
+			r.r[0] = DAReason_PMP_Resize;
+			r.r[1] = da;
+			r.r[2] = required_pages;
+			e = _kernel_swi(OS_DynamicArea,&r,&r); /* Not _swix since we need the updated r2 for error case */
+			/* Add any new slots to the free chain */
+			if (r.r[2])
+			{
+				free_chain = current_phys_size;
+				for(int i=0;i<r.r[2];i++)
+				{
+					pmp_page_association[current_phys_size] = current_phys_size+1;
+					current_phys_size++;
+				}
+				pmp_page_association[current_phys_size-1] = END_OF_LIST;
+			}
+			/* But we've still failed if we didn't get what we wanted */
+			if (e)
+			{
+				pmp_free(block);
+				return e;
+			}
+		}
+		/* free_chain now non-empty. Take slots from it, add them to a PMP_PhysOp request, and associate them with our block */
+		if (end_of_chain == END_OF_LIST)
+		{
+			block->chain = free_chain;
+		}
+		else
+		{
+			pmp_page_association[end_of_chain] = free_chain;
+		}
+		pmp_physop_t physop[MAX_STACK_PAGES];
+		int opcount = 0;
+		while ((opcount < MAX_STACK_PAGES) && (block->size < size) && (free_chain != END_OF_LIST))
+		{
+			/* Add free_chain to pending op */
+			physop[opcount++] = (pmp_physop_t) { .pmp_page_index = free_chain, .phys_page_num = pagenum++, .pageflags = PageFlags_Unavailable };
+			/* End of our alloc list is now free_chain */
+			end_of_chain = free_chain;
+			/* Step free_chain forward */
+			free_chain = pmp_page_association[free_chain];
+			block->size += 4096;
+		}
+		/* Reached a stop condition */
+		pmp_page_association[end_of_chain] = END_OF_LIST;
+		e = _swix(OS_DynamicArea,_INR(0,3),DAReason_PMP_PhysOp,da,physop,opcount);
+		if (e)
+		{
+			pmp_free(block);
+			return e;
+		}
+	}
+	/* Area successfully allocated */
+	*out_block = block;
+	return NULL;
+}
+
+_kernel_oserror *pmp_free(pmp_block_t *block)
+{
+	if (block->size == 0)
+	{
+		return NULL;
+	}
+	_kernel_oserror *e;
+	if (block->la)
+	{
+		e = pmp_unmap(block);
+		if (e)
+		{
+			return e;
+		}
+	}
+	int first_page = block->chain;
+	int last_page = -1;
+	while (block->size)
+	{
+		/* Add all the pages to a physop */
+		pmp_physop_t physop[MAX_STACK_PAGES];
+		int opcount = 0;
+		while ((opcount < MAX_STACK_PAGES) && (block->size))
+		{
+			last_page = block->chain;
+			physop[opcount++] = (pmp_physop_t) { .pmp_page_index = block->chain, .phys_page_num = -1, .pageflags = 0 };
+			block->size -= 4096;
+			block->chain = pmp_page_association[block->chain];
+		}
+		e = _swix(OS_DynamicArea,_INR(0,3),DAReason_PMP_PhysOp,da,physop,opcount);
+		if (e)
+		{
+			/* Uh-oh! We could be in an inconsistent state here. TODO: try and recover (use returned information to fix our page list) */
+			return e;
+		}
+	}
+	/* Hook first_page .... last_page onto the free list */
+	pmp_page_association[last_page] = free_chain;
+	free_chain = first_page;
+	return NULL;
+}
+
+static int block_sort_func(const void *a,const void *b)
+{
+	const pmp_block_t **aa = (const pmp_block_t **) a;
+	const pmp_block_t **bb = (const pmp_block_t **) b;
+	return ((*aa)->la - (*bb)->la);
+}
+
+_kernel_oserror *pmp_map(pmp_block_t *block)
+{
+	if (!block->size)
+	{
+		block->la = NULL;
+		return (_kernel_oserror *)"\0\0\0\0Bad block";
+	}
+	if (block->la)
+	{
+		/* Already mapped */
+		return NULL;
+	}
+	/* Search for a logical window large enough to hold this block */
+	union {
+		pmp_block_t *mapped_blocks[MAX_BLOCKS];
+		pmp_logop_t logop[MAX_STACK_PAGES];
+	} u;
+	int i,j=0;
+	for(i=0;i<MAX_BLOCKS;i++)
+	{
+		if (blocks[i].size && blocks[i].la)
+		{
+			u.mapped_blocks[j++] = &blocks[i];
+		}
+	}
+	uint8_t *la;
+	if (j)
+	{
+		qsort(u.mapped_blocks, j, sizeof(pmp_block_t *), block_sort_func);
+		for(i=0;i<j-1;i++)
+		{
+			if (u.mapped_blocks[i+1]->la - (u.mapped_blocks[i]->la + u.mapped_blocks[i]->size) >= block->size)
+			{
+				break;
+			}
+		}
+		la = u.mapped_blocks[i]->la + u.mapped_blocks[i]->size;
+	}
+	else
+	{
+		la = da_base;
+	}
+	if ((la + block->size) - da_base > max_log_size)
+	{
+		return (_kernel_oserror *)"\0\0\0\0No logical window";
+	}
+	block->la = la;
+	/* OK, now map all the pages */
+	i = 0;
+	j = block->chain;
+	int da_page = (la - da_base)>>12;
+	while (i < block->size)
+	{
+		int opcount = 0;
+		while ((i < block->size) && (opcount < MAX_STACK_PAGES))
+		{
+			u.logop[opcount++] = (pmp_logop_t) { .da_page_num = da_page++, .pmp_page_index = j, .pageflags = memory_access_privilege + PageFlags_Unavailable + (CP_CB_Writethrough << DynAreaFlags_CPShift) }; /* TODO: Support different cache policies */
+			j = pmp_page_association[j];
+			i += 4096;
+		}
+		_kernel_oserror *e = _swix(OS_DynamicArea,_INR(0,3),DAReason_PMP_LogOp,da,u.logop,opcount);
+		if (e)
+		{
+			block->la = NULL; /* Is this sufficient for recovery? */
+			return e;
+		}
+	}
+	return NULL;
+}
+
+_kernel_oserror *pmp_unmap(pmp_block_t *block)
+{
+	if (!block->la)
+	{
+		return NULL;
+	}
+	if (!block->size)
+	{
+		block->la = NULL;
+		return (_kernel_oserror *)"\0\0\0\0Bad block";
+	}
+	pmp_logop_t logop[MAX_STACK_PAGES];
+	int i=0;
+	int j=block->chain;
+	int da_page = (block->la - da_base)>>12;
+	while(i < block->size)
+	{
+		int opcount=0;
+		while ((i < block->size) && (opcount < MAX_STACK_PAGES))
+		{
+			logop[opcount++] = (pmp_logop_t) { .da_page_num = da_page++, .pmp_page_index = -1, .pageflags = PageFlags_Unavailable };
+			j = pmp_page_association[j];
+			i += 4096;
+		}
+		_kernel_oserror *e = _swix(OS_DynamicArea,_INR(0,3),DAReason_PMP_LogOp,da,logop,opcount);
+		if (e)
+		{
+			block->la = NULL; /* We're in an inconsistent state, so there's not much we can do here */
+			return e;
+		}
+	}
+	block->la = NULL;
+	return NULL;
+}

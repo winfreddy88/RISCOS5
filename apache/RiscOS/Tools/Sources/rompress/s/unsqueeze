@@ -1,0 +1,358 @@
+; Copyright 2012 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+;
+; s.UnSqueeze by RCC 25-Aug-87
+; This is a bit of code to be included in self-decompressing images to
+; expand the image in place.  See elsewhere for details of the compression
+; algorithm.
+;
+; ***********************************
+; ***    C h a n g e   L i s t    ***
+; ***********************************
+
+; Date       Name       Description
+; ----       ----       -----------
+; 13-Feb-90  TDobson    Minor optimisation which saves 1 instruction for
+;                       every output word that isn't a "short" or a "long".
+; 17-Jan-12  JLee       Ripped out of 'squeeze' utility sources and reworked
+;                       for use with compressed ROM images
+
+        GET     Hdr:OSEntries
+
+        AREA    |M2$$Code|, CODE, READONLY
+
+        EXPORT  rompress_unsqueezecode
+        EXPORT  rompress_unsqueezecodesize
+
+R0 RN 0
+R1 RN 1
+R2 RN 2
+R3 RN 3
+R4 RN 4
+R5 RN 5
+R6 RN 6
+R7 RN 7
+R8 RN 8
+R9 RN 9
+R10 RN 10
+R11 RN 11
+R12 RN 12
+R13 RN 13
+LR RN 14
+PC RN 15
+
+StackSize   * 64
+decodedSize * 0
+encodedSize * 4
+tableSize   * 8
+nShorts     * 12
+nLongs      * 16
+sizeToMove  * 20
+
+; Constants defining partition of nibble value space: these must match
+; corresponding values in mod.squeeze.
+
+NibsLong    * 7
+NibsShort   * (14-NibsLong)
+MinShort    * (2+NibsLong)
+MinLong     * 2
+
+; Code between UnSqueezeBase and UnSqueezeLimit will be copied into
+; the start of a squeezed image, and when the image is loaded it will
+; jump to the start.
+
+; Before start of unsqueeze code there will be 6 words to tell
+; it where the data is, how big it is etc.
+
+|UnsqueezeDataBlock|
+        NOP
+        NOP
+        NOP
+        NOP
+        NOP
+        NOP
+
+rompress_unsqueezecode
+        ASSERT OSDecompHdr_WSSize = . - rompress_unsqueezecode
+        DCD  16*1024 ; Workspace size
+        ASSERT OSDecompHdr_Code = . - rompress_unsqueezecode
+        DCD  entry - rompress_unsqueezecode
+        ASSERT OSDecompHdr_size = . - rompress_unsqueezecode
+
+entry
+        ; Called with:
+        ; R0 = OSHdr ptr
+        ; R1 = IMB func ptr
+        ; R2 = WS ptr
+        ; SP = stack
+        ; We're expected to obey ATPCS calling standards, so stack everything
+        ; we'll be messing with
+        STMFD R13!,{R0-R2,R4-R11,LR}
+        ; Now proceed to main unsqueeze code
+
+        ADR   R0, |UnsqueezeDataBlock|  ; R0 points to data (PC-relative)
+        LDMIA R0, {R8-R12,R14} ; load all the data
+                               ; R14 := sizeToMove
+                               ; R12 := nLongs
+                               ; R11 := nShorts
+        SUB   R10, R0, R10     ; R10 := base of encoded tables
+        SUB   R9, R10, R9      ; R9  := base of encoded data
+        ADD   R8, R9, R8       ; R8  := top of decoded image
+
+        ; We only need nLongs and nShorts while we are decoding the tables.
+        ; Afterwards we will re-use the registers for pointers to start
+        ; of tables.
+
+        LDR   R6,[SP,#8]
+
+        ; Allocate space for tables
+        ADD   R1, R11, R12  ; nLongs + nShorts
+        ADD   R7, R6, R1, LSL #2 ; curFree += (nLongs + nShorts) * 4;
+
+        MOV   R5, R10       ; R5 is ptr into encoded tables
+        MOV   R4, #0        ; this is the first table el
+decodeTab
+        ; Require:  R11 -- no of els left to decode
+        ;           R6  -- ptr into decoded table
+        ;           R5  -- ptr into encoding
+        ;           R4  -- = 0 iff this is the shorts table (i.e. 4-byte vals)
+
+; I believe this loop could be made good deal smaller and possibly
+; faster, but it's only a couple of hundred bytes and it works.
+
+
+        MOV   R2, R6        ; stash away base of first table
+        MOV   R3, #-1       ; start as if previous entry was -1
+decodeEntry
+        SUBS  R11, R11, #1  ; while (--nEntries >= 0) {
+        BLT   decodedTab    ; assert: previous word is in R3
+        LDRB  R1, [R5], #1  ; byte = *p++
+        SUBS  R0, R1, #10
+        BGE   greaterThan9
+literalOrOnes
+        CMP   R1, #0
+        BNE   ones
+literal
+        LDRB  R0, [R5], #1
+        LDRB  R1, [R5], #1
+        ORR   R0, R0, R1, LSL #8
+        LDRB  R1, [R5], #1
+        ORR   R0, R0, R1, LSL #16
+        CMP   R4, #0                 ; in the 4-byte (short encodings) table?
+        LDREQB R1, [R5], #1          ; yes, so include the 4th byte
+        ORREQ  R0, R0, R1, LSL #24   ; in the resultant word
+        ADD   R3, R3, R0
+        STR   R3, [R6], #4
+        B     decodeEntry
+ones
+        SUB   R11, R11, R1
+        ADD   R11, R11, #1
+anotherOne        ; Have number of increment-by-ones in R1
+        ADD   R3, R3, #1
+        STR   R3, [R6], #4
+        SUBS  R1, R1, #1
+        BGT   anotherOne
+        B     decodeEntry
+greaterThan9
+        CMP   R1, #92
+        ADDLT R3, R3, R0
+        STRLT R3, [R6], #4
+        BLT   decodeEntry
+greaterThan91
+        SUBS  R0, R1, #174
+        BLT   oneMore
+twoMore
+        LDRB  R1, [R5], #1
+        ORR   R0, R1, R0, LSL #16
+        LDRB  R1, [R5], #1
+        ORR   R0, R0, R1, LSL #8
+        ADD   R3, R3, R0
+        STR   R3, [R6], #4
+        B     decodeEntry
+oneMore
+        SUBS  R0, R1, #92
+        LDRB  R1, [R5], #1
+        ORR   R0, R1, R0, LSL #8
+        ADD   R3, R3, R0
+        STR   R3, [R6], #4
+        B     decodeEntry   ; } /* end while (--nEntries >= 0) { */
+
+decodedTab
+        CMP   R4, #0        ; if isShorts then
+        BNE   finishLongs   ; else finishLongs
+finishShorts
+        MOV   R11, R12      ; no of els to decode = nLongs
+        MOV   R12, R2       ; R12 = &shorts[0]
+        MOV   R2, R6        ; stash away start of longs table
+        MOV   R4, #1        ; next table is longs
+        B     decodeTab
+finishLongs
+        MOV   R11, R2       ; R11 = &longs[0]
+decodedBothTabs
+        ; Now have:  R14 = sizeToMove
+        ;            R12 = &shorts[0]
+        ;            R11 = &longs[0]
+        ;            R10 = top of encoded data
+        ;            R9  = base of encoded data
+        ;            R8  = top of decoded data
+        ;            R7  = curFree - base of unused memory
+        ;            R0..R6 unused
+
+moveRestOfCode
+        ; Decompression is going to scribble on us here, so copy the
+        ; rest of the code up into free space.
+        ADR   R5, decodeImage
+        ADR   R6, |UnSqueeze_UnSqueezeLimit|
+        MOV   R1, R7  ; we will jump to R1
+
+moveCode
+        LDR   R0, [R5], #4
+        CMP   R5, R6
+        STR   R0, [R7], #4  ; NB this updates free space pointer as we go
+        BLT   moveCode
+        ADD   R2, R1, #|UnSqueeze_UnSqueezeLimit|-decodeImage
+        MOV   R0, #1
+        ; Call the IMB function
+        ; First stack the stuff we don't want trashed
+        STMFD R13!,{R12,R14}
+        ; Set up return address (in the relocated code)
+        MOV   R14, R1
+        ; Call
+        LDR   PC, [R13, #12]
+
+decodeImage
+        ; The code from here on gets executed only after it is copied
+        ; elsewhere.  This is confusing, but necessary.
+        LDMFD R13!,{R12,R14}
+
+        ; Most of the data gets decoded in place, but we have to go round twice
+        ; just in case we have to copy some data elsewhere, so first
+        ; time round we use a higher R9 (bottom of encoded data).
+
+        ADD   R9, R9, R14   ; base = base + sizeToMove
+
+        ; top of encoded data in R10
+        ; base of encoded data in R9
+        ; top of decoded data in R8
+        ; ptr to shorts in R12
+        ; ptr to longs  in R11
+        ; R0..R6 are free for workspace
+
+decodePair
+        CMP   R10, R9           ; Have we reached the base ?
+        BLE   doneDecode
+        LDRB  R6, [R10, #-1]!   ; byte value
+        ; The words will be put in R4 and R5, to be STMDB'd
+        AND   R3, R6, #15       ; first nibble
+        SUBS  R0, R3, #MinShort ; idx = (val - 8)
+        BLT   notshort0
+short0
+        LDRB  R1, [R10, #-1]!
+        ORR   R0, R1, R0, LSL #8
+        LDR   R4, [R12, R0, LSL #2]    ; w = shorts[(nibble-8)<<8 | *p--]
+        B     gotFirst
+notshort0
+        SUBS  R0, R3, #MinLong         ; idx = (val - 2)
+        BLT   notlong0
+long0
+        LDRB  R1, [R10, #-1]!
+        ORR   R0, R1, R0, LSL #8
+        LDR   R0, [R11, R0, LSL #2]    ; w = longs[(nibble-2)<<8 | *p--]
+        LDRB  R1, [R10, #-1]!
+        ORR   R4, R1, R0, LSL #8
+        B     gotFirst
+notlong0
+        MOVS  R4, R3            ; TMD 13-Feb-90: combine 2 instructions here
+                                ; used to be CMP  R3,#0; MOVEQ R4,R3
+        BEQ   gotFirst
+literal0
+        LDRB  R0, [R10, #-1]!
+        LDRB  R1, [R10, #-1]!
+        ORR   R0, R0, R1, LSL #8
+        LDRB  R1, [R10, #-1]!
+        ORR   R0, R0, R1, LSL #16
+        LDRB  R1, [R10, #-1]!
+        ORR   R4, R0, R1, LSL #24
+
+gotFirst
+        ; Phew!  We have the first word of the pair (in R4), now we have
+        ; to do (almost) the same again, result in R5, and STMDB.
+
+        MOV   R3, R6, LSR #4     ; second nibble
+        SUBS  R0, R3, #MinShort  ; idx = (val - 8)
+        BLT   notshort1
+short1
+        LDRB  R1, [R10, #-1]!
+        ORR   R0, R1, R0, LSL #8
+        LDR   R5, [R12, R0, LSL #2]    ; w = shorts[(nibble-8)<<8 | *p--]
+        STMDB R8!, {R4,R5}
+        B     decodePair
+notshort1
+        SUBS  R0, R3, #MinLong        ; idx = (val - 2)
+        BLT   notlong1
+long1
+        LDRB  R1, [R10, #-1]!
+        ORR   R0, R1, R0, LSL #8
+        LDR   R0, [R11, R0, LSL #2]    ; w = longs[(nibble-2)<<8 | *p--]
+        LDRB  R1, [R10, #-1]!
+        ORR   R5, R1, R0, LSL #8
+        STMDB R8!, {R4,R5}
+        B     decodePair
+notlong1
+        MOVS  R5, R3            ; TMD 13-Feb-90: combine 2 instructions here
+                                ; used to be CMP  R3,#0; MOVEQ R5,R3
+
+                                       ; This doesn't pay off much
+        STMEQDB R8!, {R4,R5}           ; might be better to swap round
+        BEQ   decodePair               ; literal and zero, to save 3S on
+literal1                               ; the longer path ?
+        LDRB  R0, [R10, #-1]!
+        LDRB  R1, [R10, #-1]!          ; If I had the right byte-sex and
+        ORR   R0, R0, R1, LSL #8       ; a couple of registers to spare,
+        LDRB  R1, [R10, #-1]!          ; could do this in 15S instead of 22S
+        ORR   R0, R0, R1, LSL #16      ; using the load non-aligned word code
+        LDRB  R1, [R10, #-1]!          ; given in ARM CPU Manual.
+        ORR   R5, R0, R1, LSL #24
+        STMDB R8!, {R4,R5}
+        B     decodePair
+
+doneDecode
+        CMP   R14, #0      ; Any data need to be copied elsewhere ?
+        BLE   runImage     ; No -- just run the image
+        SUB   R6, R9, R14  ; R6 points to base of encoded data
+        MOV   R9, R7       ; R9 points to base of copied data
+        ADD   R10, R9, R14 ; R10 is current pointer into copied data
+moveEncoded
+        LDMIA R6!, {R0-R3}
+        STMIA R7!, {R0-R3}
+        SUBS  R14, R14, #16
+        BGT   moveEncoded
+        B     decodePair   ; Carry on decoding
+
+runImage
+        ; Perform the final fixup before returning to the caller
+        LDMFD R13!,{R0-R2,R4-R11,R14}
+        LDR R2, [R0, #OSHdr_ImageSize]
+        STR R2, [R0, #OSHdr_CompressedSize]
+        MOV R3, #0
+        STR R3, [R0, #OSHdr_DecompressHdr]
+        MOV PC, LR
+
+|UnSqueeze_UnSqueezeLimit|
+
+rompress_unsqueezecodesize
+        DCD |UnSqueeze_UnSqueezeLimit|-rompress_unsqueezecode
+
+        END

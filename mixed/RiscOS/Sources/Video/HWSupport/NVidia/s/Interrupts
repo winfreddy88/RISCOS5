@@ -1,0 +1,176 @@
+; Copyright 2008 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+ClaimInterrupts
+        Push    "r4,r5,r8,r9,lr"
+; check it makes sense
+        LDR     r3, PCIHandle
+        ADR     r1, PCISlot
+        MOV     r0, #PCI_ReadInfo_Slot 
+        MOV     r2, #4
+        SWI     XPCI_ReadInfo
+        LDR     r2, PCISlot
+        TEQ     r2, #&ff    ; invalid?
+        BNE     %ft1
+
+; Oh Dear .. graphics cards has responded as an AGP card... it is therefore in
+; the wrong place and will have been given the wrong idea of addressing.
+; It would be nice to be able to recover the card, but at present the
+;  only reliable way out is power off, or (possibly) a hardware reset
+;
+
+;  simple stretegy for Iyonix: try possible slots, look for first empty one
+;  set the irq for that one
+;
+; will obviously falll over if there is an empty slot 'earlier' than the video
+;  card.. but we'll have to lump that for the time being.
+;
+        MOV     r0, #0
+        MOV     r1, #0
+        MOV     r8, #0
+        MOV     r9, #EntryNo_HAL_PCISlotTable
+        SWI     XOS_Hardware           ; get table size to r0
+        SUB     sp, sp, r0
+        Push    "r0"
+        MOV     r1, r0
+        ADD     r0, sp,#4
+        SWI     XOS_Hardware
+        ADD     r5, sp,#4              ; r5 -> table
+        LDR     r4, [r5], #4           ; r4 = entries
+10      LDRB    r0, [r5, #7]
+        TEQ     r0, #0                 ; not interested in motherboard..
+        BEQ     %ft11                  ; entry no use
+        LDRB    r0, [r5, #0]           ; bus
+        LDRB    r1, [r5, #1]           ; fn
+        SWI     XPCI_FindByLocation
+        TEQ     r3, #0                 ; 0 if nothing there
+        BEQ     %ft12                  ; thats worth trying
+
+11      SUBS    r4, r4, #1
+        LDREQ   r0, GoOff              ; Oops.. run out of entries ..
+                                       ;  turn off anyway
+        SWIEQ   XOS_Reset              ;  panic!!!!
+        ADD     r5, r5, #8
+        B       %bt10
+12
+        LDRB    r2, [r5, #2]           ; IRQDEV A
+        STR     r2, PCIDevNo
+        Pull    "r0"
+        ADD     sp, sp, r0
+        B       %ft2
+
+1       LDR     r3, PCIHandle
+        MOV     r0, #PCI_ReadInfo_IntDeviceVector
+        ADR     r1, PCIDevNo
+        MOV     r2, #4
+        SWI     XPCI_ReadInfo
+        Pull    "r4,r5,r8,r9,pc",VS
+2        
+        LDR     r0, PCIDevNo
+        ORR     r0, r0, #1:SHL:31
+        ADR     r1, IRQHandler
+        MOV     r2, r12
+        SWI     XOS_ClaimDeviceVector
+        Pull    "r4,r5,r8,r9,pc",VS
+
+        LDR     r0, PCIDevNo
+        MOV     r8, #0
+        MOV     r9, #EntryNo_HAL_IRQEnable
+        SWI     XOS_Hardware
+        Pull    "r4,r5,r8,r9,pc"
+
+GoOff   DCB     "&OFF"
+
+ReleaseInterrupts
+        Push    "lr"
+        LDR     r3, MMIO
+        MOV     r0, #0
+        STR     r0, [r3, #&140]
+        STR     r0, PCIIrqsEnabled
+        LDR     r3, VBLANKENABLE
+        STR     r0, [r3]
+        LDR     r0, PCIDevNo
+        ORR     r0, r0, #1:SHL:31
+        ADR     r1, IRQHandler
+        MOV     r2, r12
+        SWI     XOS_ReleaseDeviceVector
+        Pull    "pc"
+
+EnableVSyncs
+        Push    "r0-r3,lr"
+        PHPSEI  ,r3
+        LDR     r3, VBLANK
+        LDR     r2, VBLANKENABLE
+        MOV     r0, #1
+        STR     r0, [r3]
+        LDR     r1, PCIIrqsEnabled
+        ORR     r1, r1, #1
+        STR     r1, PCIIrqsEnabled
+        STR     r0, [r2]
+        LDR     r3, MMIO
+        STR     r0, [r3, #&140]
+        PLP
+        Pull    "r0-r3,pc"
+
+IRQHandler
+        LDR     r2, VBLANK              ; don't corrupt R0,R3 if
+        LDR     r2, [r2]                ; passing on
+        LDR     r1, PCIIrqsEnabled
+        ANDS    r1, r1, r2
+        MOVEQ   pc, lr                  ; not ours
+        LDR     r3, VBLANK
+        STR     r1, [r3]                ; clear it
+        LDR     r3, [r3]                ; read to synchronise PCI
+        Push    "r4,r9"
+        MSR     CPSR_c, #I32_bit + SVC32_mode
+        Push    "r0,r5,r6,r7,lr"
+        ldrb    r7, CurrentHead
+        TST     r7, #1
+        LDREQB  r4, interlacestate0      ; interlaced? .. fudge needed
+        LDRNEB  r4, interlacestate1      ; interlaced? .. fudge needed
+        TST     r4,#1
+        BEQ     IRQh1
+;        LDR     r6,PCRTC
+;        LDR     r5,[r6,#&804]           ; interleave needs this on vsync irq
+;        ANDS    r4,r5,#7
+; [ DebugModule
+;        CMP r4,#2
+;        BLT   dmb1
+;        DREG    r5
+;dmb1        
+; ]              
+;        CMP     r4,#2
+;        BICGE   r5,r5,#7     
+;        STRGE   r5,[r6,#&804]
+;        LDRB    r4, syncFrame 
+;        ADD     r4,r4,#1
+;        STRB    r4,syncFrame
+;        AND     r5,r4,#1
+;        STR     r5,[r6,#&804]
+;        TST     r4,#1
+;        LDRNE   r0,StartAddress1
+;        LDREQ   r0,StartAddress2
+;        BL      ReSetStartAddress
+IRQh1
+        Pull    "r0,r5,r6,r7"
+        MOV     r4, #GraphicsV_VSync
+        LDRB    lr, GVinstance
+        ORR     r4, r4, lr, LSL #24    ; point to our instance
+        MOV     r9, #GraphicsV
+        SWI     XOS_CallAVector
+        Pull    "lr"
+        MSR     CPSR_c, #I32_bit + IRQ32_mode
+        Pull    "r4,r9,pc"
+
+        END

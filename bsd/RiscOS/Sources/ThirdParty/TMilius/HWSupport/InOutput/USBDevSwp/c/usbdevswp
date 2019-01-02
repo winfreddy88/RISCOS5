@@ -1,0 +1,1186 @@
+/** @file
+
+  ...
+
+  */
+/* Created 08.05.2011 T. Milius
+   Changed 13.05.2011 T. Milius */
+/* Copyright (c) 2011 by Thomas Milius Stade, Germany
+* All rights reserved.
+*
+* Redistribution and use in source and binary forms, with or without
+* modification, are permitted provided that the following conditions are met:
+*     * Redistributions of source code must retain the above copyright
+*       notice, this list of conditions and the following disclaimer.
+*     * Redistributions in binary form must reproduce the above copyright
+*       notice, this list of conditions and the following disclaimer in the
+*       documentation and/or other materials provided with the distribution.
+*     * Neither the name of Thomas Milius Stade, Germany nor the
+*       names of its contributors may be used to endorse or promote products
+*       derived from this software without specific prior written permission.
+*
+* THIS SOFTWARE IS PROVIDED BY Thomas Milius Stade, Germany ``AS IS'' AND ANY
+* EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+* WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+* DISCLAIMED. IN NO EVENT SHALL Thomas Milius Stade, Germany BE LIABLE FOR ANY
+* DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+* (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+* LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+* ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+* (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+* SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE. */
+/** @mainpage
+    @author Thomas Milius Stade, Germany
+    @version 0.01
+    @date 08.05.2011
+
+    ...
+
+    */
+/* RISC OS */
+
+/* !!!!!!!!!! libraries !!!!!!!!!! */
+/* ---------- ANSI-C ---------- */
+#include <ctype.h>
+#include <stdbool.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <stdarg.h>
+#include <string.h>
+
+/* ------------ Toolbox ------------ */
+#include <event.h>
+#include <toolbox.h>
+#include <wimp.h>
+#include <wimplib.h>
+#include <menu.h>
+#include <gadgets.h>
+#include <proginfo.h>
+#include <dcs.h>
+#include <window.h>
+
+/* ------------ RISC OS ------------ */
+#include <kernel.h>
+#include <swis.h>
+
+/* ------------ own ------------ */
+#include "configuration.h"
+#include "tb_defs.h"
+
+/* !!!!!!!!!!! definitions !!!!!!!!!! */
+#define EVENT_NOT_CLAIMED 0
+#define EVENT_CLAIMED     1
+
+#define STATUS_ATTACHED    1
+#define STATUS_ACTIVATED   2
+#define STATUS_DEACTIVATED 4
+
+#define MAX_DEVICES 8
+
+#define DEACTIVATED 0
+#define ACTIVATED   1
+
+/* !!!!!!!!!! data structures !!!!!!!!!! */
+struct device_info_structure {
+int vendor_id;
+int product_id;
+int status;
+struct configuration_structure configuration;
+bool changed;
+bool deleted;
+};
+
+struct {
+bool shutdown_flag;
+bool protect;
+bool finished_flag;
+struct device_info_structure device_info[MAX_DEVICES];
+int number_of_devices;
+int delete_offset[MAX_DEVICES];
+struct device_info_structure *delete_device;
+bool data_changed;
+ObjectId window;
+ObjectId dcs;
+} common;
+
+/* ---------- RISCOS Wimp Toolbox Communication ---------- */
+MessagesFD    messages;
+IdBlock       id_block;
+
+_kernel_oserror app_error;
+
+/* !!!!!!!!!! support functions !!!!!!!!!! */
+struct device_info_structure *find_device_info(int vendor_id,
+                                               int product_id)
+{
+int i;
+
+i=0;
+while (i < common.number_of_devices) {
+  if ((common.device_info[i].vendor_id == vendor_id) &&
+      (common.device_info[i].product_id == product_id)) {
+    return &common.device_info[i];
+    }
+  i++;
+  }
+/* No matching entry found */
+return NULL;
+}
+
+_kernel_oserror *save_device_info(struct device_info_structure *device_info)
+{
+char file_name[100];
+FILE *alias_file;
+_kernel_swi_regs regs;
+_kernel_oserror *error_os;
+
+if (device_info->changed) {
+  /* Delete from everywhere. It will be rebuilded if necassary. */
+  sprintf(file_name,
+          "<Choices$Write>.USBDevSwp.Devices.%04x_%04x",
+          device_info->vendor_id,
+          device_info->product_id);
+  remove(file_name);
+  sprintf(file_name,
+          "<Choices$Write>.USBDevSwp.Disabled.%04x_%04x",
+          device_info->vendor_id,
+          device_info->product_id);
+  remove(file_name);
+  if (device_info->deleted) {
+    device_info->status&=STATUS_ATTACHED;
+    }
+  else {
+    if ((device_info->status&STATUS_ACTIVATED) != 0) {
+      sprintf(file_name,
+              "<Choices$Write>.USBDevSwp.Devices.%04x_%04x",
+              device_info->vendor_id,
+              device_info->product_id);
+      device_info->status&=STATUS_ATTACHED|STATUS_ACTIVATED;
+      }
+    else {
+      sprintf(file_name,
+              "<Choices$Write>.USBDevSwp.Disabled.%04x_%04x",
+              device_info->vendor_id,
+              device_info->product_id);
+      device_info->status&=STATUS_ATTACHED|STATUS_DEACTIVATED;
+      }
+    if ((alias_file=fopen(file_name,"w")) != NULL) {
+      fprintf(alias_file,
+              "| Generated by USBDevSwp\n");
+      fprintf(alias_file,
+              "Alias @USBDevice____%04x_%04x____ USBDevSwp_Swap %%%%*0",
+              device_info->vendor_id,
+              device_info->product_id);
+      if (device_info->configuration.eval_offset != 500) {
+        fprintf(alias_file,
+                " -delay %d",
+                device_info->configuration.eval_offset);
+        }
+      if (device_info->configuration.selected_target != NO_TARGET) {
+        fprintf(alias_file,
+                " -target %d",
+                device_info->configuration.selected_target);
+        }
+      if (strcmp(device_info->configuration.subseq_command, "") != 0) {
+        fprintf(alias_file,
+                " \"%s\"",
+                device_info->configuration.subseq_command);
+        }
+      fprintf(alias_file, "\n\n");
+      fprintf(alias_file,
+              "If \"<USB$Device_*_*_*_%04x_%04x_-1_-1_*_*>\" <> \"\" Then Do @USBDevice____%04x_%04x____ <USB$Device_*_*_*_%04x_%04x_-1_-1_*_*> -immediate\n",
+              device_info->vendor_id,
+              device_info->product_id,
+              device_info->vendor_id,
+              device_info->product_id,
+              device_info->vendor_id,
+              device_info->product_id);
+      fclose(alias_file);
+      regs.r[0]=18;
+      regs.r[1]=(int) file_name;
+      regs.r[2]=0x00000FEB;
+      if ((error_os=_kernel_swi(OS_File, &regs, &regs)) != NULL) {
+        return error_os;
+        }
+      }
+    }
+  device_info->changed=false;
+  }
+return NULL;
+}
+
+/** Displays errors according to the given error and optinal parameters.
+
+    The error messages are located inside the "Messages" file and
+    introduced by "Error_" followed by the error number. */
+bool show_message(int message_number,
+                  ...)
+{
+va_list args;
+char message_token[20];
+char format[200];
+_kernel_swi_regs regs;
+
+sprintf(message_token,
+        "Error_%d",
+        message_number);
+regs.r[0]=(int) messages.data;
+regs.r[1]=(int) message_token;
+regs.r[2]=(int) format;
+regs.r[3]=199;
+regs.r[4]=0;
+regs.r[5]=0;
+regs.r[6]=0;
+regs.r[7]=0;
+_kernel_swi(MessageTrans_Lookup, &regs, &regs);
+va_start(args, message_number);
+vsprintf(app_error.errmess, format, args);
+va_end(args);
+app_error.errnum=0;
+wimp_report_error(&app_error,
+                  0,
+                  0,
+                  APPLICATION_NAME,
+                  0,
+                  0);
+return true;
+}
+
+/** Displays heavy internal RISC OS errors and drops the application if desired. */
+void application_report_error(_kernel_oserror *error_os,
+                              bool drop_application_flag)
+{
+
+wimp_report_error(error_os,
+                  0,
+                  APPLICATION_NAME,
+                  0,
+                  0,
+                  0);
+if (drop_application_flag) {
+  common.shutdown_flag=true;
+  exit(EXIT_FAILURE);
+  }
+}
+
+/** Initialize some internal variables/structures at start of the application. */
+bool initialize_application(void)
+{
+_kernel_oserror *error_os;
+
+common.shutdown_flag=false;
+common.protect=false;
+common.finished_flag=false;
+common.number_of_devices=0;
+common.data_changed=false;
+common.window=0x00000000;
+common.dcs=0x00000000;
+if ((error_os=initialize_error()) != NULL) {
+  return false;
+  }
+return true;
+}
+
+void note_change(struct device_info_structure *device_info)
+{
+char temp_string[256];
+int length;
+_kernel_oserror *error_os;
+
+device_info->changed=true;
+if (!common.data_changed) {
+  if ((error_os=window_get_title(0,
+                                 common.window,
+                                 temp_string,
+                                 256,
+                                 &length)) != NULL) application_report_error(error_os, false);
+  strcat(temp_string, " *");
+  if ((error_os=window_set_title(0,
+                                 common.window,
+                                 temp_string)) != NULL) application_report_error(error_os, false);
+  common.data_changed=true;
+  }
+}
+
+_kernel_oserror *fetch_state(void)
+{
+char temp_string_a[256];
+char temp_string_b[256];
+char temp_string_c[256];
+char file_line[256];
+char file_name[256];
+char *temp_pointer;
+char **params;
+int temp_length;
+int i, j;
+int vendor_id;
+int product_id;
+bool loop_end;
+struct device_info_structure *act_device_info;
+FILE *alias_file;
+_kernel_swi_regs regs, regs_b;
+_kernel_oserror *error_os;
+
+common.number_of_devices=0;
+/* Try to collected available information. */
+/* Examine activated/disabled entries */
+regs.r[0]=9;
+regs.r[2]=(int) temp_string_a;
+regs.r[5]=256;
+regs.r[6]=NULL;
+/* Deactivated files prior to activated ones to ensure that in case of doubled information
+   the activated information wins. */
+for (i=0; i < 2; i++) {
+  if (i == ACTIVATED) {
+    regs.r[1]=(int) "Choices:USBDevSwp.Devices";
+    }
+  else {
+    regs.r[1]=(int) "Choices:USBDevSwp.Disabled";
+    }
+  regs.r[4]=0;
+  do {
+    regs.r[3]=1;
+    if ((error_os=_kernel_swi(OS_GBPB, &regs, &regs)) != NULL) {
+      return error_os;
+      }
+    if (regs.r[3] != 0) {
+      if (sscanf(temp_string_a,
+                 "%x_%x",
+                 &vendor_id,
+                 &product_id) == 2) {
+        sprintf(file_name,
+                "%s.%s",
+                (char *) regs.r[1],
+                temp_string_a);
+        if ((alias_file=fopen(file_name, "r")) != NULL) {
+          if ((act_device_info=find_device_info(vendor_id,
+                                                product_id)) == NULL) {
+            if (common.number_of_devices < MAX_DEVICES) {
+              act_device_info=&common.device_info[common.number_of_devices];
+              common.number_of_devices++;
+              /* Initialize new info */
+              act_device_info->vendor_id=vendor_id;
+              act_device_info->product_id=product_id;
+              /* Set later independently whether new or existing */
+              act_device_info->status=0;
+              act_device_info->configuration.eval_offset=500;
+              act_device_info->configuration.subseq_command[0]='\0';
+              act_device_info->configuration.number_of_targets=0;
+              act_device_info->configuration.selected_target=NO_TARGET;
+              if ((error_os=get_configuration(&act_device_info->configuration,
+                                              act_device_info->vendor_id,
+                                              act_device_info->product_id)) != NULL) {
+                return error_os;
+                }
+              act_device_info->changed=false;
+              act_device_info->deleted=false;
+              }
+            }
+          else {
+            /* Usually all devices should be new but in case of corrupt information ...
+               Ensure clean up at save. */
+            note_change(act_device_info);
+            }
+          if (act_device_info != NULL) {
+            /* Note status information */
+            if (i == ACTIVATED) {
+              act_device_info->status|=STATUS_ACTIVATED;
+              }
+            else {
+              act_device_info->status|=STATUS_DEACTIVATED;
+              }
+            sprintf(temp_string_a,
+                    /* All lower for comparision */
+                    "alias @usbdevice____%04x_%04x____ usbdevswp_swap ",
+                    act_device_info->vendor_id,
+                    act_device_info->product_id);
+            temp_length=strlen(temp_string_a);
+            file_line[255]='\0';
+            while(!feof(alias_file)) {
+              file_line[0]='\0';
+              fgets(file_line, 255, alias_file);
+              /* Ensure first part is lower for comparision */
+              j=0;
+              while ((j < temp_length) && (file_line[j] != '\0')) {
+                file_line[j]=tolower(file_line[j]);
+                j++;
+                }
+              if (strncmp(file_line, temp_string_a, temp_length) == 0) {
+               /* Resets information in case another one is already avaliable. */
+                act_device_info->configuration.eval_offset=500;
+                act_device_info->configuration.subseq_command[0]='\0';
+                temp_pointer=file_line + temp_length;
+                /* Look for various parameters.
+                   Use same mask as the module. */
+                regs_b.r[0]=(int) "/A/G,immediate/S,delay/K/G,target/K/G,/G";
+                regs_b.r[1]=(int) temp_pointer;
+                regs_b.r[2]=(int) temp_string_b;
+                regs_b.r[3]=USBDEVSWP_MAX_MESSAGE_LENGTH;
+                if ((error_os=_kernel_swi(OS_ReadArgs, &regs_b, &regs_b)) != NULL) {
+                  return error_os;
+                  }
+                params=(char **) temp_string_b;
+                /* Device No will obtain the parameters passing.
+                   We ignore this incl. everything delivered within this parameters. */
+                /* Determine delay */
+                if (params[1] != 0) {
+                   /* -immediate information should not occur at here.
+                      -delay 0 would be the right choice instead. */
+                   act_device_info->configuration.eval_offset=0;
+                   }
+                else {
+                  temp_pointer=params[2];
+                  if (temp_pointer != NULL) {
+                    strncpy(temp_string_c, temp_pointer + 2, temp_pointer[1]*256 + temp_pointer[0]);
+                    temp_string_c[temp_pointer[1]*256 + temp_pointer[0]]='\0';
+                    act_device_info->configuration.eval_offset=atoi(temp_string_c);
+                    }
+                  }
+                /* Target selection */
+                temp_pointer=params[3];
+                if (temp_pointer != NULL) {
+                  strncpy(temp_string_c, temp_pointer + 2, temp_pointer[1]*256 + temp_pointer[0]);
+                  temp_string_c[temp_pointer[1]*256 + temp_pointer[0]]='\0';
+                  act_device_info->configuration.selected_target=atoi(temp_string_c);
+                  }
+                /* Subcommand */
+                temp_pointer=params[4];
+                if (temp_pointer != NULL) {
+                  strncpy(act_device_info->configuration.subseq_command, temp_pointer + 2, temp_pointer[1]*256 + temp_pointer[0]);
+                  act_device_info->configuration.subseq_command[temp_pointer[1]*256 + temp_pointer[0]]='\0';
+                  }
+                break;
+                }
+              }
+            }
+          fclose(alias_file);
+          }
+        }
+      }
+    }
+  while(regs.r[4] != -1);
+  }
+/* Evaluate attached devices by scanning USB variables.
+   After the stored information to detect new information. */
+regs.r[3]=NULL;
+do {
+  loop_end=true;
+  regs.r[0]=(int) "USB$Device_*_*_*_*_*_-1_-1_*_*";
+  regs.r[1]=NULL;
+  regs.r[2]=-1;
+  regs.r[4]=0;
+  _kernel_swi(OS_ReadVarVal, &regs, &regs);
+  if (regs.r[2] != 0) {
+    loop_end=false;
+    strncpy(temp_string_a, (char *) regs.r[3] + 20, 9);
+    temp_string_a[9]='\0';
+    sscanf(temp_string_a,
+           "%x_%x",
+           &vendor_id,
+           &product_id);
+    sprintf(temp_string_a,
+            "<USBDevSwp$Dir>.Devices.%04x_%04x",
+            vendor_id,
+            product_id);
+    regs_b.r[0]=17;
+    regs_b.r[1]=(int) temp_string_a;
+    regs_b.r[4]=NULL;
+    if ((error_os=_kernel_swi(OS_File, &regs_b, &regs_b)) != NULL) {
+      return error_os;
+      }
+    if (regs_b.r[0] == 1) {
+      /* We can handle the device. */
+      if ((act_device_info=find_device_info(vendor_id,
+                                            product_id)) == NULL) {
+        if (common.number_of_devices < MAX_DEVICES) {
+          act_device_info=&common.device_info[common.number_of_devices];
+          common.number_of_devices++;
+          /* Initialize new info */
+          act_device_info->vendor_id=vendor_id;
+          act_device_info->product_id=product_id;
+          /* Set later independently whether new or existing */
+          act_device_info->status=0;
+          act_device_info->configuration.eval_offset=500;
+          act_device_info->configuration.subseq_command[0]='\0';
+          act_device_info->configuration.number_of_targets=0;
+          act_device_info->configuration.selected_target=NO_TARGET;
+          if ((error_os=get_configuration(&act_device_info->configuration,
+                                          act_device_info->vendor_id,
+                                          act_device_info->product_id)) != NULL) {
+            return error_os;
+            }
+printf("%d\n", act_device_info->configuration.number_of_targets);
+          /* Ensures writing at save. */
+          note_change(act_device_info);
+          act_device_info->deleted=false;
+          }
+        }
+      if (act_device_info != NULL) {
+        /* Note status information */
+        act_device_info->status|=STATUS_ATTACHED;
+        }
+      }
+    }
+  }
+while(!loop_end);
+return NULL;
+}
+
+/** Performs a clean up at the end of the program. */
+bool drop_application(void)
+{
+
+close_error();
+return true;
+}
+
+void enable_gadget(int gadget_no,
+                   bool enable_flag)
+{
+unsigned int flags;
+_kernel_oserror *error_os;
+
+if ((error_os=gadget_get_flags(0,
+                               common.window,
+                               gadget_no,
+                               &flags)) != NULL) application_report_error(error_os, true);
+if ((error_os=gadget_set_flags(0,
+                               common.window,
+                               gadget_no,
+                               /*                      Norcroft bug? */
+                               (flags & 0x7FFFFFFF) | (!enable_flag ? 0x80000000 : 0x00000000))) != NULL) application_report_error(error_os, true);
+}
+
+struct device_info_structure *retreive_device_info_from_item(int component)
+{
+int device_info_number;
+
+device_info_number=(component/16) - 1;
+if ((device_info_number < 0) || (device_info_number >= MAX_DEVICES)) return NULL;
+/* Adjust deleted invisible lines */
+device_info_number+=common.delete_offset[device_info_number];
+if (device_info_number < common.number_of_devices) return &common.device_info[device_info_number];
+else return NULL;
+}
+
+void update_window(void)
+{
+char temp_string[10];
+int i, j;
+int gadget_no;
+struct device_info_structure *device_info;
+_kernel_oserror *error_os;
+
+/* To avoid avaluation of changed events. */
+common.protect=true;
+/* Determine the delete offset for every line in Window.
+   Deleted lines are staying at their location until the whole device information
+   is refreshed. In display they are skipped. So the device infroamtion belonging to a line
+   is obtained by taking the line number and adding the number of lines hidden before it.
+   This is the deleted offset. */
+j=0;
+for (i=0; i < MAX_DEVICES; i++) {
+  if (i < common.number_of_devices) {
+    if (common.device_info[i].deleted) j++;
+    }
+  common.delete_offset[i]=j;
+  }
+for (i=0; i < MAX_DEVICES; i++) {
+  device_info=retreive_device_info_from_item((i+1)*16);
+  for (j=0; j <= 7; j++) {
+    gadget_no=(i+1)*16 + j;
+    if (device_info) {
+      switch(j) {
+        case 0: {
+          sprintf(temp_string,
+                  "%04x",
+                  device_info->vendor_id);
+          if ((error_os=displayfield_set_value(0,
+                                               common.window,
+                                               gadget_no,
+                                               temp_string)) != NULL) {
+            common.protect=false;
+            application_report_error(error_os, true);
+            }
+          enable_gadget(gadget_no,
+                        true);
+          }
+        break;
+        case 1: {
+          sprintf(temp_string,
+                  "%04x",
+                  device_info->product_id);
+          if ((error_os=displayfield_set_value(0,
+                                               common.window,
+                                               gadget_no,
+                                               temp_string)) != NULL) {
+            common.protect=false;
+            application_report_error(error_os, true);
+            }
+          enable_gadget(gadget_no,
+                        true);
+          }
+        break;
+        case 2: {
+          if ((error_os=optionbutton_set_state(0,
+                                               common.window,
+                                               gadget_no,
+                                               ((device_info->status & STATUS_ACTIVATED) ? 1 : 0))) != NULL) {
+            common.protect=false;
+            application_report_error(error_os, true);
+            }
+          enable_gadget(gadget_no,
+                        ((device_info->status & (STATUS_ACTIVATED|STATUS_ATTACHED)) ? true : false));
+          }
+        break;
+        case 3: {
+          if ((error_os=numberrange_set_value(0,
+                                              common.window,
+                                              gadget_no,
+                                              device_info->configuration.eval_offset)) != NULL) {
+            common.protect=false;
+            application_report_error(error_os, true);
+            }
+          enable_gadget(gadget_no,
+                        true);
+          }
+        break;
+        case 4: {
+          sprintf(temp_string,
+                  "%04x",
+                  device_info->configuration.new_vendor_id);
+          if ((error_os=displayfield_set_value(0,
+                                               common.window,
+                                               gadget_no,
+                                               temp_string)) != NULL) {
+            common.protect=false;
+            application_report_error(error_os, true);
+            }
+          enable_gadget(gadget_no,
+                        true);
+          }
+        break;
+        case 5: {
+          sprintf(temp_string,
+                  "%04x",
+                  device_info->configuration.new_product_id);
+          if ((error_os=displayfield_set_value(0,
+                                               common.window,
+                                               gadget_no,
+                                               temp_string)) != NULL) {
+            common.protect=false;
+            application_report_error(error_os, true);
+            }
+          enable_gadget(gadget_no,
+                        true);
+          }
+        break;
+        case 6: {
+          if ((device_info->configuration.selected_target < 0) ||
+              (device_info->configuration.number_of_targets < 2)) {
+            if ((error_os=numberrange_set_value(0,
+                                                common.window,
+                                                gadget_no,
+                                                0)) != NULL) {
+              common.protect=false;
+              application_report_error(error_os, true);
+              }
+            enable_gadget(gadget_no,
+                          false);
+            }
+          else {
+            if ((error_os=numberrange_set_bounds(0x00000002,
+                                                 common.window,
+                                                 gadget_no,
+                                                 0,
+                                                 device_info->configuration.number_of_targets - 1,
+                                                 0,
+                                                 0)) != NULL) {
+              common.protect=false;
+              application_report_error(error_os, true);
+              }
+            if ((error_os=numberrange_set_value(0,
+                                                common.window,
+                                                gadget_no,
+                                                device_info->configuration.selected_target)) != NULL) {
+              common.protect=false;
+              application_report_error(error_os, true);
+              }
+            enable_gadget(gadget_no,
+                          true);
+            }
+          }
+        break;
+        case 7: {
+          if ((error_os=writablefield_set_value(0,
+                                                common.window,
+                                                gadget_no,
+                                                device_info->configuration.subseq_command)) != NULL) {
+            common.protect=false;
+            application_report_error(error_os, true);
+            }
+          enable_gadget(gadget_no,
+                        true);
+          }
+        break;
+        }
+      }
+    else {
+      switch(j) {
+        case 0:
+        case 1:
+        case 4:
+        case 5: {
+          if ((error_os=displayfield_set_value(0,
+                                               common.window,
+                                               gadget_no,
+                                               "")) != NULL) {
+            common.protect=false;
+            application_report_error(error_os, true);
+            }
+          }
+        break;
+        case 2: {
+          if ((error_os=optionbutton_set_state(0,
+                                               common.window,
+                                               gadget_no,
+                                               0)) != NULL) {
+            common.protect=false;
+            application_report_error(error_os, true);
+            }
+          }
+        break;
+        case 3:
+        case 6: {
+          if ((error_os=numberrange_set_value(0,
+                                              common.window,
+                                              gadget_no,
+                                              0)) != NULL) {
+            common.protect=false;
+            application_report_error(error_os, true);
+            }
+          }
+        break;
+        case 7: {
+          if ((error_os=writablefield_set_value(0,
+                                                common.window,
+                                                gadget_no,
+                                                "")) != NULL) {
+            common.protect=false;
+            application_report_error(error_os, true);
+            }
+          }
+        break;
+        }
+      enable_gadget(gadget_no,
+                    false);
+      }
+    }
+  }
+common.protect=false;
+}
+
+/* Reset changes */
+void reset_changes(void)
+{
+char temp_string[256];
+int length;
+_kernel_oserror *error_os;
+
+if (common.data_changed) {
+  if ((error_os=window_get_title(0,
+                                 common.window,
+                                 temp_string,
+                                 256,
+                                 &length)) != NULL) application_report_error(error_os, false);
+  /* Remove * indicator */
+  temp_string[strlen(temp_string) - 2]='\0';
+  if ((error_os=window_set_title(0,
+                                 common.window,
+                                 temp_string)) != NULL) application_report_error(error_os, false);
+  common.data_changed=false;
+  }
+}
+
+/* !!!!!!!!!! functions !!!!!!!!!! */
+/* ---------- Application Handling --------- */
+int option_button_handler(int event_code,
+                          ToolboxEvent *event,
+                          IdBlock *id_block,
+                          void *client_handle)
+{
+struct device_info_structure *device_info;
+OptionButtonStateChangedEvent *option_button_event;
+
+if (common.protect) return EVENT_CLAIMED;
+if ((device_info=retreive_device_info_from_item(id_block->self_component)) != NULL) {
+  option_button_event=(OptionButtonStateChangedEvent *) event;
+  if (option_button_event->new_state == 0) {
+    device_info->status&=~STATUS_ACTIVATED;
+    device_info->status|=STATUS_DEACTIVATED;
+    }
+  else {
+    device_info->status&=~STATUS_DEACTIVATED;
+    device_info->status|=STATUS_ACTIVATED;
+    }
+  note_change(device_info);
+  }
+return EVENT_CLAIMED;
+}
+
+int number_range_handler(int event_code,
+                         ToolboxEvent *event,
+                         IdBlock *id_block,
+                         void *client_handle)
+{
+char temp_string[10];
+struct device_info_structure *device_info;
+NumberRangeValueChangedEvent *number_range_event;
+_kernel_oserror *error_os;
+
+if (common.protect) return EVENT_CLAIMED;
+if ((device_info=retreive_device_info_from_item(id_block->self_component)) != NULL) {
+  number_range_event=(NumberRangeValueChangedEvent *) event;
+  if ((id_block->self_component % 16) == 3) {
+    device_info->configuration.eval_offset=number_range_event->new_value;
+    }
+  else {
+    device_info->configuration.selected_target=number_range_event->new_value;
+    device_info->configuration.new_vendor_id=device_info->configuration.target[device_info->configuration.selected_target].vendor_id;
+    device_info->configuration.new_product_id=device_info->configuration.target[device_info->configuration.selected_target].product_id;
+    sprintf(temp_string,
+            "%04x",
+            device_info->configuration.new_vendor_id);
+    if ((error_os=displayfield_set_value(0,
+                                         common.window,
+                                         id_block->self_component - 2,
+                                         temp_string)) != NULL) application_report_error(error_os, true);
+    sprintf(temp_string,
+            "%04x",
+            device_info->configuration.new_product_id);
+    if ((error_os=displayfield_set_value(0,
+                                         common.window,
+                                         id_block->self_component - 1,
+                                         temp_string)) != NULL) application_report_error(error_os, true);
+    }
+  note_change(device_info);
+  }
+return EVENT_CLAIMED;
+}
+
+int writable_field_handler(int event_code,
+                           ToolboxEvent *event,
+                           IdBlock *id_block,
+                           void *client_handle)
+{
+char temp_string[256];
+int string_size;
+struct device_info_structure *device_info;
+_kernel_oserror *error_os;
+
+if (common.protect) return EVENT_CLAIMED;
+if ((device_info=retreive_device_info_from_item(id_block->self_component)) != NULL) {
+  /* Filter number ranges */
+  if ((id_block->self_component % 16) == 7) {
+    /* Occurs after every key press. However this is not disturbing here. But compare to handle
+       special keys without casuing a change */
+    if ((error_os=writablefield_get_value(0,
+                                          common.window,
+                                          id_block->self_component,
+                                          temp_string,
+                                          256,
+                                          &string_size)) != NULL) application_report_error(error_os, true);
+    if (strcmp(device_info->configuration.subseq_command, temp_string) != 0) {
+      strcpy(device_info->configuration.subseq_command, temp_string);
+      note_change(device_info);
+      }
+    }
+  }
+return EVENT_CLAIMED;
+}
+
+int show_menu(int event_code,
+              ToolboxEvent *event,
+              IdBlock *id_block,
+              void *client_handle)
+{
+int x, y, buttons;
+ObjectId window;
+ComponentId component;
+_kernel_oserror *error_os;
+
+/* Determine device which could deleted */
+if ((error_os=window_get_pointer_info(0,
+                                      &x,
+                                      &y,
+                                      &buttons,
+                                      &window,
+                                      &component)) != NULL) application_report_error(error_os, true);
+if ((buttons & 0x00000002) != 0) {
+  common.delete_device=retreive_device_info_from_item(component);
+  }
+else {
+  common.delete_device=NULL;
+  }
+if ((error_os=menu_set_fade(0,
+                            id_block->self_id,
+                            APP_MENU_LIST_DELETE,
+                            (common.delete_device == NULL ? 1 : 0))) != NULL) application_report_error(error_os, true);
+return EVENT_CLAIMED;
+}
+
+int menu_selection(int event_code,
+                   ToolboxEvent *event,
+                   IdBlock *id_block,
+                   void *client_handle)
+{
+
+switch(id_block->self_component) {
+  case APP_MENU_LIST_HELP: {
+    system("<USBDevSwp$Dir>.!Help");
+    }
+  break;
+  case APP_MENU_LIST_DELETE: {
+    if (common.delete_device) {
+      common.delete_device->deleted=true;
+      note_change(common.delete_device);
+      update_window();
+      }
+    }
+  break;
+  }
+return EVENT_CLAIMED;
+}
+
+int close_window(int event_code,
+                 ToolboxEvent *event,
+                 IdBlock *id_block,
+                 void *client_handle)
+{
+_kernel_oserror *error_os;
+
+
+common.finished_flag=true;
+if ((error_os=event_deregister_toolbox_handler(common.window,
+                                               Window_HasBeenHidden,
+                                               close_window,
+                                               NULL)) != NULL) application_report_error(error_os, false);
+if ((error_os=event_deregister_toolbox_handler(common.window,
+                                               OptionButton_StateChanged,
+                                               option_button_handler,
+                                               NULL)) != NULL) application_report_error(error_os, true);
+if ((error_os=event_deregister_toolbox_handler(common.window,
+                                               NumberRange_ValueChanged,
+                                               number_range_handler,
+                                               NULL)) != NULL) application_report_error(error_os, true);
+if ((error_os=event_deregister_toolbox_handler(common.window,
+                                               WritableField_ValueChanged,
+                                               writable_field_handler,
+                                               NULL)) != NULL) application_report_error(error_os, true);
+if (common.data_changed) {
+  if ((error_os=toolbox_show_object(0,
+                                    common.dcs,
+                                    0,
+                                    NULL,
+                                    0x00000000,
+                                    0xFFFFFFFF)) != NULL) application_report_error(error_os, true);
+  }
+else {
+  common.shutdown_flag=true;
+  }
+return EVENT_CLAIMED;
+}
+
+int show_window(int event_code,
+                ToolboxEvent *event,
+                IdBlock *id_block,
+                void *client_handle)
+{
+_kernel_oserror *error_os;
+
+common.window=id_block->self_id;
+/* We are interested in closing the window */
+if ((error_os=event_register_toolbox_handler(common.window,
+                                             Window_HasBeenHidden,
+                                             close_window,
+                                             NULL)) != NULL) application_report_error(error_os, true);
+/* Cope with field changes */
+if ((error_os=event_register_toolbox_handler(common.window,
+                                             OptionButton_StateChanged,
+                                             option_button_handler,
+                                             NULL)) != NULL) application_report_error(error_os, true);
+if ((error_os=event_register_toolbox_handler(common.window,
+                                             NumberRange_ValueChanged,
+                                             number_range_handler,
+                                             NULL)) != NULL) application_report_error(error_os, true);
+if ((error_os=event_register_toolbox_handler(common.window,
+                                             WritableField_ValueChanged,
+                                             writable_field_handler,
+                                             NULL)) != NULL) application_report_error(error_os, true);
+update_window();
+return EVENT_CLAIMED;
+}
+
+int discard_handler(int event_code,
+                    ToolboxEvent *event,
+                    IdBlock *id_block,
+                    void *client_handle)
+{
+_kernel_oserror *error_os;
+
+reset_changes();
+if (common.finished_flag) {
+  common.shutdown_flag=true;
+  }
+else {
+  if ((error_os=fetch_state()) != NULL) application_report_error(error_os, true);
+  update_window();
+  }
+return EVENT_CLAIMED;
+}
+
+int cancel_handler(int event_code,
+                   ToolboxEvent *event,
+                   IdBlock *id_block,
+                   void *client_handle)
+{
+_kernel_oserror *error_os;
+
+if (common.finished_flag) {
+  if ((error_os=toolbox_show_object(0,
+                                    common.window,
+                                    0,
+                                    NULL,
+                                    0x00000000,
+                                    0xFFFFFFFF)) != NULL) application_report_error(error_os, true);
+  }
+return EVENT_CLAIMED;
+}
+
+int save_handler(int event_code,
+                 ToolboxEvent *event,
+                 IdBlock *id_block,
+                 void *client_handle)
+{
+int i;
+
+for (i=0; i < common.number_of_devices; i++) {
+  save_device_info(&common.device_info[i]);
+  }
+reset_changes();
+/* Run the module to activate some settings */
+system("<USBDevSwp$Dir>.!Run");
+if (common.finished_flag) {
+  common.shutdown_flag=true;
+  }
+return EVENT_CLAIMED;
+}
+
+/* ---------- Message Handling --------- */
+int program_quitM(WimpMessage *message,
+                  void *client_handle)
+{
+
+common.shutdown_flag=true;
+return EVENT_CLAIMED;
+}
+
+int main(int argc,
+         char *argv[])
+{
+int toolbox_events=0,
+    wimp_messages=0;
+int task, wversion;
+void *sprite_area;
+int event_code;
+_kernel_oserror *error_os;
+WimpPollBlock poll_block;
+
+/* General initializations */
+if (!initialize_application()) {
+  exit(EXIT_FAILURE);
+  }
+/* Register to Wimp/Toolbox */
+if ((error_os=toolbox_initialise(0,
+                                 WimpVersion,
+                                 &wimp_messages,
+                                 &toolbox_events,
+                                 "<USBDevSwp$Dir>",
+                                 &messages,
+                                 &id_block,
+                                 &wversion,
+                                 &task,
+                                 &sprite_area)) != NULL) application_report_error(error_os, true);
+if ((error_os=event_initialise(&id_block)) != NULL) application_report_error(error_os, true);
+/* Null Events because Poll would fail else */
+event_set_mask(0);
+/* Installation of procedures to handle certain events */
+if ((error_os=event_register_toolbox_handler(-1,
+                                             Window_AboutToBeShown,
+                                             show_window,
+                                             NULL)) != NULL) application_report_error(error_os, true);
+if ((error_os=event_register_toolbox_handler(-1,
+                                             Menu_AboutToBeShown,
+                                             show_menu,
+                                             NULL)) != NULL) application_report_error(error_os, true);
+if ((error_os=event_register_toolbox_handler(-1,
+                                             Menu_Selection,
+                                             menu_selection,
+                                             NULL)) != NULL) application_report_error(error_os, true);
+if ((error_os=event_register_toolbox_handler(-1,
+                                             DCS_Discard,
+                                             discard_handler,
+                                             NULL)) != NULL) application_report_error(error_os, true);
+if ((error_os=event_register_toolbox_handler(-1,
+                                             DCS_Cancel,
+                                             cancel_handler,
+                                             NULL)) != NULL) application_report_error(error_os, true);
+if ((error_os=event_register_toolbox_handler(-1,
+                                             DCS_Save,
+                                             save_handler,
+                                             NULL)) != NULL) application_report_error(error_os, true);
+if ((error_os=event_register_message_handler(Wimp_MQuit,
+                                             program_quitM,
+                                             NULL)) != NULL) application_report_error(error_os, true);
+if ((error_os=toolbox_create_object(0,
+                                    "DCS",
+                                    &common.dcs)) != NULL) application_report_error(error_os, true);
+if ((error_os=fetch_state()) != NULL) application_report_error(error_os, true);
+/* Repeat until termination. */
+while(!common.shutdown_flag) {
+  event_code=0;
+  if ((error_os=event_poll(&event_code,
+                           &poll_block,
+                           NULL)) != NULL) application_report_error(error_os, true);
+  }
+/* finish program */
+if ((error_os=event_deregister_message_handler(Wimp_MQuit,
+                                               program_quitM,
+                                               NULL)) != NULL) application_report_error(error_os, true);
+if ((error_os=event_deregister_toolbox_handler(-1,
+                                               DCS_Save,
+                                               save_handler,
+                                               NULL)) != NULL) application_report_error(error_os, true);
+if ((error_os=event_deregister_toolbox_handler(-1,
+                                               DCS_Cancel,
+                                               cancel_handler,
+                                               NULL)) != NULL) application_report_error(error_os, true);
+if ((error_os=event_deregister_toolbox_handler(-1,
+                                               DCS_Discard,
+                                               discard_handler,
+                                               NULL)) != NULL) application_report_error(error_os, true);
+if ((error_os=event_deregister_toolbox_handler(-1,
+                                               Menu_Selection,
+                                               menu_selection,
+                                               NULL)) != NULL) application_report_error(error_os, true);
+if ((error_os=event_deregister_toolbox_handler(-1,
+                                               Menu_AboutToBeShown,
+                                               show_menu,
+                                               NULL)) != NULL) application_report_error(error_os, true);
+if ((error_os=event_deregister_toolbox_handler(-1,
+                                               Window_AboutToBeShown,
+                                               show_window,
+                                               NULL)) != NULL) application_report_error(error_os, true);
+drop_application();
+exit(EXIT_SUCCESS);
+}

@@ -1,0 +1,797 @@
+/* Copyright 2012 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+#include <time.h>
+#include "kernel.h"
+#include "swis.h"
+
+#include "CLX/err.h"
+#include "CLX/host.h"
+#include "CLX/wholefls.h"
+
+#include "rompress.h"
+#include "romcrc.h"
+#include "VersionNum"
+#include "patchable1.h"
+#include "uimage.h"
+
+#define MIN(a,b) ((a)<(b)?(a):(b))
+#define MAX(a,b) ((a)>(b)?(a):(b))
+
+static const char *infile = NULL;
+static const char *outfile = NULL;
+static bool decompress = false;
+static bool compress = false;
+static bool verbose = false;
+static bool info = false;
+static bool test = false;
+static bool ignore = false;
+static bool patchable = false;
+static Compressor *compressor = NULL;
+static uint32_t maxsize = 0;
+static uint32_t alignsize = 0;
+static uint32_t fixedsize = 0;
+
+static char *inrom = NULL;
+static uint32_t insize;
+static uint32_t headersize;
+
+static OSHdr *oshdr = NULL;
+static OSDecompHdr *osdecomphdr = NULL;
+
+static romfooter_params footer;
+static uint32_t footer_size;
+
+extern void IMBFunc(uint32_t r0,uint32_t r1,uint32_t r2);
+extern void asm_decompress(OSHdr *hdr,void (*imb)(uint32_t,uint32_t,uint32_t),void *ws);
+
+void *safemalloc(size_t size)
+{
+  void *p = malloc(size);
+  if(!p)
+  {
+    err_fail("Out of memory allocating %u bytes",size);
+  }
+  return p;
+}
+
+static inline uint32_t ReadROMWord(uint32_t ofs)
+{
+  return ((uint32_t *) inrom)[ofs>>2];
+}
+
+static bool range_overlaps(uint32_t start1,uint32_t len1,uint32_t start2,uint32_t len2)
+{
+  /* Return true if any part of range 1 overlaps range 2 */
+  return (start1+len1 > start2) && (start2+len2 > start1);
+}
+
+static bool range_inside(uint32_t start1,uint32_t len1,uint32_t start2,uint32_t len2)
+{
+  /* Return true if range 2 fits entirely within range 1 */
+  return (start2 >= start1) && (start2+len2 <= start1+len1);
+}
+
+static bool validoshdr(uint32_t ofs)
+{
+  /* TODO - Should really build a list of all the blocks & expected sizes, then work out how much space is actually available and complain if anything doesn't fit */
+  const char *ignorestr = "OS header at %08x: %s\n";
+  if(ofs+sizeof(OSHdr) > insize)
+  {
+    if(verbose) printf(ignorestr,ofs,"Too close to end of image");
+    return false;
+  }
+  OSHdr *h = (OSHdr *) (inrom+ofs);
+  if(h->Flags & ~OSHdr_ValidFlags)
+  {
+    if(verbose) printf(ignorestr,ofs,"Unknown flags set");
+    return false;
+  }
+  uint32_t hdrsize = (h->Flags & OSHdrFlag_SupportsCompression?sizeof(OSHdr):5*4);
+  uint32_t checksize = MIN(insize-ofs,h->ImageSize); /* End of image */
+  if((h->NumEntries < OSHdr_MinEntries) || (h->NumEntries > OSHdr_MaxEntries))
+  {
+    if(verbose) printf(ignorestr,ofs,"Invalid entry count");
+    return false;
+  }
+  uint32_t entries = h->Entries+ofs;
+  if(entries & 3)
+  {
+    if(verbose) printf(ignorestr,ofs,"Entry table not aligned");
+    return false;
+  }
+  if(range_overlaps(ofs,hdrsize,entries,h->NumEntries*4))
+  {
+    if(verbose) printf(ignorestr,ofs,"Entry table overlaps OS header");
+    return false;
+  }
+  if(!range_inside(ofs,checksize,entries,h->NumEntries*4))
+  {
+    if(verbose) printf(ignorestr,ofs,"Entry point table isn't inside image");
+    return false;
+  }
+  for(uint32_t i=0;i<h->NumEntries;i++)
+  {
+    uint32_t entry = entries+ReadROMWord(entries+i*4);
+    if((entry & 3) || range_overlaps(ofs,hdrsize,entry,4) || range_overlaps(entries,h->NumEntries*4,entry,4) || !range_inside(ofs,checksize,entry,4))
+    {
+      if(verbose) printf(ignorestr,ofs,"Entry point table has duff entry");
+      return false;
+    }
+  }
+  if(!(h->Flags & OSHdrFlag_SupportsCompression))
+  {
+    if(h->ImageSize > insize-ofs)
+    {
+      if(verbose) printf(ignorestr,ofs,"Image larger than file");
+      return false;
+    }
+  }
+  else
+  {
+    uint32_t compressoffset = ofs+h->CompressOffset;
+    if(h->DecompressHdr)
+    {
+      if(h->CompressedSize >= h->ImageSize)
+      {
+        if(verbose) printf(ignorestr,ofs,"Compressed image bigger than uncompressed version");
+        return false;
+      }
+      if(h->CompressedSize > insize-ofs)
+      {
+        if(verbose) printf(ignorestr,ofs,"Compressed image larger than file");
+        return false;
+      }
+      checksize = h->CompressedSize;
+      uint32_t dh = ofs+h->DecompressHdr;
+      if(dh & 3)
+      {
+        if(verbose) printf(ignorestr,ofs,"Decompression header not aligned");
+        return false;
+      }
+      if(range_overlaps(ofs,hdrsize,dh,sizeof(OSDecompHdr)))
+      {
+        if(verbose) printf(ignorestr,ofs,"Decompression header overlaps OS header");
+        return false;
+      }
+      if(!range_inside(ofs,checksize,dh,sizeof(OSDecompHdr)))
+      {
+        if(verbose) printf(ignorestr,ofs,"Decompression table isn't inside image");
+        return false;
+      }
+      /* TODO - Check for collisions with entry table & funcs */
+      /* TODO - Check decomphdr members. WS size multiple of 4K, etc. */
+      if(compressoffset > dh)
+      {
+        if(verbose) printf(ignorestr,ofs,"Decompresion header isn't in compressed region");
+        return false;
+      }  
+    }
+    else
+    {
+      if(h->CompressedSize != h->ImageSize)
+      {
+        if(verbose) printf(ignorestr,ofs,"Uncompressed image has mismatched size");
+        return false;
+      }
+    }
+    if(compressoffset > checksize)
+    {
+      if(verbose) printf(ignorestr,ofs,"Compression offset outside image");
+      return false;
+    }
+    if(compressoffset & 3)
+    {
+      if(verbose) printf(ignorestr,ofs,"Compression offset not word aligned");
+      return false;
+    }
+    //uint32_t compresssize = checksize-compressoffset;
+    /* TODO - Check nothing is inside the compressed region */
+  }
+  return true;
+}
+
+static void findoshdr(void)
+{
+  uint32_t ofs = 0;
+  while(ofs < insize)
+  {
+    if(ReadROMWord(ofs) == OSHdr_Magic_Value)
+    {
+      /* Validate entries */
+      if(validoshdr(ofs))
+      {
+        if(verbose) printf("Found valid OS header at %08x\n",ofs);
+        oshdr = (OSHdr *) (inrom+ofs);
+        if((oshdr->Flags & OSHdrFlag_SupportsCompression) && (oshdr->DecompressHdr))
+        {
+          osdecomphdr = (OSDecompHdr *) (inrom+ofs+oshdr->DecompressHdr);
+        }
+        return;
+      }
+    }
+    ofs += 4;
+  }
+  err_fail("Failed to find OS header");
+}
+
+static void do_help(void)
+{
+  printf("rompress " Module_HelpVersion "\n\n\
+Usage: rompress <options> <infile> [<outfile>]\n\n\
+Options are:\n\
+ -i, --info          Display ROM information\n\
+ -v, --verbose       Enable verbose operation\n\
+ -h, --help          Display this help\n\
+ -t, --test          Test image decompresses correctly\n\
+ -g, --ignore        Ignore CRC/footer errors in input file\n\
+ -m <n>, --max=<n>   Specify maximum size for compressed image\n\
+ -a <n>, --align=<n> Round compressed image size up to specified alignment\n\
+ -s <n>, --size=<n>  Specify fixed size for compressed image\n\
+ -p, --patchable     Create patchable image (negative checksum recalculated\n\
+                     after decompression)\n\
+\n\
+ -d, --decompress    Decompress ROM image\n\
+\n");
+  Compressor *cc = compressors;
+  while(cc->name)
+  {
+    printf(" -%c, --%-14sCompress using the '%s' algorithm\n",cc->letter,cc->name,cc->name);
+    cc++;
+  }
+  printf("\n\
+Numbers can be in decimal or C-style hex, with optional <K|M>[B] suffix for\n\
+kilobytes/megabytes. Images are only saved back to disc if a compression or\n\
+decompression option is specified.\n"); 
+}
+
+static void do_compress(void)
+{
+  if(osdecomphdr)
+  {
+    err_fail("Image already compressed");
+  }
+  else if(!(oshdr->Flags & OSHdrFlag_SupportsCompression))
+  {
+    err_fail("Can't compress - OS image does not support runtime decompression");
+  }
+  if(!compressor)
+  {
+    err_fail("No compression algorithm specified");
+  }
+
+  /* Prepare a new ROM footer */
+  romfooter_params my_footer;
+  memset(&my_footer,0,sizeof(my_footer));
+  char ext_footer[10];
+  my_footer.signature = footer.signature; /* Keep original signature string (one day we might use it for something useful? */
+  my_footer.ext_footer = ext_footer;
+  my_footer.ext_footer_len = sizeof(ext_footer);
+  /* The extended footer contains one entry, ID 01, containing the OS header offset and the original ROM neg_checksum
+     This helps the softload tool work out what to do with the image */
+  ext_footer[0] = 1;
+  ext_footer[1] = 8;
+  memcpy(ext_footer+2,&footer.neg_checksum,4);
+  uint32_t oshdr_offset = ((uint32_t) oshdr)-((uint32_t) inrom);
+  memcpy(ext_footer+6,&oshdr_offset,4);
+
+  char *data = ((char *) oshdr)+oshdr->CompressOffset;
+  uint32_t origsize = (inrom+insize)-data;
+
+  uint32_t patch_checksum_val = 0;
+  if(patchable)
+  {
+    /* Calculate negative checksum of compressed region */
+    for(uint32_t i=0;i<origsize-12;i+=4)
+      patch_checksum_val -= ((uint32_t *) data)[i>>2];
+  }
+
+  if(verbose) printf("Compressing image...\n");
+  clock_t t = clock();
+  (compressor->func)(oshdr,data,origsize);
+  clock_t t2 = clock();
+  if(verbose) printf("Complete (%.2fs)\n",(((double)t2)-t)/CLOCKS_PER_SEC);
+
+  /* Check ROM still valid */
+  if(!validoshdr(oshdr_offset))
+  {
+    err_fail("Compression algorithm has corrupted the OS header\n");
+  }
+  osdecomphdr = (OSDecompHdr *) (inrom+oshdr_offset+oshdr->DecompressHdr);
+
+  /* Insert checksum patch code if necessary */
+  uint32_t *patch_checksum = NULL;
+  if(patchable)
+  {
+    while(oshdr->CompressedSize & 3)
+      ((char *) oshdr)[oshdr->CompressedSize++] = 0xff;
+
+    oshdr->CompressedSize += rompress_patchablecodesize;
+
+    if(oshdr->CompressedSize >= origsize)
+    {
+      err_fail("Not enough space to insert patch code\n");
+    }
+
+    memcpy(((char *)oshdr)+oshdr->CompressedSize-rompress_patchablecodesize,&rompress_patchablecode,rompress_patchablecodesize);
+
+    patch_checksum = (uint32_t *) (((uint32_t) oshdr)+oshdr->CompressedSize-12);
+    patch_checksum[1] = ((uint32_t) oshdr)-((uint32_t) inrom); /* HAL size */
+    patch_checksum[2] = oshdr->DecompressHdr+osdecomphdr->Code; /* Offset from OS header to original code */
+
+    osdecomphdr->Code = (((uint32_t) oshdr)+oshdr->CompressedSize-rompress_patchablecodesize)-((uint32_t) osdecomphdr);
+  }
+
+  uint32_t dataend = (((char *) oshdr)-inrom)+oshdr->CompressedSize;
+
+  /* Allocate space for ROM footer */
+  oshdr->CompressedSize = (oshdr->CompressedSize+romcrc_getfootersize(&my_footer)+3)&~3;
+
+  /* Work out new total size */
+  uint32_t newsize = (((char *) oshdr)-inrom)+oshdr->CompressedSize;
+
+  /* Apply alignment/padding if necessary */
+  if(alignsize)
+  {
+    int align_amount = (0-newsize) & (alignsize-1);
+    newsize += align_amount;
+    oshdr->CompressedSize += align_amount;
+    if(verbose) printf("Inserting %d alignment bytes\n",align_amount);
+  }
+
+  if(fixedsize)
+  {
+    int align_amount = fixedsize-newsize;
+    if(align_amount < 0)
+    {
+      err_fail("Compressed exceeds fixed size by %d bytes",-align_amount);
+    }
+    newsize += align_amount;
+    oshdr->CompressedSize += align_amount;
+    if(verbose) printf("Inserting %dKB of padding\n",align_amount>>10);
+  }
+
+  /* Check size constraints */
+  if(newsize >= insize)
+  {
+    err_fail("Compression algorithm '%s' failed to reduce image size",compressor->name);
+  }
+  if(maxsize && (newsize > maxsize))
+  {
+    err_fail("Compressed exceeds max size by %d bytes",newsize-maxsize);
+  }
+
+  /* Fill in any blank space */
+  memset(inrom+dataend,0xff,newsize-dataend);
+
+  /* Check ROM still valid */
+  if(!validoshdr(oshdr_offset))
+  {
+    err_fail("Compression algorithm has corrupted the OS header\n");
+  }
+  osdecomphdr = (OSDecompHdr *) (inrom+oshdr_offset+oshdr->DecompressHdr);
+
+  /* Store patch checksum */
+  if(patchable)
+  {
+    /* Although the patch code recalculates the checksum of the uncompressed region, it does so before the decompression occurs. This means that instead of storing just the compressed region checksum, we need to adjust it to take into account the OS header entries that will be manipulated during the decompression, so that the final checksum will come out correct */
+    patch_checksum[0] = patch_checksum_val + oshdr->DecompressHdr + oshdr->CompressedSize - oshdr->ImageSize;
+  }
+
+  if(verbose) printf("Appending ROM footer\n");
+  romcrc_addfooter(inrom,newsize,&my_footer);
+
+  if(verbose)
+  {
+    printf("Image file size reduced from %dKB to %dKB (%.2f%% of original)\nDecompression requires %dKB of workspace\n",insize>>10,newsize>>10,100.0*((double)newsize)/insize,osdecomphdr->WSSize>>10);
+  }
+  insize = newsize;
+
+  /* Fixup uImage header if necessary */
+  if(headersize)
+  {
+    uimage_fixup(((uimage_header *) inrom)-1, insize+headersize);
+  }
+}
+
+static void do_save(void)
+{
+  if(verbose) printf("Saving image\n");
+  _swi(OS_File,_INR(0,2)|_INR(4,5),10,outfile,0xfe5,inrom-headersize,inrom+insize);
+}
+
+static void do_decompress(void)
+{
+  if(!osdecomphdr)
+  {
+    printf("Image not compressed\n");
+    return;
+  }
+  /* Realloc to required size */
+  uint32_t oshdr_offset = ((uint32_t) oshdr)-((uint32_t)inrom);
+  uint32_t req_size = oshdr_offset+oshdr->ImageSize;
+  if(req_size > insize)
+  {
+    char *newrom = realloc(inrom-headersize,req_size+headersize);
+    if(!newrom)
+    {
+      err_fail("Out of memory allocating %d bytes",req_size);
+    }
+    newrom += headersize;
+    inrom = newrom;
+    insize = req_size;
+    oshdr = (OSHdr *) (inrom+oshdr_offset);
+    osdecomphdr = (OSDecompHdr *) (inrom+oshdr_offset+oshdr->DecompressHdr);
+  }
+  /* IMB the ROM since we're about to execute some code from it */
+  _swix(OS_SynchroniseCodeAreas,_INR(0,2),1,inrom,inrom+insize);
+  /* Do the decompression */
+  void *ws = NULL;
+  if(osdecomphdr->WSSize)
+  {
+    ws = safemalloc(osdecomphdr->WSSize);
+    /* zero init */
+    memset(ws,0,osdecomphdr->WSSize);
+  }
+  if(verbose) printf("Decompressing ROM...\nParameters: %08x %08x %08x\n",(uint32_t) oshdr,(uint32_t) IMBFunc,(uint32_t) ws);
+  clock_t t = clock();
+  asm_decompress(oshdr,IMBFunc,ws);
+  clock_t t2 = clock();
+  if(verbose) printf("Complete (%.2fs)\n",(((double)t2)-t)/CLOCKS_PER_SEC);
+  if(ws)
+    free(ws);
+  /* Decompression code should have fixed up the header */
+  if(!validoshdr(oshdr_offset))
+  {
+    err_fail("Decompression code has corrupted the OS header");
+  }
+  if(oshdr->DecompressHdr)
+  {
+    err_fail("Decompression code hasn't wiped decompression header");
+  }
+  if(req_size != (oshdr_offset+oshdr->ImageSize))
+  {
+    err_fail("Decompression code has modified ImageSize");
+  }
+  if(oshdr->ImageSize != oshdr->CompressedSize)
+  {
+    err_fail("CompressedSize not updated or incorrect");
+  }
+  /* Fixup uImage header if necessary */
+  if(headersize)
+  {
+    uimage_fixup(((uimage_header *) inrom)-1, insize+headersize);
+  }
+}
+
+static void do_info(void)
+{
+  uint32_t hdrofs = ((char *)oshdr)-inrom;
+  printf("OS header located at %08x:\n",hdrofs);
+  printf("  Flags: %08x\n",oshdr->Flags);
+  if(oshdr->Flags & OSHdrFlag_SupportsCompression)
+    printf("    Supports compression, compression offset %08x\n",oshdr->CompressOffset+hdrofs);
+  printf("  Image size: %08x\n",oshdr->ImageSize);
+  printf("  Entry table at %08x contains %d entries\n",hdrofs+oshdr->Entries,oshdr->NumEntries);
+  if(osdecomphdr)
+  {
+    printf("  Image is compressed, size %08x\n",oshdr->CompressedSize);
+    printf("  Decompression header at %08x:\n",oshdr->DecompressHdr+hdrofs);
+    printf("    Workspace size %08x\n",osdecomphdr->WSSize);
+    printf("    Decompression code at %08x\n",osdecomphdr->Code+hdrofs+oshdr->DecompressHdr);
+  }
+  printf("ROM footer signature: %08x\n",footer.signature);
+  printf("ROM footer neg checksum: %08x\n",footer.neg_checksum);
+  if(footer.ext_footer)
+  {
+    printf("Extended footer length: %04x\n",footer.ext_footer_len);
+    int i=0;
+    while(i < footer.ext_footer_len)
+    {
+      printf("  ID %02x Len %02x Data",footer.ext_footer[i],footer.ext_footer[i+1]);
+      for(int j=0;j<footer.ext_footer[i+1];j++)
+        printf(" %02x",footer.ext_footer[i+2+j]);
+      printf("\n");
+      i += 2+footer.ext_footer[i+1];
+    }
+  }
+  if (headersize)
+  {
+    printf("Has uImage header:\n");
+    uimage_info(((uimage_header *)inrom)-1);
+  }
+}
+
+static uint32_t readnum(const char *c,const char *type)
+{
+  int n;
+  uint32_t num;
+  if(sscanf(c,"%i%n",&num,&n) != 1)
+    err_fail("Bad %s",type);
+  switch(c[n])
+  {
+    case 'm': case 'M': num <<= 10;
+    case 'k': case 'K': num <<= 10;
+    case 0: break;
+    default: err_fail("Bad %s",type);
+  }
+  return num;
+}
+
+int main(int argc,char **argv)
+{
+  host_init();
+  err_init("rompress");
+
+  for(int i=1;i<argc;i++)
+  {
+    const char *c = argv[i];
+    if(*c == '-')
+    {
+      if(*++c == '-')
+      {
+        c++;
+        if(!strcmp(c,"decompress"))
+          decompress = true;
+        else if(!strcmp(c,"verbose"))
+          verbose = true;
+        else if(!strcmp(c,"info"))
+          info = true;
+        else if(!strcmp(c,"help"))
+        {
+          do_help();
+          return 0;
+        }
+        else if(!strcmp(c,"test"))
+          test = true;
+        else if(!strcmp(c,"ignore"))
+          ignore = true;
+        else if(!strcmp(c,"patchable"))
+          patchable = true;
+        else if(!strncmp(c,"align=",6))
+        {
+          alignsize = readnum(c+6,"alignment");
+          if((!alignsize) || (alignsize & (alignsize-1)))
+            err_fail("Bad alignment");
+        }
+        else if(!strncmp(c,"max=",4))
+        {
+          maxsize = readnum(c+4,"max size");
+          if(!maxsize)
+            err_fail("Bad max size");
+        }
+        else if(!strncmp(c,"size=",4))
+        {
+          fixedsize = readnum(c+4,"fixed size");
+          if(!fixedsize)
+            err_fail("Bad fixed size");
+        }
+        else
+        {
+          Compressor *cc = compressors;
+          while(cc->name)
+          {
+            if(!strcmp(c,cc->name))
+            {
+              compress = true;
+              compressor = cc;
+              break;
+            }
+            cc++;
+          }
+          if(!cc->name)
+          {
+            err_report("Unrecognised option '%s'",argv[i]);
+          }
+        }
+      }
+      else
+      {
+        while(*c)
+        {
+          switch(*c)
+          {
+            case 'd': decompress = true; break;
+            case 'v': verbose = true; break;
+            case 'i': info = true; break;
+            case 'h': do_help(); return 0;
+            case 't': test = true; break;
+            case 'g': ignore = true; break;
+            case 'p': patchable = true; break;
+            case 'a':
+              if(i == argc-1)
+              {
+                do_help();
+                return 0;
+              }
+              alignsize = readnum(argv[++i],"alignment");
+              if((!alignsize) || (alignsize & (alignsize-1)))
+                err_fail("Bad alignment");
+              break;
+            case 'm':
+              if(i == argc-1)
+              {
+                do_help();
+                return 0;
+              }
+              maxsize = readnum(argv[++i],"max size");
+              if(!maxsize)
+                err_fail("Bad max size");
+              break;
+            case 's':
+              if(i == argc-1)
+              {
+                do_help();
+                return 0;
+              }
+              fixedsize = readnum(argv[++i],"fixed size");
+              if(!fixedsize)
+                err_fail("Bad fixed size");
+              break;
+
+            default:
+              {
+                Compressor *cc = compressors;
+                while(cc->name)
+                {
+                  if(*c == cc->letter)
+                  {
+                    compress = true;
+                    compressor = cc;
+                    break;
+                  }
+                  cc++;
+                }
+                if(!cc->name)
+                {
+                  err_report("Unrecognised option '-%c'",*c);
+                }
+              }
+          }
+          c++;
+        }
+      }
+    }
+    else if(!infile)
+      infile = c;
+    else if(!outfile)
+      outfile = c;
+  }
+  if(!outfile)
+    outfile = infile;
+  if(!infile || (!test && !info && !compress && !decompress))
+  {
+    do_help();
+    return 1;
+  }
+
+  if(alignsize && maxsize && (maxsize & (alignsize-1)))
+  {
+    err_fail("Max size isn't multiple of alignment");
+  }
+
+  if(fixedsize && (alignsize || maxsize))
+  {
+    err_fail("Doesn't make sense to spcify both fixed size and alignment or max size");
+  }
+
+  if(verbose) printf("Loading image\n");
+  int32 size = wf_filesize(infile);
+  if(size < 0)
+  {
+    err_fail("Failed to load input file '%s'",infile);
+  }
+  insize = (uint32_t) size;
+  inrom = (char *) safemalloc(insize);
+  if(wf_load(infile,inrom,insize) < 0)
+  {
+    err_fail("Failed to load input file '%s'",infile);
+  }
+
+  if(verbose) printf("Checking CRCs\n");
+  if(uimage_hasheader(inrom,insize))
+  {
+    if(verbose) printf("Found valid uImage header\n");
+    if(!uimage_checksum_valid((uimage_header *) inrom) && !ignore)
+    {
+      err_fail("ROM image corrupt");
+    }
+    /* Offset inrom by the uimage header size */
+    headersize = sizeof(uimage_header);
+    inrom += headersize;
+    insize -= headersize;
+  }
+  if(!romcrc_getfooter(inrom,insize,&footer) && !ignore)
+  {
+    err_fail("ROM image corrupt");
+  }
+  footer_size = romcrc_getfootersize(&footer);
+
+  findoshdr();
+
+  if(info)
+  {
+    do_info();
+  }
+
+  bool modified = false;
+  char *testcopy = NULL;
+  uint32_t testsize = 0;
+
+  if(decompress)
+  {
+    do_decompress();
+    modified = true;
+  }
+
+  if(compress)
+  {
+    if(test)
+    {
+      /* Make a copy of the ROM so we can do a memcmp to be 100% sure it's the same image as on entry */
+      testcopy = safemalloc(insize+headersize);
+      memcpy(testcopy,inrom-headersize,insize+headersize);
+      testsize = insize;
+    }
+    do_compress();
+    modified = true;
+  }
+
+  if(test)
+  {
+    if(verbose) printf("Testing ROM image\n");
+    if(compress)
+    {
+      /* Make a copy of the compressed image so we can save it to disc if everything is OK */
+      char *compressed = safemalloc(insize+headersize);
+      memcpy(compressed,inrom-headersize,insize+headersize);
+      uint32_t compressedsize = insize;
+      /* Decompress */
+      do_decompress();
+      /* Check */
+      if((insize != testsize) || memcmp(testcopy,inrom-headersize,insize+headersize))
+      {
+        err_fail("Decompression test failed - decompressed image isn't an exact match for source");
+      }
+      /* Free temp buffers */
+      free(inrom-headersize);
+      inrom = compressed+headersize;
+      insize = compressedsize;
+      free(testcopy);
+      testcopy = NULL;
+    }
+    else
+    {
+      if(!decompress)
+        do_decompress();
+      /* Just check the CRCs */
+      if(!romcrc_getfooter(inrom,insize,&footer))
+      {
+        err_fail("Decompression test failed - CRC check failed");
+      }
+    }
+    if(verbose) printf("ROM test OK\n");
+  }
+
+  if(modified)
+    do_save();
+
+  return 0;
+}
+

@@ -1,0 +1,2042 @@
+; Copyright 2012 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+;
+        ; You'll often see these prefixed with Hdr: for historic reasons.
+        ; This is no longer necessary, and in fact omitting them makes it
+        ; possible to cross-compile your source code.
+        GET     ListOpts
+        GET     Macros
+        GET     System
+        GET     ModHand
+        GET     Services
+        GET     BCM2835Reg
+        GET     ResourceFS
+        GET     PCI
+        GET     VersionASM
+        GET     Proc
+        GET     FSNumbers
+        GET     NewErrors
+        GET     DMA
+        GET     VideoDevice
+        GET     HALEntries
+        GET     VduExt
+        GET     VIDCList
+        GET     BCMSupport
+        GET     VCHIQ
+        GET     RTSupport
+        GET     Portable
+        GET     OSMem
+
+        GBLL    Debug
+Debug   SETL    {FALSE}
+
+        GBLL    Debug_DADebug
+Debug_DADebug SETL Debug :LAND: {FALSE}
+
+          GBLL  HWPointer ; Hardware pointer via VCHIQ/dispmanx
+HWPointer SETL  {TRUE}
+
+ [ :LNOT: :DEF: GenCmd
+          GBLL  GenCmd ; vcgencmd via VCHIQ
+GenCmd    SETL  {TRUE}
+ ]
+
+          GBLL  GPUMode ; Enable GPU mode changes
+GPUMode   SETL  GenCmd :LAND: {TRUE}
+
+          GBLL  BuiltinMDF ; Enable the builtin MDF
+BuiltinMDF SETL :LNOT: GPUMode          
+
+          GBLL  AemulorSupport ; Tweak things to allow Aemulor's low colour mode emulation to work with the new GraphicsV API
+AemulorSupport SETL {TRUE}
+
+          GBLL TimerDebug ; Update some workspace vars with timer debug values
+TimerDebug SETL {FALSE}
+
+          GBLL TimeDebug ; Use the timer to log the timing of various events and GraphicsV calls
+TimeDebug SETL Debug :LAND: {FALSE}
+
+          GBLL ControlRGB ; Do we allow control of RGB/BGR order? Firmware interface for this seems to be broken
+ControlRGB SETL {FALSE}
+
+          GBLL GammaDisable ; Allow 'disable_gamma' in cmdline.txt?
+GammaDisable SETL {TRUE}
+
+MaxOverlayBuffers *      8
+MaxOverlays       *      8
+NumHeads          *      1 ; Offset applied to overlay numbers
+
+                          ^ 0
+GVOverlayBuffer_Resource  # 4 ; dispmanx overlay resource, -1 if not created
+GVOverlayBuffer_MemHandle # 4 ; memory handle
+GVOverlayBuffer_Mapping   # 3*8 ; MapOverlayBuffer result, up to three planes
+GVOverlayBuffer_Size      * :INDEX: @
+
+; GraphicsV overlay structure
+                       ^ 0
+GVOverlay_Format       # 4 ; Pointer to format info, null if slot is free
+GVOverlay_Element      # 4 ; dispmanx element, zero if none
+GVOverlay_InvXScale    # 4 ; size/scaled_size, in 16.16 format
+GVOverlay_InvYScale    # 4
+GVOverlay_Width        # 2
+GVOverlay_Height       # 2
+GVOverlay_XCoord       # 2
+GVOverlay_YCoord       # 2
+GVOverlay_ClipRectX0   # 2
+GVOverlay_ClipRectY0   # 2
+GVOverlay_ClipRectX1   # 2
+GVOverlay_ClipRectY1   # 2
+GVOverlay_ScaledWidth  # 2
+GVOverlay_ScaledHeight # 2
+GVOverlay_Mapped       # 1 ; bit map of which buffers have been mapped by MapOverlayBuffer
+        ASSERT MaxOverlayBuffers <= 8
+GVOverlay_DisplayBank  # 1 ; (desired) displayed bank number, 255 if none
+GVOverlay_Depth        # 1 ; 0=frontmost, 255=backmost
+GVOverlay_NumBuffers   # 1 ; num buffers requested by user
+                       AlignSpace 4
+GVOverlay_Buffers      # GVOverlayBuffer_Size * MaxOverlayBuffers
+GVOverlay_Size         * :INDEX:@
+
+; workspace definition
+                 ^       0,      wp                              ; Store
+tagbuffer        #       4
+tagbuffer_size   *       4096 ; allocated by PCI module to ensure noncacheable
+tagbuffer_busy   #       4 ; Nonzero if tag buffer is currently in use
+
+PeriBase         #       4              ; io base address
+
+mbxres           #       4 ; Size of displayed area
+mbyres           #       4
+mbxvres          #       4 ; Size of buffer
+mbyvres          #       4
+mbpitch          #       4 ; byte pitch
+mbbpp            #       4 ; 8/16/32
+mbxoff           #       4 ; Offset of displayed area
+mbyoff           #       4
+mbbase           #       4 ; physical base of frame buffer
+mbscrsz          #       4 ; size
+mbovertop        #       4 ; overscan top
+mboverbottom     #       4
+mboverleft       #       4
+mboverright      #       4
+ModeFlags        #       4
+
+ [ Debug_DADebug
+dadebug_writec   #       4
+ ]
+
+UpdateNeeded     #       4 ; Whether merged message needs sending
+
+TimerVal         #       4 ; The counter value at the last VSync
+ [ TimerDebug
+CounterDiff      #       4
+TimerLoad        #       4
+ ]
+
+vdu_init         #       4 ; VDU init phys addr, for GV_Render
+
+GVinstance       #       1 ; GraphicsV driver number
+TimerScale       #       1 ; Shift factor to convert counter value to timer value, plus one (for scheduling hardware updates)
+ [ AemulorSupport
+OldAemulor       #       1 ; Nonzero if an old version of Aemulor is running
+ ]
+BlankState       #       1 ; 1 if blanked, 0 if not blanked
+ [ GammaDisable
+GammaDisabled    #       1
+ ]
+                 AlignSpace
+DMA_CB           #       4 ; Logical addr of DMA control block for GV_Render
+DMA_CB_phy       #       4 ; ARM Physical addr of DMA control block
+DMA_Offset       #       4 ; Mapping from ARM to GPU physical address
+DMA_Chan         #       4 ; DMA channel registers
+DMA_BurstLength  #       1 ; Burst length to use with DMA transfers
+GVRenderNotAvailable #   1 ; Whether GraphicsV_Render is available
+VSyncAvailable   #       1 ; Nonzero if (fake) VSync is available
+VSyncTestCount   #       1 ; Counter used during VSync detection test
+
+IRQTrigger       #       4 ; IRQ trigger routine from OS_PlatformFeatures
+HALDevice        #       4 ; Pointer to our HAL device (if found)
+
+VCHIQInstance    #       4
+
+ [ GenCmd
+GenCmdService    #       4 ; vcgencmd VCHIQ service
+GenCmdResponded  #       4 ; Nonzero if vcgencmd response received
+ ]
+
+ [ GPUMode
+TVService        #       4 ; TV VCHIQ service
+TVServiceResponded #     4 ; Nonzero if response received
+TVNotifyService    #     4 ; TV notification VCHIQ service
+TVNotifyRTHandle   #     4 ; RTSupport handle for routine which reads TV service notification messages
+TVNotifyRTStack    #     16 ; SYS mode stack (all work done in SVC mode)
+TVNotifyPollword   #     4 ; Pollword used to wake RT routine
+TVNotifyRTKill     #     4 ; Gets set to zero to trigger RT routine death; goes non-zero again once it's dead
+TVNotifyModeChangeComplete # 4 ; Nonzero if we've received a (HDMI) mode change complete event
+
+GPUModeAvailable #       4 ; Nonzero if GPU mode changes available
+ConfigHDMIGroup  #       4 ; Configured hdmi_group read via vcgencmd
+ ]
+
+MaxFBMemory      #       4 ; Our guess at the largest framebuffer size we can use
+MaxFBWidth       #       4 ; Configured GPU limits read via vcgencmd
+MaxFBHeight      #       4
+MinPixelClock    #       4
+MaxPixelClock    #       4
+DisplayRotate    #       4 ; Display rotation read via vcgencmd
+DisplayRotate_0   *      0
+DisplayRotate_90  *      1
+DisplayRotate_180 *      2
+DisplayRotate_270 *      3
+DisplayRotate_HFlip * &10000
+DisplayRotate_VFlip * &20000
+FramebufferIgnoreAlpha # 4 ; Nonzero if FBSetAlphaMode tag is ignored by GPU
+
+GammaBase        #       4 ; Base address of gamma table to use (for SCALER_DISPGAMADR - not ARM address space)
+
+CurPalette       #       4*4
+DispManServiceC  #       4 ; dispmanx client service
+DispManServiceN  #       4 ; dispmanx notify service
+DispManFree      #       4 ; Nonzero if Dispmanx_Send is idle
+DispManResponded #       4 ; Nonzero if message response received
+DisplayWidth     #       4 ; Actual display width
+DisplayHeight    #       4 ; Height
+DisplayTrans     #       4 ; Transform
+DisplayFormat    #       4 ; Format
+XScale           #       4 ; RISC OS pixel -> actual pixel scale
+YScale           #       4
+XOffset          #       4 ; X & Y offsets of RISC OS desktop in actual pixels
+YOffset          #       4
+YInvScale        #       4
+DispHandle       #       4 ; dispmanx display handle
+ [ HWPointer
+HWPActive        #       4 ; true/false for whether active/available
+HWPImage         #       4 ; ptr to 32bpp cursor image in 'PCI' RAM
+HWPXCoord        #       4 ; X pos of cursor
+HWPYCoord        #       4 ; Y pos of cursor
+HWPPalDirty      #       1 ; Nonzero if palette changed
+HWPImgDirty      #       1 ; Nonzero if HWPImage updated
+HWPVisible       #       1 ; Nonzero if should be visible
+HWPIsVisible     #       1 ; Nonzero if actually visible (maintained by RTRoutine)
+HWPResource      #       4 ; dispmanx overlay resource
+HWPElement       #       4 ; dispmanx element
+RTDead           #       4 ; Nonzero if RTSupport routine is dead
+RTActive         #       4 ; Nonzero if RTSupport routine is performing work
+RTHandle         #       4 ; RTSupport routine handle
+RTStack          #       512 ; SYS mode stack
+ ]
+
+
+
+Palette          #       256*4
+
+ [ GPUMode
+GPUMode_BufLen * 256 ; hdmitimings command contains 17 numbers, so 256 bytes should be plenty of space
+HDMITimings_Len * 12 ; Length of "hdmi_timings"
+LastGPUMode      #       GPUMode_BufLen-HDMITimings_Len
+ ]
+ 
+GVOverlays       #       MaxOverlays*GVOverlay_Size
+GVOverlaysExt    *       GVOverlays - (GVOverlay_Size*NumHeads)
+
+; align to 4 byte boundary
+                 #       (((:INDEX:@)+3):AND::NOT:3)-(:INDEX:@)
+TotalRAMRequired *      :INDEX: @
+
+
+; Device-specific struct for the VDU device
+
+                        ^ 0
+VDUDevSpec_SizeField    # 4 ; Size field
+VDUDevSpec_DMAChan      # 4 ; Pointer to DMA channel
+VDUDevSpec_BurstLen     # 4 ; Burst length for use with DMA channel
+VDUDevSpec_Size         # 0 ; Size value to write to size field
+
+BaseDepth_ZOrder        * -192 ; Firmware places the desktop at -127
+BaseDepth_Basic         * 1024
+Depth_Pointer           * 2000
+
+        MACRO
+        DebugTime
+      [ TimeDebug
+        Push    "r0-r3,lr"
+        MOV     r0, #64
+        BL      DebugTX
+        LDR     r0, PeriBase
+        ADD     r0, r0, #ARM_Timer_Base
+        DoMemBarrier lr
+        LDR     r0, [r0, #ARMTimer_Counter]
+        DoMemBarrier lr
+        BL      DebugHexTX4
+        Pull    "r0-r3,lr"
+      ]
+        MEND
+
+        ; Assembler modules are conventionally, but not necessarily,
+        ; position-independent code. Area name |!| is guaranteed to appear
+        ; first in link order, whatever your other areas are named.
+        AREA    |!|, CODE, READONLY, PIC
+
+        ENTRY
+
+Module_BaseAddr
+        DCD     0 ; Start
+        DCD     Init - |!|
+        DCD     Final - |!|
+        DCD     ServiceCall - |!|; Service call handler
+        DCD     Title - |!|
+        DCD     Help - |!|
+      [ GenCmd
+        DCD     CmdTable - |!|
+      |
+        DCD     0 ; Keyword table
+      ]
+        DCD     0 ; SWI chunk
+        DCD     0 ; SWI handler
+        DCD     0 ; SWI table
+        DCD     0 ; SWI decoder
+        DCD     Messages - |!|
+        DCD     Flags - |!|
+
+Messages =      "Resources:$.Resources.BCMVideo.Messages", 0
+Title   =       Module_ComponentName, 0
+Help    =       Module_ComponentName, 9, Module_HelpVersion, 0
+      [ HWPointer
+RTPriority
+        =       "BCMVideo:32", 0 ; Note - it seems to be important for the priority of our thread to be below that of VCHIQ (128). I suspect there's some synchronisation missing from our VCHIQ port?
+      ]
+      [ GPUMode
+TVNotifyPriority
+        =       "BCMVideo:32", 0
+      ]
+Module_VCHIQ
+        =       "VCHIQ", 0
+      [ AemulorSupport
+Module_Aemulor
+        =       "Aemulor", 0
+      ]
+      [ BuiltinMDF
+loadmodefilecommand
+        DCB     "loadmodefile Resources:Resources.BCMVideo.RPIMon",0
+      ]
+        ALIGN
+Flags   &       ModuleFlag_32bit
+
+        ASSERT  Service_PostInit < Service_ModulePostInit
+        ASSERT  Service_ModulePostInit < Service_ModulePostFinal
+ServiceCallTable
+        DCD     0
+        DCD     ServiceCallEntry - Module_BaseAddr
+        DCD     Service_PostInit
+        DCD     Service_ModulePostInit
+      [ AemulorSupport
+        DCD     Service_ModulePostFinal
+      ]
+        DCD     0
+
+        DCD     ServiceCallTable - Module_BaseAddr
+ServiceCall     ROUT
+        MOV     r0, r0
+        TEQ     r1, #Service_PostInit
+        TEQNE   r1, #Service_ModulePostInit
+      [ AemulorSupport
+        TEQNE   r1, #Service_ModulePostFinal
+      ]
+        MOVNE   pc, lr
+
+ServiceCallEntry
+    [ AemulorSupport
+        ; Has Aemulor just started or stopped?
+        TEQ      r1, #Service_ModulePostInit
+        TEQNE    r1, #Service_ModulePostFinal
+        BNE      %FT09
+        Entry    "r0,r2-r3"
+        ADRL     r0, Module_Aemulor
+01
+        LDRB     r3, [r0], #1
+        LDRB     lr, [r2], #1
+        TEQ      r3, lr
+        BNE      %FT08
+        TEQ      r3, #0
+        BNE      %BT01
+        LDR      r12, [r12]
+        ; Our compatibility hacks are only needed with version 2.34 and below
+        CMP      r4, #&23400
+        CMPLE    r1, #Service_ModulePostInit
+        MOVEQ    r0, #1
+        MOVNE    r0, #0
+        STRB     r0, OldAemulor
+        EXIT
+08
+        PullEnv
+        TEQ      r1, #Service_ModulePostFinal
+        MOVEQ    pc, lr
+        ; Fall through into VCHIQ check
+09
+    ]
+        TEQ      r1, #Service_ModulePostInit
+        BNE      %FT90
+        Entry    "r0-r2"
+        ; Has VCHIQ just started?
+        ADRL     r0, Module_VCHIQ
+10
+        LDRB     r1, [r0], #1
+        LDRB     lr, [r2], #1
+        TEQ      r1, lr
+        BNE      %FT80
+        TEQ      r1, #0
+        BNE      %BT10
+        LDR      r12, [r12]
+        ; Initialise anything which relies on VCHIQ
+        ; (should also trigger initialisation of VCHIQ itself)
+      [ GenCmd
+        BL       GenCmd_Init
+      ]
+      [ HWPointer
+        BL       HWP_Init
+      ]
+        BL       GVOverlay_Init
+      [ GPUMode
+        BL       TVService_Init
+        BL       GPUMode_Init
+      ]
+80
+        EXIT
+90
+      [ BuiltinMDF
+        stmfd    sp!, {r0,lr}
+        adrl     r0, loadmodefilecommand
+        swi      XOS_CLI
+        ldmfd    sp!, {r0,pc}
+      |
+        MOV      pc, lr
+      ]
+
+      [ BuiltinMDF
+startupmode
+        DCD 1
+        DCD 1920
+        DCD 1080
+        DCD 5
+        DCD -1
+        DCD -1
+      ]
+
+Init    ROUT
+        Push    "r8-r9,lr"
+        MOV     r0, #ModHandReason_Claim
+        LDR     r3, =TotalRAMRequired
+        SWI     XOS_Module
+        BVS     ExitInitModule
+
+        STR     r2, [r12]
+        mov     r12, r2
+        MOV     r0, #0
+01
+        SUBS    r3, r3, #4
+        STR     r0, [r2], #4
+        BGT     %BT01
+        MOV     r0, #1
+        STRB    r0, GVRenderNotAvailable
+        MOV     r0, #255
+        STRB    r0, GVinstance
+      [ Debug_DADebug
+        SWI     &731C0                    ; XDADebug_GetWriteCAddress
+        ADRVS   r0, NullFunc
+        STR     r0, dadebug_writec
+      ]
+
+        MRC     p15, 0, r1, c0, c0, 0     ; read Main ID Register
+        AND     r1, r1, #&FF00
+        CMP     r1, #&C000                ; xxxxB76x for ARM1176, xxxxC07x for Cortex-A7
+        MOVCC   r1, #&40000000            ; Pi 1: ARM physical address -> L2 cached GPU physical address
+        MOVCS   r1, #&C0000000            ; Pi 2: ARM physical address -> uncached GPU physical address
+        STR     r1, DMA_Offset
+        MOV     r0, #13                   ; map in the IO space
+        LDRCC   r1, =IO_Base_BCM2835
+        LDRCS   r1, =IO_Base_BCM2836      ; to get the register address
+        LDR     r2, =IO_Size
+        swi     XOS_Memory
+        BVS     ExitInitModule
+        STR     r3, PeriBase              ; remember logical address
+
+      [ HWPointer
+        LDR     r0, =tagbuffer_size+DMACB_SIZE+32*32*4 ; tag buffer + DMA CB + HW cursor image in one block
+      |
+        LDR     r0, =tagbuffer_size+DMACB_SIZE
+      ]
+        ASSERT  DMACB_ALIGN >= 16 ; 16 alignment needed for tag buffer
+        MOV     r1, #DMACB_ALIGN
+        MOV     r2, #0
+        SWI     XPCI_RAMAlloc
+        BVS     ExitInitModule
+        STR     r0, tagbuffer
+        ADD     r0, r0, #tagbuffer_size
+        ADD     r1, r1, #tagbuffer_size
+        ASSERT  ?DMACB_RESERVED = 8
+        ; Note r2=0
+        STR     r2, [r0, #DMACB_RESERVED]
+        STR     r2, [r0, #DMACB_RESERVED+4]
+        STR     r0, DMA_CB
+        STR     r1, DMA_CB_phy
+      [ HWPointer
+        ADD     r0, r0, #DMACB_SIZE
+        STR     r0, HWPImage
+      ]
+        STR     r2, tagbuffer_busy
+
+        ; Set default GPU limits
+        MOV     r0, #1920
+        STR     r0, MaxFBWidth
+        MOV     r0, #1200
+        STR     r0, MaxFBHeight
+        LDR     r0, =25000000
+        STR     r0, MinPixelClock
+        LDR     r0, =162000000
+        STR     r0, MaxPixelClock
+        MOV     r0, #1
+        STR     r0, FramebufferIgnoreAlpha
+
+        ; Read how much GPU memory is available so we can guess at the largest
+        ; framebuffer size we can safely use
+        ADRL    r0, vcmemtags
+        SUB     sp, sp, #vcmemtagslen
+        MOV     r1, sp
+        MOV     r2, #0
+        SWI     XBCMSupport_SendTempPropertyBuffer
+        LDRVC   r0, [r1, #VCsz-vcmemtags]
+        ADD     sp, sp, #vcmemtagslen
+        BVS     ExitInitModule
+        ; With 32MB GPU memory, 1920x1200x32bpp * 2 (= ~17.5MB) is too much
+        ; 1600x1200x32bpp * 2 (= ~14.6MB) is also too much
+        ; However 1920x1200x16bpp * 2 (~8.8MB) is fine (and so would be
+        ; 1920x1200x32bpp * 1)
+        ; So let's say that the GPU needs 32MB-9MB = 23MB to operate
+        ; n.b. default GPU memory size is 64MB for a 256MB Pi, so the limit
+        ; we're calculating here is only likely to affect people who artifically
+        ; limit the amount of memory the GPU gets.
+        SUBS    r0, r0, #23<<20
+        MOVLO   r0, #0
+        STR     r0, MaxFBMemory
+
+        ; Get IRQTrigger routine
+        MOV     r0, #0
+        SWI     XOS_PlatformFeatures
+        MOVVS   r0, #0
+        TST     r0, #2
+        ADREQ   r1, NullFunc ; Just use NullFunc if no trigger needed
+        STR     r1, IRQTrigger
+        CLRV
+
+        ADRL    R0,resourcefsfiles
+        SWI     XResourceFS_RegisterFiles   ; ignore errors
+
+      [ GammaDisable
+        ADR     r6, disable_gamma_str
+        BL      CheckCmdlineTxt
+        MOVVS   r0, #1
+        MOVVC   r0, #0
+        STRB    r0, GammaDisabled
+      ]
+
+        ; Try and initialise anything which relies on VCHIQ
+        ; (should also trigger initialisation of VCHIQ itself)
+      [ GenCmd
+        BL      GenCmd_Init
+      ]
+      [ HWPointer
+        BL      HWP_Init
+      ]
+        BL      GVOverlay_Init
+      [ GPUMode
+        BL      TVService_Init
+        BL      GPUMode_Init
+      ]
+
+        MOV     r0, #ScreenModeReason_RegisterDriver
+        MOV     r1, #0
+        ADR     r2, Title
+        SWI     XOS_ScreenMode                          ; get a driver number
+        BVS     ExitInitModule
+        STRB    r0, GVinstance
+        
+      [ BuiltinMDF
+        adrl    r0, loadmodefilecommand
+        swi     XOS_CLI
+      ]
+
+        ; Search for a HAL device containing the DMA channel info
+        LDR     r0, =HALDeviceType_Video + HALDeviceVideo_VDU
+        MOV     r1, #0
+        MOV     r8, #4
+20
+        SWI     XOS_Hardware
+        BVS     %FT30
+        CMP     r1, #-1
+        BEQ     %FT30
+        LDRH    r3,[r2,#HALDevice_ID]
+        CMP     r3,#HALDeviceID_VDU_BCM2835
+        BNE     %BT20
+        LDR     lr, [r2, #HALDevice_VDUDeviceSpecificField]
+        LDR     r0, [lr, #VDUDevSpec_DMAChan]
+        LDR     r1, [lr, #VDUDevSpec_BurstLen]
+        STR     r0, DMA_Chan
+        STRB    r1, DMA_BurstLength
+        STR     r2, HALDevice
+30
+        CLRV
+
+        ; Check whether the fake VSync IRQ is working
+        ; We require at least 3 interrupts in a 20cs period
+        MOV     r0, #iDev_GPU_SMI
+        ADRL    r1, VSync_Test
+        MOV     r2, r12
+        SWI     XOS_ClaimDeviceVector
+        BVS     %FT40
+        MOV     r0, #iDev_GPU_SMI
+        MOV     r8, #0
+        MOV     r9, #EntryNo_HAL_IRQEnable
+        SWI     XOS_Hardware
+        SWI     XOS_ReadMonotonicTime
+        BVS     %FT32
+        ADD     r1, r0, #20
+31
+        LDRB    r0, VSyncTestCount
+        CMP     r0, #3
+        BGT     %FT32
+        SWI     XOS_ReadMonotonicTime
+        SUBS    r0, r0, r1
+        BLE     %BT31
+32
+        MOV     r0, #iDev_GPU_SMI
+        ADRL    r1, VSync_Test
+        MOV     r2, r12
+        SWI     XOS_ReleaseDeviceVector
+        LDRB    r0, VSyncTestCount
+        CMP     r0, #3
+        BLE     %FT40
+        STRB    r0, VSyncAvailable
+        ; Set up the ARM timer
+        ; We use this to generate an IRQ roughly halfway inbetween successive
+        ; VSync IRQs, so that we can send any pending messages to the GPU in
+        ; plenty of time for it to process them during its VSync handler
+        LDR     r0, PeriBase
+        ADD     r0, r0, #ARM_Timer_Base
+        DoMemBarrier lr
+        LDR     r1, [r0, #ARMTimer_Control]
+        BIC     r1, r1, #ARMTimer_Control_Enable ; Must stop before reconfiguring
+        STR     r1, [r0, #ARMTimer_Control]
+        ; Set the counter predivider to be the same as the timer predivider
+        ; Note that the timer predivider is 10 bits, but the counter predivider
+        ; is only 8 bits, so we have to be prepared to do some scaling. This
+        ; scaling isn't entirely accurate, but it should be more than adequate
+        ; considering that we're only interested in an IRQ that's roughly in
+        ; the middle of two VSync IRQs.
+        LDR     r2, [r0, #ARMTimer_Predivider]
+        BIC     r1, r1, #ARMTimer_Control_PredividerMask
+        CLZ     r3, r2
+        RSBS    r3, r3, #24
+        MOVGT   r2, r2, LSR r3
+        MOVLT   r3, #0
+        ADD     r3, r3, #1 ; Add 1 to the shift value to save an extra divide by two in the VSync handler
+        STRB    r3, TimerScale
+        ORR     r1, r1, r2, LSL #ARMTimer_Control_PredividerShift
+        BIC     r1, r1, #ARMTimer_Control_IRQEnable+ARMTimer_Control_PrescaleMask
+        ORR     r1, r1, #ARMTimer_Control_32bit
+        STR     r1, [r0, #ARMTimer_Control] ; Reconfigure
+        ORR     r1, r1, #ARMTimer_Control_CounterEnable+ARMTimer_Control_Enable
+        STR     r1, [r0, #ARMTimer_Control] ; Go!
+        LDR     r1, [r0, #ARMTimer_Counter]
+        DoMemBarrier lr
+        STR     r1, TimerVal        
+        MOV     r0, #iDev_ARM_Timer
+        ADRL    r1, Timer_Handler
+        MOV     r2, r12
+        SWI     XOS_ClaimDeviceVector
+        BVS     %FT40
+        MOV     r0, #iDev_ARM_Timer
+        MOV     r8, #0
+        MOV     r9, #EntryNo_HAL_IRQEnable
+        SWI     XOS_Hardware
+        ; Now set up the VSync handler
+        MOV     r0, #iDev_GPU_SMI
+        ADRL    r1, VSync_Handler
+        MOV     r2, r12
+        SWI     XOS_ClaimDeviceVector
+        MOV     r0, #iDev_GPU_SMI
+        MOV     r8, #0
+        MOV     r9, #EntryNo_HAL_IRQEnable
+        SWI     XOS_Hardware
+        B       %FT90
+
+40
+        ; No VSync IRQ available
+        ; Let the OS use its fake VSync
+        ; However we also need our own fake VSync (synchronised with the OS's)
+        ; in order to manage sending the merged message (we keep it in sync with
+        ; the OS's message to try and ensure it behaves in a fairly consistent
+        ; manner)
+        ; Simply listening for the VSync event that the OS generates isn't
+        ; sufficient because we might not be the default video driver!
+        MOV     r0, #TickerV
+        ADRL    r1, TickerV_Handler
+        MOV     r2, r12
+        SWI     XOS_Claim
+
+90
+        CLRV
+
+        MOV     r0, #GraphicsV                          ; grab GraphicsV
+        ADRL    r1, GraphicsV_Handler
+        MOV     r2, r12
+        SWI     XOS_Claim
+
+        MOV     r0, #ScreenModeReason_StartDriver
+        LDRB    r1, GVinstance
+        SWI     XOS_ScreenMode                          ; let the OS know we're ready
+
+        Pull    "r8-r9,pc"
+
+ExitInitModule                            ; need to check for what is allocated
+        Pull    "r8-r9,pc"
+
+NullFunc
+        MOV     pc, lr
+
+Final   ROUT
+        Push    "lr"
+        LDR     r12, [r12]
+
+        MOV     r0, #ScreenModeReason_StopDriver
+        LDRB    r1, GVinstance
+        SWI     XOS_ScreenMode                ; tell the OS we're leaving
+
+        ; Shutdown VCHIQ + dependants
+        BL      VCHIQFinalise
+
+        LDRB    r0, VSyncAvailable
+        CMP     r0, #0
+        MOVEQ   r0, #TickerV
+        ADREQL  r1, TickerV_Handler
+        MOVEQ   r2, r12
+        SWIEQ   XOS_Release
+        ADRL    R0,resourcefsfiles
+        SWI     XResourceFS_DeregisterFiles ; ignore errors
+        MOV     r0, #GraphicsV
+        ADRL    r1, GraphicsV_Handler
+        MOV     r2, r12
+        SWI     XOS_Release
+        MOV     r0, #iDev_GPU_SMI
+        ADRL    r1, VSync_Handler
+        MOV     r2, r12
+        SWI     XOS_ReleaseDeviceVector
+        MOV     r0, #iDev_ARM_Timer
+        ADRL    r1, Timer_Handler
+        MOV     r2, r12
+        SWI     XOS_ReleaseDeviceVector
+        BL      GV_Render_Sync
+        ; Ensure no pending async mailbox messages
+        MOV     r0, #MBSync_OnR12
+        MOV     r4, r12
+        SWI     XBCMSupport_MBSync
+        LDR     r0, tagbuffer
+        SWI     XPCI_RAMFree
+        MOV     r0, #ScreenModeReason_DeregisterDriver
+        LDRB    r1, GVinstance
+        SWI     XOS_ScreenMode
+        CLRV
+        Pull    "pc"
+
+ [ GammaDisable
+disable_gamma_str = "disable_gamma",0
+        ALIGN
+ ]
+
+        LTORG
+
+tagrel  DCD     tagrellen
+        DCD     0
+        DCD     ARM2VC_Tag_FBRelease
+        DCD     0
+        DCD     0
+        DCD     ARM2VC_Tag_End
+tagrellen *     . - tagrel
+
+; series of VC side query tags.
+;
+tagb    DCD     tagslen
+        DCD     0
+tagdisplphyswh
+        DCD     ARM2VC_Tag_FBSetPhysDimension
+        DCD     8
+        DCD     8
+phyx    DCD     1920
+phyy    DCD     1080
+tagdisplvirtwh
+        DCD     ARM2VC_Tag_FBSetVirtDimension
+        DCD     8
+        DCD     8
+virtx   DCD     1920
+virty   DCD     1080
+tagdisplvirtoffset
+        DCD     ARM2VC_Tag_FBSetVirtOffset
+        DCD     8
+        DCD     8
+vxoff   DCD     0
+vyoff   DCD     0
+tagdispldepth
+        DCD     ARM2VC_Tag_FBSetDepth
+        DCD     4
+        DCD     4
+dispbpp DCD     32                 ; 32bit
+tagdisplpixord
+        DCD     ARM2VC_Tag_FBSetPixelOrder
+        DCD     4
+        DCD     4
+disppixord DCD  1                  ; &BGR
+tagdisplalpha
+        DCD     ARM2VC_Tag_FBSetAlphaMode
+        DCD     4
+        DCD     4
+dispalpha DCD   2                  ; 0='normal' alpha channel (0=opaque), 1='reverse' alpha channel (0=transparent), 2=ignored
+taggetpitch
+        DCD     ARM2VC_Tag_FBGetPitch
+        DCD     4
+        DCD     0
+dispit  DCD     0
+tagdisplalloc
+        DCD     ARM2VC_Tag_FBAlloc
+        DCD     8
+        DCD     8
+dispbs  DCD     0x100000            ; megabyte aligned
+dispsz  DCD     0
+        DCD     ARM2VC_Tag_FBGetOverscan
+        DCD     16
+        DCD     0
+dispovertop     DCD 0
+dispoverbottom  DCD 0
+dispoverleft    DCD 0
+dispoverright   DCD 0        
+        DCD     ARM2VC_Tag_FBBlank
+        DCD     4
+        DCD     4
+        DCD     0                   ; Unblank screen on any mode change
+        DCD     ARM2VC_Tag_End
+tagslen *       . - tagb
+
+
+vettagb  DCD     vettagslen
+         DCD     0
+vtagdisplphyswh
+         DCD     ARM2VC_Tag_FBTestPhysDimension
+         DCD     8
+         DCD     8
+vphyx    DCD     1920
+vphyy    DCD     1080
+vtagdisplvirtwh
+         DCD     ARM2VC_Tag_FBTestVirtDimension
+         DCD     8
+         DCD     8
+vvirtx   DCD     1920
+vvirty   DCD     1080
+vtagdisplvirtoffset
+         DCD     ARM2VC_Tag_FBTestVirtOffset
+         DCD     8
+         DCD     8
+vvxoff   DCD     0
+vvyoff   DCD     0
+vtagdispldepth
+         DCD     ARM2VC_Tag_FBTestDepth
+         DCD     4
+         DCD     4
+vdispbpp DCD     32                 ; 32bit
+         DCD     ARM2VC_Tag_End
+vettagslen *       . - vettagb
+
+vcmemtags DCD   vcmemtagslen
+          DCD   0
+tagvcmem
+        DCD     ARM2VC_Tag_GetVCMemory
+        DCD     8
+        DCD     0
+VCbs    DCD     0
+VCsz    DCD     0
+        DCD     ARM2VC_Tag_End
+vcmemtagslen *  . - vcmemtags
+
+edidtagb   DCD    edidtagslen
+           DCD    0
+           DCD    ARM2VC_Tag_GetEDID
+           DCD    136
+           DCD    4
+edidblock  DCD    0
+edidstatus DCD    0
+edidbuffer %      128
+           DCD    ARM2VC_Tag_End
+edidtagslen *     . - edidtagb
+
+mergetags      DCD   mergetagslen+256*4+4 ; total size
+               DCD   0
+               DCD   ARM2VC_Tag_FBBlank
+               DCD   4
+               DCD   4
+mergeblank     DCD   0
+               DCD   ARM2VC_Tag_FBSetVirtOffset
+               DCD   8
+               DCD   8
+mergevxoff     DCD   0
+mergevyoff     DCD   0
+               DCD   ARM2VC_Tag_FBSetPalette
+               DCD   8+256*4
+               DCD   8+256*4
+               DCD   0 ; first palette entry
+               DCD   256 ; entry count
+mergepaldata
+               ; ... entries here ...
+mergetagslen   *     . - mergetags
+
+; r0->VIDCList3
+; r12-> workspace
+SetModeFromVIDCList     ROUT
+      [ GPUMode
+        ASSERT  tagslen <= GPUMode_BufLen
+        Entry   "r0-r10", GPUMode_BufLen   ; Reserve space for vcgencmd buffer
+      |
+        Entry   "r0-r10", tagslen
+      ]
+        mov     r6, r0                     ; preserve the list pointer
+ [ Debug
+  bl DebugTXStrInline
+  DCB "start SetMode",10,13,0
+  ALIGN
+ ]
+        MOV     r3, sp
+        
+        ; Block GV_Render, and sync any current transfer for paranoia
+        MOV     r0, #1
+        STRB    r0, GVRenderNotAvailable
+        BL      GV_Render_Sync
+
+ [ Debug
+        MOV     r5, r6
+        ASSERT  (VIDCList3_ControlList :AND: 7) = 0
+11      ldr     r0, [r5], #4
+        bl      DebugHexTX4
+        cmn     r0, #1
+        beq     %ft12
+        ldr     r0, [r5], #4
+        bl      DebugHexTX4
+        b       %bt11
+
+12
+        bl      DebugTXStrInline
+        DCB     10,13,"modedefbuf printed",10,13,0
+        ALIGN
+ ]
+        ; Release all hardware overlays
+        BL      GVOverlay_Finalise
+
+        ; Release current framebuffer before allocating new one - required to
+        ; avoid problems in some situations (e.g. if the new mode is narrower
+        ; than the old mode, we can end up with a stride that matches the old
+        ; mode rather than one which matches the new mode, resulting in a
+        ; corrupt display because we have no way of dictating the stride to the
+        ; OS)
+        ADRL    r0, tagrel
+        ASSERT  tagrellen <= tagslen
+        MOV     r1, sp
+        MOV     r2, #0
+        SWI     XBCMSupport_SendTempPropertyBuffer
+
+      [ GPUMode
+        MOV     r1, sp
+        BL      SetGPUModeFromVIDCList
+      ]
+
+        adrl    r1, tagb                     ; buffer source
+        ldr     r2, [r1]                     ; length
+111     subs    r2, r2, #4                   ; initialise the tagbugffer
+        ldrge   r4, [r1, r2]
+        strge   r4, [r3, r2]
+        bgt     %bt111
+
+        LDR     r0, [r6, #VIDCList3_PixelDepth]
+        CMP     r0, #4
+        MOVLO   r0, #8
+        MOVEQ   r0, #16
+        MOVHI   r0, #32
+        STR     r0, mbbpp
+        str     r0, [r3, #dispbpp-tagb]
+
+        ADD     r2, r6, #VIDCList3_ControlList
+        MOV     r8, #0 ; Interlace flag
+        MOV     r9, #0 ; ExtraBytes
+        MOV     r10, #0 ; ModeFlags
+20
+        LDR     r1, [r2], #4
+        CMP     r1, #-1
+        BEQ     %FT30
+        LDR     r14, [r2], #4
+        CMP     r1, #ControlList_Interlaced
+        MOVEQ   r8, r14
+        CMP     r1, #ControlList_ExtraBytes
+        MOVEQ   r9, r14
+        CMP     r1, #ControlList_ModeFlags
+        MOVEQ   r10, r14
+        B       %BT20
+30
+        STR     r10, ModeFlags
+
+        LDR     r1, [r6, #VIDCList3_HorizDisplaySize]
+        LDR     r2, [r6, #VIDCList3_VertiDisplaySize]
+        MOV     r2, r2, LSL r8
+        BL      CalcScreenSize
+
+        STR     r1, mbxres
+        ; Add the ExtraBytes into the virtual width
+        LDR     r0, [r6, #VIDCList3_PixelDepth]
+        SUB     r0, r0, #3
+        ADD     r9, r1, r9, LSR r0
+        STR     r9, mbxvres
+        str     r1, [r3, #phyx-tagb]
+        str     r9, [r3, #virtx-tagb]
+        STR     r2, mbyres
+        STR     r4, mbyvres
+        str     r2, [r3, #phyy-tagb]
+        str     r4, [r3, #virty-tagb]
+
+        ; Control RGB & alpha for 32bpp
+        CMP     r0, #2
+        BNE     %FT40
+     [ ControlRGB
+        TST     r10, #ModeFlag_DataFormatSub_RGB
+        MOVNE   r0, #0
+        STRNE   r0, [r3, #disppixord-tagb]
+     ]
+        TST     r10, #ModeFlag_DataFormatSub_Alpha
+        MOVNE   r0, #1
+        STRNE   r0, [r3, #dispalpha-tagb]
+40
+        MOV     r0, #0
+        STR     r0, mbxoff
+        STR     r0, mbyoff
+
+        mov     r0, sp
+        mov     r1, sp
+        mov     r2, #0
+ [ Debug
+  bl DebugHexTX4
+ ]
+        SWI     XBCMSupport_SendTempPropertyBuffer
+        ; TODO handle error
+ [ Debug
+  bl DebugTXStrInline
+  DCB "done FB.. size .. physadd",10,13,0
+  ALIGN
+ ]
+ [ {FALSE}
+        ; GPU seems to return virtual buffer size instead of physical size?
+        ; Calculate manually from pitch & height
+        LDR     r0, [r3,#dispit-tagb]
+        LDR     lr, [r3,#phyy-tagb]
+        MUL     r0, lr, r0
+ |
+        ldr     r0, [r3,#dispsz-tagb]
+ ]
+        str     r0, mbscrsz
+ [ Debug
+  bl DebugHexTX4
+ ]
+        ldr     r0, [r3,#dispbs-tagb]
+
+        ; Originally the GPU returned an ARM physical address, however this
+        ; seems to have recently been classified as a bug and changed to return
+        ; a GPU physical address:
+        ; https://github.com/raspberrypi/linux/pull/1026#issuecomment-114263464
+        ; We want an ARM address, so detect if it's out of range and apply the
+        ; correct offset.
+        ldr     lr, DMA_Offset
+        CMP     r0, lr
+        SUBHS   r0, r0, lr
+        
+        str     r0, mbbase
+        STR     r0, vdu_init ; just in case GV_Render calls are received before RISC OS tells us the VDU address
+ [ Debug
+  bl DebugHexTX4
+ ]
+
+        ldr     r0, [r3,#dispit-tagb]
+        str     r0, mbpitch
+ [ Debug
+  bl DebugHexTX4
+ ]
+        ldr     r0, [r3,#dispovertop-tagb]
+        str     r0, mbovertop
+ [ Debug
+  bl DebugHexTX4
+ ]
+        ldr     r0, [r3,#dispoverbottom-tagb]
+        str     r0, mboverbottom
+ [ Debug
+  bl DebugHexTX4
+ ]
+        ldr     r0, [r3,#dispoverleft-tagb]
+        str     r0, mboverleft
+ [ Debug
+  bl DebugHexTX4
+ ]
+        ldr     r0, [r3,#dispoverright-tagb]
+        str     r0, mboverright
+ [ Debug
+  bl DebugHexTX4
+ ]
+
+
+        ; Allow GV_Render, if DMA channel available
+        LDR     r0, DMA_Chan
+        TEQ     r0, #0
+        MOVNE   r0, #0
+        STRNEB  r0, GVRenderNotAvailable
+        ; Re-init dispmanx / update display scale factor as appropriate
+        LDR     r0, DispManServiceC
+        CMP     r0, #0
+        ADR     lr, %FT90
+        BNE     Dispmanx_CalcDisplayScaleOffset
+        BL      Dispmanx_Init
+ [ HWPointer
+        ; Re-init hardware pointer too
+        BL      HWP_Init
+ ]
+90
+      [ GammaDisable
+        LDRB    r0, GammaDisabled
+        CMP     r0, #0
+        BNE     %FT92
+      ]
+        LDR     r0, mbbpp
+        MOV     r1, #0
+        CMP     r0, #8
+        BEQ     %FT91
+        ; There's no firmware interface for gamma control, but it looks like we
+        ; can just poke the gamma tables directly without anything getting
+        ; upset. Detect which scaler unit is in use, and make sure gamma is
+        ; enabled for it.
+        LDR     r0, PeriBase
+        ADD     r0, r0, #SCALER
+        DoMemBarrier lr
+        LDR     r2, [r0, #SCALER_DISPCTRL0]!
+        TST     r2, #&80000000
+        ADDEQ   r1, r1, #256*3
+        LDREQ   r2, [r0, #SCALER_DISPCTRL1-SCALER_DISPCTRL0]!
+        TSTEQ   r2, #&80000000
+        ADDEQ   r1, r1, #256*3
+        LDREQ   r2, [r0, #SCALER_DISPCTRL2-SCALER_DISPCTRL1]!
+        TSTEQ   r2, #&80000000
+        ORRNE   r1, r1, #&80000000 ; Enable auto-increment for gamma addresses. Also used by us as a "gamma enabled" flag.
+        LDRNE   r2, [r0, #SCALER_DISPBKGND0-SCALER_DISPCTRL0]
+        ORRNE   r2, r2, #1<<29 ; Enable gamma LUT in scaler
+        STRNE   r2, [r0, #SCALER_DISPBKGND0-SCALER_DISPCTRL0]
+        DoMemBarrier lr
+91
+        LDR     r0, GammaBase
+        STR     r1, GammaBase
+        ; Reset both old & new gamma table, as necessary
+        CMP     r1, #0
+        BLMI    ResetGamma
+        CMP     r0, r1
+        MOVNES  r1, r0
+        BLMI    ResetGamma
+92
+        ; Allow overlays to be created again
+        BL      GVOverlay_Init
+ [ Debug
+  bl DebugTXStrInline
+  DCB "done FB2",10,13,0
+  ALIGN
+ ]
+        EXIT
+
+; In:
+; r0 = BPP (8,16,32)
+; r1 = physical width
+; r2 = physical height
+; Out:
+; r4 = virtual height
+CalcScreenSize  ROUT
+        Entry   "r3,r5"
+        ; Work out how many screen buffers we can fit before hitting any limits.
+        ;
+        ; First of all, check our memory limit
+        MUL     r5, r0, r1
+        LDR     r3, MaxFBMemory
+        MOV     r3, r3, LSL #3 ; Size in bits, not bytes
+        MUL     r5, r2, r5
+        DivRem  r4, r3, r5, lr
+        ; The GPU limits the dimensions of the virtual framebuffer to being no
+        ; larger than twice the maximum physical framebuffer size.
+        ;
+        ; So we have an additional limit of 2*MaxFBHeight/r2
+        ; (or, if rotated, 2*MaxFBWidth/r2)
+        ;
+        ; N.B. Firmware versions prior to Jan 28 2017 contained a bug where the
+        ; two limits were swapped.
+        LDR     r3, DisplayRotate
+        TST     r3, #DisplayRotate_90
+        LDREQ   r3, MaxFBHeight
+        LDRNE   r3, MaxFBWidth
+        MOV     r3, r3, LSL #1
+        DivRem  r5, r3, r2, lr
+        ; Pick the lowest
+        CMP     r5, r4
+        MOVLT   r4, r5
+        ; Make sure we allocate at least one buffer
+        CMP     r4, #0
+        MOVLE   r4, #1
+        ; Calculate corresponding height
+        MUL     r4, r2, r4
+      [ Debug
+        Push    "r0"
+        BL      DebugHexTX
+        MOV     R0, R1
+        BL      DebugHexTX4
+        MOV     R0, R2
+        BL      DebugHexTX4
+        MOV     R0, R4
+        BL      DebugHexTX4
+        BL      DebugTXStrInline
+        DCB     "CalcScreenSize BPP W H -> VH",10,13,0
+        ALIGN
+        Pull    "R0"
+      ]        
+        EXIT
+
+; In:
+; r0 -> VIDCList3
+; r12 -> workspace
+; Out:
+; r0 = GVVetMode2 flags
+; r2 = suggested ExtraBytes value
+VetModeFromVIDCList     ROUT
+        Entry   "r1,r3-r9"
+        mov     r6, r0                     ; preserve the list pointer
+
+ [ Debug
+        bl      DebugTXStrInline
+        DCB     "start vmfv3",10,13,0
+        ALIGN
+        MOV     r5, r6
+        ASSERT  (VIDCList3_ControlList :AND: 7) = 0
+11      ldr     r0, [r5], #4
+        bl      DebugHexTX4
+        cmn     r0, #1
+        beq     %ft12
+        ldr     r0, [r5], #4
+        bl      DebugHexTX4
+        b       %bt11
+
+12
+        bl      DebugTXStrInline
+        DCB     10,13,"modedefbuf printed",10,13,0
+        ALIGN
+ ]
+
+        LDR     r0, [r6]
+        CMP     r0, #3
+        BNE     %FT999
+
+        ; Vet the pixel depth
+        LDR     r1, [r6, #VIDCList3_PixelDepth]
+        CMP     r1,#3
+        CMPNE   r1,#4
+        CMPNE   r1,#5
+        BNE     %FT999
+
+        ; Convert pixel depth to expected NColour value
+        MOV     r2,#1
+        MOV     r1,r2,LSL r1 ; log2bpp -> bpp
+        RSB     r1,r2,r2,LSL r1 ; bpp -> ncolour
+
+        ; Vet the control list
+        ADD     r2,r6,#VIDCList3_ControlList
+        MOV     r8,#0 ; Interlace flag
+        MOV     r9,#0 ; ExtraBytes
+10        
+        LDR     r3,[r2],#4
+        CMP     r3,#-1
+        BEQ     %FT40
+        LDR     r14,[r2],#4
+        TEQ     r3,#ControlList_ExtraBytes
+        MOVEQ   r9,r14
+        BEQ     %BT10
+20
+        TEQ     r3,#ControlList_NColour
+        BNE     %FT30
+        CMP     r14,r1
+        BNE     %FT999
+        B       %BT10
+30
+        TEQ     r3,#ControlList_ModeFlags
+        BNE     %FT35
+        ; Calculate the expected ModeFlags value
+      [ ControlRGB
+        MOV     r0,#ModeFlag_DataFormatSub_RGB
+      |
+        MOV     r0,#0
+      ]
+        LDR     r3,FramebufferIgnoreAlpha
+        CMP     r3,#0
+        ORREQ   r0,r0,#ModeFlag_DataFormatSub_Alpha
+        TEQ     r1,#255 ; EQ -> 8bpp, NE -> 16bpp, MI -> 32bpp
+        MOVEQ   r3,#ModeFlag_FullPalette
+        LDRNE   r3,=ModeFlag_DataFormatSub_RGB+ModeFlag_64k
+        MOVMI   r3,#0                   ; Must be after NE case
+        BICMI   r14,r14,r0              ; r0 is mask of which RGB/alpha flags we support
+        CMP     r3,r14
+        BNE     %FT999
+        B       %BT10
+35
+        TEQ     r3,#ControlList_Interlaced
+        BNE     %BT10
+        CMP     r14,#1
+        MOV     r8,r14
+        BHI     %FT999
+        B       %BT10
+40
+
+        ; Calculate row pitch in bytes
+        LDR     r0, [r6, #VIDCList3_HorizDisplaySize]
+        LDR     r1, [r6, #VIDCList3_PixelDepth]
+        SUB     r1, r1, #3
+        ADD     r7, r9, r0, LSL r1
+        ; Round up to a 32 byte multiple
+        ADD     r7, r7, #31
+        BIC     r7, r7, #31
+        ; It looks like the width also needs to be a multiple of 16 pixels
+        MOV     r7, r7, LSR r1
+        ADD     r7, r7, #15
+        BIC     r7, r7, #15
+
+; Vet framebuffer width/height against configured GPU limits
+        LDR     r0, DisplayRotate
+        TST     r0, #DisplayRotate_90 ; 90 / 270 degree rotation effectively swaps the two limits
+        LDREQ   r0, MaxFBWidth
+        LDREQ   r2, MaxFBHeight
+        LDRNE   r0, MaxFBHeight
+        LDRNE   r2, MaxFBWidth
+        CMP     r7, r0, LSL #1 ; Virtual framebuffer width can't be more than twice max physical framebuffer size
+        LDRLS   r1, [r6, #VIDCList3_HorizDisplaySize]
+        CMPLS   r1, r0 ; Physical framebuffer width needs checking too
+        LDRLS   r1, [r6, #VIDCList3_VertiDisplaySize]
+        MOVLS   r1, r1, LSL r8
+        CMPLS   r1, r2
+        BHI     %FT999
+
+ [ GPUMode
+        BL      GPUMode_Vet
+        CMP     r0, #0
+        BNE     %FT999
+ ]
+
+        ; The VC 'test' calls seem to be broken and just return the current FB settings
+        ; So don't bother doing a full vet sequence
+ [ {FALSE}
+        SUB     sp, sp, #vettagslen
+        MOV     r3, sp
+        
+        adrl    r1, vettagb                  ; buffer source
+        ldr     r2, [r1]                     ; length
+111     subs    r2, r2, #4                   ; initialise the tagbugffer
+        ldrge   r4, [r1, r2]
+        strge   r4, [r3, r2]
+        bgt     %bt111
+
+
+        LDR     r0, [r6, #VIDCList3_PixelDepth]
+ [ Debug
+  bl DebugHexTX4
+ ]
+        CMP     r0, #4
+        MOVLO   r0, #8
+        MOVEQ   r0, #16
+        MOVHI   r0, #32
+        str     r0, [r3, #vdispbpp-vettagb]
+ [ Debug
+  bl DebugHexTX4
+ ]
+        LDR     r0, [r6, #VIDCList3_HorizDisplaySize]
+ ;       str     r0, [r3, #vphyx-vettagb]
+        str     r0, [r3, #vvirtx-vettagb]
+ [ Debug
+  bl DebugHexTX4
+ ]
+        LDR     r0, [r6, #VIDCList3_VertiDisplaySize]
+        MOV     r0, r0, LSL r8
+ ;       str     r0, [r3, #vphyy-vettagb]
+        str     r0, [r3, #vvirty-vettagb]
+ [ Debug
+  bl DebugHexTX4
+ ]
+        mov     r0, sp
+        mov     r1, sp
+        mov     r2, #0
+ [ Debug
+  bl DebugHexTX4
+ ]
+        SWI     XBCMSupport_SendTempPropertyBuffer
+ [ Debug
+  bl DebugTXStrInline
+  DCB "done FB.. vet response",10,13,0
+  ALIGN
+ ]
+        ; For the moment only vet virtual dimensions & bpp
+        ldr     r1, [r3,#vvirtx-vettagb]
+        ldr     r2, [r3,#vvirty-vettagb]
+        ldr     r4, [r3,#vdispbpp-vettagb]
+ [ Debug
+  mov   r0, r4
+  bl DebugHexTX4
+  mov   r0, r1
+  bl DebugHexTX4
+  mov   r0, r2
+  bl DebugHexTX4
+ ]
+        LDR     r0, [r6, #VIDCList3_HorizDisplaySize]
+        CMP     r0, r1
+        LDREQ   r0, [r6, #VIDCList3_VertiDisplaySize]
+        MOVEQ   r0, r0, LSL r8
+        CMPEQ   r0, r2
+        BNE     %FT998
+        LDR     r0, [r6, #VIDCList3_PixelDepth]
+        CMP     r0, #4
+        MOVLT   r0, #8
+        MOVEQ   r0, #16
+        MOVGT   r0, #32
+        CMP     r0, r4
+        BNE     %FT998
+        ADD     sp, sp, #vettagslen
+ ] ; {FALSE}
+ [ Debug
+  bl DebugTXStrInline
+  DCB "done vFB2",10,13,0
+  ALIGN
+ ]
+
+; Mode is good - recalculate ExtraBytes from r7
+        LDR     r0, [r6, #VIDCList3_HorizDisplaySize]
+        LDR     r1, [r6, #VIDCList3_PixelDepth]
+        SUB     r1, r1, #3
+        SUB     r2, r7, r0
+        MOV     r2, r2, LSL r1
+        MOV     r0, #GVVetMode2_Result_UnkFramestore
+        ; Set the flag for if we've changed ExtraBytes
+        CMP     r2, r9
+        ORRNE   r0, r0, #GVVetMode2_ExtraBytes_Invalid
+        EXIT
+998
+        ADD     sp, sp, #vettagslen
+999
+ [ Debug
+  bl DebugTXStrInline
+  DCB "done vFB2 - mode vet fail",10,13,0
+  ALIGN
+ ]
+        MOV     r0, #GVVetMode2_Result_Unsupported
+        EXIT
+
+; in: R1 = requested Vinit
+SetVinit        ROUT
+        Entry   "r0-r4"
+        ; Calculate corresponding Y offset to use
+        LDR     r0, mbbase
+        SUB     r0, r1, r0
+        LDR     r1, mbpitch
+        DivRem  r2, r0, r1, lr
+        ; Clamp
+        CMP     r2, #0
+        MOVLT   r2, #0
+        LDR     r0, mbyvres
+        LDR     r1, mbyres
+        SUB     r0, r0, r1
+        CMP     r2, r0
+        MOVLE   r0, r2
+        ; Same as current?
+        LDR     r2, mbyoff
+        CMP     r0, r2
+        EXIT    EQ
+      [ Debug
+        DebugTime
+        BL      DebugHexTX4
+        BL      DebugTXStrInline
+        DCB     "SetVinit yoff",10,13,0
+        ALIGN
+      ]
+        ; Set flag requesting update
+        STR     r0, mbyoff
+        STR     pc, UpdateNeeded
+        EXIT
+
+; in: r1 = pointer to palette entries
+;     r2 = base
+;     r3 = count
+; Palette updates seem to be quite slow, not helped by the fact that RISC OS likes to update them one at a time. To counter this, we buffer the updates and perform them at a later date (on the ARM timer half-VSync interrupt)
+SetPalette      ROUT
+        Entry   "r0-r4"
+      [ Debug
+        DebugTime
+        BL      DebugTXStrInline
+        DCB     "SetPalette",10,13,0
+        ALIGN
+      ]
+        ; Copy over new data
+        ADRL    r0, Palette
+        ADD     r0, r0, r2, LSL #2
+        MOV     lr, #0
+10
+        SUBS    r3, r3, #1
+        LDRGE   r4, [r1], #4
+        LDRGE   r2, [r0]
+        MOVGE   r4, r4, LSR #8
+        EORGE   r2, r2, r4
+        STRGE   r4, [r0], #4
+        ORRGE   lr, lr, r2
+        BGT     %BT10
+        ; Request merged message send if necessary
+        TEQ     lr, #0
+        STRNE   lr, UpdateNeeded
+        EXIT
+
+; in: r1 = pointer to gamma table entries
+;     r2 = base
+;     r3 = count
+SetGamma        ROUT
+        Entry   "r0-r6"
+      [ Debug :LAND: {FALSE}
+        DebugTime
+        BL      DebugTXStrInline
+        DCB     "SetGamma",10,13,0
+        ALIGN
+      ]
+        LDR     r4, PeriBase
+        ADD     r4, r4, #SCALER
+        LDR     r5, GammaBase
+        ADDS    r5, r5, r2
+        EXIT    PL ; Top bit of GammaBase should be set if gamma enabled
+        ; At the hardware level the red, green and blue gamma ramps are stored
+        ; separately from each other, so we must write the data for each
+        ; channel one at a time.
+        PHPSEI
+        ; Write red channel
+        ADD     r1, r1, #1
+        STR     r5, [r4, #SCALER_DISPGAMADR]
+10
+        SUBS    r3, r3, #1
+        LDRGEB  r6, [r1], #4
+        STRGE   r6, [r4, #SCALER_DISPGAMDAT]
+        BGT     %BT10
+        ; Write green channel
+        FRAMLDR r1
+        FRAMLDR r3
+        ADD     r1, r1, #2
+        ADD     r5, r5, #256
+        STR     r5, [r4, #SCALER_DISPGAMADR]
+20
+        SUBS    r3, r3, #1
+        LDRGEB  r6, [r1], #4
+        STRGE   r6, [r4, #SCALER_DISPGAMDAT]
+        BGT     %BT20
+        ; Write blue channel
+        FRAMLDR r1
+        FRAMLDR r3
+        ADD     r1, r1, #3
+        ADD     r5, r5, #256
+        STR     r5, [r4, #SCALER_DISPGAMADR]
+30
+        SUBS    r3, r3, #1
+        LDRGEB  r6, [r1], #4
+        STRGE   r6, [r4, #SCALER_DISPGAMDAT]
+        BGT     %BT30
+        DoMemBarrier r6
+        PLP
+        EXIT
+
+; in: r1 = gamma base address
+; Reset to a linear gamma ramp
+ResetGamma      ROUT
+        Entry   "r0-r2"
+        LDR     r0, PeriBase
+        ADD     r0, r0, #SCALER
+        PHPSEI
+        STR     r1, [r0, #SCALER_DISPGAMADR]
+        MOV     r2, #3
+10
+        MOV     r1, #0
+20
+        STRB    r1, [r0, #SCALER_DISPGAMDAT]
+        ADD     r1, r1, #1
+        TST     r1, #255
+        BNE     %BT20
+        SUBS    r2, r2, #1
+        BNE     %BT10
+        DoMemBarrier r0
+        PLP
+        EXIT
+
+VSync_Test      ROUT
+        Entry   "r0-r4,r8-r9"
+        ; Drop into SVC mode for SWI calls
+        MRS     r4, CPSR
+        ORR     r0, r4, #SVC32_mode
+        MSR     CPSR_c, r0
+        Push    "lr"
+        ; Clear IRQ in SMI
+        LDR     r0, PeriBase
+        ADD     r0, r0, #SMICS
+        DoMemBarrier lr
+        MOV     r1, #0
+        STR     r1, [r0]
+        DoMemBarrier lr
+        ; Clear IRQ in controller
+        MOV     r0, #iDev_GPU_SMI
+        MOV     r8, #0
+        MOV     r9, #EntryNo_HAL_IRQClear
+        SWI     XOS_Hardware
+        ; Increase VSync count
+        LDRB    r0, VSyncTestCount
+        CMP     r0, #255
+        ADDLT   r0, r0, #1
+        STRLTB  r0, VSyncTestCount
+        Pull    "lr"
+        MSR     CPSR_c, r4
+        EXIT
+
+VSync_Handler
+        Entry   "r0-r5,r8-r9"
+        ; Drop into SVC mode for SWI calls
+        MRS     r5, CPSR
+        ORR     r0, r5, #SVC32_mode
+        MSR     CPSR_c, r0
+        Push    "lr"
+      [ TimeDebug
+        DebugTime
+        BL      DebugTXStrInline
+        DCB     "VSync {",10,13,0
+        ALIGN
+      ]
+        LDR     r0, PeriBase
+        ADD     r2, r0, #ARM_Timer_Base
+        ADD     r0, r0, #SMICS
+        LDR     r3, TimerVal
+        LDRB    r4, TimerScale
+        DoMemBarrier lr
+        ; Clear IRQ in SMI
+        MOV     r1, #0
+        STR     r1, [r0]
+        DoMemBarrier lr
+        ; Program timer for the half-sync interrupt
+        LDR     r1, [r2, #ARMTimer_Counter]
+        SUB     r3, r1, r3
+        MOV     r3, r3, LSR r4 ; Adjusts for both 10 bit vs. 8 bit prescaler values and divides by two
+        STR     r3, [r2, #ARMTimer_Load]
+        ; Enable timer + IRQ
+        LDR     r4, [r2, #ARMTimer_Control]
+        ORR     r0, r4, #ARMTimer_Control_Enable+ARMTimer_Control_IRQEnable
+        STR     r0, [r2, #ARMTimer_Control]
+        DoMemBarrier lr
+        STR     r1, TimerVal
+        ; Clear SMI IRQ in controller
+        MOV     r0, #iDev_GPU_SMI
+        MOV     r8, #0
+        MOV     r9, #EntryNo_HAL_IRQClear
+        SWI     XOS_Hardware
+        ; If the ARM timer was programmed incorrectly and didn't fire last time
+        ; (i.e. it started off enabled), send any pending message now. This
+        ; should avoid us getting stuck never sending any messages if the timer
+        ; freaks out.
+        TST     r4, #ARMTimer_Control_IRQEnable
+        LDRNE   lr, UpdateNeeded
+        CMPNE   lr, #0
+        BLNE    MergeUpdate
+        ; Trigger VSync in OS
+        LDRB    r4, GVinstance
+        MOV     r9, #GraphicsV
+        MOV     r4, r4, LSL #24
+        ORR     r4, r4, #GraphicsV_VSync
+        SWI     XOS_CallAVector
+      [ TimeDebug
+        DebugTime
+        BL      DebugTXStrInline
+        DCB     "} VSync",10,13,0
+        ALIGN
+      ]
+        Pull    "lr"
+        MSR     CPSR_c, r5
+        EXIT
+
+MergeUpdate ROUT
+        Entry   "r0-r6"
+        ; Try and claim tag buffer
+        ; Give up if it's currently in use
+        PHPSEI  r1
+        LDR     r0, tagbuffer_busy
+        CMP     r0, #0
+        BNE     %FT90
+        STR     r0, UpdateNeeded
+        STR     pc, tagbuffer_busy
+        PLP     r1
+        ; Copy message prototype
+        LDR     r0, tagbuffer
+        ADRL    r4, mergetags
+        MOV     r5, #mergepaldata-mergetags
+        MOV     r1, r0
+10
+        LDR     r6, [r4], #4
+        STR     r6, [r1], #4
+        SUBS    r5, r5, #4
+        BNE     %BT10
+        ; Set up blank state message
+        LDRB    r6, BlankState
+        STR     r6, [r0, #mergeblank-mergetags]
+        ; Set up Y offset message
+        LDR     r6, mbyoff
+        STR     r6, [r0, #mergevyoff-mergetags]
+        ; Set up palette entries
+        MOV     r4, #256
+        ADRL    r2, Palette
+20
+        LDMIA   r2!,{r3,r5-r6,lr}
+        SUBS    r4, r4, #4
+        STMIA   r1!,{r3,r5-r6,lr}
+        BNE     %BT20
+        ; Write end tag
+        MOV     r5, #ARM2VC_Tag_End
+        STR     r5, [r1]
+        ; Send
+        ; Should perhaps be non-blocking? We can always try again later
+        MOV     r1, #SendMBMessage_Async
+        MOV     r2, #0 ; Callback R0
+        MOV     r3, r12
+        ADR     r4, MBCallback
+        SWI     XBCMSupport_SendPropertyBuffer
+        STRVS   r2, tagbuffer_busy
+        EXIT
+
+90
+        PLP     r1
+        EXIT
+
+MBCallback ROUT
+        ; Callback from BCMSupport when an async message is processed
+        ; We just need to flag the buffer as free
+        STR     r0, tagbuffer_busy ; We were entered with R0=0
+        MOV     pc, lr
+
+TickerV_Handler ROUT
+        Entry   "r0-r2"
+        ; Drop into SVC mode for SWI calls
+        MRS     r2, CPSR
+        ORR     r0, r2, #SVC32_mode
+        MSR     CPSR_c, r0
+        Push    "lr"
+        ; Check time
+        ; OS generates its fake VSync if the low bit of the centisecond timer
+        ; is set. But we want to send our merged message about halfway through
+        ; the frame, to try and ensure it reaches the GPU before the next (real)
+        ; VSync.
+        SWI     XOS_ReadMonotonicTime
+        LDR     r1, UpdateNeeded
+        EOR     r0, r0, #1
+        TST     r0, #1
+        CMPNE   r1, #0
+        BLNE    MergeUpdate
+        Pull    "lr"
+        MSR     CPSR_c, r2
+        EXIT
+
+Timer_Handler ROUT
+        Entry   "r0-r4,r8-r9"
+        ; Drop into SVC mode for SWI calls
+        MRS     r4, CPSR
+        ORR     r0, r4, #SVC32_mode
+        MSR     CPSR_c, r0
+        Push    "lr"
+      [ TimeDebug
+        DebugTime
+        BL      DebugTXStrInline
+        DCB     "Timer {",10,13,0
+        ALIGN
+      ]
+        ; Stop the timer, we only want it to fire once
+        LDR     r0, PeriBase
+        ADD     r0, r0, #ARM_Timer_Base
+        DoMemBarrier lr
+        LDR     r1, [r0, #ARMTimer_Control]
+        BIC     r1, r1, #ARMTimer_Control_Enable+ARMTimer_Control_IRQEnable
+        STR     r1, [r0, #ARMTimer_Control]
+      [ TimerDebug
+        LDR     r1, [r0, #ARMTimer_Counter]
+        LDR     r2, [r0, #ARMTimer_Load]
+      ]
+        ; Clear the IRQ states
+        STR     pc, [r0, #ARMTimer_IRQClear] ; Any value will do
+        DoMemBarrier lr
+      [ TimerDebug
+        LDR     r0, TimerVal
+        SUB     r0, r1, r0
+        STR     r0, CounterDiff ; How much counter time passed
+        STR     r2, TimerLoad ; How much timer time passed
+      [ TimeDebug
+        BL      DebugHexTX4
+        MOV     r0, r2
+        BL      DebugHexTX4
+        BL      DebugTXStrInline
+        DCB     "times",10,13,0
+        ALIGN
+      ]
+      ]
+        MOV     r0, #iDev_ARM_Timer
+        MOV     r8, #0
+        MOV     r9, #EntryNo_HAL_IRQClear
+        SWI     XOS_Hardware
+        ; Now handle any merged update
+        LDR     r0, UpdateNeeded
+        CMP     r0, #0
+        BLNE    MergeUpdate
+      [ TimeDebug
+        DebugTime
+        BL      DebugTXStrInline
+        DCB     "} Timer",10,13,0
+        ALIGN
+      ]
+        Pull    "lr"
+        MSR     CPSR_c, r4
+        EXIT
+
+VCHIQInit ROUT
+        Entry   "r0-r2"
+        LDR     r0, VCHIQInstance
+        CMP     r0, #0
+        EXIT    NE                      ; Already initialised
+        ; Register with VCHIQ
+        MOV     r0, r12
+        SWI     XVCHIQ_Initialise
+        FRAMSTR r0, VS
+        EXIT    VS
+        ; Connect to the GPU
+        MOV     r2, r0
+        MOV     r1, #0
+        MOV     r0, #0
+        SWI     XVCHIQ_Connect
+        STRVC   r2, VCHIQInstance
+        EXIT    VC
+        FRAMSTR r0
+        ; Disconnect + deregister
+        MOV     r0, r2
+        SWI     XVCHIQ_Disconnect
+        SETV
+        EXIT
+
+VCHIQFinalise ROUT
+        Entry   "r0"
+        LDR     r0, VCHIQInstance
+        CMP     r0, #0                  ; Clears V
+        EXIT    EQ
+        ; Shutdown all dependencies
+        BLVC    GVOverlay_Finalise
+      [ HWPointer
+        BLVC    HWP_Finalise
+      ]
+        BLVC    Dispmanx_Finalise
+      [ GPUMode
+        BLVC    GPUMode_Finalise
+        BLVC    TVService_Finalise
+      ]
+      [ GenCmd
+        BLVC    GenCmd_Finalise
+      ]
+        ; Now shutdown VCHIQ instance
+        MOVVC   lr, #0
+        STRVC   lr, VCHIQInstance
+        SWIVC   XVCHIQ_Disconnect
+        FRAMSTR r0, VS
+        EXIT
+
+WaitForR1        
+        ; Wait for pollword at r1 to become nonzero
+        ; Assumes interrupts can be enabled!
+        Entry   "r0,r2-r3"
+        MRS     r3, CPSR
+05
+        ORR     r2, r3, #I32_bit
+        MSR     CPSR_c, r2
+        LDR     r0, [r1]
+        CMP     r0, #0
+        BNE     %FT10
+        ; Block on mutex, with IRQs enabled. IRQs must be enabled to avoid deadlock, as RTSupport doesn't have any IRQ-enabled "idle" thread to drop into when all others are blocked.
+        BIC     r2, r3, #I32_bit
+        MSR     CPSR_c, r2
+        SWI     XRT_Yield
+        BVS     %FT10 ; Error typically means we're in an IRQ (which shouldn't happen for us). But to avoid problems just go ahead and claim the mutex anyway.
+        ADR     lr, %BT05
+        LDR     pc, IRQTrigger        
+10        
+        MSR     CPSR_c, r3
+        EXIT
+
+; in:
+; r0 -> input buffer
+; r1 = input length
+; r2 -> response buffer, NULL if no response expected
+; r3 = response buffer length
+; r4 = VCHIQ service handle
+; r5 -> response pollword (ignored if no response needed)
+; out:
+; r0 = response length (zero if none requested)
+VCHIQSend ROUT
+        Entry   "r0-r3"
+        MOV     r0, r4
+        SWI     XVCHIQ_ServiceUse
+        FRAMSTR r0,VS
+        EXIT    VS
+        CMP     r2, #0
+        MOVNE   r0, #0
+        STRNE   r0, [r5]
+        MOV     r0, r4
+        FRAMLDR r1,,r0
+        FRAMLDR r2,,r1
+        MOV     r3, #VCHI_FLAGS_BLOCK_UNTIL_QUEUED
+        SWI     XVCHIQ_MsgQueue
+        BVS     %FT80
+        ; Wait for response
+        FRAMLDR r2
+        CMP     r2, #0
+        FRAMSTR r2,EQ,r0
+        BEQ     %FT70
+10
+        MOV     r1, r5
+        BL      WaitForR1
+        MOV     r0, r4
+        MOV     r1, r2
+        FRAMLDR r2,,r3
+        MOV     r3, #0
+        SWI     XVCHIQ_MsgDequeue
+        FRAMSTR r2,,r0
+        BVS     %FT80
+70
+        MOV     r0, r4
+        SWI     XVCHIQ_ServiceRelease
+        CLRV
+        EXIT
+80
+        FRAMSTR r1,,r0
+        MOV     r0, r4
+        SWI     XVCHIQ_ServiceRelease
+        SETV
+        EXIT
+
+; In: R6 -> option to check for in cmdline.txt
+; Out: VS if option was found        
+CheckCmdlineTxt ROUT
+        Entry   "r0-r5"
+        ; Build up a mailbox message
+        MOV     r5, sp
+        MOV     r4, #ARM2VC_Tag_End
+        Push    "r4"                    ; End tag
+cmdlinelen * 1024 ; The firmware will put a bunch of stuff on the command line by default, so be cautious with the length
+        SUB     sp, sp, #cmdlinelen     ; String buffer
+        LDR     r0, =ARM2VC_Tag_GetConfig
+        MOV     r1, #cmdlinelen
+        MOV     r2, #0
+        Push    "r0-r2"                 ; Command line tag
+        SUB     r0, r5, sp
+        ADD     r0, r0, #8
+        MOV     r1, #0
+        Push    "r0-r1"                 ; Tag block header
+        MOV     r0, sp
+        MOV     r1, sp
+        MOV     r2, #0
+        SWI     XBCMSupport_SendTempPropertyBuffer
+        BVS     %FT90
+        ; Check success
+        LDR     r0, [sp, #4]
+        CMP     r0, #&80000000
+        BNE     %FT90
+        LDR     r0, [sp, #16]!
+        TST     r0, #&80000000
+        BEQ     %FT90
+        BIC     r0, r0, #&80000000
+        CMP     r0, #cmdlinelen
+        MOVHI   r0, #cmdlinelen
+        ADD     sp, sp, #4
+        MOV     r1, #0
+        STRB    r1, [sp, r0] ; Ensure null terminated, to simplify logic
+        ; Scan the string
+        MOV     r1, sp
+05
+        MOV     r14, #0
+10
+        LDRB    r3, [r1, r14]
+        LDRB    r4, [r6, r14]
+        CMP     r4, #0
+        BNE     %FT20
+        ; Require space or null at end
+        CMP     r3, #0
+        CMPNE   r3, #' '
+        BNE     %FT30
+        SETV
+        MOV     sp, r5
+        EXIT
+20
+        CMP     r3, r4
+        ADDEQ   r14, r14, #1
+        BEQ     %BT10
+30
+        ; No match. Scan forwards until we find a space.
+        LDRB    r3, [r1], #1
+        CMP     r3, #' '
+        BEQ     %BT05
+        CMP     r3, #0
+        BNE     %BT30
+90
+        ; Failed to find the string, exit V clear
+        CLRV
+        MOV     sp, r5
+        EXIT
+
+        LTORG
+
+resourcefsfiles
+      [ BuiltinMDF
+        ResourceFile    Resources.RPIMon, Resources.BCMVideo.RPIMon
+      ]
+        DCD     0                   ; terminator
+
+pollword_1
+        DCD     1
+
+        GET     GraphicsV.s
+        GET     GVOverlay.s
+        GET     Debug.s
+        GET     Dispmanx.s
+      [ HWPointer
+        GET     HWPointer.s
+      ]
+      [ GenCmd
+        GET     GenCmd.s
+      ]
+      [ GPUMode
+        GET     TVService.s
+        GET     GPUMode.s
+      ]
+        END

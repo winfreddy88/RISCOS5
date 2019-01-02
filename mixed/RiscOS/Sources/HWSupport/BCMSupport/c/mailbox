@@ -1,0 +1,331 @@
+/*
+ * Copyright (c) 2016, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include "mailbox.h"
+#include "globals.h"
+#include "errors.h"
+#include "BCMSupportHdr.h"
+
+#include "kernel.h"
+#include "swis.h"
+#include "Global/HALDevice.h"
+#include "Global/OSEntries.h"
+
+/* To avoid allocating memory in the mailbox send code we have a fixed number of response slots available */
+#define MAX_PENDING_MB_RESPONSES 32
+
+static struct device *mbox_dev = NULL;
+
+/* Mailbox registers */
+static struct
+{
+	volatile uint32_t *read;
+	volatile uint32_t *write;
+	volatile uint32_t *read_status;
+	volatile uint32_t *write_status;
+	volatile uint32_t *read_config;
+} mbox_regs;
+
+#define MBSTATUS_FULL (1u<<31)
+#define MBSTATUS_EMPTY (1u<<30)
+#define MBCONFIG_HASDATA_IRQ_EN (1u<<0)
+#define MBCONFIG_HASSPACE_IRQ_EN (1u<<1)
+#define MBCONFIG_OPP_IRQ_EN (1u<<2)
+#define MBCONFIG_HASDATA_IRQ_CLR (1u<<4)
+#define MBCONFIG_HASSPACE_IRQ_CLR (1u<<5)
+#define MBCONFIG_OPP_IRQ_CLR (1u<<6)
+
+/* Response queue */
+static volatile MBResponse_t response_queue[MAX_PENDING_MB_RESPONSES];
+static volatile int response_queue_front = 0;
+static volatile int response_queue_back = 0;
+
+static volatile bool in_irq = false;
+
+/* This spinlock covers:
+   * The write & write_status registers
+   * The response_queue_front and response_queue_back variables
+   * The in_irq flag
+   Locking for read & read_status isn't necessary (interrupt handler protects itself from re-entry)
+   Locking response_queue itself isn't necessary (see each usage for justification)
+ */
+static spinlock_t lock = SPIN_INITIALISER;
+
+_kernel_oserror *mailbox_init(void)
+{
+	/* Find and initialise the HAL device */
+	int pos=0;
+	_kernel_oserror *e;
+	do {
+		e = _swix(OS_Hardware, _INR(0,1) | _IN(8) | _OUTR(1,2), HALDeviceType_Comms + HALDeviceComms_InterProc,pos,4,&pos,&mbox_dev);
+		if (e)
+		{
+			return e;
+		}
+		if (pos == -1)
+		{
+			return geterror(Error_HWDep);
+		}
+	} while (mbox_dev->id != HALDeviceID_InterProc_BCMMBox);
+
+	dprintf(("","Activate mailbox HAL device @ %08x\n",mbox_dev));
+    
+	/* Call the Activate entry to make sure everything's OK */
+	if(!(mbox_dev->Activate)(mbox_dev))
+	{
+		return geterror(Error_HWDep);
+	}
+
+	/* Get register addresses */
+	mbox_regs.read = (uint32_t *) (((char *) mbox_dev->address) + 0x80);
+	mbox_regs.write = (uint32_t *) (((char *) mbox_dev->address) + 0xa0);
+	mbox_regs.read_status = (uint32_t *) (((char *) mbox_dev->address) + 0x98);
+	mbox_regs.write_status = (uint32_t *) (((char *) mbox_dev->address) + 0xb8);
+	mbox_regs.read_config = (uint32_t *) (((char *) mbox_dev->address) + 0x9c);
+
+	/* Configure IRQs */
+	dsb(); /* Begin BCM hardware access */
+	*mbox_regs.read_config = ((*mbox_regs.read_config)
+		& ~(MBCONFIG_HASSPACE_IRQ_EN | MBCONFIG_OPP_IRQ_EN)) /* Disable unwanted IRQs */
+		| (MBCONFIG_HASDATA_IRQ_EN | MBCONFIG_HASDATA_IRQ_CLR | MBCONFIG_HASSPACE_IRQ_CLR | MBCONFIG_OPP_IRQ_CLR); /* Enable hasdata IRQ, clear any pending IRQs */
+	dsb(); /* End BCM hardware access */
+
+	/* Claim & enable */
+	e = _swix(OS_ClaimDeviceVector, _INR(0,4), mbox_dev->devicenumber, mailbox_irq_entry, private_word, 0, 0);
+	if (e)
+	{
+		goto error;
+	}
+
+	HAL_IRQEnable(mbox_dev->devicenumber);
+
+	return NULL;
+
+error:
+	/* Deactivate device */
+	(mbox_dev->Deactivate)(mbox_dev);
+
+	return e;
+}
+
+void mailbox_shutdown(void)
+{
+	/* Wait for all pending responses
+	   Because we're shutting down, we can't use our SWIs directly. However we can fake a SWI by calling into our SWI handler. */
+	_kernel_swi_regs r;
+	r.r[0] = MBSync_OnResponse;
+	r.r[1] = 0;
+	r.r[2] = 0;
+	module_swi(BCMSupport_MBSync-BCMSupport_00, &r, private_word);
+
+	/* Now release IRQ & deactivate device */
+	_swix(OS_ReleaseDeviceVector, _INR(0,4), mbox_dev->devicenumber, mailbox_irq_entry, private_word, 0, 0);
+
+	(mbox_dev->Deactivate)(mbox_dev);
+}
+
+bool mailbox_send(uint32_t value, const MBResponse_t *response)
+{
+	spin_lock(&lock);
+	/* Check for send space */
+	dsb(); /* Begin BCM hardware access. Also acts as a barrier for any property interface buffer writes. */
+	if (((*mbox_regs.write_status) & MBSTATUS_FULL))
+	{
+		/* No space */
+		dprintf(("","mailbox full\n",value));
+		goto fail;
+	}
+	/* Send space available - check and copy response queue entry */
+	if (response)
+	{
+		int next_back = response_queue_back + 1;
+		if (next_back == MAX_PENDING_MB_RESPONSES)
+		{
+			next_back = 0;
+		}
+		if (next_back == response_queue_front)
+		{
+			/* Queue is full */
+			dprintf(("","response queue full\n",value));
+			goto fail;
+		}
+		response_queue[response_queue_back] = *response; /* Safe because (a) other threads will only know about this once we update response_queue_back and release the lock, and (b) releasing the lock contains a barrier so there's no write ordering issue between response_queue & response_queue_back */
+		response_queue_back = next_back;
+	}
+	/* Now send message */
+	*mbox_regs.write = value;
+	dsb(); /* End BCM hardware access */
+	dprintf(("","sent: %08x\n",value));
+	spin_unlock(&lock);
+	return true;
+
+fail:
+	dsb(); /* End BCM hardware access */
+	spin_unlock(&lock);
+	return false;
+}
+
+bool mailbox_peek(uint32_t flags, const MBResponse_t *mask)
+{
+	/* Get an accurate snapshot of the queue state */
+	spin_lock(&lock);
+	int queue_front = response_queue_front;
+	int queue_back = response_queue_back;
+	bool is_in_irq = in_irq;
+	spin_unlock(&lock);
+	/* Because the IRQ handler pops entries from the queue before it calls the callback, if the handler is running we can't be certain that a response we're waiting for has been fully received (from the user's perspective, of having their callback complete execution)
+	   So if the IRQ handler is running just bail out immediately */
+	if (is_in_irq)
+	{
+		return false;
+	}
+	/* Now peek at the entries
+	   If entries are popped from the queue while we perform this processing
+	   we may get some false-positives. Might want to fix that in future,
+	   but for now don't worry about it. */
+	while (queue_front != queue_back)
+	{
+		volatile MBResponse_t *entry = &response_queue[queue_front];
+		if (++queue_front == MAX_PENDING_MB_RESPONSES)
+		{
+			queue_front = 0;
+		}
+		/* Skip entries that can't match anything */
+		if (!entry->mask)
+		{
+			continue;
+		}
+		/* Detect the 'always match' option */
+		if ((flags & MBSync_OnResponse) && !mask->mask && !mask->value)
+		{
+			return false;
+		}
+		bool matches = false;
+		if ((flags & MBSync_OnResponse) && ((mask->mask != entry->mask) && (mask->value != entry->value)))
+		{
+			matches = true;
+		}
+		if ((flags & MBSync_OnR0) && (mask->callback.r0 != entry->callback.r0))
+		{
+			matches = true;
+		}
+		if ((flags & MBSync_OnR12) && (mask->callback.r12 != entry->callback.r12))
+		{
+			matches = true;
+		}
+		if ((flags & MBSync_OnCallback) && (mask->callback.pc != entry->callback.pc))
+		{
+			matches = true;
+		}
+		if (matches)
+		{
+			return false;
+		}
+	}
+	return true;
+}
+
+static bool find_response(uint32_t response, Callback_t *out)
+{
+	/* Get an accurate snapshot of the queue state */
+	spin_lock(&lock);
+	int queue_front = response_queue_front;
+	int queue_back = response_queue_back;
+	in_irq = true; /* Let mailbox_peek know that it should wait for the IRQ handler to finish */
+	/* We can guarantee that we're the only ones writing to the entries
+	   between queue_front and queue_back, so it's safe to unlock the spinlock here */
+	spin_unlock(&lock);
+	/* Look for a match */
+	while (queue_front != queue_back)
+	{
+		volatile MBResponse_t *entry = &response_queue[queue_front];
+		if (++queue_front == MAX_PENDING_MB_RESPONSES)
+		{
+			queue_front = 0;
+		}
+		/* Try and match */
+		if ((entry->mask & response) != entry->value)
+		{
+			continue;
+		}
+		/* Found a match - copy out callback if necessary */
+		bool have_callback = (entry->callback.pc != NULL);
+		if (have_callback)
+		{
+			*out = entry->callback;
+		}
+		/* Lazy way of dealing with matches in the middle of the queue: Set the mask up so that it can never match, and then pop entries from the front of the queue which have that mask value */
+		entry->mask = 0;
+		entry->value = ~0;
+		int new_front = response_queue_front;
+		while (!response_queue[new_front].mask && (new_front != queue_back))
+		{
+			if (++new_front == MAX_PENDING_MB_RESPONSES)
+			{
+				new_front = 0;
+			}
+		}
+		/* Write back new queue front */
+		barrier(); /* Ensure queue writes have completed (don't want them clobbering new queue entries) */
+		response_queue_front = new_front;
+		return have_callback;
+	}
+	/* No matches! */
+	dprintf(("","No match!\n"));
+	return false;
+}
+
+int mailbox_irq_handler(_kernel_swi_regs *r, void *pw)
+{
+	(void) r;
+	(void) pw;
+	dprintf(("","->irq\n"));
+	dsb(); /* Begin BCM hardware access */
+	while (!((*mbox_regs.read_status) & MBSTATUS_EMPTY))
+	{
+		uint32_t response = *mbox_regs.read;
+		dsb(); /* End BCM hardware access. Also acts as a read barrier for any property interface buffer. */
+		dprintf(("","receive: %08x\n",response));
+		/* Identify and remove the response slot */
+		Callback_t cb;
+		if (find_response(response, &cb))
+		{
+			dprintf(("","cb %08x\n",cb.pc));
+			if (!cb.r1)
+			{
+				cb.r1 = (void *) response;
+			}
+			invoke_callback(&cb);
+		}
+		dsb(); /* Begin BCM hardware access */
+	}
+	*mbox_regs.read_config |= MBCONFIG_HASDATA_IRQ_CLR;
+	dsb(); /* End BCM hardware access */
+	in_irq = false; /* Indicate that we're no longer potentially executing popped callbacks */
+	dprintf(("","<-irq\n"));
+	return 0;
+}

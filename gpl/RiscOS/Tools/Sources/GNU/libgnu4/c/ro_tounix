@@ -1,0 +1,212 @@
+/* ro_tounix.c
+   Filename translation from RISC OS to Unix-style.
+   Copyright (C) 1999 Darren Salt
+   All rights reserved.
+
+   Redistribution and use in source and binary forms, with or without
+   modification, are permitted provided that the following conditions are
+   met:
+   1. Redistributions of source code must retain the above copyright notice,
+   this list of conditions and the following disclaimer.
+   2. Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in the
+   documentation and/or other materials provided with the distribution.
+   3. All advertising materials mentioning features or use of this software
+   must display the following acknowledgement:
+   This product includes software developed by Darren Salt.
+   4. The name of the author may not be used to endorse or promote products
+   derived from this software without specific prior written permission.
+
+   This software is provided by the author "as is" and any express or implied
+   warranties including, but not limited to, the implied warranties of
+   merchantability and fitness for a particular purpose are disclaimed. in no
+   event shall the author be liable for any direct, indirect, incidental,
+   special, exemplary, or consequential damages (including, but not limited
+   to, procurement of substitute goods or services; loss of use, data, or
+   profits; or business interruption) however caused and on any theory of
+   liability, whether in contract, strict liability, or tort (including
+   negligence or otherwise) arising in any way out of the use of this
+   software, even if advised of the possibility of such damage.
+ */
+
+/* Written by Darren Salt <ds@youmustbejoking.demon.co.uk>.  */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "system.h"
+#include "ro_uname.h"
+
+extern const char *__ro_ext_getenv (const char *env);
+
+
+/* Munge the filename into Unix format.
+   (See the header file for more info.)
+   Note that this code doesn't do much about "<...>" constructs...  */
+const char *
+ro_tounix (const char *filename, const char *extensions_string)
+{
+  static char *buffer = 0;
+  const char *start;
+  const char *lastdot;
+  const char *secondlastdot;	/* well, second last dot plus 1 */
+  const char *p, *end;
+  char *q;
+  int root, i;
+  int hat;			/* count of '^' (up a dir) characters */
+  int len;
+
+  if (!extensions_string)
+    return filename;
+
+  if (extensions_string[0] == '$')
+    extensions_string = __ro_ext_getenv (extensions_string + 1);
+
+  if (! (filename[0] == '<' && strchr (filename, '>')))
+    {
+      /* skip past special bits of the pathname */
+      start = strrchr (filename, ':');
+      lastdot = strpbrk (filename, "$&%@\\");
+      if (lastdot > start)
+	start = lastdot;
+      start = start ? (start + 1) : filename;
+      if (*start == '.')
+	start++;
+
+      /* translate: '$' = root dir, '&' = home dir */
+      root = strchr (filename, '$') ? 1 : strchr (filename, '&') ? 2 : 0;
+    }
+  else
+    {
+      root = 0;
+      start = filename;
+    }
+
+  lastdot = strrchr (filename, '.');
+  if (!lastdot)
+    {
+      if (root)
+	{
+	  buffer = xrealloc (buffer, strlen (start) + root + 1);
+	  sprintf (buffer, "%s/%s", root == 2 ? "~" : "", start);
+	  return buffer;
+	}
+      else
+	return start;
+    }
+
+  /* We have at least one dot.  */
+
+  /* Count ^s */
+  hat = 0;
+  p = strchr (filename, '^');
+  while (p)
+    {
+      hat++;
+      p = strchr (p + 1, '^');
+    }
+
+  secondlastdot = lastdot;
+  /* find the character following the preceding dot */
+  while (secondlastdot > start && secondlastdot[-1] != '.')
+    secondlastdot--;
+
+  /* Is the name contained between the dots in our extensions string?  */
+  if (*extensions_string)
+    {
+      int len = lastdot - secondlastdot;
+      const char *q = extensions_string - 1;
+      do
+	{
+	  p = q + 1;
+	  q = strchr (p, ':');
+	  if ((q ? q - p : strlen (p)) == len
+	      && !memcmp (p, secondlastdot, len))
+	    goto is_in_ext;
+	}
+      while (q);
+    }
+  /* No - forget about the dots.  */
+  lastdot = secondlastdot = 0;
+
+is_in_ext:
+  /* Yes - remember about the dots.  */
+
+  /* Copy name into our buffer, with translation.  */
+  q = xrealloc (buffer,
+      len = strlen (start) + hat + root + 2 + 2 * (!root && *start == '~'));
+  buffer = q;
+  switch (root)
+    {
+    case 2:
+      /* '&' user root directory - prefix with '~/' */
+      *q++ = '~';
+    case 1:
+      /* '$' main root directory - prefix with '/' */
+      *q++ = '/';
+      break;
+    default:
+      if (*start == '~')
+	{
+	  /* name starts with '~' - prefix with './' */
+	  *q++ = '.';
+	  *q++ = '/';
+	}
+    }
+  for (i = 2; i >= 0; --i)
+    {
+      /* This switch causes the extension swapping.  */
+      switch (i)
+	{
+	case 2:
+	  if (!secondlastdot || start == secondlastdot)
+	    continue;
+	  p = start - 1;
+	  end = secondlastdot;
+	  break;
+	case 1:
+	  if (!lastdot)
+	    continue;
+	  p = lastdot;
+	  end = lastdot + strlen (lastdot);
+	  break;
+	default:
+	  if (lastdot)
+	    {
+	      *q++ = '.';
+	      if (secondlastdot)
+		p = secondlastdot - 1;
+	      else
+		p = start;
+	      end = lastdot;
+	    }
+	  else
+	    {
+	      p = start - 1;
+	      end = start + strlen (start);
+	    }
+	  break;
+	}
+      /* Copy the filename segment.  Doesn't handle <sysvar> stuff. */
+      while (++p < end)
+	{
+	  switch (*p)
+	    {
+	    case '.':
+	    case '/':
+	      *q++ = *p ^ ('.' ^ '/');
+	      break;
+	    case '^':
+	      *q++ = '.';
+	      *q++ = '.';
+	      break;
+	    default:
+	      *q++ = *p;
+	    }
+	}
+    }
+  *q = 0;
+
+  /* Done.  */
+  return buffer;
+}

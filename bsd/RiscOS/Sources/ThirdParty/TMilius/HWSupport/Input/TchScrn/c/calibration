@@ -1,0 +1,849 @@
+/** @file
+  */
+/* Created 29.12.2007 T. Milius
+   Changed 11.04.2016 T. Milius Support of RPi 12" display added.
+   Changed 12.04.2016 T. Milius Designed several structures more general
+   Changed 14.04.2016 T. Milius Support of D-WAV egalax HID added
+   Changed 27.04.2016 T. Milius No longer access touchscreen directly
+                                Now using TchScrn_TellPoint
+   Changed 05.06.2016 T. Milius Evaluation whether tchscrn is already active.
+   Changed 08.06.2016 T. Milius Way fetching information from TchSrcn module changed
+   Changed 10.07.2016 T. Milius RPi display 7" not 12" :-(
+    */
+/* Copyright (c) 2007-2016 by Thomas Milius Stade, Germany
+* All rights reserved.
+*
+* Redistribution and use in source and binary forms, with or without
+* modification, are permitted provided that the following conditions are met:
+*     * Redistributions of source code must retain the above copyright
+*       notice, this list of conditions and the following disclaimer.
+*     * Redistributions in binary form must reproduce the above copyright
+*       notice, this list of conditions and the following disclaimer in the
+*       documentation and/or other materials provided with the distribution.
+*     * Neither the name of the &lt;organization&gt; nor the
+*       names of its contributors may be used to endorse or promote products
+*       derived from this software without specific prior written permission.
+*
+* THIS SOFTWARE IS PROVIDED BY Thomas Milius Stade, Germany ``AS IS'' AND ANY
+* EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+* WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+* DISCLAIMED. IN NO EVENT SHALL Thomas Milius Stade, Germany BE LIABLE FOR ANY
+* DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+* (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+* LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+* ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+* (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+* SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE. */
+/** @mainpage
+    @author Thomas Milius Stade, Germany
+    @version 1.01
+    @date 08.06.2016
+
+    TchScrn implements a RISC OS touch screen calibration program for the D-Wav eGalax-touchpanels and
+    RaspberryPi 7" display.
+
+    */
+/* RISC OS */
+
+/* !!!!!!!!!! libraries !!!!!!!!!! */
+/* ---------- ANSI-C ---------- */
+#include <stdbool.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <stdarg.h>
+#include <string.h>
+
+/* ------------ Toolbox ------------ */
+#include <event.h>
+#include <toolbox.h>
+#include <wimp.h>
+#include <wimplib.h>
+#include <menu.h>
+#include <gadgets.h>
+#include <proginfo.h>
+#include <dcs.h>
+#include <window.h>
+#include <drawfile.h>
+
+/* ------------ RISC OS ------------ */
+#include <kernel.h>
+#include <swis.h>
+
+/* ------------ own ------------ */
+#include "common.h"
+#include "tb_defs.h"
+#include "draw.h"
+
+/* !!!!!!!!!!! definitions !!!!!!!!!! */
+#define EVENT_NOT_CLAIMED 0
+#define EVENT_CLAIMED     1
+
+/** Program status */
+#define CALIBRATION_STATE_CONFIGURE  0
+#define CALIBRATION_STATE_CLICK  1
+
+/* !!!!!!!!!! data structures !!!!!!!!!! */
+struct {
+/* Program control */
+bool shutdown_flag;
+bool shutdown_acknowleged;
+ObjectId calibration_window;
+ObjectId configuration_window;
+ObjectId dcs_window;
+int status;
+bool touchscreen_active;
+/* USB */
+int screen_usb_device_number;
+int panel_type;
+/* Configuration */
+unsigned int last_button_change_time[TOUCHSCREEN_BUTTON_EMULATION_STATES];
+unsigned int button_change_time[TOUCHSCREEN_BUTTON_EMULATION_STATES];
+unsigned int max_x_cell;
+unsigned int max_y_cell;
+/* Calibration */
+struct draw_file_struct draw_file;
+bool calibration_performed;
+unsigned int actual_x_edge;
+unsigned int actual_y_edge;
+/* There is always one edge more than cells. */
+point screen_point[TOUCHSCREEN_MAX_CELLS_X + 1][TOUCHSCREEN_MAX_CELLS_Y + 1];
+} common;
+
+/* ---------- RISCOS Wimp Toolbox Communication ---------- */
+MessagesFD    messages;
+IdBlock       id_block;
+
+_kernel_oserror app_error;
+
+/* !!!!!!!!!! support functions !!!!!!!!!! */
+/** Displays errors according to the given error and optinal parameters.
+
+    The error messages are located inside the "Messages" file and
+    introtuced by "Error_" folloed by the error number. */
+bool show_message(int message_number,
+                  ...)
+{
+va_list args;
+char message_token[20];
+char format[200];
+_kernel_swi_regs regs;
+
+sprintf(message_token,
+        "Error_%d",
+        message_number);
+regs.r[0]=(int) messages.data;
+regs.r[1]=(int) message_token;
+regs.r[2]=(int) format;
+regs.r[3]=199;
+regs.r[4]=0;
+regs.r[5]=0;
+regs.r[6]=0;
+regs.r[7]=0;
+_kernel_swi(MessageTrans_Lookup, &regs, &regs);
+va_start(args, message_number);
+vsprintf(app_error.errmess, format, args);
+va_end(args);
+app_error.errnum=0;
+wimp_report_error(&app_error,
+                  0,
+                  0,
+                  APPLICATION_NAME,
+                  0,
+                  0);
+return true;
+}
+
+char *fetch_command_output(char *command)
+{
+static char result_line[256];
+char command_line[512];
+char *c;
+FILE *result_file;
+
+if ((!command) ||
+     (strlen(command) < 1)) return NULL;
+sprintf(command_line,
+        "%s { > pipe:$.TchScrnRes }\n",
+        command);
+system(command_line);
+result_line[255]='\0';
+if ((result_file=fopen("pipe:$.TchScrnRes", "r")) == NULL) return NULL;
+if (fgets(result_line, 255, result_file) == NULL) {
+  fclose(result_file);
+  return NULL;
+  }
+else {
+  /* Clean up CR/LF */
+  c=result_line + strlen(result_line) - 1;
+  while((c >= result_line) &&
+        ((*c == '\r') ||
+         (*c == '\n'))) {
+    *c='\0';
+    c--;
+    }
+  fclose(result_file);
+  return result_line;
+  }
+}
+
+extern bool drop_application(void);
+
+/** Displays heavy internal RISC OS errors and drops the application if desired. */
+void application_report_error(_kernel_oserror *error_os,
+                              bool drop_application_flag)
+{
+
+wimp_report_error(error_os,
+                  0,
+                  APPLICATION_NAME,
+                  0,
+                  0,
+                  0);
+if (drop_application_flag) {
+  drop_application();
+  exit(EXIT_FAILURE);
+  }
+}
+
+/** Initialize some internal variables/structures at start of the application. */
+bool initialize_application(void)
+{
+
+initialize_draw_file(&common.draw_file);
+common.shutdown_flag=false;
+common.shutdown_acknowleged=false;
+common.status=CALIBRATION_STATE_CONFIGURE;
+common.calibration_window=0;
+common.configuration_window=0;
+common.dcs_window=0;
+common.calibration_performed=false;
+return true;
+}
+
+/** Performs a clean up like dropping the USB touchscreen connection
+    at the ned of the program. */
+bool drop_application(void)
+{
+
+drop_draw_file(&common.draw_file);
+return true;
+}
+
+/** Controls redraw of the calibration window.
+
+    In fact it renders a calibration symbol implemented as a draw file at the required
+    position. */
+int redraw_calibration(int event_code,
+                       WimpPollBlock *event,
+                       IdBlock *id_block,
+                       void *client_handle)
+{
+int loop_flag;
+_kernel_oserror *error_os;
+WimpGetWindowStateBlock state;
+WimpRedrawWindowBlock block;
+BBox window_extent;
+
+/* Taken from Castles Hyper Example */
+state.window_handle=event->redraw_window_request.window_handle;
+block.window_handle=event->redraw_window_request.window_handle;
+wimp_get_window_state(&state);
+if ((error_os=window_get_extent(0,
+                                common.calibration_window,
+                                &window_extent)) != NULL) application_report_error(error_os, true);
+wimp_redraw_window(&block,
+                   &loop_flag);
+/* Put the cross to the right position.
+   Attention: As the edge indices are stored as unsigned integer some implicit conversions are necassary
+   to avoid trouble on calculation. */
+common.draw_file.transformation[2][0]=(state.visible_area.xmin + (((int) common.actual_x_edge*(window_extent.xmax - window_extent.xmin))/(int) common.max_x_cell) - state.xscroll) * 256;
+common.draw_file.transformation[2][1]=(state.visible_area.ymax + (((int) common.actual_y_edge*(window_extent.ymin - window_extent.ymax))/(int) common.max_y_cell) - state.yscroll) * 256;
+while(loop_flag)  {
+  if (common.draw_file.file.data) {
+    drawfile_render(0,
+                    common.draw_file.file.data,
+                    common.draw_file.file.length,
+                    &common.draw_file.transformation,
+                    &block.redraw_area,
+                    0);
+    }
+  wimp_get_rectangle(&block,
+                     &loop_flag);
+  }
+return EVENT_CLAIMED;
+}
+
+/* !!!!!!!!!! functions !!!!!!!!!! */
+/* ---------- Application Handling --------- */
+int program_quitT(int event_code,
+                  ToolboxEvent *event,
+                  IdBlock *id_block,
+                  void *client_handle)
+{
+
+common.shutdown_flag=true;
+return EVENT_CLAIMED;
+}
+
+/** Claims the control over touch screen and shows the calibration window. */
+int start_calibration(int event_code,
+                      ToolboxEvent *event,
+                      IdBlock *id_block,
+                      void *client_handle)
+{
+char *result;
+int vdu_variables[5];
+int vdu_variables_value[4];
+_kernel_swi_regs regs;
+_kernel_oserror *error_os;
+WindowShowObjectBlock window_pos;
+
+/* Note actual status */
+common.touchscreen_active=false;
+/* Strange effects: If calling system several times it seems that something gets corrupted. */
+//regs.r[0]=(int) "Unset TchScrn$Status";
+//_kernel_swi(OS_CLI, &regs, &regs);
+/* OS_CLI is not always the right choice. More complex operations may fail. */
+//system("SetEvalCommand TchScrn$Status TchScrn_Status");
+//if ((result=getenv("TchScrn$Status")) != NULL) {
+if ((result=fetch_command_output("TchScrn_Status")) != NULL) {
+  if (strcmp(result, "Active") == 0) {
+    common.touchscreen_active=true;
+    }
+  }
+/* Strange effects: If calling system several times it seems that something gets corrupted. */
+//regs.r[0]=(int) "Unset TchScrn$Status";
+//_kernel_swi(OS_CLI, &regs, &regs);
+/* Claim the control over the touch screen */
+if (common.touchscreen_active) {
+  /* Strange effects: If calling system several times it seems that something gets corrupted. */
+  regs.r[0]=(int) "TchScrn_Disable";
+  _kernel_swi(OS_CLI, &regs, &regs);
+  }
+/* Note the number of the actual subareas.
+   And only here! There is no use to change area dimension without
+   determining the new edges. */
+if ((error_os=numberrange_get_value(0,
+                                    common.configuration_window,
+                                    APP_GAGDET_CELLS_X,
+                                    (int *) &common.max_x_cell)) != NULL) application_report_error(error_os, true);
+if ((error_os=numberrange_get_value(0,
+                                    common.configuration_window,
+                                    APP_GAGDET_CELLS_Y,
+                                    (int *) &common.max_y_cell)) != NULL) application_report_error(error_os, true);
+/* Create the calibration window */
+if ((error_os=toolbox_create_object(0,
+                                    "Calib",
+                                    &common.calibration_window)) != NULL) application_report_error(error_os, true);
+/* Install handlers */
+if ((error_os=event_register_wimp_handler(common.calibration_window,
+                                          Wimp_ERedrawWindow,
+                                          redraw_calibration,
+                                          NULL)) != NULL) application_report_error(error_os, true);
+/* Set up the first edge to display the calibration cross */
+common.actual_x_edge=0;
+common.actual_y_edge=0;
+common.status=CALIBRATION_STATE_CLICK;
+/* Size the Window to screen size */
+window_pos.xscroll=0;
+window_pos.yscroll=0;
+window_pos.behind=-1;
+/* Read maximum extensions. */
+vdu_variables[0]=4;
+vdu_variables[1]=11;
+vdu_variables[2]=5;
+vdu_variables[3]=12;
+vdu_variables[4]=-1;
+regs.r[0]=(int) vdu_variables;
+regs.r[1]=(int) vdu_variables_value;
+if ((error_os=_kernel_swi(OS_ReadVduVariables, &regs, &regs)) != NULL) application_report_error(error_os, true);
+window_pos.visible_area.xmin=0;
+window_pos.visible_area.ymax=0;
+window_pos.visible_area.xmax=vdu_variables_value[1]<<vdu_variables_value[0];
+window_pos.visible_area.ymin=-(vdu_variables_value[3]<<vdu_variables_value[2]);
+if ((error_os=window_set_extent(0,
+                                common.calibration_window,
+                                &window_pos.visible_area)) != NULL) application_report_error(error_os, true);
+/* Show the calibration window */
+if ((error_os=toolbox_show_object(0,
+                                  common.calibration_window,
+                                  1,
+                                  &window_pos,
+                                  0,
+                                  0)) != NULL) application_report_error(error_os, true);
+return EVENT_CLAIMED;
+}
+
+/** Handles ignoring of saving of the actual configuration as a result of the DCS box. */
+int dcs_discard(int event_code,
+                ToolboxEvent *event,
+                IdBlock *id_block,
+                void *client_handle)
+{
+
+common.shutdown_flag=true;
+common.shutdown_acknowleged=true;
+return EVENT_CLAIMED;
+}
+
+/** Handles saving of the actual configuration as a result of the DCS box. */
+int dcs_save(int event_code,
+             ToolboxEvent *event,
+             IdBlock *id_block,
+             void *client_handle)
+{
+FILE *output_file;
+int i;
+unsigned int actual_x_edge;
+unsigned int actual_y_edge;
+
+if ((output_file=fopen("<Choices$Write>.TchScrn.Settings", "w")) == NULL) {
+  show_message(5);
+  }
+else {
+  fprintf(output_file, "# Touch Screen configuration file\n");
+  fprintf(output_file, "# Lines containing data are starting with tags followed by values separated by spaces.\n\n");
+  fprintf(output_file, "# Button emulation change time in centi seconds for every emaulated button type\n\n");
+  for (i=0; i < TOUCHSCREEN_BUTTON_EMULATION_STATES; i++) {
+    fprintf(output_file, "ButEmuChange_State %d %d\n", i, common.button_change_time[i]);
+    }
+  fprintf(output_file, "\n");
+  fprintf(output_file, "# List of edges of the touch screen sub areas.\n");
+  fprintf(output_file, "# Format: X_Array_Position Y_Array_Position X_TouchScreen_Position Y_Touch_Screen_Position\n\n");
+  for (actual_y_edge=0; actual_y_edge<=common.max_y_cell; actual_y_edge++) {
+    for (actual_x_edge=0; actual_x_edge<=common.max_x_cell; actual_x_edge++) {
+      fprintf(output_file,
+              "Edge %d %d %ld %ld\n",
+              actual_x_edge,
+              actual_y_edge,
+              common.screen_point[actual_x_edge][actual_y_edge].x,
+              common.screen_point[actual_x_edge][actual_y_edge].y);
+      }
+    }
+  fprintf(output_file, "\n");
+  fclose(output_file);
+  common.shutdown_flag=true;
+  common.shutdown_acknowleged=true;
+  }
+return EVENT_CLAIMED;
+}
+
+/** Handles cancel request as a result of the DCS box and redisplays the configuration window. */
+int dcs_cancel(int event_code,
+              ToolboxEvent *event,
+              IdBlock *id_block,
+              void *client_handle)
+{
+_kernel_oserror *error_os;
+
+/* Redisplay confguration window */
+if ((error_os=toolbox_show_object(0,
+                                  common.configuration_window,
+                                  0,
+                                  NULL,
+                                  0,
+                                  0)) != NULL) application_report_error(error_os, true);
+return EVENT_CLAIMED;
+}
+
+/* ---------- Message Handling --------- */
+int program_quitM(WimpMessage *message,
+                  void *client_handle)
+{
+
+common.shutdown_flag=true;
+return EVENT_CLAIMED;
+}
+
+/* ---------- Menue Handling --------- */
+/** Displays the help file. */
+int show_general_help(int event_code,
+                      ToolboxEvent *event,
+                      IdBlock *id_block,
+                      void *client_handle)
+{
+_kernel_swi_regs regs;
+
+regs.r[0]=(int) "Run <TchScrn$Dir>.!Help";
+_kernel_swi(Wimp_StartTask, &regs, &regs);
+return EVENT_CLAIMED;
+}
+
+void my_poll(void)
+{
+int event_code;
+unsigned long min_time;
+_kernel_swi_regs regs;
+_kernel_oserror *error_os;
+WimpPollBlock poll_block;
+BBox redraw_area;
+
+/* Determine polling time */
+_kernel_swi(OS_ReadMonotonicTime, &regs, &regs);
+if (common.status == CALIBRATION_STATE_CONFIGURE) {
+  /* Nothing special to do. Be lazy. */
+  min_time=(unsigned long) regs.r[0] + 100;
+  }
+else {
+  /* Watch the touch screen activities. */
+  min_time=(unsigned long) regs.r[0] + 1;
+  }
+event_code=0;
+if ((error_os=event_poll_idle(&event_code,
+                              &poll_block,
+                              min_time,
+                              NULL)) != NULL) application_report_error(error_os, true);
+/* Examine whether point has been touched on screen. */
+if (common.status == CALIBRATION_STATE_CLICK) {
+  char command[255];
+  char *result;
+
+  switch(common.panel_type) {
+    case TOUCHSCREEN_TYPE_DWAV_EGALAX: {
+//      sprintf(command,
+//              "SetEvalCommand TchScrn$Point TchScrn_TellPoint -type egalax %d -wait 10",
+//              common.screen_usb_device_number);
+      sprintf(command,
+              "TchScrn_TellPoint -type egalax %d -wait 10",
+              common.screen_usb_device_number);
+      }
+    break;
+    case TOUCHSCREEN_TYPE_DWAV_EGALAX_HID: {
+//      sprintf(command,
+//              "SetEvalCommand TchScrn$Point TchScrn_TellPoint -type egalax_hid %d -wait 10",
+//              common.screen_usb_device_number);
+      sprintf(command,
+              "TchScrn_TellPoint -type egalax_hid %d -wait 10",
+              common.screen_usb_device_number);
+      }
+    break;
+    case TOUCHSCREEN_TYPE_DWAV_EGALAX_HID2: {
+//      sprintf(command,
+//              "SetEvalCommand TchScrn$Point TchScrn_TellPoint -type egalax_hid2 %d -wait 10",
+//              common.screen_usb_device_number);
+      sprintf(command,
+              "TchScrn_TellPoint -type egalax_hid2 %d -wait 10",
+              common.screen_usb_device_number);
+      }
+    break;
+    case TOUCHSCREEN_TYPE_RPI_DISPLAY7: {
+//      strcpy(command,
+//             "SetEvalCommand TchScrn$Point TchScrn_TellPoint -type rpi_display7 -wait 10");
+      strcpy(command,
+             "TchScrn_TellPoint -type rpi_display7 -wait 10");
+      }
+    break;
+    }
+  /* Fetch the point */
+  /* Strange effects: If calling system several times it seems that something gets corrupted. */
+//  regs.r[0]=(int) "Unset TchScrn$Point";
+//  _kernel_swi(OS_CLI, &regs, &regs);
+  /* OS_CLI is not always the right choice. More complex operations may fail. */
+//  system(command);
+//  if ((result=getenv("TchScrn$Point")) == NULL) {
+if ((result=fetch_command_output(command)) == NULL) {
+    /* Remove calibration window */
+    if ((error_os=event_deregister_wimp_handler(common.calibration_window,
+                                                Wimp_ERedrawWindow,
+                                                redraw_calibration,
+                                                NULL)) != NULL) application_report_error(error_os, true);
+    if ((error_os=toolbox_delete_object(0,
+                                        common.calibration_window)) != NULL) application_report_error(error_os, true);
+    common.calibration_window=0;
+    common.status=CALIBRATION_STATE_CONFIGURE;
+    }
+  else {
+    if (sscanf(result,
+               "x: %d y: %d",
+               &common.screen_point[common.actual_x_edge][common.actual_y_edge].x,
+               &common.screen_point[common.actual_x_edge][common.actual_y_edge].y) >= 2) {
+      common.actual_x_edge++;
+      if (common.actual_x_edge > common.max_x_cell) {
+        common.actual_x_edge=0;
+        common.actual_y_edge++;
+        if (common.actual_y_edge > common.max_y_cell) {
+          /* All points fetched. */
+          common.calibration_performed=true;
+          /* Remove calibration window */
+          if ((error_os=event_deregister_wimp_handler(common.calibration_window,
+                                                      Wimp_ERedrawWindow,
+                                                      redraw_calibration,
+                                                      NULL)) != NULL) application_report_error(error_os, true);
+          if ((error_os=toolbox_delete_object(0,
+                                              common.calibration_window)) != NULL) application_report_error(error_os, true);
+          common.calibration_window=0;
+          common.status=CALIBRATION_STATE_CONFIGURE;
+          if (common.touchscreen_active) {
+            /* Pass control back to touch screen driver. */
+            /* OS_CLI is not always the right choice. More complex operations may fail. */
+            system("<TchScrn$Dir>.Start");
+            }
+          }
+        }
+      if (common.calibration_window != 0) {
+        /* Display the calibration cross at its new position */
+        if ((error_os=window_get_extent(0,
+                                        common.calibration_window,
+                                        &redraw_area)) != NULL) application_report_error(error_os, true);
+        if ((error_os=window_force_redraw(0,
+                                          common.calibration_window,
+                                          &redraw_area)) != NULL) application_report_error(error_os, true);
+        }
+      }
+    else {
+      if (strcmp(result, "Error: Screen not touched in time.") != 0) {
+        /* Error. Stop the calibration. */
+        /* Remove calibration window */
+        if ((error_os=event_deregister_wimp_handler(common.calibration_window,
+                                                    Wimp_ERedrawWindow,
+                                                    redraw_calibration,
+                                                    NULL)) != NULL) application_report_error(error_os, true);
+        if ((error_os=toolbox_delete_object(0,
+                                            common.calibration_window)) != NULL) application_report_error(error_os, true);
+        common.calibration_window=0;
+        common.status=CALIBRATION_STATE_CONFIGURE;
+        }
+      }
+    }
+  }
+}
+
+/* ---------- Main Loop --------- */
+/** Sets up the application including all toolbox handlers and
+    implements the central polling loop. */
+int main(int argc,
+         char *argv[])
+{
+bool button_time_changes;
+int i;
+int toolbox_events=0,
+    wimp_messages=0;
+int task, wversion;
+void *sprite_area;
+_kernel_oserror *error_os;
+
+/* General initializations */
+if (!initialize_application()) {
+  exit(EXIT_FAILURE);
+  }
+/* Register to Wimp/Toolbox */
+if ((error_os=toolbox_initialise(0,
+                                 WimpVersion,
+                                 &wimp_messages,
+                                 &toolbox_events,
+                                 "<TchScrn$Dir>",
+                                 &messages,
+                                 &id_block,
+                                 &wversion,
+                                 &task,
+                                 &sprite_area)) != NULL) application_report_error(error_os, true);
+if (argc < 2) {
+  show_message(1);
+  exit(EXIT_FAILURE);
+  }
+if (strcmp(argv[1], "-type") != 0) {
+  common.screen_usb_device_number=atoi(argv[1]);
+  common.panel_type=TOUCHSCREEN_TYPE_DWAV_EGALAX;
+  }
+else {
+  if (argc < 3) {
+    show_message(1);
+    exit(EXIT_FAILURE);
+    }
+  if (strcmp(argv[2], "egalax") == 0) {
+    if (argc < 4) {
+      show_message(1);
+      exit(EXIT_FAILURE);
+      }
+    common.screen_usb_device_number=atoi(argv[3]);
+    common.panel_type=TOUCHSCREEN_TYPE_DWAV_EGALAX;
+    }
+  else if (strcmp(argv[2], "egalax_hid") == 0) {
+    if (argc < 4) {
+      show_message(1);
+      exit(EXIT_FAILURE);
+      }
+    common.screen_usb_device_number=atoi(argv[3]);
+    common.panel_type=TOUCHSCREEN_TYPE_DWAV_EGALAX_HID;
+    }
+  else if (strcmp(argv[2], "egalax_hid2") == 0) {
+    if (argc < 4) {
+      show_message(1);
+      exit(EXIT_FAILURE);
+      }
+    common.screen_usb_device_number=atoi(argv[3]);
+    common.panel_type=TOUCHSCREEN_TYPE_DWAV_EGALAX_HID2;
+    }
+  else if (strcmp(argv[2], "rpi_display7") == 0) {
+    common.panel_type=TOUCHSCREEN_TYPE_RPI_DISPLAY7;
+    }
+  else {
+    show_message(6);
+    exit(EXIT_FAILURE);
+    }
+  }
+if (!load_draw_file(&common.draw_file,
+                    "<TchScrn$Dir>.Cross")) {
+  show_message(3);
+  exit(EXIT_FAILURE);
+  }
+if ((error_os=event_initialise(&id_block)) != NULL) application_report_error(error_os, true);
+/* Null Events because Poll idle would fail else */
+event_set_mask(0);
+/* Create Objects */
+if ((error_os=toolbox_create_object(0,
+                                    "Configure",
+                                    &common.configuration_window)) != NULL) application_report_error(error_os, true);
+if ((error_os=toolbox_create_object(0,
+                                    "DCS",
+                                    &common.dcs_window)) != NULL) application_report_error(error_os, true);
+/* Installation of procedures to handle certain events */
+if ((error_os=event_register_toolbox_handler(-1,
+                                             TB_Quit,
+                                             program_quitT,
+                                             NULL)) != NULL) application_report_error(error_os, true);
+if ((error_os=event_register_toolbox_handler(common.configuration_window,
+                                             ActionButton_Selected,
+                                             start_calibration,
+                                             NULL)) != NULL) application_report_error(error_os, true);
+if ((error_os=event_register_toolbox_handler(common.dcs_window,
+                                             DCS_Discard,
+                                             dcs_discard,
+                                             NULL)) != NULL) application_report_error(error_os, true);
+if ((error_os=event_register_toolbox_handler(common.dcs_window,
+                                             DCS_Save,
+                                             dcs_save,
+                                             NULL)) != NULL) application_report_error(error_os, true);
+if ((error_os=event_register_toolbox_handler(common.dcs_window,
+                                             DCS_Cancel,
+                                             dcs_cancel,
+                                             NULL)) != NULL) application_report_error(error_os, true);
+if ((error_os=event_register_message_handler(Wimp_MQuit,
+                                             program_quitM,
+                                             NULL)) != NULL) application_report_error(error_os, true);
+/* Installation of procedures to handle menue events */
+if ((error_os=event_register_toolbox_handler(-1,
+                                             APP_MENU_SHOW_HELP,
+                                             show_general_help,
+                                             NULL)) != NULL) application_report_error(error_os, true);
+/* Load actual settings */
+if (load_settings(common.last_button_change_time,
+                  &common.max_x_cell,
+                  &common.max_y_cell,
+                  (point *) &common.screen_point)) {
+  /* Transfer values to mask */
+  for (i=0; i < TOUCHSCREEN_BUTTON_EMULATION_STATES; i++) {
+    if ((error_os=numberrange_set_value(0,
+                                        common.configuration_window,
+                                        APP_GAGDET_BUTTON_CHANGE_TIME_NOBUTTON + i,
+                                        common.last_button_change_time[i])) != NULL) application_report_error(error_os, true);
+    }
+  if ((error_os=numberrange_set_value(0,
+                                      common.configuration_window,
+                                      APP_GAGDET_CELLS_X,
+                                      common.max_x_cell)) != NULL) application_report_error(error_os, true);
+  if ((error_os=numberrange_set_value(0,
+                                      common.configuration_window,
+                                      APP_GAGDET_CELLS_Y,
+                                      common.max_y_cell)) != NULL) application_report_error(error_os, true);
+  }
+else {
+  int i;
+
+  /* Default for Button change time.
+     This is an invalid value to force generation of the
+     settings file. */
+  for (i=0; i < TOUCHSCREEN_BUTTON_EMULATION_STATES; i++) {
+    common.last_button_change_time[i]=0;
+    }
+  /* Default for egdes. */
+  common.max_x_cell=1;
+  common.max_y_cell=1;
+  switch(common.panel_type) {
+    case TOUCHSCREEN_TYPE_DWAV_EGALAX: {
+      common.screen_point[0][0].x=65;
+      common.screen_point[0][0].y=71;
+      common.screen_point[1][0].x=3696;
+      common.screen_point[1][0].y=87;
+      common.screen_point[0][1].x=91;
+      common.screen_point[0][1].y=3866;
+      common.screen_point[1][1].x=3855;
+      common.screen_point[1][1].y=3854;
+      }
+    break;
+    case TOUCHSCREEN_TYPE_DWAV_EGALAX_HID: {
+      common.screen_point[0][0].x=4018;
+      common.screen_point[0][0].y=3952;
+      common.screen_point[1][0].x=62;
+      common.screen_point[1][0].y=3956;
+      common.screen_point[0][1].x=4020;
+      common.screen_point[0][1].y=132;
+      common.screen_point[1][1].x=90;
+      common.screen_point[1][1].y=132;
+      }
+    break;
+    case TOUCHSCREEN_TYPE_DWAV_EGALAX_HID2: {
+      common.screen_point[0][0].x=0;
+      common.screen_point[0][0].y=0;
+      common.screen_point[1][0].x=4094;
+      common.screen_point[1][0].y=0;
+      common.screen_point[0][1].x=0;
+      common.screen_point[0][1].y=4090;
+      common.screen_point[1][1].x=4094;
+      common.screen_point[1][1].y=4088;
+      }
+    break;
+    case TOUCHSCREEN_TYPE_RPI_DISPLAY7: {
+      common.screen_point[0][0].x=0;
+      common.screen_point[0][0].y=0;
+      common.screen_point[1][0].x=800;
+      common.screen_point[1][0].y=0;
+      common.screen_point[0][1].x=0;
+      common.screen_point[0][1].y=480;
+      common.screen_point[1][1].x=800;
+      common.screen_point[1][1].y=480;
+      }
+    break;
+    }
+  }
+/* Repeat until termination and all is saved. */
+do {
+  /* central loop */
+  while(!common.shutdown_flag) {
+    my_poll();
+    }
+  button_time_changes=false;
+  for (i=0; i < TOUCHSCREEN_BUTTON_EMULATION_STATES; i++) {
+    /* Transfer data from configuration mask into program. */
+    if ((error_os=numberrange_get_value(0,
+                                        common.configuration_window,
+                                        APP_GAGDET_BUTTON_CHANGE_TIME_NOBUTTON + i,
+                                        (int *) &common.button_change_time[i])) != NULL) application_report_error(error_os, true);
+    if (common.last_button_change_time[i] != common.button_change_time[i]) {
+      button_time_changes=true;
+      }
+    }
+  /* Check for changes at end of program. */
+  if ((button_time_changes ||
+       common.calibration_performed) &&
+      (!common.shutdown_acknowleged)) {
+    /* There are changes */
+    /* Ask how to continue */
+    if ((error_os=toolbox_show_object(0,
+                                      common.dcs_window,
+                                      NULL,
+                                      NULL,
+                                      NULL,
+                                      NULL)) != NULL) application_report_error(error_os, true);
+    /* Keep application running until answer is available. */
+    common.shutdown_flag=false;
+    }
+  else {
+    common.shutdown_acknowleged=true;
+    }
+  }
+while(!common.shutdown_acknowleged);
+/* finish program */
+drop_application();
+exit(EXIT_SUCCESS);
+}

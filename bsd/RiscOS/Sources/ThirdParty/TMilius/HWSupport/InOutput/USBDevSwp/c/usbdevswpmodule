@@ -1,0 +1,645 @@
+/** @file
+
+  Implements a module called USBDevSwp under RISC OS which allows switching
+  functionality of USB devices which are not implementing a proper USB
+  configuration to do so.
+
+  */
+/* Created 21.04.2011 T. Milius
+   Changed 01.06.2011 T. Milius added USB nopad/short */
+/* Copyright (c) 2011 by Thomas Milius Stade, Germany
+* All rights reserved.
+*
+* Redistribution and use in source and binary forms, with or without
+* modification, are permitted provided that the following conditions are met:
+*     * Redistributions of source code must retain the above copyright
+*       notice, this list of conditions and the following disclaimer.
+*     * Redistributions in binary form must reproduce the above copyright
+*       notice, this list of conditions and the following disclaimer in the
+*       documentation and/or other materials provided with the distribution.
+*     * Neither the name of Thomas Milius Stade, Germany nor the
+*       names of its contributors may be used to endorse or promote products
+*       derived from this software without specific prior written permission.
+*
+* THIS SOFTWARE IS PROVIDED BY Thomas Milius Stade, Germany ``AS IS'' AND ANY
+* EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+* WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+* DISCLAIMED. IN NO EVENT SHALL Thomas Milius Stade, Germany BE LIABLE FOR ANY
+* DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+* (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+* LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+* ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+* (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+* SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE. */
+/** @mainpage
+    @author Thomas Milius Stade, Germany
+    @version 0.01
+    @date 08.05.2011
+
+  Implements a module called USBDevSwp under RISC OS which allows switching
+  functionality of USB devices which are not implementing a proper USB
+  configuration to do so.
+
+    */
+/* RISC OS */
+
+/* !!!!!!!!!! libraries !!!!!!!!!! */
+/* ---------- ANSI-C ---------- */
+#include <ctype.h>
+#include <stdbool.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+
+/* ------------ RISC OS ------------ */
+#include "kernel.h"
+#include "swis.h"
+
+/* ------------ Own ------------ */
+#include "usbdevswphead.h"
+#include "error.h"
+#include "configuration.h"
+#ifdef DEBUG
+#include "debug.h"
+#endif
+
+/* !!!!!!!!!!! definitions !!!!!!!!!! */
+
+/* !!!!!!!!!! data structures !!!!!!!!!! */
+struct swap_info_structure {
+struct swap_info_structure *prev_swap_info;
+struct swap_info_structure *next_swap_info;
+int eval_time;
+/* Stack is limited, so located here */
+char temp_string_a[USBDEVSWP_MAX_MESSAGE_LENGTH + 1];
+char temp_string_b[USBDEVSWP_MAX_MESSAGE_LENGTH + 1];
+char file_line[USBDEVSWP_MAX_CONFIGURATION_LINE_LENGTH + 1];
+int usb_dev_no;
+char usb_dev_name[10];
+int act_vendor_id;
+int act_product_id;
+struct configuration_structure configuration;
+};
+
+struct {
+void *ws;
+struct swap_info_structure *first_swap_info;
+} common;
+
+/* !!!!!!!!!! support functions !!!!!!!!!! */
+/* ---------- USB ---------- */
+bool perform_usb_control_request_to_device(char *device_name,
+                                           unsigned char bm_request_type,
+                                           unsigned char brequest,
+                                           unsigned short wvalue,
+                                           unsigned short windex,
+                                           unsigned short wlength,
+                                           void *buffer)
+{
+_kernel_swi_regs regs;
+_kernel_oserror *os_error;
+
+regs.r[0]=(int) 0x80000000; /* DeviceFSCallDevice_USBRequest */
+regs.r[1]=(int) device_name;
+regs.r[3]=(int)((unsigned long) bm_request_type | ((unsigned long) brequest<<8) | ((unsigned long) (wvalue & 0xFFFF)<<16));
+regs.r[4]=(int)((unsigned long) (windex & 0xFFFF) | ((unsigned long) (wlength & 0xFFFF)<<16));
+regs.r[5]=(int) buffer;
+regs.r[6]=0;
+regs.r[7]=NULL;
+regs.r[8]=NULL;
+if ((os_error=_kernel_swi(DeviceFS_CallDevice, &regs, &regs)) != NULL) {
+  return false;
+  }
+else {
+  return true;
+  }
+}
+
+/* ---------- Various ---------- */
+void drop_swap_info(struct swap_info_structure *swap_info)
+{
+
+if (swap_info->next_swap_info) {
+  swap_info->next_swap_info->prev_swap_info=swap_info->prev_swap_info;
+  }
+if (swap_info->prev_swap_info) {
+  swap_info->prev_swap_info->next_swap_info=swap_info->next_swap_info;
+  }
+else {
+  common.first_swap_info=swap_info->next_swap_info;
+  }
+free(swap_info);
+}
+
+void clear_usb_alias(/* Can be used afterwards and save memory if it is extern */
+                     char *temp_string,
+                     int vendor_id,
+                     int product_id)
+{
+_kernel_swi_regs regs;
+
+/* Prepare USB-Alias */
+sprintf(temp_string,
+        "Alias$@USBDevice____%04x_%04x____",
+        vendor_id,
+        product_id);
+/* Drop a possible USB Alias for the device */
+regs.r[0]=(int) temp_string;
+regs.r[1]=NULL;
+regs.r[2]=-1;
+regs.r[3]=NULL;
+regs.r[4]=0;
+/* For the variable may not exist ignore errors. */
+_kernel_swi(OS_SetVarVal, &regs, &regs);
+}
+
+_kernel_oserror *perform_swap(struct swap_info_structure *swap_info)
+{
+char *dev_name_offset;
+int file_handle;
+int usb_stream_handle;
+bool handle_stealing;
+int i, j, k;
+_kernel_swi_regs regs;
+_kernel_oserror *error_os,*error_os2;
+
+/* Prepare and clear USB-Alias */
+clear_usb_alias(swap_info->temp_string_a,
+                swap_info->configuration.new_vendor_id,
+                swap_info->configuration.new_product_id);
+if (strcmp(swap_info->configuration.subseq_command, "") != 0) {
+  /* Set up USB Alias for the device */
+  regs.r[0]=(int) swap_info->temp_string_a;
+  regs.r[1]=(int) swap_info->configuration.subseq_command;
+  regs.r[2]=strlen(swap_info->configuration.subseq_command) + 1;
+  regs.r[3]=NULL;
+  regs.r[4]=2;
+  if ((error_os=_kernel_swi(OS_SetVarVal, &regs, &regs)) != NULL) {
+    drop_swap_info(swap_info);
+    return error_os;
+    }
+  }
+/* Now try the change */
+if (swap_info->configuration.usb_control.usage) {
+#ifdef DEBUG
+  debug_writef(DEBUG_LEVEL_INITIALIZATION,
+               "Control request\n");
+#endif
+  /* Use a control request */
+  if (!perform_usb_control_request_to_device(swap_info->usb_dev_name,
+                                             swap_info->configuration.usb_control.bm_request_type,
+                                             swap_info->configuration.usb_control.brequest,
+                                             swap_info->configuration.usb_control.wvalue,
+                                             swap_info->configuration.usb_control.windex,
+                                             0,
+                                             NULL)) {
+    clear_usb_alias(swap_info->temp_string_a,
+                    swap_info->configuration.new_vendor_id,
+                    swap_info->configuration.new_product_id);
+    drop_swap_info(swap_info);
+    return generate_error(USBDEVSWP_ERROR_USB_CONTROL);
+    }
+  }
+/* Sent/receive messages */
+for (i=0; i < swap_info->configuration.number_of_messages; i++) {
+  for (j=0; j < 2; j++) {
+#ifdef DEBUG
+  debug_writef(DEBUG_LEVEL_INITIALIZATION,
+               "Message %d %d\n",
+               i, j);
+#endif
+    if (swap_info->configuration.message[i].endpoint[j] != USBDEVSWP_NO_ENDPOINT) {
+      /* Try to open device directly */
+      sprintf(swap_info->temp_string_a,
+              "Devices#timeout100;endpoint%d:$.%s",
+              swap_info->configuration.message[i].endpoint[j],
+              swap_info->usb_dev_name);
+      if (j == USBDEVSWP_ENDPOINT_O) {
+        regs.r[0]=0xCF;
+        }
+      else {
+        regs.r[0]=0x4F;
+        }
+      regs.r[1]=(int) swap_info->temp_string_a;
+      regs.r[2]=NULL;
+      if ((error_os=_kernel_swi(OS_Find, &regs, &regs)) != NULL) {
+        /* Which file handle belongs to an according endpoint.
+           Scan all handles. */
+        handle_stealing=true;
+        file_handle=0;
+        k=1;
+        while((file_handle == 0) &&
+              (k < 256)) {
+          regs.r[0]=254;
+          regs.r[1]=k;
+          if ((error_os=_kernel_swi(OS_Args, &regs, &regs)) != NULL) {
+            clear_usb_alias(swap_info->temp_string_a,
+                            swap_info->configuration.new_vendor_id,
+                            swap_info->configuration.new_product_id);
+            drop_swap_info(swap_info);
+            return error_os;
+            }
+          /* Check whether handle in use */
+          if (((regs.r[0] & 0x00000800) == 0) &&
+              /* Filter required direction */
+              (((j == USBDEVSWP_ENDPOINT_O) && ((regs.r[0] & 0x00000080) != 0)) ||
+               ((j == USBDEVSWP_ENDPOINT_I) && ((regs.r[0] & 0x00000040) != 0)))) {
+            regs.r[0]=7;
+            regs.r[1]=k;
+            regs.r[2]=(int) swap_info->temp_string_a;
+            regs.r[5]=USBDEVSWP_MAX_MESSAGE_LENGTH + 1;
+            if ((error_os=_kernel_swi(OS_Args, &regs, &regs)) != NULL) {
+              clear_usb_alias(swap_info->temp_string_a,
+                              swap_info->configuration.new_vendor_id,
+                              swap_info->configuration.new_product_id);
+              drop_swap_info(swap_info);
+              return error_os;
+              }
+            if ((dev_name_offset=strrchr(swap_info->temp_string_a, '.')) != NULL) {
+              dev_name_offset++;
+              /* Must match required USB device */
+              if (strcmp(dev_name_offset, swap_info->usb_dev_name) != 0) dev_name_offset=NULL;
+              /* And must be inside devices */
+              if ((dev_name_offset) && (strncmp(swap_info->temp_string_a, "devices", 7) != 0)) dev_name_offset=NULL;
+              if ((dev_name_offset) && ((swap_info->temp_string_a[7] == ':') || (swap_info->temp_string_a[7] == '#'))) {
+                /* Ok found */
+                file_handle=k;
+                }
+              }
+            }
+          k++;
+          }
+        }
+      else {
+        handle_stealing=false;
+        file_handle=regs.r[0];
+        }
+      if (file_handle == 0) {
+        clear_usb_alias(swap_info->temp_string_a,
+                        swap_info->configuration.new_vendor_id,
+                        swap_info->configuration.new_product_id);
+        drop_swap_info(swap_info);
+        return generate_error(USBDEVSWP_ERROR_USB_NO_STREAM);
+        }
+#ifdef DEBUG
+      debug_writef(DEBUG_LEVEL_INITIALIZATION,
+                   "file handle %d\n",
+                   file_handle);
+#endif
+      if (j == USBDEVSWP_ENDPOINT_O) {
+#ifdef DEBUG
+        debug_writef(DEBUG_LEVEL_INITIALIZATION,
+                     "sending %d\n",
+                     swap_info->message[i].length);
+#endif
+        /* Ensure USB short mode */
+        regs.r[0]=(int) 0x80000007;
+        regs.r[1]=(int) swap_info->usb_dev_name;
+        regs.r[2]=file_handle;
+        if ((error_os=_kernel_swi(DeviceFS_CallDevice, &regs, &regs)) == NULL) {
+          usb_stream_handle=regs.r[5];
+          /* Ensure stream flags. */
+          regs.r[0]=(int) 0x80000008;
+          regs.r[1]=(int) swap_info->usb_dev_name;
+          regs.r[2]=usb_stream_handle;
+          /* Short */
+          regs.r[3]=(int) 0x00000002;
+          regs.r[4]=(int) 0xFFFFFFFD;
+          if((error_os=_kernel_swi(DeviceFS_CallDevice, &regs, &regs)) == NULL) {
+            /* Sent message */
+            regs.r[0]=2;
+            regs.r[1]=file_handle;
+            regs.r[2]=(int) swap_info->configuration.message[i].message;
+            regs.r[3]=swap_info->configuration.message[i].length;
+            error_os=_kernel_swi(OS_GBPB, &regs, &regs);
+            }
+          }
+        }
+      else {
+        error_os=NULL;
+        if (!handle_stealing) {
+          /* Ensure USB nopad mode. But only in case that handle is not stolen. */
+          regs.r[0]=(int) 0x80000007;
+          regs.r[1]=(int) swap_info->usb_dev_name;
+          regs.r[2]=file_handle;
+          if ((error_os=_kernel_swi(DeviceFS_CallDevice, &regs, &regs)) == NULL) {
+            usb_stream_handle=regs.r[5];
+            /* Ensure stream flags. */
+            regs.r[0]=(int) 0x80000008;
+            regs.r[1]=(int) swap_info->usb_dev_name;
+            regs.r[2]=usb_stream_handle;
+            /* Nopad */
+            regs.r[3]=(int) 0x00000001;
+            regs.r[4]=(int) 0xFFFFFFFE;
+            error_os=_kernel_swi(DeviceFS_CallDevice, &regs, &regs);
+            }
+          }
+        if (error_os == NULL) {
+          /* Read reply but no evaluation */
+          regs.r[0]=4;
+          regs.r[1]=file_handle;
+          regs.r[2]=(int) swap_info->temp_string_b;
+          regs.r[3]=USBDEVSWP_MAX_MESSAGE_LENGTH + 1;
+          error_os=_kernel_swi(OS_GBPB, &regs, &regs);
+          }
+        }
+      if (!handle_stealing) {
+        /* If not stolen close USB stream */
+        regs.r[0]=0;
+        regs.r[1]=file_handle;
+        if ((error_os2=_kernel_swi(OS_Find, &regs, &regs)) != NULL) {
+          clear_usb_alias(swap_info->temp_string_a,
+                          swap_info->configuration.new_vendor_id,
+                          swap_info->configuration.new_product_id);
+          drop_swap_info(swap_info);
+          return error_os2;
+          }
+        }
+      if (error_os) {
+        /* Report transmission errors */
+        clear_usb_alias(swap_info->temp_string_a,
+                        swap_info->configuration.new_vendor_id,
+                        swap_info->configuration.new_product_id);
+        drop_swap_info(swap_info);
+        return error_os;
+        }
+      }
+    }
+  }
+drop_swap_info(swap_info);
+return NULL;
+}
+
+_kernel_oserror *setup_timer(void)
+{
+int nearest_time;
+struct swap_info_structure *swap_info, *best_swap_info;
+_kernel_swi_regs regs;
+_kernel_oserror *error_os;
+
+do {
+  nearest_time=0x7FFFFFFF;
+  best_swap_info=NULL;
+  swap_info=common.first_swap_info;
+  while (swap_info != NULL) {
+    if (swap_info->eval_time <= nearest_time) {
+      nearest_time=swap_info->eval_time;
+      best_swap_info=swap_info;
+      }
+    swap_info=swap_info->next_swap_info;
+    }
+  if (best_swap_info) {
+    /* Ok found a candidate */
+    if ((error_os=_kernel_swi(OS_ReadMonotonicTime, &regs, &regs)) != NULL) {
+      return error_os;
+      }
+    if (regs.r[0] >= nearest_time) {
+      /* Time has come */
+      if ((error_os=get_configuration(&best_swap_info->configuration,
+                                      best_swap_info->act_vendor_id,
+                                      best_swap_info->act_product_id)) != NULL) {
+        drop_swap_info(best_swap_info);
+        return error_os;
+        }
+      if ((error_os=perform_swap(best_swap_info)) != NULL) {
+        return error_os;
+        }
+      /* Check for other candidates by simply continue running in the loop! */
+      }
+    else {
+      /* Setup timer */
+      regs.r[0]=nearest_time - regs.r[0];
+      regs.r[1]=(int) timer_handler_entry;
+      regs.r[2]=(int) common.ws;
+      if ((error_os=_kernel_swi(OS_CallAfter, &regs, &regs)) != NULL) {
+        return error_os;
+        }
+      else return NULL;
+      }
+    }
+  else {
+    /* Nothing to do */
+    return NULL;
+    }
+  }
+while(1 == 1);
+}
+
+/* !!!!!!!!!! functions !!!!!!!!!! */
+_kernel_oserror *callback_handler(_kernel_swi_regs *r,
+                                  void *pw)
+{
+
+return setup_timer();
+}
+
+_kernel_oserror *timer_handler(_kernel_swi_regs *r,
+                               void *pw)
+{
+_kernel_swi_regs regs;
+_kernel_oserror *error_os;
+
+regs.r[0]=(int) callback_handler_entry;
+regs.r[1]=(int) pw;
+if ((error_os=_kernel_swi(OS_AddCallBack, &regs, &regs)) != NULL) {
+  return error_os;
+  }
+return NULL;
+}
+
+_kernel_oserror *module_init(const char *cmd_tail,
+                             int podule_base,
+                             void *pw)
+{
+_kernel_oserror *error_os;
+
+common.ws=pw;
+common.first_swap_info=NULL;
+#ifdef DEBUG
+debug_initialize();
+debug_writef(DEBUG_LEVEL_INITIALIZATION,
+             "Module Init. PW %x\n",
+             pw);
+#endif
+if ((error_os=initialize_error()) != NULL) {
+#ifdef DEBUG
+  debug_finalize();
+#endif
+  return error_os;
+  }
+return NULL;
+}
+
+_kernel_oserror *module_final(int fatal,
+                              int podule,
+                              void *pw)
+{
+
+while(common.first_swap_info != NULL) {
+  drop_swap_info(common.first_swap_info);
+  }
+close_error();
+#ifdef DEBUG
+debug_finalize();
+#endif
+return NULL;
+}
+
+_kernel_oserror *usbdevswp_cmd(const char *arg_string,
+                               int argc,
+                               int cmd_no,
+                               void *pw)
+{
+_kernel_swi_regs regs;
+_kernel_oserror *error_os;
+
+/* Swap processor mode to ensure usage of RMA memory */
+if ((error_os=_kernel_swi(OS_EnterOS, &regs, &regs)) != NULL) {
+  return error_os;
+  }
+switch(cmd_no) {
+#ifdef DEBUG
+  case CMD_USBDevSwp_DebugPrint: {
+    debug_print();
+    }
+  break;
+#endif
+  case CMD_USBDevSwp_Swap: {
+    char *c, *temp_pointer;
+    char **params;
+    struct swap_info_structure *swap_info, *other_swap_info;
+    _kernel_swi_regs regs;
+    _kernel_oserror *error_os;
+
+    /* Claim memory for base data structure */
+    if((swap_info=malloc(sizeof(struct swap_info_structure))) == NULL) {
+      return generate_error(USBDEVSWP_ERROR_NO_MEMORY);
+      }
+    swap_info->prev_swap_info=NULL;
+    swap_info->next_swap_info=common.first_swap_info;
+    if (swap_info->next_swap_info) {
+      swap_info->next_swap_info->prev_swap_info=swap_info;
+      }
+    common.first_swap_info=swap_info;
+    temp_pointer=(char *) arg_string;
+    c=swap_info->file_line;
+    while(*temp_pointer >= 32) {
+      *c=*temp_pointer;
+      c++;
+      temp_pointer++;
+      }
+    *c='\0';
+    /* Initialize base data structure */
+    swap_info->configuration.usb_control.usage=false;
+    swap_info->configuration.number_of_messages=0;
+    swap_info->configuration.number_of_targets=0;
+    /* Ensure that we will be not evaluated asynchronously */
+    swap_info->eval_time=0x7FFFFFFF;
+    /* Default 5s. Enough to cope with SCSIFS issues on BB xM */
+    swap_info->configuration.eval_offset=500;
+    regs.r[0]=(int) "/A/G,immediate/S,delay/K/G,target/K/G,/G";
+    regs.r[1]=(int) swap_info->file_line;
+    regs.r[2]=(int) swap_info->temp_string_a;
+    regs.r[3]=USBDEVSWP_MAX_MESSAGE_LENGTH;
+    if ((error_os=_kernel_swi(OS_ReadArgs, &regs, &regs)) != NULL) {
+      drop_swap_info(swap_info);
+      return error_os;
+      }
+    params=(char **) swap_info->temp_string_a;
+    /* USB device number */
+    temp_pointer=params[0];
+    if (temp_pointer == NULL) {
+      drop_swap_info(swap_info);
+      return NULL;
+      }
+    else {
+      strncpy(swap_info->temp_string_b, temp_pointer + 2, temp_pointer[1]*256 + temp_pointer[0]);
+      swap_info->temp_string_b[temp_pointer[1]*256 + temp_pointer[0]]='\0';
+      }
+    swap_info->usb_dev_no=atoi(swap_info->temp_string_b);
+    /* check whether another request an pending for the same device.
+       If yes drop our one. */
+    other_swap_info=common.first_swap_info;
+    while(other_swap_info) {
+      if (other_swap_info != swap_info) {
+        if (other_swap_info->usb_dev_no == swap_info->usb_dev_no) {
+          drop_swap_info(swap_info);
+          return NULL;
+          }
+        }
+      other_swap_info=other_swap_info->next_swap_info;
+      }
+    sprintf(swap_info->usb_dev_name,
+            "USB%d",
+            swap_info->usb_dev_no);
+    /* Retrieve Vendor and Product ID from variable belonging to the device */
+    sprintf(swap_info->temp_string_b,
+            "USB$Device_*_*_*_*_*_-1_-1_*_%s",
+            swap_info->usb_dev_name);
+    regs.r[0]=(int) swap_info->temp_string_b;
+    regs.r[1]=NULL;
+    regs.r[2]=-1;
+    regs.r[3]=NULL;
+    regs.r[4]=0;
+    _kernel_swi(OS_ReadVarVal, &regs, &regs);
+    if (regs.r[2] == 0) {
+      drop_swap_info(swap_info);
+      return generate_error(USBDEVSWP_ERROR_NO_USB_VARIABLE);
+      }
+    /* Position determination
+       12345678901234567890 123456789
+       USB$Device_XX_XX_XX_ XXXX_XXXX */
+    strncpy(swap_info->temp_string_b, (char *) regs.r[3] + 20, 9);
+    swap_info->temp_string_b[9]='\0';
+    sscanf(swap_info->temp_string_b,
+           "%x_%x",
+           &swap_info->act_vendor_id,
+           &swap_info->act_product_id);
+    /* Assume that vendor and product ids are not changing. */
+    swap_info->configuration.new_vendor_id=swap_info->act_vendor_id;
+    swap_info->configuration.new_product_id=swap_info->act_product_id;
+    /* Determine delay */
+    if (params[1] != 0) {
+      /* Execute immediate */
+      swap_info->configuration.eval_offset=0;
+      }
+    else {
+      temp_pointer=params[2];
+      if (temp_pointer != NULL) {
+        strncpy(swap_info->temp_string_b, temp_pointer + 2, temp_pointer[1]*256 + temp_pointer[0]);
+        swap_info->temp_string_b[temp_pointer[1]*256 + temp_pointer[0]]='\0';
+        swap_info->configuration.eval_offset=atoi(swap_info->temp_string_b);
+        }
+      }
+    /* Number of possible target selection */
+    temp_pointer=params[3];
+    if (temp_pointer != NULL) {
+      strncpy(swap_info->temp_string_b, temp_pointer + 2, temp_pointer[1]*256 + temp_pointer[0]);
+      swap_info->temp_string_b[temp_pointer[1]*256 + temp_pointer[0]]='\0';
+      swap_info->configuration.selected_target=atoi(swap_info->temp_string_b);
+      }
+    else {
+      swap_info->configuration.selected_target=NO_TARGET;
+      }
+    /* Subcommand */
+    temp_pointer=params[4];
+    if (temp_pointer == NULL) {
+      swap_info->configuration.subseq_command[0]='\0';
+      }
+    else {
+      strncpy(swap_info->configuration.subseq_command, temp_pointer + 2, temp_pointer[1]*256 + temp_pointer[0]);
+      swap_info->configuration.subseq_command[temp_pointer[1]*256 + temp_pointer[0]]='\0';
+      }
+    if ((error_os=_kernel_swi(OS_ReadMonotonicTime, &regs, &regs)) != NULL) {
+      drop_swap_info(swap_info);
+      return error_os;
+      }
+    swap_info->eval_time=regs.r[0] + swap_info->configuration.eval_offset;
+    if ((error_os=setup_timer()) != NULL) {
+      return error_os;
+      }
+    }
+  break;
+  }
+return NULL;
+}

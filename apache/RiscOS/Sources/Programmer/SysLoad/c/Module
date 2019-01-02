@@ -1,0 +1,564 @@
+/* Copyright 2006 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/* >SysLoad:c.Module
+ * Copyright © tematic, 2006
+ * All rights reserved.
+ */
+
+#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include <string.h>
+#include <time.h>
+
+#include "kernel.h"
+#include "swis.h"
+#include "Global/services.h"
+#include "sys/time.h"
+
+#include "ModHdr.h"
+#include "Module.h"
+
+static _kernel_oserror *SWI_ReadInfo(_kernel_swi_regs *r);
+static _kernel_oserror *SWI_AddTask(_kernel_swi_regs *r);
+static _kernel_oserror *SWI_RemoveTask(_kernel_swi_regs *r);
+static _kernel_oserror *SWI_MiscOp(void *pw, _kernel_swi_regs *r);
+static _kernel_oserror *Change_Period(void *pw, uint32_t period);
+static _kernel_oserror *Flush_Tasks(void);
+static bool             Lookup_Task(uint32_t handle);
+static _kernel_oserror *Apply_Filters(void *pw);
+static _kernel_oserror *Remove_Filters(void *pw);
+static _kernel_oserror *Add_CallX(void *pw);
+static _kernel_oserror *Remove_CallX(void *pw);
+
+static _kernel_oserror ERR_MANY_TASKS = { Module_Error + 0, "Too many tasks" };
+static _kernel_oserror ERR_MISCOP     = { Module_Error + 1, "Unknown SysLoad_MiscOp reason code" };
+
+static bool got_filters     = false;
+static bool got_callevery   = false;
+
+static uint32_t pre_time    = 0;
+static uint32_t post_time   = 0;
+static uint64_t app_time    = 0;
+static uint64_t sys_time    = 0;
+static uint64_t tsk_time    = 0;
+static uint32_t app_percent = 0;
+static uint32_t sys_percent = 0;
+static uint32_t tsk_percent = 0;
+
+static uint32_t call_every_cs = CALL_EVERY_CS;
+
+static uint64_t tasks[MAX_TASKS];
+
+
+/**********************************************************************
+ *
+ * Module initialisation code.
+ *
+ */
+_kernel_oserror *Module_Init(const char *cmd_tail, int podule_base, void *pw)
+{
+  ERR(Flush_Tasks());
+  ERR(Apply_Filters(pw));
+  ERR(Add_CallX(pw));
+  (void) system("Unset SysLoad*");
+
+  IGNORE(cmd_tail);
+  IGNORE(podule_base);
+  return(NULL);
+}
+
+
+/**********************************************************************
+ *
+ * Module finalisation code.
+ */
+_kernel_oserror *Module_Final(int fatal, int podule, void *pw)
+{
+  _kernel_oserror *err;
+
+  err = Remove_Filters(pw);
+  err = err ? err : Remove_CallX(pw);
+
+  IGNORE(fatal);
+  IGNORE(podule);
+  return(err);
+}
+
+
+/**********************************************************************
+ *
+ * Module service call handler.
+ */
+//void Module_Service(int service_number, _kernel_swi_regs *r, void *pw)
+//{
+//  IGNORE(pw);
+//  switch (service_number)
+//  {
+//    case Service_VCache:
+//    {
+//      dprintf((dbg, "Service_VCacheRegister R0=&%X R1=&%X R2=&%X R3=&%X", r->r[0], r->r[1], r->r[2], r->r[3]));
+//      if (r->r[0] == 1)
+//      {
+//        (void) vcache_register((VCache_DCI *) r->r[2]);
+//      }
+//      break;
+//    }
+//  }
+//}
+
+
+/**********************************************************************
+ *
+ * Module SWI handler.
+ */
+_kernel_oserror *Module_SWI(int swi_offset, _kernel_swi_regs *r, void *pw)
+{
+  _kernel_oserror *err;
+
+  switch (swi_offset + SysLoad_00)
+  {
+    case (SysLoad_ReadInfo):   err = SWI_ReadInfo(r); break;
+    case (SysLoad_AddTask):    err = SWI_AddTask(r); break;
+    case (SysLoad_RemoveTask): err = SWI_RemoveTask(r); break;
+    case (SysLoad_MiscOp):     err = SWI_MiscOp(pw, r); break;
+    default: err = error_BAD_SWI;
+  }
+  return(err);
+}
+
+
+/**********************************************************************
+ *
+ * In...
+ *   R0 = flags (unused)
+ * Out...
+ *   R1 = percentage of time spent in Wimp
+ *   R2 = percentage of time spent in applications
+ *   R3 = percentage of time spent in watched task(s)
+ */
+static _kernel_oserror *SWI_ReadInfo(_kernel_swi_regs *r)
+{
+  r->r[1] = sys_percent;
+  r->r[2] = app_percent;
+  r->r[3] = tsk_percent;
+  return(NULL);
+}
+
+
+/**********************************************************************
+ *
+ * Add a task to the list of those to watch. Takes no action if the task
+ * is already in the list. Will return an error if the list is full (there
+ * is a fixed limit on the number of tasks to watch).
+ *
+ * In...
+ *   R0 = flags (unused)
+ *   R1 = task handle of task to add to list
+ * Out...
+ *   None
+ */
+static _kernel_oserror *SWI_AddTask(_kernel_swi_regs *r)
+{
+  uint32_t handle = (r->r[1]) & 0xFFFF;
+  uint32_t idx    = 0;
+
+  /* Check it's not already in the list */
+  if (Lookup_Task(handle)) return(NULL);
+
+  /* Add it at the first empty slot */
+  while (idx < MAX_TASKS)
+  {
+    if (tasks[idx] == 0)
+    {
+      tasks[idx] = handle;
+      return(NULL);
+    }
+    idx++;
+  }
+  /* Barf if the list is full */
+  return(&ERR_MANY_TASKS);
+}
+
+
+/**********************************************************************
+ *
+ * Remove a task handle from the list of tasks to watch. If not found,
+ * simply returns without taking any action.
+ *
+ * In...
+ *   R0 = flags (unused)
+ *   R1 = task handle of task to remove from list
+ * Out...
+ *   None
+ */
+static _kernel_oserror *SWI_RemoveTask(_kernel_swi_regs *r)
+{
+  uint32_t idx = 0;
+
+  while (idx < MAX_TASKS)
+  {
+    if (tasks[idx] == r->r[1])
+    {
+      tasks[idx] = 0;
+      return(NULL);
+    }
+    idx++;
+  }
+  return(NULL);
+}
+
+
+/**********************************************************************
+ *
+ * Perform a miscellaneous operation.
+ *
+ * In...
+ *   R0 = reason code
+ *   Others depend upon reason code in R0
+ * Out...
+ *   Depends upon reason code in R0
+ */
+static _kernel_oserror *SWI_MiscOp(void *pw, _kernel_swi_regs *r)
+{
+  switch (r->r[0])
+  {
+    case MISCOP_TIMER:
+    {
+      /* Set the interval period for checking the statistics
+       *
+       * In...
+       *   R0 = 0 (Set interval)
+       *   R1 = interval in centiseconds
+       * Out...
+       *   None
+       */
+      ERR(Change_Period(pw, (r->r[1]) - 1));
+      break;
+    }
+    case MISCOP_FLUSH:
+    {
+      /* Remove all tasks from the list of those to watch
+       *
+       * In...
+       *   R0 = 1 (Flush)
+       * Out...
+       *   None
+       */
+      ERR(Flush_Tasks());
+      break;
+    }
+    default:
+    {
+      return(&ERR_MISCOP);
+    }
+  }
+  return(NULL);
+}
+
+
+/**********************************************************************
+ *
+ *
+ */
+static _kernel_oserror *Change_Period(void *pw, uint32_t period)
+{
+  /* Keep the period in range */
+  if (period < MIN_CALL_EVERY)
+    period = MIN_CALL_EVERY;
+  else if (period > MAX_CALL_EVERY)
+    period = MAX_CALL_EVERY;
+
+  /* If there is no change in the period, exit here */
+  if (period == call_every_cs) return(NULL);
+
+  /* Remove the ticker event (and CallBack */
+  ERR(Remove_CallX(pw));
+
+  /* Reset our globals */
+  call_every_cs = period;
+  pre_time      = 0;
+  post_time     = 0;
+  app_time      = 0;
+  sys_time      = 0;
+  tsk_time      = 0;
+  app_percent   = 0;
+  sys_percent   = 0;
+  tsk_percent   = 0;
+
+  /* Add the new ticker event */
+  ERR(Add_CallX(pw));
+
+  return(NULL);
+}
+
+
+/**********************************************************************
+ *
+ * Remove all task handles from the list of tasks to watch.
+ */
+static _kernel_oserror *Flush_Tasks(void)
+{
+  (void) memset(&tasks, 0, sizeof(tasks));
+
+  return(NULL);
+}
+
+
+/**********************************************************************
+ *
+ * Look for the specified task handle in the list of tasks to watch
+ */
+static bool Lookup_Task(uint32_t handle)
+{
+ uint32_t idx = 0;
+
+  if (handle)
+  {
+    while (idx < MAX_TASKS)
+    {
+      if (tasks[idx++] == handle) return(true);
+    }
+  }
+  return(false);
+}
+
+
+///**********************************************************************
+// *
+// * Module *command handler.
+// */
+//_kernel_oserror *Module_Cmd(const char *arg_string, int argc, int cmd_no, void *pw)
+//{
+//  IGNORE(pw);
+//  IGNORE(argc);
+//  IGNORE(arg_string);
+//
+//  /* IMPORTANT NOTE:
+//   *
+//   * The arg_string may not be zero-terminated!!!
+//   */
+//
+//  switch (cmd_no)
+//  {
+//    case CMD_SysLoad_Hello:
+//    {
+//      printf("Hello %u\n", asm_routine(3,4));
+//      break;
+//    }
+//    case CMD_SysLoad_World:
+//    {
+//      printf("World\n");
+//      break;
+//    }
+//    default:
+//    {
+//      // Oops!
+//    }
+//  }
+//  return(NULL);
+//}
+
+
+/**********************************************************************
+ *
+ * Apply a pre- and post-filter to all tasks so that we can watch all of
+ * the window open (2) and window close (3) Wimp events. These tell us more
+ * than just when windows open and close; they also tell us when the window
+ * stack order changes, when a window is moved and when a window is re-sized.
+ */
+static _kernel_oserror *Apply_Filters(void *pw)
+{
+  if (!got_filters)
+  {
+    ERR(_swix(Filter_RegisterPreFilter,  _INR(0,3), "SysLoad", &prefilter_entry, pw, FILTER_ALL));
+    ERR(_swix(Filter_RegisterPostFilter, _INR(0,4), "SysLoad", &postfilter_entry, pw, FILTER_ALL, POST_MASK));
+    got_filters = true;
+  }
+  return(NULL);
+}
+
+
+/**********************************************************************
+ *
+ * Remove our Wimp filters.
+ */
+static _kernel_oserror *Remove_Filters(void *pw)
+{
+  if (got_filters)
+  {
+    got_filters = false;
+    ERR(_swix(Filter_DeRegisterPostFilter, _INR(0,4), "SysLoad", &postfilter_entry, pw, FILTER_ALL, POST_MASK));
+    ERR(_swix(Filter_DeRegisterPreFilter,  _INR(0,3), "SysLoad", &prefilter_entry, pw, FILTER_ALL));
+  }
+  return(NULL);
+}
+
+
+/**********************************************************************
+ *
+ * Add a callevery, which we use to repeatedly check our statistics.
+ * CallEvery_Handler() below...
+ */
+static _kernel_oserror *Add_CallX(void *pw)
+{
+  if (!got_callevery)
+  {
+    ERR(_swix(OS_CallEvery, _INR(0,2), call_every_cs, &callevery_entry, pw));
+    got_callevery = true;
+  }
+  return(NULL);
+}
+
+
+/**********************************************************************
+ *
+ * Remove our callevery (and possibly our callback, too).
+ */
+static _kernel_oserror *Remove_CallX(void *pw)
+{
+  if (got_callevery)
+  {
+    got_callevery = false;
+    ERR(_swix(OS_RemoveCallBack, _INR(0,1), &callback_entry, pw));
+    ERR(_swix(OS_RemoveTickerEvent, _INR(0,1), &callevery_entry, pw));
+  }
+  return(NULL);
+}
+
+
+/**********************************************************************
+ *
+ *
+ *
+ */
+static uint32_t Get_Hires_Time(void)
+{
+  static struct timeval  unix_time     = { 0 };
+  static struct timeval *unix_time_ptr = &unix_time;
+  uint64_t               now;
+
+  gettimeofday(unix_time_ptr, NULL);
+  now = ((uint64_t)unix_time.tv_sec * 1000000ll) + (uint64_t)unix_time.tv_usec;
+
+  return (uint32_t) (now / 10);
+}
+
+
+/**********************************************************************
+ *
+ *
+ *
+ */
+_kernel_oserror *CallEvery_Handler(_kernel_swi_regs *r, void *pw)
+{
+  (void) _swix(OS_AddCallBack, _INR(0,1), &callback_entry, pw);
+
+  IGNORE(r);
+  return(NULL);
+}
+
+
+/**********************************************************************
+ *
+ *
+ *
+ */
+_kernel_oserror *CallBack_Handler(_kernel_swi_regs *r, void *pw)
+{
+  uint64_t total = sys_time + app_time + tsk_time;
+
+  /* Compute the percentage of time spent in various places */
+  app_percent = (uint32_t)((app_time * 100) / total);
+  tsk_percent = (uint32_t)((tsk_time * 100) / total);
+  sys_percent = 100 - (app_percent + tsk_percent);
+
+  /* Reset our counters */
+  sys_time = 0;
+  app_time = 0;
+  tsk_time = 0;
+
+  /* Set some system variables to reflect the current state */
+  (void) _swix(OS_SetVarVal, _INR(0,4), "SysLoad$Apps", &app_percent, sizeof(app_percent), 0, 1);
+  (void) _swix(OS_SetVarVal, _INR(0,4), "SysLoad$Sys",  &sys_percent, sizeof(sys_percent), 0, 1);
+  (void) _swix(OS_SetVarVal, _INR(0,4), "SysLoad$Task", &tsk_percent, sizeof(tsk_percent), 0, 1);
+
+  IGNORE(r);
+  IGNORE(pw);
+  return(NULL);
+}
+
+
+/**********************************************************************
+ *
+ * A task has called Wimp_Poll(Idle) - we're going into the system
+ *
+ */
+_kernel_oserror *PreFilter_Handler(_kernel_swi_regs *r, void *pw)
+{
+  uint64_t inc;
+
+  /* Read the time as we're coming out of the application */
+  pre_time = Get_Hires_Time();
+
+  /* Calculate how long it's been since we entered the app (counter may have wrapped) */
+  if (pre_time >= post_time)
+  {
+    inc = (uint64_t)pre_time - (uint64_t)post_time;
+  }
+  else
+  {
+    inc = UINT32_RANGE - ((uint64_t)post_time - (uint64_t)pre_time);
+  }
+
+  /* If we're watching the task, add to watched tasks total, else add to other apps total */
+  if (Lookup_Task(r->r[2]))
+  {
+    tsk_time += inc;
+  }
+  else
+  {
+    app_time += inc;
+  }
+
+  IGNORE(pw);
+  return(NULL);
+}
+
+
+/**********************************************************************
+ *
+ * A Wimp_Poll(Idle) call has returned - we're coming out of the system
+ *
+ */
+_kernel_oserror *PostFilter_Handler(_kernel_swi_regs *r, void *pw)
+{
+  post_time = Get_Hires_Time();
+
+  /* Calculate the amount of time since we went into Wimp_Poll (counter may have wrapped) */
+  if (post_time >= pre_time)
+  {
+    sys_time += (uint64_t)post_time - (uint64_t)pre_time;
+  }
+  else
+  {
+    sys_time += UINT32_RANGE - ((uint64_t)pre_time - (uint64_t)post_time);
+  }
+
+  IGNORE(r);
+  IGNORE(pw);
+  return(NULL);
+}

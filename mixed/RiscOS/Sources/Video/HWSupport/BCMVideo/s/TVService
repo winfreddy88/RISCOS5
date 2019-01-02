@@ -1,0 +1,284 @@
+; Copyright 2016 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+
+; Message IDs
+                                ^ 0
+ETVServiceGetState              # 1
+ETVServiceHDMIOnPreferred       # 1
+ETVServiceHDMIOnBest            # 1
+ETVServiceHDMIOnExplicit        # 1
+ETVServiceSDTVOn                # 1
+ETVServiceOff                   # 1
+ETVServiceQuerySupportedModes   # 1
+ETVServiceQueryModeSupport      # 1
+ETVServiceQueryAudioSupport     # 1
+ETVServiceEnableCopyProtect     # 1
+ETVServiceDisableCopyProtect    # 1
+ETVServiceShowInfo              # 1
+ETVServiceGetAVLatency          # 1
+ETVServiceSetHDCPKey            # 1
+ETVServiceSetHDCPSRM            # 1
+ETVServiceSetSPD                # 1
+ETVServiceSetDisplayOptions     # 1
+ETVServiceTestModeStart         # 1
+ETVServiceTestModeStop          # 1
+ETVServiceDDCRead               # 1
+ETVServiceSetAttached           # 1
+ETVServiceSetProp               # 1
+ETVServiceGetProp               # 1
+
+TVService_Init    ROUT
+        Entry   "r0-r1,r7", VCHIQ_Service_Size
+        LDR     r0, TVService
+        CMP     r0, #0
+        EXIT    NE
+        BL      VCHIQInit
+        FRAMSTR r0,VS
+        EXIT    VS
+        ; Create service
+        MOV     r0, #1
+        STR     r0, [sp, #VCHIQ_Service_Version]
+        STR     r0, [sp, #VCHIQ_Service_Version_Min]
+        LDR     r0, =&54565356 ; 'TVSV'
+        STR     r0, [sp, #VCHIQ_Service_Id]
+        MOV     r0, #0
+        STR     r0, [sp, #VCHIQ_Service_Reserved]
+        STR     r0, [sp, #VCHIQ_Service_RxFifoSize]
+        STR     r0, [sp, #VCHIQ_Service_TxFifoSize]
+        ADR     r1, TVService_ClientCallback
+        STR     r1, [sp, #VCHIQ_Service_Callback]
+        STR     r0, [sp, #VCHIQ_Service_CallbackParam]
+        STR     r0, [sp, #VCHIQ_Service_WantUnalignedBulkRx]
+        STR     r0, [sp, #VCHIQ_Service_WantUnalignedBulkTx]
+        STR     r0, [sp, #VCHIQ_Service_WantCRC]
+        LDR     r0, VCHIQInstance
+        MOV     r1, sp
+        SWI     XVCHIQ_ServiceOpen
+        MOVVS   r7, r0
+        BVS     %FT89
+        STR     r0, TVService
+        ; Release service (message functions will 'use' it again)
+        SWI     XVCHIQ_ServiceRelease
+        ; Create notification service
+        LDR     r0, =&54564E54 ; 'TVNT'
+        STR     r0, [sp, #VCHIQ_Service_Id]
+        ADR     r1, TVService_NotifyCallback
+        STR     r1, [sp, #VCHIQ_Service_Callback]
+        LDR     r0, VCHIQInstance
+        MOV     r1, sp
+        SWI     XVCHIQ_ServiceOpen
+        MOVVS   r7, r0
+        BVS     %FT88
+        STR     r0, TVNotifyService
+        ; Create RTSupport routine to handle the notifications
+        MOV     r0, #0
+        ADR     r1, TVNotify_RTRoutine
+        MOV     r2, #0
+        STR     pc, TVNotifyRTKill
+        MOV     r3, r12
+        ADR     r4, TVNotifyPollword
+        ADRL    r6, TVNotifyRTStack+?TVNotifyRTStack
+        ADRL    r7, TVNotifyPriority
+        SWI     XRT_Register
+        STRVS   r2, TVNotifyRTKill
+        BVS     %FT87
+        STR     r0, TVNotifyRTHandle
+        CLRV
+        EXIT
+87
+        LDR     r0, TVNotifyService
+        SWI     XVCHIQ_ServiceUse
+        LDR     r0, TVNotifyService
+        SWI     XVCHIQ_ServiceClose
+88
+        LDR     r0, TVService
+        SWI     XVCHIQ_ServiceUse
+        LDR     r0, TVService
+        SWI     XVCHIQ_ServiceClose
+89
+        MOV     r0, #0
+        STR     r0, TVService        
+        FRAMSTR r7,,r0
+        SETV
+        EXIT
+
+TVService_ClientCallback
+        ; Did we receive a message?
+        CMP     r1, #VCHI_CALLBACK_MSG_AVAILABLE
+        STREQ   r1, TVServiceResponded
+        MOV     pc, lr
+
+TVService_NotifyCallback
+        ; Did we receive a message?
+        CMP     r1, #VCHI_CALLBACK_MSG_AVAILABLE
+        STREQ   r1, TVNotifyPollword
+        MOV     pc, lr
+
+TVService_Finalise ROUT
+        Entry   "r0"
+        LDR     r0, TVService
+        CMP     r0, #0
+        EXIT    EQ
+        ; Kill off the notify RT routine
+        LDR     r0, TVNotifyRTHandle
+        CMP     r0, #0
+        BEQ     %FT20
+        MOV     r0, #0
+        STR     r0, TVNotifyRTKill ; Set kill signal to 0 to trigger exit
+        STR     pc, TVNotifyPollword ; And wake the thread
+        ADR     r1, TVNotifyRTKill ; Now sleep until it's dead (signal non-zero again)
+10
+        SWI     XRT_Yield
+        LDR     r0, [r1]
+        CMP     r0, #0
+        BEQ     %BT10
+        MOV     r0, #0
+        STR     r0, TVNotifyRTHandle
+20
+        ; Release services
+        LDR     r0, TVService
+        SWI     XVCHIQ_ServiceUse
+        LDR     r0, TVService
+        SWI     XVCHIQ_ServiceClose
+        LDR     r0, TVNotifyService
+        SWI     XVCHIQ_ServiceUse
+        LDR     r0, TVNotifyService
+        SWI     XVCHIQ_ServiceClose
+        MOV     r0, #0
+        STR     r0, TVService
+        STR     r0, TVNotifyService
+        EXIT
+
+; out:
+; r0 = HDMI/TV state flags
+;      bit 2: HDMI output is active, in DVI mode
+;      bit 3: HDMI output is active, in HDMI mode
+; r1 = width
+; r2 = height
+; r3[0:15] = frame rate
+; r3[16:31] = scan mode
+TVService_GetState ROUT
+        MOV     r0, #ETVServiceGetState
+        Entry   "r0-r5"
+        MOV     r0, sp
+        MOV     r1, #4
+        MOV     r2, sp
+        MOV     r3, #16
+        LDR     r4, TVService
+        ADR     r5, TVServiceResponded
+        BL      VCHIQSend
+        FRAMSTR r0,VS
+        EXIT
+
+; in:
+; r0 = 1=DVI, 2=HDMI
+; r1 = 1=CEA, 2=DMT
+; r2 = mode number
+; out:
+; r0 = 0 if successful
+TVService_SetMode ROUT
+        Entry   "r0-r5"
+        MOV     r0, #ETVServiceHDMIOnExplicit
+        Push    "r0"
+        ; First, wait to make sure all pending notifications have been received
+        ; (with a reasonable degree of accuracy - asynchronous nature means we
+        ; can never be fully sure)
+05
+        LDR     r0, TVNotifyPollword
+        CMP     r0, #0
+        BEQ     %FT10
+        ADRL    r1, pollword_1
+        SWI     XRT_Yield
+        B       %BT05
+10
+        ; Now clear the "mode change complete" pollword
+        STR     r0, TVNotifyModeChangeComplete
+        ; Issue the mode change request
+        MOV     r0, sp
+        MOV     r1, #16
+        ADD     r2, sp, #4
+        MOV     r3, #4
+        LDR     r4, TVService
+        ADR     r5, TVServiceResponded
+        BL      VCHIQSend
+        ADD     sp, sp, #4
+        FRAMSTR r0,VS
+        EXIT    VS
+        ; Wait for the mode change to complete
+20
+        ADR     r1, TVNotifyModeChangeComplete
+        SWI     XRT_Yield
+        LDR     r0, [r1]
+        CMP     r0, #0
+        BEQ     %BT20
+        EXIT
+
+TVNotify_RTRoutine ROUT
+        Entry
+        ; Drop into SVC mode for simplicity (this routine isn't active enough for it to be worth using a proper SYS mode stack)
+        MRS     r5, CPSR
+        MSR     CPSR_c, #SVC32_mode
+        MOV     r6, lr
+        BL      %FT01
+        MOV     lr, r6
+        MSR     CPSR_c, r5
+        EXIT
+01        
+        Entry   , 16
+        ; Start by clearing our pollword
+        MOV     r0, #0
+        STR     r0, TVNotifyPollword
+        ; Now read as many notifications from the queue as possible
+10
+        LDR     r0, TVNotifyService
+        MOV     r1, sp
+        MOV     r2, #12
+        MOV     r3, #0
+        SWI     XVCHIQ_MsgDequeue
+        BVS     %FT90
+        CMP     r2, #12
+        BLT     %FT90
+      [ Debug
+        LDR     r0, [sp]
+        bl      DebugHexTX4
+        LDR     r0, [sp, #4]
+        bl      DebugHexTX4
+        LDR     r0, [sp, #8]
+        bl      DebugHexTX4
+        bl DebugTXStrInline
+        DCB " notify",10,13,0
+        ALIGN
+      ]
+        ; If this is a DVI/HDMI mode change notification, set the mode change complete pollword
+        LDR     r0, [sp]
+        CMP     r0, #4
+        CMPNE   r0, #8
+        STREQ   r0, TVNotifyModeChangeComplete
+        B       %BT10
+90
+        ; Die if the kill signal is 0
+        MOV     r0, #0
+        LDR     r1, TVNotifyRTKill
+        CMP     r1, #0
+        EXIT    NE
+        ; IRQs off to make this atomic
+        CPSID   i
+        LDR     r1, TVNotifyRTHandle
+        STR     pc, TVNotifyRTKill ; Set kill signal non-zero to indicate we're (about to be) dead
+        SWI     XRT_Deregister
+        ; If we're still alive, something is very wrong. Just crash horribly.
+        UND     #0
+
+        END

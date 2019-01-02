@@ -1,0 +1,513 @@
+;
+; Copyright (c) 2012, RISC OS Open Ltd
+; Copyright (c) 2012, John Ballance
+; All rights reserved.
+;
+; Redistribution and use in source and binary forms, with or without
+; modification, are permitted provided that the following conditions are met: 
+;     * Redistributions of source code must retain the above copyright
+;       notice, this list of conditions and the following disclaimer.
+;     * Redistributions in binary form must reproduce the above copyright
+;       notice, this list of conditions and the following disclaimer in the
+;       documentation and/or other materials provided with the distribution.
+;     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+;       may be used to endorse or promote products derived from this software
+;       without specific prior written permission.
+; 
+; THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+; AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+; IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+; ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+; LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+; CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+; SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+; INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+; CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+; ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+; POSSIBILITY OF SUCH DAMAGE.
+;
+;
+
+        AREA    |ARM$$code|, CODE, READONLY, PIC
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:Proc
+        GET     Hdr:System
+        GET     Hdr:FSNumbers
+        GET     Hdr:NewErrors
+        GET     Hdr:BCMSupport
+        $GetMEMM
+        GET     hdr.BCM2835
+        GET     hdr.StaticWS
+        GET     hdr.CastleMacros
+
+        IMPORT  workspace
+
+     [ HALDebug
+        IMPORT  HAL_DebugTX
+        IMPORT  HAL_DebugHexTX4
+        IMPORT  HAL_DebugTXStrInline
+     ]
+        IMPORT  memcpy
+        EXPORT  HAL_SendHostMessage
+        EXPORT  HAL_QueryPlatform
+        EXPORT  GetVCBuffer
+        EXPORT  BCMMBox_InitDevices
+
+; Send a message packet to the host and await the reply
+; on entry, r0 =  message channel to use and/or wholemessage
+;           r1 -> message tag buffer, 16 byte aligned. or 0
+;           
+; on exit,  r0 = mailbox response word
+;          
+HAL_SendHostMessage  ROUT
+        STMFD   r13!, {r1-r3, lr}
+        DoMemBarrier r3
+        FlushDataCache ; corrupts r2,r3,lr
+        LDR     r3, PeriBase
+        ADD     r3, r3, #MB_Base
+; check we can send a message
+001     LDR     r2,[r3, #MB_Sta]
+        TST     r2, #MB_Sta_Full
+        BNE     %BT001                ; write channel full
+; send message
+        TEQ     r1, #0
+        BICNE   r1, r1, #&c0000000
+;        LDRNE   r2, FB_CacheMode
+;        ORRNE   r1, r1, r2
+        ORR     r2, r0, r1
+        AND     r1, r0, #&f            ; isolate channel number
+        STR     r2,[r3, #MB_ChWr]
+; await response and check it is ours
+002     LDR     r0,[r3, #MB_Sta]
+        TST     r0, #MB_Sta_Empty
+        BNE     %BT002                ; still empty
+        LDR     r0,[r3,#MB_ChRd]
+        AND     r2, r0, #&f
+        CMP     r2, r1                ; check its is our channel
+        BNE     %BT002                ; not our reply
+        DoMemBarrier r3
+        LDMFD   r13!, {r1-r3, pc}     ; returning composite response in r0
+
+; Interrogate the platform and set up basic machine
+; Sets up L2 cache addressing mode
+;         ARM_Memory_MB (in Megabytes)
+;         Frame buffer base address for 32bit fb
+;         Board_MAC address
+;         Board_Serial
+;         Board model & revision
+;         Available DMA channels
+;
+HAL_QueryPlatform    ROUT
+        STMFD   R13!, {r0-r6, lr}
+ [ HALDebug
+        BL      HAL_DebugTXStrInline
+        DCB     "QueryPlatform",10,0
+        ALIGN
+ ]
+        CPUDetect r4
+        MOVCC   r4, #GPU_L2CnonAl              ; Pi 1 has L2 cache enabled
+        MOVCS   r4, #GPU_UnCached              ; Pi 2 has L2 cache disabled
+        STR     r4, FB_CacheMode               ; remember base of bus addresses (i.e. memory accessed by GPU and GPU peripherals like DMA and USB)
+
+        ADRL    r0, tagbuffer
+        ADR     r1, tagb
+        MOV     r2, #tagslen
+        BL      memcpy                         ; copy to workspace buffer
+
+        MOV     r1, r0
+        MOV     r0, #MB_Chan_ARM2VC 
+        BL      HAL_SendHostMessage            ; ask the questions
+
+        ADRL    r5, tagbuffer                  ; now read the answers
+        ADD     r0,r5,#VCbs-tagb               ; VC address and size
+        LDMIA   r0, {r1, r2}
+        STR     r1, VC_Base
+        STR     r2, VC_Size
+        ADD     r0,r5,#ARMbs-tagb              ; ARM address and size
+        LDMIA   r0, {r1, r2}
+        STR     r1, ARM_Base
+        STR     r2, ARM_Size
+        LDR     r0, [r5, #boardmodel-tagb]
+        LDR     r1, [r5, #boardrev-tagb]
+        LDR     r2, [r5, #dmachans-tagb]
+        STR     r0, Board_Model
+        STR     r1, Board_Revision
+        ; If no channels are reported as available, use channel 4
+        ; (Matches default channel mask from Linux)
+        CMP     r2, #0
+        MOVEQ   r2, #1<<4
+        STR     r2, ARM_DMAChannels
+
+        ; Copy out and construct machine ID from MAC address
+        ADRL    a3, tagbuffer
+        ADD     a3, a3,#:INDEX:MAClo-:INDEX:tagb
+        LDR     lr, [a3, #-4]       ; check if message completed
+        TST     lr, #&80000000      ; NE if successful
+        MOVEQ   a1, #0
+        MOVEQ   a2, #0
+        
+        LDMNEIA a3, {a1, a2}
+        AND     a3, a1, #&ff000000
+        MOV     a3, a3, LSR #24
+        ORR     a2, a3, a2, LSL #8
+        MOV     a1, a1, LSL #8
+        ORR     a1, a1, #&81           ; make it look like a Dallas unique id 
+        BIC     a2, a2, #&ff000000
+
+        MOV     a3, #0                 ; compute a Dallas unique id CRC
+        MOV     a4, #7                 ; number of bytes to do
+gbyte                                  ;
+        AND     v2, a1, #&ff           ; get next byte. shift reg round 8 byte
+        AND     v3, a2, #&ff           ; shift reg round 8 byte
+        MOV     v1, v2, lsl #24
+        MOV     v3, v3, lsl #24
+        ORR     a1, v3, a1,lsr #8      ; shift reg round 8 byte
+        ORR     a2, v1, a2,lsr #8      ; shift reg round 8 byte
+
+        EOR     a3, a3, v2             ;                                  
+        MOV     v1, #8                 ; number of bits to do
+gbit                                   ;                                  
+        MOVS    a3, a3, LSR #1         ; shift bit out into carry
+        EORCS   a3, a3, #&8C           ; feedback carry into other bits
+        SUBS    v1, v1, #1             ; one less bit to do               
+        BNE     gbit                   ; loop until done whole byte       
+        SUBS    a4, a4, #1             ; one less byte to do
+        BNE     gbyte                  ; loop until done all 7 bytes
+
+        AND     v2, a1, #&ff           ; get next byte. shift reg round 8 byte
+        AND     v3, a2, #&ff           ; shift reg round 8 byte
+        MOV     v1, v2, lsl #24
+        MOV     v3, v3, lsl #24
+        ORR     a1, v3, a1,lsr #8      ; shift reg round 8 byte
+        ORR     a2, v1, a2,lsr #8      ; shift reg round 8 byte
+
+        ORR     a2, a2, a3, lsl #24    ; insert crc into hi byte
+        ADRL    lr,MachineID
+        STMIA   lr, {a1, a2}        
+
+        ; Check if it's a Compute Module 3, to decide whether to probe CM3 .v. CM3L
+        LDR     a4, Board_Revision 
+        AND     a4, a4, #BoardRevision_Model_Mask
+        CMP     a4, #BoardRevision_Model_Compute3
+        BNE     %FT10
+
+        ADRL    a1, tagbuffer
+        ADR     a2, tagbcm3
+        MOV     a3, #tagslencm3
+        BL      memcpy                         ; copy to workspace buffer
+
+        MOV     a2, a1
+        MOV     a1, #MB_Chan_ARM2VC 
+        BL      HAL_SendHostMessage            ; ask the questions
+
+        ADRL    a4, tagbuffer                  ; now read the answers
+        LDR     a1, [a4, #4]
+        TEQ     a1, #&80000000                 ; firmware new enough to accept all the tags?
+        LDREQ   a1, [a4, #safcat-tagbcm3]
+        MOVNE   a1, #-1
+        STR     a1, SafetyCatch
+10
+ [ HALDebug
+        BL      HAL_DebugTXStrInline
+        DCB     "QueryPlatform done",10,0
+        ALIGN
+ ]
+        LDMFD   R13!, {r0-r6, pc}
+
+; In:
+;   a1 = GET tag to fetch buffer for
+;   a2 = buffer size
+;   a3 = corresponding SET tag
+; Out:
+;   a1 = buffer logical address, 0 if not present
+;   a2-a4, ip corrupt
+;
+; Query the VC for a data buffer. Historically the VC has dictated the locations
+; of these buffers, but at some point the ability was added for the ARM to
+; dictate the address to the GPU. With recent firmware versions, use of this
+; feature is now mandatory, as on systems with 1GB of RAM the firmware will now
+; attempt to make use of the upper 16MB of RAM (which overlaps the ARM's IO
+; space, making it inaccessible to the ARM)
+;
+; Annoyingly, the main tags we're interested in don't follow the usual pattern
+; of adding &8000 in order to convert a GET request to a SET, so we require both
+; the GET and SET values to be explicitly specified.
+GetVCBuffer     ROUT
+      [ HALDebug
+        STR     lr, [sp, #-4]!
+        BL      %FT01
+        BL      HAL_DebugHexTX4
+        BL      HAL_DebugTXStrInline
+        DCB     "log",10,0
+        ALIGN
+        LDR     pc, [sp], #4
+01
+      ]
+        STMFD   sp!, {a1-a2, lr}
+      [ HALDebug
+        BL      HAL_DebugHexTX4
+        BL      HAL_DebugTXStrInline
+        DCB     "GetVCBuffer",10,0
+        ALIGN
+      ]
+        MOV     a1, a3                  ; Start off with the SET request
+        ; Reserve space for the buffer in NCNB workspace
+        LDR     ip, NCNBPhysAddr
+        LDR     a4, NCNBAddr
+        MOV     a3, a2
+        MOV     lr, #0
+10
+        SUBS    a3, a3, #4
+        STRGE   lr, [a4, a3]            ; Ensure buffer memory is zeroed, just in case ARM/VC is confused by any previous content (like a tag buffer from a previous call to GetVCBuffer). E.g. recent firmware versions will allow you to get/set the FT5406 touchscreen buffer, even if the touchscreen isn't connected.
+        BGT     %BT10
+        ADD     a3, ip, a2
+        ADD     a4, a4, a2
+        ; Now construct a message tag block after it
+        ADD     a3, a3, #15             ; Align for mailbox use
+        ADD     a4, a4, #15
+        BIC     a3, a3, #15
+        BIC     a4, a4, #15
+        STR     a1, [a4, #8]            ; Tag
+        MOV     a1, #7*4
+        MOV     a2, #0
+        STMIA   a4!, {a1, a2}           ; Total length, out flags
+        MOV     a1, #4
+        MOV     a2, #4
+        MOV     lr, #ARM2VC_Tag_End
+        STMIB   a4, {a1, a2, ip, lr}    ; Tag length, in length, in data, terminator
+        MOV     a2, a3
+        MOV     a1, #MB_Chan_ARM2VC
+        BL      HAL_SendHostMessage
+      [ HALDebug
+        LDR     a1, [a4, #-8]
+        BL      HAL_DebugHexTX4
+        LDR     a1, [a4, #-4]
+        BL      HAL_DebugHexTX4
+        LDR     a1, [a4, #0]
+        BL      HAL_DebugHexTX4
+        LDR     a1, [a4, #4]
+        BL      HAL_DebugHexTX4
+        LDR     a1, [a4, #8]
+        BL      HAL_DebugHexTX4
+        LDR     a1, [a4, #12]
+        BL      HAL_DebugHexTX4
+        LDR     a1, [a4, #16]
+        BL      HAL_DebugHexTX4
+        BL      HAL_DebugTXStrInline
+        DCB     "set",10,0
+        ALIGN
+      ]
+        ; On success, firmware should overwrite the address with zero
+        LDR     a1, [a4, #12]
+        CMP     a1, #0
+        BNE     %FT50
+        ; Buffer set success; update NCNB claim and return the claimed addr
+        LDMIA   sp!, {a1-a2, lr}
+        LDR     a1, NCNBAddr
+        LDR     ip, NCNBPhysAddr
+        ADD     a3, a1, a2
+        ADD     ip, ip, a2
+        STR     a3, NCNBAddr
+        STR     ip, NCNBPhysAddr
+        MOV     pc, lr
+50
+        ; Buffer set failure. Try getting the address instead.
+        MOV     a1, #7*4
+        MOV     a2, #0
+        STMDB   a4, {a1, a2}            ; Total length, out flags
+        LDR     a1, [sp]
+        MOV     a2, #4
+        MOV     ip, #0
+        MOV     lr, #0
+        STMIA   a4, {a1, a2, ip, lr}    ; Tag, tag length, in length, in data
+                                        ; n.b. assuming terminator word still in place!
+        MOV     a2, a3
+        MOV     a1, #MB_Chan_ARM2VC
+        BL      HAL_SendHostMessage
+      [ HALDebug
+        LDR     a1, [a4, #-8]
+        BL      HAL_DebugHexTX4
+        LDR     a1, [a4, #-4]
+        BL      HAL_DebugHexTX4
+        LDR     a1, [a4, #0]
+        BL      HAL_DebugHexTX4
+        LDR     a1, [a4, #4]
+        BL      HAL_DebugHexTX4
+        LDR     a1, [a4, #8]
+        BL      HAL_DebugHexTX4
+        LDR     a1, [a4, #12]
+        BL      HAL_DebugHexTX4
+        LDR     a1, [a4, #16]
+        BL      HAL_DebugHexTX4
+        BL      HAL_DebugTXStrInline
+        DCB     "get",10,0
+        ALIGN
+      ]
+        ; On success, firmware should write non-zero address
+        LDR     a1, [a4, #12]
+        BICS    a1, a1, #&c0000000      ; Convert to ARM phys addr
+        LDMIA   sp!, {a2-a3, lr}        ; Junk stacked a1-a2, but also loads a2 into correct reg for OS_MapInIO
+        MOVEQ   pc, lr
+        ; Buffer exists, map it in
+        MOV     a2, a1
+        MOV     a1, #1:SHL:L1_TEXShift  ; VMSA Normal, non-cacheable
+        CallOS  OS_MapInIO, tailcall
+        
+
+; Series of VC side query tags.
+;
+tagb    DCD     tagslen
+        DCD     0        
+
+        DCD     ARM2VC_Tag_GetBoardMAC
+        DCD     8
+        DCD     0        
+MAClo   DCD     0        
+MAChi   DCD     0        
+
+        DCD     ARM2VC_Tag_GetBoardSerial
+        DCD     8
+        DCD     0        
+SNlo    DCD     0
+SNhi    DCD     0        
+
+        DCD     ARM2VC_Tag_GetARMMemory
+        DCD     8
+        DCD     0        
+ARMbs   DCD     0
+ARMsz   DCD     0
+
+        DCD     ARM2VC_Tag_GetVCMemory
+        DCD     8
+        DCD     0        
+VCbs    DCD     0
+VCsz    DCD     0
+
+        DCD     ARM2VC_Tag_GetBoardModel
+        DCD     4
+        DCD     0
+boardmodel DCD  0
+
+        DCD     ARM2VC_Tag_GetBoardRevision
+        DCD     4
+        DCD     0
+boardrev DCD    0
+
+        DCD     ARM2VC_Tag_GetDMAChannels
+        DCD     4
+        DCD     0
+dmachans DCD    0                                
+        DCD     ARM2VC_Tag_FBBlank
+        DCD     4
+        DCD     4
+        DCD     1 ; Start with the screen blanked (avoids firmware displaying an RGB square)
+        DCD     ARM2VC_Tag_SetClockRate
+        DCD     12
+        DCD     12
+        DCD     2
+        DCD     3000000 ; Reset PL011 UART clock to default (Pi 3 has this set to 48MHz for BT, but currently we want to use it for plain serial)
+        DCD     0
+        DCD     ARM2VC_Tag_End
+tagslen *       . - tagb
+        ASSERT  tagslen <= ?tagbuffer
+
+; Extra series of VC side query tags for CM3. 
+;
+tagbcm3 DCD     tagslencm3
+        DCD     0        
+
+        DCD     ARM2VC_Tag_SetExtGPIOConfig
+        DCD     24
+        DCD     0
+        DCD     128+6 ; Expander IO6. Only relevant on Compute 3.
+        DCD     0     ; Configure pin on FXL6408 (U8) as input with weak pullup
+        DCD     0 
+        DCD     1
+        DCD     1
+        DCD     -1
+
+        DCD     ARM2VC_Tag_GetExtGPIOState
+        DCD     8
+        DCD     0
+        DCD     128+6
+safcat  DCD     -1    ; Sampled state, default high
+
+        DCD     ARM2VC_Tag_End
+tagslencm3 *    . - tagbcm3
+        ASSERT  tagslencm3 <= ?tagbuffer
+
+        MACRO
+$class  HALDeviceField $field, $value
+        LCLS    myvalue
+      [ "$value" = ""
+myvalue SETS    "$field"
+      |
+myvalue SETS    "$value"
+      ]
+        ASSERT  . - %A0 = HALDevice_$class$field
+     [ ?HALDevice_$class$field = 2
+        DCW     $myvalue
+   ELIF ?HALDevice_$class$field = 4
+        DCD     $myvalue
+      |
+        %       ?HALDevice_$class$field
+      ]
+        MEND
+
+
+; Template for mailbox device
+
+BCMMBox_Dev
+0
+        HALDeviceField Type,               HALDeviceType_Comms + HALDeviceComms_InterProc
+        HALDeviceField ID,                 HALDeviceID_InterProc_BCMMBox
+        HALDeviceField Location,           HALDeviceBus_Sys + HALDeviceSysBus_AHB ; Guess
+        HALDeviceField Version,            0
+        HALDeviceField Description,        BCMMBox_Description
+        HALDeviceField Address,            0
+        HALDeviceField Reserved1,          0
+        HALDeviceField Activate,           BCMMBox_Activate
+        HALDeviceField Deactivate,         BCMMBox_Deactivate
+        HALDeviceField Reset,              BCMMBox_Reset
+        HALDeviceField Sleep,              BCMMBox_Sleep
+        HALDeviceField Device,             iDev_ARM_Mbx
+        HALDeviceField TestIRQ,            0
+        HALDeviceField ClearIRQ,           0
+        HALDeviceField Reserved2,          0
+        ASSERT  . - %A0 = HALDeviceSize
+
+BCMMBox_Description
+        = "BCM283x VideoCore mailboxes", 0
+
+        ALIGN
+
+        ; Initialise our HAL devices
+BCMMBox_InitDevices ROUT
+        Entry
+        ADRL    a1, MBoxDevice
+        ADR     a2, BCMMBox_Dev
+        MOV     a3, #HALDeviceSize
+        BL      memcpy
+        ADRL    a2, MBoxDevice
+        LDR     a1, PeriBase
+        ADD     a1, a1, #MB_Base
+        STR     a1, [a2, #HALDevice_Address]
+        MOV     a1, #0
+        MOV     lr, pc
+        LDR     pc, OSentries+4*OS_AddDevice
+        EXIT
+
+BCMMBox_Activate
+        MOV     a1, #1
+BCMMBox_Deactivate
+BCMMBox_Reset
+        MOV     pc, lr
+
+BCMMBox_Sleep
+        MOV     a1, #0
+        MOV     pc, lr
+
+                END
+

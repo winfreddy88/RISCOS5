@@ -1,0 +1,627 @@
+/* Copyright 2012 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*---------------------------------------------------------------------------*/
+/* File:    fillers.c                                                        */
+/* Purpose: Fill shade and unshade gadget contents                           */
+/*---------------------------------------------------------------------------*/
+#include <string.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include "Global/CMOS.h"
+#include "Global/Services.h"
+#include "Global/Variables.h"
+#include "Global/OsBytes.h"
+#include "Interface/NetTime.h"
+#include "swis.h"
+#include "gadgets.h"
+#include "menu.h"
+#include "fillers.h"
+#include "defines.h"
+#include "common.h"
+#include "main.h"
+
+/* List of timezones */
+typedef struct tzone
+{
+    struct tzone *next;
+    BOOL          autodst;  /* Knows about DST correction */
+    int16_t       offset;   /* Minutes */
+    char          alias[2]; /* Must come last */
+} tzone_t;
+
+/* Local variables */
+static tzone_t *head = NULL;
+static using_t  serverguess;
+
+/*---------------------------------------------------------------------------*
+ * enable_gadget                                                             *
+ *                                                                           *
+ * Grey or ungrey a gadget.                                                  *
+ *---------------------------------------------------------------------------*/
+
+static void enable_gadget(int objectid, int gadgetid, BOOL enable)
+{
+    unsigned int flags;
+
+    error_trap(gadget_get_flags(0, objectid, gadgetid, &flags), 0);
+    if (!enable)
+    {
+        flags |= Gadget_Faded;
+    }
+    else
+    {
+        flags &= ~Gadget_Faded;
+    }
+    error_trap(gadget_set_flags(0, objectid, gadgetid, flags), 0);
+}
+
+
+/*---------------------------------------------------------------------------*
+ * fill_manual_setting                                                       *
+ *                                                                           *
+ * To shade or unshade the manual setting options                            *
+ *---------------------------------------------------------------------------*/
+
+void fill_manual_setting(BOOL enable)
+{
+    error_trap(radiobutton_set_state(0, main_window, RadioManually, enable), 0);
+    error_trap(radiobutton_set_state(0, main_window, RadioNet, !enable), 0);
+    enable_gadget(main_window, AdjusterHoursU, enable);
+    enable_gadget(main_window, AdjusterHoursD, enable);
+    enable_gadget(main_window, AdjusterMinutesU, enable);
+    enable_gadget(main_window, AdjusterMinutesD, enable);
+    enable_gadget(main_window, DisplayDate, enable);
+    enable_gadget(main_window, DisplayHours, enable);
+    enable_gadget(main_window, LabelColon, enable);
+    enable_gadget(main_window, DisplayMinutes, enable);
+    enable_gadget(main_window, PopUpCalendar, enable);
+}
+
+
+/*---------------------------------------------------------------------------*
+ * fill_network_setting                                                      *
+ *                                                                           *
+ * To shade or unshade the network setting options                           *
+ *---------------------------------------------------------------------------*/
+
+void fill_network_setting(BOOL enable)
+{
+    int state;
+
+    error_trap(radiobutton_set_state(0, main_window, RadioManually, !enable), 0);
+    error_trap(radiobutton_set_state(0, main_window, RadioNet, enable), 0);
+    enable_gadget(main_window, StringSetPeriod, enable);
+    enable_gadget(main_window, DisplayNetTimeState, enable);
+    state = (serverguess == USING_INETTIME) || (serverguess == USING_INETNTP);
+    enable_gadget(main_window, CheckAutoPick, enable && !state);
+    state = state || (serverguess == USING_AUTO);
+    error_trap(optionbutton_set_state(0, main_window, CheckAutoPick, state), 0);
+    enable_gadget(main_window, WriteableServer, enable && !state);
+    enable_gadget(main_window, ButtonTry, enable);
+    enable_gadget(main_window, LabelBetween, enable);
+}
+
+
+/*---------------------------------------------------------------------------*
+ * fill_no_network_setting                                                   *
+ *                                                                           *
+ * Forbid use of network setting, for example if NetTime is too old          *
+ *---------------------------------------------------------------------------*/
+
+void fill_no_network_setting(void)
+{
+    fill_network_setting(0);
+    fill_manual_setting(1);
+    error_trap(displayfield_set_value(0, main_window, DisplayNetTimeState,
+                                      messages_lookup("N00")), 0);
+    enable_gadget(main_window, RadioNet, FALSE);
+}
+
+
+/*---------------------------------------------------------------------------*
+ * fill_nettime_state                                                        *
+ *                                                                           *
+ * Deduce the overall state from the NetTime module                          *
+ *---------------------------------------------------------------------------*/
+
+void fill_nettime_state(void)
+{
+    uint32_t state, lasttime;
+    char     token[32];
+    char    *msg;
+
+    /* Don't try to error trap this incase the module got killed */    
+    state = NetTime_State_Unknown;
+    _swix(NetTime_States, _OUTR(0,1), &state, &lasttime);
+    switch (state & NetTime_Current_Mask)
+    {
+        case NetTime_Current_Busy:
+            msg = messages_lookup("N05");
+            break;
+
+        case NetTime_Current_PrerequisitesMissing:
+            msg = messages_lookup("N04");
+            break;
+
+        case NetTime_Current_Asleep:
+            if ((state & NetTime_Past_Mask) == NetTime_Past_SyncFailed)
+            {
+                msg = messages_lookup("N04");
+                break;
+            }
+            if (lasttime >= (100uL * 28 * 86400))
+            {
+                /* More than 4 weeks is unknown */
+                msg = messages_lookup("N00");
+                break;
+            }
+            if (lasttime >= (100uL * 86400))
+            {
+                msg = messages_lookup("N03");
+                sprintf(token, msg, lasttime / (100uL * 86400));
+                msg = token;
+                break;
+            }
+            if (lasttime >= (100uL * 3600))
+            {
+                msg = messages_lookup("N02");
+                sprintf(token, msg, lasttime / (100uL * 3600));
+                msg = token;
+                break;
+            }
+            if (lasttime >= (100uL * 10))
+            {
+                msg = messages_lookup("N01");
+                sprintf(token, msg, lasttime / 100);
+                msg = token;
+                break;
+            }
+            /* Within the last 10s is classed as instant */
+            msg = messages_lookup("N06");
+            break;
+
+        default:
+            msg = messages_lookup("N00");
+            break;
+    }
+    error_trap(displayfield_set_value(0, main_window,
+                                      DisplayNetTimeState, msg), 0);
+}
+
+
+/*---------------------------------------------------------------------------*
+ * fill_manual_time_date                                                     *
+ *                                                                           *
+ * Update the time fields in the manual section to be some time              *
+ *---------------------------------------------------------------------------*/
+
+void fill_manual_time_date(BOOL enable, const uint8_t *time)
+{
+    char  string[DisplayDateLen + sizeof("23:59")];
+    char *terminate;
+    char *formatter;
+
+    formatter = messages_lookup("LongFmt");
+    strcat(formatter, " %24:%MI");
+    error_trap(_swix(Territory_ConvertDateAndTime, _INR(0,4) | _OUT(1),
+                     -1, time, string, sizeof(string), formatter,
+                     &terminate), 1);
+    terminate[0] = 0;
+    terminate[-3] = 0; /* Always 2 digits */
+    terminate[-6] = 0; /* Always 2 digits */
+    error_trap(displayfield_set_value(0, main_window, DisplayDate, string), 0);
+    error_trap(displayfield_set_value(0, main_window, DisplayMinutes, &terminate[-2]), 0);
+    error_trap(displayfield_set_value(0, main_window, DisplayHours, &terminate[-5]), 0);
+
+    /* Refresh shading too */
+    fill_manual_setting(enable);
+}
+
+
+/*---------------------------------------------------------------------------*
+ * fill_best_time_server                                                     *
+ *                                                                           *
+ * Pick our best guess at a time server                                      *
+ *---------------------------------------------------------------------------*/
+
+static void fill_best_time_server(const char *user)
+{
+    char     server[WriteableServerLen];
+    uint32_t country, unclaimed, length;
+
+    /* If !Internet knowns the answer, this overrules everything */
+    if (_swix(OS_ReadVarVal, _INR(0,4) | _OUT(2),
+              "Inet$NTPServer", server, WriteableServerLen, 0, VarType_Expanded,
+              &length) == NULL)
+    {
+        server[length] = 0;
+        serverguess = USING_INETNTP;
+        goto update;
+    }
+    if (_swix(OS_ReadVarVal, _INR(0,4) | _OUT(2),
+              "Inet$TimeServer", server, WriteableServerLen, 0, VarType_Expanded,
+              &length) == NULL)
+    {
+        server[length] = 0;
+        serverguess = USING_INETTIME;
+        goto update;
+    }
+
+    /* Forced to use the caller's server */
+    if (strlen(user))
+    {
+        strcpy(server, user);
+        goto update;
+    }
+
+    /* See if there's a mapping from the country to a 2 letter TLD */
+    server[0] = 0;
+    if (_swix(OS_Byte, _INR(0,1) | _OUT(1), OsByte_Country, 127, &country) == NULL)
+    {
+        _swix(OS_ServiceCall, _INR(1,5) | _OUT(1),
+              Service_International, 9, country, server, WriteableServerLen,
+              &unclaimed);
+        if (!unclaimed)
+        {
+            /* There was, so add a dot */
+            server[2] = '.';
+            server[3] = '\0';
+        }
+    }
+    serverguess = USING_AUTO;
+    strcat(server, "pool.ntp.org");
+    
+update:
+    /* Update our best guess */    
+    error_trap(writablefield_set_value(0, main_window, WriteableServer, server), 0);
+
+    /* Refresh shading too */
+    fill_network_setting(1);
+}
+
+
+/*---------------------------------------------------------------------------*
+ * fill_time_server_used                                                     *
+ *                                                                           *
+ * Who chose the time server at the last guess, or reset from file           *
+ *---------------------------------------------------------------------------*/
+
+using_t fill_time_server_used(const char *server, using_t guess, uint8_t index)
+{
+    if (server != NULL)
+    {
+        error_trap(stringset_set_selected(1, main_window, StringSetPeriod, (char *)index), 0);
+        serverguess = guess; /* Might get overridden */
+        fill_best_time_server(server);
+    }
+    return serverguess;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * fill_locality_setting                                                     *
+ *                                                                           *
+ * To shade or unshade the locality setting options                          *
+ *---------------------------------------------------------------------------*/
+
+void fill_locality_setting(int autodst)
+{
+    int      state, isdst;
+    BOOL     possible = FALSE;
+    tzone_t *entry;
+    char     buffer[StringSetLocalityLen];
+
+    /* Find the timezone in the list and see if auto setting is possible */
+    error_trap(stringset_get_selected(0, main_window, StringSetLocality, buffer, StringSetLocalityLen, &state), 0);
+    entry = head;
+    while (entry != NULL)
+    {
+        if (strcmp(entry->alias, buffer) == 0)
+        {
+            possible = entry->autodst;
+            break;
+        }
+        entry = entry->next;
+    }
+    if (!possible) autodst = 0;
+    enable_gadget(main_window, CheckDSTAuto, possible);
+
+    /* Read from dialogue if negative */
+    if (autodst < 0)
+    {
+        error_trap(optionbutton_get_state(0, main_window, CheckDSTAuto, &autodst), 0);
+    }
+    else
+    {
+        error_trap(optionbutton_set_state(0, main_window, CheckDSTAuto, autodst), 0);
+    }
+    isdst = read_cmos_value(AlarmAndTimeCMOS);
+    isdst = (isdst & DSTCMOSBit) != 0;
+    enable_gadget(main_window, CheckDSTActive, !autodst);
+    error_trap(optionbutton_set_state(0, main_window, CheckDSTActive, isdst), 0);
+}
+
+
+/*---------------------------------------------------------------------------*
+ * fill_insert_timezone                                                      *
+ *                                                                           *
+ * Insert a timezone item into the list ordered by timezone                  *
+ *---------------------------------------------------------------------------*/
+
+static void fill_insert_timezone(const char *name, int16_t offset, BOOL autodst)
+{
+    tzone_t *item, *entry, *previous;
+
+    /* Allocate an item */
+    item = (tzone_t *)malloc(sizeof(tzone_t) + strlen(name) + StringSetTZLen);
+    if (item == NULL)
+    {
+        error_trap(common_error(messages_lookup("NotEnoughMemory")), 0);
+        return;
+    }
+
+    /* Fill some fields */
+    item->autodst = autodst;
+    item->offset = offset;
+    sprintf(item->alias, "UTC%c%02u:%02u %s",
+            offset < 0 ? '-' : '+', abs(offset / 60), abs(offset % 60), name);
+
+    if (head == NULL)
+    {
+        /* Empty list, so this item wins */
+        head = item;
+        item->next = NULL;
+        return;
+    }
+
+    /* Scan for the next nearest */
+    previous = NULL;
+    entry = head;
+    while (entry != NULL)
+    {
+        if (entry->offset >= item->offset) break;
+        previous = entry;
+        entry = entry->next;
+    }
+
+    if (entry == head)
+    {
+        /* Insert before head */
+        head = item;
+        item->next = entry;
+    }
+    else
+    {
+        /* Insert after previous */
+        previous->next = item;
+        item->next = entry;
+    }
+}
+
+
+/*---------------------------------------------------------------------------*
+ * fill_timezone_stringset                                                   *
+ *                                                                           *
+ * Update the gadget with the latest linked list contents                    *
+ *---------------------------------------------------------------------------*/
+
+static void fill_timezone_stringset(void)
+{
+    char    *aliases;
+    tzone_t *entry;
+    size_t   length = 1;
+
+    /* Count the string set including commas and terminator */
+    entry = head;
+    while (entry != NULL)
+    {
+        length = length + strlen(entry->alias) + 1;
+        entry = entry->next;
+    }
+
+    /* Collect up the replacement string set */
+    aliases = (char *)malloc(length);
+    if (aliases == NULL)
+    {
+        error_trap(common_error(messages_lookup("NotEnoughMemory")), 0);
+        return;
+    }
+    aliases[0] = 0;
+    entry = head;
+    while (entry != NULL)
+    {
+        strcat(aliases, entry->alias);
+        strcat(aliases, ",");
+        entry = entry->next;
+    }
+
+    /* Squash the last excess comma and update the string set */
+    aliases[length - 1] = 0;
+    error_trap(stringset_set_available(0, main_window, StringSetLocality,
+                                       aliases), 0);
+    free(aliases);
+}
+
+
+/*---------------------------------------------------------------------------*
+ * fill_best_timezone                                                        *
+ *                                                                           *
+ * Tick the timezone that the match is a substring of or make one up         *
+ *---------------------------------------------------------------------------*/
+
+void fill_best_timezone(const char *match)
+{
+    tzone_t  *entry;
+    size_t    length;
+    uint32_t  territory, zone;
+    int32_t   cmosoffset;
+    char      name[StringSetLocalityLen];
+
+    /* See if a textual match is already in the list */
+    length = strlen(match);
+    entry = head;
+    while (entry != NULL)
+    {
+        if (strncmp(match, entry->alias, length) == 0)
+        {
+            error_trap(stringset_set_selected(0, main_window, StringSetLocality, (char *)match), 0);
+            return;
+        }
+        entry = entry->next;
+    }
+
+    /* If the timezone CMOS matches one of the current territory timezone
+     * offsets then choose the territory's entry.
+     */
+    cmosoffset = (int8_t)read_cmos_value(TimeZoneCMOS);
+    cmosoffset = cmosoffset * 15;
+    _swix(Territory_Number, _OUT(0), &territory);
+    for (zone = 0; newenough_readtz && (zone < 32); zone++)
+    {
+        int32_t     std;
+        int         onlyone;
+        const char *stdname;
+
+        if (_swix(Territory_ReadTimeZones, _INR(0,1) | _IN(4) | _OUT(0) | _OUT(2) | _OUT(4),
+                  territory, zone, 0x454E4F5A,
+                  &stdname, &std, &onlyone) == NULL)
+        {
+            std = std / 6000;
+            if (cmosoffset == std)
+            {
+                sprintf(name, "UTC%c%02u:%02u %s",
+                        cmosoffset < 0 ? '-' : '+', abs(cmosoffset / 60), abs(cmosoffset % 60),
+                        messages_lookup("TzpXXXX"));
+                _swix(Territory_NumberToName, _INR(0,2),
+                      territory, &name[StringSetTZLen], StringSetLocalityLen - StringSetTZLen);
+                strcat(name, " '");
+                strcat(name, stdname);
+                strcat(name, "'");      
+                error_trap(stringset_set_selected(0, main_window, StringSetLocality, name), 0);
+                return;
+            }
+
+            /* Stop now if the extended API isn't supported */
+            if (onlyone) break;
+        }
+        else
+        {
+            /* No more zones in this territory */
+            break;
+        }
+    }
+
+    /* Just pick any that has the right offset */
+    length = sprintf(name, "UTC%c%02u:%02u ", 
+                     cmosoffset < 0 ? '-' : '+', abs(cmosoffset / 60), abs(cmosoffset % 60));
+    entry = head;
+    while (entry != NULL)
+    {
+        if (strncmp(name, entry->alias, length) == 0)
+        {
+            error_trap(stringset_set_selected(0, main_window, StringSetLocality, entry->alias), 0);
+            return;
+        }
+        entry = entry->next;
+    }
+
+    /* An unlisted timezone, add a dummy entry to the list and select it */
+    fill_insert_timezone(messages_lookup("TzpXXXX"), (int16_t)cmosoffset, FALSE);
+    fill_timezone_stringset();
+    strcat(name, messages_lookup("TzpXXXX"));
+    error_trap(stringset_set_selected(0, main_window, StringSetLocality, name), 0);
+}
+
+
+/*---------------------------------------------------------------------------*
+ * fill_timezone_menu                                                        *
+ *                                                                           *
+ * Generate list of known timezones                                          *
+ *---------------------------------------------------------------------------*/
+
+void fill_timezone_menu(void)
+{
+    uint32_t territory, zone;
+    int16_t  offset;
+    size_t   length;
+    char     token[8];
+    char     name[StringSetLocalityLen];
+    char    *aliases, *comma;
+
+    /* Get any generic ones from the messages file */
+    for (offset = -14 * 60; offset <= 14 * 60; offset = offset + 15)
+    {
+        sprintf(token, "Tz%c%02u%02u", offset < 0 ? 'm' : 'p', abs(offset / 60), abs(offset % 60));
+        aliases = messages_lookup(token);
+        length = strlen(aliases);
+        if (length != 0)
+        {
+            while (1)
+            {
+                /* Allow8 multiple regions in a timezone lookup */
+                comma = strchr(aliases, ',');
+                if (comma != NULL) *comma = 0;
+
+                /* Add this one region */
+                fill_insert_timezone(aliases, offset, FALSE);
+
+                /* Skip the comma and continue to the next region if there is one */
+                if (comma == NULL) break;
+                aliases = comma + 1;
+            }
+        }
+    }
+
+    /* See which territory modules are installed */
+    for (territory = 0; territory < 0x400; territory++)
+    {
+        for (zone = 0; newenough_readtz && (zone < 32); zone++)
+        {
+            int32_t     std;
+            int         onlyone;
+            const char *stdname;
+            int         autodst = 0;
+            
+            if (_swix(Territory_ReadTimeZones, _INR(0,1) | _IN(4) | _OUT(0) | _OUT(2) | _OUT(4),
+                      territory, zone, 0x454E4F5A,
+                      &stdname, &std, &onlyone) == NULL)
+            {
+                /* Add this territory to the list */
+                strcpy(name, messages_lookup("TzpXXXX"));
+                _swix(Territory_NumberToName, _INR(0,2),
+                      territory, name, sizeof(name));
+                strcat(name, " '");
+                strcat(name, stdname);
+                strcat(name, "'");      
+                offset = (int16_t)(std / 6000);
+                _swix(Territory_DaylightSaving, _INR(0,1) | _OUT(0),
+                      territory, 2, &autodst);
+                fill_insert_timezone(name, offset, autodst != 0);
+
+                /* Stop now if the extended API isn't supported */
+                if (onlyone) break;
+            }
+            else
+            {
+                /* No more zones in this territory */
+                break;
+            }
+        }
+    }
+    
+    /* Replace the stringset */
+    fill_timezone_stringset();
+}

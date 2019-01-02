@@ -1,0 +1,394 @@
+; Copyright 2009 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+; Using the DMA controller to clear RAM is much faster than doing it with the CPU (with the cache/write buffer off, at least)
+                 GBLL Use_DMA_Clear
+Use_DMA_Clear    SETL {TRUE}
+
+init_ram
+        ; There is some setup we want to do here - auto & smart idle modes!
+        LDR     v1, =SDRC_Regs
+        MOV     a1, #1+(2<<3)
+        STR     a1, [v1, #SDRC_SYSCONFIG]
+ [ {FALSE} ; With multiple board types supported, it's now much easier just to rely on u-boot to set everything up properly.
+        ; Make sure all attached RAM is initialised
+        ; Although x-loader will initialise some RAM for us, it might not necessarily use the best settings, and it might not initialise all the RAM that's available (e.g. CS1 on rev C beagleboard)
+        ; This code roughly follows the sdrc_init()/dram_init() flow in u-boot
+
+        LDR     v1, =SDRC_Regs
+        ; CS0 setup:
+        ; - If we're not running from SDRAM, (re)init CS0
+        MOV     a1, pc
+        CMP     a1, #CS0_SDRAM
+        BHS     %FT10
+        ; do_sdrc_init(CS0,EARLY_INIT)
+        ; First we reset SDRC
+        MOV     a1, #2
+        STR     a1, [v1, #SDRC_SYSCONFIG] ; SOFTRESET
+        MOV     a2, #12*1024*1024
+20
+        LDR     a1, [v1, #SDRC_SYSSTATUS]
+        TST     a1, #1
+        BNE     %FT30
+        SUBS    a2, a2, #1
+        BNE     %BT20
+30
+        MOV     a1, #0
+        STR     a1, [v1, #SDRC_SYSCONFIG]
+        ; Setup SDRC to ball mux. Or something.
+        MOV     a1, #&100
+        STR     a1, [v1, #SDRC_SHARING]
+        ; Disable powerdown via CKE
+        MOV     a1, #&81
+        STR     a1, [v1, #SDRC_POWER_REG]
+        ; Enable DLL, 90 degree phase
+        MOV     a1, #&A
+        STR     a1, [v1, #SDRC_DLLA_CTRL]
+        ; Wait for lock (indefinitely?)
+20
+        LDR     a1, [v1, #SDRC_DLLA_STATUS]
+        TST     a1, #4
+        BEQ     %BT20
+
+        ; Now initialise CS0
+        LDR     a1, =&02584099 ; 128MB, etc.
+        STR     a1, [v1, #SDRC_MCFG_0]
+        LDR     a1, =&4E201
+        STR     a1, [v1, #SDRC_RFR_CTRL_0]
+        LDR     a1, =(21 :SHL: 27) :OR: (10 :SHL: 22) :OR: (7 :SHL: 18) :OR: (3 :SHL: 15) :OR: (3 :SHL: 12) :OR: (2 :SHL: 9) :OR: (3 :SHL: 6) :OR: 6
+        STR     a1, [v1, #SDRC_ACTIM_CTRLA_0] ; 165MHz timings
+        LDR     a1, =(1 :SHL: 12) :OR: 23 :OR: (5 :SHL: 8) :OR: (1 :SHL: 16)
+        STR     a1, [v1, #SDRC_ACTIM_CTRLB_0]
+        ; NOP, PRECHARGE, AUTOREFRESH, AUTOREFRESH sequence
+        MOV     a1, #0
+        STR     a1, [v1, #SDRC_MANUAL_0]
+        MOV     a1, #1
+        STR     a1, [v1, #SDRC_MANUAL_0]
+        MOV     a1, #2
+        STR     a1, [v1, #SDRC_MANUAL_0]
+        STR     a1, [v1, #SDRC_MANUAL_0]
+        ; CAS latency, burst length, etc.
+        MOV     a1, #&32
+        STR     a1, [v1, #SDRC_MR_0]
+        ; Now check the setup
+        ; This is the same technique as mem_ok() in u-boot
+        LDR     a1, =CS0_SDRAM
+        MOV     a2, #0
+        LDR     a3, =&12345678
+        STR     a2, [a1, #&400]
+        STR     a3, [a1]
+        STR     a2, [a1, #4]
+        LDR     a2, [a1, #&400]
+        LDR     a4, [a1]
+        CMP     a2, #0
+        CMPEQ   a3, a4
+        BEQ     %FT10 ; It's good
+        ; Else it's bad and we need to disable CS0
+        MOV     a1, #0
+        STR     a1, [v1, #SDRC_MCFG_0]
+10
+        ; Check if CS1 is active
+        ; If not, and we're a rev C beagleboard, activate it
+        LDR     a1, [v1, #SDRC_MCFG_1]
+        LDR     a2, =&3FF00
+        TST     a1, a2
+        BNE     %FT10
+        ; Beagleboard rev C check:
+        ; Although the manual fails to mention it, apparently GPIO 171 will be low if we're on rev C
+        ; Else we're rev A/B
+        LDR     a2, =L4_GPIO6
+        LDR     a1, [a2, #GPIO_OE]
+        ORR     a1, a1, #1:SHL:11
+        STR     a1, [a2, #GPIO_OE]
+        ; Wait a bit just to make sure the input is up to date
+        MOV     a1, #32768
+5
+        SUBS    a1, a1, #1
+        BNE     %BT5
+        LDR     a1, [a2, #GPIO_DATAIN]
+        TST     a1, #1:SHL:11
+        BNE     %FT10
+
+        ; Make CS0 and CS1 contiguous, in case it helps RISC OS a bit (e.g. finding large areas of contiguous physical memory for IO)
+        LDR     a1, [v1, #SDRC_MCFG_0]
+        LDR     a2, =&3FF<<1
+        ANDS    a1, a2, a1, LSR #7 ; CS0 size in MB
+        BEQ     %FT5 ; If no CS0, just program offset of 0
+        CMP     a1, #32
+        MOVLT   a1, #32 ; Min 32MB offset if CS0 present
+        ; Round up to power of two
+        SUB     a2, a1, #1
+        TST     a2, a1
+        CLZNE   a2, a1
+        MOVNE   a1, #1
+        MOVNE   a1, a1, ROR a2
+5
+        AND     a2, a1, #&60 ; 32MB offset
+        MOV     a1, a1, LSR #7 ; 128MB offset
+        ORR     a1, a1, a2, LSL #3
+        STR     a1, [v1, #SDRC_CS_CFG]
+        
+        ; Initialise CS1
+        LDR     a1, =&02584099 ; 128MB, etc.
+        STR     a1, [v1, #SDRC_MCFG_1]
+        LDR     a1, =&4E201
+        STR     a1, [v1, #SDRC_RFR_CTRL_1]
+        LDR     a1, =(21 :SHL: 27) :OR: (10 :SHL: 22) :OR: (7 :SHL: 18) :OR: (3 :SHL: 15) :OR: (3 :SHL: 12) :OR: (2 :SHL: 9) :OR: (3 :SHL: 6) :OR: 6
+        STR     a1, [v1, #SDRC_ACTIM_CTRLA_1] ; 165MHz timings
+        LDR     a1, =(1 :SHL: 12) :OR: 23 :OR: (5 :SHL: 8) :OR: (1 :SHL: 16)
+        STR     a1, [v1, #SDRC_ACTIM_CTRLB_1]
+        ; NOP, PRECHARGE, AUTOREFRESH, AUTOREFRESH sequence
+        MOV     a1, #0
+        STR     a1, [v1, #SDRC_MANUAL_1]
+        MOV     a1, #1
+        STR     a1, [v1, #SDRC_MANUAL_1]
+        MOV     a1, #2
+        STR     a1, [v1, #SDRC_MANUAL_1]
+        STR     a1, [v1, #SDRC_MANUAL_1]
+        ; CAS latency, burst length, etc.
+        MOV     a1, #&32
+        STR     a1, [v1, #SDRC_MR_1]
+        ; Now check the setup
+        LDR     a1, =CS0_SDRAM
+        LDR     a4, [v1, #SDRC_CS_CFG]
+        AND     a3, a4, #7 ; Offset in 128MB units
+        ADD     a1, a1, a3, LSL #20+7
+        AND     a3, a4, #&300 ; Offset in 32MB units
+        ADD     a1, a1, a3, LSL #20+5-8 ; a1 = CS1 start
+        MOV     a2, #0
+        LDR     a3, =&12345678
+        STR     a2, [a1, #&400]
+        STR     a3, [a1]
+        STR     a2, [a1, #4]
+        LDR     a2, [a1, #&400]
+        LDR     a4, [a1]
+        CMP     a2, #0
+        CMPEQ   a3, a4
+        BEQ     %FT10 ; It's good
+        ; Else it's bad and we need to disable CS1
+        MOV     a1, #0
+        STR     a1, [v1, #SDRC_MCFG_1]
+10
+ ]
+        ; Done!
+        MOV     pc, lr
+
+        
+        
+; a1 <= Highest physical address in RAM +1
+get_end_of_ram
+        LDR     v1, =SDRC_Regs
+        LDR     a3, [v1, #SDRC_MCFG_1]
+        LDR     a2, =&3FF00<<13
+        ANDS    a3, a2, a3, LSL #13
+        BEQ     %FT10
+        LDR     a2, =CS0_SDRAM
+        LDR     a4, [v1, #SDRC_CS_CFG]
+        AND     v2, a4, #7 ; Offset in 128MB units
+        ADD     a2, a2, v2, LSL #20+7
+        AND     v2, a4, #&300 ; Offset in 32MB units
+        ADD     a2, a2, v2, LSL #20+5-8
+        ADD     a1, a3, a2
+        MOV     pc, lr
+10
+        ; No RAM in CS1; therefore must be in CS0
+        LDR     a3, [v1, #SDRC_MCFG_0]
+        LDR     a2, =&3FF00<<13
+        AND     a3, a2, a3, LSL #13 ; Get CS0 RAM size
+        LDR     a2, =CS0_SDRAM
+        ADD     a1, a3, a2
+        MOV     pc, lr
+
+
+
+clear_ram
+        ; Clear everything up to a1
+        ; Can clobber all regs except v8 & sb
+        ; If DMA clear is disabled, the clear areas must be multiples of 128 bytes in length. Else they must be multiples of 4 bytes.
+ [ Use_DMA_Clear
+        ; Reset the DMA controller
+        LDR     v5, =L4_sDMA
+  [ :LNOT: Use_DMA_Copy ; Already reset if using DMA copy
+        MOV     v1, #2
+        STR     v1, [v5, #DMA4_OCP_SYSCONFIG]
+5
+        LDR     v1, [v5, #DMA4_SYSSTATUS]
+        TST     v1, #1
+        BEQ     %BT5
+        ; Set a sensible FIFO budget (as per SDMACReset)
+        LDR     a2, =&100080
+        STR     a2, [v5, #DMA4_GCR]
+        ; Configure channel 0 for the right settings
+        ADD     v5, v5, #DMA4_i
+        LDR     v1, [v5, #DMA4_CLNK_CTRLi]
+        BIC     v1, v1, #&8000 ; Disable channel linking
+        STR     v1, [v5, #DMA4_CLNK_CTRLi]
+        MOV     v1, #1<<4
+        STR     v1, [v5, #DMA4_CICRi] ; frame end interrupt enabled
+        MOV     v1, #1
+        STR     v1, [v5, #DMA4_CFNi] ; 1 frame
+  |
+        ADD     v5, v5, #DMA4_i
+  ]
+        LDR     v1, =&2C002 ; 32bit elements, 64 byte bursts, last write non-posted
+        STR     v1, [v5, #DMA4_CSDPi]
+        MOV     v1, #0
+        STR     v1, [v5, #DMA4_COLORi] ; Clear colour of 0. Although the clear colour register only holds a 24 bit value, the MSB (for 4-byte DMA) is always written as 0.
+ ]
+        MOV     v2, a1
+        LDR     v1, =SDRC_Regs
+        LDR     a3, [v1, #SDRC_MCFG_0]
+        LDR     a2, =&3FF00<<13
+        ANDS    a3, a2, a3, LSL #13 ; Get CS0 RAM size
+        BEQ     %FT10
+        LDR     a2, =CS0_SDRAM
+        SUB     a1, v2, a2
+        CMP     a1, a3
+        MOVGT   a1, a3 ; Work out how much we're meant to be clearing
+        CMP     a1, #0
+        BEQ     %FT10
+ [ Use_DMA_Clear
+        ; To keep things simple we split the transfer into chunks small enough to fit inside
+        ; one frame (64MB) and wait for each one to complete
+        ; This means we don't have to worry about the code breaking if the clear area isn't
+        ; MB aligned (or 128 byte aligned, as the original code assumed)
+        MOV     a1, a1, LSR #2 ; Number of elements remaining
+        MOV     a3, #&1000000 ; Max elements per transfer+1 (not quite 64MB!)
+40
+        LDR     v1, [v5, #DMA4_CSRi]
+        STR     v1, [v5, #DMA4_CSRi] ; Clear status register
+        CMP     a1, a3
+        MOVLT   v1, a1
+        SUBGE   v1, a3, #1
+        STR     v1, [v5, #DMA4_CENi]
+        SUB     a1, a1, v1
+        STR     a2, [v5, #DMA4_CDSAi]
+        ADD     a2, a2, v1, LSL #2
+        LDR     a4, =&1014080
+        STR     a4, [v5, #DMA4_CCRi] ; Enable channel with constant fill, post-increment destination, source synchronised
+        ; Use the transfer size as a rough timer for how long we should wait before
+        ; we start hammering the status register
+50
+        SUBS    v1, v1, #256
+        BGT     %BT50
+50
+        LDR     v1, [v5, #DMA4_CSRi]
+        TST     v1, #1<<4
+        BEQ     %BT50
+        ; Make doubly sure that it's finished by checking WR_ACTIVE/RD_ACTIVE
+50
+        LDR     v1, [v5, #DMA4_CCRi]
+        TST     v1, #&600
+        BNE     %BT50
+        CMP     a1, #0
+        BNE     %BT40
+ |
+        MOV     a3, #0
+        MOV     a4, #0
+        MOV     v1, #0
+        MOV     v3, #0
+        MOV     v4, #0
+        MOV     v5, #0
+        MOV     sp, #0
+        MOV     ip, #0
+20
+        STMIA   a2!,{a3,a4,v1,v3,v4,v5,sp,ip} ; 32 bytes
+        STMIA   a2!,{a3,a4,v1,v3,v4,v5,sp,ip} ; 64 bytes
+        STMIA   a2!,{a3,a4,v1,v3,v4,v5,sp,ip} ; 96 bytes
+        STMIA   a2!,{a3,a4,v1,v3,v4,v5,sp,ip} ; 128 bytes
+        SUBS    a1, a1, #128
+        BGT     %BT20
+ ]
+10
+        LDR     v1, =SDRC_Regs
+        LDR     a3, [v1, #SDRC_MCFG_1]
+        LDR     a2, =&3FF00<<13
+        ANDS    a3, a2, a3, LSL #13
+        BEQ     %FT30
+        LDR     a2, =CS0_SDRAM
+        LDR     a4, [v1, #SDRC_CS_CFG]
+        AND     v3, a4, #7 ; Offset in 128MB units
+        ADD     a2, a2, v3, LSL #20+7
+        AND     v3, a4, #&300 ; Offset in 32MB units
+        ADD     a2, a2, v3, LSL #20+5-8
+        SUB     a1, v2, a2
+        CMP     a1, a3
+        MOVGT   a1, a3 ; Work out how much we're meant to be clearing
+        CMP     a1, #0
+        BEQ     %FT30
+ [ Use_DMA_Clear
+        ; To keep things simple we split the transfer into chunks small enough to fit inside
+        ; one frame (64MB) and wait for each one to complete
+        ; This means we don't have to worry about the code breaking if the clear area isn't
+        ; MB aligned (or 128 byte aligned, as the original code assumed)
+        MOV     a1, a1, LSR #2 ; Number of elements remaining
+        MOV     a3, #&1000000 ; Max elements per transfer+1 (not quite 64MB!)
+40
+        LDR     v1, [v5, #DMA4_CSRi]
+        STR     v1, [v5, #DMA4_CSRi] ; Clear status register
+        CMP     a1, a3
+        MOVLT   v1, a1
+        SUBGE   v1, a3, #1
+        STR     v1, [v5, #DMA4_CENi]
+        SUB     a1, a1, v1
+        STR     a2, [v5, #DMA4_CDSAi]
+        ADD     a2, a2, v1, LSL #2
+        LDR     a4, =&1014080
+        STR     a4, [v5, #DMA4_CCRi] ; Enable channel
+        ; Use the transfer size as a rough timer for how long we should wait before we start hammering the status register
+50
+        SUBS    v1, v1, #256
+        BGT     %BT50
+50
+        LDR     v1, [v5, #DMA4_CSRi]
+        TST     v1, #1<<4
+        BEQ     %BT50
+        ; Make doubly sure that it's finished by checking WR_ACTIVE/RD_ACTIVE
+50
+        LDR     v1, [v5, #DMA4_CCRi]
+        TST     v1, #&600
+        BNE     %BT50
+        CMP     a1, #0
+        BNE     %BT40
+ |
+
+        MOV     a3, #0
+        MOV     a4, #0
+        MOV     v1, #0
+        MOV     v3, #0
+        MOV     v4, #0
+        MOV     v5, #0
+        MOV     sp, #0
+        MOV     ip, #0
+40
+        STMIA   a2!,{a3,a4,v1,v3,v4,v5,sp,ip} ; 32 bytes
+        STMIA   a2!,{a3,a4,v1,v3,v4,v5,sp,ip} ; 64 bytes
+        STMIA   a2!,{a3,a4,v1,v3,v4,v5,sp,ip} ; 96 bytes
+        STMIA   a2!,{a3,a4,v1,v3,v4,v5,sp,ip} ; 128 bytes
+        SUBS    a1, a1, #128
+        BGT     %BT40
+ ]
+30
+ [ Use_DMA_Clear
+        ; Invalidate the I-cache & BTC, just in case
+        ; (D cache & L2 cache should be turned off, so no need to worry about them)
+        MOV     a1, #0
+        MCR     p15, 0, a1, c7, c5, 0
+        MCR     p15, 0, a1, c7, c5, 6
+        DSB     SY
+        ISB     SY
+ ]
+        MOV     pc, lr
+
+        END

@@ -1,0 +1,412 @@
+; 
+; CDDL HEADER START
+; 
+; The contents of this file are subject to the terms of the
+; Common Development and Distribution License (the "Licence").
+; You may not use this file except in compliance with the Licence.
+; 
+; You can obtain a copy of the licence at
+; RiscOS/Sources/ThirdParty/Endurance/Lib/DThreads/LICENCE.
+; See the Licence for the specific language governing permissions
+; and limitations under the Licence.
+; 
+; When distributing Covered Code, include this CDDL HEADER in each
+; file and include the Licence file. If applicable, add the
+; following below this CDDL HEADER, with the fields enclosed by
+; brackets "[]" replaced with your own identifying information:
+; Portions Copyright [yyyy] [name of copyright owner]
+; 
+; CDDL HEADER END
+; 
+; 
+; Copyright 2007 Endurance Technology Ltd.  All rights reserved.
+; Use is subject to license terms.
+; 
+; CStart.s
+; Low-level stuff that can't be written in C.
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:APCS.<APCS>
+        GET     Hdr:ModHand
+        GET     Hdr:UpCall
+        GET     Hdr:EnvNumbers
+        GET     Hdr:Wimp
+
+        EXPORT  DThreads_ModuleStart
+        EXPORT  DThreads_ModuleCleanUp
+        EXPORT  DThreads_ModuleBase
+
+        IMPORT  _kernel_init
+        IMPORT  _clib_finalisemodule
+        IMPORT  |Image$$RO$$Base|
+        IMPORT  |RTSK$$Data$$Base|
+        IMPORT  |RTSK$$Data$$Limit|
+        IMPORT  DThreads_FindMem
+        IMPORT  DThreads_CloseDownThread
+
+        AREA    |Asm$$Code|, CODE, READONLY
+
+        IMPORTVar DThreads_StaticDataMutex
+        IMPORTVar DThreads_Initialised
+        IMPORTVar DThreads_ThreadCount
+        IMPORTVar DThreads_CommandLineParserBuffer
+        IMPORTVar DThreads_OldHandlers
+        IMPORTVar DThreads_ErrorBuffer
+        IMPORTVar DThreads_DANumber
+        IMPORTVar DThreads_DABase
+
+        ; In:  a2 -> mutex
+        ; Out: a1, lr_svc corrupted
+        MACRO
+$label  ClaimMutex
+$label
+10      MOV     a1, #0
+        SWP     a1, a1, [a2]
+        TEQ     a1, #0
+        BNE     %FT90
+        MOV     a1, #6
+        SWI     XOS_UpCall
+        B       %BT10
+90
+        MEND
+
+        ; In: a2 -> mutex
+        ; Out: a1 corrupted
+        MACRO
+$label  ReleaseMutex
+        MOV     a1, #1
+        STR     a1, [a2]
+        MEND
+
+; Size of root stack
+StackSize * 2*1024
+
+; Layout of int_thread struct (must be kept in line with C version)
+                ^       0
+t_mem_next      #       4
+t_mem_handle    #       4
+t_task_handle   #       4
+t_old_handlers  #       4*9
+t_error_buffer  #       4 + 256
+t_next          #       4
+t_stack         #       4
+
+; Distance from the relocation offsets to the stack limit
+|_Lib$Reloc$Off$DP| * 540
+
+; Module-application start entry point.
+; a1 -> command string
+; ip -> module private word
+; USR mode.
+; Return using OS_Exit (or never, if execution context is shut down remotely).
+DThreads_ModuleStart
+        LDR     ip, [ip]
+        LDMIB   ip, {v5-v6} ; get lib as well as client relocation
+        LDRVar  a2, v6, DThreads_Initialised
+        EORS    a2, a2, #1 ; first time?
+        BNE     %FT50
+
+        ; Getting here means we're a thread running under the TaskWindow
+        MOV     v5, a1 ; keep argument string safe
+        ADRVar  a2, v6, DThreads_StaticDataMutex
+        ClaimMutex
+        ADR     a1, keyword_definition
+        MOV     a2, v5
+        ADRVar  a3, v6, DThreads_CommandLineParserBuffer
+        MOV     a4, #16
+        SWI     XOS_ReadArgs
+        LDRVC   a2, [a3]
+        MOVVC   a1, #16
+        SWIVC   XOS_ReadUnsigned
+        ADRVar  a2, v6, DThreads_StaticDataMutex
+        ReleaseMutex
+        SWIVS   OS_GenerateError
+        MOV     v5, a3 ; -> thread's root stack chunk
+
+        ; Get stack and thread details
+        LDR     a1, [v5, #3*4] ; stack size
+        ADD     sp, v5, a1
+        SUB     sp, sp, #12 ; some data already on stack
+        ADD     sl, v5, #5*4 + |_Lib$Reloc$Off$DP|
+        MOV     fp, #0
+        Pull    "v4" ; -> int_thread struct
+
+        ; Take note of current task handle
+        MOV     a1, #5
+        SWI     Wimp_ReadSysInfo
+        STR     a1, [v4, #t_task_handle]
+
+        ; Install handlers
+        ADR     v1, Handlers
+        ADD     v2, v4, #t_old_handlers
+        ADD     v3, v4, #t_error_buffer
+        BL      InstallHandlers
+
+        ; Call thread
+        MOV     lr, pc
+        Pull    "a1, pc"
+        TEQ     a1, #0
+        MOVEQ   a2, #0
+        MOVEQ   a3, #0
+        SWIEQ   OS_Exit
+        SWI     OS_GenerateError
+
+keyword_definition
+        =       "stack/K", 0
+        ALIGN
+
+50      ; Install handlers around the application, in case the third-party code
+        ; we call from main does something nasty.
+        STRVar  a2, v6, DThreads_Initialised, lr
+        ADR     v1, Handlers_First
+        ADRVar  v2, v6, DThreads_OldHandlers
+        ADRVar  v3, v6, DThreads_ErrorBuffer
+        BL      InstallHandlers
+
+        ; Create root stack chunk
+        LDRVar  v2, v6, DThreads_DABase
+        MOV     a1, v2
+        MOV     a2, #StackSize
+        MOV     lr, #0
+51      STR     lr, [a1], #4
+        SUBS    a2, a2, #4
+        BNE     %BT51
+        LDR     a1, =&f60690ff
+        MOV     a2, #0
+        MOV     a3, #0
+        MOV     a4, #StackSize
+        MOV     v1, #0
+        STMIA   v2, {a1-v1,v5-v6}
+
+        ; Do C library initialisation
+        LDRVar  a1, v6, DThreads_DANumber
+        SWI     XOS_ReadDynamicArea
+        ADD     v1, v2, a2
+        MOV     a4, #1
+        ADD     a3, v2, #StackSize
+        MOV     a2, v2
+        ADR     a1, _k_init_block
+        B       _kernel_init
+
+Handlers
+        DCD     ErrorH
+        DCD     ExitH
+        DCD     UpCallH
+
+Handlers_First
+        DCD     ErrorH_First
+        DCD     ExitH_First
+        DCD     UpCallH_First
+
+_k_init_block
+        DCD     |Image$$RO$$Base|
+        DCD     |RTSK$$Data$$Base|
+        DCD     |RTSK$$Data$$Limit|
+
+        ; In:
+        ;   v1 -> handlers to install
+        ;   v2 -> block to save old handlers
+        ;   v3 -> error buffer
+        ;   ip -> module workspace
+        ;   USR mode
+        ; Out:
+        ;   a1-v2 corrupted
+InstallHandlers
+        MOV     a1, #ErrorHandler
+        LDR     a2, [v1], #4
+        MOV     a3, ip
+        MOV     a4, v3
+        SWI     XOS_ChangeEnvironment
+        STMIA   v2!, {a2-a4}
+        MOV     a1, #ExitHandler
+        LDR     a2, [v1], #4
+        MOV     a3, ip
+        MOV     a4, #0
+        SWI     XOS_ChangeEnvironment
+        STMIA   v2!, {a2-a4}
+        MOV     a1, #UpCallHandler
+        LDR     a2, [v1], #4
+        MOV     a3, ip
+        MOV     a4, #0
+        SWI     XOS_ChangeEnvironment
+        STMIA   v2!, {a2-a4}
+        MOV     pc, lr
+
+        ; In:
+        ;   v1 -> handlers to restore
+        ;   SVC mode
+        ; Out:
+        ;   a1-v1, lr_svc corrupted
+RemoveHandlers
+        Push    "lr"
+        MOV     a1, #ErrorHandler
+        LDMIA   v1!, {a2-a4}
+        SWI     XOS_ChangeEnvironment
+        MOV     a1, #ExitHandler
+        LDMIA   v1!, {a2-a4}
+        SWI     XOS_ChangeEnvironment
+        MOV     a1, #UpCallHandler
+        LDMIA   v1!, {a2-a4}
+        SWI     XOS_ChangeEnvironment
+        Pull    "pc"
+
+ErrorH_First
+        SWI     XOS_EnterOS ; stop preemption and guarantee us a stack
+        MOV     sl, sp, LSR #20
+        MOV     sl, sl, LSL #20
+        MOV     fp, #0
+        LDMIB   a1, {v5-v6}
+        STMIA   sl, {v5-v6}
+        ADD     sl, sl, #|_Lib$Reloc$Off$DP|
+        ADRVar  v1, v6, DThreads_OldHandlers
+        ADRVar  v2, v6, DThreads_ErrorBuffer
+        B       %FT10
+ErrorH
+        SWI     XOS_EnterOS ; stop preemption and guarantee us a stack
+        MOV     sl, sp, LSR #20
+        MOV     sl, sl, LSL #20
+        MOV     fp, #0
+        LDMIB   a1, {v5-v6}
+        STMIA   sl, {v5-v6}
+        ADD     sl, sl, #|_Lib$Reloc$Off$DP|
+        MOV     a1, #0 ; get pointer to int_thread struct (8 bytes in)
+        BL      DThreads_FindMem
+        ADD     v1, a1, #t_old_handlers - 8
+        ADD     v2, a1, #t_error_buffer - 8
+10      BL      RemoveHandlers
+        BL      DThreads_CloseDownThread
+        LDRVar  a1, v6, DThreads_ThreadCount
+        CMP     a1, #0
+        ADD     a1, v2, #4 ; point at error block, skipping stored PC
+        SWIHI   OS_GenerateError ; if not last thread, just call parent handler
+        LDR     a2, =&58454241
+        MOV     a3, #-1 ; max possible return code, should guarantee error
+        LDR     a4, =|Image$$RO$$Base|
+        LDR     lr, [a4, #16]
+        ADD     a4, a4, lr ; -> module name
+        SWI     OS_ExitAndDie
+        ; this will kill the module and branch directly to parent error handler
+
+ExitH_First
+        SWI     XOS_EnterOS ; stop preemption and guarantee us a stack
+        MOV     sl, sp, LSR #20
+        MOV     sl, sl, LSL #20
+        MOV     fp, #0
+        LDMIB   ip, {v5-v6}
+        STMIA   sl, {v5-v6}
+        ADD     sl, sl, #|_Lib$Reloc$Off$DP|
+        ADRVar  v1, v6, DThreads_OldHandlers
+        B       %FT10
+ExitH
+        SWI     XOS_EnterOS ; stop preemption and guarantee us a stack
+        MOV     sl, sp, LSR #20
+        MOV     sl, sl, LSL #20
+        MOV     fp, #0
+        LDMIB   ip, {v5-v6}
+        STMIA   sl, {v5-v6}
+        ADD     sl, sl, #|_Lib$Reloc$Off$DP|
+        MOV     a1, #0 ; get pointer to int_thread struct (8 bytes in)
+        BL      DThreads_FindMem
+        ADD     v1, a1, #t_old_handlers - 8
+10      BL      RemoveHandlers
+        BL      DThreads_CloseDownThread
+        LDRVar  a1, v6, DThreads_ThreadCount
+        CMP     a1, #0
+        MOV     a1, #0
+        MOV     a2, #0
+        MOV     a3, #0
+        SWIHI   OS_Exit ; if not last thread, just call parent handler
+        LDR     a4, =|Image$$RO$$Base|
+        LDR     lr, [a4, #16]
+        ADD     a4, a4, lr ; -> module name
+        SWI     OS_ExitAndDie
+        ; this will kill the module and branch directly to parent exit handler
+
+UpCallH_First
+        TEQ     a1, #UpCall_NewApplication
+        MOVNE   pc, lr
+        Push    "a1-v1,v3-v6,sl,fp,lr"
+        MOV     sl, sp, LSR #20
+        MOV     sl, sl, LSL #20
+        MOV     fp, #0
+        LDMIA   sl, {v3-v4}
+        LDMIB   ip, {v5-v6}
+        STMIA   sl, {v5-v6}
+        ADD     sl, sl, #|_Lib$Reloc$Off$DP|
+        ADRVar  v1, v6, DThreads_OldHandlers
+        B       %FT10
+UpCallH
+        TEQ     a1, #UpCall_NewApplication
+        MOVNE   pc, lr
+        Push    "a1-v1,v3-v6,sl,fp,lr"
+        MOV     sl, sp, LSR #20
+        MOV     sl, sl, LSL #20
+        MOV     fp, #0
+        LDMIA   sl, {v3-v4}
+        LDMIB   ip, {v5-v6}
+        STMIA   sl, {v5-v6}
+        ADD     sl, sl, #|_Lib$Reloc$Off$DP|
+        MOV     a1, #0 ; get pointer to int_thread struct (8 bytes in)
+        BL      DThreads_FindMem
+        ADD     v1, a1, #t_old_handlers - 8
+10      BL      RemoveHandlers
+        BL      DThreads_CloseDownThread
+        LDRVar  a1, v6, DThreads_ThreadCount
+        CMP     a1, #0
+        SUB     sl, sl, #|_Lib$Reloc$Off$DP|
+        STMIA   sl, {v3-v4}
+        Pull    "a1-v1,v3-v6,sl,fp"
+        Pull    "pc", HI ; just return if not last thread
+        ; It's a little tricky here, because there's no equivalent of
+        ; OS_ExitAndDie that we can use, and we can't execute code from the
+        ; module once it's been killed. Build some return code on the SVC stack!
+        Pull    "lr"
+        MOV     ip, sp
+        SUB     sp, sp, #3*4 ; make space for the return code
+        Push    "a1-a3,ip,lr"
+        ADR     lr, %FT99
+        LDMIA   lr, {a1-a3}
+        STMDB   ip, {a1-a3}
+        MOV     a1, #1
+        ADD     a2, sp, #5*4
+        ADD     a3, sp, #7*4
+        SWI     XOS_SynchroniseCodeAreas
+        LDR     a2, =|Image$$RO$$Base|
+        LDR     lr, [a2, #16]
+        ADD     a2, a2, lr ; -> module name
+        MOV     a1, #4 ; kill module
+        ADD     pc, sp, #5*4
+99      SWI     XOS_Module
+        CMP     a1, a1 ; ignore errors
+        LDMIA   sp, {a1-a3,sp,pc}
+
+; Late finalisation entry point.
+; Called when ModuleInit returns an error, or ModuleFinal is successful.
+; a1 -> module private word
+; SVC mode.
+; Must return with V clear due to a bug in CMHG.
+DThreads_ModuleCleanUp
+        ; Read our dynamic area number from static storage before it gets freed.
+        FunctionEntry
+        LDR     ip, [a1]
+        StaticBaseFromWP a2, ip
+        LDRVar  lr, a2, DThreads_DANumber
+        Push    "lr"
+        ; Call C library cleanup.
+        BL      _clib_finalisemodule
+        ; Remove dynamic area if it was created.
+        Pull    "a2"
+        TEQ     a2, #0
+        MOVNE   a1, #1
+        SWINE   XOS_DynamicArea
+        CLRV
+        Return
+
+; Return the base address of the module
+DThreads_ModuleBase
+        LDR     a1, =|Image$$RO$$Base|
+        Return  , LinkNotStacked
+
+        END

@@ -1,0 +1,427 @@
+;
+; CDDL HEADER START
+;
+; The contents of this file are subject to the terms of the
+; Common Development and Distribution License (the "Licence").
+; You may not use this file except in compliance with the Licence.
+;
+; You can obtain a copy of the licence at
+; cddl/RiscOS/Sources/HAL/Titanium/LICENCE.
+; See the Licence for the specific language governing permissions
+; and limitations under the Licence.
+;
+; When distributing Covered Code, include this CDDL HEADER in each
+; file and include the Licence file. If applicable, add the
+; following below this CDDL HEADER, with the fields enclosed by
+; brackets "[]" replaced with your own identifying information:
+; Portions Copyright [yyyy] [name of copyright owner]
+;
+; CDDL HEADER END
+;
+;
+; Copyright 2014 Elesar Ltd.  All rights reserved.
+; Use is subject to license terms.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:OSEntries
+        
+        GET     hdr.RegMap
+        GET     hdr.StaticWS
+
+        AREA    |Muxing$$Code|, CODE, READONLY, PIC
+
+        EXPORT  SetupPinMux
+        EXPORT  SetupInterruptMux
+        EXPORT  SetupDMAMux
+        EXPORT  SetupClockMux
+
+; SetupClockMux
+SetupClockMux ROUT
+        LDR     a2, =ControlCore_PhysBase + ControlCore_PhysAdjust
+
+        ; Mux DPLL_DSI1_A_CLK1 to LCD1 and switch VIDE01 and HDMI away from L4 view
+        LDR     a1, [a2, #CTRL_CORE_DSS_PLL_CONTROL]
+        BIC     a1, a1, #CTRL_CORE_DSS_PLL_CONTROL_PLL_VIDEO1_DSS_CONTROL_DISABLE :OR: \
+                         CTRL_CORE_DSS_PLL_CONTROL_PLL_HDMI_DSS_CONTROL_DISABLE :OR: \
+                         CTRL_CORE_DSS_PLL_CONTROL_DSI1_A_CLK1_SELECTION_MASK
+        ASSERT  CTRL_CORE_DSS_PLL_CONTROL_DSI1_A_CLK1_SELECTION_VIDEO1 = 0                 
+        STR     a1, [a2, #CTRL_CORE_DSS_PLL_CONTROL]
+
+        ; Request DES HDCP clock, not used but without it the DSS gets stuck initialising
+        LDR     a1, [a2, #CTRL_CORE_CONTROL_IO_2]
+        ORR     a1, a1, #CTRL_CORE_CONTROL_IO_2_DSS_DESHDCP_CLKEN
+        STR     a1, [a2, #CTRL_CORE_CONTROL_IO_2]
+
+        ; Mux clock from SYS_CLK1 to VIDEO1 and HDMI PLLs
+        LDR     a2, =PRMCkgen_PhysBase
+        ASSERT  CM_CLKSEL_VIDEO1_PLL_SYS_SYS_CLK1 = CM_CLKSEL_HDMI_PLL_SYS_SYS_CLK1 
+        MOV     a1, #0
+        STR     a1, [a2, #CM_CLKSEL_VIDEO1_PLL_SYS]
+        STR     a1, [a2, #CM_CLKSEL_HDMI_PLL_SYS]
+
+        ; Turn on the optional 60MHz for the USB2 PHYs
+        LDR     a2, =CMCoreCoreAON_PhysBase
+        MOV     a1, #CM_COREAON_L3INIT_60M_GFCLK_CLKCTRL_OPTFCLKEN_L3INIT_60M_GFCLK
+        STR     a1, [a2, #CM_COREAON_L3INIT_60M_GFCLK_CLKCTRL]
+
+        ; Ensure CORE_CLK = CORE_X2_CLK after post divide
+        LDR     a2, =CMCoreAONCkgen_PhysBase
+        LDR     a1, [a2, #CM_CLKSEL_CORE]
+        BIC     a1, a1, #CM_CLKSEL_CORE_CLKSEL_L3
+        STR     a1, [a2, #CM_CLKSEL_CORE]
+
+        ; Turn on the shared OCP2SCP translators
+        LDR     a2, =CMCoreL3INIT_PhysBase
+        MOV     a1, #CM_CLKCTRL_MODULEMODE_AUTO
+        STR     a1, [a2, #CM_L3INIT_OCP2SCP1_CLKCTRL]
+        STR     a1, [a2, #CM_L3INIT_OCP2SCP3_CLKCTRL]
+        LDR     a2, =CMCoreL4CFG_PhysBase
+        STR     a1, [a2, #CM_L4CFG_OCP2SCP2_CLKCTRL]
+
+        ; OCP2SCP reset
+        MOV     a4, #3
+20
+        CMP     a4, #2
+        LDRCC   a2, =OCP2SCP1_PhysBase
+        LDREQ   a2, =OCP2SCP2_PhysBase
+        LDRHI   a2, =OCP2SCP3_PhysBase
+        MOV     a1, #OCP2SCP_SYSCONFIG_SOFTRESET
+        STR     a1, [a2, #OCP2SCP_SYSCONFIG]
+30
+        LDR     a1, [a2, #OCP2SCP_SYSSTATUS]
+        TST     a1, #OCP2SCP_SYSSTATUS_RESETDONE
+        BEQ     %BT30
+
+        ; Pick some safe sync times, leave DIVISIONRATIO alone
+        LDR     a1, [a2, #OCP2SCP_TIMING]
+        BIC     a1, a1, #OCP2SCP_TIMING_SYNC2_MASK :OR: OCP2SCP_TIMING_SYNC1_MASK
+        ORR     a1, a1, #(7:SHL:OCP2SCP_TIMING_SYNC2_SHIFT) :OR: \
+                         (7:SHL:OCP2SCP_TIMING_SYNC1_SHIFT)
+        STR     a1, [a2, #OCP2SCP_TIMING]
+        SUBS    a4, a4, #1
+        BNE     %BT20
+
+        ; Turn on the GPIO2 clock for CMOS lock
+        LDR     a2, =CMCoreL4PER_PhysBase
+        MOV     a1, #CM_CLKCTRL_MODULEMODE_AUTO
+        STR     a1, [a2, #CM_L4PER_GPIO2_CLKCTRL]
+
+        MOV     pc, lr
+
+; SetupInterruptMux
+SetupInterruptMux ROUT
+        LDR     a2, =ControlCore_PhysBase + ControlCore_PhysAdjust
+
+        ; Steer UART8 interrupts to a spare one
+        LDR     a3, =CTRL_CORE_IRQ_HI_MASK
+        ASSERT  DevNoUART8 = 27
+        LDR     a1, [a2, #CTRL_CORE_MPU_IRQ_26_27]
+        BIC     a1, a1, a3
+        ORR     a1, a1, #219:SHL:CTRL_CORE_IRQ_HI_SHIFT
+        STR     a1, [a2, #CTRL_CORE_MPU_IRQ_26_27]
+
+        ; Steer MCASP3 interrupts to a spare one
+        LDR     a3, =CTRL_CORE_IRQ_LO_MASK
+        ASSERT  DevNoMCASP3Tx = 50
+        LDR     a1, [a2, #CTRL_CORE_MPU_IRQ_50_51]
+        BIC     a1, a1, a3
+        ORR     a1, a1, #151:SHL:CTRL_CORE_IRQ_LO_SHIFT
+        STR     a1, [a2, #CTRL_CORE_MPU_IRQ_50_51]
+        
+        ; Steer CPSW interrupts to a spare block of 4 for the MPU
+        LDR     a1, =334:SHL:CTRL_CORE_IRQ_LO_SHIFT :OR: \
+                     335:SHL:CTRL_CORE_IRQ_HI_SHIFT
+        ASSERT  DevNoGMAC = 114
+        STR     a1, [a2, #CTRL_CORE_MPU_IRQ_114_115]
+        LDR     a1, =336:SHL:CTRL_CORE_IRQ_LO_SHIFT :OR: \
+                     337:SHL:CTRL_CORE_IRQ_HI_SHIFT
+        STR     a1, [a2, #CTRL_CORE_MPU_IRQ_116_117]
+
+        ; Steer PCIe interrupts to lower numbered MPU ones
+        LDR     a1, =232:SHL:CTRL_CORE_IRQ_LO_SHIFT :OR: \
+                     233:SHL:CTRL_CORE_IRQ_HI_SHIFT
+        ASSERT  DevNoPCIe0Main = 68
+        ASSERT  DevNoPCIe0MSI = DevNoPCIe0Main + 1
+        STR     a1, [a2, #CTRL_CORE_MPU_IRQ_68_69]
+        LDR     a1, =355:SHL:CTRL_CORE_IRQ_LO_SHIFT :OR: \
+                     356:SHL:CTRL_CORE_IRQ_HI_SHIFT
+        ASSERT  DevNoPCIe1Main = 84
+        ASSERT  DevNoPCIe1MSI = DevNoPCIe1Main + 1
+        STR     a1, [a2, #CTRL_CORE_MPU_IRQ_84_85]
+
+        MOV     pc, lr
+
+; SetupDMAMux
+SetupDMAMux ROUT
+        LDR     a2, =ControlCore_PhysBase + ControlCore_PhysAdjust
+
+        ; Steer MCASP3 DMA to a spare one
+        LDR     a1, =133:SHL:CTRL_CORE_DREQ_LO_SHIFT :OR: \
+                     132:SHL:CTRL_CORE_DREQ_HI_SHIFT
+        ASSERT  (DMANoMCASP3Tx0 = 20) :LAND: (DMANoMCASP3Rx0 = 21)
+        STR     a1, [a2, #CTRL_CORE_DMA_SYSTEM_DREQ_20_21]
+
+        MOV     pc, lr
+        
+; SetupPinMux
+SetupPinMux ROUT
+        LDR     a2, =ControlCore_PhysBase + ControlCore_PhysAdjust
+
+        ; Mux IO pins to IIC4 peripheral
+        LDR     a1, =CTRL_CORE_PAD_MUXMODE_7 :OR: CTRL_CORE_PAD_INPUTENABLE :OR: \
+                     CTRL_CORE_PAD_PULLUDDISABLE
+        STR     a1, [a2, #CTRL_CORE_PAD_GPMC_A1]
+        STR     a1, [a2, #CTRL_CORE_PAD_GPMC_A0]
+
+        ; Mux IO pins to IIC5 peripheral
+        LDR     a1, =CTRL_CORE_PAD_MUXMODE_4 :OR: CTRL_CORE_PAD_INPUTENABLE :OR: \
+                     CTRL_CORE_PAD_PULLUDDISABLE
+        STR     a1, [a2, #CTRL_CORE_PAD_MCASP5_ACLKX]
+        STR     a1, [a2, #CTRL_CORE_PAD_MCASP5_FSX]
+
+        ; Mux IO pins to IIC1 peripheral (no real mux options, but turn off the pullups)
+        LDR     a1, =CTRL_CORE_PAD_MUXMODE_0 :OR: CTRL_CORE_PAD_INPUTENABLE :OR: \
+                     CTRL_CORE_PAD_PULLUDDISABLE
+        STR     a1, [a2, #CTRL_CORE_PAD_I2C1_SDA]
+        STR     a1, [a2, #CTRL_CORE_PAD_I2C1_SCL]
+        
+        ; VOUT1 for 'DVI2' (the HDMI PHY for 'DVI1' has no muxing)
+        LDR     a1, =CTRL_CORE_PAD_MUXMODE_0 :OR: CTRL_CORE_PAD_PULLUDDISABLE
+        STR     a1, [a2, #CTRL_CORE_PAD_VOUT1_CLK]
+        STR     a1, [a2, #CTRL_CORE_PAD_VOUT1_DE]   
+        STR     a1, [a2, #CTRL_CORE_PAD_VOUT1_HSYNC]
+        STR     a1, [a2, #CTRL_CORE_PAD_VOUT1_VSYNC]
+        STR     a1, [a2, #CTRL_CORE_PAD_VOUT1_D0]   
+        STR     a1, [a2, #CTRL_CORE_PAD_VOUT1_D1]   
+        STR     a1, [a2, #CTRL_CORE_PAD_VOUT1_D2]   
+        STR     a1, [a2, #CTRL_CORE_PAD_VOUT1_D3]   
+        STR     a1, [a2, #CTRL_CORE_PAD_VOUT1_D4]   
+        STR     a1, [a2, #CTRL_CORE_PAD_VOUT1_D5]   
+        STR     a1, [a2, #CTRL_CORE_PAD_VOUT1_D6]   
+        STR     a1, [a2, #CTRL_CORE_PAD_VOUT1_D7]   
+        STR     a1, [a2, #CTRL_CORE_PAD_VOUT1_D8]   
+        STR     a1, [a2, #CTRL_CORE_PAD_VOUT1_D9]   
+        STR     a1, [a2, #CTRL_CORE_PAD_VOUT1_D10]  
+        STR     a1, [a2, #CTRL_CORE_PAD_VOUT1_D11]  
+        STR     a1, [a2, #CTRL_CORE_PAD_VOUT1_D12]  
+        STR     a1, [a2, #CTRL_CORE_PAD_VOUT1_D13]  
+        STR     a1, [a2, #CTRL_CORE_PAD_VOUT1_D14]  
+        STR     a1, [a2, #CTRL_CORE_PAD_VOUT1_D15]  
+        STR     a1, [a2, #CTRL_CORE_PAD_VOUT1_D16]  
+        STR     a1, [a2, #CTRL_CORE_PAD_VOUT1_D17]  
+        STR     a1, [a2, #CTRL_CORE_PAD_VOUT1_D18]  
+        STR     a1, [a2, #CTRL_CORE_PAD_VOUT1_D19]  
+        STR     a1, [a2, #CTRL_CORE_PAD_VOUT1_D20]  
+        STR     a1, [a2, #CTRL_CORE_PAD_VOUT1_D21]  
+        STR     a1, [a2, #CTRL_CORE_PAD_VOUT1_D22]  
+        STR     a1, [a2, #CTRL_CORE_PAD_VOUT1_D23]
+
+        ; Turn off charger detect and pullup/down for USB2PHY, make pins USB not GPIO
+        MOV     a1, #CTRL_CORE_SRCOMP_NORTH_SIDE_USB2PHY_DISCHGDET
+        STR     a1, [a2, #CTRL_CORE_SRCOMP_NORTH_SIDE]
+        MOV     a1, #CTRL_CORE_CONTROL_USB2PHYCORE_USB2PHY_DISCHGDET
+        STR     a1, [a2, #CTRL_CORE_CONTROL_USB2PHYCORE]
+
+        ; Not power down USB2PHY1 & USB2PHY2
+        LDR     a1, [a2, #CTRL_CORE_SRCOMP_NORTH_SIDE]
+        BIC     a1, a1, #CTRL_CORE_SRCOMP_NORTH_SIDE_USB2PHY_PD
+        STR     a1, [a2, #CTRL_CORE_SRCOMP_NORTH_SIDE]
+        LDR     a1, [a2, #CTRL_CORE_DEV_CONF]
+        BIC     a1, a1, #CTRL_CORE_DEV_CONF_USBPHY_PD
+        STR     a1, [a2, #CTRL_CORE_DEV_CONF]
+
+        ; Mux for SD card pins of MMC1
+        LDR     a1, =CTRL_CORE_PAD_MUXMODE_0 :OR: CTRL_CORE_PAD_PULLUDDISABLE
+        STR     a1, [a2, #CTRL_CORE_PAD_MMC1_CLK]
+        STR     a1, [a2, #CTRL_CORE_PAD_MMC1_CMD]
+        LDR     a1, =CTRL_CORE_PAD_MUXMODE_0 :OR: CTRL_CORE_PAD_INPUTENABLE :OR: \
+                     CTRL_CORE_PAD_PULLUDDISABLE
+        STR     a1, [a2, #CTRL_CORE_PAD_MMC1_DAT0]
+        STR     a1, [a2, #CTRL_CORE_PAD_MMC1_DAT1]
+        STR     a1, [a2, #CTRL_CORE_PAD_MMC1_DAT2]
+        STR     a1, [a2, #CTRL_CORE_PAD_MMC1_DAT3]
+        STR     a1, [a2, #CTRL_CORE_PAD_MMC1_SDCD]
+        LDR     a1, [a2, #CTRL_CORE_CONTROL_SPARE_RW]
+        ORR     a1, a1, #CTRL_CORE_CONTROL_SPARE_RW_MMC1_LOOPBACK 
+        STR     a1, [a2, #CTRL_CORE_CONTROL_SPARE_RW] ; Internal loopback
+
+        ; Mux data and handshaking lines for UART1
+        LDR     a1, =CTRL_CORE_PAD_MUXMODE_0 :OR: CTRL_CORE_PAD_PULLUDDISABLE
+        STR     a1, [a2, #CTRL_CORE_PAD_UART1_TXD]
+        STR     a1, [a2, #CTRL_CORE_PAD_UART1_RTSN]
+        LDR     a1, =CTRL_CORE_PAD_MUXMODE_5 :OR: CTRL_CORE_PAD_PULLUDDISABLE
+        STR     a1, [a2, #CTRL_CORE_PAD_UART2_CTSN]   ; Aka UART1_DTRN
+
+        LDR     a1, =CTRL_CORE_PAD_MUXMODE_0 :OR: CTRL_CORE_PAD_INPUTENABLE :OR: \
+                     CTRL_CORE_PAD_PULLUDENABLE :OR: CTRL_CORE_PAD_PULLTYPE_UP
+        STR     a1, [a2, #CTRL_CORE_PAD_UART1_RXD]
+        STR     a1, [a2, #CTRL_CORE_PAD_UART1_CTSN]
+        LDR     a1, =CTRL_CORE_PAD_MUXMODE_5 :OR: CTRL_CORE_PAD_INPUTENABLE :OR: \
+                     CTRL_CORE_PAD_PULLUDENABLE :OR: CTRL_CORE_PAD_PULLTYPE_UP
+        STR     a1, [a2, #CTRL_CORE_PAD_UART2_TXD]    ; Aka UART1_DSRN
+        STR     a1, [a2, #CTRL_CORE_PAD_UART2_RXD]    ; Aka UART1_DCDN
+        STR     a1, [a2, #CTRL_CORE_PAD_UART2_RTSN]   ; Aka UART1_RIN
+
+        ; Mux data and handshaking lines for UART8
+        LDR     a1, =CTRL_CORE_PAD_MUXMODE_3 :OR: CTRL_CORE_PAD_PULLUDDISABLE
+        STR     a1, [a2, #CTRL_CORE_PAD_MCASP4_FSX]   ; Aka UART8_TXD
+        STR     a1, [a2, #CTRL_CORE_PAD_MCASP4_AXR1]  ; Aka UART8_RTSN
+        LDR     a1, =CTRL_CORE_PAD_MUXMODE_E :OR: CTRL_CORE_PAD_PULLUDDISABLE
+        STR     a1, [a2, #CTRL_CORE_PAD_SPI2_D0]      ; Aka UART8_DTRN
+
+        LDR     a1, =CTRL_CORE_PAD_MUXMODE_3 :OR: CTRL_CORE_PAD_INPUTENABLE :OR: \
+                     CTRL_CORE_PAD_PULLUDENABLE :OR: CTRL_CORE_PAD_PULLTYPE_UP
+        STR     a1, [a2, #CTRL_CORE_PAD_MCASP4_ACLKX] ; Aka UART8_RXD
+        STR     a1, [a2, #CTRL_CORE_PAD_MCASP4_AXR0]  ; Aka UART8_CTSN
+        LDR     a1, =CTRL_CORE_PAD_MUXMODE_E :OR: CTRL_CORE_PAD_INPUTENABLE :OR: \
+                     CTRL_CORE_PAD_PULLUDENABLE :OR: CTRL_CORE_PAD_PULLTYPE_UP
+        STR     a1, [a2, #CTRL_CORE_PAD_SPI2_D1]      ; Aka UART8_DSRN
+        STR     a1, [a2, #CTRL_CORE_PAD_SPI2_SCLK]    ; Aka UART8_DCDN
+        STR     a1, [a2, #CTRL_CORE_PAD_SPI2_CS0]     ; Aka UART8_RIN
+
+        ; MDIO and 2 x RGMII interfaces
+      [ Vayu
+        LDR     a1, =CTRL_CORE_PAD_MUXMODE_0 :OR: CTRL_CORE_PAD_PULLUDDISABLE
+        STR     a1, [a2, #CTRL_CORE_PAD_MDIO_MCLK]
+        ORR     a1, a1, #CTRL_CORE_PAD_INPUTENABLE
+        STR     a1, [a2, #CTRL_CORE_PAD_MDIO_D]
+
+        ! 0, "TODO! No Vayu RGMII support"
+      |
+        LDR     a1, =CTRL_CORE_PAD_MUXMODE_3 :OR: CTRL_CORE_PAD_PULLUDDISABLE
+        STR     a1, [a2, #CTRL_CORE_PAD_VIN2A_D10]
+        ORR     a1, a1, #CTRL_CORE_PAD_INPUTENABLE
+        STR     a1, [a2, #CTRL_CORE_PAD_VIN2A_D11]
+
+        LDR     a1, [a2, #CTRL_CORE_CONTROL_IO_1]
+        BIC     a1, a1, #CTRL_CORE_CONTROL_IO_1_GMII1_SEL_MASK :OR: \
+                         CTRL_CORE_CONTROL_IO_1_GMII2_SEL_MASK
+        ORR     a1, a1, #CTRL_CORE_CONTROL_IO_1_GMII1_SEL_RGMII :OR: \
+                         CTRL_CORE_CONTROL_IO_1_GMII2_SEL_RGMII 
+        STR     a1, [a2, #CTRL_CORE_CONTROL_IO_1]
+
+        ; RGMII for NET1
+        LDR     a1, =CTRL_CORE_PAD_MUXMODE_0 :OR: CTRL_CORE_PAD_PULLUDDISABLE
+        STR     a1, [a2, #CTRL_CORE_PAD_RGMII0_TXC]
+        STR     a1, [a2, #CTRL_CORE_PAD_RGMII0_TXCTL]
+        STR     a1, [a2, #CTRL_CORE_PAD_RGMII0_TXD3]
+        STR     a1, [a2, #CTRL_CORE_PAD_RGMII0_TXD2]
+        STR     a1, [a2, #CTRL_CORE_PAD_RGMII0_TXD1]
+        STR     a1, [a2, #CTRL_CORE_PAD_RGMII0_TXD0]
+        ORR     a1, a1, #CTRL_CORE_PAD_INPUTENABLE
+        STR     a1, [a2, #CTRL_CORE_PAD_RGMII0_RXC]
+        STR     a1, [a2, #CTRL_CORE_PAD_RGMII0_RXCTL]
+        STR     a1, [a2, #CTRL_CORE_PAD_RGMII0_RXD3]
+        STR     a1, [a2, #CTRL_CORE_PAD_RGMII0_RXD2]
+        STR     a1, [a2, #CTRL_CORE_PAD_RGMII0_RXD1]
+        STR     a1, [a2, #CTRL_CORE_PAD_RGMII0_RXD0]
+        
+        ; RGMII for NET2
+        LDR     a1, =CTRL_CORE_PAD_MUXMODE_3 :OR: CTRL_CORE_PAD_PULLUDDISABLE
+        STR     a1, [a2, #CTRL_CORE_PAD_VIN2A_D12]
+        STR     a1, [a2, #CTRL_CORE_PAD_VIN2A_D13]
+        STR     a1, [a2, #CTRL_CORE_PAD_VIN2A_D14]
+        STR     a1, [a2, #CTRL_CORE_PAD_VIN2A_D15]
+        STR     a1, [a2, #CTRL_CORE_PAD_VIN2A_D16]
+        STR     a1, [a2, #CTRL_CORE_PAD_VIN2A_D17]
+        ORR     a1, a1, #CTRL_CORE_PAD_INPUTENABLE
+        STR     a1, [a2, #CTRL_CORE_PAD_VIN2A_D18]
+        STR     a1, [a2, #CTRL_CORE_PAD_VIN2A_D19]
+        STR     a1, [a2, #CTRL_CORE_PAD_VIN2A_D20]
+        STR     a1, [a2, #CTRL_CORE_PAD_VIN2A_D21]
+        STR     a1, [a2, #CTRL_CORE_PAD_VIN2A_D22]
+        STR     a1, [a2, #CTRL_CORE_PAD_VIN2A_D23]
+      ]
+        ; PCIe on two controllers, 1 lane each
+        LDR     a1, [a2, #CTRL_CORE_CONTROL_IO_2]
+        BIC     a1, a1, #CTRL_CORE_CONTROL_IO_2_PCIE_1LANE_2LANE_SELECTION
+        STR     a1, [a2, #CTRL_CORE_CONTROL_IO_2]
+        LDR     a1, [a2, #CTRL_CORE_PCIE_CONTROL]
+        BIC     a1, a1, #CTRL_CORE_PCIE_CONTROL_PCIE_B1C0_MODE_SEL
+        STR     a1, [a2, #CTRL_CORE_PCIE_CONTROL]
+        LDR     a1, =CTRL_CORE_PCIE_PCS_NOMINAL
+        STR     a1, [a2, #CTRL_CORE_PCIE_PCS]
+
+        ; Hotplug inputs (unused)
+        LDR     a1, =CTRL_CORE_PAD_MUXMODE_E :OR: CTRL_CORE_PAD_INPUTENABLE :OR: \
+                     CTRL_CORE_PAD_PULLUDDISABLE
+        STR     a1, [a2, #CTRL_CORE_PAD_VIN2A_HSYNC0]
+        STR     a1, [a2, #CTRL_CORE_PAD_VIN2A_FLD0]
+
+        ; Soft off control line
+        LDR     a1, =CTRL_CORE_PAD_MUXMODE_E :OR: CTRL_CORE_PAD_PULLUDDISABLE
+        STR     a1, [a2, #CTRL_CORE_PAD_SPI1_SCLK]
+
+        ; MMC1 power control FET
+        LDR     a1, =CTRL_CORE_PAD_MUXMODE_E :OR: CTRL_CORE_PAD_PULLUDDISABLE
+        STR     a1, [a2, #CTRL_CORE_PAD_MMC3_DAT1]
+
+        ; The CMOS lock jumper
+        LDR     a1, =CTRL_CORE_PAD_MUXMODE_E :OR: CTRL_CORE_PAD_INPUTENABLE :OR: \
+                     CTRL_CORE_PAD_PULLUDDISABLE
+        STR     a1, [a2, #CTRL_CORE_PAD_GPMC_WAIT0]
+
+        ; Unique PROM clock out and data in
+        LDR     a1, =CTRL_CORE_PAD_MUXMODE_E :OR: CTRL_CORE_PAD_PULLUDDISABLE
+        STR     a1, [a2, #CTRL_CORE_PAD_GPMC_AD0]
+        ORR     a1, a1, #CTRL_CORE_PAD_INPUTENABLE
+        STR     a1, [a2, #CTRL_CORE_PAD_GPMC_AD1]
+
+        ; RAM vendor table entry number (unused)
+        LDR     a1, =CTRL_CORE_PAD_MUXMODE_E :OR: CTRL_CORE_PAD_INPUTENABLE :OR: \
+                     CTRL_CORE_PAD_PULLUDDISABLE
+        STR     a1, [a2, #CTRL_CORE_PAD_GPMC_AD10]
+        STR     a1, [a2, #CTRL_CORE_PAD_GPMC_AD11]
+        STR     a1, [a2, #CTRL_CORE_PAD_GPMC_AD12]
+        STR     a1, [a2, #CTRL_CORE_PAD_GPMC_AD13]
+
+        ; User port
+        LDR     a1, =CTRL_CORE_PAD_MUXMODE_E :OR: CTRL_CORE_PAD_INPUTENABLE :OR: \
+                     CTRL_CORE_PAD_PULLUDENABLE :OR: CTRL_CORE_PAD_PULLTYPE_UP
+        STR     a1, [a2, #CTRL_CORE_PAD_VIN2A_VSYNC0]             
+        STR     a1, [a2, #CTRL_CORE_PAD_VIN2A_D0]
+        STR     a1, [a2, #CTRL_CORE_PAD_VIN2A_D1]
+        STR     a1, [a2, #CTRL_CORE_PAD_VIN2A_D2]
+        STR     a1, [a2, #CTRL_CORE_PAD_VIN2A_D3]
+        STR     a1, [a2, #CTRL_CORE_PAD_VIN2A_D4]
+        STR     a1, [a2, #CTRL_CORE_PAD_VIN2A_D5]
+        STR     a1, [a2, #CTRL_CORE_PAD_VIN2A_D6]
+        LDR     a1, =CTRL_CORE_PAD_MUXMODE_E :OR: CTRL_CORE_PAD_INPUTENABLE :OR: \
+                     CTRL_CORE_PAD_PULLUDDISABLE
+        STR     a1, [a2, #CTRL_CORE_PAD_WAKEUP2]
+        STR     a1, [a2, #CTRL_CORE_PAD_WAKEUP3]
+
+        ; USB o/c pins one per hub port (unused)
+        LDR     a1, =CTRL_CORE_PAD_MUXMODE_E :OR: CTRL_CORE_PAD_INPUTENABLE :OR: \
+                     CTRL_CORE_PAD_PULLUDDISABLE
+        STR     a1, [a2, #CTRL_CORE_PAD_GPIO6_10]
+        STR     a1, [a2, #CTRL_CORE_PAD_GPIO6_11]
+        STR     a1, [a2, #CTRL_CORE_PAD_MMC3_DAT0]
+        STR     a1, [a2, #CTRL_CORE_PAD_MMC3_CMD]
+        STR     a1, [a2, #CTRL_CORE_PAD_MMC3_CLK]
+        STR     a1, [a2, #CTRL_CORE_PAD_MMC1_SDWP]
+        STR     a1, [a2, #CTRL_CORE_PAD_USB2_DRVVBUS]
+        STR     a1, [a2, #CTRL_CORE_PAD_USB1_DRVVBUS]
+
+        ; PMIC interrupt (unused)
+        LDR     a1, =CTRL_CORE_PAD_MUXMODE_E :OR: CTRL_CORE_PAD_INPUTENABLE :OR: \
+                     CTRL_CORE_PAD_PULLUDDISABLE
+        STR     a1, [a2, #CTRL_CORE_PAD_SPI1_CS0]
+
+        ; Mux IO pins for MCASP audio
+        LDR     a1, =CTRL_CORE_PAD_MUXMODE_0 :OR: CTRL_CORE_PAD_INPUTENABLE :OR: \
+                     CTRL_CORE_PAD_PULLUDDISABLE
+        STR     a1, [a2, #CTRL_CORE_PAD_MCASP3_AXR1]
+        STR     a1, [a2, #CTRL_CORE_PAD_MCASP3_ACLKX]
+        LDR     a1, =CTRL_CORE_PAD_MUXMODE_0 :OR: CTRL_CORE_PAD_PULLUDDISABLE
+        STR     a1, [a2, #CTRL_CORE_PAD_MCASP3_AXR0]
+        STR     a1, [a2, #CTRL_CORE_PAD_MCASP3_FSX]
+        LDR     a1, =CTRL_CORE_PAD_MUXMODE_3 :OR: CTRL_CORE_PAD_PULLUDDISABLE
+        STR     a1, [a2, #CTRL_CORE_PAD_XREF_CLK2]
+
+        MOV     pc, lr
+
+        END

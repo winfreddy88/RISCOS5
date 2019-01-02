@@ -1,0 +1,389 @@
+; Copyright 2017 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr.Copro15ops
+        GET     Hdr:MEMM.VMSAv6
+        GET     Hdr.Defs
+
+        AREA    Bootstrap, CODE, READONLY, PIC
+
+        EXPORT  BootstrapStart
+        EXPORT  BootstrapEnd
+        EXPORT  BootstrapLen
+        EXPORT  BootstrapBootOffset
+        EXPORT  BootstrapDataOffset
+
+a1      RN      0
+a2      RN      1
+a3      RN      2
+a4      RN      3
+v1      RN      4
+v2      RN      5
+v3      RN      6
+v4      RN      7
+v5      RN      8
+v6      RN      9
+sb      RN      9
+v7      RN      10
+v8      RN      11
+
+        MACRO
+        DebugReg $reg, $str
+ [ BootstrapDebug
+        Push "$reg"
+        [ "$str" <> ""      
+           BL      DebugHALPrint
+           =       "$str", 0
+           ALIGN
+        ]
+        bl  DebugHALPrintReg
+ ]
+        MEND
+
+        MACRO
+        DebugTX $str
+ [ BootstrapDebug
+        BL      DebugHALPrint
+        =       "$str", 13,10,00
+        ALIGN
+ ]
+        MEND
+
+        MACRO
+        DebugProgress
+ [ BootstrapDebug
+        STR     pc, BootstrapStart
+ ]
+        MEND
+
+BootstrapLen
+        DCD     BootstrapEnd - BootstrapStart
+ 
+BootstrapBootOffset
+        DCD     BootstrapBoot - BootstrapStart
+
+BootstrapDataOffset
+        DCD     BootstrapData - BootstrapStart
+
+BootstrapStart
+ [ BootstrapDebug
+        ; Processor vectors
+        B       Reset
+        B       Undef
+        B       SWI
+        B       Prefetch
+        B       Data
+        B       AddrEx
+        B       IRQ
+        B       FIQ
+ ]
+
+BootstrapBoot
+        DebugProgress
+
+        ; Drop out of HYP and into SVC
+        MRS     r0, CPSR
+        AND     r0, r0, #M32_bits
+        TEQ     r0, #HYP32_mode
+        LDR     r0, =F32_bit+I32_bit+A32_bit+SVC32_mode
+        BNE     %FT02
+
+        ADR     lr, %FT03
+        MSR     SPSR_cxsf, r0
+        MSR     elr_hyp, lr
+        ERET
+02
+        MSR     CPSR_cxsf, r0
+03
+
+        DebugProgress
+
+        ; OS_InitARM surrogate
+        ; Can't call the real one since it would invalidate all caches (!)
+        ; (Also it's hard to locate)
+        ADR     r0, mmuc_init_new
+        LDMIA   r0, {r0, r1}
+        ARM_read_control r2
+        ORR     r2, r2, r0
+        BIC     r2, r2, r1
+        ORR     r2, r2, #MMUC_I
+        ARM_write_control r2
+
+        DebugProgress
+
+        ; Invalidate L1 caches
+        BL      InvalidateCaches ; r7-r13 corrupted
+
+        DebugProgress
+
+        ; Prep CP15
+        MOV     r0, #0
+        MCR     p15, 0, r0, c2, c0, 2 ; TTBCR: Ensure only TTBR0 is used
+        MOV     r0, #1
+        ARM_MMU_domain r0
+ [ BootstrapDebug
+        LDR     r0, BootstrapData+BWS_BootstrapLog
+        MCR     p15, 0, r0, c12, c0, 0 ; Set VBAR to our vectors
+ ]
+        LDR     r0, BootstrapData+BWS_BootstrapMyL1PT
+        ARM_MMU_transbase r0
+        ISB
+        ; TODO: Probably need to set up ACTLR correctly (make it HAL responsibility?)
+        ; TODO: Rather than rebuild SCTLR from scratch, just copy primary core SCTLR+ACTLR (with VBAR modifications)
+        ; Enable MMU, caches, etc.
+        ARM_read_control r0
+        ORR     r0, r0, #MMUC_W+MMUC_C+MMUC_M   ; Write buffer, data cache, MMU on
+        ORR     r0, r0, #MMUC_R+MMUC_Z          ; ROM mode enable, branch predict enable
+        ORR     r0, r0, #MMUC_XP ; Extended pages enabled (v6)
+        BIC     r0, r0, #MMUC_TRE+MMUC_AFE ; TEX remap, Access Flag disabled
+        BIC     r0, r0, #MMUC_EE+MMUC_TE+MMUC_VE ; Exceptions = nonvectored LE ARM
+        ORR     r0, r0, #MMUC_A ; Alignment exceptions on
+        BIC     r0, r0, #MMUC_V ; High processor vectors disabled - use VBAR
+        ARM_write_control r0
+        ISB
+        NOP
+        NOP
+
+        DebugProgress
+
+        ; MMU now on, branch to logical mapping of ourselves
+        LDR     r0, BootstrapData+BWS_BootstrapLog
+        LDR     r1, =BootstrapStage2-BootstrapStart
+        ADD     pc, r0, r1
+
+mmuc_init_new
+        ; MMUC initialisation flags for ARMv6/ARMv7
+        ; This tries to leave the reserved/unpredictable bits untouched, while initialising everything else to what we want
+                ; ARMv7MP (probably) wants SW. ARMv6 wants U+XP (which should both be fixed at 1 on ARMv7)
+        DCD     MMUC_SW+MMUC_U+MMUC_XP
+                ; M+C+W+Z+I+L2 clear to keep MMU/caches off.
+                ; A to keep alignment exceptions off (for now at least)
+                ; B+EE clear for little-endian
+                ; S+R+RR clear to match mmuc_init_old
+                ; V+VE clear to keep processor vectors at &0
+                ; FI clear to disable fast FIQs (interruptible LDM/STM)
+                ; TRE+AFE clear for our VMSAv6 implementation
+                ; TE clear for processor vectors to run in ARM mode
+        DCD     MMUC_M+MMUC_A+MMUC_C+MMUC_W+MMUC_B+MMUC_S+MMUC_R+MMUC_Z+MMUC_I+MMUC_V+MMUC_RR+MMUC_FI+MMUC_VE+MMUC_EE+MMUC_L2+MMUC_TRE+MMUC_AFE+MMUC_TE
+
+
+BootstrapStage2        
+        DebugProgress
+
+        ; Switch to OS L1PT
+        LDR     r0, BootstrapData+BWS_BootstrapOSL1PT
+        ARM_MMU_transbase r0
+        ISB
+        TLBIALL ; invalidate TLBs
+        ICIALLU ; invalidate instruction cache + branch predictors
+        DSB     ; Wait for completion
+        ISB
+
+        DebugProgress
+
+        ; We're now up and running
+
+ [ BootstrapDebug
+        ; Set up shared stack for all modes
+        ADRL    r0, MyStack
+        CPS     #UND32_mode
+        MOV     sp, r0
+        CPS     #ABT32_mode
+        MOV     sp, r0
+        CPS     #IRQ32_mode
+        MOV     sp, r0
+        CPS     #FIQ32_mode
+        MOV     sp, r0
+        CPS     #SVC32_mode
+        MOV     sp, r0
+        CPS     #SYS32_mode
+        MOV     sp, r0
+
+        DebugProgress
+
+        ; Announce
+        DebugTX "Hello!"
+        MRC     p15, 0, a1, c0, c0, 5
+        DebugReg a1
+ ]
+
+        ; Set up core WS ptr
+        LDR     r0, BootstrapData+BWS_CoreWS
+        SetCoreWS r0
+        ; Jump to kernel entry point
+        LDR     pc, BootstrapData+BWS_Kernel
+
+ [ BootstrapDebug
+Halt
+        WFE
+        B       Halt
+
+Reset
+        DebugReg r14
+        DebugTX "Reset"
+        B       Halt
+
+Undef
+        DebugReg r14
+        DebugTX "Undef"
+        B       Halt
+
+SWI
+        DebugReg r14
+        DebugTX "SWI"
+        B       Halt
+
+Prefetch
+        DebugReg r14
+        DebugTX "Prefetch"
+        B       Halt
+
+Data
+        DebugReg r14
+        DebugTX "Data"
+        B       Halt
+
+AddrEx
+        DebugReg r14
+        DebugTX "AddrEx"
+        B       Halt
+
+IRQ
+        DebugReg r14
+        DebugTX "IRQ"
+        B       Halt
+
+FIQ
+        DebugReg r14
+        DebugTX "FIQ"
+        B       Halt
+
+DebugHALPrint
+        Push    "a1-a4,v1,sb,ip"
+        LDR     sb, BootstrapData+BWS_HALWS
+        MOV     v1, lr
+10      LDRB    a1, [v1], #1
+        TEQ     a1, #0
+        BEQ     %FT20
+        MOV     lr, pc
+        LDR     pc, BootstrapData+BWS_DebugTX
+        B       %BT10
+20
+        ADD     v1, v1, #3
+        BIC     lr, v1, #3
+        Pull    "a1-a4,v1,sb,ip"
+        MOV     pc, lr
+
+DebugHALPrintReg ; Output number on top of stack to the serial port
+        Push    "a1-a4,v1-v4,sb,ip,lr"   ; this is 11 regs
+        LDR     v2, [sp,#11*4]           ; find TOS value on stack
+        ADR     v3, hextab
+        MOV     v4, #8
+05
+        LDR     sb, BootstrapData+BWS_HALWS
+10      LDRB    a1, [v3, v2, LSR #28]
+        MOV     lr, pc
+        LDR     pc, BootstrapData+BWS_DebugTX
+        MOV     v2, v2, LSL #4
+        SUBS    v4, v4, #1
+        BNE     %BT10
+        MOV     a1, #13
+        MOV     lr, pc
+        LDR     pc, BootstrapData+BWS_DebugTX
+        MOV     a1, #10
+        MOV     lr, pc
+        LDR     pc, BootstrapData+BWS_DebugTX
+
+        Pull    "a1-a4,v1-v4,sb,ip,lr"
+        ADD     sp, sp, #4
+        MOV     pc, lr
+
+hextab  DCB "0123456789abcdef"
+ ]
+
+; Data block filled in by master core
+BootstrapData
+        %       BWS_Size
+
+
+; This is basically the same as the ARMv7+ cache invalidation from
+; HAL_InvalidateCache_ARMvF, except it only invalidates the core-local caches
+InvalidateCaches
+        TLBIALL ; invalidate TLBs
+        ICIALLU ; invalidate instruction cache + branch predictors
+        DSB     ; Wait for completion
+        ISB
+        MRC     p15, 1, r8, c0, c0, 1           ; Read CLIDR to r8
+        TST     r8, #&07000000
+        BEQ     %FT50
+        MOV     r11, #0 ; Current cache level
+10 ; Loop1
+        ADD     r10, r11, r11, LSR #1 ; Work out 3 x cachelevel
+        MOV     r9, r8, LSR r10 ; bottom 3 bits are the Cache type for this level
+        AND     r9, r9, #7 ; get those 3 bits alone
+        CMP     r9, #2 ; Only care about data or split caches
+        CMPNE   r9, #3
+        BNE     %FT40
+        MCR     p15, 2, r11, c0, c0, 0 ; write CSSELR from r11
+        ISB
+        MRC     p15, 1, r9, c0, c0, 0 ; read current CSSIDR to r9
+        AND     r10, r9, #CCSIDR_LineSize_mask ; extract the line length field
+        ADD     r10, r10, #4 ; add 4 for the line length offset (log2 16 bytes)
+        LDR     r8, =CCSIDR_Associativity_mask:SHR:CCSIDR_Associativity_pos
+        AND     r8, r8, r9, LSR #CCSIDR_Associativity_pos ; r8 is the max number on the way size (right aligned)
+        CLZ     r13, r8 ; r13 is the bit position of the way size increment
+        LDR     r12, =CCSIDR_NumSets_mask:SHR:CCSIDR_NumSets_pos
+        AND     r12, r12, r9, LSR #CCSIDR_NumSets_pos ; r12 is the max number of the index size (right aligned)
+20 ; Loop2
+        MOV     r9, r12 ; r9 working copy of the max index size (right aligned)
+30 ; Loop3
+        ORR     r7, r11, r8, LSL r13 ; factor in the way number and cache number into r7
+        ORR     r7, r7, r9, LSL r10 ; factor in the index number
+        DCISW   r7 ; Invalidate
+        SUBS    r9, r9, #1 ; decrement the index
+        BGE     %BT30
+        SUBS    r8, r8, #1 ; decrement the way number
+        BGE     %BT20
+        DSB                ; Cortex-A7 errata 814220: DSB required when changing cache levels when using set/way operations. This also counts as our end-of-maintenance DSB.
+        MRC     p15, 1, r8, c0, c0, 1
+40 ; Skip
+        ADD     r11, r11, #2
+        AND     r7, r8, #&07000000
+        CMP     r7, r11, LSL #23
+        BGT     %BT10        
+
+50 ; Finished
+        ; Wait for clean to complete
+        DSB
+        ISB
+        MOV     pc, lr
+
+        LTORG   ; Ensure no literals outside copied region
+
+ [ BootstrapDebug
+        %       256
+
+MyStack
+ ]
+
+BootstrapEnd
+
+        ; To allow us to only get by with one initial page table, we must make sure the logical and physical mappings of the bootstrap code can't overlap
+        ASSERT BootstrapEnd - BootstrapStart <= 4096
+        
+        END
+

@@ -1,0 +1,546 @@
+/*
+ * Copyright (c) 2012, Ben Avison
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of the copyright holder nor the names of their
+ *       contributors may be used to endorse or promote products derived from
+ *       this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY
+ * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+#include <stddef.h>
+#include <stddef.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include "kernel.h"
+#include "swis.h"
+
+#include "Global/HALEntries.h"
+#include "Interface/SDHCIDevice.h"
+#include "Interface/SDIO.h"
+
+#include "mmc2.h"
+
+#ifdef DEBUG_ENABLED
+#include <stdio.h>
+#define dprintf printf
+#else
+#define dprintf(...) do; while(0)
+#endif
+
+/* A quick macro to silence compiler warnings about unused parameters */
+#define IGNORE(x) do { (void)(x); } while(0)
+
+/* Convert from GPIO line number to bank number (based at 0) */
+#define GPIO_BANK(line) ((line)/32)
+
+/* Convert from GPIO line number to bit number within the bank */
+#define GPIO_BIT(line)  (1u<<((line)%32))
+
+/** Maximum time bus power is allowed to take to ramp up or down.
+ *  MMC and SD agree this is 35 ms max ramp up, but nothing is said about ramp down so I'm assuming it's the same.
+ */
+#define BUS_POWER_RAMP (35000) /* in us */
+
+/** Number of reads of SYSSTATUS before we give up waiting for reset to complete */
+#define RESET_TIMEOUT (100)
+
+/** Number of reads of SYSCTL before we give up waiting for SDCLK to stabilise */
+#define CLOCKSET_TIMEOUT (1000)
+
+/* Time to leave initialisation procedure to execute, in us */
+#define INIT_PROCEDURE_TIME (1000)
+
+/** Frequency of the clock which we divide to produce SDCLK, in kHz */
+#define FCLK_FREQ (96000)
+
+/* Physical base addresses of each controller */
+#define MMCHS1_PHYS (0x4809C000)
+#define MMCHS2_PHYS (0x480B4000)
+#define MMCHS3_PHYS (0x480AD000)
+
+/* Physical base address of each GPIO bank */
+#define GPIO5_PHYS (0x49056000) // for GPIO 141
+#define GPIO6_PHYS (0x49058000) // for GPIO 162
+
+/* Physical addresses of pin mux registers */
+#define CONTROL_PADCONF_GPIO130_PHYS (0x48002158) // mode 0 = MMC2_CLK
+#define CONTROL_PADCONF_GPIO131_PHYS (0x4800215A) // mode 0 = MMC2_CMD
+#define CONTROL_PADCONF_GPIO132_PHYS (0x4800215C) // mode 0 = MMC2_DAT0
+#define CONTROL_PADCONF_GPIO133_PHYS (0x4800215E) // mode 0 = MMC2_DAT1
+#define CONTROL_PADCONF_GPIO134_PHYS (0x48002160) // mode 0 = MMC2_DAT2
+#define CONTROL_PADCONF_GPIO135_PHYS (0x48002162) // mode 0 = MMC2_DAT3
+#define CONTROL_PADCONF_GPIO136_PHYS (0x48002164) // mode 1 = MMC2_DIR_DAT0
+#define CONTROL_PADCONF_GPIO137_PHYS (0x48002166) // mode 1 = MMC2_DIR_DAT1 (affects DAT2 & DAT3 too)
+#define CONTROL_PADCONF_GPIO138_PHYS (0x48002168) // mode 1 = MMC2_DIR_CMD
+#define CONTROL_PADCONF_GPIO139_PHYS (0x4800216A) // mode 1 = MMC2_CLKIN
+#define CONTROL_PADCONF_GPIO141_PHYS (0x4800216E)
+#define CONTROL_PADCONF_GPIO162_PHYS (0x48002198)
+
+/* Bits within PADCONF registers (7.6.3 of spruf98b) */
+#define PADCONF_WAKEUPEVENT       (1u<<15)
+#define PADCONF_WAKEUPENABLE      (1u<<14)
+#define PADCONF_OFFPULLTYPESELECT (1u<<13)
+#define PADCONF_OFFPULLUDENABLE   (1u<<12)
+#define PADCONF_OFFOUTVALUE       (1u<<11)
+#define PADCONF_OFFOUTENABLE      (1u<<10)
+#define PADCONF_OFFENABLE         (1u<<9)
+#define PADCONF_INPUTENABLE       (1u<<8)
+#define PADCONF_PULLTYPESELECT    (1u<<4)
+#define PADCONF_PULLUDENABLE      (1u<<3)
+#define PADCONF_MUXMODE_GPIO      (4u<<0)
+#define PADCONF_MUXMODE_MASK      (7u<<0)
+
+/* Physical addresses of clock setup registers */
+#define CM_FCLKEN1_CORE_PHYS (0x48004A00)
+#define CM_ICLKEN1_CORE_PHYS (0x48004A10)
+
+/* Bits within clock setup registers */
+#define EN_MMC1 (1u<<24)
+#define EN_MMC2 (1u<<25)
+#define EN_MMC3 (1u<<30)
+
+/* Physical address of DEVCONF1 register */
+#define CONTROL_DEVCONF1 (0x480022D8)
+
+/* Bits within DEVCONF1 */
+#define MMCSDIO2ADPCLKISEL (1u<<6)
+
+/* RISC OS device numbers for each controller's IRQ line */
+#define MMC1_IRQ (83)
+#define MMC2_IRQ (86)
+#define MMC3_IRQ (94)
+
+/* GPIO pin assignments */
+#define GPIO_CD (162)
+#define GPIO_WP (141)
+
+typedef volatile struct
+{
+  uint32_t reserved1[(0x10-0x00)/4];
+  uint32_t SYSCONFIG;       // +0x10
+  uint32_t SYSSTATUS;       // +0x14
+  uint32_t IRQSTATUS1;      // +0x18
+  uint32_t IRQENABLE1;      // +0x1C
+  uint32_t WAKEUPENABLE;    // +0x20
+  uint32_t reserved2;
+  uint32_t IRQSTATUS2;      // +0x28
+  uint32_t IRQENABLE2;      // +0x2C
+  uint32_t CTRL;            // +0x30
+  uint32_t OE;              // +0x34
+  uint32_t DATAIN;          // +0x38
+  uint32_t DATAOUT;         // +0x3C
+  uint32_t LEVELDETECT0;    // +0x40
+  uint32_t LEVELDETECT1;    // +0x44
+  uint32_t RISINGDETECT;    // +0x48
+  uint32_t FALLINGDETECT;   // +0x4C
+  uint32_t DEBOUNCENABLE;   // +0x50
+  uint32_t DEBOUNCINGTIME;  // +0x54
+  uint32_t reserved3[(0x60-0x58)/4];
+  uint32_t CLEARIRQENABLE1; // +0x60
+  uint32_t SETIRQENABLE1;   // +0x64
+  uint32_t reserved4[(0x70-0x68)/4];
+  uint32_t CLEARIRQENABLE2; // +0x70
+  uint32_t SETIRQENABLE2;   // +0x74
+  uint32_t reserved5[(0x80-0x78)/4];
+  uint32_t CLEARWKUENA;     // +0x80
+  uint32_t SETWKUENA;       // +0x84
+  uint32_t reserved6[(0x90-0x88)/4];
+  uint32_t CLEARDATAOUT;    // +0x90
+  uint32_t SETDATAOUT;      // +0x94
+} omap_gpio_regset_t;
+
+typedef volatile struct
+{
+  uint32_t reserved1[(0x10-0x0)/4];
+  uint32_t SYSCONFIG;     //  +0x10
+#define SYSCONFIG_SOFTRESET (1u<<1)
+  uint32_t SYSSTATUS;     //  +0x14
+#define SYSSTATUS_RESETDONE (1u<<0)
+  uint32_t reserved2[(0x24-0x18)/4];
+  uint32_t CSRE;          //  +0x24
+  uint32_t SYSTEST;       //  +0x28
+  uint32_t CON;           //  +0x2C
+#define CON_OD   (1u<<0)
+#define CON_INIT (1u<<1)
+#define CON_DW8  (1u<<5)
+  uint32_t PWCNT;         //  +0x30
+  uint32_t reserved3[(0x104-0x34)/4];
+  uint32_t BLK;           // +0x104
+  uint32_t ARG;           // +0x108
+  uint32_t CMD;           // +0x10C
+  uint32_t RSP10;         // +0x110
+  uint32_t RSP32;         // +0x114
+  uint32_t RSP54;         // +0x118
+  uint32_t RSP76;         // +0x11C
+  uint32_t DATA;          // +0x120
+  uint32_t PSTATE;        // +0x124
+#define PSTATE_CMDI (1u<<0)
+  uint32_t HCTL;          // +0x128
+#define HCTL_DTW        (1u<<1)
+#define HCTL_SDBP       (1u<<8)
+#define HCTL_SDVS_SHIFT (9)
+#define HCTL_SDVS_1_8V  (5 << HCTL_SDVS_SHIFT)
+#define HCTL_SDVS_3_0V  (6 << HCTL_SDVS_SHIFT)
+#define HCTL_SDVS_3_3V  (7 << HCTL_SDVS_SHIFT)
+#define HCTL_SDVS_MASK  (7 << HCTL_SDVS_SHIFT)
+  uint32_t SYSCTL;        // +0x12C
+#define SYSCTL_ICE        (1u<<0)
+#define SYSCTL_ICS        (1u<<1)
+#define SYSCTL_CEN        (1u<<2)
+#define SYSCTL_CLKD_SHIFT (6)
+#define SYSCTL_CLKD_MASK  (0x3FF << SYSCTL_CLKD_SHIFT)
+#define SYSCTL_SRC        (1u<<25)
+  uint32_t STAT;          // +0x130
+#define STAT_CC           (1u<<0)
+  uint32_t IE;            // +0x134
+  uint32_t ISE;           // +0x138
+  uint32_t AC12;          // +0x13C
+  uint32_t CAPA;          // +0x140
+#define CAPA_VS33 (1u<<24)
+#define CAPA_VS30 (1u<<25)
+#define CAPA_VS18 (1u<<26)
+  uint32_t reserved4;
+  uint32_t CUR_CAPA;      // +0x148
+  uint32_t reserved5[(0x1FC-0x14C)/4];
+  uint32_t REV;           // +0x1FC
+} omap_sdhci_regset_t;
+
+static bool sdhci_activate(struct device *generic_dev);
+static void sdhci_deactivate(struct device *generic_dev);
+static void sdhci_reset(struct device *generic_dev);
+static int32_t sdhci_sleep(struct device *generic_dev, int32_t state);
+static bool sdhci_test_irq(struct device *generic_dev);
+static uint32_t sdhci_get_vdd_capabilities(sdhcidevice_t *dev, uint32_t slot);
+static void sdhci_set_vdd(sdhcidevice_t *dev, uint32_t slot, uint32_t voltage);
+static void sdhci_set_bus_mode(sdhcidevice_t *dev, uint32_t slot, bool od_not_pp);
+static void sdhci_post_power_on(sdhcidevice_t *dev, uint32_t slot);
+static void sdhci_set_bus_width(sdhcidevice_t *dev, uint32_t slot, uint32_t lines);
+static uint32_t sdhci_get_max_current(sdhcidevice_t *dev, uint32_t slot);
+static uint32_t sdhci_set_sdclk(sdhcidevice_t *dev, uint32_t slot, uint32_t freq_khz);
+static uint32_t sdhci_get_tmclk(sdhcidevice_t *dev, uint32_t slot);
+static void sdhci_set_activity(sdhcidevice_t *dev, uint32_t slot, uint32_t level);
+static bool sdhci_get_card_detect(sdhcidevice_t *dev, uint32_t slot);
+static bool sdhci_get_write_protect(sdhcidevice_t *dev, uint32_t slot);
+
+static omap_gpio_regset_t *m_gpio_address[6];
+
+static sdhci_slotinfo_t m_slot_info = {
+    HALDeviceSDHCI_SlotFlag_Bus4Bit,
+    NULL /* patched up at initialisation time */
+};
+
+static struct sdhci
+{
+  sdhcidevice_t        dev;
+  omap_gpio_regset_t **gpio;
+} m_sdhci = {
+  {
+    {
+      HALDeviceType_ExpCtl + HALDeviceExpCtl_SDIO,
+      HALDeviceID_SDIO_SDHCI,
+      HALDeviceBus_Interconnect + HALDeviceInterconnectBus_L4,
+      0,
+      "TI OMAP3 SD host controller",
+      NULL, /* patched up at initialisation time */
+      { 0 },
+      sdhci_activate,
+      sdhci_deactivate,
+      sdhci_reset,
+      sdhci_sleep,
+      MMC2_IRQ,
+      sdhci_test_irq,
+      NULL,
+      { 0 }
+    },
+    HALDeviceSDHCI_Flag_32bit | HALDeviceSDHCI_Flag_R2bug,
+    1,
+    &m_slot_info,
+    NULL, /* write_register */
+    NULL, /* get_capabilities */
+    sdhci_get_vdd_capabilities,
+    sdhci_set_vdd,
+    sdhci_set_bus_mode,
+    sdhci_post_power_on,
+    sdhci_set_bus_width,
+    sdhci_get_max_current,
+    sdhci_set_sdclk,
+    sdhci_get_tmclk,
+    sdhci_set_activity,
+    sdhci_get_card_detect,
+    sdhci_get_write_protect
+  },
+  m_gpio_address
+};
+
+
+static volatile uint32_t *temporary_map_in(uint32_t physical)
+{
+  static uint32_t old_state;
+  static uint32_t previous = 0;
+  volatile uint32_t *logical;
+  if (previous != 0)
+    _swix(OS_Memory,_INR(0,1), 15, old_state);
+  if (physical != 0)
+    _swix(OS_Memory, _INR(0,1)|_OUTR(2,3), 14, physical, &logical, &old_state);
+  previous = physical;
+  return logical;
+}
+
+_kernel_oserror *mmc2_Init(void)
+{
+  _kernel_oserror *e = _swix(OS_Memory, _INR(0,2)|_OUT(3), 13, MMCHS2_PHYS, 0x200, &m_sdhci.dev.dev.address);
+  if (e != NULL)
+    return e;
+  m_slot_info.stdregs = (char *) m_sdhci.dev.dev.address + 0x100;
+  dprintf("Registers are at %p\n", m_slot_info.stdregs);
+
+  /* Get permanent addresses for GPIO controllers so we can poll them later */
+  e = _swix(OS_Memory, _INR(0,2)|_OUT(3), 13, GPIO5_PHYS, sizeof (omap_gpio_regset_t), m_gpio_address+5-1);
+  if (e != NULL)
+    return e;
+  e = _swix(OS_Memory, _INR(0,2)|_OUT(3), 13, GPIO6_PHYS, sizeof (omap_gpio_regset_t), m_gpio_address+6-1);
+  if (e != NULL)
+    return e;
+
+  /* The following pokes can all be done with temporary mappings */
+#define PROGRAMPADCONF(phys, mode_and_input) \
+  do { \
+    volatile uint32_t *padconf = temporary_map_in((phys) &~ 3); \
+    *padconf = *padconf &~ (0xFFFFu << (((phys) & 2) * 8)) | ((mode_and_input) << (((phys) & 2) * 8)); \
+  } while (0)
+
+  PROGRAMPADCONF(CONTROL_PADCONF_GPIO130_PHYS, 0 | PADCONF_PULLUDENABLE | PADCONF_PULLTYPESELECT);
+  PROGRAMPADCONF(CONTROL_PADCONF_GPIO131_PHYS, 0 | PADCONF_PULLUDENABLE | PADCONF_PULLTYPESELECT | PADCONF_INPUTENABLE);
+  PROGRAMPADCONF(CONTROL_PADCONF_GPIO132_PHYS, 0 | PADCONF_PULLUDENABLE | PADCONF_PULLTYPESELECT | PADCONF_INPUTENABLE);
+  PROGRAMPADCONF(CONTROL_PADCONF_GPIO133_PHYS, 0 | PADCONF_PULLUDENABLE | PADCONF_PULLTYPESELECT | PADCONF_INPUTENABLE);
+  PROGRAMPADCONF(CONTROL_PADCONF_GPIO134_PHYS, 0 | PADCONF_PULLUDENABLE | PADCONF_PULLTYPESELECT | PADCONF_INPUTENABLE);
+  PROGRAMPADCONF(CONTROL_PADCONF_GPIO135_PHYS, 0 | PADCONF_PULLUDENABLE | PADCONF_PULLTYPESELECT | PADCONF_INPUTENABLE);
+  PROGRAMPADCONF(CONTROL_PADCONF_GPIO136_PHYS, 1 | PADCONF_PULLUDENABLE | PADCONF_PULLTYPESELECT);
+  PROGRAMPADCONF(CONTROL_PADCONF_GPIO137_PHYS, 1 | PADCONF_PULLUDENABLE | PADCONF_PULLTYPESELECT);
+  PROGRAMPADCONF(CONTROL_PADCONF_GPIO138_PHYS, 1 | PADCONF_PULLUDENABLE | PADCONF_PULLTYPESELECT);
+  PROGRAMPADCONF(CONTROL_PADCONF_GPIO139_PHYS, 1 | PADCONF_PULLUDENABLE | PADCONF_PULLTYPESELECT | PADCONF_INPUTENABLE);
+  PROGRAMPADCONF(CONTROL_PADCONF_GPIO141_PHYS, PADCONF_MUXMODE_GPIO | PADCONF_INPUTENABLE);
+  PROGRAMPADCONF(CONTROL_PADCONF_GPIO162_PHYS, PADCONF_MUXMODE_GPIO | PADCONF_INPUTENABLE);
+  *temporary_map_in(CM_ICLKEN1_CORE_PHYS) |= EN_MMC2;
+  *temporary_map_in(CM_FCLKEN1_CORE_PHYS) |= EN_MMC2;
+  *temporary_map_in(CONTROL_DEVCONF1) &= ~MMCSDIO2ADPCLKISEL;
+  temporary_map_in(0);
+
+  m_gpio_address[GPIO_BANK(GPIO_CD)]->OE &= ~GPIO_BIT(GPIO_CD);
+  m_gpio_address[GPIO_BANK(GPIO_WP)]->OE &= ~GPIO_BIT(GPIO_WP);
+
+  /* Register our SDHCI device */
+  return _swix(OS_Hardware, _IN(0)|_IN(8), &m_sdhci.dev, 2);
+}
+
+void mmc2_Final(void)
+{
+  /* Deregister our SDHCI device */
+  _swix(OS_Hardware, _IN(0)|_IN(8), &m_sdhci.dev, 3);
+}
+
+static bool sdhci_activate(struct device *generic_dev)
+{
+  sdhcidevice_t *dev = (sdhcidevice_t *) generic_dev;
+  IGNORE(dev);
+  return true;
+}
+
+static void sdhci_deactivate(struct device *generic_dev)
+{
+  sdhcidevice_t *dev = (sdhcidevice_t *) generic_dev;
+  IGNORE(dev);
+}
+
+static void sdhci_reset(struct device *generic_dev)
+{
+  sdhcidevice_t *dev = (sdhcidevice_t *) generic_dev;
+  omap_sdhci_regset_t *regs = dev->dev.address;
+
+  /* The reset sequence below is defined in the OMAP35xx TRM, sections 22.5.1 and 22.6.1.3.1 */
+
+  /* 22.6.1.3.1.2 MMCHS Controller Software Reset */
+  regs->SYSCONFIG = SYSCONFIG_SOFTRESET;
+  for (int i = RESET_TIMEOUT;; i--)
+  {
+    if (i == 0)
+    {
+      dprintf("Reset timed out\n");
+      return;
+    }
+    if (regs->SYSSTATUS & SYSSTATUS_RESETDONE)
+    {
+      dprintf("Reset done in %u tries\n", RESET_TIMEOUT - i);
+      break;
+    }
+  }
+
+  /* 22.6.1.3.1.3 MMCHS Controller Voltage Capabilities Initialization */
+  regs->CAPA |= CAPA_VS18;
+}
+
+static int32_t sdhci_sleep(struct device *generic_dev, int32_t state)
+{
+  sdhcidevice_t *dev = (sdhcidevice_t *) generic_dev;
+  IGNORE(dev);
+  IGNORE(state);
+  return 0;
+}
+
+static bool sdhci_test_irq(struct device *generic_dev)
+{
+  sdhcidevice_t *dev = (sdhcidevice_t *) generic_dev;
+  IGNORE(dev);
+  return 1;
+}
+
+static uint32_t sdhci_get_vdd_capabilities(sdhcidevice_t *dev, uint32_t slot)
+{
+  IGNORE(dev);
+  IGNORE(slot);
+  return CAPA_VS33 / CAPA_VS33; // flags start at bit 0
+}
+
+static void sdhci_set_vdd(sdhcidevice_t *dev, uint32_t slot, uint32_t voltage)
+{
+  IGNORE(dev);
+  IGNORE(slot);
+  IGNORE(voltage);
+  
+  omap_sdhci_regset_t *regs = dev->dev.address;
+  regs->HCTL = HCTL_SDVS_1_8V;
+  regs->HCTL = HCTL_SDVS_1_8V | HCTL_SDBP; /* needs to be two separate writes, the SDBP bit won't latch on the first write */
+  
+  _swix(OS_Hardware, _IN(0)|_INR(8,9), BUS_POWER_RAMP, 0, EntryNo_HAL_CounterDelay);
+}
+
+static void sdhci_set_bus_mode(sdhcidevice_t *dev, uint32_t slot, bool od_not_pp)
+{
+  omap_sdhci_regset_t *regs = dev->dev.address;
+  regs->CON = regs->CON &~ CON_OD | (od_not_pp * CON_OD);
+  IGNORE(slot);
+}
+
+static void sdhci_post_power_on(sdhcidevice_t *dev, uint32_t slot)
+{
+  omap_sdhci_regset_t *regs = dev->dev.address;
+
+  /* 22.6.1.3.1.5 MMCHS Controller INIT Procedure Start */
+  /* We can't set SDCLK as slow as 80 kHz as suggested - and using the the
+   * 150 kHz set twice doesn't seem to work. Use the procedure described in
+   * figure 22-27 instead. */
+  sdhci_set_sdclk(dev, 0, 150); /* doesn't work without this */
+  regs->CON |= CON_INIT;
+  regs->CMD = 0; /* dummy command - value doesn't matter because CMD line is held at 1 */
+  _swix(OS_Hardware, _IN(0)|_INR(8,9), INIT_PROCEDURE_TIME, 0, EntryNo_HAL_CounterDelay);
+  regs->STAT |= STAT_CC;  /* acknowledge command complete interrupt */
+  regs->CON &= ~CON_INIT; /* end initialisation sequence */
+  regs->STAT = -1u;       /* acknowledge all interrupts */
+
+  IGNORE(slot);
+}
+
+static void sdhci_set_bus_width(sdhcidevice_t *dev, uint32_t slot, uint32_t lines)
+{
+  omap_sdhci_regset_t *regs = dev->dev.address;
+  if (lines == 8)
+    regs->CON |= CON_DW8;
+  else
+  {
+    regs->CON &= ~CON_DW8;
+    if (lines == 4)
+      regs->HCTL |= HCTL_DTW;
+    else
+      regs->HCTL &= ~HCTL_DTW;
+  }
+  IGNORE(slot);
+}
+
+static uint32_t sdhci_get_max_current(sdhcidevice_t *dev, uint32_t slot)
+{
+  IGNORE(dev);
+  IGNORE(slot);
+  return 100; /* I' not sure what the power rails are supposed to be able to supply, so try a low figure */
+}
+
+static uint32_t sdhci_set_sdclk(sdhcidevice_t *dev, uint32_t slot, uint32_t freq_khz)
+{
+  omap_sdhci_regset_t *regs = dev->dev.address;
+  uint32_t divider = (FCLK_FREQ + freq_khz - 1) / freq_khz; /* round divider up so we round frequency down */
+  if (divider > (SYSCTL_CLKD_MASK >> SYSCTL_CLKD_SHIFT))
+      divider = SYSCTL_CLKD_MASK >> SYSCTL_CLKD_SHIFT; /* maximum possible divider */
+  regs->SYSCTL &= ~SYSCTL_CEN; /* stop clock going to card */
+  regs->SYSCTL &= ~SYSCTL_ICE; /* stop clock */
+  regs->SYSCTL = regs->SYSCTL &~ SYSCTL_CLKD_MASK | (divider << SYSCTL_CLKD_SHIFT);
+  regs->SYSCTL |= SYSCTL_ICE; /* start clock */
+  for (int i = CLOCKSET_TIMEOUT;; i--)
+  {
+    if (i == 0)
+    {
+      dprintf("Clock stabilisation timed out\n");
+      break;
+    }
+    if (regs->SYSCTL & SYSCTL_ICS)
+    {
+      dprintf("Clock stabilised in %u tries\n", CLOCKSET_TIMEOUT - i);
+      break; /* clock has stabilised */
+    }
+  }
+  regs->SYSCTL |= SYSCTL_CEN; /* provide clock to card */
+  IGNORE(slot);
+  return FCLK_FREQ / divider;
+}
+
+static uint32_t sdhci_get_tmclk(sdhcidevice_t *dev, uint32_t slot)
+{
+  /* The OMAP datasheet (capabilities register) seems to imply that it
+   * reuses SDCLK for TMCLK. Verified experimentally. */
+  omap_sdhci_regset_t *regs = dev->dev.address;
+  uint32_t divider = (regs->SYSCTL & SYSCTL_CLKD_MASK) >> SYSCTL_CLKD_SHIFT;
+  IGNORE(slot);
+  return FCLK_FREQ / divider;
+}
+
+static void sdhci_set_activity(sdhcidevice_t *dev, uint32_t slot, uint32_t level)
+{
+  /* Can't */
+  IGNORE(dev);
+  IGNORE(slot);
+  IGNORE(level);
+}
+
+static bool sdhci_get_card_detect(sdhcidevice_t *dev, uint32_t slot)
+{
+  struct sdhci *sdhci = (struct sdhci *) dev;
+  IGNORE(slot);
+
+  /* Line is active low */
+  return !(sdhci->gpio[GPIO_BANK(GPIO_CD)]->DATAIN & GPIO_BIT(GPIO_CD));
+}
+
+static bool sdhci_get_write_protect(sdhcidevice_t *dev, uint32_t slot)
+{
+  struct sdhci *sdhci = (struct sdhci *) dev;
+  IGNORE(slot);
+
+  /* Line is active high */
+  return sdhci->gpio[GPIO_BANK(GPIO_WP)]->DATAIN & GPIO_BIT(GPIO_WP);
+}

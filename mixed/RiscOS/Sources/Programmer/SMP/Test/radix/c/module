@@ -1,0 +1,185 @@
+/*
+ * Copyright (c) 2017, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include <stdlib.h>
+#include <stdio.h>
+#include <time.h>
+#include <string.h>
+#include "kernel.h"
+#include "swis.h"
+
+#include "Global/RISCOS.h"
+#include "Global/ModHand.h"
+#include "Global/Services.h"
+#include "SyncLib/synclib.h"
+#include "AsmUtils/rminfo.h"
+
+#include "modhdr.h"
+#include "radix.h"
+#include "alloc.h"
+
+#ifndef SMP_RegisterSWIChunk
+#define SMP_RegisterSWIChunk            0x059bc0
+#define SMP_DeregisterSWIChunk          0x059bc1
+#define SMP_CreateThread                0x059bc2
+#define SMP_DestroyThread               0x059bc3
+#define SMP_Sleep                       0x059bc4
+#define SMP_Yield                       0x059bc5
+#define SMP_ExamineThread               0x059bc6
+#define SMP_CurrentThread               0x059bc7
+#define SMP_DefaultAffinity             0x059bc8
+#define SMP_TerminateThread             0x059bc9
+#endif
+
+static void *module_pw;
+
+_kernel_oserror *module_initialise(const char *cmd_tail, int podule_base, void *pw)
+{
+	module_pw = pw;
+	synclib_init();
+
+	return NULL;
+}
+
+_kernel_oserror *module_finalise(int fatal, int podule, void *pw)
+{
+	return NULL;
+}
+
+_kernel_oserror *module_command(const char *arg_string, int argc, int cmd_no, void *pw)
+{
+	switch (cmd_no)
+	{
+	case CMD_SMPTest:
+		return _swix(OS_Module, _INR(0,2), ModHandReason_Enter, Module_Title, arg_string); 
+	}
+
+	return NULL;
+}
+
+void module_service(int service, _kernel_swi_regs *r, void *pw)
+{
+	if ((service == Service_Memory) && (r->r[2] == Image_RO_Base))
+	{
+		r->r[1] = 0;
+	}
+	return;
+}
+
+int main(int argc,char **argv)
+{
+	int seed = rand();
+	printf("Seed: %d\n",seed);
+	srand(seed);
+	radix_args *a;
+	a = (radix_args *) rma_alloc(sizeof(radix_args)*4);
+	int threads[4] = {-1,-1,-1,-1};
+	for(int i=0;i<4;i++)
+	{
+		srand(seed);
+		a[i] = radix_gen();
+	}
+	clock_t t0 = clock();
+	radix(a[0]);
+	clock_t t1 = clock();
+	printf("Sort time: %d cs\n",t1-t0);
+	radix_check(a[0]);
+	printf("Press any key to terminate\n");
+	bool run = true;
+	while (run || (threads[1] != -1) || (threads[2] != -1) || (threads[3] != -1))
+	{
+		for(int i=1;i<4;i++)
+		{
+			if (run && (threads[i] == -1))
+			{
+				printf("Starting thread %d\n",i);
+				char name[32];
+				sprintf(name,"SMPTest %d",i);
+				_kernel_oserror *e = _swix(SMP_CreateThread,_INR(0,6)|_OUT(0),name,0,0,&a[i],module_pw,thread_entry,0x13,&threads[i]);
+				if (e)
+				{
+					fprintf(stderr,"[%d] %d %s\n",i,e->errnum,e->errmess);
+					run = false;
+				}
+			}
+			if (threads[i] != -1)
+			{
+				_kernel_oserror te;
+				int status,code;
+				_kernel_oserror *tep;
+				_kernel_oserror *e = _swix(SMP_ExamineThread,_INR(0,2)|_IN(5)|_OUTR(4,6),threads[i],0,0,&te,&status,&tep,&code);
+				if (e)
+				{
+					fprintf(stderr,"[%d] %d %s\n",i,e->errnum,e->errmess);
+					run = false;
+				}
+				else if (status == 4)
+				{
+					if (tep)
+					{
+						fprintf(stderr,"[%d] failed with %d %s\n",i,tep->errnum,tep->errmess);
+						run = false;
+					}
+					else
+					{
+						printf("[%d] done\n",i);
+						if (!radix_check(a[i]))
+						{
+							run = false;
+						}
+						else if (memcmp(a[0].out,a[i].out,sizeof(uint32_t*)*a[i].sz))
+						{
+							fprintf(stderr,"memcmp fail\n");
+							run = false;
+						}
+						_swix(SMP_DestroyThread,_IN(0),threads[i]);
+						threads[i] = -1;
+					}
+				}
+			}
+		}
+		int c;
+		_swix(OS_Byte,_INR(0,2)|_OUT(2),129,1,0,&c);
+		if (run && (c != 255))
+		{
+			run = false;
+			printf("Stopping...\n");
+		}
+	}
+	for(int i=0;i<4;i++)
+	{
+		radix_free(a[i]);
+	}
+	rma_free(a);
+	return 0;
+}
+
+_kernel_oserror *thread_handler(_kernel_swi_regs *r, void *pw)
+{
+	radix(*((radix_args *)r->r[0]));
+	return NULL;
+}

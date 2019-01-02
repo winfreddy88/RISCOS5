@@ -1,0 +1,847 @@
+/*
+ * Copyright (c) 2010, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include <string.h>
+#include "Global/RISCOS.h"
+#include "Global/HALEntries.h"
+#include "Global/GraphicsV.h"
+#include "swis.h"
+
+#include "DebugLib/DebugLib.h"
+
+#include "dispc.h"
+#include "globals.h"
+#include "dsi.h"
+#include "graphicsv.h"
+#include "dss.h"
+#include "venc.h"
+
+#if 0
+/* Scaling coefficients, from the TRM (spruf98d, section 15.6.1.3.5)
+   The values are packed into the registers as follows:
+   * The H registers contain HC0,HC1,HC2,HC3 (low byte to high)
+   * The HV registers contain HC4,VC0,VC1,VC2
+   * The V registers contain VC00, VC22 (which correspond to HC0 and HC4)
+*/
+
+static const int8_t upscale_3tap[8][3] =
+{
+/*	VC2		VC1			VC0 */
+	{ 0,	(int8_t)128, 0}, /* Note: Although 128 causes an overflow, apparently that's OK! */
+	{ 3,	123,		2},
+	{12,	111,		52},
+	{32,	89,			7},
+	{ 0,	64,			64},
+	{72,	89,			32},
+	{ 5,	111,		12},
+	{ 2,	123,		3},
+};
+
+static const int8_t upscale_5tap[8][5] =
+{
+/* HC4/VC22	HC3/VC2	HC2/VC1		HC1/VC0	HC0/VC00 */
+	{ 0,	 0,		(int8_t)128,0,		0},
+	{-1,	13,		124,		-8,		0},
+	{-2,	30,		112,		-11,	-1},
+	{-5,	51,		95,			-11,	-2},
+	{ 0,	-9,		73,			73,		-9},
+	{-2,	-11,	95,			51,		-5},
+	{-1,	-11,	112,		30,		-2},
+	{ 0,	-8,		124,		13,		-1},
+};
+
+static const int8_t downscale_3tap[8][3] =
+{
+/*	VC2		VC1	VC0 */
+	{36,	56,	36},
+	{40,	57,	31},
+	{45,	56,	27},
+	{50,	55,	23},
+	{18,	55,	55},
+	{23,	55,	50},
+	{27,	56,	45},
+	{31,	57,	40},
+};
+
+static const int8_t downscale_5tap[8][5] =
+{
+/* HC4/VC22	HC3/VC2	HC2/VC1	HC1/VC0	HC0/VC00 */
+	{0,		36,		56,		36,		0},
+	{4,		40,		55,		31,		-2},
+	{8,		44,		54,		27,		-5},
+	{-12,	48,		53,		22,		-7},
+	{-9,	17,		52,		51,		17},
+	{-7,	22,		53,		48,		12},
+	{-5,	27,		54,		44,		8},
+	{-2,	31,		55,		40,		4},
+};
+
+/* For each register, for each 3/5 tap config, and whether it's H or V scaling,
+   the byte offsets within the above table rows to grab the data from */
+static const uint32_t h_coefficient_offsets[3] = /* 5-tap only */
+{
+	0x01020304, /* H */
+	0xffffff00, /* HV */
+	0xffffffff, /* V */
+};
+
+static const uint32_t v_coefficient_offsets[2][3] =
+{
+	{ /* 3-tap */
+		0xffffffff, /* H */
+		0x000102ff, /* HV */
+		0xffffffff, /* V */
+	},
+	{ /* 5-tap */
+		0xffffffff, /* H */
+		0x010203ff, /* HV */
+		0xffff0004, /* V */
+	},
+};
+
+static uint32_t grab_coef_bytes(uint32_t offsets, const uint8_t *bytes)
+{
+	uint32_t out = 0;
+	for (int byte = 0; byte < 4; ++byte)
+	{
+		uint32_t offset = offsets >> 24;
+		if (offset != 0xff)
+			out |= bytes[offset];
+		offsets = offsets << 8;
+		out = out << 8;
+	}
+	return out;
+}
+
+static void dispc_program_vid_scale_coefficients(int vidoverlay, int h_upscale, int v_upscale, int v5tap)
+{
+	volatile vid_regs_t *r = (vidoverlay ? &dispc->vid2 : &dispc->vid1);
+	const uint32_t *h_coef_offsets = h_coefficient_offsets;
+	const uint32_t *v_coef_offsets = v_coefficient_offsets[v5tap];
+	const uint8_t *h_coef_table = (const uint8_t *)(h_upscale ? upscale_5tap : downscale_5tap);
+	const uint8_t *v_coef_table = (v_upscale ? (v5tap ? (const uint8_t *)upscale_5tap : (const uint8_t *)upscale_3tap) : (v5tap ? (const uint8_t *)downscale_5tap : (const uint8_t *)downscale_3tap));
+	for (int phase = 0; phase < 8; phase++)
+	{
+		r->fir_coef[phase].h = grab_coef_bytes(h_coef_offsets[0], h_coef_table);
+		r->fir_coef[phase].hv = grab_coef_bytes(h_coef_offsets[1], h_coef_table)
+							  | grab_coef_bytes(v_coef_offsets[1], v_coef_table);
+		if (v5tap)
+		{
+			dispc->vid_fir_coef_v[vidoverlay][phase] = grab_coef_bytes(v_coef_offsets[2], v_coef_table);
+			v_coef_table += 5;
+		}
+		else
+			v_coef_table += 3;
+		h_coef_table += 5;
+	}
+}
+#endif
+
+static void dispc_update_gfx_overlay(volatile gfx_regs_t *r, overlay *o)
+{
+	/* TODO - Needs updating for non-16x32bit burst? */
+	/* TODO - Needs updating for rotation */
+	/* TODO - Needs updating for configurable arbitration */
+	/* TODO - Needs updating for overlay optimisation */
+	/* TODO - Enable replication for <24bpp data */
+	uint32_t temp;
+	int32_t  ppl, lpp;
+	uint32_t gobits = 0;
+	/* If we're moving it from one display to another, we need to update both - so gobits
+	   should take into account both the initial and final display */
+	uint32_t attr = r->attributes;
+	uint32_t interlaceoffset;
+	if (attr & OVERLAY_ATTRIBUTES_ENABLE)
+		gobits = ((attr & OVERLAY_ATTRIBUTES_GFXCHANNELOUT)
+			   ? DISPC_CONTROL_GOTV : DISPC_CONTROL_GOLCD);
+	switch (o->target)
+	{
+		default: /* TODO - Error here! */
+		case TARGET_NONE:
+			if (attr & OVERLAY_ATTRIBUTES_ENABLE)
+			{
+				/* EXPERIMENTATION - Sometimes when disabling an overlay that's being displayed
+				   on the TV, it instead appears on the LCD. Try retaining the output channel
+				   flag and see if it disabled properly. */
+				r->attributes &= OVERLAY_ATTRIBUTES_GFXCHANNELOUT | OVERLAY_ATTRIBUTES_CHANNELOUT2;
+				if (gobits == DISPC_CONTROL_GOTV)
+				{
+					dispc->control1 |= DISPC_CONTROL_GOTV;
+				}
+				else
+				{
+					dispc->control2 |= DISPC_CONTROL_GOLCD;
+				}
+			}
+			return;
+		case TARGET_LCD:
+			temp = dispc->size_lcd2;
+			ppl = REG_EXTRACT(temp, DISPC_SIZE_LCD_PPL) + 1;
+			lpp = REG_EXTRACT(temp, DISPC_SIZE_LCD_LPP) + 1;
+			if (dispc->control2 & DISPC_CONTROL_LCDENABLE) /* TODO - Does this even matter? */
+				gobits |= DISPC_CONTROL_GOLCD;
+			interlaceoffset = 0;
+			break;
+		case TARGET_TV:
+			temp = dispc->size_tv;
+			ppl = REG_EXTRACT(temp, DISPC_SIZE_LCD_PPL) + 1;
+			lpp = REG_EXTRACT(temp, DISPC_SIZE_LCD_LPP) + 1;
+			if (dispc->control1 & DISPC_CONTROL_TVENABLE)
+				gobits |= DISPC_CONTROL_GOTV;
+			interlaceoffset = o->stride;
+			break;
+	}
+	/* Crop to screen */
+	int32_t  w = o->width;
+	int32_t  h = o->height;
+	int32_t  x = o->x;
+	int32_t  y = o->y;
+	uint32_t ba = o->ba;
+	if (x < 0)
+	{
+		w += x;
+		ba += ((uint32_t)(-x * overlay_format_bpp[o->format >> OVERLAY_ATTRIBUTES_FORMAT_SHIFT])) >> 3;
+		x = 0;
+	}
+	if (y < 0)
+	{
+		h += y;
+		ba -= y * o->stride;
+		y = 0;
+	}
+	if (interlaceoffset)
+	{
+		y = y >> 1;
+		h = h >> 1;
+	}
+	if (x + w > ppl)
+		w = ppl - x;
+	if (y + h > lpp)
+		h = lpp - y;
+	if ((w > 0) && (h > 0) && (o->ba) && !blanked)
+	{
+		r->ba[1] = ba;
+		r->ba[0] = ba + interlaceoffset;
+		r->position = (x << OVERLAY_POSITION_X_SHIFT) | (y << OVERLAY_POSITION_Y_SHIFT);
+		r->size = ((w-1) << OVERLAY_SIZE_X_SHIFT) | ((h-1) << OVERLAY_SIZE_Y_SHIFT);
+		r->row_inc = (o->stride + 1 + interlaceoffset)
+					  - ((w * overlay_format_bpp[o->format >> OVERLAY_ATTRIBUTES_FORMAT_SHIFT]) >> 3);
+		/* TODO - make this arbitration configurable */
+		uint32_t attr2 = OVERLAY_ATTRIBUTES_ENABLE
+					   | o->format
+					   | OVERLAY_ATTRIBUTES_ROTATION_0
+					   | OVERLAY_ATTRIBUTES_GFXBURSTSIZE_16X32
+					   | (o->target == TARGET_TV ? OVERLAY_ATTRIBUTES_GFXCHANNELOUT : OVERLAY_ATTRIBUTES_CHANNELOUT2_LCD2)
+					   | OVERLAY_ATTRIBUTES_GFXARBITRATION;
+		/* TODO - May malfunction if reserved fields aren't 0? Do we reeally even care
+		          about avoiding redoing this? */
+#if 0
+		if (attr != attr2)
+		{
+			r->pixel_inc = 1;
+			temp = REG_EXTRACT(r->buf_size_status, OVERLAY_FIFO_SIZE_STATUS);
+			r->buf_threshold = ((temp - 1) << OVERLAY_FIFOHIGHTHRESHOLD_SHIFT)
+							 | ((temp - 128) << OVERLAY_FIFOLOWTHRESHOLD_SHIFT);
+			/* Graphics specific settings */
+			dispc->gfx_preload = fifo_preload_for_lcd[hwconfig->lcd_configs[current_lcd].lcd_type];
+			/* TODO - What about TV output? What if we add LCD_NONE for no LCD available? */
+			r->table_ba = gfx_palette_p;
+			r->attributes = attr2;
+		}
+#else
+		r->pixel_inc = 1;
+		temp = REG_EXTRACT(r->buf_size_status, OVERLAY_FIFO_SIZE_STATUS);
+		r->buf_threshold = ((temp - 1) << OVERLAY_FIFOHIGHTHRESHOLD_SHIFT)
+						 | ((temp - 128) << OVERLAY_FIFOLOWTHRESHOLD_SHIFT);
+		/* Graphics specific settings */
+		dispc->gfx_preload = fifo_preload_for_lcd[hwconfig->lcd_configs[current_lcd].lcd_type];
+		/* TODO - What about TV output? What if we add LCD_NONE for no LCD available? */
+		r->table_ba = gfx_palette_p;
+		r->attributes = attr2;
+#endif
+		/* Enable/disable gamma table */
+		uint32_t config = dispc->config1;
+		if ((&overlays[overlay_desktop] == o)
+		 && (o->format != OVERLAY_ATTRIBUTES_FORMAT_BMP1)
+		 && (o->format != OVERLAY_ATTRIBUTES_FORMAT_BMP2)
+		 && (o->format != OVERLAY_ATTRIBUTES_FORMAT_BMP4)
+		 && (o->format != OVERLAY_ATTRIBUTES_FORMAT_BMP8))
+#if 1
+		{
+			if (!(config & DISPC_CONFIG_PALETTEGAMMATABLE))
+				dispc->config1 = config | DISPC_CONFIG_PALETTEGAMMATABLE;
+		}
+		else if (config & DISPC_CONFIG_PALETTEGAMMATABLE)
+			dispc->config1 = config & ~DISPC_CONFIG_PALETTEGAMMATABLE;
+#else
+		{
+			config |= DISPC_CONFIG_PALETTEGAMMATABLE;
+		}
+		else
+		{
+			config &= ~DISPC_CONFIG_PALETTEGAMMATABLE;
+		}
+		/* update hardware register */
+		dispc->config1 = config;
+#endif
+		if (gobits & DISPC_CONTROL_GOTV)
+		{
+			dispc->control1 |= DISPC_CONTROL_GOTV;
+		}
+		if (gobits & DISPC_CONTROL_GOLCD)
+		{
+			dispc->control2 |= DISPC_CONTROL_GOLCD;
+		}
+	}
+	else
+	{
+		/* Can't be seen - disable it */
+		if (attr & OVERLAY_ATTRIBUTES_ENABLE)
+		{
+			/* EXPERIMENTATION - Sometimes when disabling an overlay that's being displayed
+			   on the TV, it instead appears on the LCD. Try retaining the output channel flag
+			   and see if it disabled properly. */
+			r->attributes &= OVERLAY_ATTRIBUTES_GFXCHANNELOUT | OVERLAY_ATTRIBUTES_CHANNELOUT2;
+			if (gobits & DISPC_CONTROL_GOTV)
+			{
+				dispc->control1 |= DISPC_CONTROL_GOTV;
+			}
+			if (gobits & DISPC_CONTROL_GOLCD)
+			{
+				dispc->control2 |= DISPC_CONTROL_GOLCD;
+			}
+		}
+	}
+}
+
+static void dispc_update_vid_overlay(volatile vid_regs_t *r, overlay *o, int idx)
+{
+	/* TODO - Needs updating for non-16x32bit burst? */
+	/* TODO - Needs updating for rotation */
+	/* TODO - Needs updating for configurable arbitration */
+	/* TODO - Needs updating for scaling */
+	/* TODO - Needs updating for overlay optimisation */
+	/* TODO - Enable replication for <24bpp data */
+	uint32_t temp;
+	int32_t  ppl, lpp;
+	uint32_t gobits = 0;
+	/* If we're moving it from one display to another, we need to update both - so gobits
+	   should take into account both the initial and final display */
+	uint32_t attr = r->attributes;
+	uint32_t interlaceoffset;
+	if (attr & OVERLAY_ATTRIBUTES_ENABLE)
+		gobits = ((attr & OVERLAY_ATTRIBUTES_VIDCHANNELOUT)
+			   ? DISPC_CONTROL_GOTV : DISPC_CONTROL_GOLCD);
+	switch (o->target)
+	{
+		default: /* TODO - Error here! */
+		case TARGET_NONE:
+			if (attr & OVERLAY_ATTRIBUTES_ENABLE)
+			{
+				/* EXPERIMENTATION - Sometimes when disabling an overlay that's being displayed
+				   on the TV, it instead appears on the LCD. Try retaining the output channel
+				   flag and see if it disabled properly. */
+				r->attributes &= OVERLAY_ATTRIBUTES_VIDCHANNELOUT | OVERLAY_ATTRIBUTES_CHANNELOUT2;
+				if (gobits == DISPC_CONTROL_GOTV)
+				{
+					dispc->control1 |= DISPC_CONTROL_GOTV;
+				}
+				else
+				{
+					dispc->control2 |= DISPC_CONTROL_GOLCD;
+				}
+			}
+			return;
+		case TARGET_LCD:
+			temp = dispc->size_lcd2;
+			ppl = REG_EXTRACT(temp, DISPC_SIZE_LCD_PPL) + 1;
+			lpp = REG_EXTRACT(temp, DISPC_SIZE_LCD_LPP) + 1;
+			if (dispc->control2 & DISPC_CONTROL_LCDENABLE) /* TODO - Does this even matter? */
+				gobits |= DISPC_CONTROL_GOLCD;
+			interlaceoffset = 0;
+			break;
+		case TARGET_TV:
+			temp = dispc->size_tv;
+			ppl = REG_EXTRACT(temp, DISPC_SIZE_LCD_PPL) + 1;
+			lpp = REG_EXTRACT(temp, DISPC_SIZE_LCD_LPP) + 1;
+			if(dispc->control1 & DISPC_CONTROL_TVENABLE)
+				gobits |= DISPC_CONTROL_GOTV;
+			interlaceoffset = o->stride;
+			break;
+	}
+	/* Crop to screen */
+	int32_t  w = o->width;
+	int32_t  h = o->height;
+	int32_t  x = o->x;
+	int32_t  y = o->y;
+	uint32_t ba = o->ba;
+	if (x < 0)
+	{
+		w += x;
+		ba += ((uint32_t)(-x * overlay_format_bpp[o->format >> OVERLAY_ATTRIBUTES_FORMAT_SHIFT])) >> 3;
+		x = 0;
+	}
+	if (y < 0)
+	{
+		h += y;
+		ba -= y * o->stride;
+		y = 0;
+	}
+	if (interlaceoffset)
+	{
+		y = y >> 1;
+		h = h >> 1;
+	}
+	if (x + w > ppl)
+		w = ppl - x;
+	if (y + h > lpp)
+		h = lpp - y;
+	if ((w > 0) && (h > 0) && (o->ba) && !blanked)
+	{
+		r->ba[1] = ba;
+		r->ba[0] = ba + interlaceoffset;
+		r->position = (x << OVERLAY_POSITION_X_SHIFT) | (y << OVERLAY_POSITION_Y_SHIFT);
+		/* Picture size must be set, even if scaling isn't being used */
+		r->picture_size = r->size = ((w-1) << OVERLAY_SIZE_X_SHIFT) | ((h-1) << OVERLAY_SIZE_Y_SHIFT);
+		r->row_inc = (o->stride + 1 + interlaceoffset) - ((w * overlay_format_bpp[o->format >> OVERLAY_ATTRIBUTES_FORMAT_SHIFT]) >> 3);
+		uint32_t attr2 = OVERLAY_ATTRIBUTES_ENABLE
+					   | o->format
+					   | OVERLAY_ATTRIBUTES_ROTATION_0
+					   | OVERLAY_ATTRIBUTES_VIDRESIZEENABLE_NONE
+					   | OVERLAY_ATTRIBUTES_VIDBURSTSIZE_16X32
+					   | (o->target == TARGET_TV ? OVERLAY_ATTRIBUTES_VIDCHANNELOUT : OVERLAY_ATTRIBUTES_CHANNELOUT2_LCD2);
+		/* TODO - May malfunction if reserved fields aren't 0? Do we really even care about
+		          avoiding redoing this? */
+#if 0
+		if (attr != attr2)
+		{
+			r->pixel_inc = 1;
+			temp = REG_EXTRACT(r->buf_size_status, OVERLAY_FIFO_SIZE_STATUS);
+			r->buf_threshold = ((temp - 1) << OVERLAY_FIFOHIGHTHRESHOLD_SHIFT)
+							 | ((temp - 128) << OVERLAY_FIFOLOWTHRESHOLD_SHIFT);
+			/* Video specific settings */
+			dispc->vid_preload[idx] = fifo_preload_for_lcd[hwconfig->lcd_configs[current_lcd].lcd_type];
+			r->attributes = attr2;
+		}
+#else
+		r->pixel_inc = 1;
+		temp = REG_EXTRACT(r->buf_size_status, OVERLAY_FIFO_SIZE_STATUS);
+		r->buf_threshold = ((temp - 1) << OVERLAY_FIFOHIGHTHRESHOLD_SHIFT)
+						 | ((temp - 128) << OVERLAY_FIFOLOWTHRESHOLD_SHIFT);
+		/* Video specific settings */
+		dispc->vid_preload[idx] = fifo_preload_for_lcd[hwconfig->lcd_configs[current_lcd].lcd_type];
+		r->attributes = attr2;
+#endif
+		if (gobits & DISPC_CONTROL_GOTV)
+		{
+			dispc->control1 |= DISPC_CONTROL_GOTV;
+		}
+		if (gobits & DISPC_CONTROL_GOLCD)
+		{
+			dispc->control2 |= DISPC_CONTROL_GOLCD;
+		}
+	}
+	else
+	{
+		/* Can't be seen - disable it */
+		if (attr & OVERLAY_ATTRIBUTES_ENABLE)
+		{
+			/* EXPERIMENTATION - Sometimes when disabling an overlay that's being displayed
+			   on the TV, it instead appears on the LCD. Try retaining the output channel flag
+			   and see if it disabled properly. */
+			r->attributes &= OVERLAY_ATTRIBUTES_VIDCHANNELOUT | OVERLAY_ATTRIBUTES_CHANNELOUT2;
+			if (gobits & DISPC_CONTROL_GOTV)
+			{
+				dispc->control1 |= DISPC_CONTROL_GOTV;
+			}
+			if (gobits & DISPC_CONTROL_GOLCD)
+			{
+				dispc->control2 |= DISPC_CONTROL_GOLCD;
+			}
+		}
+	}
+}
+
+void dispc_update_overlay(overlayidx idx)
+{
+	/* The different padding in the graphics & video registers means we must have two
+	   separate update functions :( */
+	overlay *o = &overlays[idx];
+	int irqs;
+//	dprintf(("","ovl %d: target %d w %d h %d ba %08x\n",idx,o->target,o->width,o->height,o->ba));
+	if (!begin_quick_hardware_update(&irqs))
+		return; /* TODO - Mark as pending */
+	switch (idx)
+	{
+		case OVERLAY_GFX:
+			dispc_update_gfx_overlay(&dispc->gfx, o);
+			break;
+		case OVERLAY_VID1:
+			dispc_update_vid_overlay(&dispc->vid1, o, 0);
+			break;
+		case OVERLAY_VID2:
+			dispc_update_vid_overlay(&dispc->vid2, o, 0);
+			break;
+		default: /* TODO - Error! */
+			break;
+	}
+	end_quick_hardware_update(irqs);
+}
+
+void dispc_set_lcdmode(lcdtimings *timings)
+{
+	/* TODO - Need way of specifying spatial/temporal dithering stuff for mono displays */
+	/* TODO - Need way of specifying TDM stuff */
+	/* TODO - Needs updating for non-RFBI bypass mode */
+	/* TODO - Need way of setting digital hold time */
+	/* TODO - Need way of setting LCDENABLEPOL, LCDENABLESIGNAL (only relevant to SDI?) */
+	/* TODO - Need to call HAL to turn external chip on/off */
+	/* The flow used here is similar to that shown in spruf98d fig 15-147 (p2343),
+	   except the PLL reprogramming steps use the DSI PLL */
+	if (timings != &current_timings)
+		memcpy(&current_timings, timings, sizeof(lcdtimings));
+	int irqs;
+	if (!begin_slow_hardware_update(&irqs))
+	{
+		dprintf(("", "dispc_set_lcdmode: Banned!\n"));
+		return; /* TODO - Mark as pending */
+	}
+	dprintf(("","dispc_set_lcdmode: rate=%d syncpol=%d\n",timings->pixelrate,timings->syncpol));
+	dprintf(("","hsw=%d hfp=%d hbp=%d width=%d\n",timings->hsw,timings->hfp,timings->hbp,timings->width));
+	dprintf(("","vsw=%d vfp=%d vbp=%d height=%d\n",timings->vsw,timings->vfp,timings->vbp,timings->height));
+
+	/* We can skip this if we aren't changing pixel rate */
+	if (timings->pixelrate != dsi_pll_current_pixel_rate)
+	{
+		if (dispc->control2 & DISPC_CONTROL_LCDENABLE)
+		{
+			dprintf(("", "Disabling LCD prior to update\n"));
+			/* -1. TODO - Should this be done irrespective of LCDENABLE state? */
+			/* 0. TODO - Disable external chip? */
+			/* 1. Disable all pipelines (including TV ones?) */
+			dispc->gfx.attributes &= ~OVERLAY_ATTRIBUTES_ENABLE;
+			dispc->vid1.attributes &= ~OVERLAY_ATTRIBUTES_ENABLE;
+			dispc->vid2.attributes &= ~OVERLAY_ATTRIBUTES_ENABLE;
+			/* 2. Disable HSync, VSync, pixel data, AC bias */
+			dispc->config2 |= DISPC_CONFIG_PIXELGATED
+							| DISPC_CONFIG_HSYNCGATED
+							| DISPC_CONFIG_VSYNCGATED
+							| DISPC_CONFIG_ACBIASGATED;
+			/* 3. Force an update */
+			dispc->control2 |= DISPC_CONTROL_GOLCD;
+			/* 4. Wait */
+			int timeout = 100000000;
+			while ((dispc->control2 & DISPC_CONTROL_GOLCD) && --timeout)
+			{
+				;
+			}
+			if (!timeout)
+			{
+				dprintf(("", "dispc_set_lcdmode: Timeout waiting for DISPC_CONTROL_GOLCD clear\n"));
+			}
+			/* 5. Disable LCD */
+			dispc->control2 &= ~DISPC_CONTROL_LCDENABLE;
+			/* X. Wait for FRAMEDONE bit (according to most other docs) */
+			/* TODO - Except we can't be sure that we've received it before or after we
+			   cleared LCDENABLE! Need to do it from an interrupt routine? */
+		}
+
+		/* 7-23. Reprogram PLL */
+		dsi_pll_program_for_dispc(timings->pixelrate);
+
+		if (exp_synclost_count > 5)
+		{
+			dprintf(("", "dispc_set_lcdmode: EXPERIMENT: Delaying after PLL reprogram to try and escape synclost loop\n"));
+			_swix(OS_Hardware, _IN(0) | _INR(8,9), 100000, 0, EntryNo_HAL_CounterDelay);
+		}
+
+		dss->ctrl = DSS_CTRL_FCK_CLK_SWITCH_PLL2
+				   | DSS_CTRL_LCD2_CLK_SWITCH;
+	}
+	else
+	{
+		/* Prevent any updates from occuring in the middle of our update.
+		   TODO - this isn't foolproof */
+		dispc->control2 &= ~DISPC_CONTROL_GOLCD;
+	}
+
+	lcdconfig *config = &hwconfig->lcd_configs[current_lcd];
+	/* Build appropriate DISPC_CONTROL value */
+	uint32_t control = dispc->control2 & (DISPC_CONTROL_TVENABLE | DISPC_CONTROL_GOTV);
+	switch (config->lcd_type)
+	{
+		case LCD_TFT:
+			control = DISPC_CONTROL_STNTFT;
+			switch (config->dsi_bpp)
+			{
+				case 12:
+					control |= DISPC_CONTROL_TFTDATALINES_12BPP;
+					break;
+				case 16:
+					control |= DISPC_CONTROL_TFTDATALINES_16BPP;
+					break;
+				case 18:
+					control |= DISPC_CONTROL_TFTDATALINES_18BPP;
+					break;
+				case 24:
+					control |= DISPC_CONTROL_TFTDATALINES_24BPP;
+					break;
+				/* else error? */
+			}
+			break;
+		case LCD_STN_COLOUR:
+			control = 0;
+			break;
+		case LCD_STN_MONO4:
+			control = DISPC_CONTROL_MONOCOLOR;
+			break;
+		case LCD_STN_MONO8:
+			control = DISPC_CONTROL_MONOCOLOR | DISPC_CONTROL_M8B;
+			break;
+		/* else error? */
+	}
+
+	/* Program display timings */
+	dispc->size_lcd2 = ((timings->width - 1) << DISPC_SIZE_LCD_PPL_SHIFT)
+					 | ((timings->height - 1) << DISPC_SIZE_LCD_LPP_SHIFT); /* 1-based */
+	dispc->timing_h2 = ((timings->hsw - 1) << DISPC_TIMING_H_HSW_SHIFT)
+					 | ((timings->hfp - 1) << DISPC_TIMING_H_HFP_SHIFT)
+					 | ((timings->hbp - 1) << DISPC_TIMING_H_HBP_SHIFT); /* All 1-based */
+	dispc->timing_v2 = ((timings->vsw - 1) << DISPC_TIMING_V_VSW_SHIFT)
+					 | (timings->vfp << DISPC_TIMING_V_VFP_SHIFT)
+					 | (timings->vbp << DISPC_TIMING_V_VBP_SHIFT); /* Only VSW is 1-based! */
+	uint32_t pol_freq;
+	pol_freq = config->acbias_freq << DISPC_POL_FREQ_ACB_SHIFT;
+	if (config->flags & LCDCONFIG_RF)
+		pol_freq |= DISPC_POL_FREQ_RF;
+	if (config->flags & LCDCONFIG_IEO)
+		pol_freq |= DISPC_POL_FREQ_IEO;
+	if (config->flags & LCDCONFIG_IPC)
+		pol_freq |= DISPC_POL_FREQ_IPC;
+	if (timings->syncpol & VIDCLIST3_HSYNC)
+		pol_freq |= DISPC_POL_FREQ_IHS;
+	if (timings->syncpol & VIDCLIST3_VSYNC)
+		pol_freq |= DISPC_POL_FREQ_IVS;
+	dispc->pol_freq2 = pol_freq;
+	/* TODO - Make this configurable - CPR */
+	dispc->config2 |= DISPC_CONFIG_CPR;
+	/* Update transparency settings */
+	dispc_flush_transparency_cfg(false);
+	/* Default CPR value for RISC OS */
+	dispc->cpr2_coef_r = 256;
+	dispc->cpr2_coef_g = 256 << 11;
+	dispc->cpr2_coef_b = 256 << 22;
+
+#if 0
+	/* DISPC_CONFIG2 does not have these fields */
+#if 0
+	dispc->config1 = (dispc->config1 & ~DISPC_CONFIG_LOADMODE_MASK) | DISPC_CONFIG_LOADMODE_BOTH;
+#else
+	/* Load palette + frame data. TODO - Tweak? */
+	dispc->config1 = (dispc->config1 & ~DISPC_CONFIG_LOADMODE_MASK) | DISPC_CONFIG_LOADMODE_BOTH_THEN_FRAME;
+#endif
+#endif
+
+	/* Re-enable all the other clocks */
+	dispc->config2 &= ~(	DISPC_CONFIG_PIXELGATED
+						 |	DISPC_CONFIG_HSYNCGATED
+						 |	DISPC_CONFIG_VSYNCGATED
+						 |	DISPC_CONFIG_ACBIASGATED);
+
+	if (exp_synclost_count > 10)
+	{
+		dprintf(("", "dispc_set_lcdmode: EXPERIMENT: Delaying after enabling clocks to try and escape synclost loop\n"));
+		_swix(OS_Hardware, _IN(0) |_INR(8,9), 100000, 0, EntryNo_HAL_CounterDelay);
+	}
+
+	/* Flush any pending overlay updates */
+	for (int i = 0; i < OVERLAY_MAX; i++)
+		dispc_update_overlay((overlayidx)i);
+
+	/* Make sure that appropriate IRQs are enabled */
+	uint32_t mask = DISPC_IRQ_VSYNC2 | (exp_synclost_count < 15 ? DISPC_IRQ_SYNCLOST2 : 0)
+#ifdef DEBUGLIB /* Enable these IRQs for debug builds so we can see when they occur. */
+	| DISPC_IRQ_GFXBUFFERUNDERFLOW | DISPC_IRQ_OCPERROR | DISPC_IRQ_VID1BUFFERUNDERFLOW | DISPC_IRQ_VID2BUFFERUNDERFLOW
+#endif
+	;
+
+	/* clear any pending interrupts first */
+	do
+	{
+		dispc->irqstatus = mask;
+	} while (dispc->irqstatus & mask);
+	/* Now enable display */
+	dispc->control2 = control | DISPC_CONTROL_GOLCD | DISPC_CONTROL_LCDENABLE;
+	dispc->irqenable = mask;
+
+	/* Enable power to any external chips */
+	(hwconfig->lcd_configs[current_lcd].power)(dev, 65536);
+
+	dprintf(("", "dispc_set_lcdmode: Done (%d)\n", exp_synclost_count));
+	end_slow_hardware_update(irqs);
+}
+
+void dispc_flush_transparency_cfg(bool go)
+{
+	int irqs;
+	if (!begin_quick_hardware_update(&irqs))
+		return;
+
+	uint32_t orig_config2 = dispc->config2;
+	uint32_t orig_config1 = dispc->config1;
+	uint32_t config2 = orig_config2 & ~(	DISPC_CONFIG_TCKLCDENABLE
+										  |	DISPC_CONFIG_TCKLCDSELECTION);
+	uint32_t config1 = orig_config1 & ~(	DISPC_CONFIG_TCKTVENABLE
+										  |	DISPC_CONFIG_TCKTVSELECTION
+										  |	DISPC_CONFIG_TVALPHABLENDERENABLE);
+	/* TODO - Check for errors (e.g. VIDSRC when colour space conversion/scaling in use */
+	config2 |= transparency_lut[TARGET_LCD][current_transparencycfgs[TARGET_LCD]];
+	config1 |= transparency_lut[TARGET_TV][current_transparencycfgs[TARGET_TV]];
+	if (config2 != orig_config2)
+	{
+		dispc->config2 = config2;
+		if (go)
+		{
+			config2 = config2 ^ orig_config2;
+			if (   (dispc->control2 & DISPC_CONTROL_LCDENABLE)
+				&& (config2 & (DISPC_CONFIG_TCKLCDENABLE | DISPC_CONFIG_TCKLCDSELECTION)))
+			{
+				dispc->control2 |= DISPC_CONTROL_GOLCD;
+			}
+		}
+	}
+	if (config1 != orig_config1)
+	{
+		dispc->config1 = config1;
+		if (go)
+		{
+			config1 = config1 ^ orig_config1;
+			if (   (dispc->control1 & DISPC_CONTROL_TVENABLE)
+				&& (config1 & (  DISPC_CONFIG_TCKTVENABLE
+							  | DISPC_CONFIG_TCKTVSELECTION
+							  | DISPC_CONFIG_TVALPHABLENDERENABLE)))
+			{
+				dispc->control1 |= DISPC_CONTROL_TVENABLE;
+			}
+		}
+	}
+	end_quick_hardware_update(irqs);
+}
+
+
+
+int dispc_irq_handler(_kernel_swi_regs *r, void *pw)
+{
+	/* Get cause */
+	uint32_t cause = dispc->irqstatus & dispc->irqenable;
+
+	(void)r;
+	(void)pw;
+
+	if (0 == cause)
+		return 1; /* Wasn't us! */
+
+	/* SYNCLOST handling - as per note on p2192 of spruf98d:
+	   * Disable offending display (LCD or TV)
+	   * Wait for current frame to complete (FRAMEDONE or EVSYNC_EVEN/EVSYNC_ODD)
+	   * Perform DSS SOFTRESET
+	   * Reprogram and pray it's fixed! */
+	if (cause & DISPC_IRQ_SYNCLOST2)
+	{
+		/* This still feels icky */
+		dispc->irqstatus = DISPC_IRQ_FRAMEDONE2;
+		dispc->control2 &= ~DISPC_CONTROL_LCDENABLE;
+		dispc->irqenable = (dispc->irqenable & ~DISPC_IRQ_SYNCLOST2) | DISPC_IRQ_FRAMEDONE2;
+		set_ban(BHUB_SYNCLOST);
+		exp_synclost_count++;
+	}
+	if (cause & DISPC_IRQ_SYNCLOSTTV)
+	{
+		dispc->irqstatus = DISPC_IRQ_EVSYNC_EVEN | DISPC_IRQ_EVSYNC_ODD;
+		dispc->control1 &= ~DISPC_CONTROL_TVENABLE;
+		dispc->irqenable = (dispc->irqenable & ~DISPC_IRQ_SYNCLOSTTV)
+						 | DISPC_IRQ_EVSYNC_EVEN | DISPC_IRQ_EVSYNC_ODD;
+		set_ban(BHUB_SYNCLOSTDIGITAL);
+	}
+#ifdef DEBUGLIB
+	if ((cause & ~(DISPC_IRQ_VSYNC2 | DISPC_IRQ_EVSYNC_EVEN | DISPC_IRQ_EVSYNC_ODD)) != 0)
+		dprintf(("", "dispc_irq_handler: Cause %08x\n", cause));
+#endif
+	/* Clear IRQs */
+	dispc->irqstatus = cause;
+	/* Clear in interrupt controller */
+	_swix(OS_Hardware, _IN(0) | _INR(8,9), dev->dev.devicenumber & ~(1u << 31), 0,
+		  EntryNo_HAL_IRQClear);
+	/* We can now enable interrupts? */
+	int irqs = _kernel_irqs_disabled();
+	if (irqs)
+		_kernel_irqs_on();
+	/* Only tell RISC OS about VSync if we haven't encountered SYNCLOST,
+	   and only if it's the right kind of vsync */
+	if (((cause & DISPC_IRQ_VSYNC2) && (default_display == TARGET_LCD)
+		 && !(ban_hardware_update & BHUB_SYNCLOST))
+		 || ((cause & (DISPC_IRQ_EVSYNC_EVEN | DISPC_IRQ_EVSYNC_ODD))
+		 && (default_display == TARGET_TV) && !(ban_hardware_update & BHUB_SYNCLOSTDIGITAL)))
+	{
+		/* Let RISC OS know it was a VSync */
+		_kernel_oserror *e = _swix(OS_CallAVector, _IN(4) | _IN(9),
+								   GraphicsV_VSync | (graphicsv_driver_number << 24),
+								   GraphicsV);
+		if (e)
+			dprintf(("", "%08x %s\n", e->errnum, e ->errmess));
+	}
+	if (	((cause & DISPC_IRQ_FRAMEDONE2) && (ban_hardware_update & BHUB_SYNCLOST))
+		||	((cause & (DISPC_IRQ_EVSYNC_EVEN | DISPC_IRQ_EVSYNC_ODD))
+			 && (ban_hardware_update & BHUB_SYNCLOSTDIGITAL)))
+	{
+		/* SYNCLOST handling, part two
+		   Reset the DSS, then reprogram whatever outputs were active before the incident */
+		uint32_t oldctrl = dispc->control2;
+		dprintf(("", "dispc_irq_handler: dss_reset: cause %08x ban %08x oldctrl %08x\n", cause, ban_hardware_update, oldctrl));
+		/* Clear all bans beforehand? Seems icky */
+		bool restore_lcd = ((oldctrl & DISPC_CONTROL_LCDENABLE) || (ban_hardware_update & BHUB_SYNCLOST));
+		bool restore_tv = ((oldctrl & DISPC_CONTROL_TVENABLE) || (ban_hardware_update & BHUB_SYNCLOSTDIGITAL));
+		clear_ban(BHUB_SYNCLOST);
+		clear_ban(BHUB_SYNCLOSTDIGITAL);
+		dss_reset();
+		if (restore_lcd)
+		{
+			/* Should fully reprogram everything that we need */
+			dispc_set_lcdmode(&current_timings);
+		}
+		if (restore_tv)
+		{
+			/* We need to fool the code into resetting the mode */
+			tvouttype type = current_tvtype;
+			current_tvtype = TVOUT_NONE;
+			venc_set_tvmode(current_tvmode, type, testcard);
+		}
+	}
+	if (irqs)
+		_kernel_irqs_off();
+	return 0;
+}

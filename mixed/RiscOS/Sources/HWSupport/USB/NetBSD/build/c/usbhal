@@ -1,0 +1,802 @@
+/* Copyright 2011 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/* This file is the HAL equivalent of usbmodule.c, with a few routines from
+   port.c thrown in for good measure.
+*/
+
+#include <dev/usb/usbhal.h>
+
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#include "DebugLib/DebugLib.h"
+#include "swis.h"
+#include <sys/callout.h>
+#include "sys/time.h"
+#include "Global/HALEntries.h"
+
+#include "dev/usb/usb.h"
+#include "dev/usb/usbdi.h"
+#include "dev/usb/usbdi_util.h"
+#include "dev/usb/usbdivar.h"
+
+#define MAX_TSLEEP_HANDLES 32 /* Should be plenty? */
+#define MAX_CALLBACKS 16
+
+//#define DEBUG_HAL
+
+#ifdef DEBUG_HAL
+#define hdprintf printf
+#else
+#define hdprintf(...) 0
+#endif
+
+extern void HALHeap_InitHeap(void *heap,uint32_t size);
+extern uint32_t HAL_CounterRead(void);
+extern uint32_t HAL_CounterPeriod(void);
+extern int HAL_TimerDevice(int timer);
+extern void HAL_TimerIRQClear(int timer);
+extern int HAL_IRQEnable(int device);
+extern int HAL_IRQDisable(int device);
+extern int HAL_IRQSource(void);
+extern void HAL_IRQClear(int device);
+extern void HAL_DebugTX(int c);
+
+extern void panic (const char* str, ...);
+
+/* this is defined in usb.c by the macro USB_DECLARE_DRIVER */
+extern const struct cfattach usb_ca;
+extern const struct cfattach uhub_uhub_ca;
+extern struct usbd_bus *usb_getbus(device_ptr_t self);
+extern int usbioctl(int devt, u_long cmd, void* data, int flag, void *p);
+
+static void re_discover(void *param);
+
+#if 0
+/* Some heap validation code, since I got rid of the code in halheap.s */
+void dumpheap(uint32_t *heap)
+{
+    int s = splbio();
+    printf("heap @ %p:\nmag %x\nfree %x\nbase %x\nend %x\n",heap,heap[0],heap[1],heap[2],heap[3]);
+    uint32_t free = heap[1];
+    uint32_t next = 16;
+    if(free)
+        free += 4;
+    while(free)
+    {
+        if(free > next)
+        {
+            printf("allocs between %x and %x:\n",next,free);
+            do {
+                printf("%x: alloc size %x\n",next,heap[next>>2]);
+                if((heap[next>>2] > heap[2]) || (heap[next>>2]+next > heap[2]) || (heap[next>>2]&3) || !heap[next>>2])
+                {
+                    printf("bad block, skipping rest\n");
+                    break;
+                }
+                next += heap[next>>2];
+            } while(free>next);
+            if(free!=next)
+                printf("alloc mismatch! next=%x\n",next);
+        }
+        printf("%x: free size %x next %x\n",free,heap[(free+4)>>2],heap[free>>2]);
+        if(heap[(free+4)>>2] == heap[free>>2])
+            printf("consecutive free blocks!\n");
+        next = free+heap[(free+4)>>2];
+        if((heap[free>>2] & 3) || (heap[free>>2] >= heap[2]) || (heap[free>>2]+free >= heap[2]))
+        {
+            printf("bad next ptr\n");
+            do {} while(1);
+        }
+        if((heap[(free+4)>>2] & 3) || (heap[(free+4)>>2] >= heap[2]) || (heap[(free+4)>>2]+free >= heap[2]))
+        {
+            printf("bad size\n");
+            do {} while(1);
+        }
+        if(!heap[free>>2])
+        {
+            printf("end of free list\n");
+            break;
+        }
+        free = free+heap[free>>2];
+        if(free<next)
+        {
+            printf("next free is inside current?\n");
+            do {} while(1);
+        }
+    }
+    if(free > heap[2])
+    {
+        printf("free list extends beyond heap end\n");
+    }
+    if(next > heap[2])
+    {
+        printf("next ptr beyond heap end\n");
+    }
+    printf("end allocs:\n");
+    while(next < heap[2])
+    {
+        printf("%x: alloc size %x\n",next,heap[next>>2]);
+        if((heap[next>>2] > heap[2]) || (heap[next>>2]+next > heap[2]) || (heap[next>>2]&3) || !heap[next>>2])
+        {
+            printf("bad block, skipping rest\n");
+            break;
+        }
+        next += heap[next>>2];
+    }
+    printf("end\n");
+    splx(s);
+}
+#endif
+
+/*
+ * Keyboard code
+ */
+
+#define NKEYCODE 6
+
+struct ukbd_data {
+    uint8_t modifiers;
+    uint8_t reserved;
+    uint8_t keycode[NKEYCODE];
+};
+
+struct ukbd_softc {
+    USBBASEDEVICE           sc_dev;
+    usbd_device_handle      sc_udev;
+    usbd_interface_handle   sc_iface;       /* interface */
+    usbd_pipe_handle        sc_intrpipe;    /* interrupt pipe */
+    int                     sc_ep_addr;
+
+    struct ukbd_data        data;
+};
+
+void ukbd_intr(usbd_xfer_handle xfer, usbd_private_handle addr, usbd_status ustatus)
+{
+    struct ukbd_softc *sc = addr;
+    struct ukbd_data * data = &sc->data;
+
+    if (ustatus) {
+        hdprintf("ukbd_intr: status=%d\n", ustatus);
+        if (ustatus != USBD_CANCELLED)
+        {
+            usbd_clear_endpoint_stall_async(sc->sc_intrpipe);
+        }
+        return;
+    }
+
+    /* Minimal decoding, as per Tungsten HAL */
+    uint32_t result = KbdFlag_Present;
+    if (data->modifiers & ((1<<0) | (1<<4)))
+        result |= KbdFlag_Ctrl;
+    if (data->modifiers & ((1<<1) | (1<<5)))
+        result |= KbdFlag_Shift;
+
+    for (int i = 0; i < NKEYCODE; ++i)
+    {
+        switch (data->keycode[i])
+        {
+        case 0x15: result |= KbdFlag_R; break;
+        case 0x17: result |= KbdFlag_T; break;
+        case 0x4c: result |= KbdFlag_Delete; break;
+        case 0x4d: result |= KbdFlag_Copy; break;
+        }
+    }
+    result |= KbdFlag_Done;
+    int s = splbio();
+    USBHALWS->kbdflags |= result;
+    splx(s);
+}
+
+struct device* attach_keyboard (struct device* parent, void* aux)
+{
+    struct ukbd_softc* softc;
+    struct usb_attach_arg *uaa = aux;
+    usb_interface_descriptor_t *id;
+    usb_endpoint_descriptor_t *ed;
+
+    /* First see if we match */
+    /* Check that this is a keyboard that speaks the boot protocol. */
+    if (uaa->iface == NULL)
+    {
+       return (UMATCH_NONE);
+    }
+    id = usbd_get_interface_descriptor(uaa->iface);
+    if (id == NULL ||
+        id->bInterfaceClass != UICLASS_HID ||
+        id->bInterfaceSubClass != UISUBCLASS_BOOT ||
+        id->bInterfaceProtocol != UIPROTO_BOOT_KEYBOARD)
+    {
+       return (UMATCH_NONE);
+    }
+
+    /* If so, allocate memory for the device and attach ourselves. */
+    softc = malloc (sizeof *softc);
+    if (softc == NULL) {
+        return NULL;
+    }
+    memset(softc,0,sizeof(*softc));
+    strcpy (softc->sc_dev.dv_xname, "USBK");
+    softc->sc_dev.dv_cfdata = (void*) 4; // keyboard
+
+    softc->sc_udev = uaa->device;
+    softc->sc_iface = uaa->iface;
+
+    ed = usbd_interface2endpoint_descriptor(uaa->iface, 0);
+    if (ed == NULL) {
+        hdprintf("kbd: Could not read endpoint descriptor\n");
+        return NULL;
+    }
+
+    if (usbd_set_protocol(uaa->iface, 0)) {
+        hdprintf("kbd: Set protocol failed\n");
+        return NULL;
+    }
+
+    softc->sc_ep_addr = ed->bEndpointAddress;
+
+
+    hdprintf("USB keyboard enabled\n");
+    int s = splbio();
+    USBHALWS->kbdflags |= KbdFlag_Present;
+    splx(s);
+
+    /* set idle rate to 0 */
+    usbd_set_idle (softc->sc_iface, 0, 0);
+
+    /* Set up interrupt pipe. */
+    usbd_open_pipe_intr(softc->sc_iface, softc->sc_ep_addr,
+        USBD_SHORT_XFER_OK, &softc->sc_intrpipe, softc,
+        &softc->data, sizeof(softc->data), ukbd_intr,
+        USBD_DEFAULT_INTERVAL);
+
+    return (struct device*) softc;
+}
+
+int detach_keyboard (struct device* kb)
+{
+    struct ukbd_softc* sc = (struct ukbd_softc*) kb;
+    usbd_abort_pipe(sc->sc_intrpipe);
+    usbd_close_pipe(sc->sc_intrpipe);
+    free (kb);
+    return 0;
+}
+
+/*
+ * HAL interface bits
+ */
+
+void triggercbs (void)
+{
+    if(!USBHALWS->irqsema)
+    {
+        if(!USBHALWS->cbs_needed)
+            return;
+
+        int s = splbio();
+        /* Prevent nested calls to triggercbs() needlessly processing the callback chain when we're already in the middle of it. Effectively matches behaviour of CBack_VectorReq flag in kernel. */
+        USBHALWS->cbs_needed = false;
+        /* Trigger all pending callbacks */
+        while(USBHALWS->numcb)
+        {
+            int idx = USBHALWS->nextcb & (MAX_CALLBACKS-1);
+            void (*cbfunc)(void *) = USBHALWS->callbacks[idx].cbfunc;
+            void *param = USBHALWS->callbacks[idx].param;
+            USBHALWS->numcb--;
+            USBHALWS->nextcb++;
+            hdprintf("cb %p %p\n",cbfunc,param);
+            if(cbfunc)
+            {
+                cbfunc(param);
+                splbio(); /* Make sure IRQs remain off */
+            }
+        }
+        splx(s);
+    }
+}
+
+void USBHAL_Init(void *heapbase,uint32_t heapsize,void *ncnbbase,uint32_t ncnbsize)
+{
+    /* Init heaps so malloc/free will work */
+    USBHALWS->heap_normal = heapbase;
+    USBHALWS->heap_ncnb = ncnbbase;
+    HALHeap_InitHeap(USBHALWS->heap_normal,heapsize);
+    HALHeap_InitHeap(USBHALWS->heap_ncnb,ncnbsize);
+    /* Init rest of workspace */
+    TAILQ_INIT(&(USBHALWS->allbuses));
+    USBHALWS->usbbus_no = 1;
+    USBHALWS->monotonictime = 0;
+    USBHALWS->callouts = NULL;
+    USBHALWS->irqsema = 0;
+    USBHALWS->t_handles = malloc(MAX_TSLEEP_HANDLES*4);
+    USBHALWS->t_locks = malloc(MAX_TSLEEP_HANDLES*4);
+    USBHALWS->nhandles = 0;
+    USBHALWS->kbdflags = 0;
+    USBHALWS->callbacks = malloc(sizeof(usbhal_callback)*MAX_CALLBACKS);
+    USBHALWS->nextcb = 0;
+    USBHALWS->numcb = 0;
+    USBHALWS->cbs_needed = false;
+    /* The centisecond timer will be running, but the interrupt won't. Enable it. */
+    HAL_IRQEnable(HAL_TimerDevice(0));
+    /* Start rediscover callout. Half second interval should do it. */
+    USBHALWS->rediscover = malloc(sizeof(struct callout));
+    callout_init(USBHALWS->rediscover,0);
+    callout_reset(USBHALWS->rediscover,500,re_discover,NULL);
+}
+
+uint32_t USBHAL_KbdScan(void)
+{
+    /* Return sticky flags */
+    return USBHALWS->kbdflags;
+}
+
+int USBHAL_KbdScanInterrupt(int irq)
+{
+    USBHALWS->irqsema++;
+    hdprintf("i%d\n",irq);
+    if(irq == HAL_TimerDevice(0))
+    {
+        /* Timer interrupt */
+        HAL_TimerIRQClear(0);
+        HAL_IRQClear(irq);
+        USBHALWS->monotonictime++;
+        while(USBHALWS->callouts && (USBHALWS->monotonictime >= USBHALWS->callouts->c_time))
+        {
+            /* Trigger callout */
+            void (*f)(void *) = USBHALWS->callouts->c_func;
+            void *v = USBHALWS->callouts->c_arg;
+            USBHALWS->callouts = USBHALWS->callouts->c_next;
+            hdprintf("co %p %p\n",f,v);
+            if(f)
+            {
+                f(v);
+            }
+            /* Make sure IRQs are still off */
+            splbio();
+        }
+        irq = -1;
+    }
+    else if(irq != -1)
+    {
+        /* Process controller IRQs */
+        struct device* dev;
+        TAILQ_FOREACH(dev, &USBHALWS->allbuses, dv_list)
+        {
+            struct usbd_bus *bus = usb_getbus(dev);
+            if(bus->methods->do_intr(bus,irq))
+            {
+                irq = -1;
+                goto done;
+            }
+        }
+        hdprintf("?\n");
+    }
+done:
+    USBHALWS->irqsema--;
+    /* Trigger any pending callbacks */
+    triggercbs();
+    hdprintf("I\n");
+    return irq;
+}
+
+void USBHAL_Shutdown(void)
+{
+#if 0
+    dumpheap(USBHALWS->heap_normal);
+    dumpheap(USBHALWS->heap_ncnb);
+#endif
+    callout_stop(USBHALWS->rediscover);
+    /* RISC OS calls this with interrupts off, but we probably want them on */
+    splx(0);
+    /* Shut down all host controllers */
+    struct device* dev;
+    TAILQ_FOREACH(dev, &USBHALWS->allbuses, dv_list)
+    {
+        /* Trigger any pending callbacks */
+        triggercbs();
+        
+        (*usb_ca.ca_detach)(dev, 0);
+
+        /* Should we be doing this before or after? */
+        struct usbd_bus *bus = usb_getbus(dev);
+        bus->methods->shutdown(bus);
+        
+        free (dev);
+    }
+    /* Trigger any pending callbacks */
+    triggercbs();
+    /* Now stop the timer IRQ */
+    HAL_IRQDisable(HAL_TimerDevice(0));
+    /* Done! */
+    /* TODO - Clear up memory allocations? */
+    splbio();
+}
+
+void USBHAL_AddCallback(void (*cbfunc)(void *),void *param)
+{
+    int s = splbio();
+    if(USBHALWS->numcb == MAX_CALLBACKS)
+        panic("Ran out of callbacks!");
+    int idx = (USBHALWS->numcb+USBHALWS->nextcb) & (MAX_CALLBACKS-1);
+    USBHALWS->callbacks[idx].cbfunc = cbfunc;
+    USBHALWS->callbacks[idx].param = param;
+    USBHALWS->numcb++;
+    USBHALWS->cbs_needed = true;
+    splx(s);
+}
+
+void USBHAL_RemoveCallback(void (*cbfunc)(void *),void *param)
+{
+    int s = splbio();
+    for(int i=0;i<USBHALWS->numcb;i++)
+    {
+        int idx = (i+USBHALWS->nextcb) & (MAX_CALLBACKS-1);
+        if((USBHALWS->callbacks[idx].cbfunc == cbfunc) && (USBHALWS->callbacks[idx].param == param))
+        {
+            /* Do it the easy way */
+            USBHALWS->callbacks[idx].cbfunc = NULL;
+            splx(s);
+            return;
+        }
+    }
+    splx(s);
+}
+
+/*
+ * usbmodule.c routines:
+ */
+
+device_ptr_t register_bus(device_ptr_t bus)
+{
+    device_ptr_t softc;
+    /* initialise device structure */
+    softc = malloc (usb_ca.ca_devsize);
+    if (softc == NULL) return NULL;
+    memset(softc,0,usb_ca.ca_devsize);
+    TAILQ_INSERT_TAIL (&(USBHALWS->allbuses), softc, dv_list);
+    hdprintf("adding bus %p using %p size %x\n", bus,softc,usb_ca.ca_devsize);
+
+    /* abuse the device structure a bit */
+    bus->dv_unit = softc->dv_unit = (USBHALWS->usbbus_no++);
+
+    /* set the flag to make it explore immediately */
+    softc->dv_cfdata = &(struct cfdata) { .cf_flags = 1 };;
+
+    strcpy (softc->dv_xname, "USBDriver");
+
+    (*usb_ca.ca_attach)(0, softc, bus);
+
+    return softc;
+}
+
+/*---------------------------------------------------------------------------*/
+
+void deregister_bus (device_ptr_t bus)
+{
+    hdprintf ("removing bus %p\n", bus);
+    (*usb_ca.ca_detach)(bus, 0);
+    hdprintf ("finished removing bus %p\n", bus);
+    TAILQ_REMOVE (&(USBHALWS->allbuses), (device_ptr_t) bus, dv_list);
+    free (bus);
+}
+
+/*---------------------------------------------------------------------------*/
+
+struct device* get_softc (int unit)
+{
+    struct device* dev;
+    TAILQ_FOREACH(dev, &(USBHALWS->allbuses), dv_list)
+    {
+        if (dev->dv_unit == ((unit >> 16) & 0xff))
+            return dev;
+    }
+
+    hdprintf ("couldn't find unit %x\n", unit);
+    return NULL;
+}
+
+/*---------------------------------------------------------------------------*/
+
+extern void usb_discover (void*);
+
+void discover_callback (void* sc)
+{
+    struct usbd_bus* bus = sc;
+    struct device* dev;
+    hdprintf ("bus discover %p\n",bus);
+    TAILQ_FOREACH(dev, &USBHALWS->allbuses, dv_list)
+    {
+        /* XXX this is dodgy, because in the case where the OHCIDriver module
+           has removed its memory, 'bus' is no longer a valid pointer, and
+           could either cause an abort or accidentally contain a valid usbctl */
+     hdprintf("dev:%p uctl:%p \n",dev,bus->usbctl);
+        if (dev == (struct device*) bus->usbctl)
+            goto valid;
+    }
+
+    hdprintf ("bus %p has been removed\n",bus);
+    if(bus) bus->callbacks=0;
+    return;
+
+valid:
+    /* This is a standard callx callback, so we want IRQs on */
+    splx(0);
+    hdprintf ("discovering %p\n",dev);
+    do {
+        usb_discover (bus->usbctl);
+    } while (--bus->callbacks);
+    hdprintf ("finished callbacks\n");
+}
+
+/*---------------------------------------------------------------------------*/
+  
+void usb_needs_explore_callback (void* h) {
+    struct usbd_bus* bus = h;
+    if (bus->callbacks>9) bus->callbacks=9;
+    if (bus->callbacks++ == 0)
+    {
+        hdprintf ("Adding explore callback on bus %p\n",h);
+        USBHAL_AddCallback (discover_callback, h);
+    }
+    else
+        hdprintf ("deferring callback on bus %p - %d callbacks queued\n",bus, bus->callbacks);
+}
+
+/*---------------------------------------------------------------------------*/
+
+struct device* attach_hub (struct device* parent, void* aux)
+{
+    struct device* softc;
+    struct usb_attach_arg* uaa = aux;
+
+    /* don't match generic */
+    if (uaa->usegeneric) return NULL;
+
+    hdprintf ("Trying match on usb hub\n");
+
+    /* First see if we match */
+    if ((*uhub_uhub_ca.ca_match) (0, 0, aux) == UMATCH_NONE)
+    {
+       hdprintf ("Failed to match\n");
+       return NULL;
+    }
+
+    /* If so, allocate memory for the device and attach ourselves. */
+    softc = malloc (uhub_uhub_ca.ca_devsize);
+    if (softc == NULL) {
+        hdprintf ("Couldn't allocate memory for hub device\n");
+        return NULL;
+    }
+    memset (softc, 0, uhub_uhub_ca.ca_devsize);
+    strcpy (softc->dv_xname,"USBHub");
+    softc->dv_cfdata = (void*) 1; // hub
+
+    (*uhub_uhub_ca.ca_attach) (parent, softc, aux);
+
+    hdprintf ("Matched hub\n");
+
+    return softc;
+}
+
+/*---------------------------------------------------------------------------*/
+
+int detach_hub (struct device* hub)
+{
+    (*uhub_uhub_ca.ca_detach) (hub, 0);
+    free (hub);
+    return 0;
+}
+
+/*---------------------------------------------------------------------------*/
+
+struct device* riscos_usb_attach
+(
+    void* dev,
+    struct device*  parent,
+    void* aux
+) {
+    struct device* ret = attach_hub(parent,aux);
+    if(!ret)
+        ret = attach_keyboard(parent,aux);
+    return ret;
+}
+
+/*---------------------------------------------------------------------------*/
+
+int config_detach (struct device* dev, int n)
+{
+    hdprintf ("config detach %p, %d, type %d\n",
+        dev, n, (int) dev->dv_cfdata);
+    /* catch case of config_detach called from config_found above */
+    if (dev == (void*) 1)
+    {
+        return 0;
+    }
+
+    switch ((int) (dev->dv_cfdata))
+    {
+    case 1: return detach_hub (dev);
+    case 4: return detach_keyboard (dev);
+    }
+
+//    free (dev);
+    return 0;
+}
+
+/*---------------------------------------------------------------------------*/
+
+void uhub_activate (void)
+{}
+
+/*---------------------------------------------------------------------------*/
+
+static void re_discover(void *param)
+{
+    (void)param;
+    for (int i = 1; i < USBHALWS->usbbus_no; i++)
+    {
+        if (get_softc (i << 16) != NULL)
+        {
+            hdprintf("rediscover bus %d\n",i);
+            usbioctl (i << 16, USB_DISCOVER, 0, 0, 0);
+        }
+    }
+    callout_reset(USBHALWS->rediscover,500,re_discover,NULL);
+}
+
+/*
+ * port.c routines:
+ */
+
+extern uint64_t gettime (void);
+
+uint64_t gettime (void)
+{
+    uint32_t cs;
+    uint32_t ns_factor;
+    uint32_t max_count = HAL_CounterPeriod();
+
+    /* conversion to ns, assume counter is for 1 cs */
+    ns_factor = 10000000u / max_count;
+
+    cs = USBHALWS->monotonictime;
+    return (uint64_t) (max_count - HAL_CounterRead()) * ns_factor +
+        ((uint64_t) cs) * 10000000 /* 1e7 */;
+}
+
+/*
+ * Callouts
+ */
+void
+callout_init (struct callout* c,int ignored)
+{
+    (void)ignored;
+    memset (c, 0, sizeof c);
+}
+
+void
+callout_stop (struct callout *c) {
+    int s = splbio();
+    struct callout **c2 = &(USBHALWS->callouts);
+    while(*c2)
+    {
+        if(*c2 == c)
+        {
+            *c2 = c->c_next;
+            splx(s);
+            return;
+        }
+        c2 = &((*c2)->c_next);
+    }
+    splx(s);
+}
+
+void
+callout_reset (struct callout *c, int i, void (*f)(void *), void *v) {
+    int s = splbio();
+    callout_stop(c);
+    if (i <= 0) i = 1;
+    c->c_arg = v;
+    c->c_func = f;
+    c->c_time = (((uint32_t)(i+9))/10u) + USBHALWS->monotonictime;
+    /* Find insertion pos */
+    struct callout **c2 = &(USBHALWS->callouts);
+    while((*c2) && ((*c2)->c_time < c->c_time))
+        c2 = &((*c2)->c_next);
+    c->c_next = *c2;
+    *c2 = c;
+    splx(s);
+}
+
+int tsleep (void* ident, int priority, const char* wmesg, int timo, int noblock)
+{
+    int i;
+    int s = splbio();
+    uint64_t t0, t1, t2;
+
+    hdprintf(">ts %p\n",ident);
+
+    t1 = t0 = gettime();
+    t1 += ((uint64_t) timo) * 1000000;
+
+    for (i = 0; i < USBHALWS->nhandles && USBHALWS->t_handles[i] && USBHALWS->t_handles[i] != ident; ++i);
+
+    if (i == USBHALWS->nhandles) {
+        USBHALWS->nhandles = i + 1;
+        if (USBHALWS->nhandles >= MAX_TSLEEP_HANDLES)
+        {
+            panic ("run out of thread handles...");
+        }
+    }
+
+    USBHALWS->t_handles[i] = ident;
+    USBHALWS->t_locks[i] = 0;
+
+    /* wait until the lock is free */
+    /* TODO - May want to limit max wait to 5 seconds to ensure boot doesn't hang? */
+    splx(0);
+    if (timo) {
+        do {
+            triggercbs ();
+            t2 = gettime ();
+        }
+        while ((USBHALWS->t_locks[i] == 0) && (t2 < t1));
+    }
+    else
+    {
+        while (USBHALWS->t_locks[i] == 0)
+        {
+            triggercbs ();
+        }
+    }
+    splbio();
+
+    USBHALWS->t_handles[i] = 0;
+
+    hdprintf("<ts\n");
+
+    splx(s);
+
+    return 0;
+}
+
+int wakeup (void* ident) {
+    int i;
+    hdprintf("wu %p\n",ident);
+
+    /* Find the index of the handle passed */
+    for (i = 0; i < USBHALWS->nhandles && USBHALWS->t_handles[i] != ident; ++i);
+
+    /* unlock it */
+    if (USBHALWS->t_handles[i] == ident)
+    {
+      USBHALWS->t_locks[i] = 1;
+      USBHALWS->t_handles[i] =NULL; /* TODO - Could cause handle to be reused before tsleep is able to wake up? */
+    }  
+    return 0;
+}
+
+void usbd_devinfo_vp(usbd_device_handle dev, char* v, size_t vl, char* p, size_t pl, int usedev)
+{
+#ifdef DEBUG_HAL
+    usb_device_descriptor_t *udd = &dev->ddesc;
+    snprintf(v, vl, "Vendor ID %04X", UGETW(udd->idVendor));
+    snprintf(p, pl, "Product ID %04X", UGETW(udd->idProduct));
+#else
+    *v = *p = NULL;
+#endif
+}

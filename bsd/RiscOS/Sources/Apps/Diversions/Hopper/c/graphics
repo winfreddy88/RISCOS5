@@ -1,0 +1,973 @@
+/*
+ * Copyright (c) 1994, Simon Foster
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+/*
+  Name    - !Hopper95
+  Module  - graphics.c
+  Purpose - Handle the graphics stuff.
+  Author  - Simon Foster
+  Version - 1.00 (12-Dec-1994)
+*/
+
+#include <stdlib.h>
+#include <string.h>
+#include "kernel.h"
+#include "os.h"
+#include "colourtrans.h"
+#include "osspriteop.h"
+#include "osbyte.h"
+#include "font.h"
+
+#include "graphics.h"
+#include "data.h"
+#include "memory.h"
+#include "hopper.h"
+#include "sync.h"
+#include "qtm.h"
+#include "sprite.h"
+#include "keys.h"
+#include "main.h"
+#include "messages.h"
+
+/* The various defines required */
+
+/* Structures */
+typedef struct gfx_plot         gfx_plot ;
+typedef struct gfx_mask         gfx_mask ;
+
+struct gfx_plot {
+  int  spr_address ;
+  int  scr_address ;
+  int  word_width ;
+  int  height ;
+  int  width ;
+} ;
+
+struct gfx_mask {
+  int  spr_address ;
+  int  mask_address ;
+  int  scr_address ;
+  int  word_width ;
+  int  height ;
+  int  width ;
+} ;
+
+
+/* Global variables */
+/* Sprites that require standard plotting */
+gfx_plot   plot_list[100] ;
+int        to_plot = 0 ;
+gfx_plot   water_list[100], cars_list[100] ;
+int        to_water = 0, to_cars = 0 ;
+gfx_plot   store_list[100] ;
+int        to_store = 0 ;
+gfx_mask   mask_list[100] ;
+int        to_mask = 0 ;
+
+/* Pointers to where various data is held */
+int        *screen ;           /* The screen itself */
+int        *second = NULL ;    /* The back screen */
+int        *frog ;             /* The frog sprite */
+int	   *fly ;              /* The fly sprite */
+int	   *snake ;            /* The snake sprite */
+int	   *waters ;           /* The water objects */
+int	   *vehicles ;         /* The vehicle objects */
+int	   *scenery ;          /* Various parts of the scenery */
+int	   *numbers ;          /* The number sprites */
+int        *title ;            /* The title screen */
+int        frog_store[120] ;
+int        snake_store[100] ;
+int        *frog_old_add, *snake_old_add, snake_old_from, snake_old_to ;
+int        defined[4][8] = {  24,  27,  67,  63,  15,  63,  51, 248,
+                              48, 176, 132, 248, 224, 248, 152,  62,
+                             112, 248, 248, 248, 112,   0,   0,   0,
+                               0, 112, 112, 112,   0,   0,   0,   0
+                           } ;
+
+osspriteop_area       *spritearea ;
+osspriteop_save_area  *savearea ;
+font_f		      trinity ;
+int                   gfx_escape, gfx_function ;
+int		      gfx_r0, gfx_r1, gfx_r2, gfx_r3 ;
+
+
+/* The functions */
+
+/* Load in all the graphics data */
+void gfx_load_graphics_data ( void )
+{
+  int                savesize ;
+  osspriteop_header  *header ;
+
+  if ( os_check_mode_valid ( (os_mode) 13, NULL, NULL) & _C) {
+    main_exit_error ( messages_xlate_error ( "ModeDef", NULL, NULL ) ) ;
+  }
+
+  frog     = data_load ( "Graphics.Frog" ) ;
+  fly      = data_load ( "Graphics.Fly" ) ;
+  waters   = data_load ( "Graphics.Water" ) ;
+  vehicles = data_load ( "Graphics.Vehicles" ) ;
+  scenery  = data_load ( "Graphics.Scenery" ) ;
+  snake    = data_load ( "Graphics.Snake" ) ;
+  numbers  = data_load ( "Graphics.Numbers" ) ;
+  title    = data_load ( "Graphics.Title" ) ;
+
+  /* Create a sprite for the back screen */
+  spritearea = (osspriteop_area *) memory_alloc ( 81920 + 256, "back screen" ) ;
+  spritearea -> size  = 81920 + 256 ;
+  spritearea -> first = 16 ;
+  osspriteop_clear_sprites ( osspriteop_USER_AREA, spritearea ) ;
+  osspriteop_create_sprite ( osspriteop_USER_AREA, spritearea, "data", 0,
+                                                  320, 256, (os_mode) 13 ) ;
+  savesize = osspriteop_read_save_area_size ( osspriteop_USER_AREA,
+                                      spritearea, (osspriteop_id) "data" ) ;
+  savearea = (osspriteop_save_area *) memory_alloc ( savesize, "save area" ) ;
+  savearea -> a[0] = 0 ;
+
+  header = osspriteop_select_sprite ( osspriteop_USER_AREA, spritearea,
+                                                  (osspriteop_id) "data" ) ;
+  second = (int *) ( ((byte *) header) + header -> image ) ;
+}
+
+
+/* Free all the memory used by the graphics module */
+void gfx_closedown ( void )
+{
+  free ( frog ) ;
+  free ( fly ) ;
+  free ( waters ) ;
+  free ( vehicles ) ;
+  free ( scenery ) ;
+  free ( snake ) ;
+  free ( numbers ) ;
+  free ( title ) ;
+  free ( spritearea ) ;
+  free ( savearea ) ;
+}
+
+
+/* Initialise the list of sprites that require plotting */
+void gfx_initialise_plot_list ( void )
+{
+  to_plot  = 0 ;
+  to_water = 0 ;
+  to_cars  = 0 ;
+  to_store = 0 ;
+  to_mask  = 0 ;
+}
+
+
+/* Add a sprite to the list */
+void gfx_add_to_plot_list ( int *spr_add, int *scr_add, int word, int height,
+                                   	     	      	       int width )
+{
+  if ( word > 0 ) {
+    plot_list[to_plot].spr_address = (int) spr_add ;
+    plot_list[to_plot].scr_address = (int) scr_add ;
+    plot_list[to_plot].word_width  = word ;
+    plot_list[to_plot].height      = height ;
+    plot_list[to_plot].width       = width ;
+
+    to_plot++ ;
+  }
+}
+
+
+/* Add a sprite to the list */
+void gfx_add_to_water_list ( int *spr_add, int *scr_add, int word,
+     			    	                     int height, int width )
+{
+  if ( word > 0 ) {
+    water_list[to_water].spr_address = (int) spr_add ;
+    water_list[to_water].scr_address = (int) scr_add ;
+    water_list[to_water].word_width  = word ;
+    water_list[to_water].height      = height ;
+    water_list[to_water].width       = width ;
+
+    to_water++ ;
+  }
+}
+
+
+/* Add a sprite to the list */
+void gfx_add_to_cars_list ( int *spr_add, int *scr_add, int word,
+     			    	                     int height, int width )
+{
+  if ( word > 0 ) {
+    cars_list[to_cars].spr_address = (int) spr_add ;
+    cars_list[to_cars].scr_address = (int) scr_add ;
+    cars_list[to_cars].word_width  = word ;
+    cars_list[to_cars].height      = height ;
+    cars_list[to_cars].width       = width ;
+
+    to_cars++ ;
+  }
+}
+
+
+/* Add a sprite to the list */
+void gfx_add_to_store_list ( int *spr_add, int *scr_add, int word,
+                                                     int height, int width )
+{
+  if ( word > 0 ) {
+    store_list[to_store].spr_address = (int) spr_add ;
+    store_list[to_store].scr_address = (int) scr_add ;
+    store_list[to_store].word_width  = word ;
+    store_list[to_store].height      = height ;
+    store_list[to_store].width       = width ;
+
+    to_store++ ;
+  }
+}
+
+
+/* Add a sprite to the list */
+void gfx_add_to_mask_list ( int *spr_add, int *mask_add, int *scr_add,
+                                           int word, int height, int width )
+{
+  if ( word > 0 ) {
+    mask_list[to_mask].spr_address  = (int) spr_add ;
+    mask_list[to_mask].mask_address = (int) mask_add ;
+    mask_list[to_mask].scr_address  = (int) scr_add ;
+    mask_list[to_mask].word_width   = word ;
+    mask_list[to_mask].height       = height ;
+    mask_list[to_mask].width        = width ;
+
+    to_mask++ ;
+  }
+}
+
+
+/* Plot a list of sprites */
+void gfx_plot_sprites ( gfx_plot *list )
+{
+  int  count = 0 ;
+  int  row ;
+  int  *spr, *scr, width, height, add ;
+
+  while ( list[count].spr_address != 0 ) {
+    spr    = (int *) list[count].spr_address ;
+    scr    = (int *) list[count].scr_address ;
+    width  = list[count].word_width << 2 ;
+    add    = list[count].width >> 2 ;
+    height = list[count].height ;
+
+    for ( row = 0; row <= height; row ++ ) {
+      memcpy ( scr, spr, width ) ;
+      scr = scr + 80 ;
+      spr = spr + add ;
+    }
+
+    count ++ ;
+  }
+}
+
+
+/* Store a list of sprites */
+void gfx_store_sprites ( gfx_plot *list )
+{
+  int  count = 0 ;
+  int  row ;
+  int  *spr, *scr, width, height, add ;
+
+  while ( list[count].spr_address != 0 ) {
+    spr    = (int *) list[count].spr_address ;
+    scr    = (int *) list[count].scr_address ;
+    width  = list[count].word_width << 2 ;
+    add    = list[count].width >> 2 ;
+    height = list[count].height ;
+
+    for ( row = 0; row <= height; row ++ ) {
+      memcpy ( spr, scr, width ) ;
+      scr = scr + 80 ;
+      spr = spr + add ;
+    }
+
+    count ++ ;
+  }
+}
+
+
+/* Mask a list of sprites */
+void gfx_mask_sprites ( gfx_mask *list )
+{
+  int  count = 0 ;
+  int  row, col ;
+  int  *spr, *scr, *mask, width, height, add ;
+
+  while ( list[count].spr_address != 0 ) {
+    spr    = (int *) list[count].spr_address ;
+    scr    = (int *) list[count].scr_address ;
+    mask   = (int *) list[count].mask_address ;
+    width  = list[count].word_width ;
+    add    = list[count].width >> 2 ;
+    height = list[count].height ;
+
+    for ( row = 0; row <= height; row ++ ) {
+      for ( col = 0; col < width; col ++ ) {
+        scr[col] = (scr[col] & mask[col]) | spr[col] ;
+      }
+      scr  = scr + 80 ;
+      spr  = spr + add ;
+      mask = mask + add ;
+    }
+
+    count ++ ;
+  }
+}
+
+
+/* Plot the sprites */
+void gfx_plot_list ( int order )
+{
+  _kernel_swi_regs  pregs, sregs, mregs, wregs, cregs ;
+  int               a, b ;
+
+  plot_list[to_plot].spr_address   = 0 ;
+  cars_list[to_cars].spr_address   = 0 ;
+  water_list[to_water].spr_address = 0 ;
+  store_list[to_store].spr_address = 0 ;
+  mask_list[to_mask].spr_address   = 0 ;
+
+  pregs.r[0] = (int) plot_list ;
+  sregs.r[0] = (int) store_list ;
+  mregs.r[0] = (int) mask_list ;
+  cregs.r[0] = (int) cars_list ;
+  wregs.r[0] = (int) water_list ;
+
+  if ( order == 0 ) {
+    os_byte ( 19, 0, 0, &a, &b ) ;
+/*
+    sprite_plot ( (int *) water_list ) ;
+*/
+    gfx_plot_sprites ( water_list ) ;
+    gfx_store_sprites ( store_list ) ;
+    gfx_mask_sprites ( mask_list ) ;
+    gfx_plot_sprites ( cars_list ) ;
+    gfx_plot_sprites ( plot_list ) ;
+  }
+  else {
+    os_byte ( 19, 0, 0, &a, &b ) ;
+/*
+    sprite_plot ( (int *) water_list ) ;
+*/
+    gfx_plot_sprites ( water_list ) ;
+    gfx_plot_sprites ( cars_list ) ;
+    gfx_store_sprites ( store_list ) ;
+    gfx_mask_sprites ( mask_list ) ;
+    gfx_plot_sprites ( plot_list ) ;
+  }
+  xosscreenmode_force_clean();
+}
+
+
+/* Initialise the mode */
+void gfx_initialise_mode ( void )
+{
+  int  list[2], loop, loop2 ;
+
+  /* Change to the correct mode */
+  os_writec ( 22 ) ;
+  os_writec ( 13 ) ;
+
+  /* Turn off the cursor */
+  os_remove_cursors () ;
+
+  /* Find the location in memory where the screen starts */
+  list[0] = 149 ;
+  list[1] = -1 ;
+
+  os_read_vdu_variables ( (os_vdu_var_list *) list, list ) ;
+
+  screen = (int *) list[0] - 40 ;
+
+  /* User defined characters */
+  for (loop = 0; loop < 4; loop++) {
+    os_writec ( 23 ) ;
+    os_writec ( 128 + loop ) ;
+    for (loop2 = 0; loop2 < 8; loop2++) {
+      os_writec ( defined[loop][loop2] ) ;
+    }
+  }
+
+  /* Find the font handle for Trinity.Bold.Italic */
+  trinity = font_find_font( "Trinity.Bold.Italic", 45*16, 19*16, 0, 0,
+                                                             &loop, &loop) ;
+
+  /* Set up Escape key, and functions keys, store so can be restored later */
+  os_byte ( 229, 0xff, 0, &gfx_escape, &loop ) ;
+  os_byte ( 221, 0xc0, 0, &gfx_function, &loop ) ;
+}
+
+
+/* Closedown the mode */
+void gfx_closedown_mode ( void )
+{
+  int  d ;
+
+
+  /* Restore the escape and function keys */
+  os_byte ( 229, gfx_escape, 0, &d, &d ) ;
+  os_byte ( 221, gfx_function, 0, &d, &d ) ;
+
+  /* Remove the font handle */
+  font_lose_font ( trinity ) ;
+}
+
+
+/* Display a vehicle */
+void gfx_show_vehicle ( gfx_sprite *stat )
+{
+  int   *spr_addr, *scr_addr ;
+  int   nx = stat->x + 158 ;
+  int   from, to ;
+
+  if (nx > 120 && nx < 480) {
+    from = (nx < 160) ? (40 - (nx / 4)) : 0 ;
+
+    spr_addr  = (vehicles + (((stat->spr * 4) + ( nx % 4 )) * 200)) + from ;
+    scr_addr  = (screen + (nx / 4) + (stat->y * 80)) + from ;
+
+    to = (nx > 440) ? (483 - nx) / 4 : 10 ;
+    to = (to - from) << 2 ;
+
+    gfx_add_to_cars_list ( spr_addr, scr_addr, to / 4, 18, 40 ) ;
+  }
+}
+
+
+/* Print a water to the screen */
+void gfx_show_water ( gfx_sprite *stat )
+{
+  int   *spr_addr, *scr_addr ;
+  int   nx = stat->x + 158 ;
+  int   from, to ;
+
+  if (nx > 72 && nx < 480) {
+    from = (nx < 160) ? 40 - (nx / 4) : 0 ;
+    spr_addr = (waters + (((stat->spr * 4) + ( nx % 4 )) * 440)) + from ;
+    scr_addr = (screen + (nx / 4) + (stat->y * 80)) + from ;
+
+    to = (nx > 392) ? (483 - nx) / 4 : 22 ;
+    to = (to - from) << 2 ;
+
+    gfx_add_to_water_list ( spr_addr, scr_addr, to / 4, 19, 88 ) ;
+  }
+}
+
+
+/* Print a block of scenery to the screen */
+void gfx_show_scenery ( int x, int y, int spr )
+{
+  int   *spr_addr, *scr_addr ;
+  int   nx = x + 160 ;
+
+  spr_addr  = (int *) (scenery + (spr * 240)) ;
+  scr_addr  = (int *) (screen + (nx / 4) + (y * 80)) ;
+
+  gfx_add_to_plot_list ( spr_addr, scr_addr, 10, 23, 40 ) ;
+}
+
+
+/* Display the title screen */
+int  gfx_display_title ( void )
+{
+  int  loop ;
+  int  fade[42] ;
+  int  timer, speed ;
+  int  state = 0 ;
+
+  for ( loop = 0; loop < 18560; loop ++ ) {
+    second[loop] = 0 ;
+  }
+
+  gfx_initialise_plot_list () ;
+  gfx_add_to_plot_list ( title, second + 9, 61, 41, 244 ) ;
+  gfx_plot_list ( 1 ) ;
+
+  for ( loop = 0; loop <= 41; loop ++ ) {
+    fade[loop] = loop - 41 ;
+  }
+
+  sync_read_timer () ;
+  sync_set_timer ( &timer ) ;
+
+  while ( fade[0] < 60  &&  state == 0 ) {
+    state = hopper_key ( 0 ) ;
+
+    speed = sync_elapsed ( &timer, 16 ) ;
+
+    for ( loop = 0; loop <= 41; loop ++ ) {
+      gfx_psycho ( second + (loop * 80), screen + 40 + (loop * 80), 320,
+                                 (fade[loop] >= 0) ? fade[loop] : 0, 320 ) ;
+
+      fade[loop] = (fade[loop] < (61 - speed)) ? fade[loop] + speed : 60 ;
+    }
+  }
+
+  return ( state ) ;
+}
+
+
+/* Print a frog to the screen */
+void gfx_show_frog ( gfx_sprite *stat )
+{
+  int   *spr_addr, *mask_addr, *scr_addr, *store_addr = frog_store ;
+  int   nx = stat->x + 160 ;
+
+  spr_addr     = (frog + (stat->spr * 960) + ((nx % 4) * 240)) ;
+  mask_addr    = spr_addr + 120 ;
+  scr_addr     = (screen + (stat->y * 80) ) + (nx / 4) ;
+  frog_old_add = scr_addr ;
+
+  gfx_add_to_store_list ( store_addr, scr_addr, 6, 19, 24 ) ;
+  gfx_add_to_mask_list ( spr_addr, mask_addr, scr_addr, 6, 19, 24 ) ;
+}
+
+
+/* Delete the frog from the screen */
+void gfx_delete_frog ( void )
+{
+  gfx_add_to_water_list ( frog_store, frog_old_add, 6, 19, 24 ) ;
+}
+
+
+/* Print the fly to the screen */
+void gfx_show_fly ( int x )
+{
+  int   *spr_addr, *scr_addr, *mask_addr ;
+  int   nx = x + 158 ;
+  int   from, to ;
+
+  if (nx > 140 && nx < 480) {
+    spr_addr     = (int *) ( fly + (( nx % 4 ) * 200 ) + 15 ) ;
+    mask_addr    = (int *) ( spr_addr + 100 ) ;
+    scr_addr     = (int *) ( screen + (nx / 4) + 7040 ) ; /* 6800 */
+
+    from = (nx < 160) ? 40 - (nx / 4) : 0 ;
+    to   = (nx > 460) ? (483 - nx) / 4 : 5 ;
+
+    gfx_add_to_mask_list ( spr_addr+from, mask_addr+from, scr_addr+from,
+                                                         to-from, 12, 20 ) ;
+  }
+}
+
+
+/* Print the snake to the screen */
+void gfx_show_snake ( int x )
+{
+  int   *spr_addr, *scr_addr, *mask_addr, *store_addr = snake_store ;
+  int   nx = x + 158 ;
+  int   from, to ;
+
+  snake_old_add = (int *) -1 ;
+
+  if (nx > 128 && nx < 480) {
+    spr_addr      = (int *) ( snake + (( nx % 4 ) * 192 ) ) ;
+    mask_addr     = (int *) ( spr_addr + 96 ) ;
+    scr_addr      = (int *) ( screen + (nx / 4) + 10080 ) ;
+    snake_old_add = scr_addr ;
+
+    from = (nx < 160) ? 40 - (nx / 4) : 0 ;
+    to   = (nx > 448) ? (483 - nx) / 4 : 8 ;
+
+    gfx_add_to_store_list ( store_addr + from, scr_addr + from, to-from,
+                                                                  11, 32 ) ;
+    gfx_add_to_mask_list ( spr_addr + from, mask_addr + from,
+                                        scr_addr + from, to-from, 11, 32 ) ;
+    snake_old_from = from ;
+    snake_old_to   = to ;
+  }
+}
+
+
+/* Delete the snake from the screen */
+void gfx_delete_snake ( void )
+{
+  if ( snake_old_add != (int *) -1 ) {
+    gfx_add_to_water_list ( snake_store + snake_old_from,
+              snake_old_add + snake_old_from, snake_old_to - snake_old_from,
+                                                                  11, 32 ) ;
+  }
+}
+
+
+/* Print a number to the screen */
+void gfx_show_number ( int x, int y, int spr )
+{
+  int   *spr_addr, *scr_addr ;
+  int   nx = x + 160 ;
+
+  spr_addr  = numbers + (spr * 40) ;
+  scr_addr  = (screen + (nx / 4) + (y * 80)) ;
+
+  gfx_add_to_plot_list ( spr_addr, scr_addr, 4, 9, 16 ) ;
+}
+
+
+/* Set the colour to a specified colour */
+void gfx_set_colour ( int col, int bright )
+{
+  int        d, blue, green, red, bgt ;
+  os_colour  value ;
+
+  bgt = ( (bright * 0x10) + bright ) & 0xff ;
+
+  blue  = ( col & BLUE  ? 0xff : bgt ) ;
+  green = ( col & GREEN ? 0xff : bgt ) ;
+  red   = ( col & RED   ? 0xff : bgt ) ;
+
+  value = ( blue  << os_BSHIFT ) +
+          ( green << os_GSHIFT ) +
+          ( red   << os_RSHIFT ) ;
+
+  colourtrans_set_gcol ( value, 0x100u, 0, &d ) ;
+}
+
+
+/* Use the PsychoEffect module */
+void gfx_psycho ( int *from, int *to, int size, int fade, int width )
+{
+  _kernel_swi_regs  regs ;
+
+  regs.r[0] = (int) from ;
+  regs.r[1] = (int) to ;
+  regs.r[2] = size ;
+  regs.r[3] = fade ;
+  regs.r[4] = width ;
+
+  _kernel_swi ( PsychoEffect_Fade, &regs, &regs ) ;
+}
+
+
+/* Fade the screen */
+void gfx_fade_screen ( void )
+{
+  int  loop ;
+  int  timer, speed ;
+
+  gfx_psycho ( screen + 40, second, 81920, 60, 320 ) ;
+
+  loop = 59 ;
+
+  sync_read_timer () ;
+  sync_set_timer ( &timer ) ;
+
+  while ( loop > 0 ) {
+    gfx_psycho ( second, screen + 40, 81920, loop, 320 ) ;
+
+    sync_read_timer () ;
+    speed = sync_elapsed ( &timer, 12 ) ;
+    loop = (loop > speed) ? loop - speed : 0 ;
+  }
+}
+
+
+/* Fade the screen and music together */
+void gfx_fade_screen_and_qtm ( void )
+{
+  int               loop, volume ;
+  int               timer, speed ;
+  _kernel_swi_regs  regs ;
+
+  gfx_psycho ( screen + 40, second, 81920, 60, 320 ) ;
+
+  loop = 59 ;
+  volume = keys_music_vol ;
+
+  sync_read_timer () ;
+  sync_set_timer ( &timer ) ;
+
+  while ( loop > 0 ) {
+    gfx_psycho ( second, screen + 40, 81920, loop, 320 ) ;
+
+    regs.r[0] = volume ;
+    _kernel_swi ( QTM_Volume, &regs, &regs ) ;
+
+    sync_read_timer () ;
+    speed = sync_elapsed ( &timer, 12 ) ;
+    loop = (loop > speed) ? loop - speed : 0 ;
+    volume = volume > 0 ? volume - 1 : 0 ;
+  }
+
+  qtm_stop_music () ;
+}
+
+
+/* Draw a line from (x0,y0) to (x1,y1) */
+void gfx_draw_line ( int x0, int y0, int x1, int y1 )
+{
+  os_plot ( 4, x0 * 4, 1023 - ( y0 * 4 ) ) ;
+  os_plot ( 5, x1 * 4, 1023 - ( y1 * 4 ) ) ;
+}
+
+
+/* Write a string to the screen */
+void gfx_write_string ( const char *string, int x, int y, int col, int bright )
+{
+  int        d, blue, green, red, bgt ;
+  os_colour  value ;
+
+  bgt = ( (bright * 0x10) + bright ) & 0xff ;
+
+  blue  = ( col & BLUE  ? 0xff : bgt ) ;
+  green = ( col & GREEN ? 0xff : bgt ) ;
+  red   = ( col & RED   ? 0xff : bgt ) ;
+
+  value = ( blue  << os_BSHIFT ) +
+          ( green << os_GSHIFT ) +
+          ( red   << os_RSHIFT ) ;
+
+  colourtrans_set_font_colours ( trinity, 0x00000000, value, 14, (os_colour *) &d, (os_colour *) &d, &d ) ;
+  font_paint ( trinity, string, 784, x << 2, 991 - ( y << 2 ), (font_paint_block *) &d, (os_trfm *) &d, 0 ) ;
+}
+
+
+/* Return the length of a screen */
+int  gfx_string_width ( const char *string )
+{
+  int   loop, total, x_pt, y_pt ;
+  char  *ptr ;
+
+  font_converttopoints ( 1280, 1024, &x_pt, &y_pt ) ;
+  font_string_width ( string, x_pt, y_pt, -1, strlen(string), &ptr, &x_pt, &y_pt, &total, &loop ) ;
+  font_convertto_os ( x_pt, 0, &total, &y_pt ) ;
+
+  return ( total ) ;
+}
+
+
+/* Write a string to the screen, right justified */
+void gfx_string_right ( const char *string, int x, int y, int col, int bright )
+{
+  int        d, blue, green, red, bgt ;
+  os_colour  value ;
+
+  bgt = ( (bright * 0x10) + bright ) & 0xff ;
+
+  blue  = ( col & BLUE  ? 0xff : bgt ) ;
+  green = ( col & GREEN ? 0xff : bgt ) ;
+  red   = ( col & RED   ? 0xff : bgt ) ;
+
+  value = ( blue  << os_BSHIFT ) +
+          ( green << os_GSHIFT ) +
+          ( red   << os_RSHIFT ) ;
+
+  colourtrans_set_font_colours ( trinity, 0x00000000, value, 14,
+                                  (os_colour *) &d, (os_colour *) &d, &d ) ;
+  font_paint ( trinity, string, 784, (x << 2) - gfx_string_width(string),
+            991 - ( y << 2 ), (font_paint_block *) &d, (os_trfm *) &d, 0 ) ;
+}
+
+
+/* Write a string to the screen, centred */
+void gfx_string_centre ( const char *string, int x, int y, int col, int bright )
+{
+  int        d, blue, green, red, bgt ;
+  os_colour  value ;
+
+  bgt = ( (bright * 0x10) + bright ) & 0xff ;
+
+  blue  = ( col & BLUE  ? 0xff : bgt ) ;
+  green = ( col & GREEN ? 0xff : bgt ) ;
+  red   = ( col & RED   ? 0xff : bgt ) ;
+
+  value = ( blue  << os_BSHIFT ) +
+          ( green << os_GSHIFT ) +
+          ( red   << os_RSHIFT ) ;
+
+  colourtrans_set_font_colours ( trinity, 0x00000000, value, 14,
+                                  (os_colour *) &d, (os_colour *) &d, &d ) ;
+  font_paint ( trinity, string, 784,
+                (x << 2) - (gfx_string_width( (char *) string ) / 2), 991 - ( y << 2 ),
+                              (font_paint_block *) &d, (os_trfm *) &d, 0 ) ;
+}
+
+
+/* Switch all output to the sprite */
+void gfx_to_sprite ( void )
+{
+  osspriteop_switch_output_to_sprite ( osspriteop_USER_AREA, spritearea,
+    (osspriteop_id) "data", savearea, &gfx_r0, &gfx_r1, &gfx_r2, &gfx_r3 ) ;
+}
+
+
+/* Back to the screen again */
+void gfx_to_screen ( void )
+{
+  osspriteop_switch_output_to_sprite ( osspriteop_USER_AREA,
+                         (osspriteop_area *) gfx_r1, (osspriteop_id) gfx_r2,
+     (osspriteop_save_area *) gfx_r3, &gfx_r0, &gfx_r1, &gfx_r2, &gfx_r3 ) ;
+}
+
+
+/* Clear the screen */
+void gfx_clear ( void )
+{
+  os_writec ( 12 ) ;
+}
+
+
+/* Perform fade */
+void gfx_fade ( int start_row, int height, int fade, int direction )
+{
+  if ( direction == TO ) {
+    gfx_psycho ( second + (start_row * 80), screen + 40 + (start_row * 80),
+                                                 height * 320, fade, 320 ) ;
+  }
+  else {
+    gfx_psycho ( screen + 40 + (start_row * 80), second + (start_row * 80),
+                                                 height * 320, fade, 320 ) ;
+  }
+}
+
+
+/* Fade special effects */
+int  gfx_special_in ( void )
+{
+  int  fade[b_B + 1] ;
+  int  loop, which, step ;
+  int  timer, st ;
+  int  state = 0 ;
+
+  switch ( sync_random ( 0, 3 ) ) {
+    case 0 :
+      for ( loop = b_T; loop <= b_B; loop ++ ) {
+        fade[loop] = 0 - ( loop - b_T ) ;
+      }
+      which = b_B ;
+      step = 8 ;
+      break ;
+    case 1 :
+      for ( loop = b_T; loop <= (b_T + ((b_B - b_T) / 2)) ; loop ++ ) {
+        fade[loop] = 0 - (loop - b_T) ;
+        fade[b_B - (loop - b_T)] = 0 - (loop - b_T) ;
+      }
+      which = b_T + ((b_B - b_T) / 2) ;
+      step = 4 ;
+      break ;
+    case 2 :
+      for ( loop = b_T; loop <= b_B; loop ++ ) {
+        fade[loop] = 0 - ( (b_B - b_T) - (loop - b_T) ) ;
+      }
+      which = b_T ;
+      step = 8 ;
+      break ;
+    case 3 :
+      for ( loop = b_T; loop <= (b_T + ((b_B - b_T) / 2)) ; loop ++ ) {
+        fade[loop] = 0 - ( ((b_T + ((b_B - b_T) / 2)) - b_T)
+                                                          - (loop - b_T) ) ;
+        fade[b_B - (loop - b_T)] = 0 - ( ((b_T + ((b_B - b_T) / 2)) - b_T)
+                                                          - (loop - b_T) ) ;
+      }
+      which = b_T ;
+      step = 4 ;
+      break ;
+  }
+
+  sync_read_timer () ;
+  sync_set_timer ( &timer ) ;
+
+  while ( fade[which] < 60  &&  state == 0 ) {
+    state = hopper_key ( 0 ) ;
+
+    st = step * sync_elapsed ( &timer, 32 ) ;
+
+    for ( loop = b_T; loop <= b_B; loop ++ ) {
+      gfx_psycho ( second + (loop * 80), screen + 40 + (loop * 80), 320,
+                                 (fade[loop] >= 0) ? fade[loop] : 0, 320 ) ;
+      fade[loop] = (fade[loop] < 61 - st) ? fade[loop] + st : 60 ;
+    }
+  }
+
+  return ( state ) ;
+}
+
+
+
+/* Fade special effects */
+int  gfx_special_out ( void )
+{
+  int  fade[b_B + 1] ;
+  int  loop, which, step ;
+  int  timer, st ;
+  int  state = 0 ;
+
+  switch ( sync_random ( 0, 3 ) ) {
+    case 0 :
+      for ( loop = b_T; loop <= b_B; loop ++ ) {
+        fade[loop] = 60 + ( loop - b_T ) ;
+      }
+      which = b_B ;
+      step = 8 ;
+      break ;
+    case 1 :
+      for ( loop = b_T; loop <= (b_T + ((b_B - b_T) / 2)) ; loop ++ ) {
+        fade[loop] = 60 + (loop - b_T) ;
+        fade[b_B - (loop - b_T)] = 60 + (loop - b_T) ;
+      }
+      which = b_T + ((b_B - b_T) / 2) ;
+      step = 4 ;
+      break ;
+    case 2 :
+      for ( loop = b_T; loop <= b_B; loop ++ ) {
+        fade[loop] = 60 + ( (b_B - b_T) - (loop - b_T) ) ;
+      }
+      which = b_T ;
+      step = 8 ;
+      break ;
+    case 3 :
+      for ( loop = b_T; loop <= (b_T + ((b_B - b_T) / 2)) ; loop ++ ) {
+        fade[loop] = 60 + ( ((b_T + ((b_B - b_T) / 2)) - b_T)
+                                                          - (loop - b_T) ) ;
+        fade[b_B - (loop - b_T)] = 60 + ( ((b_T + ((b_B - b_T) / 2)) - b_T)
+                                                          - (loop - b_T) ) ;
+      }
+      which = b_T ;
+      step = 4 ;
+      break ;
+  }
+
+  sync_read_timer () ;
+  sync_set_timer ( &timer ) ;
+
+  while ( fade[which] > 0  &&  state == 0 ) {
+    state = hopper_key ( 0 ) ;
+
+    st = step * sync_elapsed ( &timer, 32 ) ;
+
+    for ( loop = b_T; loop <= b_B; loop ++ ) {
+      gfx_psycho ( second + (loop * 80), screen + 40 + (loop * 80), 320,
+                               (fade[loop] <= 60) ? fade[loop] : 60, 320 ) ;
+      fade[loop] = (fade[loop] > st) ? fade[loop] - st : 0 ;
+    }
+  }
+
+  return ( state ) ;
+}
+
+

@@ -1,0 +1,1289 @@
+; Copyright 2010 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:Machine.<Machine>
+        GET     Hdr:ImageSize.<ImageSize>
+        $GetIO
+
+        GET     Hdr:OSEntries
+        GET     Hdr:HALEntries
+        GET     Hdr:HALDevice
+        GET     Hdr:AudioDevice
+        GET     Hdr:MixerDevice
+        GET     Hdr:Proc
+
+        GET     hdr.omap3530
+        GET     hdr.StaticWS
+        GET     hdr.PRCM
+
+        AREA    |Asm$$Code|, CODE, READONLY, PIC
+
+        EXPORT  Audio_Init
+
+        IMPORT  TPSRead
+        IMPORT  TPSWrite
+
+        IMPORT  memcpy
+        IMPORT  HAL_IRQClear
+        IMPORT  HAL_CounterDelay
+
+; A brief rundown of OMAP HAL audio support:
+; Audio in/out is typically provided via the TWL/TPS companion chip, using "port 2" of the TWL/TPS audio subsystem. "port 2" provides a I2S/TDM-compatible interface, capable of operating at a variety of sample rates.
+; Two interfaces are used to link the audio subsystem to the OMAP: I2C is used to program the audio subsystem, and I2S is used to transmit & receive data (using the McBSP module on the OMAP side).
+; Both the TWL/TPS and the OMAP are capable of acting as either the master or slave across the I2S link, so to keep things simple this implementation has the TWL/TPS acting as master and the OMAP acting as slave.
+; Finally, to keep the McBSP buffer full, the SDMA module of the OMAP is used
+
+; This means that, on the software side, audio is provided by the following network of components:
+;
+;                             HAL I2C driver
+;                                   |
+;                           RISC OS I2C driver
+;                           |                |
+;                HAL mixer device  <->  HAL audio device
+;                       |                     |
+;             SoundControl module  <->  SoundDMA module
+;                                             |
+;                                       DMAManager module
+;                                             |
+;                                       HAL DMA device
+;
+; (Note - there's also a small amount of communication between the HAL DMA device and the HAL audio device, to allow for the correct setting of the FIFO threshold/DMA packet size)
+
+; With regards to the actual sound I/O features the TPS makes available:
+; "Digital" data comes from ICs, "Analog" data are pins that may/may not be connected to speakers/microphones/etc. The "RX" path sends data out through the DACs, and the "TX" path accepts data from the ADCs.
+;
+;   INPUTS - DIGITAL                          OUTPUTS - DIGITAL
+;Stereo I2S data from CPU (tdm/i2s.din)  Stereo I2S data to CPU (tdm/i2s.dout)
+;PCM voice data from modem (pcm.vdr)     PCM voice data to modem (pcm.vdx)
+;PCM voice data from SUBMIC (pcm.vdr)
+;PCM voice data from BT (bt.pcm.din)     PCM voice data to BT (bt.pcm.dout)
+;
+;   INPUTS - ANALOGUE                         OUTPUTS - ANALOGUE
+;Mono headset microphone (hsmic)         Stereo headset (hsor/hsol)
+;                                        Stereo hands-free speaker (ihf_l/r_p/m)
+;Mono handset main microphone (mic_main) Mono handset earphone (earp/earm)
+;Mono handset submicrophone (mic_sub)
+;Digital microphone 0
+;Digital microphone 1
+;Stereo FM radio/auxiliary input (fml/fmr, auxl/auxr)
+;                                        Stereo predriver output (predriv_l/r)
+;Mono carkit microphone (usb_din)        Stereo carkit output (usb_d+/-)
+;
+; (The above ignores the 4-channel TDM capability, since we're using I2S)
+
+; We'll be operating the mixer in the "option 1" setting, which gives "four simultaneous multimedia analog channels (four multimedia DACs and no modem voice path) and two simultaneous ADCs or four channels coming from digital microphones
+; This basically means that the mixer looks like the satisfyingly confusing figure 14-6 in the TPS manual (swcu050d.pdf). In summary....
+
+
+; Output:           Mode:  PGA Amplifier:  VDL_GAIN ARXL1 ARXR1 ARXL2 ARXR2
+; Headset left      MIX                       *       *           *
+; Headset right     MIX                       *             *           *
+; Predriver left    MIX                       *       *           *     *  (1,2)
+; Predriver right   MIX                       *             *     *     *  (2)
+; Hands-free left   MUX                       *       *           *     *  (2,3)
+; Hands-free right  MUX                       *             *     *     *  (2,3)
+; Carkit left       MIX                       *       *           *
+; Carkit right      MIX                       *             *           *
+; Earphone          MIX                       *       *     *     *
+;
+; (1) Also allows "Vmid" to be used as a mix source, whatever that is.
+; (2) Stereo crossover is supported on ARXL2/ARXR2
+; (3) Lacks an output amplifier. All other outputs have output amplifiers (albeit ones with only a handful of gain settings).
+
+; The "analog mixing" allows each PGA amplifier to have two inputs:
+; PGA Amplifier:           Inputs:
+; VDL_GAIN                 Ampli_L, ????? (seriously - the diagram has two lines that don't go anywhere!)
+; ARXL1                    DACL1, Ampli_L
+; ARXR1                    DACR1, Ampli_R
+; ARXL2                    DACL2, Ampli_L
+; ARXR2                    DACR2, Ampli_R
+
+; Digital muxes allow the DACs to have multiple sources.
+; These muxes are controlled by the RX_PATH_SEL register.
+; DAC:                  Inputs: SDRL1 SDRR1 SDRM1 SDRL2 SDRR2 SDRM2
+; DACL1                           *           *     *           *
+; DACR1                                 *     *           *     *
+; DACL2                                             *           *
+; DACR2                                                   *     *
+
+; SDRL1/SDRR1 is data received over the I2S link
+; SDRL2/SDRR2 is data received over the I2S link, added to the output of the ATXARX(L/R)_PGA amplifiers (which source their data from the audio TX L1/R1 channels)
+; The RX & TX I2S channels are enabled/disabled via the OPTION register
+
+; And, speaking of the "TX" path, there are two input amplifiers (Ampli_L, Ampli_R), which feed two ADCs (ADCL, ARDC) (as well as potentially feeding back to the output PGA amplifiers). The Ampli_L & Ampli_R amplifiers take ther input from the following:
+; Ampli_L       Carkit mic, headset mic, handset main mic, FM radio/aux left
+; Ampli_R       Handset sub mic, FM radio/aux right
+
+; The ADCL & ADCR output is combined with another source of data - the digital microphones - to produce four outputs: Audio TX L1, R1, L2, R2. These signals are fed into corresponding amplifiers (ATXL1PGA, ATXR1PGA, ATXL2PGA, ATXR2PGA) & filters, before being fed into the four mic channels of the I2S/TDM interface (and, in the case of the R1/L1 channels, into the loopback PGAs).
+; The channels are mapped to the I2S/TDM mic channels as follows:
+; Audio TX channel        TDM mic channel
+; L1                      1
+; R1                      3
+; L2                      2
+; R2                      4
+
+; Out of all the amplifiers, only the following have reasonably flexible gain controls: (ignoring BT, DTMF)
+; ATXL1PGA, ATXR1PGA
+; AVTXL2PGA, AVTXR2PGA
+; ARXL1PGA, ARXR1PGA
+; ARXL2PGA, ARXR2PGA
+; VRX(L?)PGA (voice downlink)
+; VSTPGA (voice sidetone)
+; VRX2ARXPGA (voice RX to audio RX)
+; ARX2VTXPGA (audio RX to voice TX)
+; ARXL1_APGA, ARXR1_APGA
+; ARXL2_APGA, ARXR2_APGA
+; ATX2ARXL, ATX2ARXR (audio TX to audio RX)
+; VDL_APGA (voice downlink again?)
+; MICAMPL/R (stereo microphone amp - but which mic?)
+; The following have rather restrictive gain settings:
+; EAR (earpiece)
+; HSR (headset left/right)
+; L/R Predrivers
+; Carkit L/R
+
+; So, in summary.....
+; * Since RISC OS only produces one stream of stereo data, we can assign one DAC/amplifier pair (DACL2/DACR2, to keep the voice path free for the future?) to playing the data generated by the OS
+; * VDL_GAIN, DACL1, DACR1 amplifiers can be ignored (although VDL_GAIN would be useful for mono data received by Ampli_L?)
+; * There are only two ADCs, so you can only really sample from one stereo source at a time (or two mono)
+; * The plethora of outputs can select their mix from RISC OS sound data & the ADC data at will
+; * In any case, RISC OS doesn't really have an API for sound recording (or setting the recording source), so we could just ignore all the inputs entirely until that gets rectified (although for most OMAP devices which RISC OS is targeting, it's likely that the stereo "auxiliary" input will be the one providing all the input data, so an API to select the recording source isn't entirely necessary)
+
+; As for mapping inputs & outputs to those currently supported by the HAL mixer API:
+; TPS                             HAL mixer category
+; Headset left/right              HEADPHONES
+; Predriver left/right            SPEAKER
+; Hands-free left/right           LINE_OUT
+; Carkit left/right               AUX_OUT (carkit is more likely to be useful than earphone, if a carkit-compatible USB driver is written)
+; Earphone                        none?
+; Headset mic                     MIC
+; Handset main mic                none?
+; Handset sub mic                 none?
+; Digital mic 0                   none?
+; Digital mic 1                   none?
+; Stereo FM/aux input             LINE_IN
+; Mono carkit mic                 AUX_IN (to match AUX_OUT)
+
+; 'SYSTEM' should obviously control the volume of the sound RO generates - i.e. by using the ARXL2PGA/ARXR2PGA amplifiers 
+
+; For the beagleboard, the TWL/TPS is connected to the OMAP via I2C1 & McBSP2
+; The audio out header is connected to the headset L/R channels on the TPS
+; The audio in header is connected to the aux L/R channels on the TPS 
+
+
+; Flag to enable gobs of debug output
+            GBLL    AudioDebug
+AudioDebug  SETL    {FALSE}
+
+Audio_Init
+        Push    "v1-v4,lr"
+ [ AudioDebug
+        DebugTX "Audio_Init"
+ ]
+        ADRL    v1, AudioWS
+        MOV     a1, v1
+        ADR     a2, AudioTemplate
+        MOV     a3, #Audio_DeviceSize
+        BL      memcpy
+        STR     sb, [v1, #:INDEX:AudioWorkspace]
+        ; Get McBSP2 logical address
+        LDR     v2, L4_Per_Log
+        ADD     v2, v2, #L4_McBSP2-L4_Per
+        STR     v2, [v1, #:INDEX:AudioRegs]
+ [ AudioDebug
+        DebugReg v2, "McBSP2 @ "
+ ]
+
+        ; Before we go any further, turn on the power to McBSP2 & make sure it's in a reset state
+        ; TODO - This should probably go in AudioActivate!
+        LDR     a1, L4_ClockMan_Log
+        ADD     a1, a1, #CM_FCLKEN_PER
+        LDR     a2, [a1]
+        ORR     a2, a2, #1 ; McBSP2 clock enable
+        STR     a2, [a1]
+        LDR     a2, [a1, #CM_ICLKEN_PER-CM_FCLKEN_PER]!
+        ORR     a2, a2, #1
+        STR     a2, [a1]
+        ; Clear CONTROL_DEVCONF.MCBSP2_CLKS?
+        LDR     a1, L4_Core_Log
+        ADD     a1, a1, #&2200
+        LDR     a2, [a1, #&74]
+        BIC     a2, a2, #1<<6
+        STR     a2, [a1, #&74]
+        ; Set McBSP2 to reset state
+        MOV     a1, #0
+        STR     a1, [v2, #MCBSPLP_SPCR1]
+        MOV     a1, #&200
+        STR     a1, [v2, #MCBSPLP_SPCR2]
+        ; Perform full reset, in fact
+        MOV     a1, #2
+        STR     a1, [v2, #MCBSPLP_SYSCONFIG]
+10
+        LDR     a1, [v2, #MCBSPLP_SYSCONFIG]
+        TST     a1, #2
+        BNE     %BT10
+        ; Set smart idle mode. No auto-idle available! :(
+        MOV     a1, #2<<3
+        STR     a1, [v2, #MCBSPLP_SYSCONFIG]
+        ; One-time setup of transmitter registers
+        MOV     a1, #&F ; Active-low RX/TX frame sync, RX on rising, TX on falling
+        STR     a1, [v2, #MCBSPLP_PCR]
+        MOV     a1, #&40 ; 16bit words, 1 word per frame
+        STR     a1, [v2, #MCBSPLP_XCR1]
+        LDR     a1, =&8041 ; dual-phase frame, (16 bit, 1 word), MSB first, 1-bit delay
+        STR     a1, [v2, #MCBSPLP_XCR2]
+        ; Program sample rate generator registers - not sure if this is required, since we run in slave mode
+        LDR     a1, =&f01 ; 16 bit frame width-1, CLKGDV=1
+        STR     a1, [v2, #MCBSPLP_SRGR1]
+        MOV     a1, #&1f ; FPER=2*16 bit-1
+        STR     a1, [v2, #MCBSPLP_SRGR2]
+
+        ; Now resume HAL device setup...
+        
+        ADD     v2, v1, #Audio_DeviceSize
+        MOV     a1, v2
+        ADR     a2, MixerTemplate
+        MOV     a3, #Mixer_DeviceSize
+        BL      memcpy
+
+        ; Fill in pointers to each other
+        STR     v1, [v2, #HALDevice_MixerCtrlr]
+        STR     v2, [v1, #HALDevice_AudioMixer]
+
+        LDRB    a1, [sb, #BoardConfig_MixerChans]
+        STRB    a1, [v2, #:INDEX:MixerDisableFlags]
+        ; Unavailable channels, and input channels, start muted
+        ORR     a1, a1, #(1<<MixerChannel_HeadsetMic)+(1<<MixerChannel_AuxInput)+(1<<MixerChannel_CarkitMic)
+        ADD     a2, v2, #:INDEX:MixerSettings
+10      AND     a3, a1, #1
+        MOVS    a1, a1, LSR #1
+        STR     a3, [a2], #8
+        BNE     %BT10
+
+        ; Register devices
+        MOV     a2, v1
+        MOV     a1, #0
+        CallOS  OS_AddDevice
+        MOV     a2, v2
+        MOV     a1, #0
+        CallOS  OS_AddDevice
+
+        ; Set TPS audio registers to default values
+        MOV     a1, #TPSAUDIO_IIC*2
+        ADR     a2, TPSDefaults
+        MOV     a3, #1 ; Program CODEC_MODE first to make sure the power is off, then program everything else in one go
+        MOV     a4, #CODEC_MODE
+        LDR     v1, OSentries+4*OS_IICOpV
+        BL      TPSWrite
+ [ AudioDebug
+        CMP     a1, #0
+        BEQ     %FT10
+        DebugTX "Audio_Init: TPS CODEC_MODE reset failed!"
+10
+ ]
+        MOV     a1, #TPSAUDIO_IIC*2
+        ADD     a2, a2, #1
+        MOV     a3, #(MISC_SET_2+1)-OPTION
+        ADD     a4, a4, #1
+        BL      TPSWrite
+ [ AudioDebug
+        CMP     a1, #0
+        BEQ     %FT10
+        DebugTX "Audio_Init: TPS audio reset failed!"
+10
+ ]
+        ; Write APLL_CTL with the right value
+        MOV     a1, #TPSAUDIO_IIC*2
+        ADD     a2, sb, #BoardConfig_APLL_CTL
+        MOV     a3, #1
+        MOV     a4, #APLL_CTL
+        BL      TPSWrite
+ [ AudioDebug
+        CMP     a1, #0
+        BEQ     %FT10
+        DebugTX "Audio_Init: APLL_CTL write failed!"
+10
+ ]
+
+ [ AudioDebug
+        DebugTX "Audio_Init done"
+ ]
+        Pull    "v1-v4,pc"
+
+TPSDefaults ; List of default settings for TPS registers
+        ; These are the settings taken from TRM (swcu050d.pdf), and then overlaid with the default settings that are required for sound output (i.e. steps 3-17, 19-27, 31 of the example given in section 14.5.3), and then tidied up a bit further
+        DCB &00 ; CODEC_MODE
+        DCB &C0 ; OPTION - RX path 2 enabled 
+        DCB &00 ; (unused)
+        DCB &00 ; MCBIAS_CTL
+        DCB &20 ; ANAMICL
+        DCB &00 ; ANAMICR
+        DCB &00 ; AVADC_CTL
+        DCB &00 ; ADCMICSEL
+        DCB &00 ; DIGMIXING
+        DCB &00 ; ATXL1PGA
+        DCB &00 ; ATXR1PGA
+        DCB &00 ; ATXL2PGA
+        DCB &00 ; AVTXR2PGA
+        DCB &01 ; AUDIO_IF
+        DCB &00 ; VOICE_IF
+        DCB &00 ; ARXR1PGA mute
+        DCB &00 ; ARXL1PGA mute
+        DCB &3F ; ARXR2PGA 0dB
+        DCB &3F ; ARXL2PGA 0dB
+        DCB &00 ; VRXPGA
+        DCB &00 ; VSTPGA
+        DCB &00 ; VRX2ARXPGA
+        DCB &0C ; AVDAC_CTL
+        DCB &00 ; ARX2VTXPGA
+        DCB &30 ; ARXL1_APGA_CTL mute
+        DCB &30 ; ARXR1_APGA_CTL mute
+        DCB &33 ; ARXL2_APGA_CTL 0dB
+        DCB &33 ; ARXR2_APGA_CTL 0dB
+        DCB &00 ; ATX2ARXPGA
+        DCB &00 ; BT_IF
+        DCB &00 ; BTPGA
+        DCB &00 ; BTSTPGA
+        DCB &00 ; EAR_CTL
+        DCB &24 ; HS_SEL - TODO - Also HS_OUTLOW_EN?
+        DCB &00 ; HS_GAIN_SET
+        DCB &34 ; HS_POPN_SET
+        DCB &00 ; PREDL_CTL - TODO - Also PREDL_OUTLOW_EN?
+        DCB &00 ; PREDR_CTL
+        DCB &00 ; PRECKL_CTL
+        DCB &00 ; PRECKR_CTL
+        DCB &00 ; HFL_CTL
+        DCB &00 ; HFR_CTL
+        DCB &05 ; ALC_CTL
+        DCB &00 ; ALC_SET1
+        DCB &00 ; ALC_SET2
+        DCB &00 ; BOOST_CTL
+        DCB &01 ; SOFTVOL_CTL - TODO - tweak delay setting
+        DCB &13 ; DTMF_FREQSEL
+        DCB &00 ; DTMF_TONEXT1H
+        DCB &00 ; DTMF_TONEXT1L
+        DCB &00 ; DTMF_TONEXT2H
+        DCB &00 ; DTMF_TONEXT2L
+        DCB &79 ; DTMF_TONOFF
+        DCB &11 ; DTMF_WANONOFF
+        DCB &00 ; CODEC_RX_SCRAMBLE_H
+        DCB &00 ; CODEC_RX_SCRAMBLE_M
+        DCB &00 ; CODEC_RX_SCRAMBLE_L
+        DCB &00 ; APLL_CTL - gets filled in properly afterwards
+        DCB &00 ; DTMF_CTL
+        DCB &00 ; DTMF_PGA_CTL2
+        DCB &00 ; DTMF_PGA_CTL1
+        DCB &02 ; MISC_SET_1
+        DCB &00 ; PCMBTMUX
+        DCB &00 ; (unused)
+        DCB &00 ; (unused)
+        DCB &00 ; (unused)
+        DCB &0A ; RX_PATH_SEL - Map I2S RX path 2 to digital paths 1 and 2 (somewhat unecessary to map to both since we only need one)
+        DCB &00 ; VDL_APGA_CTL
+        DCB &00 ; VIBRA_CTL
+        DCB &00 ; VIBRA_SET
+        DCB &00 ; (unused)
+        DCB &00 ; ANAMIC_GAIN
+        DCB &00 ; MISC_SET_2
+
+        ASSERT (. - TPSDefaults) = (MISC_SET_2+1)-CODEC_MODE
+        
+        ALIGN 
+
+; Sample rate table
+; The first 'reserved' byte is used to store the value that needs programming into the TPS CODEC_MODE register
+
+        GBLA    numrate
+numrate SETA    0
+
+        MACRO
+$lab    cdf     $freq, $per, $mode      ; CD-derived rate ($freq in Hz, since all integral)
+$lab    DCD     $freq*1024              ; frequency value as reported by Sound_SampleRate
+        DCB     $per                    ; period as reported via Sound_Configure
+        DCB     $mode                   ; CODEC_MODE setting    
+        DCW     0                       ; padding to 8 bytes
+numrate SETA    numrate+1
+        MEND
+
+        ASSERT  AudioRateTableSize = 8
+
+ratetab cdf     8000, 125, &01          ;  8kHz     (125usec)  AC97/6
+        cdf     11025, 91, &11          ; 11.025kHz (~91 usec) CD/4
+        cdf     12000, 83, &21          ; 12kHz     (~83 usec) AC97/4
+        cdf     16000, 63, &41          ; 16kHz     (~63 usec) AC97/3
+        cdf     22050, 45, &51          ; 22.05kHz  (~45 usec) CD/2
+        cdf     24000, 42, &61          ; 24kHz     (~42 usec) AC97/2
+        cdf     32000, 31, &81          ; 32kHz     (~31 usec) AC97*2/3
+        cdf     44100, 23, &91          ; 44.1kHz   (~23 usec) CD/1
+        cdf     48000, 21, &a1          ; 48kHz     (~21 usec) AC97/1
+        cdf     96000, 10, &e1          ; 96kHz     (~10 usec) AC97*2
+
+; Audio controller HAL device
+
+AudioTemplate
+        DCW     HALDeviceType_Audio + HALDeviceAudio_AudC
+        DCW     HALDeviceID_AudC_TPS65950
+        DCD     HALDeviceBus_Ser + HALDeviceSerBus_IIC
+        DCD     1:SHL:16        ; API version
+        DCD     AudioDesc
+        DCD     0               ; Address - N/A
+        %       12              ; Reserved
+        DCD     AudioActivate
+        DCD     AudioDeactivate
+        DCD     AudioReset
+        DCD     AudioSleep
+        DCD     McBSP2_IRQ      ; Device
+        DCD     0               ; TestIRQ cannot be called
+        %       8
+        DCD     0               ; Filled in during init
+        DCD     1               ; Output channels (supported so far)
+        DCD     0               ; Input channels (supported so far)
+        ASSERT  (.-AudioTemplate) = HALDevice_Audio_Size
+        ; DMA channel parameters
+        DCD     0 ; flags
+        DCD     McBSP2_DMA_TX + 1 ; logical channel
+        DCD     0 ; 'cycle speed'
+        DCD     2 ; transfer unit size
+        DCD     L4_McBSP2+MCBSPLP_DXR ; *physical* address to send data to
+        ; Enable/disable/IRQ routines
+        DCD     PreEnable
+        DCD     PostEnable
+        DCD     PreDisable
+        DCD     PostDisable
+        DCD     IRQHandle
+        DCD     numrate         ; Number of sample rates
+        DCD     ratetab         ; Sample rate table
+        DCD     AudioSetRate    ; SetRate function
+        ASSERT  (.-AudioTemplate) = HALDevice_Audio_Size_1
+        %       16              ; Padding to keep things the same size as the Pandora device struct
+        ASSERT  (.-AudioTemplate) = HALDevice_Audio_Size_2
+        DCD     0               ; Filled in during init
+        DCD     0               ; Filled in during init
+        DCD     0
+        ALIGN
+
+        ASSERT  (.-AudioTemplate) = Audio_DeviceSize
+
+; Mixer HAL device
+
+MixerTemplate
+        DCW     HALDeviceType_Audio + HALDeviceAudio_Mixer
+        DCW     HALDeviceID_Mixer_TPS65950
+        DCD     HALDeviceBus_Ser + HALDeviceSerBus_IIC
+        DCD     1               ; API version
+        DCD     MixerDesc
+        DCD     0               ; Address - N/A
+        %       12              ; Reserved
+        DCD     MixerActivate
+        DCD     MixerDeactivate
+        DCD     MixerReset
+        DCD     MixerSleep
+        DCD     -1              ; Device
+        DCD     0               ; TestIRQ cannot be called
+        %       8
+        DCD     0               ; Filled in during init
+        DCD     MixerChannels   
+        DCD     MixerGetFeatures
+        DCD     MixerSetMix
+        DCD     MixerGetMix
+        DCD     MixerGetMixLimits
+        ASSERT  (.-MixerTemplate) = HALDevice_Mixer_Size + 4
+        ; Default settings will be filled in during init
+        DCD     0, 0
+        DCD     0, 0           
+        DCD     0, 0           
+        DCD     0, 0           
+        DCD     0, 0
+        DCD     0, 0           
+        DCD     0, 0           
+        DCD     0, 0
+        DCW     0 ; MixerHeadsetGain
+        DCW     0 ; MixerPredriverGain
+        DCW     0 ; MixerHandsFreeGain
+        DCW     0 ; MixerCarkitOutGain
+        DCW     &3F3F ; MixerSystemGain
+        DCW     &3333 ; MixerSystemGain2
+        %       4 
+        ASSERT  (.-MixerTemplate) = Mixer_DeviceSize
+
+AudioDesc
+        =       "TPS65950-compatible audio controller", 0
+
+MixerDesc
+        =       "TPS65950-compatible audio mixer", 0
+        ALIGN
+
+AudioActivate
+        ; TODO - Fix this!
+        ; SoundDMA is higher up the module chain than SoundControl
+        ; Which means we need the audio controller to do the mixer init, otherwise stuff might not work properly
+        Entry   "v1,sb", 4
+        ; Turn off codec, program mix params
+        LDR     v1, [a1, #HALDevice_AudioMixer]
+        ADD     v1, v1, #(:INDEX:MixerSettings)+8*MixerChannels
+        MOV     a2, #MixerChannels-1
+        LDR     sb, AudioWorkspace
+ [ AudioDebug
+        DebugTX "AudioActivate: Setting defaults"
+ ]
+        ADR     a3, ratetab
+        LDRB    a3, [a3, #5] ; Just use first rate for now
+        STR     a3, AudioMode
+        BL      SetCodecMode
+10      LDMDB   v1!,{a3-a4}
+        BL      ReallySetMix
+        SUBS    a2, a2, #1
+        BGE     %BT10
+        ; Finished!        
+        MOV     a1, #1
+        EXIT
+
+AudioDeactivate
+        MOV     pc, lr
+
+AudioReset
+        MOV     pc, lr
+
+AudioSleep
+        MOV     a1, #0
+        MOV     pc, lr
+
+SetCodecMode
+        ; Reprogram CODEC_MODE from softcopy
+        ; Assumes a1=audio device ptr, sb=HAL workspace
+        Entry   "a1-a4,v1"
+        ADR     a2, AudioMode
+        MOV     a1, #TPSAUDIO_IIC*2
+        MOV     a3, #1
+        MOV     a4, #CODEC_MODE
+        LDR     v1, OSentries+4*OS_IICOpV
+        BL      TPSWrite
+ [ AudioDebug
+        CMP     a1, #0
+        EXIT EQ
+        DebugTX "SetCodecMode: TPS write failed!"
+ ]
+        EXIT
+
+PreEnable
+        ; a2 = DMA buffer length
+        ; Use the buffer length to calculate a DMA packet size that fits in the FIFO.
+        LDR     a3, AudioWorkspace
+        MOV     a4, #1
+10
+        MOV     a2, a2, LSR #1 ; Number of DMA elements/FIFO entries
+        CMP     a2, #&200 ; FIFO size is &500. To try and avoid underflow, try to make sure there's no more than &200 free entries.
+        STRLE   a2, [a3, #:INDEX:DMAPktSz_Audio]
+        MOVLE   pc, lr
+        ; Divide size by two until we reach our goal
+        TST     a2, #1
+        MOVEQ   a4, a4, LSL #1
+        BEQ     %BT10
+        ; If we're here, it means we can't divide any more, and we're still stuck with a large transfer size.
+        ; For RISC OS, the largest non-fittable size is 4K-4, which will result in a2=&3FF and a4=2
+        ; Since &3FF is smaller than the FIFO size we'll make an exception to our above rule and allow it to be used
+        ; But to future-proof ourselves against buffers larger than 4K we'll fall back to using a4 if needed. Transferring only two elements at a time will hurt the memory bus a bit, but at least it'll work!
+        CMP     a2, #&400
+        STRLE   a2, [a3, #:INDEX:DMAPktSz_Audio]
+        STRGT   a4, [a3, #:INDEX:DMAPktSz_Audio]
+        MOV     pc, lr
+
+PostEnable
+        ; a2 = DMA buffer length
+        ; This function is a mix of two things - the TPS programming steps from section 14.5.3 of the manual (swcu050d.pdf, page 715/716), and the McBSP programming steps
+        ; The steps for both have been stripped down to the bare minimum that are required for (re)initialisation.
+        ; The McBSP instance is initialised first, to allow the DMA to prefill the TX FIFO. The TWL/TPS is then initialised afterwards.
+        Entry   "v1-v3,sb"
+        LDR     sb, AudioWorkspace
+ [ AudioDebug
+        DebugTX "PostEnable"
+ ]
+        Push    "a1"
+        LDR     v1, AudioRegs
+        ; Set McBSP instance to reset state (although it should be reset already)
+        MOV     a1, #0
+        STR     a1, [v1, #MCBSPLP_SPCR1]
+        MOV     a1, #&200
+        STR     a1, [v1, #MCBSPLP_SPCR2]
+        ; Reset IRQ state, and enable underflow/overflow IRQ
+        MVN     a1, #0
+        STR     a1, [v1, #MCBSPLP_IRQSTATUS]
+        MOV     a1, #&1800
+        STR     a1, [v1, #MCBSPLP_IRQENABLE]
+        ; Program FIFO threshold value, using our precomputed packet size
+        LDR     a2, DMAPktSz_Audio
+ [ AudioDebug
+        DebugReg a2, "Packet size="
+ ]        
+        SUB     a2, a2, #1
+        STR     a2, [v1, #MCBSPLP_THRSH2] ; Threshold = number of 16bit samples that SDMA sends, minus one. Any other value is wrong and will cause audio corruption.
+        ; Wait 2 SRG clock cycles
+        ; For now, just wait for a msec or so
+        MOV     a1, #1024
+        BL      HAL_CounterDelay
+        ; Bring sample rate generator out of reset (required even with external clocks)
+        MOV     v2, #&240
+        STR     v2, [v1, #MCBSPLP_SPCR2]
+        ; Bring transmitter out of reset
+        ORR     v2, v2, #1
+        STR     v2, [v1, #MCBSPLP_SPCR2]
+        ; Wait some more, according to linux
+        MOV     a1, #1024
+        BL      HAL_CounterDelay
+        Pull    "a1"
+        ; Now start frame sync
+        ORR     v2, v2, #&80
+        STR     v2, [v1, #MCBSPLP_SPCR2]
+        ; Wait for FIFO to fill by DMA
+        LDR     v3, DMAPktSz_Audio
+        ; Use the 32K timer to provide a clock reference for a timeout (in
+        ; case DMA isn't running for some reason, e.g. DMAManager being
+        ; naughty and sneakily resetting it during Service_PreReset)
+        LDR     v2, L4_32KTIMER_Log
+        LDR     a3, [v2, #REG_32KSYNCNT_CR]
+10
+        LDR     a2, [v1, #MCBSPLP_XBUFFSTAT]
+        CMP     a2, v3
+        BLE     %FT20
+        LDR     ip, [v2, #REG_32KSYNCNT_CR]
+        SUB     ip, ip, a3
+        CMP     ip, #16384 ; Half a second should be more than enough
+        BLO     %BT10
+ [ AudioDebug
+        DebugTX "FIFO fill timeout!"
+ ]
+        ; Since timeouts shouldn't happen, I don't think anyone will mind if
+        ; we just bug out and don't start the audio codec
+        EXIT
+20
+ [ AudioDebug
+        DebugReg a2, "Post-prime XBUFFSTAT="
+ ]
+        
+        ; TPS Step 18 - turn codec power on
+        LDR     v1, AudioMode
+        ORR     v1, v1, #2
+        STR     v1, AudioMode
+        BL      SetCodecMode
+        ; TPS Steps 28-30 - Set and wait for antipop
+        BL      SetAndWaitForAntiPop
+        ; TPS Step 32 - Disable codec, for some unmentioned reason
+        BIC     v1, v1, #2
+        STR     v1, AudioMode
+        BL      SetCodecMode
+        ; TPS Step 33 - Enable codec again
+        ORR     v1, v1, #2
+        STR     v1, AudioMode
+        BL      SetCodecMode
+        ; TPS Steps 34-37 - Enable headset (if needed!)
+        LDR     a1, [a1, #HALDevice_AudioMixer]
+        LDR     a2, MixerSettings+MixerChannel_HeadsetOut*8
+        TST     a2, #1
+        BLEQ    UpdateHeadset
+        EXIT
+
+PreDisable
+        ; Disable the TWL/TPS, and then McBSP
+        ; This should avoid unwanted underflow IRQs
+        Entry   "v1,sb"
+        LDR     sb, AudioWorkspace
+ [ AudioDebug
+        DebugTX "PreDisable"
+ ]
+        ; Disable IRQs
+        LDR     a2, AudioRegs
+        MOV     a3, #0
+        STR     a3, [a2, #MCBSPLP_IRQENABLE]
+        ; Disable headset output if required
+        LDR     v1, [a1, #HALDevice_AudioMixer]
+        LDR     a2, [v1, #:INDEX:MixerSettings+MixerChannel_HeadsetOut*8]
+        ANDS    a2, a2, #1
+        BNE     %FT30
+        STRH    a2, [v1, #:INDEX:MixerHeadsetGain]
+        Push    "a1"
+        ADRL    a2, HeadsetDisableSequence
+        MOV     a3, #1
+        LDR     v1, OSentries+4*OS_IICOpV
+10
+        LDRB    a4, [a2],#1
+        CMP     a4, #255
+        LDREQB  a4, [a2],#1
+        BLEQ    DoHeadsetRampDelay
+        MOV     a1, #TPSAUDIO_IIC*2
+        CMP     a4, #0
+        BEQ     %FT20
+        BL      TPSWrite
+ [ AudioDebug
+        CMP     a1, #0
+        BEQ     %FT15
+        DebugReg a4,"PreDisable: Write failed, reg="
+15
+ ]
+        ADD     a2, a2, #1
+        B       %BT10
+20
+        Pull    "a1"        
+30
+        ; Turn codec power off
+        LDR     a2, AudioMode
+        BIC     a2, a2, #2
+        STR     a2, AudioMode
+        BL      SetCodecMode
+        ; Disable McBSP
+        LDR     v1, AudioRegs
+        MOV     a1, #0
+        STR     a1, [v1, #MCBSPLP_SPCR1]
+        MOV     a1, #&200
+        STR     a1, [v1, #MCBSPLP_SPCR2]
+        EXIT
+
+PostDisable
+        MOV     pc, lr
+
+IRQHandle
+ [ AudioDebug
+        Push    "sb,lr"
+        LDR     sb, AudioWorkspace
+        LDR     a2, AudioRegs
+        LDR     a2, [a2, #MCBSPLP_IRQSTATUS]
+        DebugReg a2,"IRQHandle: IRQSTATUS="
+        Pull    "sb,lr"
+ ]
+        ; Just clear the IRQ and ask for an audio reset
+        LDR     a3, AudioRegs
+        MOV     a2, #0
+        STR     a2, [a3, #MCBSPLP_IRQENABLE] ; Make sure we don't get bothered about this again - we can't guarantee when the OS will get round to resetting the audio, and could potentially get stuck in a loop if we allow the IRQ to keep firing
+        MVN     a2, #0
+        STR     a2, [a3, #MCBSPLP_IRQSTATUS]
+        MOV     a1, #AudioIRQHandle_RequestReset
+        MOV     pc, lr
+
+AudioSetRate
+        ; a2 = sample rate index (0-based)
+        Entry   "sb"
+        LDR     sb, AudioWorkspace
+ [ AudioDebug
+        DebugReg a2, "AudioSetRate: "
+ ]
+        ; Reload CODEC_MODE with the required value
+        ; The manual states APLL_RATE can only be changed if the codec is off!
+        ADRL    a3, ratetab
+        ASSERT  AudioRateTableSize = 8
+        ADD     a3, a3, a2, LSL #3
+        LDRB    a3, [a3, #5]
+        LDR     a2, AudioMode
+        CMP     a2, a3
+        EXIT EQ ; Redundant update, ignore
+        TST     a2, #2
+ [ AudioDebug
+        BEQ     %FT10
+        DebugTX "AudioSetRate: Failed, codec is active!"
+        EXIT
+10
+ |
+        EXIT NE
+ ]
+        STR     a3, AudioMode
+        BL      SetCodecMode        
+        EXIT
+
+MixerActivate
+        MOV     a1, #1
+
+MixerDeactivate
+        MOV     pc, lr
+
+MixerReset
+        Entry   "v1,sb", 4
+        ; Turn off codec, program default mix params
+        ADR     v1, MixerSettings+8*MixerChannels
+        LDR     a1, [a1, #HALDevice_MixerCtrlr]
+        MOV     a2, #MixerChannels-1
+        LDR     sb, AudioWorkspace
+ [ AudioDebug
+        DebugTX "MixerReset: Setting defaults"
+ ]
+        LDR     a3, AudioMode
+        BIC     a3, a3, #2
+        STR     a3, AudioMode
+        BL      SetCodecMode
+10      LDMDB   v1!,{a3-a4}
+        BL      ReallySetMix
+        SUBS    a2, a2, #1
+        BGE     %BT10
+        EXIT
+
+MixerSleep
+        ; TODO?
+        MOV     a1, #0
+        MOV     pc, lr
+
+MixerGetFeatures
+        ; Check if this channel is disabled and needs the 'fixed' flag
+        MOV     a4, #1
+        LDRB    a3, MixerDisableFlags
+        TST     a3, a4, LSL a2
+        ADR     a1, MixerFeaturesTab
+        LDR     a1, [a1, a2, LSL #2]
+        ORRNE   a1, a1, #MixerFeaturesFlag_Fixed
+        MOV     pc, lr
+
+MixerFeaturesTab
+        ; Stereo headset output
+        DCW     0
+        DCW     MixerCategory_Headphones
+        ; Stereo speaker predriver output
+        DCW     MixerFeaturesFlag_DefaultMute
+        DCW     MixerCategory_Speaker
+        ; Stereo hands-free output
+        DCW     MixerFeaturesFlag_DefaultMute
+        DCW     MixerCategory_LineOut
+        ; Stereo carkit output
+        DCW     MixerFeaturesFlag_DefaultMute
+        DCW     MixerCategory_AuxOut
+        ; System audio
+        DCW     0
+        DCW     MixerCategory_System
+        ; Mono headset mic
+        DCW     MixerFeaturesFlag_Mono :OR: MixerFeaturesFlag_DefaultMute
+        DCW     MixerCategory_Mic        
+        ; Stereo FM/aux input
+        DCW     MixerFeaturesFlag_DefaultMute
+        DCW     MixerCategory_LineIn       
+        ; Mono carkit mic
+        DCW     MixerFeaturesFlag_Mono :OR: MixerFeaturesFlag_DefaultMute
+        DCW     MixerCategory_AuxIn        
+
+MixerGetMixLimits
+        ADR     a1, MixerLimitsTab
+        ADD     a1, a1, a2, LSL #3
+        ADD     a1, a1, a2, LSL #2
+        LDMIA   a1, {a1-a2,a4}
+        STMIA   a3, {a1-a2,a4}
+        MOV     pc, lr
+
+MixerLimitsTab
+        ; Stereo headset output
+        DCD     -6*16
+        DCD     6*16
+        DCD     6*16
+        ; Stereo speaker predriver output
+        DCD     -6*16
+        DCD     6*16
+        DCD     6*16
+        ; Stereo hands-free output
+        DCD     0
+        DCD     0
+        DCD     16
+        ; Stereo carkit output
+        DCD     -6*16
+        DCD     6*16
+        DCD     6*16
+        ; System audio
+        DCD     -62*16 + -18*16
+        DCD     12*16  + 12*16
+        DCD     16
+        ; Mono headset mic
+        DCD     0
+        DCD     30*16
+        DCD     16
+        ; Stereo FM/aux input. May be wrong? (relies on ALC, which fig 14-6 says isn't available)
+        DCD     0
+        DCD     30*16
+        DCD     16
+        ; Mono carkit mic
+        DCD     0
+        DCD     30*16
+        DCD     16
+
+MixerSetMix
+        ; a1 = mixer device
+        ; a2 = channel
+        ; a3 = mute flag
+        ; a4 = gain, in dB*16
+        Entry   "v1"
+        ; Double-check that we aren't being asked to program a disabled channel
+        ; Although ReallySetMix will do another check, we must check here to make sure we don't update the stored settings (particularly the headset settings, which UpdateHeadset treats as gospel)
+        MOV     ip, #1
+        LDRB    v1, MixerDisableFlags
+        TST     v1, ip, LSL a2
+        EXIT    NE
+        ADR     v1, MixerSettings
+        ADD     v1, v1, a2, LSL #3
+        LDMIA   v1, {ip, lr}
+        TEQ     a3, ip
+        TEQEQ   a4, lr
+        STMNEIA v1, {a3, a4}
+        LDRNE   a1, [a1, #HALDevice_MixerCtrlr]
+        BLNE    ReallySetMix
+        EXIT
+
+ReallySetMix
+        ; a1 = *audio* device
+        ; a2-a4 as above
+        ; Preserves all regs
+        ; Channel gain & mute control can't easily be abstracted, need to do it on a case-by-case basis :(
+        ; Common code to get ready for IIC transfers
+        Entry   "a1-a4,v1-v5,sb,v7"
+        LDR     sb, AudioWorkspace
+  [ AudioDebug
+        DebugTX "ReallySetMix:"
+        DebugReg a2,"Channel="
+        DebugReg a3,"Mute="
+        DebugReg a4,"Gain="
+  ]
+        ; Triple-check that we aren't being asked to program a disabled channel
+        ; (ReallySetMix gets called unconditionally in a few places; easier to just check for invalid channels here rather than in every place it gets called from)
+        LDRB    v5, [sb, #BoardConfig_MixerChans]
+        MOV     v2, #1
+        TST     v5, v2, LSL a2
+        EXIT    NE
+        LDR     v5, [a1, #HALDevice_AudioMixer]
+        MOV     v2, a3
+        LDR     v4, AudioMode
+        ADD     v7, v5, #:INDEX: MixerSettings+4
+        LDR     v1, OSentries+4*OS_IICOpV
+        MOV     a1, #TPSAUDIO_IIC*2
+        ADD     v7, v7, a2, LSL #3
+        ADR     a3, SetMixTab
+        MOV     v3, a4
+        LDR     pc, [a3, a2, LSL #2]
+        ; Following code entered with:
+        ; a1, v1 ready for TPSRead/TPSWrite
+        ; v2 = mute flag
+        ; v3 = gain
+        ; v4 = current CODEC_MODE setting
+        ; v5 = mixer device
+        ; sb = HAL WS
+        ; v7 = gain writeback ptr
+SetMixTab
+        DCD     SetMixHeadsetOut
+        DCD     SetMixPredriver
+        DCD     SetMixHandsFree
+        DCD     SetMixCarkitOut
+        DCD     SetMixSystem
+        DCD     SetMixHeadsetMic
+        DCD     SetMixAuxInput
+        DCD     SetMixCarkitMic
+
+SetMixHeadsetOut ; HS_* regs
+        ; If the codec is on, go through to UpdateHeadset
+        ; Else do nothing
+        TST     v4, #2
+        MOVNE   a1, v5
+        BLNE    UpdateHeadset
+        EXIT    
+
+SetMixPredriver ; PRED* regs
+        MOV     v4, #&24 ; 0dB gain, AL2
+        MOV     lr, #0
+        CMP     v3, #6*16
+        MOVGE   v4, #&14 ; 6dB gain, AL2
+        MOVGE   lr, #6*16
+        CMP     v3, #-6*16
+        MOVLE   v4, #&34 ; -6dB gain, AL2
+        MOVLE   lr, #-6*16
+        TST     v2, #1
+        ORREQ   v4, v4, v4, LSL #8 ; R channel settings
+        MOVNE   v4, #0 ; Else disable everything
+        ADD     a2, v5, #:INDEX:MixerPredriverGain
+        LDRH    ip, [a2]
+        CMP     ip, v4
+        EXIT    EQ
+        STRH    v4, [a2]
+        MOV     a3, #2
+        STR     lr, [v7]
+        MOV     a4, #PREDL_CTL
+        BL      TPSWrite
+ [ AudioDebug
+        CMP     a1, #0
+        EXIT EQ
+        DebugTX "SetMixPredriver: TPS write failed!"
+ ]
+        EXIT
+
+SetMixHandsFree ; HF* regs
+        TST     v2, #1
+        MOVEQ   v4, #&3E ; AL2, enabled
+        ORREQ   v4, v4, #&3E00 ; AR2, enabled
+        MOVNE   v4, #0
+        ADD     a2, v5, #:INDEX:MixerHandsFreeGain
+        LDRH    ip, [a2]
+        CMP     ip, v4
+        EXIT    EQ
+        MOV     lr, #0
+        STRH    v4, [a2]
+        MOV     a3, #2
+        STR     lr, [v7]
+        MOV     a4, #HFL_CTL
+        BL      TPSWrite
+ [ AudioDebug
+        CMP     a1, #0
+        EXIT EQ
+        DebugTX "SetMixHandsFree: TPS write failed!"
+ ]
+        EXIT
+
+SetMixCarkitOut ; PRECK* regs
+        MOV     v4, #&64 ; 0dB gain, AL2
+        MOV     lr, #0
+        CMP     v3, #6*16
+        MOVGE   v4, #&54 ; 6dB gain, AL2
+        MOVGE   lr, #6*16
+        CMP     v3, #-6*16
+        MOVLE   v4, #&74 ; -6dB gain, AL2
+        MOVLE   lr, #-6*16
+        TST     v2, #1
+        ORREQ   v4, v4, v4, LSL #8 ; R channel settings
+        MOVNE   v4, #0 ; Else disable everything
+        ADD     a2, v5, #:INDEX:MixerCarkitOutGain
+        LDRH    ip, [a2]
+        CMP     ip, v4
+        EXIT    EQ
+        STRH    v4, [a2]
+        MOV     a3, #2
+        STR     lr, [v7]
+        MOV     a4, #PRECKL_CTL
+        BL      TPSWrite
+ [ AudioDebug
+        CMP     a1, #0
+        EXIT EQ
+        DebugTX "SetMixCarkitOut: TPS write failed!"
+ ]
+        EXIT
+
+SetMixSystem ; ARX(L/R)2PGA (digital) and ARX(L/R)2_APGA_CTL (analogue)
+        ; The ARX(L/R)2PGA regs have both a coarse grain stage (0dB, 6dB, 12dB) and fine-grain stage (-62dB -> 0dB)
+        ; ARX(L/R)2_APGA_CTL are (relatively) fine-grain, from -18dB to 12dB
+        ; Under the assumption the analogue amplifier will be more liable to noise/distortion, we'll try and do as much as possible using the digital amplifier
+        ; TODO - Once other channels start depending on the analogue amplifiers this technique of using the two amplifiers in unison probably won't be workable. It may be worth splitting the analogue amplifiers off into a seperate mixer so the user is given full control?
+        ; First, apply digital coarse grain
+        MOV     v4, #0
+        MOVS    v3, v3, ASR #4
+        MOV     ip, v3
+        ADDGT   v4, v4, #&40 ; +6dB
+        SUBGTS  v3, v3, #6
+        ADDGT   v4, v4, #&40 ; +12dB
+        SUBGTS  v3, v3, #6
+        ; Now apply digital fine-grain
+        MOVGT   v3, #0 ; Don't go any higher than 12dB
+        ADD     lr, v4, v4, LSR #1
+        ADDS    v3, v3, #&3F
+        SUB     lr, lr, #63*16
+        MOVLE   v3, #1 ; Clamp to -62dB
+        ADD     lr, lr, v3, LSL #4
+        ORR     v4, v4, v3
+        TST     v2, #1
+        ORREQ   v4, v4, v4, LSL #8 ; L channel settings
+        MOVNE   v4, #0 ; Else disable everything
+        ; We arrive here with:
+        ; v4 = ARXR2PGA, ARXL2PGA settings
+        ; ip = requested gain (dB)
+        ; lr = digital gain achieved (dB*16)
+        ; Apply analogue gain
+        RSB     v3, ip, lr, ASR #4
+        BIC     v3, v3, #1 ; Ensure multiple of 2dB
+        CMP     v3, #-12 ; Actually +12dB
+        MOVLT   v3, #-12
+        CMP     v3, #18 ; Actually -18dB
+        MOVGT   v3, #18
+        SUB     lr, lr, v3, LSL #4 ; lr = final gain achieved
+        ; Mung v3 into ARX(L/R)2_APGA_CTL values
+        MOV     v3, v3, LSL #2
+        ADD     v3, v3, #(6<<3)+3
+        ORR     v3, v3, v3, LSL #8
+        TST     v2, #1 ; Check mute
+        MOVNE   v3, #0
+        ; Now program everything
+        STR     lr, [v7]
+        ADD     a2, v5, #:INDEX:MixerSystemGain
+        LDRH    ip, [a2]
+        MOV     a3, #2
+        CMP     ip, v4
+        BEQ     %FT10
+        STRH    v4, [a2]
+        MOV     a4, #ARXR2PGA
+        BL      TPSWrite
+ [ AudioDebug
+        CMP     a1, #0
+        BEQ     %FT10
+        DebugTX "SetMixSystem: TPS write failed!"
+ ]
+10
+        ADD     a2, v5, #:INDEX:MixerSystemGain2
+        LDRH    ip, [a2]
+        CMP     ip, v3
+        EXIT    EQ
+        STRH    v3, [a2]
+        MOV     a1, #TPSAUDIO_IIC*2
+        MOV     a4, #ARXL2_APGA_CTL
+        BL      TPSWrite
+ [ AudioDebug
+        CMP     a1, #0
+        EXIT EQ
+        DebugTX "SetMixSystem: TPS write failed!"
+ ]
+        EXIT
+
+SetMixHeadsetMic ; TODO - Implement!
+SetMixAuxInput ; TODO - Implement!
+SetMixCarkitMic ; TODO - Implement!
+        EXIT
+
+MixerGetMix
+        ADR     a1, MixerSettings
+        ADD     a1, a1, a2, LSL #3
+        LDMIA   a1, {a1, a2}
+        MOV     pc, lr
+
+SetAndWaitForAntiPop
+        ; Sets the CNCL_OFFSET_START bit in the ANAMICL register, then waits for it to clear
+        ; Note: Assumes original register contents is &00!
+        ; Also assumes that the codec power is on, otherwise (presumably) nothing will happen
+        ; Input: sb = HAL workspace
+        Entry   "a1-a4,v1", 4
+        MOV     a1, #TPSAUDIO_IIC*2
+        MOV     a2, sp
+        MOV     a3, #1
+        MOV     a4, #ANAMICL
+        LDR     v1, OSentries+4*OS_IICOpV
+        MOV     ip, #&a0
+        STR     ip, [a2]
+        BL      TPSWrite
+ [ AudioDebug
+        CMP     a1, #0
+        BEQ     %FT10
+        DebugTX "SetAndWaitForAntiPop: TPS write failed!"
+ ]
+10
+        ; Linux uses a delay here to avoid spamming IIC, so we might as well use one too
+        MOV     a1, #1024
+        BL      HAL_CounterDelay
+        MOV     a1, #TPSAUDIO_IIC*2
+        MOV     a2, sp
+        MOV     a3, #1
+        MOV     a4, #ANAMICL
+        BL      TPSRead
+ [ AudioDebug
+        CMP     a1, #0
+        BEQ     %FT15
+        DebugTX "SetAndWaitForAntiPop TPS read failed!"
+15
+ ]
+        CMP     a1, #0
+        LDREQB  a1, [a2]
+        TSTEQ   a1, #&80 ; Check if CNCL_OFFSET_START is still set
+        BNE     %BT10
+        EXIT
+
+UpdateHeadset
+        ; This performs the steps necessary to enable/disable the headset output
+        ; Input:
+        ; a1 = mixer device
+        ; sb = HAL workspace
+        Entry    "a1-a4,v1", 12
+        ; Get mixer settings for headset
+        ADR     lr, MixerSettings+MixerChannel_HeadsetOut*8
+        LDMIA   lr, {a4,v1} ; a4 = mute flag, v1 = gain
+        ; Calculate HS_GAIN_SET
+        MOV     ip, #&a ; 0dB gain
+        MOV     a3, #0
+        CMP     v1, #6*16
+        MOVGE   ip, #&5 ; 6dB gain
+        MOVGE   a3, #6*16
+        CMP     v1, #-6*16
+        MOVLE   ip, #&f ; -6dB gain
+        MOVLE   a3, #-6*16
+        STR     a3, [lr, #4] ; Write back actual gain
+        TST     a4, #1
+        ADRNE   a2, HeadsetDisableSequence ; Muted, so disable it
+        MOVNE   ip, #0
+        BNE     %FT05
+        ; Copy enable sequence to stack so we can modify it with the correct gain
+        ADR     a3, HeadsetEnableSequence
+        MOV     a2, sp
+        LDRH    v1, MixerHeadsetGain
+        CMP     v1, #0 ; Is the headset currently turned off?
+        LDMIA   a3, {a3,a4,v1}
+        ORR     a4, a4, ip, LSL #8 ; Set correct gain
+        STMEQIA a2, {a3,a4,v1} ; Full programming sequence if headset off
+        BICNE   a4, a4, #&FF0000 ; If headset on, only change HS_GAIN_SET
+        STRNE   a4, [a2]
+05
+        ; a2 = sequence to program
+        ; ip = HS_GAIN_SET value
+        LDRH    v1, MixerHeadsetGain
+ [ AudioDebug
+        DebugReg ip,"UpdateHeadset: New="
+        DebugReg v1,"Old="
+ ]
+        CMP     v1, ip
+        EXIT    EQ ; Avoid reprogramming identical values
+        STRH    ip, MixerHeadsetGain
+        MOV     a3, #1
+        LDR     v1, OSentries+4*OS_IICOpV
+10
+        LDRB    a4, [a2],#1
+        CMP     a4, #255
+        LDREQB  a4, [a2],#1
+        BLEQ    DoHeadsetRampDelay
+        MOV     a1, #TPSAUDIO_IIC*2
+        CMP     a4, #0
+        EXIT    EQ
+        BL      TPSWrite
+ [ AudioDebug
+        CMP     a1, #0
+        BEQ     %FT15
+        DebugReg a4,"UpdateHeadset: Write failed, reg="
+15
+ ]
+        ADD     a2, a2, #1
+        B       %BT10
+
+DoHeadsetRampDelay
+        ; Wait for the headset anti-pop to take effect
+        Entry   "a1-a4,ip"
+        LDR     a1, HeadsetRampDelay
+        BL      HAL_CounterDelay
+        EXIT
+
+RAMP_DELAY_VAL * 3
+
+HeadsetRampDelay
+        ; Required delay is 2^(19+RAMP_DELAY_VAL)/26 microseconds, assuming 26MHz system clock
+        DCD (1:SHL:(19+RAMP_DELAY_VAL)) / 26          
+
+HeadsetEnableSequence
+        DCB HS_SEL, &24 ; 19. Select the headset outputs
+        DCB HS_POPN_SET,&40 + (RAMP_DELAY_VAL :SHL: 2) ; 34, 35. Program antipop bias ramp delay and enable vmid
+        DCB HS_GAIN_SET,&00 ; 36. Enable headset output stage & gain setting. NOTE - This gets filled in above.
+        DCB HS_POPN_SET,&42 + (RAMP_DELAY_VAL :SHL: 2) ; 37. Enable ramp
+        DCB &FF ; Wait for ramp time
+        DCB 0 ; Terminator
+        ALIGN
+
+HeadsetDisableSequence
+        DCB HS_POPN_SET,&40 + (RAMP_DELAY_VAL :SHL: 2) ; Disable ramp
+        DCB &FF ; Wait for ramp time
+        DCB HS_GAIN_SET,&00 ; Disable gain
+        DCB HS_POPN_SET,&20 + (RAMP_DELAY_VAL :SHL: 2) ; Disable Vmid, enable external mute
+        DCB HS_SEL,&00 ; Disable headset outputs (for when external mute isn't available)
+        DCB 0 ; Terminator
+        ALIGN
+
+        END

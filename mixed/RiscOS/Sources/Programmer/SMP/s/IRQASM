@@ -1,0 +1,87 @@
+; Copyright 2017 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:Proc
+        GET     Hdr.Defs
+
+        AREA    IRQDesp, CODE, READONLY, PIC
+
+        EXPORT  asm_no_irq
+        EXPORT  asm_irq_handle
+        EXPORT  asm_irq_c_veneer
+        IMPORT  irq_disable
+
+                  ^ 0
+IRQDesp_Link      # 4
+IRQDesp_R12Val    # 4
+IRQDesp_CallAddr  # 4
+
+IRQDesp_Link_Unshared * 1       ; flag in Link (for _this_ node)
+
+       ASSERT   IRQDesp_CallAddr = IRQDesp_R12Val + 4
+
+; void asm_no_irq(void);
+; However, we know we only get called from asm_irq_despatch, so really we have
+; the IRQ number in r0
+asm_no_irq ROUT
+        CMP     r0, #-1
+        BNE     irq_disable
+        Pull    "pc"                    ; Claim IRQ
+
+; void asm_irq_despatch(int irq, void *node);
+asm_irq_handle ROUT
+ [ {FALSE}
+        Push    "lr"                    ; Stash return address for vector claim
+        ; RISC OS 5 IRQ vector handlers are allowed to corrupt R1, R2 & R12 if they don't claim the call
+        ; We need R0 for the device number, so use R3 for the node ptr (avoids trashing APCS regs, allowing direct calls back into our kernel)
+        MOV     r3, r1
+01      MOV     lr, pc
+        LDMIA   r3, {r3, r12, pc}
+        TST     r3, #IRQDesp_Link_Unshared
+        BEQ     %BT01
+        Pull    "pc"
+ |
+        ; Hack #1: The RISC OS kernel is naughty and corrupts R11 when claiming an IRQ (R11 is in the corruptible list given in NewIRQs, but both NewCDV and PRM1 only mention R0-R3, R12)
+        ; We must preserve it since it's needed for APCS
+        ; Hack #2: AHCIDriver corrupts R3 without claiming the IRQ, so use R4 for the node pointer
+        ADR     r3, %FT90
+        Push    "r3,r4,r11,lr"
+        MOV     r4, r1
+01      MOV     lr, pc
+        LDMIA   r4, {r4, r12, pc}
+        TST     r4, #IRQDesp_Link_Unshared
+        BEQ     %BT01
+        ADD     sp, sp, #4
+90
+        Pull    "r4,r11,pc"
+ ]
+
+; void asm_irq_c_veneer(void);
+; Minimalistic veneer to allow IRQ handlers implemented in the kernel to be
+; called
+; Expects r12 to be a pointer to the C function:
+;   int func(void);
+; Return 0 to intercept, 1 to pass on (as per CMHG veneers)
+asm_irq_c_veneer ROUT
+        Push    "lr"
+        BLX     r12
+        CMP     r0, #0
+        ADDEQ   sp, sp, #4
+        Pull    "pc"
+
+        END
+

@@ -1,0 +1,421 @@
+/*
+ * CDDL HEADER START
+ *
+ * The contents of this file are subject to the terms of the
+ * Common Development and Distribution License (the "Licence").
+ * You may not use this file except in compliance with the Licence.
+ *
+ * You can obtain a copy of the licence at
+ * cddl/RiscOS/Sources/HAL/Titanium/LICENCE.
+ * See the Licence for the specific language governing permissions
+ * and limitations under the Licence.
+ *
+ * When distributing Covered Code, include this CDDL HEADER in each
+ * file and include the Licence file. If applicable, add the
+ * following below this CDDL HEADER, with the fields enclosed by
+ * brackets "[]" replaced with your own identifying information:
+ * Portions Copyright [yyyy] [name of copyright owner]
+ *
+ * CDDL HEADER END
+ */
+/*
+ * Copyright 2014 Elesar Ltd.  All rights reserved.
+ * Use is subject to license terms.
+ */
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdlib.h>
+#include "pcisupport.h"
+#include "pcireg.h"
+
+#define DEBUG   FALSE
+
+/* Steer clear of HAL workspace pointer */
+__global_reg(6) void *sb;
+
+#if DEBUG
+#define PCI_DEBUG(s,v)  PCIDebug(s,v)
+static void PCIDebug(const char *prefix, uint32_t value)
+{
+	while (*prefix >= ' ')
+	{
+		HAL_DebugTX(*prefix);
+		prefix++;
+	}
+	HAL_DebugTXWord(value);
+	if (*prefix != 0)
+	{
+		HAL_DebugTX(13);
+		HAL_DebugTX(10);
+	}
+}
+#else
+#define PCI_DEBUG(s,v)  /* Nothing */
+#endif
+
+static uint8_t PCILog2Size(uint64_t size)
+{
+	size_t i;
+
+	for (i = 0; i < 64; i++)
+	{
+		/* This also tests for ISPOW2 implicitly */
+		if ((1uLL << i) == size) return (uint8_t)i;
+	}
+
+	return UINT8_MAX;
+}
+
+static void PCIAllocate(pci_t *ws, size_t rc, uint8_t type,
+                        uint32_t lo, uint32_t hi, uint32_t offset, uint32_t *hwm)
+{
+	size_t   fn, fnlimit, bar, bars;
+	uint32_t size, align, next = lo;
+
+	/* Equate root complex with device */
+	fnlimit = ws->dev[rc].fn[0].multifn ? PCI_FNLIMIT : 1;
+	for (fn = 0; fn < fnlimit; fn++)
+	{
+		pcifn_t *thisfn = &ws->dev[rc].fn[fn];
+
+		if (thisfn->skip) continue;
+		switch (thisfn->type)
+		{
+			case PCI_HDRTYPE_DEVICE:
+				bars = 6 + 1;
+				break;
+
+			case PCI_HDRTYPE_PPB:
+			case PCI_HDRTYPE_PCB:
+			default:
+				continue;
+		}
+
+		for (bar = 0; bar < bars; bar++)
+		{
+			if ((thisfn->bar[bar].type == type) && (next < hi))
+			{
+				/* Minimum alignment treats everything but IO as memory */
+				align = (type == BAR_IO) ? PCI_IOALIGN : PCI_MEMALIGN;
+
+				/* Re align to at least the requested size, since lower bits
+				 * wont be implemented in that bar register.
+				 */
+				size = 1u << thisfn->bar[bar].log2size;
+				if (size > align) align = size;
+				align--;
+				next = (next + align) & ~align;
+
+				/* Type match, assign and increment */
+				PCI_DEBUG(" Next at ", next);
+				PCI_DEBUG(" for dev ", rc);
+				PCI_DEBUG(" fn ", fn);
+				PCI_DEBUG(" bar \n", bar);
+				thisfn->bar[bar].addr = next + offset;
+				next = next + size;
+			}
+		}
+
+		/* Run out of space yet? */
+		if (next >= hi) break;
+	}
+
+	/* Report the high water mark */
+	if (hwm != NULL) *hwm = next;
+}
+
+static void PCIOpenBars(const pci_t *ws, size_t bus, uint32_t devfn)
+{
+	uint32_t rombar;
+	size_t   bar, bars;
+	uint16_t command = 0;
+	const pcifn_t *thisfn = &ws->dev[PCIDEV(devfn)].fn[PCIFN(devfn)];
+
+	if (thisfn->skip) return;
+
+	switch (thisfn->type)
+	{
+		case PCI_HDRTYPE_DEVICE:
+			bars = 6 + 1;
+			rombar = PCI_MAPREG_ROM;
+			break;
+
+		case PCI_HDRTYPE_PPB:
+			bars = 2 + 1;
+			rombar = PCI_MAPREG_ROM + 8;
+			break;
+
+		default:
+			return;
+	}
+
+	for (bar = 0; bar < bars; bar++)
+	{
+		switch (thisfn->bar[bar].type)
+		{
+			case BAR_ROM:
+				command |= PCI_COMMAND_MEM_ENABLE;
+				HAL_PCIWriteConfigWord(bus, devfn, rombar, PCI_MAPREG_ROM_ENABLE | thisfn->bar[bar].addr);
+				break;
+
+			case BAR_IO:
+				command |= PCI_COMMAND_IO_ENABLE;
+				HAL_PCIWriteConfigWord(bus, devfn, PCI_BAR(bar), thisfn->bar[bar].addr);
+				break;
+
+			case BAR_MEM:
+				command |= PCI_COMMAND_MEM_ENABLE | PCI_COMMAND_MASTER_ENABLE;
+				HAL_PCIWriteConfigWord(bus, devfn, PCI_BAR(bar), thisfn->bar[bar].addr);
+				break;
+
+			case BAR_DUFF:
+			default:
+				break;
+		}
+	}
+	HAL_PCIWriteConfigHalfword(bus, devfn, PCI_COMMAND_STATUS_REG, command);
+}
+
+static void PCIDishOutInts(const pci_t *ws, size_t rc, size_t bus, uint32_t devfn)
+{
+	static const uint8_t irqno[PCI_COUNT * PCI_INTERRUPT_PIN_MAX] = PCI_IRQNOS;
+	uint32_t icr;
+	uint8_t  pin, line;
+	const pcifn_t *thisfn = &ws->dev[PCIDEV(devfn)].fn[PCIFN(devfn)];
+
+	if (thisfn->skip) return;
+
+	icr = HAL_PCIReadConfigWord(bus, devfn, PCI_INTERRUPT_REG);
+	pin = PCI_INTERRUPT_PIN(icr);
+	if ((pin != PCI_INTERRUPT_PIN_NONE) && (pin <= PCI_INTERRUPT_PIN_MAX))
+	{
+		/* Wants an interrupt */
+#if PCI_SWITCHES
+#error "Cycle ints around the devices"
+#else
+		line = irqno[(rc * PCI_INTERRUPT_PIN_MAX) +
+		             (pin - PCI_INTERRUPT_PIN_A)];
+#endif
+		HAL_PCIWriteConfigByte(bus, devfn, PCI_INTERRUPT_REG, line);
+		PCI_DEBUG("Assigned INT#", line);
+		PCI_DEBUG(" to dev ", PCIDEV(devfn));
+		PCI_DEBUG(" fn \n", PCIFN(devfn));
+	}
+}
+
+static void PCIQueryFunction(pci_t *ws, size_t bus, uint32_t devfn)
+{
+	uint32_t bhlc, cr, rombar, base, mask;
+	uint8_t  log2size;
+	size_t   bar, bars;
+	pcifn_t *thisfn = &ws->dev[PCIDEV(devfn)].fn[PCIFN(devfn)];
+
+	/* Command disable everything while probing */
+	HAL_PCIWriteConfigHalfword(bus, devfn, PCI_COMMAND_STATUS_REG, 0);
+
+	/* Skip bridges */
+	thisfn->skip = false;
+	thisfn->bridge = false;
+	cr = HAL_PCIReadConfigWord(bus, devfn, PCI_CLASS_REG);
+	if (PCI_CLASS(cr) == PCI_CLASS_BRIDGE)
+	{
+		thisfn->bridge = true;
+#if PCI_SWITCHES
+#error "No support for switches or bridges yet"
+#else
+		thisfn->skip = true;
+		return;
+#endif
+	}
+
+	/* Common settings */
+	bhlc = HAL_PCIReadConfigWord(bus, devfn, PCI_BHLC_REG);
+	HAL_PCIWriteConfigWord(bus, devfn, PCI_BHLC_REG,
+	                       PCI_BHLC_CODE(PCI_BIST(bhlc),
+	                                     PCI_HDRTYPE_TYPE(bhlc),
+	                                     PCI_HDRTYPE_MULTIFN(bhlc),
+	                                     0, /* Latency timer has no meaning on PCIe */
+	                                     PCI_CACHEALIGN / sizeof(uint32_t) /* In words */
+	                                    ));                            
+
+	thisfn->type = PCI_HDRTYPE_TYPE(bhlc);
+	thisfn->multifn = PCI_HDRTYPE_MULTIFN(bhlc); 
+	switch (thisfn->type)
+	{
+		case PCI_HDRTYPE_DEVICE:
+			bars = 6;
+			rombar = PCI_MAPREG_ROM;
+			break;
+
+		case PCI_HDRTYPE_PPB:
+#if PCI_SWITCHES
+			bars = 2;
+			rombar = PCI_MAPREG_ROM + 8;
+			break;
+#else
+			/* Fall through */
+#endif
+		case PCI_HDRTYPE_PCB:
+		default:
+			thisfn->skip = true;
+			return;
+	}
+
+	for (bar = 0; bar < bars; bar++)
+	{
+		HAL_PCIWriteConfigWord(bus, devfn, PCI_BAR(bar), ~0);
+		base = HAL_PCIReadConfigWord(bus, devfn, PCI_BAR(bar)); 
+		HAL_PCIWriteConfigWord(bus, devfn, PCI_BAR(bar), 0);
+		switch (PCI_MAPREG_TYPE(base))
+		{
+			case PCI_MAPREG_TYPE_MEM:
+				switch (PCI_MAPREG_MEM_TYPE(base))
+				{
+					case PCI_MAPREG_MEM_TYPE_64BIT:
+					case PCI_MAPREG_MEM_TYPE_32BIT:
+						mask = ~(base & PCI_MEMBAR_MASK);
+						log2size = PCILog2Size(1 + (uint64_t)mask);
+						if ((log2size > 32) || (base == 0))
+						{
+							/* PCI spec 4GB limit */
+							thisfn->bar[bar].type = BAR_DUFF;
+							PCI_DEBUG(" Duff Mem bar \n", bar);
+						}
+						else
+						{
+							thisfn->bar[bar].log2size = log2size;
+							thisfn->bar[bar].type = BAR_MEM;
+							PCI_DEBUG(" Log2(Mem bar) \n", log2size);
+						}
+						if (PCI_MAPREG_MEM_TYPE(base) == PCI_MAPREG_MEM_TYPE_64BIT)
+						{
+							/* Lowly 32 bit address space */
+							bar++;
+							HAL_PCIWriteConfigWord(bus, devfn, PCI_BAR(bar), 0);
+						}
+						break;
+
+					default:
+						thisfn->bar[bar].type = BAR_DUFF;
+						PCI_DEBUG(" Duff Mem bar \n", bar);
+						break;
+				}
+				break;
+
+			case PCI_MAPREG_TYPE_IO:
+				mask = ~(base & PCI_IOBAR_MASK);
+				log2size = PCILog2Size(1 + (uint64_t)mask);
+				if ((log2size > 8) || (base == 0))
+				{
+					/* PCI spec 256B limit */
+					thisfn->bar[bar].type = BAR_DUFF;
+					PCI_DEBUG(" Duff IO bar \n", bar);
+				}
+				else
+				{
+					thisfn->bar[bar].log2size = log2size;
+					thisfn->bar[bar].type = BAR_IO;
+					PCI_DEBUG(" Log2(IO bar) \n", log2size);
+				}
+				break;
+
+			default:
+				thisfn->bar[bar].type = BAR_DUFF;
+				PCI_DEBUG(" Duff bar \n", bar);
+				break;
+		}
+	}
+
+	/* ROM space */
+	HAL_PCIWriteConfigWord(bus, devfn, rombar, ~0);
+	base = HAL_PCIReadConfigWord(bus, devfn, rombar);
+	HAL_PCIWriteConfigWord(bus, devfn, rombar, 0);
+	mask = ~(base & PCI_ROMBAR_MASK);
+	log2size = PCILog2Size(1 + (uint64_t)mask);
+	if ((log2size > 24) || (base == 0))
+	{
+		/* PCI spec 16MB limit */
+		thisfn->bar[PCI_BARROM].type = BAR_DUFF;
+		PCI_DEBUG(" Duff ROM bar \n", bar);
+	}
+	else
+	{
+		thisfn->bar[PCI_BARROM].log2size = log2size;
+		thisfn->bar[PCI_BARROM].type = BAR_ROM;
+		PCI_DEBUG(" Log2(ROM bar) \n", log2size);
+	}
+}
+
+void PCIProbing(pci_t *ws, size_t wssize)
+{
+	size_t   rc, bus = 0, dev, fn, fnlimit, try;
+	uint8_t  hdrtype;
+	uint32_t id, bhlc, hwm;
+
+	/* Safety check */
+	if (wssize < sizeof(pci_t)) return;
+
+	for (dev = 0; dev < PCI_DEVLIMIT; dev++)
+	{
+		for (try = 0; try < 5; try++)
+		{
+			/* Have a few goes at getting the ID word */
+			id = HAL_PCIReadConfigWord(bus, PCIDEV_FN(dev, 0), PCI_ID_REG);
+			if (id != ~0) break;
+		}
+		if (id != ~0)
+		{
+			/* Lights are on */
+			bhlc = HAL_PCIReadConfigWord(bus, PCIDEV_FN(dev, 0), PCI_BHLC_REG);
+			hdrtype = PCI_HDRTYPE(bhlc);
+			fnlimit = PCI_HDRTYPE_MULTIFN(hdrtype) ? PCI_FNLIMIT : 1;   
+			for (fn = 0; fn < fnlimit; fn++)
+			{
+				PCI_DEBUG("Found ", id);
+				PCI_DEBUG(" on dev ", dev);
+				PCI_DEBUG(" fn \n", fn);
+				ws->dev[dev].fn[fn].id = id;
+				PCIQueryFunction(ws, bus, PCIDEV_FN(dev, fn));
+			}
+		}
+		else
+		{
+			/* Nobody home */
+			ws->dev[dev].fn[0].multifn = false;
+			ws->dev[dev].fn[0].skip = true;
+		}
+	}
+
+#if PCI_SWITCHES
+#error "Allocator not suited to switches or bridges"
+#else
+	/* To do the allocation step we need to know which RC is which so
+	 * the offset is relative to the right window, yet overall it looks
+	 * like one bus to PCI Manager. Some dopey cards take a base address of 0
+	 * to mean "disable" so steer clear of 0 too.
+	 */
+	PCI_DEBUG("Allocate RC \n", 0);
+	PCIAllocate(ws, 0, BAR_MEM, PCI_MEMALIGN, PCI_MEMSPACESIZE, 0, &hwm);
+	PCIAllocate(ws, 0, BAR_ROM, hwm, PCI_MEMSPACESIZE,          0, NULL);
+	PCIAllocate(ws, 0, BAR_IO,  PCI_IOALIGN, PCI_IOSPACESIZE,   0, NULL);
+	PCI_DEBUG("Allocate RC \n", 1);
+	PCIAllocate(ws, 1, BAR_MEM, PCI_MEMALIGN, PCI_MEMSPACESIZE, PCI_WINDOWSIZE, &hwm);
+	PCIAllocate(ws, 1, BAR_ROM, hwm, PCI_MEMSPACESIZE,          PCI_WINDOWSIZE, NULL);
+	PCIAllocate(ws, 1, BAR_IO,  PCI_IOALIGN, PCI_IOSPACESIZE,   PCI_IOSPACESIZE, NULL);
+#endif
+
+	for (dev = 0; dev < PCI_DEVLIMIT; dev++)
+	{
+		if (ws->dev[dev].fn[0].skip) continue;
+		rc = (bus == 0) ? dev : bus & (PCI_COUNT - 1);
+		fnlimit = ws->dev[dev].fn[0].multifn ? PCI_FNLIMIT : 1;
+		for (fn = 0; fn < fnlimit; fn++)
+		{
+			/* Assign and enable IO/memory/ROM windows */
+			PCIOpenBars(ws, bus, PCIDEV_FN(dev, fn));
+
+			/* Assign interrupts modulo INT A/B/C/D if requested */
+			PCIDishOutInts(ws, rc, bus, PCIDEV_FN(dev, fn));
+		}
+	}
+}

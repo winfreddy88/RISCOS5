@@ -1,0 +1,608 @@
+/*
+ * Copyright (c) 2010, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include "modhead.h"
+#include "swis.h"
+
+#include "Global/RISCOS.h"
+#include "Global/Services.h"
+#include "Global/HALEntries.h"
+#include "Global/GraphicsV.h"
+
+#include "DebugLib/DebugLib.h"
+
+#include "regs.h"
+#include "videodevice.h"
+#include "graphicsv.h"
+#include "globals.h"
+#include "dispc.h"
+#include "dss.h"
+#include "venc.h"
+#include "sdma.h"
+
+
+static int do_null(_kernel_swi_regs *r)
+{
+	(void)r;
+	/* Nothing */
+	return 0;
+}
+
+static int do_vsync(_kernel_swi_regs *r)
+{
+	(void)r;
+	/* Nothing */
+	return 1;
+}
+
+static int do_setmode(_kernel_swi_regs *r)
+{
+	/* TODO - Needs updating for TV output */
+	/* TODO - Needs updating for display rotation, etc. */
+	/* TODO - Should verify mode and then abort if it's bad? */
+	/* TODO - Should take into account fixed LCD */
+	/* TODO - Need to decide what to do with border */
+	/* TODO - How best to ensure atomicity? */
+	r->r[4] = 0;
+	vidclist3 *params = (vidclist3 *)r->r[0];
+	/* Disable any overlays that are currently using the default display? */
+	for (int i = 0; i < OVERLAY_MAX; ++i)
+	{
+		if (overlays[i].target == default_display)
+			overlays[i].target = TARGET_NONE;
+	}
+	/* Update (but don't apply) main overlay */
+	overlay *o = &overlays[overlay_desktop];
+	o->width = params->HorizDisplaySize;
+	o->height = params->VertiDisplaySize;
+	o->x = 0;
+	o->y = 0;
+	switch (params->PixelDepth)
+	{
+		case VIDCLIST3_1BPP :
+			o->format = OVERLAY_ATTRIBUTES_FORMAT_BMP1;
+			break;
+		case VIDCLIST3_2BPP :
+			o->format = OVERLAY_ATTRIBUTES_FORMAT_BMP2;
+			break;
+		case VIDCLIST3_4BPP :
+			o->format = OVERLAY_ATTRIBUTES_FORMAT_BMP4;
+			break;
+		case VIDCLIST3_8BPP :
+			o->format = OVERLAY_ATTRIBUTES_FORMAT_BMP8;
+			break;
+		case VIDCLIST3_16BPP :
+			o->format = OVERLAY_ATTRIBUTES_FORMAT_xRGB15_1555;
+			break;
+		case VIDCLIST3_32BPP :
+			o->format = OVERLAY_ATTRIBUTES_FORMAT_xRGB24_8888;
+			break;
+	}
+	o->stride = (o->width * overlay_format_bpp[o->format >> OVERLAY_ATTRIBUTES_FORMAT_SHIFT]) >> 3;
+	o->target = default_display;
+	/* Select appropriate palette func for this new mode */
+	if (overlay_desktop == OVERLAY_GFX)
+		select_palette_func(o->format, (default_display == TARGET_LCD));
+	/* Now set the mode, which will also re-apply overlay settings */
+	exp_synclost_count = 0;
+	if (default_display == TARGET_LCD)
+	{
+		if (hwconfig->lcd_configs[current_lcd].lcd_timings)
+		{
+			/* Use fixed timings */
+			dispc_set_lcdmode(hwconfig->lcd_configs[current_lcd].lcd_timings);
+		}
+		else
+		{
+			/* Build lcdtimings struct ready for setting mode */
+			lcdtimings timings;
+			timings.pixelrate = params->PixelRate * 1000;
+			timings.hsw = params->HorizSyncWidth;
+			if (timings.hsw > hwconfig->max_sync)
+			{
+				dprintf(("", "do_setmode: Clamping HSW %d -> %d\n", timings.hsw, hwconfig->max_sync));
+				timings.hsw = hwconfig->max_sync;
+			}
+			/*
+				We don't yet have anything useful to do with the border values, so just
+				combine them with the porch values like the NVidia module
+			 */
+			timings.hfp = params->HorizFrontPorch + params->HorizRightBorder;
+			if (timings.hfp > hwconfig->max_porch)
+			{
+				dprintf(("", "do_setmode: Clamping HFP %d -> %d\n", timings.hfp, hwconfig->max_porch));
+				timings.hfp = hwconfig->max_porch;
+			}
+			timings.hbp = params->HorizBackPorch + params->HorizLeftBorder;
+			if (timings.hbp > hwconfig->max_porch)
+			{
+				dprintf(("", "do_setmode: Clamping HBP %d -> %d\n", timings.hbp, hwconfig->max_porch));
+				timings.hbp = hwconfig->max_porch;
+			}
+			timings.width = params->HorizDisplaySize;
+			timings.vsw = params->VertiSyncWidth;
+			if (timings.vsw > hwconfig->max_sync)
+			{
+				dprintf(("", "do_setmode: Clamping VSW %d -> %d\n", timings.vsw, hwconfig->max_sync));
+				timings.vsw = hwconfig->max_sync;
+			}
+			timings.vfp = params->VertiFrontPorch + params->VertiBottomBorder;
+			if (timings.vfp >= hwconfig->max_porch)
+			{
+				dprintf(("", "do_setmode: Clamping VFP %d -> %d\n", timings.vfp, hwconfig->max_porch-1));
+				timings.vfp = hwconfig->max_porch - 1;
+			}
+			timings.vbp = params->VertiBackPorch + params->VertiTopBorder;
+			if (timings.vbp >= hwconfig->max_porch)
+			{
+				dprintf(("", "do_setmode: Clamping VBP %d -> %d\n", timings.vbp, hwconfig->max_porch-1));
+				timings.vbp = hwconfig->max_porch - 1;
+			}
+			timings.height = params->VertiDisplaySize;
+			timings.syncpol = params->SyncPol;
+			dispc_set_lcdmode(&timings);
+		}
+	}
+	else
+	{
+		venc_set_tvmode(current_tvmode, current_tvtype, false);
+		/* Ensure LCD is off */
+		(hwconfig->lcd_configs[current_lcd].power)(dev, 0);
+	}
+	return 0;
+}
+
+static int do_setinterlace(_kernel_swi_regs *r)
+{
+	(void)r;
+	/* TODO! */
+	return 0;
+}
+
+static int do_setblank(_kernel_swi_regs *r)
+{
+	r->r[4] = 0;
+	blanked = (r->r[0] != 0);
+	if (default_display == TARGET_LCD)
+	{
+		/* TODO - Should make a better effort to reduce power consumption.
+		   E.g. disable DISPC entirely when blanking fixed panel.
+		   For now, just have global 'blanked' flag to allow us to disable the overlays?
+		 */
+		int irqs;
+		int dpms = r->r[1];
+		/* If we're on a device with a fixed LCD, ignore the supplied
+		   DPMS state and just turn the LCD off entirely */
+		if (hwconfig->lcd_configs[current_lcd].lcd_timings)
+		{
+			(hwconfig->lcd_configs[current_lcd].power)(dev, (r->r[0] ? 0 : 65536));
+			dpms = 3; /* Should be safe to gate all clocks if we've just turned off the LCD */
+		}
+		if (begin_quick_hardware_update(&irqs))
+		{
+			uint32_t config = dispc->config2 & ~(DISPC_CONFIG_HSYNCGATED | DISPC_CONFIG_VSYNCGATED | DISPC_CONFIG_PIXELGATED);
+			if (r->r[0])
+			{
+				/* Gate pixel clock */
+				config |= DISPC_CONFIG_PIXELGATED;
+				if (dpms & 1) /* Gate HSync */
+					config |= DISPC_CONFIG_HSYNCGATED;
+				if (dpms & 2) /* Gate VSync */
+					config |= DISPC_CONFIG_VSYNCGATED;
+			}
+			dispc->config2 = config;
+#if 1
+			/* It looks like we might need to set the go bits for all of the updates
+			   to take effect, even though the TRM suggests otherwise */
+			dispc->control2 |= DISPC_CONTROL_GOLCD;
+#endif
+			end_quick_hardware_update(irqs);
+		}
+	}
+
+	/* Update overlays to toggle them on/off */
+	for (int i = 0; i < OVERLAY_MAX; ++i)
+	{
+		dispc_update_overlay((overlayidx)i);
+	}
+
+	return 0;
+}
+
+static int do_updatepointer(_kernel_swi_regs *r)
+{
+	/* TODO - What if palette change isn't immediately followed by an updatepointer call?
+	          Need to stick something in IRQ handler that does a secondary update on vsync */
+	/* TODO - Turn IRQs off at this level to avoid overlay array corruption? */
+	/* TODO - Needs updating for alpha blending instead of TCK */
+	shape_t *shape = ((shape_t *)r->r[3]);
+	r->r[4] = 0;
+	if (r->r[0] & 1)
+	{
+		/* Redo palette if needed */
+		int dirty = 32*32/4; /* Number of dirty bytes */
+		uint8_t *src = (uint8_t *)shape->buffLA;
+		uint8_t *dest = mouse_image_soft;
+		uint32_t *real = mouse_image_l;
+		int incount = shape->height * 32 / 4; /* Number of bytes left in input */
+		if (incount > dirty)
+			incount = dirty; /* Protect against dodgy heights */
+		if (mouse_dirty)
+		{
+			uint32_t trans = mouse_palette_soft[0];
+			while (		(trans == mouse_palette_soft[1])
+					||	(trans == mouse_palette_soft[2])
+					||	(trans == mouse_palette_soft[3]))
+			{
+				trans = (trans + 1) & 0xffffff;
+			}
+			mouse_palette_soft[0] = dispc->trans_color2 = dispc->trans_color[1] = trans;
+		}
+		else if (r->r[0] & 2)
+		{
+			while (incount>0)
+			{
+				if (*((uint32_t *)src) != *((uint32_t *)dest)) /* Check words for speed */
+					goto rebuild;
+				src		+= 4;
+				dest	+= 4;
+				real	+= 16;
+				dirty	-= 4;
+				incount	-= 4;
+			}
+			while (dirty > 0)
+			{
+				if (*((uint32_t *)dest))
+					goto rebuild;
+				dest	+= 4;
+				real	+= 16;
+				dirty	-= 4;
+			}
+		}
+		/* Redo image if needed
+		   Note that we always pad it out to 32x32;
+		   should make life easier once we have rotation support */
+		/* TODO - Make faster - test each individual byte to see if it matches dest
+		   - should speed up most stuff where only small portions change (e.g. hourglass) */
+		if (mouse_dirty)
+		{
+			rebuild:
+			while (dirty-- > 0)
+			{
+				uint8_t data = (incount-- > 0 ? *src++ : 0);
+				*dest++ = data;
+				*real++ = mouse_palette_soft[data & 3];
+				data = data >> 2;
+				*real++ = mouse_palette_soft[data & 3];
+				data = data >> 2;
+				*real++ = mouse_palette_soft[data & 3];
+				data = data >> 2;
+				*real++ = mouse_palette_soft[data];
+			}
+			mouse_dirty = false;
+		}
+		/* Redo position & other overlay attribs if needed */
+		overlay *o = &overlays[overlay_pointer];
+		if ((o->x != r->r[1]) || (o->y != r->r[2]) || (o->target != default_display))
+		{
+			o->width = 32;
+			o->height = 32;
+			o->x = r->r[1] + overlays[overlay_desktop].x;
+			o->y = r->r[2] + overlays[overlay_desktop].y;
+			o->format = OVERLAY_ATTRIBUTES_FORMAT_xRGB24_8888;
+			o->ba = mouse_image_p;
+			o->stride = 32*4;
+			o->la = (uint8_t *)mouse_image_l; /* Not really needed */
+			o->target = default_display;
+			dispc_update_overlay(overlay_pointer);
+		}
+	}
+	else if (overlays[overlay_pointer].target != TARGET_NONE)
+	{
+		overlays[overlay_pointer].target = TARGET_NONE;
+		dispc_update_overlay(overlay_pointer);
+	}
+	return 0;
+}
+
+static int do_setdmaaddress(_kernel_swi_regs *r)
+{
+	if (r->r[0] == 0)
+	{
+		/* IRQs off for atomicity (mainly for dispc->control write) */
+		int irqs = _kernel_irqs_disabled();
+		if (!irqs)
+			_kernel_irqs_off();
+		/* TODO - Tidy this up when doing the new GraphicsV stuff.
+		   Currently we don't get told the DMA address until after the first mode change,
+		   so to protect against OCPERROR interrupts, dispc_update_overlay avoids enabling
+		   overlays which don't have a base address. This if() makes sure that when we do
+		   finally get told the address, the overlay gets enabled properly. */
+		if (overlays[overlay_desktop].ba)
+		{
+			uint32_t ba = overlays[overlay_desktop].ba = r->r[1];
+			if (overlays[overlay_desktop].target != TARGET_NONE)
+			{
+				volatile uint32_t *regs;
+				switch (overlay_desktop)
+				{
+					default :
+					case OVERLAY_GFX :
+						regs = dispc->gfx.ba;
+						break;
+					case OVERLAY_VID1 :
+						regs = dispc->vid1.ba;
+						break;
+					case OVERLAY_VID2 :
+						regs = dispc->vid2.ba;
+						break;
+				}
+				regs[1] = ba;
+				regs[0] = ba + (overlays[overlay_desktop].target == TARGET_TV ? overlays[overlay_desktop].stride : 0);
+				if (!ban_hardware_update)
+				{
+					if (overlays[overlay_desktop].target == TARGET_LCD)
+					{
+						dispc->control2 |= DISPC_CONTROL_GOLCD;
+					}
+					else
+					{
+						dispc->control1 |= DISPC_CONTROL_GOTV;
+					}
+				}
+			}
+		}
+		else
+		{
+			overlays[overlay_desktop].ba = r->r[1];
+			dispc_update_overlay(overlay_desktop);
+		}
+		if (!irqs)
+			_kernel_irqs_on();
+	}
+	else if (r->r[0] == 3)
+	{
+		vdu_init = r->r[1];
+	}
+	r->r[4] = 0;
+	return 0;
+}
+
+static int do_vetmode(_kernel_swi_regs *r)
+{
+	/* TODO - Needs updating for TV output */
+	/* TODO - Needs updating for if using video overlay instead of graphics, display rotation, etc. */
+	vidclist3 *params = (vidclist3 *)r->r[0];
+	/* For the moment, ignore the mode timings if we're using TV out or fixed LCD */
+	if ((overlays[default_display].target != TARGET_TV)
+	 && (hwconfig->lcd_configs[current_lcd].max_pixelrate != 0))
+	{
+		/* Check pixel rate */
+		if (params->PixelRate > hwconfig->lcd_configs[current_lcd].max_pixelrate)
+			return 1;
+		/* Check required REGM, REGN values */
+		clock_divider div = calculate_dss_clock_divider(params->PixelRate);
+		if ((div.regm > REG_MAX(DSI_PLL_CONFIGURATION1_PLL_REGM))
+		 || (div.regn > REG_MAX(DSI_PLL_CONFIGURATION1_PLL_REGN)))
+			return 1;
+		/* check for BMP8 erratum (in connection with pcd==1) */
+		if ((params->PixelDepth <= VIDCLIST3_8BPP) && (div.pcd == 1))
+			return 1;
+		/* Now check mode timings */
+		if ((params->HorizSyncWidth > hwconfig->max_sync)
+		 || (params->HorizBackPorch + params->HorizLeftBorder > hwconfig->max_porch)
+		 || (params->HorizFrontPorch + params->HorizRightBorder > hwconfig->max_porch)
+		 || (params->VertiSyncWidth > hwconfig->max_sync)
+		 || (params->VertiBackPorch + params->VertiTopBorder > hwconfig->max_porch)
+		 || (params->VertiFrontPorch + params->VertiBottomBorder > hwconfig->max_porch))
+			return 1;
+		/* Check (HBP+HSW+HFP)*PCD > 8 */
+		uint32_t val = params->HorizBackPorch + params->HorizLeftBorder
+					 + params->HorizSyncWidth + params->HorizFrontPorch
+					 + params->HorizRightBorder;
+		if (val * div.pcd  <= 8)
+			return 1;
+	}
+	/* Check screen size */
+	if ((params->HorizDisplaySize-1 > REG_MAX(DISPC_SIZE_LCD_PPL))
+	 || (params->VertiDisplaySize-1 > REG_MAX(DISPC_SIZE_LCD_LPP))
+	 /* Width must be multiple of 8 pixels for STALLMODE=0 */
+	 || (params->HorizDisplaySize & 0x7))
+		return 1;
+	/* Check colour depth */
+	switch (params->PixelDepth)
+	{
+		case VIDCLIST3_1BPP :
+		case VIDCLIST3_2BPP :
+		case VIDCLIST3_4BPP :
+		case VIDCLIST3_8BPP :
+		case VIDCLIST3_16BPP : /* TODO - Should be removed at some point! */
+		case VIDCLIST3_32BPP :
+			break;
+		default:
+			return 1;
+	}
+	/* Else we're good */
+	r->r[4] = 0;	/* set positive response */
+	r->r[0] = 0;
+	return 0;
+}
+
+static int do_displayfeatures(_kernel_swi_regs *r)
+{
+	r->r[0] = 0x6; /* Hardware pointer, interlace with progressive framestore */
+	if (overlay_desktop == OVERLAY_GFX)
+	{
+		/*
+			OMAP4430 Silicon Errata Public RevD chapter 2.4
+			BITMAP 1-2-4 formats not supported by the graphics pipeline
+		 */
+#if 0
+		r->r[1] = 0x3f; /* 1, 2, 4, 8, 16, 32bpp */
+#else
+		r->r[1] = 0x38; /* 8, 16, 32bpp */
+#endif
+	}
+	else
+	{
+		r->r[1] = 0x30; /* Only 16bpp, 32bpp */
+	}
+	r->r[2] = 32; /* 32 byte buffer alignment? */
+	r->r[4] = 0;
+	return 0;
+}
+
+static int do_framestoreaddress(_kernel_swi_regs *r)
+{
+	(void)r;
+	/* Nothing */
+	return 1;
+}
+
+static int do_writepaletteentry(_kernel_swi_regs *r)
+{
+	/* TODO - Handle potential lack of CPR for border colour */
+	r->r[4] = 0;
+	uint32_t idx = r->r[2];
+	switch (r->r[0])
+	{
+		case 0 :
+			(gfx_palette_func)((uint32_t *)&r->r[1], idx, 1);
+			break;
+		case 1 :
+			if (!idx)
+				dispc->default_color2 = dispc->default_color[1] = ((uint32_t)r->r[1]) >> 8;
+			break;
+		case 2 :
+			(mouse_palette_func)((uint32_t *)&r->r[1], idx, 1);
+			break;
+	}
+	return 0;
+}
+
+static int do_writepaletteentries(_kernel_swi_regs *r)
+{
+	/* TODO - Handle potential lack of CPR for border colour */
+	r->r[4] = 0;
+	uint32_t idx = r->r[2];
+	uint32_t c = r->r[3];
+	uint32_t *pal = (uint32_t *) r->r[1];
+	switch (r->r[0])
+	{
+		case 0 :
+			(gfx_palette_func)(pal, idx, c);
+			break;
+		case 1 :
+			if (!idx && c)
+				dispc->default_color2 = dispc->default_color[1] = (*pal) >> 8;
+			break;
+		case 2 :
+			(mouse_palette_func)(pal, idx, c);
+			break;
+	}
+	return 0;
+}
+
+static int do_readpaletteentry(_kernel_swi_regs *r)
+{
+	r->r[4] = 0;
+	return 0;
+}
+
+static int do_render(_kernel_swi_regs *r)
+{
+	overlay *o = &overlays[overlay_desktop];
+	/* Protect against (unlikely) event of lack of acceleration,
+	   or (likely) event of us not knowing the framebuffer setup yet */
+	if (!sdmachan || (o->target == TARGET_NONE) || (vdu_init == ~0))
+		return 1;
+	switch (r->r[1])
+	{
+		case GVRender_NOP :
+			goto complete;
+		case GVRender_CopyRectangle :
+			if (!sdma_copyrect(o, (copyrect_params *)r->r[2]))
+				break;
+			goto complete;
+		case GVRender_FillRectangle :
+			if(!sdma_fillrect(o, (fillrect_params *)r->r[2]))
+				break;
+			goto complete;
+	}
+	if (r->r[0] & GVRender_SyncIfNotComplete)
+		sdma_sync();
+	return 1;
+complete:
+	if (r->r[0] & GVRender_SyncIfComplete)
+		sdma_sync();
+	r->r[4] = 0;
+	return 0;
+}
+
+static int do_iicop(_kernel_swi_regs *r)
+{
+	(void)r;
+	/* For now, just let the HAL handle it */
+	return 1;
+}
+
+static int do_selecthead(_kernel_swi_regs *r)
+{
+	(void)r;
+	/* TODO? */
+	return 0;
+}
+
+int graphicsv_handler(_kernel_swi_regs *r, void *pw)
+{
+	if ((((uint32_t)r->r[4]) >> 24) != graphicsv_driver_number)
+		return 1;
+	uint16_t func = (uint16_t)r->r[4];
+
+	(void)pw;
+
+	switch (func)
+	{
+		case GraphicsV_Complete:			return do_null(r);
+		case GraphicsV_VSync:				return do_vsync(r);
+		case GraphicsV_SetMode:				return do_setmode(r);
+		case GraphicsV_SetInterlace:		return do_setinterlace(r);
+		case GraphicsV_SetBlank:			return do_setblank(r);
+		case GraphicsV_UpdatePointer:		return do_updatepointer(r);
+		case GraphicsV_SetDMAAddress:		return do_setdmaaddress(r);
+		case GraphicsV_VetMode:				return do_vetmode(r);
+		case GraphicsV_DisplayFeatures:		return do_displayfeatures(r);
+		case GraphicsV_FramestoreAddress:	return do_framestoreaddress(r);
+		case GraphicsV_WritePaletteEntry:	return do_writepaletteentry(r);
+		case GraphicsV_WritePaletteEntries:	return do_writepaletteentries(r);
+		case GraphicsV_ReadPaletteEntry:	return do_readpaletteentry(r);
+		case GraphicsV_Render:				return do_render(r);
+		case GraphicsV_IICOp:				return do_iicop(r);
+		case GraphicsV_SelectHead:			return do_selecthead(r);
+		default:							return 1;
+	}
+}

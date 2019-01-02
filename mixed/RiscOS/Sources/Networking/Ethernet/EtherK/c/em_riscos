@@ -1,0 +1,1874 @@
+/* Copyright 2002 Tematic Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/**************************************************************/
+/* File:    em_riscos.c                                       */
+/*                                                            */
+/* Purpose: RISC OS specific interface routines to the BSD    */
+/*          driver code for the EtherK device driver.         */
+/*                                                            */
+/* Author:  J.R.Byrne. Some routines (mainly filtering) were  */
+/*          adapted from Ether1 and EtherI.                   */
+/**************************************************************/
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <string.h>
+
+#include <kernel.h>
+#include <swis.h>
+
+#include <Global/HalEntries.h>
+#include <Interface/PCI.h>
+
+#include <sys/types.h>
+#include <net/ethernet.h>
+
+#include <AsmUtils/irqs.h>
+#include <callx/callx.h>
+
+#include "em_riscos.h"
+#include "if_em.h"
+#include "em_device.h"
+#include "log.h"
+#include "msgs.h"
+
+/* Local definitions */
+
+/* Simple test macro for broadcast addresses - relies on character */
+/* buffers being aligned two bytes before a word boundary.         */
+#define IS_BROADCAST(x) (*(u_int *)((x) + 2) == 0xffffffff && \
+                         *(u_short *)(x) == 0xffff)
+
+/* Simple test macro for multicast addresses. */
+#define IS_MULTICAST(x) ((*(u_char *)(x) & 0x01) && \
+                         (*(u_char *)(x)) != 0xff)
+
+/* Local functions */
+
+static int ignore_intr(struct adapter * adapter);
+static void set_receive_level (device_t dev, int addrlevel);
+static _kernel_oserror * watchdog_reset_callback(_kernel_swi_regs * r, void * pw, void * handle);
+
+
+/**************************************************************/
+/* usec_delay()                                               */
+/*                                                            */
+/* Delay for a number of microseconds.                        */
+/*                                                            */
+/* Parameters: Number of microseconds to delay for.           */
+/**************************************************************/
+
+void usec_delay(uint32_t t)
+{
+    if ((t > 10000) && !_kernel_irqs_disabled())
+    {
+        _kernel_oserror * e;
+        uint32_t          start, now;
+
+        _swix(OS_ReadMonotonicTime, _OUT(0), &start);
+        t = (t+9999)/10000;
+        do
+        {
+            e = _swix(OS_ReadMonotonicTime, _OUT(0), &now);
+        } while (e == NULL && now - start <= t);
+    }
+    else
+    {
+        _swix(OS_Hardware, _IN(0)|_INR(8,9), t, 0, EntryNo_HAL_CounterDelay);
+    }
+}
+
+/**************************************************************/
+/* pci_read_config()                                          */
+/*                                                            */
+/* Read a PCI device's configuration space.                   */
+/*                                                            */
+/* Parameters: Pointer to the relevant device structure;      */
+/*                                                            */
+/*             Configuration space address;                   */
+/*                                                            */
+/*             Access size (1, 2 or 4).                       */
+/*                                                            */
+/* Returns:    The value that was read.                       */
+/**************************************************************/
+
+uint32_t pci_read_config(device_t dev, int reg, int width)
+{
+    _kernel_oserror * e;
+    uint32_t          val;
+
+    e = _swix(PCI_ConfigurationRead,
+              _IN(0) | _INR(2,3) | _OUT(1),
+
+              reg,
+              width,
+              dev->function_handle,
+
+              &val);
+
+    if (e != NULL)
+    {
+        dprintf(("", "%s: PCI_ConfigurationRead failed - '%s' (&%x)\n", __func__, e->errmess, e->errnum));
+        log_error(dev, e);
+        val = 0;
+    }
+
+    return val;
+}
+
+/**************************************************************/
+/* pci_write_config()                                         */
+/*                                                            */
+/* Write a PCI device's configuration space.                  */
+/*                                                            */
+/* Parameters: Pointer to the relevant device structure;      */
+/*                                                            */
+/*             Configuration space address;                   */
+/*                                                            */
+/*             Access size (1, 2 or 4).                       */
+/**************************************************************/
+
+void pci_write_config(device_t dev, int reg, uint32_t val, int width)
+{
+    _kernel_oserror * e;
+
+    e = _swix(PCI_ConfigurationWrite,
+              _INR(0,3),
+
+              reg,
+              val,
+              width,
+              dev->function_handle);
+
+    if (e != NULL)
+    {
+        dprintf(("", "%s: PCI_ConfigurationWrite failed - '%s' (&%x)\n", __func__, e->errmess, e->errnum));
+        log_error(dev, e);
+    }
+}
+
+/**************************************************************/
+/* vtophys()                                                  */
+/*                                                            */
+/* Convert a logical RAM address to a physical RAM address.   */
+/*                                                            */
+/* Parameters: The logical address to convert.                */
+/*                                                            */
+/* Returns:    The physical address.                          */
+/**************************************************************/
+
+uint32_t vtophys(vm_offset_t v)
+{
+    struct
+    {
+        uint32_t page;
+        uint32_t logical;
+        uint32_t physical;
+    } block;
+    block.logical = (uint32_t)v;
+
+    _swix(OS_Memory,
+          _INR(0,2),
+
+          (1<<9) | (1<<13),
+          &block,
+          1);
+
+    return block.physical;
+}
+
+/**************************************************************/
+/* em_ro_flush_wb()                                           */
+/*                                                            */
+/* Flush the processor's memory Write Buffer.                 */
+/**************************************************************/
+
+void em_ro_flush_wb(void)
+{
+    _swix(OS_MMUControl,
+          _IN(0),
+
+          1 | (1<<28));
+}
+
+/**************************************************************/
+/* em_ro_get_pci_hw_address()                                 */
+/*                                                            */
+/* Get the address of a PCI device's memory-mapped area.      */
+/*                                                            */
+/* Parameters: Pointer to the relevant device structure;      */
+/*                                                            */
+/*             Pointer to where to store the result.          */
+/*                                                            */
+/* Returns:    Whether or not the function succeeded.         */
+/**************************************************************/
+
+bool em_ro_get_pci_hw_address(device_t dev, uint8_t ** result)
+{
+    _kernel_oserror * e;
+
+    e = _swix(PCI_HardwareAddress,
+              _INR(0,1) | _IN(3) | _OUT(4),
+
+              0,
+              0,
+              dev->function_handle,
+
+              result);
+
+    if (e != NULL)
+    {
+        dprintf(("", "%s: PCI_HardwareAddress failed - '%s' (&%x)\n", __func__, e->errmess, e->errnum));
+        log_error(dev, e);
+        *result = NULL;
+    }
+
+    return (e == NULL);
+}
+
+/**************************************************************/
+/* em_ro_get_pci_io_address()                                 */
+/*                                                            */
+/* Get the PCI address from a particular Base Address         */
+/* Register for a device.                                     */
+/*                                                            */
+/* Parameters: Pointer to the relevant device structure;      */
+/*                                                            */
+/*             Index of the Base Address Register to read;    */
+/*                                                            */
+/*             Pointer to where to store the result.          */
+/*                                                            */
+/* Returns:    Whether or not the function succeeded.         */
+/**************************************************************/
+
+bool em_ro_get_pci_io_address(device_t dev, uint32_t address_index, uint32_t * result)
+{
+    _kernel_oserror * e;
+
+    e = _swix(PCI_HardwareAddress,
+              _INR(0,1) | _IN(3) | _OUT(1),
+
+              0,
+              address_index,
+              dev->function_handle,
+
+              result);
+
+    if (e != NULL)
+    {
+        dprintf(("", "%s: PCI_HardwareAddress failed - '%s' (&%x)\n", __func__, e->errmess, e->errnum));
+        log_error(dev, e);
+        return false;
+    }
+
+    return true;
+}
+
+/**************************************************************/
+/* em_ro_pci_memalloc()                                       */
+/*                                                            */
+/* Allocate a block of memory from the pool of fixed          */
+/* contiguous memory for PCI device communication. This is    */
+/* bufferable but uncacheable.                                */
+/*                                                            */
+/* Parameters: Size required;                                 */
+/*                                                            */
+/*             Alignment required (0 if none);                */
+/*                                                            */
+/*             Boundary limitation (0 if none).               */
+/*                                                            */
+/* Returns:    The logical address of the memory, or NULL.    */
+/**************************************************************/
+
+void * em_ro_pci_memalloc(size_t size, uint32_t alignment, uint32_t boundary)
+{
+    _kernel_oserror * e;
+    void            * ptr;
+
+    e = _swix(PCI_RAMAlloc,
+              _INR(0,2) | _OUT(0),
+
+              size,
+              alignment,
+              boundary,
+
+              &ptr);
+
+    if (e != NULL)
+    {
+        dprintf(("", "%s: PCI_RAMAlloc failed - '%s' (&%x)\n", __func__, e->errmess, e->errnum));
+        ptr = NULL;
+    }
+
+    return ptr;
+}
+
+/**************************************************************/
+/* em_ro_pci_memfree()                                        */
+/*                                                            */
+/* Free memory that was allocated with em_ro_pci_memalloc().  */
+/*                                                            */
+/* Parameters: Address of the memory to free.                 */
+/**************************************************************/
+
+void em_ro_pci_memfree(void * address)
+{
+    _kernel_oserror * e;
+
+    e = _swix(PCI_RAMFree,
+              _IN(0),
+
+              address);
+
+    if (e != NULL)
+    {
+        dprintf(("", "%s: PCI_RAMFree failed - '%s' (&%x)\n", __func__, e->errmess, e->errnum));
+    }
+}
+
+/**************************************************************/
+/* em_ro_disable_dev_irq()                                    */
+/*                                                            */
+/* Disables interrupts for a device.                          */
+/*                                                            */
+/* Parameters: Pointer to the relevant device structure.      */
+/*                                                            */
+/* Returns:    Previous interrupt state for this device       */
+/*             (non-zero if enabled).                         */
+/**************************************************************/
+
+int em_ro_disable_dev_irq(device_t dev)
+{
+    int s;
+
+    _swix(OS_Hardware,
+          _IN(0) |_INR(8,9) | _OUT(0),
+
+          dev->device_vector,
+          0,
+          EntryNo_HAL_IRQDisable,
+
+          &s);
+
+    return s;
+}
+
+/**************************************************************/
+/* em_ro_enable_dev_irq()                                     */
+/*                                                            */
+/* Enables interrupts for a device.                           */
+/*                                                            */
+/* Parameters: Pointer to the relevant device structure.      */
+/**************************************************************/
+
+void em_ro_enable_dev_irq(device_t dev)
+{
+    _swix(OS_Hardware,
+          _IN(0) |_INR(8,9),
+
+          dev->device_vector,
+          0,
+          EntryNo_HAL_IRQEnable);
+}
+
+/**************************************************************/
+/* em_ro_setup_intr()                                         */
+/*                                                            */
+/* Start handling interrupts from a device. The device vector */
+/* is claimed and interrupts are enabled for this vector.     */
+/*                                                            */
+/* Parameters: Pointer to the relevant device structure.      */
+/*                                                            */
+/* Returns:    Whether or not the function succeeded.         */
+/**************************************************************/
+
+bool em_ro_setup_intr(device_t dev)
+{
+    _kernel_oserror * e;
+
+    /* Claim the device vector */
+
+    e = _swix(OS_ClaimDeviceVector,
+              _INR(0,2),
+
+              dev->device_vector | (1u<<31),
+              em_asm_irq_trampoline,
+              dev);
+
+    if (e != NULL)
+    {
+            dprintf(("", "%s: OS_ClaimDeviceVector failed - '%s' (&%x)\n", __func__, e->errmess, e->errnum));
+            log_error(dev, e);
+            return false;
+    }
+
+    dev->dev_vector_claimed = true;
+
+    /* Make sure interrupts are enabled */
+
+    em_ro_enable_dev_irq(dev);
+
+    return true;
+}
+
+/**************************************************************/
+/* em_ro_teardown_intr()                                      */
+/*                                                            */
+/* Stop handling interrupts from a device.                    */
+/*                                                            */
+/* Parameters: Pointer to the relevant device structure.      */
+/**************************************************************/
+
+void em_ro_teardown_intr(device_t dev)
+{
+    if (dev->dev_vector_claimed)
+    {
+        _kernel_oserror * e;
+        
+        dev->dev_vector_claimed = false;
+
+        e = _swix(OS_ReleaseDeviceVector,
+                  _INR(0,2),
+
+                  dev->device_vector | (1u<<31),
+                  em_asm_irq_trampoline,
+                  dev);
+
+        if (e != NULL)
+        {
+            dprintf(("", "%s: OS_ReleaseDeviceVector failed - '%s' (&%x)\n", __func__, e->errmess, e->errnum));
+            log_error(dev, e);
+        }
+    }
+}
+
+/**************************************************************/
+/* em_ro_irq_handler()                                        */
+/*                                                            */
+/* Interrupt handler called when an interrupt occurs which    */
+/* may have been from our device. This is called via          */
+/* em_asm_irq_trampoline(), which ensures that the pointer    */
+/* to the relevant device structure is in r->r[1]. We check   */
+/* to see whether the interrupt really was from our device,   */
+/* handle it if so, and return a flag to say whether we've    */
+/* handled the interrupt or whether it should be passed on to */
+/* other claimants of the same vector.                        */
+/*                                                            */
+/* Parameters: Pointer to entry register block;               */
+/*                                                            */
+/*             Private word pointer (unused).                 */
+/*                                                            */
+/* Returns:    Either 0 (interrupt claimed) or 1 (pass on).   */
+/**************************************************************/
+
+int em_ro_irq_handler(_kernel_swi_regs * r, void * pw)
+{
+    device_t dev = (device_t)r->r[1];
+    int      pass_on;
+
+    (void)pw;
+
+    /* If re-entered, pass on the call. It's probably an interrupt from */
+    /* something sharing the same interrupt line.                       */
+    if (dev->irq_handler_entered)
+        return 1;
+
+    if (dev->ignore_irqs)
+    {
+        /* Use simple handler if we are ignoring interrupts from this device. */
+        pass_on = ignore_intr(&dev->adapter);
+    }
+    else
+    {
+        dev->irq_handler_entered = true;
+    
+        /*dprintf(("IRQ", "%s: Entry\n", __func__));*/
+    
+        pass_on = em_intr(&dev->adapter);
+    
+        dev->irq_handler_entered = false;
+    
+        /*dprintf(("IRQ", "%s: Exit (pass_on=%d)\n", __func__, pass_on));*/
+    }
+
+    return pass_on;
+}
+
+/**************************************************************/
+/* ignore_intr()                                              */
+/*                                                            */
+/* Simple interrupt handler used when we are ignoring         */
+/* interrupts from our device. Check whether our device       */
+/* really has generated an interrupt (this will clear the     */
+/* interrupt state) and also record the interrupt register    */
+/* state for use by the diagnostics code.                     */
+/*                                                            */
+/* Parameters: Pointer to the relevant adapter structure.     */
+/*                                                            */
+/* Returns:    Either 0 (interrupt claimed) or 1 (pass on).   */
+/**************************************************************/
+
+static int ignore_intr(struct adapter * adapter)
+{
+    uint32_t reg_ims = E1000_READ_REG(&adapter->hw, IMS);
+    uint32_t reg_icr = E1000_READ_REG(&adapter->hw, ICR) & reg_ims;
+
+    adapter->diag_icr |= reg_icr;   /* Record for the diagnostics code */
+    return (reg_icr == 0);
+}
+
+/**************************************************************/
+/* em_ro_init_supported_stats()                               */
+/*                                                            */
+/* Initialise a DCI 4 statistics structure to indicate which  */
+/* statistics are supported.                                  */
+/*                                                            */
+/* Parameters: Pointer to the statistics structure.           */
+/**************************************************************/
+
+void em_ro_init_supported_stats(struct stats * supported)
+{
+    int i;
+
+    /* General information */
+    supported->st_interface_type = 0xff;
+    supported->st_link_status = 0xff;
+    supported->st_link_polarity = 0xff;
+    supported->st_blank1 = 0;
+    supported->st_link_failures = ~0;
+    supported->st_network_collisions = 0;
+
+    /* Transmit statistics */
+    supported->st_collisions = ~0;
+    supported->st_excess_collisions = ~0;
+    supported->st_heartbeat_failures = 0;
+    supported->st_not_listening = 0;
+#if 0
+    supported->st_net_error = 0;
+#endif
+    supported->st_tx_frames = ~0;
+    supported->st_tx_bytes = ~0;
+    supported->st_tx_general_errors = ~0;
+
+    /* Receive statistics */
+    supported->st_crc_failures = ~0;
+    supported->st_frame_alignment_errors = ~0;
+    supported->st_dropped_frames = ~0;
+    supported->st_runt_frames = ~0;
+    supported->st_overlong_frames = ~0;
+    supported->st_jabbers = ~0;
+    supported->st_late_events = 0; /* What is this ? */
+    supported->st_unwanted_frames = ~0;
+    supported->st_rx_frames = ~0;
+    supported->st_rx_bytes = ~0;
+    supported->st_rx_general_errors = ~0;
+
+    for (i = 0; i < ETHER_ADDR_LEN; ++i)
+    {
+        supported->st_last_dest_addr[i] = 0xff;
+        supported->st_last_src_addr[i] = 0xff;
+    }
+
+    do
+    {
+        supported->st_last_dest_addr[i] = 0;
+        supported->st_last_src_addr[i] = 0;
+        ++i;
+    }
+    while (++i < sizeof (supported->st_last_dest_addr));
+}
+
+/**************************************************************/
+/* em_ro_init_stats()                                         */
+/*                                                            */
+/* Initialise the DCI 4 statistics structure for a device.    */
+/*                                                            */
+/* Parameters: Pointer to the relevant device structure.      */
+/**************************************************************/
+
+void em_ro_init_stats(device_t dev)
+{
+    /* Nothing to do at present */
+    (void)dev;
+}
+
+/**************************************************************/
+/* em_ro_update_stats()                                       */
+/*                                                            */
+/* Update the DCI 4 statistics structure for a device with    */
+/* the latest statistics.                                     */
+/*                                                            */
+/* Parameters: Pointer to the relevant device structure.      */
+/**************************************************************/
+
+void em_ro_update_stats(device_t dev)
+{
+    struct adapter   * adapter = &dev->adapter;
+    struct em_phy_info phy_info;
+    int                s;
+
+    if (!dev->initialised)
+    {
+        dev->stats.st_link_status = 0;
+        return;
+    }
+
+    /* Do the things that em_local_timer() does */
+
+    s = splimp();
+
+    em_check_for_link(&adapter->hw);
+    em_print_link_status(adapter);
+    em_update_stats_counters(adapter);
+
+    splx(s);
+
+    /* Set the DCI 4 stats structure with this information */
+    dev->stats.st_link_status = (dev->stats.st_link_status & ST_STATUS_RXMASK) | ST_STATUS_OK;
+    if (adapter->link_active == 1)
+    {
+        dev->stats.st_link_status |= ST_STATUS_ACTIVE;
+        if (adapter->hw.media_type == em_media_type_fiber)
+        {
+            dev->stats.st_interface_type = ST_TYPE_1000BASESX;
+            dev->stats.st_link_status |= ST_STATUS_FULL_DUPLEX;
+        }
+        else
+        {
+            switch (adapter->link_speed)
+            {
+                case 10:
+                    dev->stats.st_interface_type = ST_TYPE_10BASET;
+                    break;
+                case 100:
+                    dev->stats.st_interface_type = ST_TYPE_100BASETX;
+                    break;
+                case 1000:
+                    dev->stats.st_interface_type = ST_TYPE_1000BASET;
+                    break;
+            }
+            if (adapter->link_duplex == FULL_DUPLEX)
+                dev->stats.st_link_status |= ST_STATUS_FULL_DUPLEX;
+
+        }
+        /* Receive level bits are set by set_receive_level() */
+    }
+
+    /* Get the link polarity */
+    dev->stats.st_link_polarity = ST_LINK_POLARITY_CORRECT;
+    if (em_phy_get_info(&adapter->hw, &phy_info) == 0)
+    {
+        if (phy_info.cable_polarity == em_rev_polarity_reversed)
+            dev->stats.st_link_polarity = ST_LINK_POLARITY_INCORRECT;
+    }
+
+    /* dev->stats.st_link_failures = Directly updated by em_print_link_status() */
+
+    /* The statistics may be updated by an interrupt, so disable interrupts */
+    /* while we gather the statistics to ensure consistency.                */
+
+    s = ensure_irqs_off();
+
+    /* Transmit statistics */
+    dev->stats.st_collisions = (unsigned long)adapter->stats.colc;
+    dev->stats.st_excess_collisions = (unsigned long)adapter->stats.ecol;
+    /* dev->stats.st_heartbeat_failures = 0; */
+    /* dev->stats.st_not_listening = 0; */
+    dev->stats.st_tx_frames = (unsigned long)adapter->stats.gptc;
+    dev->stats.st_tx_bytes = (unsigned long)adapter->stats.gotcl;
+    dev->stats.st_tx_general_errors = (unsigned long)(
+                                      adapter->stats.ecol +
+                                      adapter->stats.latecol +
+                                      adapter->watchdog_resets); /* !!! TODO Check this */
+
+    /* Receive statistics */
+    dev->stats.st_crc_failures = (unsigned long)adapter->stats.crcerrs;
+    dev->stats.st_frame_alignment_errors = (unsigned long)adapter->stats.algnerrc;
+    dev->stats.st_dropped_frames = adapter->dropped_pkts;
+    dev->stats.st_runt_frames = (unsigned long)(adapter->stats.ruc + adapter->stats.rfc);
+    dev->stats.st_overlong_frames = (unsigned long)adapter->stats.roc;
+    dev->stats.st_jabbers = (unsigned long)adapter->stats.rjc;
+    /* dev->stats.st_late_events = 0; [What is this?] */
+    /* dev->stats.st_unwanted_frames = Directly updated by em_ro_filter_packet() */
+    dev->stats.st_rx_frames = (unsigned long)adapter->stats.gprc;
+    dev->stats.st_rx_bytes = (unsigned long)adapter->stats.gorcl;
+    dev->stats.st_rx_general_errors = (unsigned long)(
+                                      adapter->stats.rxerrc +  /* Receive Error Count */
+                                      /*adapter->stats.rlec +     Receive Length Error Count (=ruc+rfc+roc+rjc) */
+                                      adapter->stats.rnbc +    /* RX No Buffers Count */
+                                      adapter->stats.mpc +     /* Missed Packet Count */
+                                      adapter->stats.cexterr); /* Carrier Extension Error Count */
+
+    restore_irqs(s);
+}
+
+/**************************************************************/
+/* set_link_config()                                          */
+/*                                                            */
+/* Update the settings in the hardware structure for link     */
+/* auto-negotiation, speed advertising, forced speed, MDI-X   */
+/* and flow control from the corresponding settings in the    */
+/* device structure.                                          */
+/*                                                            */
+/* Parameters: Pointer to the relevant device structure.      */
+/**************************************************************/
+
+static void set_link_config(device_t dev)
+{
+    struct adapter * adapter = &dev->adapter;
+
+    switch (dev->link_setting)
+    {
+        case link_auto:
+            adapter->hw.autoneg = DO_AUTO_NEG;
+            adapter->hw.autoneg_advertised = dev->advertise;
+            break;
+
+        case link_1000: /* Note that the user cannot actually set this */
+            adapter->hw.autoneg = DO_AUTO_NEG;
+            adapter->hw.autoneg_advertised = ADVERTISE_1000_FULL;
+            break;
+
+        case link_100_half:
+            adapter->hw.autoneg = FALSE;
+            adapter->hw.autoneg_advertised = 0;
+            adapter->hw.forced_speed_duplex = em_100_half;
+            break;
+
+        case link_100_full:
+            adapter->hw.autoneg = FALSE;
+            adapter->hw.autoneg_advertised = 0;
+            adapter->hw.forced_speed_duplex = em_100_full;
+            break;
+
+        case link_10_half:
+            adapter->hw.autoneg = FALSE;
+            adapter->hw.autoneg_advertised = 0;
+            adapter->hw.forced_speed_duplex = em_10_half;
+            break;
+
+        case link_10_full:
+            adapter->hw.autoneg = FALSE;
+            adapter->hw.autoneg_advertised = 0;
+            adapter->hw.forced_speed_duplex = em_10_full;
+            break;
+    }
+
+    adapter->hw.mdix = dev->link_mdix;
+    adapter->hw.fc = dev->flow_control;
+
+    /* Call the validation routine to be safe */
+    em_validate_mdi_setting(&adapter->hw);
+}
+
+/**************************************************************/
+/* update_nvram()                                             */
+/*                                                            */
+/* Update the NVRAM settings (if available) with the current  */
+/* settings in the device structure.                          */
+/*                                                            */
+/* Parameters: Pointer to the relevant device structure.      */
+/*                                                            */
+/* Returns:    Error pointer.                                 */
+/**************************************************************/
+
+static _kernel_oserror * update_nvram(device_t dev)
+{
+    _kernel_oserror * e = NULL;
+
+    if (dev->nvram_size != 0)
+    {
+        NVRAMData data;
+
+        data.value = 0;
+        data.fields.link = (uint32_t)dev->link_setting;
+        data.fields.mdix = dev->link_mdix;
+        data.fields.fc = (uint32_t)dev->flow_control;
+        data.fields.unused = 1;
+
+        /* Bits 0-2 are speed, bits 3-4 are MDI mode, bits 5-6 are flow control */
+        e = _swix(OS_Byte,
+                  _INR(0,2),
+    
+                  162,
+                  dev->nvram_addr,
+                  data.value);
+    }
+
+    return e;
+}
+
+/**************************************************************/
+/* restart_if_running()                                       */
+/*                                                            */
+/* If the interface is currently running, restart it and      */
+/* wait for autonegotiation to complete.                      */
+/*                                                            */
+/* Parameters: Pointer to the relevant device structure.      */
+/**************************************************************/
+
+static void restart_if_running(device_t dev)
+{
+    struct adapter * adapter = &dev->adapter;
+
+    if (dev->initialised && (adapter->interface_data.ac_if.if_flags & IFF_RUNNING) != 0)
+    {
+        adapter->hw.wait_autoneg_complete = 1;
+        em_ro_restart(dev);
+        adapter->hw.wait_autoneg_complete = WAIT_FOR_AUTO_NEG_DEFAULT;
+    }
+}
+
+/**************************************************************/
+/* em_ro_change_link()                                        */
+/*                                                            */
+/* Change the link speed/duplex and MDI-X settings. If        */
+/* appropriate, the settings will be saved to NVRAM and the   */
+/* interface will be restarted with the new configuration.    */
+/*                                                            */
+/* Parameters: Pointer to the relevant device structure;      */
+/*                                                            */
+/*             The new link speed/duplex setting;             */
+/*                                                            */
+/*             The new MDI-X setting.                         */
+/*                                                            */
+/* Returns:    Error pointer.                                 */
+/**************************************************************/
+
+_kernel_oserror * em_ro_change_link(device_t dev, ConfigLink link, uint8_t mdix)
+{
+    struct adapter * adapter = &dev->adapter;
+
+    /* Can't change settings if this is a fibre link. */
+    if (adapter->hw.media_type == em_media_type_fiber)
+        return messages_make_error("Err_Fibre", ENODEV, NULL);
+
+    /* Remember the new setting */
+    dev->link_setting = link;
+    dev->link_mdix = mdix;
+
+    /* Save to NVRAM if possible */
+    update_nvram(dev);
+
+    /* If started, restart the device with the new configuration */
+    restart_if_running(dev);
+
+    return NULL;
+}
+
+/**************************************************************/
+/* em_ro_set_advertise()                                      */
+/*                                                            */
+/* Change the speeds advertised for auto-negotiation. The new */
+/* setting will be saved to NVRAM, if possible. This setting  */
+/* won't come into force until the next time the link is      */
+/* negotiated. If they want to, the user can force this by    */
+/* doing "*Configure EKLink <unit> Auto"                      */
+/*                                                            */
+/* Parameters: Pointer to the relevant device structure;      */
+/*                                                            */
+/*             The new advertised speeds bit mask.            */
+/*                                                            */
+/* Returns:    Error pointer.                                 */
+/**************************************************************/
+
+_kernel_oserror * em_ro_set_advertise(device_t dev, uint8_t setting)
+{
+    /* Remember the new setting */
+    dev->advertise = setting;
+
+    /* Save to NVRAM if possible */
+    if (dev->nvram_size > 1)
+    {
+        _swix(OS_Byte,
+              _INR(0,2),
+
+              162,
+              dev->nvram_addr + 1,
+              setting);
+    }
+
+    /* Note that this setting won't come into force until the next time */
+    /* the link is negotiated. If they want to, the user can force this */
+    /* by doing "*Configure EKLink <unit> Auto"                         */
+
+    return NULL;
+}
+
+/**************************************************************/
+/* em_ro_set_flow()                                           */
+/*                                                            */
+/* Change the link flow control settings. The new setting     */
+/* will be saved to NVRAM if possible, and the interface will */
+/* be restarted if it is currently running.                   */
+/*                                                            */
+/* Parameters: Pointer to the relevant device structure;      */
+/*                                                            */
+/*             The new flow control setting.                  */
+/*                                                            */
+/* Returns:    Error pointer.                                 */
+/**************************************************************/
+
+_kernel_oserror * em_ro_set_flow(device_t dev, em_fc_type setting)
+{
+    /* Remember the new setting */
+    dev->flow_control = setting;
+
+    /* Save to NVRAM if possible */
+    update_nvram(dev);
+
+    /* If started, restart the device with the new configuration */
+    restart_if_running(dev);
+
+    return NULL;
+}
+
+/**************************************************************/
+/* em_ro_check_options()                                      */
+/*                                                            */
+/* This is called from the BSD initialisation code to ensure  */
+/* that the correct initial values are set for all            */
+/* the configuration options, overriding the BSD defaults.    */
+/*                                                            */
+/* Parameters: Pointer to the relevant device structure.      */
+/**************************************************************/
+
+void em_ro_check_options(device_t dev)
+{
+    set_link_config(dev);
+}
+
+/**************************************************************/
+/* em_ro_read_configuration()                                 */
+/*                                                            */
+/* Read configuration options from NVRAM and update the       */
+/* device structure accordingly.                              */
+/*                                                            */
+/* Parameters: Pointer to the relevant device structure.      */
+/**************************************************************/
+
+void em_ro_read_configuration(device_t dev)
+{
+    _kernel_oserror * e;
+    uint32_t          info[2];
+
+    e = _swix(PCI_ReadInfo,
+              _INR(0,3),
+
+              PCI_ReadInfo_CMOSAddress | PCI_ReadInfo_CMOSSize,
+              &info,
+              sizeof(info),
+              dev->function_handle);
+
+    if (e != NULL)
+    {
+        /* Something went wrong - we can't read NVRAM */
+        dev->nvram_addr = 0;
+        dev->nvram_size = 0;
+
+        dprintf(("", "%s: PCI_ReadInfo (CMOS) for function handle %u failed: '%s'\n", __func__, dev->function_handle, e->errmess));
+    }
+    else
+    {
+        dev->nvram_addr = info[0];
+        dev->nvram_size = info[1];
+
+        dprintf(("Init", "%s: Device has %u bytes of NVRAM at address %u\n", __func__, dev->nvram_size, dev->nvram_addr));
+    }
+
+    /* Read settings from the first byte of NVRAM */
+
+    dev->link_setting = link_auto;
+    dev->link_mdix = 0;
+    dev->flow_control = em_fc_full;
+
+    if (dev->nvram_size != 0)
+    {
+        NVRAMData data;
+
+        e = _swix(OS_Byte,
+                  _INR(0,1) | _OUT(2),
+
+                  161,
+                  dev->nvram_addr,
+
+                  &data.value);
+
+        if (e == NULL)
+        {
+            dprintf(("Init", "%s: NVRAM[0] value was &%x\n", __func__, data.value));
+
+            /* If bit 7 (unused) is not set to 1, use defaults */
+            if (data.fields.unused == 1)
+            {
+                /* Bits 0-2 of NVRAM are the speed/duplex part of '*Configure EKLink' */
+                if (data.fields.link >= link_max)
+                    dev->link_setting = link_auto;
+                else
+                    dev->link_setting = (ConfigLink)data.fields.link;
+    
+                /* Bits 3-4 of NVRAM are the MDI part of '*Configure EKLink' */
+                if (data.fields.mdix == 3)
+                    dev->link_mdix = 0;
+                else
+                    dev->link_mdix = (uint8_t)data.fields.mdix;
+    
+                /* Bits 5-6 of NVRAM are the setting of '*Configure EKFlowControl' */
+                dev->flow_control = (em_fc_type)data.fields.fc;
+            }
+        }
+    }
+
+    /* Read settings from the second byte of NVRAM */
+
+    dev->advertise = AUTONEG_ADV_DEFAULT;
+
+    if (dev->nvram_size > 1)
+    {
+        uint32_t data;
+
+        e = _swix(OS_Byte,
+                  _INR(0,1) | _OUT(2),
+
+                  161,
+                  dev->nvram_addr + 1,
+
+                  &data);
+
+        if (e == NULL)
+        {
+            dprintf(("Init", "%s: NVRAM[1] value was &%x\n", __func__, data));
+
+            /* Check for invalid values */
+            if (data != 0 && ((data & 0xd0) == 0))
+                dev->advertise = (uint8_t)data;
+        }
+    }
+}
+
+/**************************************************************/
+/* af_reject()                                                */
+/*                                                            */
+/* Filtering function used to reject *all* received packets.  */
+/*                                                            */
+/* Parameters: The address level;                             */
+/*                                                            */
+/*             Pointer to the packet header;                  */
+/*                                                            */
+/*             Pointer to our MAC address.                    */
+/*                                                            */
+/* Returns:    1 to say the packet should be rejected.        */
+/**************************************************************/
+
+int af_reject(uint32_t level, uint8_t * pack_hdr, uint8_t * mac_addr)
+{
+    (void)level;
+    (void)pack_hdr;
+    (void)mac_addr;
+
+    return 1;
+}
+
+/**************************************************************/
+/* af_specific()                                              */
+/*                                                            */
+/* Filtering function used when only specifically addressed   */
+/* packets are accepted by the hardware.                      */
+/*                                                            */
+/* Parameters: The address level;                             */
+/*                                                            */
+/*             Pointer to the packet header;                  */
+/*                                                            */
+/*             Pointer to our MAC address.                    */
+/*                                                            */
+/* Returns:    0 to say the packet should be accepted.        */
+/**************************************************************/
+
+static int af_specific(uint32_t level, uint8_t * pack_hdr, uint8_t * mac_addr)
+{
+    (void)level;
+    (void)pack_hdr;
+    (void)mac_addr;
+
+    /* The hardware does *all* the filtering for us */
+    return 0;
+}
+
+/**************************************************************/
+/* af_normal()                                                */
+/*                                                            */
+/* Filtering function used when hardware packet filtering     */
+/* accepts specific and broadcast packets.                    */
+/*                                                            */
+/* Parameters: The address level;                             */
+/*                                                            */
+/*             Pointer to the packet header;                  */
+/*                                                            */
+/*             Pointer to our MAC address.                    */
+/*                                                            */
+/* Returns:    0 if the packet should be accepted, 1 if it    */
+/*             should be filtered out.                        */
+/**************************************************************/
+
+static int af_normal(uint32_t level, uint8_t * pack_hdr, uint8_t * mac_addr)
+{
+    (void)mac_addr;
+    
+    if (level == ADDRLVL_SPECIFIC && IS_BROADCAST(pack_hdr)) return 1;
+
+    return 0;
+}
+
+/**************************************************************/
+/* af_multicast()                                             */
+/*                                                            */
+/* Filtering function used when hardware packet filtering     */
+/* accepts specific and broadcast and multicast packets.      */
+/*                                                            */
+/* Parameters: The address level;                             */
+/*                                                            */
+/*             Pointer to the packet header;                  */
+/*                                                            */
+/*             Pointer to our MAC address.                    */
+/*                                                            */
+/* Returns:    0 if the packet should be accepted, 1 if it    */
+/*             should be filtered out.                        */
+/**************************************************************/
+
+static int af_multicast(uint32_t level, uint8_t * pack_hdr, uint8_t * mac_addr)
+{
+    (void)mac_addr;
+    
+    switch (level)
+    {
+        case ADDRLVL_SPECIFIC:
+            if (IS_BROADCAST(pack_hdr)) return 1; /* Filter it out */
+            /* else, fall through case */
+
+        case ADDRLVL_NORMAL:
+            if (IS_MULTICAST(pack_hdr)) return 1; /* Don't want it */
+            /* else, fall through case */
+
+        case ADDRLVL_MULTICAST:
+        default:
+            return 0; /* Protocol wants this packet */
+    }
+}
+
+/**************************************************************/
+/* af_promiscuous()                                           */
+/*                                                            */
+/* Filtering function used when hardware packet filtering     */
+/* accepts all packets.                                       */
+/*                                                            */
+/* Parameters: The address level;                             */
+/*                                                            */
+/*             Pointer to the packet header;                  */
+/*                                                            */
+/*             Pointer to our MAC address.                    */
+/*                                                            */
+/* Returns:    0 if the packet should be accepted, 1 if it    */
+/*             should be filtered out.                        */
+/**************************************************************/
+
+static int af_promiscuous(uint32_t level, uint8_t * pack_hdr, uint8_t * mac_addr)
+{
+    int isbroadcast = IS_BROADCAST(pack_hdr);
+    int ismulticast = IS_MULTICAST(pack_hdr);
+
+    switch (level)
+    {
+        case ADDRLVL_SPECIFIC:
+            if (isbroadcast) return 1; /* Filter it out */
+            /* else, fall through case */
+
+        case ADDRLVL_NORMAL:
+            if (ismulticast) return 1; /* Don't want it */
+            /* else, fall through case */
+
+        case ADDRLVL_MULTICAST:
+            /* Reject all packets that aren't broadcast or multicast, */
+            /* and which don't match the MAC address.                 */
+            if (!isbroadcast && !ismulticast)
+            {
+                int i;
+    
+                for (i = 0; i < ETHER_ADDR_LEN; i++)
+                {
+                    if (pack_hdr[i] != mac_addr[i]) return 1;
+                }
+            }
+            /* fall through case */
+
+        case ADDRLVL_PROMISCUOUS:
+        default:
+            return 0; /* protocol wants this packet */
+    }
+}
+
+/**************************************************************/
+/* em_ro_update_addrlevel()                                   */
+/*                                                            */
+/* Find most general address level for all active filters on  */
+/* a given unit, and ask for hardware to be set to that       */
+/* level.                                                     */
+/*                                                            */
+/* Parameters: Pointer to the relevant device structure.      */
+/**************************************************************/
+
+void em_ro_update_addrlevel(device_t dev)
+{
+    static const AddressFilter filters[] =
+    {
+        af_reject,
+        af_specific,
+        af_normal,
+        af_multicast,
+        af_promiscuous
+    };
+
+    int             level = -1;
+    FilterChainRef  fc;
+
+    if (dev->ieeefilter != NULL)
+        level = MAX(level, (int)dev->ieeefilter->fs_addrlevel);
+
+    if (dev->e2monitor != NULL)
+        level = MAX(level, (int)dev->e2monitor->fs_addrlevel);
+
+    if (dev->e2sink != NULL)
+        level = MAX(level, (int)dev->e2sink->fs_addrlevel);
+
+    for (fc = dev->e2specific; fc; fc = fc->fc_next)
+        level = MAX(level, (int)fc->fc_addrlevel);
+
+    set_receive_level(dev, level);
+
+    /* Set appropriate filtering function */
+    dev->address_filter = filters[level + 1];
+
+    /* Note that because the hardware filter doesn't change at exactly */
+    /* the same moment the software filtering function does, there is  */
+    /* the possibility that the odd packet may be accepted or rejected */
+    /* incorrectly immediately after changing the filtering level.     */
+    /* There doesn't seem to be a simple way to resolve this, but in   */
+    /* practice it seems unlikely to cause any problems.               */
+}
+
+/**************************************************************/
+/* set_receive_level()                                        */
+/*                                                            */
+/* Set the hardware filtering to the appropriate level, or    */
+/* stop the hardware completely (if the level is -1).         */
+/*                                                            */
+/* Parameters: Pointer to the relevant device structure;      */
+/*                                                            */
+/*             The required address filtering level. The      */
+/*             possible levels are defined in dcistructs.h    */
+/*             and correspond to the Filter SWI parameters.   */
+/*             Level -1 means disable the interface.          */
+/**************************************************************/
+
+static void set_receive_level(device_t dev, int addrlevel)
+{
+    struct adapter * adapter = &dev->adapter;
+
+    dprintf(("Misc", "%s: Set receive level to %d\n", __func__, addrlevel));
+
+    if (addrlevel == -1)
+    {
+        if (dev->adapter.interface_data.ac_if.if_flags & IFF_RUNNING)
+            em_stop(adapter);
+    }
+    else
+    {
+        uint32_t reg_rctl;
+        uint8_t  status = ST_STATUS_DIRECT;
+        int      s;
+
+        s = splimp();
+
+        reg_rctl = E1000_READ_REG(&dev->adapter.hw, RCTL) &
+            ~(E1000_RCTL_BAM | E1000_RCTL_UPE | E1000_RCTL_MPE);
+
+        if (addrlevel >= ADDRLVL_NORMAL)
+        {
+            /* Broadcasts are OK */
+            reg_rctl |= E1000_RCTL_BAM;
+
+            status = ST_STATUS_BROADCAST;
+        }
+
+        if( addrlevel >= ADDRLVL_MULTICAST )
+        {
+            /* Multicasts are OK */
+            reg_rctl |= E1000_RCTL_MPE;
+
+            status = ST_STATUS_MULTICAST;
+        }
+
+        if( addrlevel >= ADDRLVL_PROMISCUOUS )
+        {
+            /* We'll go with anything */
+            reg_rctl |= E1000_RCTL_UPE;
+
+            status = ST_STATUS_PROMISCUOUS;
+        }
+
+        E1000_WRITE_REG(&adapter->hw, RCTL, reg_rctl);
+        E1000_WRITE_FLUSH(&adapter->hw);
+
+        dev->stats.st_link_status = (dev->stats.st_link_status & ~ST_STATUS_RXMASK) | status;
+    
+        splx(s);
+    }
+}
+
+/**************************************************************/
+/* em_ro_start()                                              */
+/*                                                            */
+/* Start up the interface, if it's not already running.       */
+/*                                                            */
+/* Parameters: Pointer to the relevant device structure.      */
+/*                                                            */
+/* Returns:    BSD error number.                              */
+/**************************************************************/
+
+int em_ro_start(device_t dev)
+{
+    if (!dev->initialised)
+        return EIO;
+
+    if (dev->adapter.interface_data.ac_if.if_flags & IFF_RUNNING)
+        return 0;
+
+    dprintf(("Misc", "%s: Starting interface\n", __func__));
+
+    /* Update the hardware structure with user settings */
+    set_link_config(dev);
+
+    return em_init(&dev->adapter);
+}
+
+/**************************************************************/
+/* em_ro_restart()                                            */
+/*                                                            */
+/* Reset and restart the interface.                           */
+/*                                                            */
+/* Parameters: Pointer to the relevant device structure.      */
+/**************************************************************/
+
+void em_ro_restart(device_t dev)
+{
+    dprintf(("Misc", "%s: Restarting interface\n", __func__));
+
+    /* Update the hardware structure with user settings */
+    set_link_config(dev);
+
+    /* Reinitialise the device */
+    em_init(&dev->adapter);
+
+    /* Restore the receive level */
+    em_ro_update_addrlevel(dev);
+}
+
+/**************************************************************/
+/* em_ro_filter_packet()                                      */
+/*                                                            */
+/* This is called when a packet has been recieved. The packet */
+/* is filtered, and if accepted it is put in an mbuf chain,   */
+/* then added to the received packets list. If the received   */
+/* packets list already contained packets accepted by a       */
+/* different filter, they are sent to their protocol          */
+/* module and the list is cleared first.                      */
+/*                                                            */
+/* Parameters: Pointer to the adapter structure for the       */
+/*             receiving device.                              */
+/*                                                            */
+/*             Pointer to the packet data. This must be       */
+/*             aligned two bytes after a word boundary.       */
+/*                                                            */
+/*             The packet length including the header but     */
+/*             excluding the CRC.                             */
+/*                                                            */
+/*             Pointer to a pointer to the head of the list   */
+/*             of received packets mbuf chains. May be        */
+/*             altered.                                       */
+/*                                                            */
+/*             Pointer to a pointer to the filter for the     */
+/*             packets on the received packets list. May be   */
+/*             altered.                                       */
+/**************************************************************/
+
+void em_ro_filter_packet(struct adapter * adapter, uint8_t * packet, uint32_t len,
+    struct mbuf ** m_head_ptr, FilterSingleRef * current_filter)
+{
+    device_t        dev = adapter->dev;
+    FilterSingleRef fs = NULL;
+    uint32_t        type;
+    struct mbuf   * mh;
+    struct mbuf   * mp;
+    struct mbuf   * m;
+    RxHdrRef        hdr;
+
+    /* Drop packets that are too short or too long. */
+    if (len < ETHER_HDR_LEN || len > (ETHER_MAX_LEN - ETHER_CRC_LEN))
+    {
+        /* The hardware should catch these, so this should never happen */
+        adapter->dropped_pkts++;
+        return;
+    }
+
+    /* Pop the source address in the statistics structure */
+    memcpy(dev->stats.st_last_src_addr, packet + ETHER_ADDR_LEN, ETHER_ADDR_LEN);
+
+    /* Get the type, and decide if we can handle it */
+    type = ntohs(*(uint16_t *)(packet + (2 * ETHER_ADDR_LEN)));
+
+    /* First discrimination of frame type - is it an IEEE 802.3 or an */
+    /* Ethernet 2.0 frame?                                            */
+    if (type <= ETHERMTU)
+    {
+        fs = dev->ieeefilter;
+    }
+    /* It's an Ethernet 2.0 frame, do we have specific or sink filters active? */
+    else if (dev->e2specific || dev->e2sink)
+    {
+        FilterChainRef fc;
+
+        /* Start by trying to match specific frame types */
+        for (fc = dev->e2specific; fc; fc = fc->fc_next)
+        {
+            if (fc->fc_type == type)
+            {
+                fs = &fc->fc_filter;
+                break;
+            }
+        }
+
+        /* Default to sink filter if no specific matches */
+        if (!fc)
+        {
+            fs = dev->e2sink;
+        }
+    }
+    /* All we have left is the Ethernet 2.0 monitor */
+    else
+    {
+        fs = dev->e2monitor;
+    }
+
+    /* Pass the packet along if it is wanted */
+    if (fs)
+    {
+        /* Use the filtering routine appropriate to the current level of */
+        /* packet reception.                                             */
+        if (dev->address_filter(fs->fs_addrlevel, packet, adapter->hw.mac_addr))
+        {
+            /* Filter rejected this frame */
+            dev->stats.st_unwanted_frames++;
+            return;
+        }
+    }
+    else
+    {
+        /* No protocols want this frame */
+        dev->stats.st_unwanted_frames++;
+        return;
+    }
+
+    /* This frame is wanted. Allocate an mbuf for the received frame header */
+    mh = ALLOC_S(sizeof(RxHdr), NULL);
+    if (mh == NULL)
+    {
+        adapter->mbuf_alloc_failed++;
+        return;
+    }
+
+    /* Create an mbuf chain and copy the packet data (less the header) into it */
+    mp = ALLOC(len - ETHER_HDR_LEN, packet + ETHER_HDR_LEN);
+    if (mp == NULL)
+    {
+        m_free(mh);
+        adapter->mbuf_alloc_failed++;
+        return;
+    }
+
+    /* Fill in the received frame header */
+    mh->m_type = MT_HEADER;
+
+    hdr = mtod(mh, RxHdrRef);
+
+    hdr->rx_tag = 0;
+    memcpy(hdr->rx_src_addr, packet + ETHER_ADDR_LEN, ETHER_ADDR_LEN);
+    memcpy(hdr->rx_dst_addr, packet, ETHER_ADDR_LEN);
+    hdr->rx_frame_type = type;
+    hdr->rx_error_level = 0;
+    hdr->rx_cksum = 0;
+    *(u_short *)(&hdr->_spad[0]) = 0;
+    *(u_short *)(&hdr->_dpad[0]) = 0;
+
+    /* Run down the packet data chain, setting the type field */
+    for (m = mp; m; m = m->m_next)
+        m->m_type = MT_DATA;
+
+    /* Join the header to the data chain */
+    CAT(mh, mp);
+
+    /* Add the packet to the list */
+    if (*m_head_ptr == NULL)
+    {
+        /* The list is empty - start it. */
+        *m_head_ptr = mh;
+        *current_filter = fs;
+    }
+    else if (fs != *current_filter)
+    {
+        /* The list contains packets accepted by a different filter - pass   */
+        /* them to their protocol module by calling the receive handler now. */
+        em_asm_callproto(&dev->dib, *m_head_ptr, (*current_filter)->fs_handler, (*current_filter)->fs_pwptr);
+
+        /* Start a new list */
+        *m_head_ptr = mh;
+        *current_filter = fs;
+    }
+    else
+    {
+        /* The list contains packets accepted by the same filter, add the */
+        /* new chain to the list.                                         */
+        for (m = *m_head_ptr; m->m_list != NULL; m = m->m_list)
+            /* Do nothing */;
+        m->m_list = mh;
+    }
+}
+
+/**************************************************************/
+/* em_ro_transmit()                                           */
+/*                                                            */
+/* Transmit a number of packets of data.                      */
+/*                                                            */
+/* Parameters: Pointer to the relevant device structure;      */
+/*                                                            */
+/*             Pointer to the head of the mbuf chain to       */
+/*             transmit;                                      */
+/*                                                            */
+/*             The number of packets in the chain;            */
+/*                                                            */
+/*             Pointer to the destination MAC address;        */
+/*                                                            */
+/*             Pointer to the source MAC address;             */
+/*                                                            */
+/*             The packet type (network byte order).          */
+/*                                                            */
+/* Returns:    0 if successful, else error number.            */
+/**************************************************************/
+
+int em_ro_transmit(device_t dev, struct mbuf * m_head, int num_packets,
+    uint8_t * edst, uint8_t * esrc, uint16_t type)
+{
+    struct adapter      * adapter = &dev->adapter;
+    struct em_tx_buffer * tx_buffer;
+    struct em_tx_desc   * current_tx_desc = NULL;
+    int                   s;
+    struct mbuf         * m;
+    uint32_t              len;
+    uint8_t             * p;
+    uint32_t              now;
+    int                   error = 0;
+
+    dprintf(("TX", "%s: Called with %d packets of type &%x\n", __func__, num_packets, (unsigned)type));
+
+    _swix(OS_ReadMonotonicTime, _OUT(0), &now);
+
+    /* This is based on em_start() from if_em.c */
+
+    s = splimp();
+
+#ifdef DBG_STATS
+    u_int32_t start_time = em_ro_get_time();
+#endif
+
+    if (dev->tx_handler_entered || dev->irq_handler_entered)
+    {
+        dprintf(("", "%s: TX handler re-entrancy (tx=%d, irq=%d) - can't transmit\n",
+            __func__, (int)dev->tx_handler_entered, (int)dev->irq_handler_entered));
+
+        adapter->tx_re_ent_fails++;
+        splx(s);
+        return INETERR_TXBLOCKED;
+    }    
+
+    dev->tx_handler_entered = true;
+
+    /* Force a cleanup if number of descriptors available hit the threshold */
+    if (
+        adapter->num_tx_desc_avail < num_packets ||
+        adapter->num_tx_desc_avail <= EM_TX_CLEANUP_THRESHOLD
+       )
+        em_clean_transmit_interrupts(adapter);
+
+    if (adapter->num_tx_desc_avail < num_packets)
+    {
+        dprintf(("", "%s: Not enough TXDs (have %d, need %d) - can't transmit\n",
+                 __func__, adapter->num_tx_desc_avail, num_packets));
+        dprintf(("", "%s: First packet start time was %ucs ago\n",
+                 __func__, (now - adapter->tx_buffer_area[adapter->oldest_used_tx_desc].start_time)));
+
+        adapter->no_tx_desc_avail1++;
+        error = INETERR_TXBLOCKED;
+    }
+    else
+    {
+        int i = adapter->next_avail_tx_desc;
+        while (m_head != NULL)
+        {
+            /* Find the packet length */
+            for (len = ETHER_HDR_LEN, m = m_head; m; m = m->m_next )
+                len += m->m_len;
+
+            if (len > ETHER_HDR_LEN + ETHERMTU)
+            {
+                adapter->oversize_tx_pkts++;
+                error = EMSGSIZE;
+                break;
+            }
+
+            tx_buffer = &adapter->tx_buffer_area[i];
+            tx_buffer->start_time = now;
+
+            /* Construct the packet */
+
+            p = &tx_buffer->buffer[ETHER_ALIGN];
+
+            /* Construct the packet header */
+            memcpy(p, edst, ETHER_ADDR_LEN);
+            p += ETHER_ADDR_LEN;
+            memcpy(p, esrc, ETHER_ADDR_LEN);
+            p += ETHER_ADDR_LEN;
+            *((uint16_t *)p) = type;
+            p += ETHER_TYPE_LEN;
+
+            /* Append the packet data */
+            EXPORT(m_head, M_COPYALL, p);
+
+            /* Set the packet descriptor */
+
+            current_tx_desc = &adapter->tx_desc_base[i];
+            current_tx_desc->buffer_addr = tx_buffer->buffer_addr;
+
+            /* Last Descriptor of Packet needs End Of Packet (EOP) bit set. */
+            current_tx_desc->lower.data = (adapter->txd_cmd | len | E1000_TXD_CMD_EOP);
+            current_tx_desc->upper.data = 0;
+
+            if (++i == adapter->num_tx_desc)
+                i = 0;
+            
+            adapter->num_tx_desc_avail--;
+
+            em_ro_flush_wb();
+
+            /* Advance the Transmit Descriptor Tail (Tdt), this tells the */
+            /* E1000 that this frame is available to transmit.            */
+            E1000_WRITE_REG(&adapter->hw, TDT, i);
+
+            /* Move to next packet in list */
+            m_head = m_head->m_list;
+        }
+        adapter->next_avail_tx_desc = i;
+    }
+
+    /* Get max TX descs used for stats */
+    len = adapter->num_tx_desc - adapter->num_tx_desc_avail;
+    if (len > adapter->max_txd_used)
+        adapter->max_txd_used = len;
+
+#ifdef DBG_STATS
+    uint32_t end_time = em_ro_get_time();
+    uint32_t tx_time = end_time - start_time;
+    dprintf(("TX", "%s: %u-%u (%uus) txd used=%u\n", __func__, start_time, end_time, tx_time, len));
+
+    adapter->tx_calls++;
+    if (error != 0)
+        adapter->tx_call_errors++;
+    adapter->tx_time += tx_time;
+    if (tx_time > adapter->max_tx_time)
+        adapter->max_tx_time = tx_time;
+#endif
+
+    dev->tx_handler_entered = false;
+
+    splx(s);
+
+    return error;
+}
+
+/**************************************************************/
+/* em_ro_watchdog()                                           */
+/*                                                            */
+/* Watchdog check. If a packet has been on the transmit queue */
+/* for more than one second, assume the chip is stuck and     */
+/* attempt to reset it on a callback.                         */
+/*                                                            */
+/* Parameters: Pointer to the relevant device structure;      */
+/*                                                            */
+/*             The current monotonic time.                    */
+/**************************************************************/
+
+void em_ro_watchdog(device_t dev, uint32_t now)
+{
+    struct adapter * adapter = &dev->adapter;
+
+    if (adapter->num_tx_desc_avail != adapter->num_tx_desc)
+    {
+        if ((now - adapter->tx_buffer_area[adapter->oldest_used_tx_desc].start_time) > 100)
+        {
+            dprintf(("", "%s: Found packet stuck on transmit queue for more than 1s\n", __func__));
+    
+            /* Don't do anything if we are here because of pause frames */
+            if ((E1000_READ_REG(&adapter->hw, STATUS) & E1000_STATUS_TXOFF) == 0)
+            {
+                /* Add callback to reset chip */
+                dprintf(("", "%s: Controller stopped transmitting - reset on callback\n", __func__));
+                callx_add_callback(watchdog_reset_callback, dev);
+            }
+        }
+    }
+}
+
+/**************************************************************/
+/* watchdog_reset_callback()                                  */
+/*                                                            */
+/* Callback handler that will reset the chip if the watchdog  */
+/* found that a packet was stuck on the transmit queue.       */
+/*                                                            */
+/* Parameters: Callback handler registers (unused);           */
+/*                                                            */
+/*             Private word pointer (unused);                 */
+/*                                                            */
+/*             Pointer to the relevant device structure.      */
+/*                                                            */
+/* Returns:    Error pointer.                                 */
+/**************************************************************/
+
+static _kernel_oserror * watchdog_reset_callback(_kernel_swi_regs * r, void * pw, void * handle)
+{
+    device_t         dev = (device_t)handle;
+    struct adapter * adapter = &dev->adapter;
+
+    (void)r;
+    (void)pw;
+
+    dprintf(("", "%s: Called\n", __func__));
+
+    /* Last chance - try another cleanup */
+    em_clean_transmit_interrupts(adapter);
+
+    /* Are we still stuck? */
+    if (adapter->num_tx_desc_avail != adapter->num_tx_desc)
+    {
+        uint32_t now;
+
+        _swix(OS_ReadMonotonicTime, _OUT(0), &now);
+
+        if ((now - adapter->tx_buffer_area[adapter->oldest_used_tx_desc].start_time) > 100)
+        {
+            struct ifnet *ifp = &adapter->interface_data.ac_if;
+
+            /* Oh dear, the chip got stuck somehow - reset */
+
+            log_message(adapter->dev, "Watchdog timeout -- resetting");
+
+            ifp->if_flags &= ~IFF_RUNNING;
+            em_ro_restart(dev);
+
+            adapter->watchdog_resets++;
+        }
+    }
+
+    return NULL;
+}
+
+/**********************************************************************/
+
+#ifdef DBG_STATS
+static uint32_t   timer_period;
+static uint32_t   timer_divisor;
+static uint32_t   timer_initial = 0;
+static bool       timer_ok = false;
+
+void em_ro_init_dbg_stats(void)
+{
+    _kernel_oserror * e;
+    uint32_t          granularity;
+
+    e = _swix(OS_Hardware,
+              _IN(0) | _INR(8,9) | _OUT(0),
+
+              0,
+              0,
+              EntryNo_HAL_TimerPeriod,
+
+              &timer_period);
+
+    if (e == NULL && timer_period != 0)
+    {
+        timer_period--;
+
+        e = _swix(OS_Hardware,
+                  _IN(0) | _INR(8,9) | _OUT(0),
+
+                  0,
+                  0,
+                  EntryNo_HAL_TimerGranularity,
+
+                  &granularity);
+
+        timer_divisor = granularity / 1000000;
+
+        if (e == NULL && timer_divisor != 0)
+        {
+            timer_ok = true;
+        }
+    }
+
+    timer_initial = em_ro_get_time();
+}
+
+uint32_t em_ro_get_time(void)
+{
+    uint32_t cs1, cs2, ticks_left;
+
+    _swix(OS_ReadMonotonicTime, _OUT(0), &cs1);
+
+    if (!timer_ok)
+        return (cs1 * 10000 - timer_initial);
+
+    _swix(OS_Hardware,
+          _IN(0) | _INR(8,9) | _OUT(0),
+
+          0,
+          0,
+          EntryNo_HAL_TimerReadCountdown,
+
+          &ticks_left);
+
+    _swix(OS_ReadMonotonicTime, _OUT(0), &cs2);
+
+    if (cs1 == cs2)
+        return (cs2 * 10000 + (timer_period - ticks_left) / timer_divisor - timer_initial);
+    else
+        return (cs2 * 10000 - timer_initial);
+}
+#endif

@@ -1,0 +1,969 @@
+/** @file rel2html.c
+ *
+ *  Author:  Steve Revill
+ *  Date:    21st Jan 2010
+ *  Purpose: see @c cmd_help()
+ *
+ *  WARNING: Incomprehensible cobbled-together code alert. Sorry folks.
+ */
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdarg.h>
+#include <string.h>
+
+/** Return codes.
+ */
+#define ERR_SYNTAX    (1)
+#define ERR_IN_FILE   (2)
+#define ERR_OUT_FILE  (3)
+#define ERR_IN_SIZE   (4)
+#define ERR_MALLOC    (5)
+#define ERR_LOAD      (6)
+#define ERR_COMPONENT (7)
+#define ERR_WRITE     (8)
+#define ERR_VERSION   (9)
+
+/** Maximum length of a change log line to output (wrap at that width).
+ */
+#define MAX_LOG_WIDTH (88)
+
+/** Fragments of input file that our parser looks for.
+ */
+#define DIFFREL_TITLE    "<H3>Change Summary:</H3>"
+#define DIFFREL_CHANGES  "Component "
+#define DIFFREL_NOCHANGE "No components"
+#define DIFFREL_ISNEW    " has been added at tag "
+#define DIFFREL_NOTTHERE " has been removed "
+#define DIFFREL_BETWEEN  " between tags "
+#define DIFFREL_HASTAGS  " has tags of "
+#define DIFFREL_ADDED    "New components:"
+#define DIFFREL_REMOVED  "Removed components:"
+#define DIFFREL_SUBTITLE "-------------------------------------"
+#define DIFFREL_LOGGING  "Logging component "
+#define DIFFREL_VERSION1 "Version "
+#define DIFFREL_VERSION2 ". Tagged as '"
+#define DIFFREL_VERSION3 ". Not tagged"
+#define DIFFREL_SUMMARY  "Summary:"
+#define DIFFREL_DETAIL   "Detail:"
+#define DIFFREL_ADMIN    "Admin:"
+#define DIFFREL_AUTHOR   "Author:"
+#define DIFFREL_NOTES    "Notes:"
+
+/** Fragments of HTML to output.
+ */
+#define HTML_HEAD        "<!DOCTYPE html PUBLIC \"-//W3C//DTD XHTML 1.0 Transitional//EN\" \"http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd\">\n" \
+                         "<html xmlns=\"http://www.w3.org/1999/xhtml\" xml:lang=\"de\" lang=\"de\" dir=\"ltr\">\n" \
+                         "<head>\n" \
+                         "  <title>Changes: %s</title>\n" \
+                         "  <meta http-equiv=\"Content-type\" content=\"text/html; charset=utf-8\" />\n" \
+                         "  <link type=\"text/css\" rel=\"stylesheet\" href=\"%s\" />\n" \
+                         "</head>\n" \
+                         "<body alink=\"#e5ffd4\" bgcolor=\"#ffffff\" link=\"#6e915e\" text=\"#333333\" vlink=\"#8cb877\">\n"
+#define HTML_TITLE       "<h1>Changes: %s</h1>\n<br />\n"
+#define HTML_FOOT        "</body>\n</html>"
+#define HTML_LOG_START   "\n<p><pre>"
+#define HTML_LOG_END     "</pre></p>\n"
+#define HTML_ALTERED     "\n<h2>Components changed</h2>\n\n<ul>\n"
+#define HTML_ADDED       "\n<h2>Components added</h2>\n\n<ul>\n"
+#define HTML_REMOVED     "\n<h2>Components removed</h2>\n\n<ul>\n"
+#define HTML_DETAIL      "\n<h2>Full Change Logs</h2>\n\n"
+#define HTML_EMPTYLIST   "<p>Nothing.</p>\n"
+#define HTML_OPEN_STRONG "<strong>"
+#define HTML_SHUT_STRONG "</strong>\n"
+#define HTML_SHUT_UL     "</ul>\n"
+#define HTML_LOG_TITLE   "\n<hr>\n<h3>\n" \
+                         "  Logs for <a name=\"%s\" href=\"%s%s/VersionNum\">%s</a> from\n" \
+                         "  <a href=\"%s%s/VersionNum?only_with_tag=%s\">%s</a> to\n" \
+                         "  <a href=\"%s%s/VersionNum?only_with_tag=%s\">%s</a>\n</h3>\n\n"
+#define HTML_ALTERED_CMP "  <li>\n    <a href=\"#%s\">%s</a> from\n" \
+                         "    <a href=\"%s%s/VersionNum?only_with_tag=%s\">%s</a> to\n" \
+                         "    <a href=\"%s%s/VersionNum?only_with_tag=%s\">%s</a>\n  </li>\n"
+#define HTML_ADDED_CMP   "  <li>\n    <a href=\"%s%s/VersionNum\">%s</a> version\n" \
+                         "    <a href=\"%s%s/VersionNum?only_with_tag=%s\">%s</a>\n  </li>\n"
+#define HTML_REMOVED_CMP "  <li>\n    <a href=\"%s%s/VersionNum\">%s</a>\n  </li>\n"
+#define HTML_VERSION1    "\n<strong>Tagged as <a href=\"%s%s/VersionNum?only_with_tag=%s\">%s</a></strong>"
+#define HTML_VERSION2    "\n<strong>Not tagged</strong>"
+#define HTML_SUMMARY1    "<h3>"
+#define HTML_SUMMARY2    "</h3>"
+
+
+/** Trap an error in the parser code and jump to the location where we handle errors.
+ *
+ *  @param  fn  Function to call or expression to evaluate.
+ *
+ *  Side-effects: will 'goto error' if the expressing @a fn evaluates to a non-zero number.
+ *  This macro assumes an earlier declaration of 'int err'.
+ */
+#define PARSE_ERR( fn ) do { err = (fn); if (err) goto error; } while (0)
+
+
+/** Table to map between raw text (Acorn Latin1 encoding) to HTML-safe text (I did the common stuff and gave up there).
+ */
+const char *html[256] =
+{
+  /* 0..15 */
+  "", "", "", "", "", "", "", "", "", "	", "\n", "", "", " ", "", "",
+  /* 16..31 */
+  "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+  /* 32..47 */
+  " ", "!", "&quot;", "#", "$", "%", "&amp;", "&#39;", "(", ")", "*", "+", ",", "-", ".", "/",
+  /* 48..57 */
+  "0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+  /* 58..64 */
+  ":", ";", "&lt;", "=", "&gt;", "?", "@",
+  /* 65..90 */
+  "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M",
+  "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z",
+  /* 91..96 */
+  "[", "\\", "]", "^", "_", "`",
+  /* 97..122 */
+  "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m",
+  "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z",
+  /* 123..255 */
+  "{", "|", "}", "~", "", "Ä", "Å", "Ç", "É", "Ñ", "Ö", "Ü", "á", "à", "â", "ä", "ã", "å", "&#8482;", "é", "&bull;",
+  "&lsquo;", "&rsquo;", "í", "ì", "&ldquo;", "&rdquo;", "ñ", "ó", "ò", "ô", "ö", "õ", "ú", "ù", "û", "ü", "&nbsp;",
+  "&iexcl;", "¢", "&pound;", "§", "&yen;", "¶", "&sect;", "®", "&copy;", "™", "&laquo;", "&not;", "&shy;", "&reg;",
+  "&macr;", "&deg;", "&plusmn;", "&sup2;", "&sup3;", "¥", "µ", "&para;", "∑", "∏", "&sup1;", "&ordm;", "&raquo;", "&frac14;",
+  "&frac12;", "&frac34;", "&iquest;", "¿", "¡", "¬", "√", "ƒ", "≈", "∆", "«", "»", "…", " ", "À", "Ã", "Õ", "Œ", "œ",
+  "–", "—", "“", "”", "‘", "’", "÷", "◊", "ÿ", "Ÿ", "⁄", "€", "‹", "›", "ﬁ", "ﬂ", "‡", "·", "‚", "„", "‰", "Â", "Ê",
+  "Á", "Ë", "È", "Í", "Î", "Ï", "Ì", "Ó", "Ô", "", "Ò", "Ú", "Û", "Ù", "ı", "ˆ", "˜", "¯", "˘", "˙", "˚", "¸", "˝",
+  "˛", "ˇ"
+};
+
+
+/** Various states for our parser state machine (a very rough state machine).
+ */
+static enum state_s {
+  state_title = 0,
+  state_addrem,
+  state_nochange,
+  state_subtitle,
+  state_logging,
+  state_logtxt
+} state;
+
+
+/** Nasty 'orrible bodges - pre-allocated buffers for various things.
+ */
+static char vbuf[4192];                  /**< Buffer for output to file from @c fprintf_html(). */
+static char component[192];              /**< Buffer to hold component name, e.g. 'castle/RiscOS/Sources/BuildSys'. */
+static char this_comp[sizeof component]; /**< Buffer to hold copy of current component's name. */
+static char link[sizeof component];      /**< Buffer to hold <a name="*"> form of the component name ('/' swapped for '_'). */
+static char tag1[48];                    /**< Temporary buffer to hold a cvs tag string. Also used for other stuff. */
+static char tag2[48];                    /**< Temporary buffer to hold a cvs tag string. */
+
+/* Command line switches and parameters.
+ */
+static const char *sw_input  = NULL;
+static const char *sw_output = NULL;
+static const char *sw_title  = NULL;
+static const char *sw_css    = (char *) "./styles.css";
+static const char *sw_view   = (char *) "./viewer/";
+
+
+/** Write some text to the output file, converting into an HTML-safe format.
+ *
+ *  @param  f    Output file pointer.
+ *  @param  fmt  Format string.
+ *  @param  ...  Variadic parameters.
+ *
+ *  @return  Return code.
+ */
+static int fprintf_html(FILE * const f, const char * const fmt, ...)
+{
+  va_list        va;
+  unsigned char *chr = (unsigned char *)vbuf;
+  int            written;
+
+  /* Write the string into a buffer first */
+  va_start(va, fmt);
+  written = vsnprintf(vbuf, sizeof vbuf, fmt, va); 
+  va_end(va);
+  if (written >= sizeof vbuf)
+    return ERR_WRITE;
+
+  /* Then output the string in HTML-safe format */
+  while (*chr)
+  {
+    if (fprintf(f, "%s", html[*chr]) < 0)
+      return ERR_WRITE;
+    chr++;
+  }
+  return 0;
+}
+
+
+/** Dump some text to the output file without processing it (may be raw HTML).
+ *
+ *  @param  f    Output file pointer.
+ *  @param  fmt  Format string.
+ *  @param  ...  Variadic parameters.
+ *
+ *  @return  Return code.
+ */
+static int dump_html(FILE * const f, const char * const fmt, ...)
+{
+  va_list va;
+  int     written;
+
+  va_start(va, fmt);
+  written = vfprintf(f, fmt, va);
+  va_end(va);
+  if (written < 0)
+    return ERR_WRITE;
+
+  return 0;
+}
+
+
+/** Check for the title in the input file.
+ *
+ *  @param  str  Pointer to line in input file (zero-terminated).
+ *
+ *  @return  true if it looks like the title line, else false.
+ */
+static bool is_title(const char * const str)
+{
+  return ( state == state_title ) && !strcmp(str, DIFFREL_TITLE);
+}
+
+
+/** Check for the start of the added components list in the input file.
+ *
+ *  @param  str  Pointer to line in input file (zero-terminated).
+ *
+ *  @return  true if it looks like the start of the added components list, else false.
+ */
+static bool is_added(const char * const str)
+{
+  return ( state > state_title )
+         &&
+         ( state < state_subtitle )
+         &&
+         !strcmp(str, DIFFREL_ADDED);
+}
+
+
+/** Check for the start of the removed components list in the input file.
+ *
+ *  @param  str  Pointer to line in input file (zero-terminated).
+ *
+ *  @return  true if it looks like the start of the removed components list, else false.
+ */
+static bool is_removed(const char * const str)
+{
+  return ( state > state_title )
+         &&
+         ( state < state_subtitle )
+         &&
+         !strcmp(str, DIFFREL_REMOVED);
+}
+
+
+/** Check for a dividing line before a new set of component log entries.
+ *
+ *  @param  str  Pointer to line in input file (zero-terminated).
+ *
+ *  @return  true if it looks like a separator "-----" line, else false.
+ */
+static bool is_subtitle(const char * const str)
+{
+  return ( state > state_nochange )
+         &&
+         !strcmp(str, DIFFREL_SUBTITLE);
+}
+
+
+/** Check for the name of a component corresponding to the following log entries.
+ *
+ *  @param  str  Pointer to line in input file (zero-terminated).
+ *
+ *  @return  true if it looks like the title of a (set of) change log(s) for a component, else false.
+ */
+static bool is_logging(const char * const str)
+{
+  return ( state > state_nochange )
+         &&
+         ( str == strstr(str, DIFFREL_LOGGING) );
+}
+
+
+/** Check for a version information line of the form output by srccommit on the end of a log entry.
+ *
+ *  @param  str  Pointer to line in input file (zero-terminated).
+ *
+ *  @return  true if it looks like the version information from srccommit, else false.
+ */
+static bool is_version(const char * const str)
+{
+  return ( state > state_nochange )
+         &&
+         ( str == strstr(str, DIFFREL_VERSION1) )
+         &&
+         ( strstr(str, DIFFREL_VERSION2) || strstr(str, DIFFREL_VERSION3) );
+}
+
+
+/** Check that we are currently processing log entry text.
+ *
+ *  @param  str  Pointer to line in input file (zero-terminated).
+ *
+ *  @return  true if it we're currently in the @a state_logtxt state, else false.
+ */
+static bool is_logtxt(const char * const str)
+{
+  return state > state_logging;
+}
+
+
+/** Locate the position of the next line in the input file.
+ *
+ *  @param  ptr   Pointer to current line in input file in memory.
+ *  @param  line  Line number in input file.
+ *  @param  end   Pointer to end of input file in memory.
+ *
+ *  @return  Pointer to start of current line.
+ *
+ *  If the returned pointer >= @a end on exit from this function, we've hit the end of
+ *  the input file. @a line is incremented to match returned line's number. @ptr is
+ *  updated to point to start of the next line.
+ */
+static char *get_line(char ** const ptr, uint32_t *line, const char * const end)
+{
+  char *str = *ptr;
+
+  if (str < end)
+  {
+    *ptr += 1 + strlen(str);
+    (*line)++;
+  }
+  return str;
+}
+
+
+/** Locate the position of the next non-empty line in the input file.
+ *
+ *  @param  ptr   Pointer to current line in input file in memory.
+ *  @param  line  Line number in input file.
+ *  @param  end   Pointer to end of input file in memory.
+ *
+ *  @return  Pointer to start of non-empty line.
+ *
+ *  If the returned pointer >= @a end on exit from this function, we've hit the end of
+ *  the input file. @a line is incremented to match returned line's number. @ptr is
+ *  updated to point to start of the next line.
+ */
+static char *get_non_empty_line(char ** const ptr, uint32_t *line, const char * const end)
+{
+  char *str;
+
+  do
+  {
+    str = get_line(ptr, line, end);
+  }
+  while (!*str && *ptr < end);
+
+  return str;
+}
+
+
+/** Replace '/' chars in @a in string with '_' chars and dump results in @a out buffer.
+ *
+ *  @param  out  Pointer to buffer for output string (MUST be large enough).
+ *  @param  in   Pointer to zero-terminated input string.
+ *
+ *  This routine will result in undefined behaviour if the buffer pointed to by
+ *  @a out is not large enough to hold a copy of in input string and its zero
+ *  terminator byte.
+ */
+static void make_link(char *out, const char *in)
+{
+  while (*in)
+  {
+    *out++ = (*in == '/') ? '_' : *in;
+    in++;
+  }
+  *out = '\0';
+}
+
+
+/** Given one of the various lines of input listing a component, generate the appropriate output.
+ *
+ *  @param  f    Output file pointer.
+ *  @param  str  Pointer to line in input file (zero-terminated).
+ *
+ *  @return  Return code.
+ */
+static int parse_component(FILE * const f, const char * const str)
+{
+  if (str == strstr(str, DIFFREL_NOCHANGE))
+  {
+    /* There are no entries in this particular list - ignore this line */
+    return dump_html(f, HTML_EMPTYLIST);
+  }
+  else if (strstr(str, DIFFREL_NOTTHERE))
+  {
+    /* This component has been removed from the products file */
+    if (1 != sscanf(str + strlen(DIFFREL_CHANGES), "%s", component))
+      return ERR_COMPONENT;
+
+    make_link(link, component);
+    return dump_html(f, HTML_REMOVED_CMP, sw_view, component, component);
+  }
+  else if (strstr(str, DIFFREL_ISNEW))
+  {
+    char *end;
+
+    /* This component has been added to the products file */
+    if (2 != sscanf(str + strlen(DIFFREL_CHANGES), "%s" DIFFREL_ISNEW "%s.", component, tag1))
+      return ERR_COMPONENT;
+
+    /* Bodge to remove trailing fullstop */
+    end = tag1 + strlen(tag1) - 1;
+    if (*end == '.')
+      *end = '\0';
+
+    make_link(link, component);
+    return dump_html(f, HTML_ADDED_CMP, sw_view, component, component,
+                                        sw_view, component, tag1, tag1);
+  }
+  else if (str == strstr(str, DIFFREL_CHANGES))
+  {
+    /* This component has changed version */
+    if (3 != sscanf(str + strlen(DIFFREL_CHANGES), "%s" DIFFREL_HASTAGS "%s and %s", component, tag1, tag2))
+      return ERR_COMPONENT;
+
+    make_link(link, component);
+    return dump_html(f, HTML_ALTERED_CMP, link, component,
+                                          sw_view, component, tag1, tag1,
+                                          sw_view, component, tag2, tag2);
+  }
+  else if (strstr(str, DIFFREL_BETWEEN))
+  {
+    /* Start of log messages for the component */
+    if (3 != sscanf(str + strlen(DIFFREL_LOGGING), "%s" DIFFREL_BETWEEN "%s and %s", component, tag1, tag2))
+      return ERR_COMPONENT;
+
+    make_link(link, component);
+    strcpy(this_comp, component);
+    return dump_html(f, HTML_LOG_TITLE, link,
+                                        sw_view, component, component,
+                                        sw_view, component, tag1, tag1,
+                                        sw_view, component, tag2, tag2);
+  }
+  return ERR_COMPONENT;
+}
+
+
+/** Parse the input file (loaded into memory) and write the results to the output file.
+ *
+ *  @param  f      Output file pointer.
+ *  @param  ptr    Pointer to base of the input file in memory.
+ *  @param  bufsz  Size (bytes) of the buffer into which the input file was loaded.
+ *
+ *  @return  Return code.
+ */
+static int parse_file(FILE * const f, char * ptr, const size_t bufsz)
+{
+  int      err    = 0;
+  uint32_t line   = 0;      /* Input file line number */
+  bool     blank  = false;  /* Have we got blank lines to output in the change log text? */
+  bool     list   = false;  /* Are we in a <ul> </ul> list of components? */
+  bool     logtxt = false;  /* Are we outputting the change log text? */
+  bool     detail = false;  /* Are we past the summary of changes section? */
+  char     *end   = ptr + bufsz;
+  char     *str;
+
+  state = state_title;
+  str   = get_line(&ptr, &line, end);
+  while (ptr < end)
+  {
+    if (is_title(str))
+    {
+      /* The title of this release information document */
+      PARSE_ERR(dump_html(f, HTML_HEAD,  sw_title, sw_css));
+      PARSE_ERR(dump_html(f, HTML_TITLE, sw_title));
+      PARSE_ERR(dump_html(f, HTML_ALTERED));
+      list = true;
+
+      /* Parse any components that have changed version in the products file */
+      str = get_line(&ptr, &line, end);
+      while (*str)
+      {
+        PARSE_ERR(parse_component(f, str));
+        str = get_line(&ptr, &line, end);
+      }
+      state = state_addrem;
+    }
+    else if (is_added(str))
+    {
+      /* A component that's been added to the products file */
+      if (list)
+      {
+        PARSE_ERR(dump_html(f, HTML_SHUT_UL));
+        list = false;
+      }
+      PARSE_ERR(dump_html(f, HTML_ADDED));
+      list = true;
+
+      /* Parse any components that have been added to the products file */
+      str = get_line(&ptr, &line, end);
+      while (*str)
+      {
+        PARSE_ERR(parse_component(f, str));
+        str = get_line(&ptr, &line, end);
+      }
+      state = state_addrem;
+    }
+    else if (is_removed(str))
+    {
+      /* A component that's been removed from the products file */
+      if (list)
+      {
+        PARSE_ERR(dump_html(f, HTML_SHUT_UL));
+        list = false;
+      }
+      PARSE_ERR(dump_html(f, HTML_REMOVED));
+      list = true;
+
+      /* Parse any components that have been removed from the products file */
+      str = get_line(&ptr, &line, end);
+      while (*str)
+      {
+        PARSE_ERR(parse_component(f, str));
+        str = get_line(&ptr, &line, end);
+      }
+      state = state_subtitle;
+    }
+    else if (is_subtitle(str))
+    {
+      /* A separator line to indicate the start of some logging info for a component */
+      if (list)
+      {
+        PARSE_ERR(dump_html(f, HTML_SHUT_UL));
+        list = false;
+      }
+      if (!detail)
+      {
+        PARSE_ERR(dump_html(f, HTML_DETAIL));
+        detail = true;
+      }
+      if (logtxt)
+      {
+        PARSE_ERR(dump_html(f, HTML_LOG_END));
+        logtxt = false;
+      }
+      str   = get_line(&ptr, &line, end);
+      state = state_logging;
+    }
+    else if (is_logging(str))
+    {
+      /* A "Logging component" line */
+      if (list)
+      {
+        PARSE_ERR(dump_html(f, HTML_SHUT_UL));
+        list = false;
+      }
+      if (!detail)
+      {
+        PARSE_ERR(dump_html(f, HTML_DETAIL));
+        detail = true;
+      }
+      if (logtxt)
+      {
+        PARSE_ERR(dump_html(f, HTML_LOG_END));
+        logtxt = false;
+      }
+      PARSE_ERR(parse_component(f, str));
+      str   = get_non_empty_line(&ptr, &line, end);
+      state = state_logtxt;
+    }
+    else if (is_version(str))
+    {
+      /* The version information summary line from srccommit */
+      if (strstr(str, DIFFREL_VERSION2))
+      {
+        char *sub = strstr(str, DIFFREL_VERSION2) + strlen(DIFFREL_VERSION2);
+
+        /* Strip trailing ' quote */
+        strcpy(tag1, sub);
+        *(tag1 + strlen(tag1) - 1) = '\0';
+        PARSE_ERR(dump_html(f, HTML_VERSION1, sw_view, this_comp, tag1, tag1));
+      }
+      else if (strstr(str, DIFFREL_VERSION3))
+      {
+        PARSE_ERR(dump_html(f, HTML_VERSION2));
+      }
+      else
+        PARSE_ERR(ERR_VERSION);
+
+      if (logtxt)
+      {
+        PARSE_ERR(dump_html(f, HTML_LOG_END));
+        logtxt = false;
+      }
+      str = get_non_empty_line(&ptr, &line, end);
+    }
+    else if (is_logtxt(str))
+    {
+      uint32_t len   = strlen(str);
+      bool     first = false;
+
+      /* A line of text from a change log */
+      if (!logtxt)
+      {
+        PARSE_ERR(dump_html(f, HTML_LOG_START));
+        logtxt = true;
+        blank  = false;
+        first  = true;
+      }
+
+      /* Compress multiple blank lines into a single line */
+      if (len == 0)
+      {
+        blank = true;
+      }
+      else
+      {
+        if (blank)
+        {
+          PARSE_ERR(dump_html(f, "\n"));
+          blank = false;
+        }
+
+        /* Force long lines to be split over several lines of output */
+        if (len > MAX_LOG_WIDTH)
+        {
+          uint32_t indent = 0;
+          char    *pos    = str;
+          char    *end    = str + len;
+
+          /* Count leading spaces */
+          while (*pos == ' ')
+          {
+            *(component + indent) = ' ';
+            indent++;
+            pos++;
+          }
+          *(component + indent) = '\0';
+
+          /* Output the line in sections (splitting at a space if possible) */
+          do
+          {
+            char *spc;
+            int   size;
+
+            size = snprintf(link, MAX_LOG_WIDTH - indent, "%s", pos);
+            if (size >= MAX_LOG_WIDTH - indent)
+            {
+              spc = strrchr(link + (MAX_LOG_WIDTH >> 1), ' ');
+              if (spc)
+                *spc = '\0';
+            }
+            PARSE_ERR(fprintf_html(f, "%s%s\n", component, link));
+            pos += 1 + strlen(link);
+          } while (pos < end);
+        }
+        else
+        {
+          /* Is this one of the standard subheading lines in a log file? */
+          if (
+               !strcmp(str, DIFFREL_SUMMARY) || !strcmp(str, DIFFREL_DETAIL) ||
+               !strcmp(str, DIFFREL_ADMIN)   || !strcmp(str, DIFFREL_AUTHOR) ||
+               !strcmp(str, DIFFREL_NOTES)
+             )
+          {
+            PARSE_ERR(dump_html(f, HTML_OPEN_STRONG));
+            PARSE_ERR(fprintf_html(f, "%s", str));
+            PARSE_ERR(dump_html(f, HTML_SHUT_STRONG));
+          }
+          else
+          {
+            /* A short-ish line. If it's the first, it's a summary */
+            if (first)
+            {
+              /* Strip leading spaces */
+              while (*str == ' ')
+                str++;
+
+              /* Emphasise this line as it should be the change summary */
+              PARSE_ERR(dump_html(f, HTML_SUMMARY1));
+              PARSE_ERR(fprintf_html(f, "%s", str));
+              PARSE_ERR(dump_html(f, HTML_SUMMARY2));
+              blank = true;
+            }
+            else
+            {
+              /* Any other line */
+              PARSE_ERR(fprintf_html(f, "%s\n", str));
+            }
+          }
+        }
+      }
+      str = get_line(&ptr, &line, end);
+    }
+    else
+    {
+      /* A junk line that we're going to ignore */
+      if (*str)
+        printf("%u: (ignored line): %s\n", line, str);
+      str = get_line(&ptr, &line, end);
+    }
+  }
+
+  if (logtxt)
+    PARSE_ERR(dump_html(f, HTML_LOG_END));
+  PARSE_ERR(dump_html(f, HTML_FOOT));
+
+  return 0;
+
+error:
+  printf("Input file error, line %u\n", line);
+  return err;
+}
+
+
+/** Load the input file into memory and start the parser process (free memory when finished).
+ *
+ *  @param  inf    Pointer to the input file.
+ *  @param  outf   Pointer to the output file.
+ *  @param  bufsz  Size (bytes) of the input file.
+ *
+ *  @return  Return code.
+ */
+static int load_file(FILE * const inf, FILE * const outf, const size_t bufsz)
+{
+  int   err = 0;
+  char *buf = NULL;
+  char *ptr;
+
+  buf = malloc(bufsz + 1);
+  if (!buf) { err = ERR_MALLOC; goto error; }
+  if (fread(buf, bufsz, 1, inf) != 1) { err = ERR_LOAD; goto error; }
+
+  /* Zero-terminate each line in the loaded file */
+  ptr = buf;
+  while (ptr < buf + bufsz)
+  {
+    if (*ptr == '\n')
+      *ptr = '\0';
+    ptr++;
+  }
+  *(buf + bufsz) = '\0';
+
+  err = parse_file(outf, buf, bufsz);
+
+error:
+  if (buf) free(buf);
+  return err;
+}
+
+
+/** Return the size (bytes) of the specified file.
+ *
+ *  @param  f  Pointer to file (must be open).
+ *
+ *  @return  Size (bytes) of file - zero may mean it is empty or may indicate an error.
+ */
+static size_t fsize(FILE * const f)
+{
+  size_t size;
+  size_t pos;
+
+  pos = (size_t) ftell(f);
+  if (pos == -1L) return 0;
+  if (fseek(f, 0, SEEK_END)) return 0;
+  size = (size_t) ftell(f);
+  if (size == -1L) return 0;
+  if (fseek(f, pos, SEEK_SET)) return 0;
+
+  return size;
+}
+
+
+/** Start the processing of the input file and generation of the output file.
+ *
+ *  @param  in   Pointer to input filename (zero-terminated).
+ *  @param  out  Pointer to output filename (zero-terminated).
+ *
+ *  @return  Return code.
+ */
+static int process(const char * const in, const char * const out)
+{
+  int      err  = 0;
+  FILE    *inf  = NULL;
+  FILE    *outf = NULL;
+  size_t size;
+
+  inf  = fopen(in,  "r");
+  if (!inf) { err = ERR_IN_FILE; goto error; }
+  outf = fopen(out, "w");
+  if (!outf) { err = ERR_OUT_FILE; goto error; }
+  size = fsize(inf);
+  if (!size) { err = ERR_IN_SIZE; goto error; }
+  err = load_file(inf, outf, size);
+
+error:
+  if (inf)  fclose(inf);
+  if (outf) fclose(outf);
+  return err;
+}
+
+
+/** Output a brief overview of this program's command line syntax.
+ */
+static void syntax(void)
+{
+  printf("\nSyntax: rel2html [-Help] [-Viewer <URI>] [-Css <URI>] -Title <text> <input text> <output html>\n");
+}
+
+
+/** Output the full textual help message for this program.
+ *
+ *  @return  Return code (always zero).
+ */
+static void cmd_help(void)
+{
+  printf("rel2html\n\n");
+  printf("Convert the textual output from the 'diffrelease.pl' script into an HTML file\n");
+  printf("which is designed to be easier on the eye and handy to navigate out of. You can\n");
+  printf("click on links from within this report directly to an appropriate page in an\n");
+  printf("appropriate viewer service, such as cvsweb. It will also refer to an external\n");
+  printf("cascading style sheet.\n");
+  syntax();
+  printf("\n");
+  printf("  <input text>  - name of the input file output by the diffrelease.pl script\n");
+  printf("  <output html> - name of the output file to create\n");
+  printf("  -title <text> - mandatory: document title string (must be HTML safe\n");
+  printf("  -viewer <URI> - optional: location of the viewer (e.g. '/viewer/view/')\n");
+  printf("  -css <URI>    - optional: location of the CSS file (e.g. '/css/risc_os_open.css')\n");
+  printf("\nDefaults:\n\n");
+  /* Note: this output will be wrong if the user specified -help _and_ -css or something like that */
+  printf("  -viewer '%s'\n", sw_view);
+  printf("  -css '%s'\n", sw_css);
+  exit(EXIT_SUCCESS);
+}
+
+
+/** Parse the parameters to this program.
+ *
+ *  @param  argc  Number of parameters.
+ *  @param  argv  Array of zero-terminated parameter strings.
+ *
+ *  @return  Return code.
+ */
+static int parameters(const int argc, const char * const argv[])
+{
+  int notsw = 0;
+  int i;
+
+  /* Parse our parameters */
+  for (i = 1; i < argc; i++)
+  {
+    const char * sw = (char *)argv[i];
+
+    if (*sw == '-')
+    {
+      char *ptr = tag1;
+
+      /* Force the switch to lowercase */
+      sw++;
+      while (*sw)
+      {
+        char chr = (unsigned char) *sw++;
+
+        *ptr++ = (chr >= 'A' && chr <= 'Z') ? chr + 'a' - 'A' : chr;
+      }
+      *ptr = '\0';
+      if (*sw)
+        sw++;
+
+      /* Decide which switch it was, get parameter if required */
+      if (!strcmp(tag1, "h") || !strcmp(tag1, "help") || !strcmp(tag1, "-help"))
+        cmd_help();
+      else if (!strcmp(tag1, "t") || !strcmp(tag1, "title"))
+        sw_title = argv[++i];
+      else if (!strcmp(tag1, "v") || !strcmp(tag1, "viewer"))
+        sw_view = argv[++i];
+      else if (!strcmp(tag1, "c") || !strcmp(tag1, "css"))
+        sw_css = argv[++i];
+      else
+        return ERR_SYNTAX;
+    }
+    else
+    {
+      /* This is a parameter rather than a switch */
+      switch (notsw++)
+      {
+        case 0:
+          sw_input = sw;
+          break;
+        case 1:
+          sw_output = sw;
+          break;
+        default:
+          return ERR_SYNTAX;
+      }
+    }
+  }
+#if 0
+  printf("input:  '%s'\n", sw_input ? (char *)sw_input : "");
+  printf("output: '%s'\n", sw_output ? (char *)sw_output : "");
+  printf("title:  '%s'\n", sw_title ? (char *)sw_title : "");
+  printf("css:    '%s'\n", sw_css ? (char *)sw_css : "");
+  printf("view:   '%s'\n", sw_view ? (char *)sw_view : "");
+#endif
+
+  return (!sw_input || !sw_output || !sw_title) ? ERR_SYNTAX : 0;
+}
+
+
+/** Main entry point.
+ *
+ *  @param  argc  Number of parameters.
+ *  @param  argv  Array of zero-terminated parameter strings.
+ *
+ *  @return  Return code.
+ */
+int main(const int argc, const char * const argv[])
+{
+  int err;
+
+  err = parameters(argc, argv);
+  if (!err)
+    err = process(sw_input, sw_output);
+
+  switch (err)
+  {
+    case ERR_SYNTAX:
+      syntax();
+      break;
+    case ERR_IN_FILE:
+      printf("Error: failed to open input file (not found?)\n");
+      break;
+    case ERR_OUT_FILE:
+      printf("Error: failed to create/open output file\n");
+      break;
+    case ERR_IN_SIZE:
+      printf("Error: input file is empty (or error calculating size)\n");
+      break;
+    case ERR_MALLOC:
+      printf("Error: memory allocation failed (out of memory?)\n");
+      break;
+    case ERR_LOAD:
+      printf("Error: failed to load input file (file system error?)\n");
+      break;
+    case ERR_COMPONENT:
+      printf("Error: malformed component and/or tag description\n");
+      break;
+    case ERR_WRITE:
+      printf("Error: failed when writing to output file (disc full?)\n");
+      break;
+    case ERR_VERSION:
+      printf("Error: malformed change log version/tag summary\n");
+  }
+  return err;
+}

@@ -1,0 +1,45 @@
+# Copyright 1998 Acorn Computers Ltd
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# URLclient
+.SUFFIXES: .c .o
+
+test: URLClient FTPProxy
+	@|
+
+run: test
+	@URLClient -test URLs
+	@URLClient -test FileURLs
+
+URLClient: URLclient.o
+	link -o $@ URLclient.o c:o.stubs
+
+PathWrite: pathwrite.o
+	link -o $@ pathwrite.o c:o.stubs	
+
+speedtest: speedtest.c
+	cc c.speedtest
+
+FTPProxy: FTPPrxSrc
+	FTPPrxSrc
+
+clean:
+        -delete FTPProxy
+        -delete PrintWrite
+        -delete speedtest
+        -delete URLClient
+        x wipe o.* fr~c~v
+
+
+.c.o:; cc -c -throwback $*.c

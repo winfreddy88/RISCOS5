@@ -1,0 +1,1859 @@
+/*
+ * Copyright (c) 1995, Andreas Zieringer
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include "Desk/File.h"
+#include "Desk/Filing.h"
+#include "Desk/Str.h"
+#include "Desk/SWI.h"
+#include "Desk/DeskMem.h"
+#include "Desk/Time.h"
+#include "Desk/Icon.h"
+#include "Desk/Menu.h"
+#include "Desk/Pane2.h"
+
+#include "global.h"
+#include "misc.h"
+#include "iconnames.h"
+#include "flex.h"
+#include "event.h"
+
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+#define REM         1
+#define NAME        2
+#define NUMBER      3
+#define TERMINAL    4
+#define BAUD        5
+#define DATA        6
+#define WRAP        7
+#define ECHO        8
+#define LINES25     9
+#define ONLINE      10
+#define MODEMINIT   11
+#define DOWNLOAD    12
+#define FILETR      13
+#define ENDHEADER   14
+#define WAIT        15
+#define WAITUNTIL   16
+#define SEND        17
+#define DIAL        18
+#define OSCLI       19
+#define UPLOAD      20
+#define KEY         21
+#define SMARTBUTTON 22
+#define IF          23
+#define IFN         24
+#define GOTO        25
+#define GOSUB       26
+#define RETURN      27
+#define SET         28
+#define INC         29
+#define DEC         30
+#define HANGUPS     31
+#define QUIT        32
+#define AVATAR      33
+#define PORT        34
+#define FLOW        35
+#define RECORD      36
+#define STATUSLINE  37
+#define END         38
+
+static char dial_menu_items[1024];
+static int wait,t;
+static int action=0;
+static char string[256];
+static int if_return=0;
+static int if_seen=0;
+static char str[80];
+
+#define MAX_RETURN_NR 20
+static Desk_file_position return_pos[MAX_RETURN_NR];
+static int return_nr=0;
+
+typedef struct
+        {
+          char *name;
+          int pos;
+        } label_str;
+
+static label_str labels[100];
+static int nr_of_labels=0;
+
+typedef struct
+        {
+          char *name;
+          int value;
+        } var_str;
+
+static var_str vars[100];
+static int nr_of_vars;
+
+
+static void back(Desk_file_handle file)
+{
+  Desk_file_position pos;
+
+  if(Desk_File_EOF(file))
+    return;
+
+  pos=Desk_File_ReturnPos(file);
+  Desk_File_Seek(file,pos-1);
+}
+
+static void next_line(Desk_file_handle file)
+{
+  while(!Desk_File_EOF(file) && Desk_File_ReadChar(file)!=0x0a);
+  //back(file);
+}
+
+static int skip_lines(Desk_file_handle file)
+{
+  int l=0;
+
+  while(!Desk_File_EOF(file) && Desk_File_ReadChar(file)==0x0a)
+    l++;
+  back(file);
+  return(l);
+}
+
+static void skip_blanks(Desk_file_handle file)
+{
+  int z;
+
+  //while( (z<=32) && !Desk_FileEOF(file))
+
+  if(!Desk_File_EOF(file))
+  {
+    z=Desk_File_ReadChar(file);
+    while((z==32 || z==9) && !Desk_File_EOF(file))
+      z=Desk_File_ReadChar(file);
+    back(file);
+  }
+}
+
+static void get_string(Desk_file_handle file,char *string)
+{
+  int z,i;
+
+  if(Desk_File_EOF(file))
+    return;
+
+  if((z=Desk_File_ReadChar(file))=='<') // system variable
+  {
+    i=0;
+    while( !Desk_File_EOF(file) && (z=Desk_File_ReadChar(file)) != '>')
+      string[i++]=z;
+    string[i]=0;
+    strcpy(string,getenv(string));
+  }
+  else if(z=='"') // string
+  {
+    i=0;
+    while( !Desk_File_EOF(file) && (z=Desk_File_ReadChar(file)) != '"')
+      string[i++]=z;
+    string[i]=0;
+  }
+  else
+    show_message("Error in Script File");
+}
+
+static void get_text(Desk_file_handle file,char *text)
+{
+  int z,i;
+
+  if(Desk_File_EOF(file))
+    return;
+
+  i=0;
+  while(!Desk_File_EOF(file) && (z=Desk_File_ReadChar(file))>32)
+    text[i++]=z;
+  text[i]=0;
+  back(file);
+}
+
+static void get_variable(Desk_file_handle file,char *text)
+{
+  int z,i;
+
+  if(Desk_File_EOF(file))
+    return;
+
+  i=0;
+  while(!Desk_File_EOF(file) && (z=Desk_File_ReadChar(file))>32)
+  {
+    if( (z>=65 && z<=90) || (z>=97 && z<=122) || (z>=48 && z<=57) || z==95)
+      text[i++]=z;
+    else
+      break;
+  }
+  text[i]=0;
+  back(file);
+}
+
+
+static void get_condition(Desk_file_handle file,char *text)
+{
+  int z,i;
+
+  if(Desk_File_EOF(file))
+    return;
+
+  i=0;
+  while(!Desk_File_EOF(file) && (z=Desk_File_ReadChar(file))>32)
+  {
+    if(z==33 || z==60 || z==61 || z==62 )
+      text[i++]=z;
+    else
+      break;
+  }
+  text[i]=0;
+  back(file);
+}
+
+static void get_number(Desk_file_handle file,char *text)
+{
+  int z,i;
+
+  if(Desk_File_EOF(file))
+    return;
+
+  i=0;
+  while(!Desk_File_EOF(file) && (z=Desk_File_ReadChar(file))>32)
+  {
+    if(z>=48 && z<=57)
+      text[i++]=z;
+    else
+      break;
+  }
+  text[i]=0;
+  back(file);
+}
+
+static int get_token(Desk_file_handle file)
+{
+  int i,z;
+
+
+  if(Desk_File_EOF(file))
+    return(-2);
+
+  i=0;
+  while( !Desk_File_EOF(file) && (z=Desk_File_ReadChar(file))>32)
+  {
+    //if( (z>=65 && z<=90) || (z>=97 && z<=122) || (z>=48 && z<=57) || z=='_' || z==':')
+      str[i++]=z;
+    //else
+    //  break;
+  }
+  str[i]=0;
+  back(file);
+
+
+  //printf("token: %s\n",str);
+  //Desk_Error_Report(0,"%s",str);
+
+  if(!Desk_stricmp(str,"REM"))
+    return(REM);
+  if(!Desk_stricmp(str,"NAME"))
+    return(NAME);
+  if(!Desk_stricmp(str,"NUMBER"))
+    return(NUMBER);
+  if(!Desk_stricmp(str,"TERMINAL"))
+    return(TERMINAL);
+  if(!Desk_stricmp(str,"BAUD"))
+    return(BAUD);
+  if(!Desk_stricmp(str,"DATA"))
+    return(DATA);
+  if(!Desk_stricmp(str,"WRAP"))
+    return(WRAP);
+  if(!Desk_stricmp(str,"ECHO"))
+    return(ECHO);
+  if(!Desk_stricmp(str,"LINES25"))
+    return(LINES25);
+  if(!Desk_stricmp(str,"ONLINE"))
+    return(ONLINE);
+  if(!Desk_stricmp(str,"MODEMINIT"))
+    return(MODEMINIT);
+  if(!Desk_stricmp(str,"DOWNLOAD"))
+    return(DOWNLOAD);
+  if(!Desk_stricmp(str,"FILETR"))
+    return(FILETR);
+  if(!Desk_stricmp(str,"ENDHEADER"))
+    return(ENDHEADER);
+  if(!Desk_stricmp(str,"WAIT"))
+    return(WAIT);
+  if(!Desk_stricmp(str,"WAITUNTIL"))
+    return(WAITUNTIL);
+  if(!Desk_stricmp(str,"SEND"))
+    return(SEND);
+  if(!Desk_stricmp(str,"DIAL"))
+    return(DIAL);
+  if(!Desk_stricmp(str,"OSCLI"))
+    return(OSCLI);
+  if(!Desk_stricmp(str,"UPLOAD"))
+    return(UPLOAD);
+  if(!Desk_stricmp(str,"KEY"))
+    return(KEY);
+  if(!Desk_stricmp(str,"SMARTBUTTON"))
+    return(SMARTBUTTON);
+  if(!Desk_stricmp(str,"IF"))
+    return(IF);
+  if(!Desk_stricmp(str,"IFN"))
+    return(IFN);
+  if(!Desk_stricmp(str,"GOTO"))
+    return(GOTO);
+  if(!Desk_stricmp(str,"GOSUB"))
+    return(GOSUB);
+  if(!Desk_stricmp(str,"RETURN"))
+    return(RETURN);
+  if(!Desk_stricmp(str,"SET"))
+    return(SET);
+  if(!Desk_stricmp(str,"INC"))
+    return(INC);
+  if(!Desk_stricmp(str,"DEC"))
+    return(DEC);
+  if(!Desk_stricmp(str,"HANGUP"))
+    return(HANGUPS);
+  if(!Desk_stricmp(str,"QUIT"))
+    return(QUIT);
+  if(!Desk_stricmp(str,"AVATAR"))
+    return(AVATAR);
+  if(!Desk_stricmp(str,"PORT"))
+    return(PORT);
+  if(!Desk_stricmp(str,"FLOW"))
+    return(FLOW);
+  if(!Desk_stricmp(str,"RECORD"))
+    return(RECORD);
+  if(!Desk_stricmp(str,"STATUSLINE"))
+    return(STATUSLINE);
+  if(!Desk_stricmp(str,"END"))
+    return(END);
+
+  if(str[strlen(str)-1]!=':') // kein label
+  {
+    if(!if_seen)
+    {
+      sprintf(gstring,"Don't understand command %s\n",str);
+      //Desk_Error_Report(0,"error %s",str);
+      show_message(gstring);
+    }
+    return(-1); // error
+  }
+  return(0); // label
+
+}
+
+
+
+void load_header(char *name)
+{
+  Desk_file_handle file;
+  int token;
+  int end;
+  int i,z;
+  int t_number_nr_max;
+  int nr;
+  //char *text;
+
+
+  if(pause_status)
+    return;
+
+  statusline=1;
+
+  strcpy(t_name,"");
+  for(i=0;i<MAX_NUMBERS;i++)
+    strcpy(t_number[i],"");
+  t_number_nr=0;
+  t_terminal=dial_terminal_nr;//_0;
+  t_baud=dial_baud_nr;//_0;
+  t_data=dial_data_nr;//_0;
+  t_filetr=transfer_type_nr;//_0;
+  t_wrap=wrap_0;
+  t_echo=local_echo;//_0;
+  t_lines25=0;
+  t_avatar=avatar;//_0;
+  t_online=0;
+  t_crtocrlf=crtocrlf;//_0;
+  t_lftocrlf=lftocrlf;//_0;
+  strcpy(t_modeminit,"");
+  strcpy(t_download,"");
+  t_send_crashrecovery=send_crashrecovery;//_0;
+  t_receive_file_action=receive_file_action;//_0;
+  t_tx_window_size=tx_window_size;//_0;
+  t_ackint=ackint;//_0;
+  t_xmodem_crc=xmodem_crc;//_0;
+  t_xmodem_k=xmodem_k;//_0;
+  t_ymodem_crc=ymodem_crc;//_0;
+  t_ymodem_k=ymodem_k;//_0;
+  t_ascii_char_delay=ascii_char_delay;//_0;
+  t_ascii_line_delay=ascii_line_delay;//_0;
+  t_ascii_trans=ascii_trans;//_0;
+
+  portnumber=portnumber_0;
+  flow_type_nr=flow_type_nr_0;
+
+  sprintf(gstring,"%s.%s",SCRIPTS_PATH,name);
+  file=Desk_File_Open(gstring,Desk_file_READ);
+  if(file==NULL)
+  {
+    sprintf(gstring,"Couldn't open file %s",name);
+    show_message(gstring);
+    return;
+  }
+  end=FALSE;
+
+  /*
+  for(i=0;i<12;i++)
+  {
+    if(fkeys[i]!=NULL)
+    {
+      Desk_DeskMem_Free(fkeys[i]);
+      fkeys[i]=NULL;
+    }
+  }
+  */
+  /*
+  for(i=0;i<12;i++)
+    Desk_Icon_SetText(fkeys_window,i,"");
+  */
+  for(i=0;i<12;i++)
+    strcpy(t_fkeys[i],"");
+
+  for(i=0;i<8;i++)
+  {
+    strcpy(t_sb_label[i],"");
+    strcpy(t_sb_data[i],"");
+  }
+
+  t_number_nr_max=0;
+  while(!end)
+  {
+    skip_lines(file);
+    skip_blanks(file);
+    token=get_token(file);
+
+    switch(token)
+    {
+      case REM:
+        next_line(file);
+        skip_lines(file);
+      break;
+      case NAME:
+        skip_blanks(file);
+        get_string(file,t_name);
+        //strcpy(t_oldname,t_name);
+        next_line(file);
+        skip_lines(file);
+      break;
+      case NUMBER:
+        skip_blanks(file);
+        get_string(file,t_number[t_number_nr_max]);
+        skip_blanks(file);
+
+        while((z=Desk_File_ReadChar(file))==',')
+        {
+          skip_blanks(file);
+          get_string(file,t_number[++t_number_nr_max]);
+          skip_blanks(file);
+        }
+        if(z!=',')
+          back(file);
+        next_line(file);
+        skip_lines(file);
+      break;
+      case TERMINAL:
+        skip_blanks(file);
+        get_text(file,gstring);
+        next_line(file);
+        skip_lines(file);
+        for(i=0;i<4;i++)
+        {
+          if(!Desk_stricmp(terminal[i].string,gstring))
+          {
+            t_terminal=i;
+            break;
+          }
+        }
+        if(i==4)
+        {
+          sprintf(gstring2,"Don't know Terminaltype %s\n",gstring);
+          show_message(gstring2);
+          t_terminal=0;
+        }
+      break;
+      case BAUD:
+        skip_blanks(file);
+        get_text(file,gstring);
+        next_line(file);
+        skip_lines(file);
+        for(i=0;i<MAX_BAUD_NR;i++)
+        {
+          if(!Desk_stricmp(baud[i].string,gstring))
+          {
+            t_baud=i; //baud[i].value;
+            break;
+          }
+        }
+        if(i==MAX_BAUD_NR)
+        {
+          sprintf(gstring2,"Baudrate %s doesn't exist\n",gstring);
+          show_message(gstring2);
+          t_baud=4;
+        }
+      break;
+      case DATA:
+        skip_blanks(file);
+        get_text(file,gstring);
+        next_line(file);
+        skip_lines(file);
+        for(i=0;i<8;i++)
+        {
+          if(!Desk_stricmp(gstring,data[i].string))
+          {
+            t_data=i; //data[i].value;
+            break;
+          }
+        }
+        if(i==8)
+        {
+          sprintf(gstring2,"Data %s doesn't exist\n",gstring);
+          show_message(gstring2);
+          t_data=5;
+        }
+      break;
+       case FILETR:
+        skip_blanks(file);
+        get_text(file,gstring);
+        //next_line(file);
+        //skip_lines(file);
+        for(i=0;i<4;i++)
+        {
+          if(!Desk_stricmp(transfer[i],gstring))
+          {
+            t_filetr=i;
+            break;
+          }
+        }
+        if(i==4)
+        {
+          sprintf(gstring2,"Don't know file transfer type %s\n",gstring);
+          show_message(gstring2);
+          t_filetr=0;
+        }
+        switch(i)
+        {
+          case 0: //xmodem
+            skip_blanks(file);
+            get_text(file,gstring);
+            if(strlen(gstring)>0)
+              t_xmodem_crc=atoi(gstring);
+            skip_blanks(file);
+
+            get_text(file,gstring);
+            if(strlen(gstring)>0)
+              t_xmodem_k=atoi(gstring);
+            skip_blanks(file);
+            next_line(file);
+            skip_lines(file);
+          break;
+          case 1: //ymodem
+            skip_blanks(file);
+            get_text(file,gstring);
+            if(strlen(gstring)>0)
+              t_ymodem_crc=atoi(gstring);
+            skip_blanks(file);
+
+            get_text(file,gstring);
+            if(strlen(gstring)>0)
+              t_ymodem_k=atoi(gstring);
+            skip_blanks(file);
+            next_line(file);
+            skip_lines(file);
+          break;
+          case 2: //zmodem
+            skip_blanks(file);
+
+            get_text(file,gstring);
+            if(strlen(gstring)>0)
+            {
+              t_tx_window_size=atoi(gstring);
+              /*
+              if(t_tx_window_size>0)
+                t_tx_window=1;
+              else
+                t_tx_window=0;
+              */
+            }
+            skip_blanks(file);
+
+            get_text(file,gstring);
+            if(strlen(gstring)>0)
+              t_send_crashrecovery=atoi(gstring);
+            skip_blanks(file);
+
+            get_text(file,gstring);
+            if(strlen(gstring)>0)
+              t_ackint=atoi(gstring);
+            skip_blanks(file);
+
+            get_text(file,gstring);
+            if(strlen(gstring)>0)
+              t_receive_file_action=atoi(gstring);
+            skip_blanks(file);
+
+            next_line(file);
+            skip_lines(file);
+          break;
+          case 3: //ascii
+            skip_blanks(file);
+            get_text(file,gstring);
+            if(strlen(gstring)>0)
+              t_ascii_char_delay=atoi(gstring);
+            skip_blanks(file);
+
+            get_text(file,gstring);
+            if(strlen(gstring)>0)
+              t_ascii_line_delay=atoi(gstring);
+            skip_blanks(file);
+
+            get_text(file,gstring);
+            if(strlen(gstring)>0)
+              t_ascii_trans=atoi(gstring);
+            skip_blanks(file);
+
+            next_line(file);
+            skip_lines(file);
+          break;
+        }
+      break;
+      case WRAP:
+        skip_blanks(file);
+        get_text(file,gstring);
+        next_line(file);
+        skip_lines(file);
+        if(!Desk_stricmp(gstring,"AUTO"))
+          t_wrap=1;
+        if(!Desk_stricmp(gstring,"ON"))
+          t_wrap=1;
+        if(!Desk_stricmp(gstring,"OFF"))
+          t_wrap=0;
+      break;
+      case ECHO:
+        skip_blanks(file);
+        get_text(file,gstring);
+        next_line(file);
+        skip_lines(file);
+        if(!Desk_stricmp(gstring,"ON"))
+          t_echo=1;
+        if(!Desk_stricmp(gstring,"OFF"))
+          t_echo=0;
+      break;
+      case LINES25:
+        skip_blanks(file);
+        get_text(file,gstring);
+        next_line(file);
+        skip_lines(file);
+        if(!Desk_stricmp(gstring,"ON"))
+          t_lines25=1;
+        if(!Desk_stricmp(gstring,"OFF"))
+          t_lines25=0;
+      break;
+      case ONLINE:
+        skip_blanks(file);
+        get_text(file,gstring);
+        t_online=atoi(gstring)*6000; // in 1/100 sekunden
+        next_line(file);
+        skip_lines(file);
+      break;
+      case MODEMINIT:
+        skip_blanks(file);
+        get_string(file,t_modeminit);
+        next_line(file);
+        skip_lines(file);
+      break;
+      case DOWNLOAD:
+        skip_blanks(file);
+        get_string(file,t_download);
+        next_line(file);
+        skip_lines(file);
+      break;
+      case ENDHEADER:
+        next_line(file);
+        skip_lines(file);
+        end=TRUE;
+      break;
+      case KEY:
+        skip_blanks(file);
+        get_string(file,gstring);
+        nr=atoi(&gstring[1])-1;
+        skip_blanks(file);
+        if(Desk_File_ReadChar(file)!=',')
+        {
+          sprintf(gstring,"',' missing\n");
+          show_message(gstring);
+        }
+        skip_blanks(file);
+        get_string(file,gstring);
+        next_line(file);
+        skip_lines(file);
+        /*
+        text = (char *)Desk_DeskMem_Malloc(strlen(gstring)+1);
+        strcpy(text,gstring);
+        fkeys[nr]=text;
+        */
+        //Desk_Icon_SetText(fkeys_window,nr,gstring);
+        strcpy(t_fkeys[nr],gstring);
+      break;
+      case SMARTBUTTON:
+        skip_blanks(file);
+        get_text(file,gstring);
+        if(strlen(gstring)>0)
+          nr=atoi(gstring)-1;
+        skip_blanks(file);
+        get_string(file,t_sb_label[nr]);
+        skip_blanks(file);
+        get_string(file,t_sb_data[nr]);
+        next_line(file);
+        skip_lines(file);
+      break;
+      case AVATAR:
+        skip_blanks(file);
+        get_text(file,gstring);
+        next_line(file);
+        skip_lines(file);
+        if(!Desk_stricmp(gstring,"ON"))
+          t_avatar=1;
+        if(!Desk_stricmp(gstring,"OFF"))
+          t_avatar=0;
+      break;
+      case PORT:
+        skip_blanks(file);
+        get_text(file,gstring);
+        next_line(file);
+        skip_lines(file);
+        i=atoi(gstring);
+        if(i<0 || i>max_port_nr)
+        {
+          sprintf(gstring,"Port number %d is illegal\n",i);
+          show_message(gstring);
+          portnumber=0;
+        }
+        else
+          portnumber=i;
+        Desk_Icon_SetInteger(sinfo_window,SINFO_PORT,portnumber);
+      break;
+      case FLOW:
+        skip_blanks(file);
+        get_text(file,gstring);
+        next_line(file);
+        skip_lines(file);
+
+        if(!Desk_stricmp(gstring,"NO"))
+          flow_type_nr=0;
+        if(!Desk_stricmp(gstring,"HARDWARE"))
+          flow_type_nr=1;
+        if(!Desk_stricmp(gstring,"XON/XOFF"))
+          flow_type_nr=2;
+        if(!Desk_stricmp(gstring,"BOTH"))
+          flow_type_nr=3;
+        (*driver)(DRIVER_FLOWCONTROL,portnumber,flow_type_nr,0);
+        Desk_Icon_SetText(sinfo_window,SINFO_FLOW,flow[flow_type_nr]);
+      break;
+      case -1:
+        next_line(file);
+        skip_lines(file);
+      break;
+    }
+  }
+  // scan for labels
+
+  for(i=0;i<nr_of_labels;i++)
+  {
+    if(labels[i].name!=NULL)
+    {
+      Desk_DeskMem_Free(labels[i].name);
+      labels[i].name=NULL;
+    }
+  }
+  nr_of_labels=0;
+  do
+  {
+    skip_lines(file);
+    skip_blanks(file);
+    token=get_token(file);
+    if(token==0) // label
+    {
+      //Desk_Error_Report(0,str);
+      str[strlen(str)-1]=0; // doppelpunkt weg
+      labels[nr_of_labels].name=(char *)Desk_DeskMem_Malloc(strlen(str)+1);
+      strcpy(labels[nr_of_labels].name,str);
+      labels[nr_of_labels++].pos=Desk_File_ReturnPos(file)-strlen(str)+1;
+    }
+    if(token!=-2)
+      next_line(file);
+  }
+  while(token!=-2);
+
+  return_nr=0;
+
+
+  for(i=0;i<nr_of_vars;i++)
+  {
+    if(vars[i].name!=NULL)
+    {
+      Desk_DeskMem_Free(vars[i].name);
+      vars[i].name=NULL;
+    }
+  }
+  nr_of_vars=0;
+
+
+
+  Desk_File_Close(file);
+}
+
+void save_header(char *name)
+{
+  Desk_file_handle out;
+  Desk_file_handle old;
+  int end;
+  int token;
+  int z,i;
+
+  sprintf(gstring,"%s.%s",SCRIPTS_PATH,name);
+  old=Desk_File_Open(gstring,Desk_file_READ);
+
+  sprintf(gstring,"%s.!new!",SCRIPTS_PATH);
+  out=Desk_File_Open(gstring,Desk_file_WRITE);
+  if(out==NULL)
+  {
+    sprintf(gstring,"Couldn't open file %s",name);
+    show_message(gstring);
+    return;
+  }
+
+  Desk_File_printf(out,"NAME      %c%s%c\n",34,t_name,34);
+  Desk_File_printf(out,"NUMBER    ");
+
+  if(*(t_number[0])!=0)
+  {
+    for(i=0;i<MAX_NUMBERS;i++)
+    {
+      if(*(t_number[i])!=0)
+      {
+        if(i!=0)
+          Desk_File_printf(out,",%c%s%c",34,t_number[i],34);
+        else
+          Desk_File_printf(out,"%c%s%c",34,t_number[i],34);
+      }
+      else
+        break;
+    }
+  }
+  else
+    Desk_File_printf(out,"%c%c",34,34);
+
+  Desk_File_printf(out,"\n");
+  Desk_File_printf(out,"TERMINAL  %s\n",terminal[t_terminal].string);
+  Desk_File_printf(out,"BAUD      %s\n",baud[t_baud].string);
+  Desk_File_printf(out,"DATA      %s\n",data[t_data].string);
+  switch(t_filetr)
+  {
+    case 0: // xmodem
+      Desk_File_printf(out,"FILETR    %s %d %d\n",transfer[t_filetr],t_xmodem_crc,t_xmodem_k);
+    break;
+    case 1: // ymodem
+      Desk_File_printf(out,"FILETR    %s %d %d\n",transfer[t_filetr],t_ymodem_crc,t_ymodem_k);
+    break;
+    case 2: // zmodem
+      Desk_File_printf(out,"FILETR    %s %d %d %d %d\n",transfer[t_filetr],t_tx_window_size,
+                       t_send_crashrecovery,t_ackint,t_receive_file_action);
+    break;
+    case 3: // ascii
+      Desk_File_printf(out,"FILETR    %s %d %d %d\n",transfer[t_filetr],t_ascii_char_delay,
+                       t_ascii_line_delay,t_ascii_trans);
+    break;
+
+  }
+  if(t_wrap==1)
+    strcpy(gstring,"ON");
+  if(t_wrap==0)
+    strcpy(gstring,"OFF");
+  Desk_File_printf(out,"WRAP      %s\n",gstring);
+  if(t_echo)
+    strcpy(gstring,"ON");
+  else
+    strcpy(gstring,"OFF");
+  Desk_File_printf(out,"ECHO      %s\n",gstring);
+  if(t_lines25)
+    strcpy(gstring,"ON");
+  else
+    strcpy(gstring,"OFF");
+  Desk_File_printf(out,"LINES25   %s\n",gstring);
+  if(t_avatar)
+    strcpy(gstring,"ON");
+  else
+    strcpy(gstring,"OFF");
+  Desk_File_printf(out,"AVATAR    %s\n",gstring);
+  Desk_File_printf(out,"ONLINE    %d\n",t_online);
+  Desk_File_printf(out,"MODEMINIT %c%s%c\n",34,t_modeminit,34);
+  if(strcmp(old_downloads_directory,t_download))
+    Desk_File_printf(out,"DOWNLOAD  %c%s%c\n",34,t_download,34);
+  else
+    Desk_File_printf(out,"DOWNLOAD  %c%c\n",34,34);
+  /*
+  for(i=0;i<12;i++)
+  {
+    if(fkeys[i]!=NULL)
+      Desk_File_printf(out,"KEY       %cF%d%c,%c%s%c\n",34,i+1,34,34,fkeys[i],34);
+  }
+  */
+  for(i=0;i<12;i++)
+  {
+    //Desk_Icon_GetText(fkeys_window,i,gstring);
+    if(strlen(t_fkeys[i])>0)
+     Desk_File_printf(out,"KEY       %cF%d%c,%c%s%c\n",34,i+1,34,34,t_fkeys[i],34);
+  }
+
+  for(i=0;i<8;i++)
+  {
+    //Desk_Icon_GetText(fkeys_window,i,gstring);
+    if(strlen(t_sb_label[i])>0)
+     Desk_File_printf(out,"SMARTBUTTON %d %c%s%c %c%s%c\n",i+1,34,t_sb_label[i],34,34,t_sb_data[i],34);
+  }
+
+  Desk_File_printf(out,"ENDHEADER\n\n");
+
+  if(old!=NULL)
+  {
+    // skip header
+    end=FALSE;
+    while(!end)
+    {
+      skip_blanks(old);
+      token=get_token(old);
+
+      if(token==ENDHEADER)
+        end=TRUE;
+      next_line(old);
+      skip_lines(old);
+    }
+    while(!Desk_File_EOF(old))
+    {
+      z=Desk_File_ReadChar(old);
+      Desk_File_WriteChar(out,z);
+    }
+    Desk_File_Close(old);
+  }
+  else
+  {
+    Desk_File_printf(out,"REM Logon\n");
+    Desk_File_printf(out,"\nDIAL\n");
+    Desk_File_printf(out,"\nEND\n");
+  }
+  Desk_File_Close(out);
+
+  sprintf(gstring2,"%s.!new!",SCRIPTS_PATH);
+  Desk_File_SetType(gstring2,Desk_filetype_TEXT);
+  sprintf(gstring,"%s.%s",SCRIPTS_PATH,name);
+  Desk_SWI(9,0,Desk_SWI_OS_FSControl,26 /* Copy */,gstring2,gstring,130,0,0,0,0,0);
+}
+
+
+void check_wait(void)
+{
+  char *p;
+  int i;
+
+  if(action==WAIT)
+  {
+    if(wait!=-1 && wait!=-2)
+    {
+      t=Desk_Time_Monotonic()+wait;
+      wait=-2;
+    }
+    if(wait==-2)
+    {
+      if(t<=Desk_Time_Monotonic())
+      {
+        action=0;
+        if(if_seen==1)
+          if_return=0;
+        if(if_seen==2) // IFN
+          if_return=1;
+      }
+    }
+    p=wsl+strlen(wsl)-strlen(string); // vergleicht strright(wsl,strlen(string)) mit string
+    if(string[0]!=0 && !strcmp(p,string))
+    {
+      for(i=0;i<strlen(string);i++) // aus der Warteschlange loeschen
+        *p++=32;
+      action=0;
+      if(if_seen==1)
+        if_return=1;
+      if(if_seen==2) // IFN
+        if_return=0;
+    }
+    /*
+    if(string[0]!=0 && (p=strstr(wsl,string)))
+    {
+      for(i=0;i<strlen(string);i++) // aus der Warteschlange loeschen
+        *p++=32;
+      action=0;
+    }
+    */
+  }
+}
+
+
+void scan_logon(char *name)
+{
+  int token;
+  int token2;
+  int end;
+  char waittime[12];
+  int z,i,c,n,len;
+  Desk_file_position file_pos2;
+  int return_value;
+  //char *wsd;
+  static Desk_file_position file_pos;
+  static file_des *current_file;
+  struct tm ts;
+  time_t time_now;
+  time_t time_wait;
+  char *p1,*p2;
+  double diff;
+  Desk_file_handle f=-1;
+  Desk_event_pollblock event;
+  time_t spool_time;
+
+
+  if(logon==0)
+    return;
+
+  if(logon==1)
+  {
+    file_pos=0;
+    action=0;
+  }
+
+/*
+  if(action==0)
+  {
+    if(logon_file!=-1)
+    {
+       Desk_File_Close(logon_file);
+       logon_file=-1;
+    }
+    sprintf(gstring2,"%s.%s",SCRIPTS_PATH,name);
+    logon_file=Desk_File_Open(gstring2,Desk_file_READ);
+    if(logon_file==NULL)
+    {
+      sprintf(gstring2,"Couldn't open file %s",name);
+      show_message(gstring2);
+      logon=0;
+    }
+  }
+*/
+
+  // skip header
+  if(logon==1 && action==0)
+  {
+    if(logon_file!=-1)
+    {
+       Desk_File_Close(logon_file);
+       logon_file=-1;
+    }
+
+    sprintf(gstring2,"%s.%s",SCRIPTS_PATH,name);
+    logon_file=Desk_File_Open(gstring2,Desk_file_READ);
+    if(logon_file==NULL)
+    {
+      sprintf(gstring2,"Couldn't open file %s",name);
+      show_message(gstring2);
+      logon=0;
+    }
+
+    logon++;
+    end=FALSE;
+    while(!end)
+    {
+      skip_blanks(logon_file);
+      token=get_token(logon_file);
+
+      if(token==ENDHEADER)
+        end=TRUE;
+      next_line(logon_file);
+      skip_lines(logon_file);
+    }
+    //file_pos=Desk_File_ReturnPos(logon_file);
+  }
+
+  if(action==0)
+  {
+    //Desk_File_Seek(logon_file,file_pos);
+    strcpy(string,"");
+    end=FALSE;
+    skip_blanks(logon_file);
+    token=get_token(logon_file);
+
+    if((if_seen && if_return) || !if_seen || (if_seen && token==WAIT))
+    {
+
+      switch(token)
+      {
+        case REM:
+          next_line(logon_file);
+          skip_lines(logon_file);
+        break;
+        case WAITUNTIL:
+          skip_blanks(logon_file);
+          get_text(logon_file,string); // 12.08.1997
+          strcpy(gstring,string);
+          strcat(gstring," ");
+          p1=string;
+          p2=strchr(p1,'.');
+          *p2=0;
+          ts.tm_mday=atoi(p1);
+          //Desk_Error_Report(0,"day: %d",ts.tm_mday);
+          p1=p2+1;
+          p2=strchr(p1,'.');
+          *p2=0;
+          ts.tm_mon=atoi(p1)-1;
+          //Desk_Error_Report(0,"mon: %d",ts.tm_mon);
+          p1=p2+1;
+          ts.tm_year=atoi(p1)-1900;
+          //Desk_Error_Report(0,"year: %d",ts.tm_year);
+          skip_blanks(logon_file);
+          get_text(logon_file,string); // 20:00:00
+          strcat(gstring,string);
+          next_line(logon_file);
+          skip_lines(logon_file);
+          p1=string;
+          p2=strchr(p1,':');
+          *p2=0;
+          ts.tm_hour=atoi(p1);
+          //Desk_Error_Report(0,"hour: %d",ts.tm_hour);
+          p1=p2+1;
+          p2=strchr(p1,':');
+          *p2=0;
+          ts.tm_min=atoi(p1);
+          //Desk_Error_Report(0,"min: %d",ts.tm_min);
+          p1=p2+1;
+          ts.tm_sec=atoi(p1);
+          //Desk_Error_Report(0,"sec: %d",ts.tm_sec);
+
+          time_now=time(&time_now);
+          time_wait=mktime(&ts);
+          //Desk_Error_Report(0,"time now: %s",ctime(&time_now));
+          //Desk_Error_Report(0,"time wait: %s",ctime(&time_wait));
+          //Desk_Error_Report(0,"diff: %f",difftime(time_wait,time_now));
+          if(statusline)
+            Desk_Icon_printf(unten_window,UNTEN_LSTATUS,"WAITU %s",gstring);
+          pause_status=1;
+          while((diff=difftime(time_wait,time_now))>0)
+          {
+            time_now=time(&time_now);
+            Desk_Event_Poll();
+          }
+          pause_status=0;
+        break;
+        case WAIT:
+          wait=-1;
+          skip_blanks(logon_file);
+          z=Desk_File_ReadChar(logon_file);
+          if(z=='"' || z=='<')
+          {
+            back(logon_file);
+            get_string(logon_file,string);
+
+            z=Desk_File_ReadChar(logon_file);
+
+            while(z!=',' && z>=32)
+              z=Desk_File_ReadChar(logon_file);
+
+            if(z==',')
+            {
+              skip_blanks(logon_file);
+              get_text(logon_file,waittime);
+              wait=atoi(waittime);
+              if(wait==0)
+                wait=-1;
+            }
+            else
+              back(logon_file);
+          }
+          else
+          {
+            back(logon_file);
+            get_text(logon_file,waittime);
+            wait=atoi(waittime);
+          }
+          if(!if_seen)
+          {
+            next_line(logon_file);
+            skip_lines(logon_file);
+          }
+          if((len=strlen(string))>20)
+          {
+            for(i=0;i<20;i++)
+              string[i]=string[i+len-20];
+            string[i]=0;
+          }
+          action=WAIT;
+          if(string[0]!=0 && wait!=-1 && statusline)
+            Desk_Icon_printf(unten_window,UNTEN_LSTATUS,"WAIT %c%s%c,%d",34,string,34,wait);
+          if(string[0]!=0 && wait==-1 && statusline)
+            Desk_Icon_printf(unten_window,UNTEN_LSTATUS,"WAIT %c%s%c",34,string,34);
+          if(string[0]==0 && wait!=-1 && statusline)
+            Desk_Icon_printf(unten_window,UNTEN_LSTATUS,"WAIT %d",wait);
+        break;
+        case SEND:
+          skip_blanks(logon_file);
+          get_string(logon_file,string);
+          next_line(logon_file);
+          skip_lines(logon_file);
+          action=SEND;
+          if(statusline)
+            Desk_Icon_printf(unten_window,UNTEN_LSTATUS,"SEND %c%s%c",34,string,34);
+        break;
+        case DIAL:
+          next_line(logon_file);
+          skip_lines(logon_file);
+          action=DIAL;
+          if(statusline)
+            Desk_Icon_printf(unten_window,UNTEN_LSTATUS,"DIAL %s",t_number[t_number_nr]);
+        break;
+        case OSCLI:
+          skip_blanks(logon_file);
+          get_string(logon_file,string);
+          next_line(logon_file);
+          skip_lines(logon_file);
+          action=OSCLI;
+          if(statusline)
+            Desk_Icon_printf(unten_window,UNTEN_LSTATUS,"OSCLI %c%s%c",34,string,34);
+        break;
+        case UPLOAD:
+          skip_blanks(logon_file);
+          get_string(logon_file,string);
+          next_line(logon_file);
+          skip_lines(logon_file);
+          action=UPLOAD;
+          if(statusline)
+            Desk_Icon_printf(unten_window,UNTEN_LSTATUS,"UPLOAD %c%s%c",34,string,34);
+        break;
+        case IF:
+        case IFN:
+          if_return=0;
+
+          if(token==IF)
+          {
+            return_value=1;
+            if_seen=1;
+          }
+          else
+          {
+            return_value=0;
+            if_seen=2;
+          }
+          skip_blanks(logon_file);
+          file_pos2=Desk_File_ReturnPos(logon_file);
+          token2=get_token(logon_file);
+          //Desk_Error_Report(0,"token: %d,%s",token2,str);
+          if(token2==-1)
+          {
+            Desk_File_Seek(logon_file,file_pos2);
+            //get_text(logon_file,gstring2);
+            get_variable(logon_file,gstring2);
+            for(i=0;i<nr_of_vars;i++)
+            {
+              if(!strcmp(vars[i].name,gstring2))
+              {
+                skip_blanks(logon_file);
+                //get_text(logon_file,gstring);
+                get_condition(logon_file,gstring);
+                if(!strcmp(gstring,">"))
+                {
+                  skip_blanks(logon_file);
+                  get_number(logon_file,gstring);
+                  skip_blanks(logon_file);
+                  if(vars[i].value>atoi(gstring))
+                    if_return=return_value;
+                  else
+                    if_return=!return_value;
+                }
+                if(!strcmp(gstring,"<"))
+                {
+                  skip_blanks(logon_file);
+                  get_number(logon_file,gstring);
+                  skip_blanks(logon_file);
+                  if(vars[i].value<atoi(gstring))
+                    if_return=return_value;
+                  else
+                    if_return=!return_value;
+                }
+                if(!strcmp(gstring,">="))
+                {
+                  skip_blanks(logon_file);
+                  get_number(logon_file,gstring);
+                  skip_blanks(logon_file);
+                  if(vars[i].value>=atoi(gstring))
+                    if_return=return_value;
+                  else
+                    if_return=!return_value;
+                }
+                if(!strcmp(gstring,"<="))
+                {
+                  skip_blanks(logon_file);
+                  get_number(logon_file,gstring);
+                  skip_blanks(logon_file);
+                  if(vars[i].value<=atoi(gstring))
+                    if_return=return_value;
+                  else
+                    if_return=!return_value;
+                }
+                if(!strcmp(gstring,"=="))
+                {
+                  skip_blanks(logon_file);
+                  get_number(logon_file,gstring);
+                  skip_blanks(logon_file);
+                  if(vars[i].value==atoi(gstring))
+                    if_return=return_value;
+                  else
+                    if_return=!return_value;
+                }
+                if(!strcmp(gstring,"!="))
+                {
+                  skip_blanks(logon_file);
+                  get_number(logon_file,gstring);
+                  skip_blanks(logon_file);
+                  if(vars[i].value!=atoi(gstring))
+                    if_return=return_value;
+                  else
+                    if_return=!return_value;
+                }
+                break;
+              }
+            }
+            if(i==nr_of_vars)
+            {
+              strcpy(gstring,"Couldn't find variable '");
+              strcat(gstring,gstring2);
+              strcat(gstring,"'");
+              show_message(gstring);
+            }
+            //next_line(logon_file);
+            //skip_lines(logon_file);
+            //if_seen=0;
+          }
+          else
+          {
+            if(token2==WAIT)
+              Desk_File_Seek(logon_file,file_pos2);
+            else
+            {
+              sprintf(gstring,"Don't know what to do with %s after IF",str);
+              show_message(gstring);
+            }
+          }
+        break;
+        case GOTO:
+        case GOSUB:
+          skip_blanks(logon_file);
+          get_text(logon_file,gstring2);
+          next_line(logon_file);
+          skip_lines(logon_file);
+          if(token==GOSUB)
+          {
+            if(return_nr>=MAX_RETURN_NR)
+            {
+              show_message("Too many nested gosubs");
+              if(statusline)
+                Desk_Icon_SetText(unten_window,UNTEN_LSTATUS,"aborted");
+              end=TRUE;
+              action=0;
+              logon=0;
+            }
+            else
+              return_pos[return_nr++]=Desk_File_ReturnPos(logon_file);
+          }
+          for(i=0;i<nr_of_labels;i++)
+          {
+            if(!strcmp(labels[i].name,gstring2))
+            {
+              Desk_File_Seek(logon_file,labels[i].pos);
+              break;
+            }
+          }
+          if(i==nr_of_labels)
+          {
+            strcpy(gstring,"Couldn't find label '");
+            strcat(gstring,gstring2);
+            strcat(gstring,"'");
+            show_message(gstring);
+          }
+        break;
+        case RETURN:
+          if(return_nr>0)
+            Desk_File_Seek(logon_file,return_pos[--return_nr]);
+          else
+            show_message("No address left to return");
+        break;
+        case SET:
+          skip_blanks(logon_file);
+          get_text(logon_file,gstring);
+          for(i=0;i<nr_of_vars;i++)
+          {
+            if(!strcmp(vars[i].name,gstring))
+              break;
+          }
+          if(i==nr_of_vars)
+          {
+            vars[nr_of_vars].name=(char *)Desk_DeskMem_Malloc(strlen(gstring)+1);
+            strcpy(vars[nr_of_vars].name,gstring);
+            skip_blanks(logon_file);
+            get_text(logon_file,gstring);
+            vars[nr_of_vars++].value=atoi(gstring);
+          }
+          else // variable wurde schon mal gesetzt
+          {
+            skip_blanks(logon_file);
+            get_text(logon_file,gstring);
+            vars[i].value=atoi(gstring);
+          }
+
+          next_line(logon_file);
+          skip_lines(logon_file);
+          //Desk_Error_Report(0,"var: %s = %d",vars[0].name,vars[0].value);
+        break;
+        case INC:
+        case DEC:
+          skip_blanks(logon_file);
+          get_text(logon_file,gstring2);
+          next_line(logon_file);
+          skip_lines(logon_file);
+          for(i=0;i<nr_of_vars;i++)
+          {
+            if(!strcmp(vars[i].name,gstring2))
+            {
+              if(token==INC)
+                vars[i].value++;
+              else
+                vars[i].value--;
+              //Desk_Error_Report(0,"var: %s = %d",vars[i].name,vars[i].value);
+              break;
+            }
+          }
+          if(i==nr_of_vars)
+          {
+            strcpy(gstring,"Couldn't find variable '");
+            strcat(gstring,gstring2);
+            strcat(gstring,"'");
+            show_message(gstring);
+          }
+        break;
+        case HANGUPS:
+          next_line(logon_file);
+          skip_lines(logon_file);
+          //pause_status=1;
+          script_hangup=1;
+          hangup();
+          transfer_active=0;
+          //pause_status=0;
+        break;
+        case RECORD:
+          skip_blanks(logon_file);
+          if(Desk_File_ReadChar(logon_file)!='"') // no file name
+          {
+            back(logon_file);
+            time(&spool_time);
+            strftime(gstring,80,"%d%m_%H%M",localtime(&spool_time)); // daymonth_hourminute
+            for(i=0;i<strlen(gstring);i++)
+            {
+              if(!isalpha(gstring[i]) && !isdigit(gstring[i]))
+                gstring[i]='_';
+            }
+          }
+          else
+          {
+            back(logon_file);
+            get_string(logon_file,gstring);
+          }
+          skip_blanks(logon_file);
+          next_line(logon_file);
+          skip_lines(logon_file);
+          sprintf(spool_filename,"<Wimp$ScrapDir>.Connector.SpoolFiles.%s",gstring);
+          Desk_File_CreateDirectory("<Wimp$ScrapDir>.Connector");
+          Desk_File_CreateDirectory("<Wimp$ScrapDir>.Connector.SpoolFiles");
+          f=Desk_File_Open(spool_filename,Desk_file_WRITE);
+          if(f==-1)
+          {
+            show_message(msg[5].text);
+            break;//return;
+          }
+          Desk_File_Close(f);
+          if(export_data_text)
+            Desk_File_SetType(spool_filename,Desk_filetype_TEXT);
+          else
+            Desk_File_SetType(spool_filename,Desk_filetype_DATA);
+          spool_position=0;
+          event.data.mouse.icon=SPOOL_REC;
+          Click_spool_window(&event, NULL);
+          Open_spool_window();
+        break;
+        case STATUSLINE:
+          skip_blanks(logon_file);
+          get_text(logon_file,gstring);
+          next_line(logon_file);
+          skip_lines(logon_file);
+          if(!Desk_stricmp(gstring,"ON"))
+            statusline=1;
+          if(!Desk_stricmp(gstring,"OFF"))
+            statusline=0;
+        break;
+        case QUIT:
+          next_line(logon_file);
+          skip_lines(logon_file);
+          quit_prg(0);  // forces quit even if file transfer active.
+        break;
+        case END:
+          //Desk_Error_Report(0,"hier!");
+          //next_line(logon_file);
+          //skip_lines(logon_file);
+          if(online)
+          {
+            if(t_name[0]!=0 && statusline)
+              Desk_Icon_printf(unten_window,UNTEN_LSTATUS,"Logged in %c%s%c",34,t_name,34);
+          }
+          else
+          {
+            if(statusline)
+              Desk_Icon_SetText(unten_window,UNTEN_LSTATUS,"END");
+          }
+          end=TRUE;
+          action=0;
+          logon=0;
+          if(logon_file!=-1)
+          {
+            Desk_File_Close(logon_file);
+            logon_file=-1;
+          }
+        break;
+        case 0: // skip label
+          next_line(logon_file);
+          skip_lines(logon_file);
+        break;
+        case -1: // skip unknown command
+          next_line(logon_file);
+          skip_lines(logon_file);
+        break;
+      }
+      if(action!=WAIT && token!=IF && token!=IFN)
+      {
+        if_seen=0;
+      }
+    }
+    else
+    {
+      next_line(logon_file);  // wenn if false dann naechste zeile
+      skip_lines(logon_file);
+      if_seen=0;
+    }
+
+    //file_pos=Desk_File_ReturnPos(logon_file);
+
+    /*
+    if(logon_file!=-1)
+    {
+      Desk_File_Close(logon_file);
+      logon_file=-1;
+    }
+    */
+  }
+
+  if(action==DIAL)
+  {
+    dial(t_number[t_number_nr]);
+    action=0;
+  }
+
+  check_wait();
+  /*
+  if(action==WAIT)
+  {
+    if(wait!=-1 && wait!=-2)
+    {
+      t=Desk_Time_Monotonic()+wait;
+      wait=-2;
+    }
+    if(wait==-2)
+    {
+      if(t<=Desk_Time_Monotonic())
+        action=0;
+    }
+
+    if(string[0]!=0 && strstr(wsl,string))
+      action=0;
+  }
+  */
+
+  if(action==SEND)
+  {
+      // verschluesselt nach rot13 Verfahren
+      if(string[0]=='®')
+      {
+        i=0;
+        c=string[i+1];
+        while( c!='®' && c!=0 )
+        {
+          if( (c>=65 && c<=90) || (c>=97 && c<=122) )
+          {
+            n=(c&0x1f);
+            n+=13;
+            if(n>26)
+              n-=26;
+            string[i]=(c&0xe0);
+            string[i]+=n;
+          }
+          else
+            string[i]=c;
+          i++;
+          c=string[i+1];
+        }
+        if(c!='®')
+        {
+          //show_message("'®' missing in Script File");
+          string[i]=0;
+        }
+        else
+        {
+          while(string[i+2]!=0)
+          {
+            string[i]=string[i+2];
+            i++;
+          }
+          string[i]=0;
+        }
+      }
+      send_string(string);
+      /*
+      for(i=0;i<strlen(string);i++)
+        *wsd++=32;
+      */
+      action=0;
+  }
+
+  if(action==OSCLI)
+  {
+    if(system(string)==-2)
+      show_message("Error in OSCLI command.");
+    action=0;
+  }
+
+  if(action==UPLOAD)
+  {
+    current_file = (file_des *)Desk_DeskMem_Malloc(sizeof (file_des));
+    current_file->filetype=0xffd;
+    current_file->size=Desk_File_GetLength(string);
+    Desk_Filing_GetLeafname(string,current_file->name);
+    Desk_LinkList_Init(&(current_file->header));
+    Desk_LinkList_AddToTail(&Files,&(current_file->header));
+    file_nr++;
+    Desk_Filing_GetPathname(string,file_path);
+    Desk_Filing_GetPathname(string,current_file->path);
+    current_file->sent=0;
+    current_file->selected=0;
+    create_send_list();
+    send_all=1;
+    start_send();
+
+    //Desk_Error_Report(0,"hier");
+    //current_file=Desk_LinkList_FirstItem(&Files);
+    //Desk_LinkList_Unlink(&Files,&(current_file->header));
+    //Desk_DeskMem_Free(current_file);
+
+    action=0;
+  }
+  if(action==HANGUPS)
+  {
+    hangup();
+    action=0;
+  }
+}
+
+
+void load_name(char *name)
+{
+  Desk_file_handle file;
+  int token;
+
+  sprintf(gstring,"%s.%s",SCRIPTS_PATH,name);
+  file=Desk_File_Open(gstring,Desk_file_READ);
+  if(file==NULL)
+  {
+    sprintf(gstring,"Couldn't open file %s",name);
+    show_message(gstring);
+    return;
+  }
+
+  while(!Desk_File_EOF(file))
+  {
+    skip_lines(file);
+    skip_blanks(file);
+    token=get_token(file);
+
+    if(token==NAME)
+    {
+      skip_blanks(file);
+      get_string(file,t_name);
+      //strcpy(t_oldname,t_name);
+      next_line(file);
+      skip_lines(file);
+      break;
+    }
+    else
+    {
+      next_line(file);
+      skip_lines(file);
+    }
+  }
+  if(t_name[0]==0)
+    Desk_Error_Report(0,"Error in script file '%s'",name);
+  Desk_File_Close(file);
+}
+
+void scan_scripts_dir(void)
+{
+  char filename[60];
+  int number,seq_point;
+  Desk_icon_handle iconh;
+  Desk_icon_createblock icon;
+  int ypos,worky;
+  char *indirectstring="";
+  char *name;
+  Desk_window_openblock open;
+  Desk_window_state state;
+  char *p;
+
+  dial_menu_items[0]=0;
+
+  // scan scripts directory
+  icon.window = pane_window;
+  icon.icondata.workarearect.min.x=8;
+  icon.icondata.workarearect.max.x=600;
+  icon.icondata.flags.value=0x77018511;
+  //icon.icondata.flags.value=0x77018411;
+  //icon.icondata.data.indirecttext.bufflen=30;
+  icon.icondata.data.indirecttext.validstring=indirectstring;
+
+  ypos=-8;
+  seq_point=0;
+  number=1;
+  number_of_scripts=0;
+  do
+  {
+    Desk_Filing_ReadDirNames(SCRIPTS_PATH,filename,&number,&seq_point,60,NULL);
+    if (number && Desk_stricmp(filename,"!Default!"))
+    {
+      /* Got filename */
+      icon.icondata.workarearect.min.y=ypos-48;
+      icon.icondata.workarearect.max.y=ypos;
+      t_name[0]=0;
+      load_name(filename);
+      if(t_name[0]!=0)
+      {
+        //sprintf(gstring,"%s,",t_name);
+        strcpy(gstring,t_name);
+        while((p=strchr(gstring,',')))
+          *p=';';
+
+        strcat(dial_menu_items,gstring);
+        strcat(dial_menu_items,",");
+
+        name=(char *)Desk_DeskMem_Malloc(strlen(t_name)+1);
+        strcpy(name,t_name);
+
+        if(t_filename[number_of_scripts]!=NULL)
+          Desk_DeskMem_Free(t_filename[number_of_scripts]);
+        t_filename[number_of_scripts] = (char *) Desk_DeskMem_Malloc(strlen(filename)+1);
+        //else
+        //  DeskMem_Realloc(t_filename[number_of_scripts],strlen(filename)+1);
+
+        /*
+        if(t_filename[number_of_scripts]==NULL)
+          flex_alloc((flex_ptr)&t_filename[number_of_scripts],strlen(filename)+1);
+        else
+          flex_extend((flex_ptr)&t_filename[number_of_scripts],strlen(filename)+1);
+        */
+
+        strcpy(t_filename[number_of_scripts],filename);
+        icon.icondata.data.indirecttext.buffer=name;
+        icon.icondata.data.indirecttext.bufflen=strlen(t_name)+1;
+        Desk_Wimp_CreateIcon(&icon,&iconh);
+        ypos-=48;
+        number_of_scripts++;
+      }
+    }
+  }
+  while(seq_point>=0);
+
+  worky=number_of_scripts*48+8+52; //76;
+  if (worky>416)
+    Desk_Window_SetExtent(pane_window,0,-worky,608,0);
+  else
+    Desk_Window_SetExtent(pane_window,0,-416,608,0);
+  Desk_Window_ForceWholeRedraw(pane_window);
+  t_name[0]=0;
+
+  if(Desk_Window_IsOpen(pane_window))
+  {
+    open.window=pane_window;
+    Desk_Wimp_GetWindowState(pane_window,&state);
+    open.screenrect.min.x=state.openblock.screenrect.min.x;
+    open.screenrect.min.y=state.openblock.screenrect.min.y;
+    open.screenrect.max.x=state.openblock.screenrect.max.x;
+    open.screenrect.max.y=state.openblock.screenrect.max.y;
+    open.behind=state.openblock.behind;
+    open.scroll.y=0;
+    open.scroll.x=0;
+    Desk_Pane2_OpenWindow(pane_window,&open);
+  }
+  dial_menu_items[strlen(dial_menu_items)-1]=0; // loesche letztes komma
+  dial_menu=Desk_Menu_New("Dial",dial_menu_items);
+}
+
+void remove_script(char *name)
+{
+  sprintf(gstring,"%s.%s",SCRIPTS_PATH,name);
+  Desk_File_Delete(gstring);
+}
+
+
+

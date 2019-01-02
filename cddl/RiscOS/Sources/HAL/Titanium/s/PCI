@@ -1,0 +1,745 @@
+;
+; CDDL HEADER START
+;
+; The contents of this file are subject to the terms of the
+; Common Development and Distribution License (the "Licence").
+; You may not use this file except in compliance with the Licence.
+;
+; You can obtain a copy of the licence at
+; cddl/RiscOS/Sources/HAL/Titanium/LICENCE.
+; See the Licence for the specific language governing permissions
+; and limitations under the Licence.
+;
+; When distributing Covered Code, include this CDDL HEADER in each
+; file and include the Licence file. If applicable, add the
+; following below this CDDL HEADER, with the fields enclosed by
+; brackets "[]" replaced with your own identifying information:
+; Portions Copyright [yyyy] [name of copyright owner]
+;
+; CDDL HEADER END
+;
+;
+; Copyright 2014 Elesar Ltd.  All rights reserved.
+; Use is subject to license terms.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:OSEntries
+
+        GET     hdr.RegMap
+        GET     hdr.StaticWS
+                
+        AREA    |PCI$$Code|, CODE, READONLY, PIC
+
+        EXPORT  HAL_PCIAddresses
+        EXPORT  HAL_PCISlotTable
+        EXPORT  HAL_PCIReadConfigByte
+        EXPORT  HAL_PCIReadConfigWord
+        EXPORT  HAL_PCIReadConfigHalfword
+        EXPORT  HAL_PCIWriteConfigByte
+        EXPORT  HAL_PCIWriteConfigWord
+        EXPORT  HAL_PCIWriteConfigHalfword
+        EXPORT  PCIIRQEnable
+        EXPORT  PCIIRQDisable
+        EXPORT  PCIIRQClear
+        EXPORT  PCIIRQSource
+        EXPORT  PCIIRQStatus
+        EXPORT  PCIInit
+        IMPORT  PCIProbing
+        IMPORT  memcpy
+        IMPORT  HAL_DebugTXInlineString
+        IMPORT  HAL_CounterDelay
+        IMPORT  HAL_IRQEnable
+        IMPORT  HAL_IRQDisable
+        IMPORT  HAL_IRQClear
+        IMPORT  HAL_IRQSource
+        IMPORT  HAL_IRQStatus
+
+; Bounds
+PCILog2BusLimit * 4                     ; More than 1 bit, but not as crazy as 8
+PCIBusLimit     * 1:SHL:PCILog2BusLimit 
+PCILog2DevLimit * 5                     ; Per PCI 3.0 spec
+PCIDevLimit     * 1:SHL:PCILog2DevLimit 
+PCILog2FnLimit  * 3                     ; Per PCI 3.0 spec
+PCIFnLimit      * 1:SHL:PCILog2FnLimit  
+PCICfgSpaceSize * (PCIBusLimit * PCIDevLimit * PCIFnLimit * 256)
+PCIIOSpaceSize  * 1024 * 1024           ; Semi arbitrary, it is deprecated after all
+PCIMemSpaceSize * PCIeL3Window_PhysSize - PCICfgSpaceSize - PCIIOSpaceSize
+PCILinkUpTries  * 1024
+PCILinkUpDelay  * 40                    ; Microseconds
+
+; TLP fields per Figure 2-5 of PCIe 2.1
+Fmt3WNoData         * 2_000             ; 3 words, no data
+Fmt4WNoData         * 2_001             ; 4 words, no data
+Fmt3WWithData       * 2_010             ; 3 words, with data amount in length field
+Fmt4WWithData       * 2_011             ; 4 words, with data amount in length field
+FmtTLPPrefix        * 2_100             ; TLP prefix
+TypeM               * 2_00000           ; Memory read/write
+TypeMRdLk           * 2_00001           ; Memory read request locked
+TypeIO              * 2_00010           ; IO read/write
+TypeCfg0            * 2_00100           ; Configuration read/write type 0
+TypeCfg1            * 2_00101           ; Configuration read/write type 1
+TypeMsg             * 2_10000           ; Message request
+TypeRoutingMask     * 2_00111           ; Bits containing routing mechanism in TypeMsg
+TypeRoutingShift    * 0
+TypeCpl             * 2_01010           ; Completion
+TypeCplLk           * 2_01011           ; Completion of TypeMRdLk
+TypeFetchAdd        * 2_01100           ; Fetch and add atomic
+TypeSwap            * 2_01101           ; Unconditional swap atomic
+TypeCAS             * 2_01110           ; Compare and swap atomic
+TypeLPrfx           * 2_00000           ; Local TLP prefix
+TypeLPrfxMask       * 2_01111           ; Bits containing type for FmtTLPPrefix
+TypeLPrfxShift      * 0
+TypeEPrfx           * 2_10000           ; End to end TLP prefix
+TypeEPrfxMask       * 2_01111           ; Bits containing type for FmtTLPPrefix
+TypeEPrfxShift      * 0
+AttrIDOrdering      * 2_100             ; Note these aren't adjacent in the header
+AttrRelaxedOrdering * 2_010
+AttrNoSnoop         * 2_001
+
+; ATU allocations       ARM view          PCI view
+; PCIe1 OBR0    Cfg     20000000-200FFFFF 00000000-000FFFFF
+;       OBR1    IO      2FF00000-2FFFFFFF 00000000-000FFFFF
+;       OBR2    Memory  20100000-2FEFFFFF 00000000-0FDFFFFF <-+
+;       OBR3-15 Unused                                        |
+;       IBR0-1  Unused                                        |
+;       IBR2    Memory  80000000-FFFFFFFF 00000000-7FFFFFFF   |- Note the 2MB hole
+;       IBR3    Unused                                        |  in memory space
+; PCIe2 OBR0    Cfg     3FF00000-3FFFFFFF 00000000-000FFFFF   |
+;       OBR1    IO      30000000-300FFFFF 00100000-001FFFFF   |
+;       OBR2    Memory  30100000-3FEFFFFF 10000000-1FDFFFFF <-+
+;       OBR3-15 Unused
+;       IBR0-1  Unused
+;       IBR2    Memory  80000000-FFFFFFFF 00000000-7FFFFFFF
+;       IBR3    Unused
+PCICfgSpaces
+        DCD     PCIeL3Window1_PhysBase
+        DCD     PCIeL3Window2_PhysBase + PCIeL3Window_PhysSize - PCICfgSpaceSize
+PCIIOSpaces
+        DCD     PCIeL3Window1_PhysBase + PCIeL3Window_PhysSize - PCIIOSpaceSize
+        DCD     PCIeL3Window2_PhysBase
+PCIMemSpaces
+        DCD     PCIeL3Window1_PhysBase + PCICfgSpaceSize
+        DCD     PCIeL3Window2_PhysBase + PCIIOSpaceSize
+PCICfgTargetSpaces
+        DCD     0
+        DCD     0
+PCIIOTargetSpaces
+        DCD     0
+        DCD     PCIIOSpaceSize
+PCIMemOBTargetSpaces
+        DCD     0
+        DCD     PCIeL3Window_PhysSize
+PCIMemIBTargetSpaces
+        DCD     DRAM_PhysBase
+        DCD     DRAM_PhysBase
+PCIDevices
+        ASSERT  IRQCount < 256
+        DCB     DevNoPCIe0MSI, DevNoPCIe1MSI
+        ALIGN
+PCIClocks
+        DCD     CM_L3INIT_PCIESS1_CLKCTRL
+        DCD     CM_L3INIT_PCIESS2_CLKCTRL     
+PCIBases
+        DCD     PCIe_SS1_PhysBase
+        DCD     PCIe_SS2_PhysBase
+PCICount        * (. - PCIBases):SHR:2
+        ASSERT  ?PCIe_SS_LogBase = (4 * PCICount)
+
+; PCIOpenATU
+; => a1 = size of region
+;    a2 = options 0-7   = type for TLP
+;                 8-15  = region index
+;                 16-23 = flags
+;                 24-31 = controller index
+;    a3 = table of ARM view of the region address
+;    a4 = table of PCI view of the region address
+;    [sp + 0] = controller
+PCIOpenATU ROUT
+        Push    "lr"
+
+OpenTypeShift   * 0
+OpenRegionShift * 8
+OpenOB          * 0:SHL:16
+OpenIB          * 1:SHL:16
+OpenCtrlShift   * 24
+
+        ; Pick which region to open
+        UBFX    ip, a2, #OpenRegionShift, #8
+        MOV     ip, ip, LSL #PCIECTRL_PL_IATU_INDEX_REGION_INDEX_SHIFT
+        TST     a2, #OpenIB
+        ASSERT  PCIECTRL_PL_IATU_INDEX_REGION_DIRECTION_OB = 0
+        ORRNE   ip, ip, #PCIECTRL_PL_IATU_INDEX_REGION_DIRECTION_IB
+        LDR     lr, [sp, #4]            ; Recover the controller
+        STR     ip, [lr, #PCIECTRL_PL_IATU_INDEX]
+
+        ; Target view
+        UBFX    ip, a2, #OpenCtrlShift, #8
+        LDR     ip, [a4, ip, LSL #2]
+        STR     ip, [lr, #PCIECTRL_PL_IATU_REG_LOWER_TARGET]
+
+        ; ARM view
+        LDR     a4, =PCIECTRL_PL_IATU_REG_LOWER_BASE_OB_MASK
+        UBFX    ip, a2, #OpenCtrlShift, #8
+        LDR     ip, [a3, ip, LSL #2]
+        AND     a3, a4, ip
+        STR     a3, [lr, #PCIECTRL_PL_IATU_REG_LOWER_BASE]
+        ADD     a3, a3, a1
+        SUB     a3, a3, #1              ; Make inclusive
+        STR     a3, [lr, #PCIECTRL_PL_IATU_REG_LIMIT]
+
+        ; Always 32 bit
+        MOV     a3, #0
+        STR     a3, [lr, #PCIECTRL_PL_IATU_REG_UPPER_BASE]
+        STR     a3, [lr, #PCIECTRL_PL_IATU_REG_UPPER_TARGET]
+
+        ; Type control
+        UBFX    ip, a2, #OpenTypeShift, #8
+        MOV     ip, ip, LSL #PCIECTRL_PL_IATU_REG_CTRL_1_TYPE_SHIFT
+        STR     ip, [lr, #PCIECTRL_PL_IATU_REG_CTRL_1]
+        LDR     a3, =PCIECTRL_PL_IATU_REG_CTRL_2_REGION_ENABLE :OR: \
+                     PCIECTRL_PL_IATU_REG_CTRL_2_RESPONSE_CODE_NO_OVERRIDE
+        STR     a3, [lr, #PCIECTRL_PL_IATU_REG_CTRL_2]
+
+        Pull    "pc"
+
+; PCIIRQEnable
+; => a1 = device number
+; <= a1 = 0 was previously disabled
+PCIIRQEnable ROUT
+        Push    "lr"
+
+        ; Enable the corresponding line bit in the root complex, and
+        ; make sure the top level interrupt in the GIC is too
+        SUB     a2, a1, #DevNoPCIInts
+        MOV     a3, a2, LSR #2          ; A/B/C/D to controller conversion
+        ADR     a4, PCIe_SS_LogBase
+        LDR     a4, [a4, a3, LSL #2]
+
+        AND     a2, a2, #3
+        MOV     a1, #1
+        ASSERT  PCIECTRL_TI_CONF_IRQ_MSI_INTABCD_SHIFT = 0
+        MOV     a1, a1, LSL a2          ; Bit set of which to enable
+
+        LDR     a2, =:INDEX:PCIECTRL_TI_CONF_IRQENABLE_SET_MSI
+        ADD     a2, a4, a2
+
+        ; Be atomic while updating bits
+        MRS     a4, CPSR
+        ORR     ip, a4, #F32_bit :OR: I32_bit
+        MSR     CPSR_c, ip
+
+        LDR     lr, [a2]
+        STR     a1, [a2]
+
+        MSR     CPSR_c, a4
+
+        ANDS    a1, a1, lr              ; Enable when already enabled
+        Pull    "pc", NE
+
+        ADR     a4, PCIDevices
+        LDRB    a1, [a4, a3]
+        BL      HAL_IRQEnable           ; Enable the top level interrupt too
+
+        MOV     a1, #0
+        Pull    "pc"
+
+; PCIIRQDisable
+; => a1 = device number
+; <= a1 = 0 was previously disabled
+PCIIRQDisable ROUT
+        Push    "lr"
+
+        ; Clear the corresponding line bit in the root complex, if all
+        ; are now disable also disable the top level interrupt in the GIC
+        SUB     a2, a1, #DevNoPCIInts
+        MOV     a3, a2, LSR #2          ; A/B/C/D to controller conversion
+        ADR     a4, PCIe_SS_LogBase
+        LDR     a4, [a4, a3, LSL #2]
+
+        AND     a2, a2, #3
+        MOV     a1, #1
+        ASSERT  PCIECTRL_TI_CONF_IRQ_MSI_INTABCD_SHIFT = 0
+        MOV     a1, a1, LSL a2          ; Bit set of which to enable
+
+        LDR     a2, =:INDEX:PCIECTRL_TI_CONF_IRQENABLE_CLR_MSI
+        ADD     a2, a4, a2
+
+        ; Be atomic while updating bits
+        MRS     a4, CPSR
+        ORR     ip, a4, #F32_bit :OR: I32_bit
+        MSR     CPSR_c, ip
+
+        LDR     lr, [a2]
+        STR     a1, [a2]
+        DSB     SY                      ; Ensure write got through
+
+        MSR     CPSR_c, a4
+
+        ANDS    a1, a1, lr              ; Disable when already disabled?
+        Pull    "pc", EQ
+
+        TST     lr, #PCIECTRL_TI_CONF_IRQ_MSI_INTABCD_MASK
+        Pull    "pc", NE                ; At least 1 still on
+
+        ADR     a4, PCIDevices
+        LDRB    a1, [a4, a3]
+        BL      HAL_IRQDisable          ; Disable the top level interrupt too
+
+        MOV     a1, #1
+        Pull    "pc"
+
+; PCIIRQClear
+; => a1 = device number in the special DevNoPCIInts range
+PCIIRQClear ROUT
+        Push    "lr"
+
+        ; The action of servicing the peripheral results in a message being
+        ; sent to clear the line in the root complex, so this just needs
+        ; to convert an emulated device number into the root complex one
+        SUB     a2, a1, #DevNoPCIInts
+        MOV     a3, a2, LSR #2          ; A/B/C/D to controller conversion
+        ADR     a4, PCIDevices
+        LDRB    a1, [a4, a3]
+        BL      HAL_IRQClear
+
+        Pull    "pc"
+
+; PCIIRQSource
+; => a1 = DevNoPCIe0MSI or DevNoPCIe1MSI
+; <= a1 = device number of current interrupt (or -1 if none)
+PCIIRQSource ROUT
+        TEQ     a1, #DevNoPCIe0MSI
+        ASSERT  PCICount = 2
+        MOVEQ   a2, #0
+        MOVNE   a2, #1
+        ADR     a4, PCIe_SS_LogBase
+        LDR     a4, [a4, a2, LSL #2]    ; The controller that got us here
+        LDR     a3, =:INDEX:PCIECTRL_TI_CONF_IRQSTATUS_MSI
+        LDR     a3, [a4, a3]
+        MOV     a3, a3, LSL #32 - 4 - PCIECTRL_TI_CONF_IRQ_MSI_INTABCD_SHIFT
+        CLZ     a3, a3                  ; A/B/C/D -> 3/2/1/0 or 32 if none
+        RSBS    a4, a3, #3              ;         -> 0/1/2/3
+        ADDPL   a4, a4, a2, LSL #2      ; Plus controller index x 4
+        ADDPL   a1, a4, #DevNoPCIInts
+        MOVMI   a1, #-1                 ; Not even 1 bit was set
+        MOV     pc, lr
+        
+; PCIIRQStatus
+; => a1 = device number in the special DevNoPCIInts range
+; <= a1 = 0 if not interrupting
+PCIIRQStatus ROUT
+        SUB     a2, a1, #DevNoPCIInts
+        MOV     a3, a2, LSR #2          ; A/B/C/D to controller conversion
+        ADR     a4, PCIe_SS_LogBase
+        LDR     a4, [a4, a3, LSL #2]
+        LDR     a3, =:INDEX:PCIECTRL_TI_CONF_IRQSTATUS_MSI
+        LDR     a3, [a4, a3]
+        AND     a2, a2, #3              ; A/B/C/D interest
+        MOV     a4, #1
+        AND     a1, a3, a4, LSL a2
+        MOV     pc, lr
+
+; PCIInit
+PCIInit ROUT
+        Push    "v1-v4, lr"
+
+        ; Map in the reset registers
+        MOV     a1, #0
+        LDR     a2, =PRML3INIT_PhysBase
+        MOV     a3, #PRML3INIT_PhysSize
+        CallOS  OS_MapInIO
+        STR     a1, PRML3INIT_LogBase
+
+        ; Force into reset, clear reset flags, release from reset
+        MOV     a2, #RM_PCIESS_RSTCTRL_RST_LOCAL_PCIE1 :OR: \
+                     RM_PCIESS_RSTCTRL_RST_LOCAL_PCIE2
+        STR     a2, [a1, #RM_PCIESS_RSTCTRL]
+        ASSERT  RM_PCIESS_RSTCTRL_RST_LOCAL_PCIE1 = RM_PCIESS_RSTST_RST_LOCAL_PCIE1
+        ASSERT  RM_PCIESS_RSTCTRL_RST_LOCAL_PCIE2 = RM_PCIESS_RSTST_RST_LOCAL_PCIE2
+        STR     a2, [a1, #RM_PCIESS_RSTST]
+        MOV     a3, #0
+        STR     a3, [a1, #RM_PCIESS_RSTCTRL]
+10
+        LDR     a3, [a1, #RM_PCIESS_RSTST]
+        TEQ     a3, a2
+        BNE     %BT10
+
+        ; APLL reference clock selection (and enable)
+        LDR     a2, CMCoreCkgen_LogBase
+      [ Vayu
+        LDR     a1, =CM_CLKMODE_APLL_PCIE_MODE_SELECT_LOCK :OR: \
+                     CM_CLKMODE_APLL_PCIE_CLKDIV_BYPASS :OR: \
+                     CM_CLKMODE_APLL_PCIE_REFSEL
+      |
+        LDR     a1, =CM_CLKMODE_APLL_PCIE_MODE_SELECT_LOCK :OR: \
+                     CM_CLKMODE_APLL_PCIE_CLKDIV_BYPASS
+      ]
+        STR     a1, [a2, #CM_CLKMODE_APLL_PCIE]
+20
+        LDR     a1, [a2, #CM_IDLEST_APLL_PCIE]
+        TST     a1, #CM_IDLEST_APLL_PCIE_ST_APLL_CLK
+        BEQ     %BT20
+
+        ; Map in the PCIePHY registers
+        MOV     a1, #0
+        LDR     a2, =PCIePHY_PhysBase
+        MOV     a3, #PCIePHY_PhysSize
+        CallOS  OS_MapInIO
+        STR     a1, PCIePHY_LogBase
+
+        ; Tune up the PHY per Table 26-119 of TRM
+        LDR     a2, =(2_00010:SHL:27) :OR: (2_0100:SHL:14) :OR: (2_00:SHL:5)
+        STR     a2, [a1, #PCIEPHYRX_ANA_PROGRAMMABILITY_REG1]
+        LDR     a2, =(2_01:SHL:27) :OR: (2_1:SHL:26) :OR: (2_0000101100110:SHL:11)
+        STR     a2, [a1, #PCIEPHYRX_DIGITAL_MODES_REG1]
+        LDR     a2, =(2_10:SHL:30)
+        STR     a2, [a1, #PCIEPHYRX_TRIM_REG4]
+        LDR     a2, =(2_11:SHL:30)
+        STR     a2, [a1, #PCIEPHYRX_DLL_REG1]
+        LDR     a2, =(2_0000000000000000:SHL:16) :OR: (2_111110000:SHL:7) :OR: (2_11:SHL:1)
+        STR     a2, [a1, #PCIEPHYRX_EQUALIZER_REG1]        
+
+        ; Power up sequence
+        LDR     a1, ControlCore_LogBase
+        LDR     a2, =((ClkOsc0 / 1000000):SHL:CTRL_CORE_PHY_POWER_PCIESS_PCIESS_PWRCTRL_CLK_FREQ_SHIFT) :OR: \
+                     CTRL_CORE_PHY_POWER_PCIESS_PCIESS_PWRCTRL_CLK_CMD_BOTH
+        STR     a2, [a1, #CTRL_CORE_PHY_POWER_PCIESS1]
+        STR     a2, [a1, #CTRL_CORE_PHY_POWER_PCIESS2]
+
+        ; Physical coding sublayer nominal delay
+        MOV     a2, #CTRL_CORE_PCIE_PCS_NOMINAL
+        STR     a2, [a1, #CTRL_CORE_PCIE_PCS]
+
+        ; Two controllers, one lane each
+        LDR     a2, [a1, #CTRL_CORE_PCIE_CONTROL]
+        BIC     a2, a2, #CTRL_CORE_PCIE_CONTROL_PCIE_B1C0_MODE_SEL
+        STR     a2, [a1, #CTRL_CORE_PCIE_CONTROL]
+        LDR     a2, [a1, #CTRL_CORE_CONTROL_IO_2]
+        BIC     a2, a2, #CTRL_CORE_CONTROL_IO_2_PCIE_1LANE_2LANE_SELECTION
+        STR     a2, [a1, #CTRL_CORE_CONTROL_IO_2]
+
+        ; Reference clock
+        LDR     a2, [a1, #CTRL_CORE_SMA_SW_6]
+        BIC     a2, a2, #CTRL_CORE_SMA_SW_6_PCIE_TX_RX_CONTROL_MASK
+      [ Vayu
+        ASSERT  CTRL_CORE_SMA_SW_6_PCIE_TX_RX_CONTROL_IN = 0
+      |
+        ORR     a2, a2, #CTRL_CORE_SMA_SW_6_PCIE_TX_RX_CONTROL_OUT
+      ]
+        STR     a2, [a1, #CTRL_CORE_SMA_SW_6]
+
+        MOV     v1, #0
+        ADR     v2, PCIBases
+        ADR     v3, PCIe_SS_LogBase
+        LDR     v4, CMCoreL3INIT_LogBase
+30
+        ; Map in PCI controller
+        MOV     a1, #0
+        LDR     a2, [v2, v1, LSL #2]
+        MOV     a3, #PCIe_SS_Size
+        CallOS  OS_MapInIO
+        STR     a1, [v3, v1, LSL #2]    ; Assigned logical base
+
+        ; Turn on the clock
+        MOV     a3, #CM_L3INIT_PCIE_CLKSTCTRL_CLKTRCTRL_SW_WKUP
+        STR     a3, [v4, #CM_L3INIT_PCIE_CLKSTCTRL]
+        LDR     a3, =CM_L3INIT_PCIESS1_CLKCTRL_OPTFCLKEN_PCIEPHY_CLK :OR: \
+                     CM_L3INIT_PCIESS1_CLKCTRL_OPTFCLKEN_PCIEPHY_CLK_DIV :OR: \
+                     CM_CLKCTRL_MODULEMODE_ENABLED
+        ASSERT  CM_L3INIT_PCIESS1_CLKCTRL_OPTFCLKEN_PCIEPHY_CLK = CM_L3INIT_PCIESS2_CLKCTRL_OPTFCLKEN_PCIEPHY_CLK
+        ASSERT  CM_L3INIT_PCIESS1_CLKCTRL_OPTFCLKEN_PCIEPHY_CLK_DIV = CM_L3INIT_PCIESS2_CLKCTRL_OPTFCLKEN_PCIEPHY_CLK_DIV
+        ADR     a2, PCIClocks
+        LDR     a2, [a2, v1, LSL #2]    ; Respective CLKCTRL offset
+        STR     a3, [v4, a2]
+
+        ; Make a root complex
+        LDR     a2, =:INDEX:PCIECTRL_TI_CONF_DEVICE_TYPE
+        MOV     a3, #PCIECTRL_TI_CONF_DEVICE_TYPE_RC
+        STR     a3, [a1, a2]
+40
+        LDR     a4, [a1, a2]
+        TEQ     a4, a3
+        BNE     %BT40
+
+        LDR     a2, =:INDEX:PCIECTRL_TI_CONF_DEVICE_CMD
+        LDR     a3, [a1, a2]
+        TST     a3, #PCIECTRL_TI_CONF_DEVICE_CMD_LTSSM_EN
+        BICNE   a3, a3, #PCIECTRL_TI_CONF_DEVICE_CMD_LTSSM_EN
+        STRNE   a3, [a1, a2]
+
+        ; We never read our own root complex configuration, lock in defaults
+        LDR     a2, =:INDEX:PCIECTRL_PL_DBI_RO_WR_EN
+        LDR     a3, [a1, a2]
+        BIC     a3, a3, #PCIECTRL_PL_DBI_RO_WR_EN_CX_DBI_RO_WR_EN
+        STR     a3, [a1, a2]
+
+        Push    "a1"
+
+        ; Open OBR0 ATU window for Cfg (ATU_LOWER_TARGET changed on the fly)
+        MOV     a1, #PCICfgSpaceSize
+        LDR     a2, =(0:SHL:OpenRegionShift) :OR: OpenOB :OR: (TypeCfg0:SHL:OpenTypeShift) 
+        ORR     a2, a2, v1, LSL #OpenCtrlShift
+        ADR     a3, PCICfgSpaces
+        ADR     a4, PCICfgTargetSpaces
+        BL      PCIOpenATU
+
+        ; Open OBR1 ATU window for IO
+        MOV     a1, #PCIIOSpaceSize
+        LDR     a2, =(1:SHL:OpenRegionShift) :OR: OpenOB :OR: (TypeIO:SHL:OpenTypeShift)
+        ORR     a2, a2, v1, LSL #OpenCtrlShift
+        ADR     a3, PCIIOSpaces
+        ADR     a4, PCIIOTargetSpaces
+        BL      PCIOpenATU
+
+        ; Open IBR2 and OBR2 ATU window for Mem
+        MOV     a1, #PCIMemSpaceSize
+        LDR     a2, =(2:SHL:OpenRegionShift) :OR: OpenIB :OR: (TypeM:SHL:OpenTypeShift) 
+        ORR     a2, a2, v1, LSL #OpenCtrlShift
+        ADR     a3, PCIMemSpaces
+        ADR     a4, PCIMemIBTargetSpaces
+        BL      PCIOpenATU
+
+        MOV     a1, #PCIMemSpaceSize
+        LDR     a2, =(2:SHL:OpenRegionShift) :OR: OpenOB :OR: (TypeM:SHL:OpenTypeShift)
+        ORR     a2, a2, v1, LSL #OpenCtrlShift
+        ADR     a3, PCIMemSpaces
+        ADR     a4, PCIMemOBTargetSpaces
+        BL      PCIOpenATU
+
+        Pull    "a1"
+
+        ; Clear any pending interrupts
+        MOV     a3, #-1
+        LDR     a2, =:INDEX:PCIECTRL_TI_CONF_IRQENABLE_CLR_MAIN
+        STR     a3, [a1, a2]
+        LDR     a2, =:INDEX:PCIECTRL_TI_CONF_IRQSTATUS_MAIN
+        STR     a3, [a1, a2]
+        LDR     a2, =:INDEX:PCIECTRL_TI_CONF_IRQENABLE_CLR_MSI
+        STR     a3, [a1, a2]
+        LDR     a2, =:INDEX:PCIECTRL_TI_CONF_IRQSTATUS_MSI
+        STR     a3, [a1, a2]
+
+        ; Start the link up
+        LDR     a2, =:INDEX:PCIECTRL_TI_CONF_DEVICE_CMD
+        LDR     a3, [a1, a2]
+        ORR     a3, a3, #PCIECTRL_TI_CONF_DEVICE_CMD_LTSSM_EN
+        STR     a3, [a1, a2]
+        LDR     a2, =:INDEX:PCIECTRL_TI_CONF_PHY_CS
+
+        Push    "v1-v2"
+        ADD     v1, a1, a2
+        MOV     v2, #PCILinkUpTries
+50
+        MOV     a1, #PCILinkUpDelay
+        BL      HAL_CounterDelay
+
+        LDR     a4, [v1]
+        TST     a4, #PCIECTRL_TI_CONF_PHY_CS_LINK_UP
+        BNE     %FT60
+
+        SUBS    v2, v2, #1
+        BNE     %BT50
+
+        DebugTX "PCIe link down"
+        B       %FT70
+60
+        DebugTX "PCIe link up"
+
+70
+        Pull    "v1-v2"
+
+        ; Map in the configuration space for this controller
+        MOV     a1, #0
+        ADRL    a2, PCICfgSpaces
+        LDR     a2, [a2, v1, LSL #2]
+        MOV     a3, #PCICfgSpaceSize
+        CallOS  OS_MapInIO
+        ADR     a2, PCICfg_LogBase
+        STR     a1, [a2, v1, LSL #2]    ; Assigned logical base
+
+        ; Map in the IO space for this controller
+        MOV     a1, #0
+        LDR     a2, PCIIOSpaces
+        LDR     a2, [a2, v1, LSL #2]
+        MOV     a3, #PCIIOSpaceSize
+        CallOS  OS_MapInIO
+        ADR     a2, PCIIO_LogBase
+        STR     a1, [a2, v1, LSL #2]    ; Assigned logical base
+
+        ADD     v1, v1, #1
+        TEQ     v1, #PCICount
+        BNE     %BT30
+
+        ; Now probe all of configuration space for any PCI devices
+        DebugTX "PCI probing"
+        ADRL    a1, PCIProbingWS
+        LDR     a2, =?PCIProbingWS 
+        BL      PCIProbing
+
+        Pull    "v1-v4, pc"
+
+; HAL_PCIWriteConfig[Byte | Word | Halfword]
+; => a1 = bus
+;    a2 = dev/fn
+;    a3 = byte offset
+;    a4 = value
+HAL_PCIWriteConfigByte ROUT
+        MOV     ip, #-1
+        B       %FT10
+HAL_PCIWriteConfigHalfword
+        MOV     ip, #-2
+        B       %FT10
+HAL_PCIWriteConfigWord
+        MOV     ip, #-4
+        B       %FT10
+
+; HAL_PCIReadConfig[Byte | Word | Halfword]
+; => a1 = bus
+;    a2 = dev/fn
+;    a3 = byte offset
+HAL_PCIReadConfigByte
+        MOV     ip, #1
+        B       %FT10
+HAL_PCIReadConfigHalfword
+        MOV     ip, #2
+        B       %FT10
+HAL_PCIReadConfigWord
+        MOV     ip, #4
+10
+        Push    "v1-v2, lr"
+
+        CMP     a1, #0
+        ASSERT  (PCICount :AND: (PCICount - 1)) = 0
+        ANDNE   v2, a1, #PCICount - 1   ; Recover controller index from bottom bits of bus
+        BNE     %FT20
+
+        MOV     v2, a2, LSR #PCILog2FnLimit
+        CMP     v2, #PCICount           ; Root complex, the device is the controller index
+        MOVCS   a1, #-1                 ; No switch, no configuration for you
+        Pull    "v1-v2, pc", CS
+20        
+        ADR     lr, PCIe_SS_LogBase
+        LDR     v1, [lr, v2, LSL #2]    ; Controller registers
+        LDR     lr, =:INDEX:PCIECTRL_TI_CONF_PHY_CS
+        LDR     lr, [v1, lr]
+        TST     lr, #PCIECTRL_TI_CONF_PHY_CS_LINK_UP
+        MOVEQ   a1, #-1                 ; No link, no configuration for you
+        Pull    "v1-v2, pc", EQ
+
+        ; Select OBR0 again, just incase anyone's been messing
+        LDR     lr, =(0:SHL:PCIECTRL_PL_IATU_INDEX_REGION_INDEX_SHIFT) :OR: \
+                     PCIECTRL_PL_IATU_INDEX_REGION_DIRECTION_OB
+        STR     lr, [v1, #PCIECTRL_PL_IATU_INDEX]
+        DMB     SY
+
+        ; Choose configuration type
+        CMP     a1, #0
+        MOVEQ   lr, #TypeCfg0:SHL:PCIECTRL_PL_IATU_REG_CTRL_1_TYPE_SHIFT
+        MOVNE   lr, #TypeCfg1:SHL:PCIECTRL_PL_IATU_REG_CTRL_1_TYPE_SHIFT
+        STR     lr, [v1, #PCIECTRL_PL_IATU_REG_CTRL_1]
+
+        ; Formulate the target from Bus/Dev/Fn
+        BICEQ   a2, a2, #(PCIDevLimit - 1):SHL:PCILog2FnLimit
+        ASSERT  PCIECTRL_PL_IATU_REG_LOWER_TARGET_FN_SHIFT + PCILog2FnLimit = \
+                PCIECTRL_PL_IATU_REG_LOWER_TARGET_DEV_SHIFT
+        MOV     a2, a2, LSL #PCIECTRL_PL_IATU_REG_LOWER_TARGET_FN_SHIFT
+        ORR     a2, a2, a1, LSL #PCIECTRL_PL_IATU_REG_LOWER_TARGET_BUS_SHIFT
+        STR     a2, [v1, #PCIECTRL_PL_IATU_REG_LOWER_TARGET]
+
+        ; Dummy readback to sync the settings
+        LDR     lr, [v1, #PCIECTRL_PL_IATU_INDEX]
+
+        ADR     lr, PCICfg_LogBase
+        LDR     a2, [lr, v2, LSL #2]    ; ATU window for Cfg
+
+        MOVS    ip, ip
+        BPL     %FT30
+
+        CMP     ip, #-2                 ; Write case
+        STRGTB  a4, [a2, a3]
+        STREQH  a4, [a2, a3]
+        STRLT   a4, [a2, a3]
+
+        Pull    "v1-v2, pc"
+30
+        CMP     ip, #2                  ; Read case
+        LDRLTB  a1, [a2, a3]
+        LDREQH  a1, [a2, a3]
+        LDRGT   a1, [a2, a3]
+
+        Pull    "v1-v2, pc"
+
+; HAL_PCIAddresses
+; => a1 = buffer
+;    a2 = size of buffer
+; <= a1 = bytes written to buffer
+HAL_PCIAddresses ROUT
+        Push    "v1, lr"
+        CMP     a2, #7*4
+        MOVCS   a3, #7*4
+        MOVCC   a3, a2
+        MOV     v1, a3                  ; The smaller of the two
+        ADR     a2, %FT10
+        BL      memcpy
+
+        MOV     a1, v1
+        Pull    "v1, pc"
+10
+        ASSERT  PCIeL3Window1_PhysBase + PCIeL3Window_PhysSize = PCIeL3Window2_PhysBase
+        ; Memory space offset, and range of addresses allocatable to it
+        DCD     PCIeL3Window1_PhysBase + PCICfgSpaceSize
+        DCD     &00000000
+        DCD     (2 * PCIeL3Window_PhysSize) - PCICfgSpaceSize - PCIIOSpaceSize - 1
+        ; IO space offset, and range of addresses allocatable to it
+        DCD     PCIeL3Window2_PhysBase - PCIIOSpaceSize
+        DCD     &00000000
+        DCD     (2 * PCIIOSpaceSize) - 1
+        ; Adjustment between SDRAM and PCI memory for inbound memory writes
+        DCD     &00000000
+
+; HAL_PCISlotTable
+; => a1 = buffer
+;    a2 = size of buffer
+; <= a1 = buffer size needed (and buffer updated if large enough)
+HAL_PCISlotTable ROUT
+        CMP     a2, #4 + SlotTableLast - SlotTableFirst
+        BCC     %FT20
+
+        ADR     ip, %FT30
+        LDR     a4, [ip], #4
+        STR     a4, [a1], #4            ; Table entries count
+10
+        SUBS    a4, a4, #1
+        LDMPLIA ip!, {a2,a3}
+        STMPLIA a1!, {a2,a3}
+        BPL     %BT10
+20
+        MOV     a1, #4 + SlotTableLast - SlotTableFirst
+        MOV     pc, lr
+30
+        ; Slot table
+        ; 1 word - number of entries
+        ; 2 words per entry - +0 bus number
+        ;                     +1 dev/fn 
+        ;                     +2 INTA# devno for OS_ClaimDeviceVector (or 255 for none)
+        ;                     +3 INTB# devno for OS_ClaimDeviceVector (or 255 for none)
+        ;                     +4 INTC# devno for OS_ClaimDeviceVector (or 255 for none)
+        ;                     +5 INTD# devno for OS_ClaimDeviceVector (or 255 for none)
+        ;                     +6 flags b0-3 corresponding INTx# is not shared
+        ;                              b4   is 64 bit wide
+        ;                              b5   is 66MHz capable
+        ;                              b6   is a NIC
+        ;                              b7   unused
+        ;                     +7 pseudo podule slot number for CMOS allocation
+        DCD     (SlotTableLast - SlotTableFirst):SHR:3
+SlotTableFirst
+        ; SK705
+        DCB     0, (0*8)+0, DevNoPCIInts + 0, DevNoPCIInts + 1, DevNoPCIInts + 2, DevNoPCIInts + 3, 2_00001111, 4
+        ; SK704
+        DCB     0, (1*8)+0, DevNoPCIInts + 4, DevNoPCIInts + 5, DevNoPCIInts + 6, DevNoPCIInts + 7, 2_00001111, 5
+SlotTableLast
+
+        END

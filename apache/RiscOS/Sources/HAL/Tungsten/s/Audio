@@ -1,0 +1,441 @@
+; Copyright 2003 Tematic Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+
+
+; HAL code for the M5451 audio controller and the STAC 9750 AC'97 CODEC
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:APCS.<APCS>
+        GET     Hdr:System
+
+        GET     Hdr:AudioDevice
+        GET     Hdr:MixerDevice
+        GET     Hdr:OSEntries
+        GET     Hdr:PCI
+
+        GET     hdr.StaticWS
+
+        EXPORT  Audio_Init
+
+        IMPORT  memcpy
+        IMPORT  HAL_PCIReadConfigByte
+        IMPORT  HAL_PCIReadConfigWord
+        IMPORT  PCI_TungstenSecondaryBus
+
+M5451PCIDevice  *       1
+
+
+
+        AREA    |Asm$$Code|, CODE, READONLY, PIC
+
+Audio_Init
+        Push    "v1,lr"
+        ADRL    a1, AudioWS + 0
+        ADR     a2, AudioTemplate
+        MOV     a3, #M5451Audio_DeviceSize
+        BL      memcpy
+        BL      PCI_TungstenSecondaryBus
+        MOV     v1, a1
+        LDR     a3, AudioTemplate + HALDevice_Location
+        LDR     a4, AudioTemplate + HALDevice_AudioMixer
+        ADRL    a2, AudioWS + 0
+        ORR     a3, a3, a1, LSL #16
+        ADD     a4, sb, a4
+        STR     a3, [a2, #HALDevice_Location]
+        STR     a4, [a2, #HALDevice_AudioMixer]
+        MOV     a2, #M5451PCIDevice:SHL:3 + 0
+        MOV     a3, #PCIConf0_InterruptLine
+        BL      HAL_PCIReadConfigByte   ; read interrupt device from config space
+        ORR     a1, a1, #1:SHL:31       ; PCI interrupts are shared
+        STR     a1, AudioWS + 0 + HALDevice_Device
+        MOV     a1, v1
+        MOV     a2, #M5451PCIDevice:SHL:3 + 0
+        MOV     a3, #PCIConf0_BaseAddresses + 1*4
+        BL      HAL_PCIReadConfigWord   ; read base memory physical address
+        MOV     a2, a1
+        MOV     a1, #0                  ; not bufferable
+        MOV     a3, #&1000              ; range is 4K in size
+        CallOS  OS_MapInIO              ; get it mapped in, and find logical address
+        CMP     a1, #0
+        Pull    "v1,pc", EQ             ; bomb out if we couldn't map it in
+        ADRL    a2, AudioWS + 0
+        STR     a1, [a2, #:INDEX: M5451AudioBase] ; remember it for later
+        MOV     a1, #0
+        CallOS  OS_AddDevice
+
+        ADRL    a1, AudioWS + M5451Audio_DeviceSize
+        ADR     a2, MixerTemplate
+        MOV     a3, #STAC9750Mixer_DeviceSize
+        BL      memcpy
+        LDR     a4, MixerTemplate + HALDevice_MixerCtrlr
+        ADRL    a2, AudioWS + M5451Audio_DeviceSize
+        ADD     a4, sb, a4
+        STR     a4, [a2, #HALDevice_MixerCtrlr]
+        MOV     a1, #0
+        CallOS  OS_AddDevice
+
+        ADRL    a1, AudioWS + 0
+        BL      M5451AudCReset          ; reset controller
+
+        ADRL    a1, AudioWS + M5451Audio_DeviceSize
+        BL      STAC9750MixerReset      ; reset codec
+        Pull    "v1,pc"
+
+; Audio I/O controller HAL device
+
+AudioTemplate
+        DCW     HALDeviceType_Audio + HALDeviceAudio_AudC
+        DCW     HALDeviceID_AudC_M5451
+        DCD     HALDeviceBus_Exp + HALDeviceExpBus_PCI + M5451PCIDevice:SHL:8
+        DCD     0               ; API version
+        DCD     M5451AudCDesc
+        DCD     0               ; Address - N/A
+        %       12              ; Reserved
+        DCD     M5451AudCActivate
+        DCD     M5451AudCDeactivate
+        DCD     M5451AudCReset
+        DCD     M5451AudCSleep
+        DCD     0               ; Device needs looking up
+        DCD     M5451AudCTestIRQ
+        %       8
+        DCD     :INDEX:AudioWS + M5451Audio_DeviceSize ; needs relocating by sb
+        DCD     1               ; Output channels (supported so far)
+        DCD     0               ; Input channels (supported so far)
+        ASSERT  (.-AudioTemplate) = HALDevice_Audio_Size
+        DCD     0               ; Base filled in during init
+        DCB     0               ; Inactive by default
+        ALIGN
+
+        ASSERT  (.-AudioTemplate) = M5451Audio_DeviceSize
+
+; Mixer HAL device
+
+MixerTemplate
+        DCW     HALDeviceType_Audio + HALDeviceAudio_Mixer
+        DCW     HALDeviceID_Mixer_STAC9750
+        DCD     HALDeviceBus_Ser + HALDeviceSerBus_ACLink + 0
+        DCD     1               ; API version
+        DCD     STAC9750MixerDesc
+        DCD     0               ; Address - N/A
+        %       12              ; Reserved
+        DCD     STAC9750MixerActivate
+        DCD     STAC9750MixerDeactivate
+        DCD     STAC9750MixerReset
+        DCD     STAC9750MixerSleep
+        DCD     -1              ; Device
+        DCD     0               ; TestIRQ cannot be called
+        %       8
+        DCD     :INDEX:AudioWS + 0 ; needs relocating by sb
+        DCD     MixerChannels
+        DCD     STAC9750MixerGetFeatures
+        DCD     STAC9750MixerSetMix
+        DCD     STAC9750MixerGetMix
+        DCD     STAC9750MixerGetMixLimits
+        ASSERT  (.-MixerTemplate) = HALDevice_Mixer_Size + 4
+        DCD     0, 0            ; Speaker defaults to 0 dB
+        DCD     0, 0            ; Headphone jack defaults to 0 dB
+        DCD     0, 0            ; Header out defaults to 0 dB
+        DCD     0, 0            ; System audio defaults to 0 dB
+        DCD     1, 0            ; Mic defaults to mute
+        DCD     1, 0            ; Line in defaults to mute
+        DCD     0, 0            ; CD header in defaults to 0 dB
+        DCD     1, 0            ; Mono header in defaults to mute
+        DCD     1, 0            ; Stereo header in defaults to mute
+        ALIGN
+
+        ASSERT  (.-MixerTemplate) = STAC9750Mixer_DeviceSize
+
+M5451AudCDesc
+        =       "Acer M5451 AC'97 controller", 0
+        ALIGN
+
+M5451AudCActivate
+        Push    "lr"
+        MOV     a2, #1
+        STRB    a2, M5451AudioActive
+        LDR     a1, [a1, #HALDevice_AudioMixer]
+        ADR     a2, STAC9750MixerSettings + MixerChannel_System * 8
+        LDMIA   a2, {a3, a4}
+        MOV     a2, #MixerChannel_System
+        BL      ReallySetMix            ; unmute system channel
+        MOV     a1, #1                  ; always return successful
+        Pull    "pc"
+
+M5451AudCDeactivate
+        Push    "lr"
+        MOV     a2, #0
+        STRB    a2, M5451AudioActive
+        LDR     a1, [a1, #HALDevice_AudioMixer]
+        ADR     a2, STAC9750MixerSettings + MixerChannel_System * 8
+        LDMIA   a2, {a3, a4}
+        MOV     a2, #MixerChannel_System
+        BL      ReallySetMix            ; mute system channel
+        Pull    "pc"
+
+M5451AudCReset
+        MOV     pc, lr
+
+M5451AudCSleep
+        MOV     a1, #0                  ; power management not yet implemented
+        MOV     pc, lr
+
+M5451AudCTestIRQ
+        MOV     a1, #0                  ; not yet implemented
+        MOV     pc, lr
+
+STAC9750MixerDesc
+        =       "SigmaTel STAC9750 audio codec", 0
+        ALIGN
+
+STAC9750MixerActivate
+        MOV     a1, #1                  ; always successful
+        ; drop through...
+STAC9750MixerDeactivate
+        MOV     pc, lr
+
+STAC9750MixerReset
+        Push    "v1-v2,lr"
+        MOV     v1, a1
+        LDR     a1, [v1, #HALDevice_MixerCtrlr]
+        LDR     a1, M5451AudioBase
+        MOV     a2, #&100
+        STR     a2, [a1, #AC97_WRITE]   ; reset codec chip
+
+        LDR     a1, [v1, #HALDevice_MixerCtrlr]
+        MOV     a3, #&26
+        MOV     a4, #0
+        BL      WriteAC97               ; ensure everything powered up
+
+        MOV     v2, #2_1111
+20      LDR     a1, [v1, #HALDevice_MixerCtrlr]
+        MOV     a3, #&26
+        BL      ReadAC97
+        BICS    a4, v2, a4              ; sets Z iff bottom 4 bits of a4 are all set
+        BNE     %BT20                   ; loop until all parts of codec ready
+
+        MOV     v2, #0
+50      MOV     a1, v1
+        ADR     a2, MixerTemplate + :INDEX: STAC9750MixerSettings
+        ADD     a2, a2, v2, LSL #3
+        LDMIA   a2, {a3, a4}
+        ADR     a2, STAC9750MixerSettings
+        ADD     a2, a2, v2, LSL #3
+        STMIA   a2, {a3, a4}
+        MOV     a2, v2
+        BL      ReallySetMix            ; program our mixer defaults
+        ADD     v2, v2, #1
+        CMP     v2, #MixerChannels
+        BCC     %BT50
+        Pull    "v1-v2,pc"
+
+STAC9750MixerSleep
+        MOV     a1, #0                  ; power management not yet implemented
+        MOV     pc, lr
+
+STAC9750MixerGetFeatures
+        LDR     a1, [pc, a2, LSL #2]
+        MOV     pc, lr
+        ; Speaker
+        DCW     MixerFeaturesFlag_Mono
+        DCW     MixerCategory_Speaker
+        ; Headphone jack
+        DCW     0
+        DCW     MixerCategory_Headphones
+        ; Header output
+        DCW     0
+        DCW     MixerCategory_AuxOut
+        ; System audio
+        DCW     0
+        DCW     MixerCategory_System
+        ; Mic
+        DCW     MixerFeaturesFlag_Mono :OR: MixerFeaturesFlag_DefaultMute
+        DCW     MixerCategory_Mic
+        ; Line in
+        DCW     MixerFeaturesFlag_DefaultMute
+        DCW     MixerCategory_LineIn
+        ; CD header input
+        DCW     0
+        DCW     MixerCategory_AuxIn
+        ; Mono header input
+        DCW     MixerFeaturesFlag_Mono :OR: MixerFeaturesFlag_DefaultMute
+        DCW     MixerCategory_AuxIn
+        ; Stereo header input
+        DCW     MixerFeaturesFlag_DefaultMute
+        DCW     MixerCategory_AuxIn
+
+STAC9750MixerGetMixLimits
+        ADR     a1, MixerLimitsTab
+        ADD     a1, a1, a2, LSL #3
+        ADD     a1, a1, a2, LSL #2
+        LDMIA   a1, {a1-a2,a4}
+        STMIA   a3, {a1-a2,a4}
+        MOV     pc, lr
+
+MixerLimitsTab
+        ; Speaker
+        DCD     -&1F*24
+        DCD     0
+        DCD     24
+        ; Headphone jack
+        DCD     -&1F*24
+        DCD     0
+        DCD     24
+        ; Header output
+        DCD     -&1F*24
+        DCD     0
+        DCD     24
+        ; System audio
+        DCD     -&1F*24
+        DCD     12*16
+        DCD     24
+        ; Mic
+        DCD     -&1F*24
+        DCD     12*16
+        DCD     24
+        ; Line in
+        DCD     -&1F*24
+        DCD     12*16
+        DCD     24
+        ; CD header input
+        DCD     -&1F*24
+        DCD     12*16
+        DCD     24
+        ; Mono header input
+        DCD     -&F*16*3
+        DCD     0
+        DCD     16*3
+        ; Stereo header input
+        DCD     -&1F*24
+        DCD     12*16
+        DCD     24
+
+STAC9750MixerSetMix
+        Push    "v1,lr"
+        ADR     v1, STAC9750MixerSettings
+        ADD     v1, v1, a2, LSL #3
+        LDMIA   v1, {ip, lr}
+        TEQ     a3, ip
+        TEQEQ   a4, lr
+        STMNEIA v1, {a3, a4}
+        BLNE    ReallySetMix
+        Pull    "v1,pc"
+
+ReallySetMix ; same entry conditions, but without soft-copy check
+        LDR     a1, [a1, #HALDevice_MixerCtrlr]
+        ADR     ip, MixRegTable
+        CMP     a2, #MixerChannel_System
+        LDRB    a2, [ip, a2]
+        LDREQB  ip, M5451AudioActive
+        TSTEQ   ip, #1
+        MOVEQ   a3, #1          ; force system mute if system audio inactive
+        ; Clamp inputs to be within sensible limits
+        CMN     a4, #756        ; 47.25dB
+        MVNLT   a4, #756        ; Note: Not important that will be 1 off
+        CMP     a4, #12*16
+        MOVGT   a4, #12*16
+        ; Divide by 24 (i.e. 1.5dB) by multiplying by 683 and then dividing by
+        ; 16384. This is accurate up to at least +/-767
+        LDR     ip, =683
+        MUL     ip, a4, ip
+        MOV     a4, ip, ASR #14
+        CMP     a2, #&0A        ; PC Beep Mixer
+        MOV     ip, #&1F
+        BICEQ   a4, a4, #1      ; PC Beep is in 3dB units, but shifted left one bit in the register
+        MOVEQ   ip, #&1E
+        RSBLT   a4, a4, #0
+        RSBGT   a4, a4, #8      ; Apply 12dB bias to analog mixers
+        ; Clamp to within valid values for register
+        CMP     a4, #0
+        MOVLT   a4, #0
+        CMP     a4, ip
+        MOVGT   a4, ip
+        MOVGT   a3, #1          ; Mute if over-attenuated
+        ; TODO - Save the rounded/clamped gain value so that GetMix can return
+        ; it. However this will interfere with the checks that MixerSetMix
+        ; performs, so an extra state cache may be required to ensure we can
+        ; still avoid redundant updates. E.g. a hardware register cache like the
+        ; OMAP3 driver uses.
+        CMP     a2, #&06        ; Master MONO
+        CMPNE   a2, #&0A        ; PC Beep Mixer
+;        CMPNE   a2, #&0C       ; Phone Mixer - Not used atm
+        CMPNE   a2, #&0E        ; Mic Mixer
+        ORRNE   a4, a4, a4, LSL #8 ; Apply settings to both channels if stereo
+        ORR     a4, a4, a3, LSL #15 ; Apply mute flag
+        MOV     a3, a2
+        ; drop through...
+WriteAC97
+        ; a1 -> controller device
+        ; a3 = AC'97 register to poke
+        ; a4 = value to poke it with
+        LDR     a1, M5451AudioBase
+        ORR     a4, a3, a4, LSL #16
+        ORR     a4, a4, #&8100  ; bit 15 set => don't reset; bit 8 set => WnR
+        MRS     ip, CPSR
+        ORR     a2, ip, #I32_bit
+        MSR     CPSR_c, a2
+05      LDR     a2, [a1, #AC97_WRITE]
+        TST     a2, #&8000
+        BNE     %BT05           ; loop until not busy
+        STR     a4, [a1, #AC97_WRITE]
+10      LDR     a2, [a1, #AC97_WRITE]
+        TST     a2, #&8000
+        BEQ     %BT10           ; loop until busy
+        MSR     CPSR_c, ip
+        MOV     pc, lr
+
+ReadAC97
+        ; a1 -> controller device
+        ; a3 = AC'97 register to peek
+        ; out: a4 = value read
+        LDR     a1, M5451AudioBase
+        MOV     a4, #&1000      ; initialise timeout loop counter
+        MRS     ip, CPSR
+        ORR     a2, ip, #I32_bit
+        MSR     CPSR_c, a2
+05      LDR     a2, [a1, #AC97_READ]
+        TST     a2, #&8000
+        SUBNES  a4, a4, #1
+        BNE     %BT05           ; loop until not busy or timed out
+        MOV     a4, #&1000
+        ORR     a2, a3, #&8000  ; bit 15 set => don't reset
+        STR     a2, [a1, #AC97_READ]
+10      LDR     a2, [a1, #AC97_READ]
+        TST     a2, #&8000
+        SUBNES  a4, a4, #1
+        BNE     %BT10           ; loop until not busy or timed out
+        MSR     CPSR_c, ip
+        MOV     a4, a2, LSR #16
+        MOV     pc, lr
+
+MixRegTable
+        =       &06             ; speaker controlled by Master Volume MONO
+        =       &04             ; headphone jack controlled by HP_OUT Mixer
+        =       &02             ; header out controlled by Master Volume
+        =       &18             ; system sound controlled by PCM Out Mixer
+        =       &0E             ; mic controlled by Mic Mixer
+        =       &10             ; line in jack controlled by Line In Mixer
+        =       &12             ; aux in header 1 (CD) controlled by CD Mixer
+        =       &0A             ; aux in header 2 controlled by PC Beep Mixer
+        =       &16             ; aux in header 3 controlled by AUX Mixer
+        ALIGN
+
+STAC9750MixerGetMix
+        ADR     a1, STAC9750MixerSettings
+        ADD     a1, a1, a2, LSL #3
+        LDMIA   a1, {a1, a2}
+        MOV     pc, lr
+
+        END

@@ -1,0 +1,390 @@
+; Copyright 2005 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:Machine.<Machine>
+        GET     Hdr:ImageSize.<ImageSize>
+
+        GET     Hdr:OSEntries
+        GET     Hdr:HALEntries
+        GET     Hdr:PCI
+        GET     Hdr:DMA
+
+        GET     hdr.StaticWS
+        GET     hdr.pxa255
+
+        AREA    |Asm$$Code|, CODE, READONLY, PIC
+
+        IMPORT  HAL_PCIReadConfigByte
+        IMPORT  HAL_PCIReadConfigHalfword
+        IMPORT  HAL_PCIReadConfigWord
+        IMPORT  HAL_PCIWriteConfigByte
+        IMPORT  HAL_PCIWriteConfigHalfword
+        IMPORT  HAL_PCIWriteConfigWord
+        IMPORT  PCI_TungstenSecondaryBus
+
+        IMPORT  memcpy
+
+
+        EXPORT  ATA_Init
+        EXPORT  HAL_ATAControllerInfo
+        EXPORT  HAL_ATASetModes
+        EXPORT  HAL_ATACableID
+
+ATA_Init
+        Push    "v1,v2,lr"
+        ; Find bus number
+        BL      PCI_TungstenSecondaryBus
+        ; Enable ATA-4, cable detect, Ultra DMA, make simplex bus master bit R/W
+        MOV     v1, a1
+        MOV     a2, #11*8
+        MOV     a3, #&4A
+        LDR     a4, =&C900
+        BL      HAL_PCIWriteConfigHalfword
+        ; Get bus master register address
+        MOV     a1, v1
+        MOV     a2, #11*8
+        MOV     a3, #PCIConf0_BaseAddresses+16
+        BL      HAL_PCIReadConfigWord
+        BIC     v1, a1, #3
+        ; Clear simplex bit
+        MOV     a1, v1
+        MOV     a2, #11*8
+        ADD     a3, v1, #2
+        MOV     a4, #0
+        BL      HAL_PCIWriteConfigByte
+        ; Make simplex bus master bit RO
+        MOV     a1, v1
+        MOV     a2, #11*8
+        MOV     a3, #&4A
+        LDR     a4, =&C904
+        BL      HAL_PCIWriteConfigHalfword
+        ; Disable Ultra DMA on all 4 devices
+        MOV     a1, v1
+        MOV     a2, #11*8
+        MOV     a3, #&56
+        LDR     a4, =&8888
+        BL      HAL_PCIWriteConfigHalfword
+        ; Set max slow PIO for primary controller
+        MOV     a1, v1
+        MOV     a2, #11*8
+        MOV     a3, #&58
+        MOV     a4, #0
+        BL      HAL_PCIWriteConfigWord
+        ; Set max slow PIO for secondary controller
+        MOV     a1, v1
+        MOV     a2, #11*8
+        MOV     a3, #&5C
+        MOV     a4, #0
+        BL      HAL_PCIWriteConfigWord
+        Pull    "v1,v2,pc"
+
+HAL_ATAControllerInfo
+        CMP     a1, #-1
+        BEQ     %FT50
+        CMP     a1, #2
+        MOVHS   a1, #0
+        MOVHS   pc, lr
+
+        Push    "a2,a3,v1-v5,lr"
+        MOV     v5, a1                  ; v5 = Controller number
+
+        SUB     sp, sp, #12*4           ; construct on stack
+        MOV     v1, sp
+
+        MOV     a1, #2_1010             ; 32-bit PIO, no 48-bit DMA
+        STR     a1, [v1], #4
+
+        BL      PCI_TungstenSecondaryBus
+        MOV     v2, a1                  ; v2 = bus of 1535+
+
+        LDR     v3, PCI_IO_Address
+        MOV     v4, #PCIConf0_BaseAddresses
+
+        ; Read command block address
+        MOV     a2, #11*8               ; Secondary bus, Dev 11 = M5229
+        ADD     a3, v4, v5, LSL #3
+        BL      HAL_PCIReadConfigWord
+        BIC     a1, a1, #3
+        ADD     a1, a1, v3
+        STR     a1, [v1], #4
+
+        ; Read control block address
+        MOV     a1, v2
+        MOV     a2, #11*8
+        ADD     a3, v4, v5, LSL #3
+        ADD     a3, a3, #4
+        BL      HAL_PCIReadConfigWord
+        BIC     a1, a1, #3
+        ADD     a1, a1, v3
+        STR     a1, [v1], #4
+
+        ; Read bus master address
+        MOV     a1, v2
+        MOV     a2, #11*8
+        ADD     a3, v4, #16
+        BL      HAL_PCIReadConfigWord
+        BIC     a1, a1, #3
+        ADD     a1, a1, v5, LSL #3
+        ADD     a1, a1, v3
+        STR     a1, [v1], #4
+
+        TEQ     v5, #0
+        MOVEQ   a1, #Device_ATA1
+        MOVNE   a1, #Device_ATA2
+        MOV     a2, #2_11111            ; PIO modes 0-4
+        MOV     a3, #2_111              ; Multiword DMA modes 0-2
+        MOV     a4, #2_111111           ; Ultra DMA modes 0-5
+        STMIA   v1!, {a1-a4}
+
+        BL      PCI_TungstenSecondaryBus
+        LDR     a2, =HALDeviceBus_Exp + HALDeviceExpBus_PCI + 11:SHL:8
+        ORR     a2, a2, a1, LSL #16
+        MOV     a1, #HALDeviceID_DMAL_M5229
+        TEQ     v5, #0
+        ADREQ   a3, DeviceDescr0
+        ADRNE   a3, DeviceDescr1
+        LDREQ   a4, =DMALC_IDE0
+        LDRNE   a4, =DMALC_IDE1
+        STMIA   v1!, {a1-a4}
+
+        LDMIA   v1!, {a1,a3}            ; caller's buffer + length
+        CMP     a3, #12*4
+        MOVHI   a3, #12*4
+        MOV     a2, sp
+        BL      memcpy                  ; copy in as much as possible
+
+        MOV     sp, v1
+
+        MOV     a1, #12*4               ; say how much we gave them
+        Pull    "v1-v5,pc"
+
+50
+        Push    "a2,a3,v1,lr"
+        SUB     sp, sp, #4*4            ; construct on stack
+        MOV     v1, sp
+
+        BL      PCI_TungstenSecondaryBus
+        LDR     a3, =HALDeviceBus_Exp + HALDeviceExpBus_PCI + 11:SHL:8
+        ORR     a3, a3, a1, LSL #16
+        MOV     a1, #2
+        MOV     a2, #HALDeviceID_DMAC_M5229
+        ADR     a4, DeviceDescr
+        STMIA   v1!, {a1-a4}
+
+        LDMIA   v1!, {a1,a3}            ; caller's buffer + length
+        CMP     a3, #4*4
+        MOVHI   a3, #4*4
+        MOV     a2, sp
+        BL      memcpy                  ; copy in as much as possible
+
+        MOV     sp, v1
+
+        MOV     a1, #4*4                ; say how much we gave them
+        Pull    "v1,pc"
+
+DeviceDescr  = "Acer M5229 ATA controller bus master", 0
+DeviceDescr0 = "Acer M5229 ATA controller bus master primary channel", 0
+DeviceDescr1 = "Acer M5229 ATA controller bus master secondary channel", 0
+        ALIGN
+
+HAL_ATASetModes
+        CMP     a1, #2
+        MOVHS   pc, lr
+
+        Push    "a2,a3,v1-v5,lr"
+        MOV     v4, #0          ; v4=DMA control value
+        MOV     v5, a1          ; v5=controller number
+        MOV     v1, a2          ; v1->device 0 speed settings
+        MOV     v2, a3          ; v2->device 1 speed settings
+        BL      PCI_TungstenSecondaryBus
+        MOV     v3, a1          ; v3=ATA controller PCI bus
+
+        MACRO
+        EvaluateBasics $r,$dev
+        TEQ     $r, #0
+        BEQ     %FT20
+
+        LDRB    lr, [$r, #6]    ; check for UltraDMA
+        TEQ     lr, #&FF
+        BEQ     %FT15
+
+        ; UltraDMA mode in use
+        CMP     lr, #5
+        MOVHI   lr, #5          ; we do up to mode 5
+        STRHIB  lr, [$r, #6]
+        RSB     lr, lr, #12     ; -> 12,11,10,9,8,7
+        ORR     lr, lr, #8      ; -> 12,11,10,9,8,15
+        ORR     v4, v4, lr, LSL #$dev*4
+        MOV     lr, #&FF
+        STRB    lr, [$r, #5]    ; indicate normal DMA off
+        B       %FT18
+
+15      LDRB    lr, [$r, #5]    ; check for multiword DMA
+        TEQ     lr, #&FF
+        BEQ     %FT18
+
+        ; multiword DMA mode in use
+        CMP     lr, #2
+        MOVHI   lr, #2          ; we do up to mode 2
+        STRHIB  lr, [$r, #5]
+        MOV     lr, #&FF
+        STRB    lr, [$r, #6]    ; indicate UltraDMA off
+
+18      LDRB    lr, [$r, #4]    ; check and limit PIO speed
+        CMP     lr, #4
+        MOVHI   lr, #4
+        STRHIB  lr, [$r, #4]
+20
+        MEND
+
+        EvaluateBasics v1,0
+        EvaluateBasics v2,1
+
+        ; Now PIO and DMA values regularised in parameters
+        ; v4 = Ultra DMA mode register value
+
+        ; Set Ultra DMA mode/timing
+        MOV     a1, v3
+        MOV     a2, #11*8
+        ADD     a3, v5, #&56
+        MOV     a4, v4
+        BL      HAL_PCIWriteConfigByte
+
+        ; Set data timing (device $dev), from data at $r
+        ; Leave $r set to PIO mode value
+        MACRO
+        SetDataTiming $r,$dev
+        TEQ     $r, #0
+        MOVEQ   v4, #&FF
+        MOVEQ   $r, #4
+        LDRNEB  v4, [$r, #5]            ; v4 = multiword DMA mode (or &FF)
+        LDRNEB  $r, [$r, #4]            ; $r = PIO mode
+        ADR     a1, PIO_Data_Table
+        LDRB    a2, [a1, $r, LSL #1]!   ; a2 = PIO pulse time
+        LDRB    a3, [a1, #1]            ; a3 = PIO recovery time
+        TEQ     v4, #&FF
+        BEQ     %FT20
+        ADR     a1, DMA_Data_Table
+        LDRB    a4, [a1, v4, LSL #1]!   ; a4 = DMA pulse time
+        LDRB    lr, [a1, #1]            ; lr = DMA recovery time
+        CMP     a4, a2
+        MOVHI   a2, a4                  ; get higher of each
+        CMP     lr, a3
+        MOVHI   a3, lr
+20      AND     a3, a3, #2_1111         ; recovery time is a 4-bit field
+        AND     a2, a2, #2_111          ; pulse time is a 3-bit field
+        ORR     a4, a3, a2, LSL #4      ; combine into register format
+        MOV     a1, v3
+        MOV     a2, #11*8
+        MOV     a3, #&5A+$dev
+        ADD     a3, a3, v5, LSL #2
+        BL      HAL_PCIWriteConfigByte
+        MEND
+
+        SetDataTiming v1,0
+        SetDataTiming v2,1
+
+        ; Now v1 = device 0 PIO mode, v2 = device 1 PIO mode
+        ; Select highest common mode
+
+        CMP     v1, v2
+        MOVHI   v1, v2
+
+        ; Set control timing (both devices)
+        ADR     a1, PIO_Reg_Table
+        LDRB    a4, [a1, v1]
+        MOV     a1, v3
+        MOV     a2, #11*8
+        MOV     a3, #&59
+        ADD     a3, a3, v5, LSL #2
+        BL      HAL_PCIWriteConfigByte
+
+        ; Set address setup timing (both devices)
+        ADR     a1, PIO_Addr_Table
+        LDRB    a4, [a1, v1]
+        MOV     a1, v3
+        MOV     a2, #11*8
+        MOV     a3, #&58
+        ADD     a3, a3, v5, LSL #2
+        BL      HAL_PCIWriteConfigByte
+
+        ; Now FIFO control of each device
+        LDMFD   sp!, {v1,v2}
+        TEQ     v1, #0
+        LDRNE   v1, [v1, #0]
+        TEQ     v2, #0
+        LDRNE   v2, [v2, #0]
+        MOV     a4, #0
+        TST     v1, #1
+        ORRNE   a4, a4, #&05
+        TST     v2, #1
+        ORRNE   a4, a4, #&50
+        MOV     a1, v3
+        MOV     a2, #11*8
+        MOV     a3, #&54
+        ADD     a3, a3, v5
+        BL      HAL_PCIWriteConfigByte
+
+        Pull    "v1-v5,pc"
+
+; Data timings are shared between PIO and multiword DMA, so need to select
+; timings that meet both the PIO and DMA requirements.
+
+;      Pulse time,recovery time (33MHz clocks)
+PIO_Data_Table
+        =       8,12    ; 240ns,360ns = 600ns cycle
+        =       5,8     ; 150ns,240ns = 390ns cycle (standard=383ns)
+        =       4,4     ; 120ns,120ns = 240ns cycle
+        =       3,3     ; 90ns,90ns   = 180ns cycle
+        =       3,1     ; 90ns,30ns   = 120ns cycle
+        ALIGN
+
+DMA_Data_Table
+        =       8,8     ; 240ns,240ns = 480ns cycle
+        =       3,2     ; 90ns,60ns   = 150ns cycle
+        =       3,1     ; 90ns,30ns   = 120ns cycle
+        ALIGN
+
+; Register values for PIO modes (no clash with DMA, so use raw)
+PIO_Reg_Table
+        =       &0C     ; 240ns,360ns = 600ns cycle (ATA spec says 290ns
+        =       &05     ; 240ns,150ns = 390ns cycle  pulse for modes 0-2
+        =       &03     ; 240ns,90ns  = 330ns cycle  but controller can't
+        =       &33     ; 90ns,90ns   = 180ns cycle  go that high)
+        =       &31     ; 90ns,30ns   = 120ns cycle
+        ALIGN
+
+PIO_Addr_Table
+        =       &03, &02, &01, &01, &01
+        ALIGN
+
+HAL_ATACableID
+        CMP     a1, #2
+        MOVHS   a1, #0
+        MOVHS   pc, lr
+        Push    "v1,lr"
+        ADD     v1, a1, #1              ; 0/1 => bit 0/bit 1
+        BL      PCI_TungstenSecondaryBus
+        MOV     a2, #11*8
+        MOV     a3, #&4A
+        BL      HAL_PCIReadConfigHalfword
+        TST     a1, v1
+        MOVEQ   a1, #1
+        MOVNE   a1, #0
+        Pull    "v1,pc"
+
+        END

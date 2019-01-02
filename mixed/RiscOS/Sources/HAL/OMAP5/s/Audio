@@ -1,0 +1,1268 @@
+; Copyright 2015 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:Machine.<Machine>
+        GET     Hdr:ImageSize.<ImageSize>
+        $GetIO
+
+        GET     Hdr:OSEntries
+        GET     Hdr:HALEntries
+        GET     Hdr:HALDevice
+        GET     Hdr:AudioDevice
+        GET     Hdr:MixerDevice
+        GET     Hdr:Proc
+
+        GET     hdr.omap543x
+        GET     hdr.StaticWS
+        GET     hdr.PRCM
+        GET     hdr.GPIO
+
+        AREA    |Asm$$Code|, CODE, READONLY, PIC
+
+        EXPORT  Audio_Init
+
+        IMPORT  TPSRead
+        IMPORT  TPSWrite
+
+        IMPORT  memcpy
+        IMPORT  HAL_IRQClear
+        IMPORT  HAL_CounterDelay
+        IMPORT  GPIOx_SetAsOutput
+
+; A brief rundown of OMAP5 HAL audio support:
+; Audio in/out is typically provided via the TWL6040 companion chip.
+; Two interfaces are used to link the audio subsystem to the OMAP: I2C is used to program the
+; audio subsystem, and PDM is used to transmit & receive data (using the McPDM module on the
+; OMAP side).
+; Both the TWL6040 and the OMAP are capable of acting as either the master or slave across the
+; PDM link, so to keep things simple this implementation has the TWL6040 acting as master and
+; the OMAP acting as slave.
+; Finally, to keep the McPDM buffer full, the SDMA module of the OMAP is used
+
+; This means that, on the software side, audio is provided by the following network of
+; components:
+;
+;                             HAL I2C driver
+;                                   |
+;                           RISC OS I2C driver
+;                           |                |
+;                HAL mixer device  <->  HAL audio device
+;                       |                     |
+;             SoundControl module  <->  SoundDMA module
+;                                             |
+;                                       DMAManager module
+;                                             |
+;                                       HAL DMA device
+;
+; (Note - there's also a small amount of communication between the HAL DMA device and the HAL
+; audio device, to allow for the correct setting of the FIFO threshold/DMA packet size)
+
+; With regards to the actual sound I/O features TWL6040 makes available:
+; Audio output:
+;   Headset
+;   Handsfree
+;   Vibrator
+;   Auxiliary
+;   Earphone
+; Audio input:
+;   Mic left input (Main mic | HS mic | AUX/FM left input)
+;   Mic right input (Main mic | HS mic | AUX/FM right input)
+;   Line In
+
+; The Phoenix codec (TWL6040) renders samples at 88.2 kHz and 96 kHz.
+; Handsfree speakers and other paths work at 96 kHz, but headphone has 2 modes:
+;   Low power mode (88.2 and 96 kHz)
+;   High performance mode (96 kHz only)
+
+; There are 8 digital input channels on TWL6040 that can be used for rendering audio out
+; to 9 different analogue outputs. There are 5 McPDM channels (DL0 - DL4), an I2C channel
+; and 2 auxiliary inputs that can be used for FM radio (AFM0/AFM1). Audio from these
+; inputs can be routed to the various analogue outputs as per following table:
+
+; Output port   DL0     DL1     DL2     DL3     DL4     I2C or frame(3) AFM0    AFM1
+; Earphone      X(1)
+; Left Headset  X                                                       X
+; Right Headset X       X                                                       X
+; Left HF                       X                                       X
+; Right HF                      X       X                                       X
+; Left Aux                      X(2)                                    X
+; Right Aux                     X(2)    X(2)                                    X
+; Left Vibr.                                    X       X
+; Right Vibr.                                   X       X
+; (1) This path cannot be concurrent of L/R headset paths
+; (2) These paths can be concurrent but not independent of L/R handsfree paths
+; (3) The frame line can be used for register write in command mode
+
+; TWL6040 has the following 5 analogue input channels that can be used for encoding audio.
+; Uplink audio from TWL6040 to the OMAP Audio BackEnd (ABE) can be transferred over
+; 2 McPDM channles (UL0 and UL1) or via 2 auxiliary ports, AFM0 and AFM1, which are often
+; used for FM radio audio. The possible mappings of these inputs to uplink channels in to
+; the OMAP ABE are as follows:
+
+; Input port            UL0     UL1     AFM0    AFM1
+; Main Microphone, MMIC X
+; Sub Microphone, SMIC          X
+; Headset Micro, HSMIC  X       X
+; Left Aux/FM radio     X               X
+; Right Aux/FM radio            X               X
+
+; So, in summary.....
+; * Since RISC OS only produces one stream of stereo data, we can assign one DAC/amplifier pair
+;   (HSL/HSR, to keep the voice path free for the future?) to playing the data generated by
+;   the OS
+; * There are only two ADCs, so you can only really sample from one stereo source at a time
+;   (or two mono)
+; * The plethora of outputs can select their mix from RISC OS sound data & the ADC data at will
+; * In any case, RISC OS doesn't really have an API for sound recording (or setting the
+;   recording source), so we could just ignore all the inputs entirely until that gets
+;   rectified (although for most OMAP devices which RISC OS is targeting, it's likely that the
+;   stereo "auxiliary" input will be the one providing all the input data, so an API to select
+;   the recording source isn't entirely necessary)
+
+; As for mapping inputs & outputs to those currently supported by the HAL mixer API:
+; TWL6040                         HAL mixer category
+; Headset left/right              HEADPHONES
+; Earphone                        SPEAKER
+; Hands-free left/right           LINE_OUT
+; Auxiliary left/right            AUX_OUT
+;
+; Headset mic                     MIC
+; Handset main mic                AUX_IN
+; Handset sub mic                 none?
+; Digital mic 0                   none?
+; Digital mic 1                   none?
+; Stereo FM/aux input             LINE_IN
+
+
+; For all boards the TWL6040 is connected to the OMAP5 via I2C1 & McPDM.
+;
+; The OMAP4460 Pandaboard ES provides a stacked audio connector, which provides two 3.5 mm audio
+; jack connections. The upper jack on this stacked connector (J16A) is connected to the
+; FM Audio Left and Right inputs of the TWL6040 Audio Companion IC (AFML/AFMR). The lower jack
+; on this stacked connector (J16B) is connected to the Headset Left and Right outputs of the
+; TWL6040 Audio Companion IC. For expansion purposes the left Hands-Free speaker
+; outputs of the TWL6040 are connected to the Expansion Connector J6 [Pin 13,15].
+;
+
+
+; Flag to enable gobs of debug output
+                GBLL    AudioDebug
+AudioDebug      SETL    {FALSE}
+;AudioDebug     SETL    {TRUE}
+
+
+; GPIO pin for activating power to TWL6040 audio chip (from board config)
+;AUDIO_POWER_PIN                *       144
+AUDIO_POWER_DELAY       *       (50*1024)       ; ~51 ms
+
+; interrupt mask for use with McPDM downlink channel
+MCPDM_IRQ_DN_MASK       *       (MCPDM_IRQ_DN_EMPTY + MCPDM_IRQ_DN_FULL)
+
+; flag for using only supported sample rates
+                GBLL    AllSampleRates
+AllSampleRates  SETL    {FALSE}
+
+
+; McPDM downlink channel mask
+MCPDM_DL_CHANNELS       *       (MCPDM_CTRL_PDM_DN1_EN + MCPDM_CTRL_PDM_DN2_EN)
+
+; special gain values for marking OFF state
+HS_GAIN_OFF             *       &F0
+HF_GAIN_OFF             *       &1F
+
+
+; some definitions for TWL6037 register
+
+        MACRO
+$name   DeclareTPSReg $group, $offset
+TPSRegGroup_$name * $group
+TPSRegOffset_$name * $offset
+        MEND
+
+; SMPS9 generates 2.1V for TWL6040
+SMPS9_CTRL              DeclareTPSReg &48, &38
+SMPS9_VOLTAGE           DeclareTPSReg &48, &3B
+
+CLK32KG_CTRL            DeclareTPSReg &48, &D4
+CLK32KAUDIO_CTRL        DeclareTPSReg &48, &D5
+
+; bits in CTRL register
+CTRL_MODE_ACTIVE_MSK    *       (3 << 0)
+CTRL_MODE_ACTIVE_ON     *       (1 << 0)
+CTRL_MODE_SLEEP_MSK     *       (3 << 2)
+CTRL_MODE_SLEEP_ON      *       (1 << 2)
+CTRL_STATUS_MSK         *       (3 << 4)
+CTRL_STATUS_ON          *       (1 << 4)
+
+CTRL_MODE_ON            *       (CTRL_MODE_ACTIVE_ON + CTRL_MODE_SLEEP_ON)
+
+; voltage value for generating 2.1 V: RANGE=1,volt=0x3B
+VOLTAGE_VAL_2V1         *       &BD
+
+
+        MACRO
+        MyTPSWrite $reg, $value
+        LDR     lr, =$value
+        STR     lr, [sp]
+        MOV     a1, #TPSRegGroup_$reg * 2
+        MOV     a4, #TPSRegOffset_$reg
+        BL      TPSWrite
+        MEND
+
+
+Audio_Init
+        Push    "v1-v4,lr"
+  [ AudioDebug
+        DebugTX "Audio_Init"
+  ]
+        ADRL    v1, AudioWS
+        MOV     a1, v1
+        ADR     a2, AudioTemplate
+        MOV     a3, #Audio_DeviceSize
+        BL      memcpy
+        STR     sb, [v1, #:INDEX:AudioWorkspace]
+        ; Get McPDM logical address
+        LDR     v2, L4_ABE_Log
+        ADD     v2, v2, #(L4_McPDM - L4_ABE)
+        STR     v2, [v1, #:INDEX:AudioRegs]
+  [ AudioDebug
+        DebugReg v2, "McPDM @ "
+  ]
+
+        ; Configure all PADs for McPDM and AUDIOPWRON pin
+        LDR     a1, L4_Core_Log
+        LDR     a2, =(L4_CTRL_MODULE_CORE_PAD - L4_Core)
+        ADD     a1, a2, a1
+        ADD     a1, a1, #0x100          ; add common offset
+        LDR     a2, =0x0006             ; output + Mode 6
+        LDR     a3, [sb, #BoardConfig_AudioGPIO]
+        CMP     a3, #141                ; gpio5_141 == AUDIOPWRON (OMAP5_UEVM)
+        STREQH  a2, [a1, #0x00BE]       ; gpio5_141
+        CMPNE   a3, #144                ; gpio5_144 == AUDIOPWRON (IGEPV050)
+        STREQH  a2, [a1, #0x00C4]       ; gpio5_144
+        LDR     a2, =0x01080108         ; inputs: IEN + PTD + Mode 0
+        LDR     a3, =0x0118             ; input:  IEN + PTU + Mode 0
+        STRH    a2, [a1, #0x0082]       ; ABE_CLKS
+        STR     a2, [a1, #0x009C]       ; ABE_MCPDM_UL_DATA + ABE_MCPDM_DN_DATA
+        STRH    a3, [a1, #0x00A0]       ; ABE_MCPDM_FRAME
+        STRH    a2, [a1, #0x00A2]       ; ABE_MCPDM_LB_CLK
+
+        ; Enable ABE power domain and select clock source
+        LDR     a1, L4_PRM_Log
+        ADD     a1, a1, #ABE_PRM
+        LDR     a2, [a1, #PM_ABE_PWRSTCTRL]
+        ORR     a2, a2, #3              ; ON state
+        STR     a2, [a1, #PM_ABE_PWRSTCTRL]
+        ADD     a1, a1, #(WKUPAON_CM - ABE_PRM)
+        LDR     a2, [a1, #CM_WKUPAON_CLKSTCTRL]
+        ORR     a2, a2, #3              ; HW_AUTO
+        STR     a2, [a1, #CM_WKUPAON_CLKSTCTRL]
+        SUB     a1, a1, #(WKUPAON_CM - CKGEN_PRM)
+        MOV     a2, #0                  ; 0=SYS_CLK,1=SYS_32K
+        STR     a2, [a1, #CM_CLKSEL_ABE_PLL_REF]
+
+        ; Prepare TWL6037 voltages used by TWL6040
+        Push    "v1-v2"                 ; v1,v2 is used by I2C calls
+        SUB     sp, sp, #4              ; buffer for TWL6037 register contents
+        MOV     a2, sp
+        MOV     a3, #1
+        LDR     v1, OSentries+4*OS_IICOpV
+;       MyTPSWrite CLK32KG_CTRL, CTRL_MODE_ON
+;       MOV     a2, sp
+;       MOV     a3, #1
+        MyTPSWrite CLK32KAUDIO_CTRL, CTRL_MODE_ON
+        MOV     a2, sp
+        MOV     a3, #1
+        MyTPSWrite SMPS9_CTRL, CTRL_MODE_ON
+        MOV     a2, sp
+        MOV     a3, #1
+        MyTPSWrite SMPS9_VOLTAGE, VOLTAGE_VAL_2V1
+        ADD     sp, sp, #4
+        Pull    "v1-v2"                 ; restore orignal values
+
+        ; Before we go any further, enable module McPDM
+        LDR     a1, L4_CM_CORE_AON_Log
+        ADD     a1, a1, #CKGEN_CM_CORE_AON
+        LDR     a2, [a1, #CM_CLKSEL_ABE]
+        ORR     a2, a2, #(1 << 8)       ; PAD_CLOCKS_GATE
+        STR     a2, [a1, #CM_CLKSEL_ABE]
+        ADD     a1, a1, #(ABE_CM_CORE_AON - CKGEN_CM_CORE_AON)
+        MOV     a2, #2                  ; enable module
+        STR     a2, [a1, #CM_ABE_MCPDM_CLKCTRL]
+        LDR     a2, [a1, #CM_ABE_CLKSTCTRL]
+        BIC     a2, a2, #3              ; NO SLEEP
+        STR     a2, [a1, #CM_ABE_CLKSTCTRL]
+
+        ; Turn on the power for external audio chip (TWL6040)
+        LDR     a1, [sb, #BoardConfig_AudioGPIO]
+        MOV     a2, #1
+        CMP     a1, #-1
+        BLNE    GPIOx_SetAsOutput
+        ; wait a bit
+        LDR     a1, =AUDIO_POWER_DELAY
+        BL      HAL_CounterDelay
+
+        ; Set McPDM to reset state
+        ; Perform full reset, in fact
+        MOV     a1, #MCPDM_SYSCONFIG_SOFTRESET
+        STR     a1, [v2, #MCPDM_SYSCONFIG]
+10
+        LDR     a1, [v2, #MCPDM_SYSCONFIG]
+        TST     a1, #MCPDM_SYSCONFIG_SOFTRESET
+        BNE     %BT10
+
+        ; Set smart idle mode. No auto-idle available! :(
+        MOV     a1, #MCPDM_SYSCONFIG_IDLEMODE_SMART
+        STR     a1, [v2, #MCPDM_SYSCONFIG]
+        MOV     v3, v2                  ; save ptr to PcPDM for later
+
+
+        ; Now resume HAL device setup...
+
+        ADD     v2, v1, #Audio_DeviceSize
+        MOV     a1, v2
+        ADR     a2, MixerTemplate
+        MOV     a3, #Mixer_DeviceSize
+        BL      memcpy
+
+        ; Fill in pointers to each other
+        STR     v1, [v2, #HALDevice_MixerCtrlr]
+        STR     v2, [v1, #HALDevice_AudioMixer]
+
+        LDRB    a1, [sb, #BoardConfig_MixerChans]
+        STRB    a1, [v2, #:INDEX:MixerDisableFlags]
+        ; Unavailable channels, and input channels, start muted
+        ORR     a1, a1, #((1<<MixerChannel_HeadsetMic) + (1<<MixerChannel_AuxInput) + (1<<MixerChannel_MainMic))
+        ADD     a2, v2, #:INDEX:MixerSettings
+10      AND     a3, a1, #1
+        MOVS    a1, a1, LSR #1
+        STR     a3, [a2], #8
+        BNE     %BT10
+
+        ; Register devices
+        MOV     a2, v1
+        MOV     a1, #0
+        CallOS  OS_AddDevice
+        MOV     a2, v2
+        MOV     a1, #0
+        CallOS  OS_AddDevice
+
+
+        ; allow registers to be accessed by i2c (only I2C, in fast mode)
+        ; twl6040_write(codec, TWL6040_REG_ACCCTL, cache[TWL6040_REG_ACCCTL]);
+        MOV     v4, v1                  ; save workspace ptr for later
+        ADD     a2, v4, #:INDEX: AudioChipCache
+        MOV     a4, #TWL6040_REG_ACCCTL
+        ADD     a2, a2, a4
+        MOV     a3, #(TWL6040_I2CSEL + TWL6040_INTCLRMODE + TWL6040_I2CMODE_FM)
+        STRB    a3, [a2]
+        MOV     a1, #TWL6040_IIC*2
+        MOV     a3, #1
+        LDR     v1, OSentries+4*OS_IICOpV
+        BL      TPSWrite
+  [ AudioDebug
+        CMP     a1, #IICStatus_Completed
+        BEQ     %FT10
+        DebugTX "Audio_Init: TWL6040_ACCCTL access failed!"
+10
+  ]
+
+        ; now read all regs into our reg cache
+        ADD     a2, v4, #:INDEX: AudioChipCache ; address our reg cache
+        MOV     a4, #TWL6040_REG_ASICID
+        ADD     a2, a2, a4                      ; start with first valid register
+        MOV     a1, #TWL6040_IIC*2
+        MOV     a3, #(TWL6040_REG_STATUS + 1 - TWL6040_REG_ASICID)
+        LDR     v1, OSentries+4*OS_IICOpV
+        BL      TPSRead
+  [ AudioDebug
+        CMP     a1, #IICStatus_Completed
+        BEQ     %FT20
+        DebugTX "Audio_Init: read of TWL6040 regs failed!"
+20
+  ]
+
+        ; extract offsets from TWL6040_REG_HSOTRIM register and set McPDM offsets
+        ADD     a2, v4, #:INDEX: AudioChipCache
+        MOV     a4, #TWL6040_REG_HSOTRIM
+        LDRB    a3, [a2, a4]
+        MOV     a2, a3, LSR #4          ; extract HSF part
+        AND     a3, a3, #TWL6040_HSLO   ; isolate HSL part
+        CMP     a3, #7
+        SUBHI   a3, a3, #16             ; sign correction
+        AND     a3, a3, #0x1F           ; mask valid offset bits
+        CMP     a2, #7
+        SUBHI   a2, a2, #16             ; sign correction
+        AND     a2, a2, #0x1F           ; mask valid offset bits
+        MOV     a3, a3, LSL #1          ; shift into DN_OFST_RX1 field
+        MOV     a2, a2, LSL #9          ; shift into DN_OFST_RX2 field
+        ORR     a3, a3, #MCPDM_DN_OFFSET_DN_OFST_RX1_EN
+        ORR     a2, a2, #MCPDM_DN_OFFSET_DN_OFST_RX2_EN
+        ORR     a2, a3, a2
+        STR     a2, [v3, #MCPDM_DN_OFFSET]
+        ; configure downlink threshold
+    [ {FALSE}
+        MOV     a2, #(8 - 1)
+    |
+        ; cope with erratum i713
+;       MOV     a2, #2
+        MOV     a2, #6                  ; this seems to be the upper limit
+    ]
+        STR     a2, [v3, #MCPDM_FIFO_CTRL_DN]
+
+30
+
+  [ AudioDebug
+        DebugTX "Audio_Init done"
+  ]
+        Pull    "v1-v4,pc"
+
+
+
+
+; Sample rate table
+; The first 'reserved' byte is used to store the value that needs programming into the
+; TWL6040 LPPLLCTL register, the second byte is used for 'mono --> stereo' flag (HSMN2ST)
+; 'mono' means: R channel gets same value as L channel (==> double sample rate)
+
+        GBLA    numrate
+numrate SETA    0
+
+        MACRO
+$lab    cdf     $freq, $per, $m, $mode  ; CD-derived rate ($freq in Hz, since all integral)
+$lab    DCD     $freq*1024              ; frequency value as reported by Sound_SampleRate
+        DCB     $per                    ; period as reported via Sound_Configure
+        DCB     $mode                   ; 0=TWL6040_LPLLFIN not set, sysclk=19200000
+                                        ; 1=TWL6040_LPLLFIN     set, sysclk=17640000
+        DCB     $m                      ; 1=HSMN2ST active, 0=HSMN2ST not active
+        DCB     0                       ; padding to 8 bytes
+numrate SETA    numrate+1
+        MEND
+
+        ASSERT  AudioRateTableSize = 8
+
+; short forms for mode
+MODE_1920       *       (TWL6040_LPLLENA + 0)
+MODE_1764       *       (TWL6040_LPLLENA + TWL6040_LPLLFIN)
+
+ratetab
+  [ AllSampleRates
+        cdf     8000, 125, 1, MODE_1920         ;  8kHz     (125us)  AC97/6
+        cdf     11025, 91, 1, MODE_1764         ; 11.025kHz (~91 us) CD/4
+        cdf     16000, 63, 1, MODE_1920         ; 16kHz     (~63 us) AC97/3
+        cdf     22050, 45, 1, MODE_1764         ; 22.05kHz  (~45 us) CD/2
+        cdf     32000, 31, 1, MODE_1920         ; 32kHz     (~31 us) AC97*2/3
+        ; these are not natively supported
+        cdf     44100, 23, 1, MODE_1764         ; 44.1kHz   (~23 us) CD/1
+        cdf     48000, 21, 1, MODE_1920         ; 48kHz     (~21 us) AC97/1
+  ] ; AllSampleRates
+        cdf     88200, 11, 0, MODE_1764         ; 88.2kHz   (~11 us) CD*2
+        cdf     96000, 10, 0, MODE_1920         ; 96kHz     (~10 us) AC97*2
+
+; Audio controller HAL device
+
+AudioTemplate
+        DCW     HALDeviceType_Audio + HALDeviceAudio_AudC
+        DCW     HALDeviceID_AudC_TWL6040
+        DCD     HALDeviceBus_Ser + HALDeviceSerBus_IIC
+        DCD     2:SHL:16        ; API version 2.0
+        DCD     AudioDesc
+        DCD     0               ; Address - N/A
+        %       12              ; Reserved
+        DCD     AudioActivate
+        DCD     AudioDeactivate
+        DCD     AudioReset
+        DCD     AudioSleep
+        DCD     AUDIO_IRQ       ; Device
+        DCD     0               ; TestIRQ cannot be called
+        %       8
+        DCD     0               ; Filled in during init
+        DCD     1               ; Output channels (supported so far)
+        DCD     0               ; Input channels (supported so far)
+        ASSERT  (.-AudioTemplate) = HALDevice_Audio_Size
+        ; DMA channel parameters
+        DCD     0               ; flags
+        DCD     AUDIO_DMA_CHAN + 1              ; logical channel
+        DCD     0                               ; 'cycle speed'
+        DCD     2                               ; transfer unit size: 16 bit (2 byte)
+        DCD     L4_McPDM + MCPDM_DN_DATA + 2    ; *physical* address to send data to
+                                                ; use upper half word only (left aligned 24 bit)
+        ; Enable/disable/IRQ routines
+        DCD     PreEnable
+        DCD     PostEnable
+        DCD     PreDisable
+        DCD     PostDisable
+        DCD     IRQHandle
+        DCD     numrate         ; Number of sample rates
+        DCD     ratetab         ; Sample rate table
+        DCD     AudioSetRate    ; SetRate function
+        ; extra fields for API 2.0
+        DCD     0               ; AudioCustomDMAEnable
+        DCD     AudioFlag_StereoReverse ; map R-L to L-R
+        DCD     0               ; AudioMinBuffSize
+        DCD     0               ; AudioBuffAlign
+        ASSERT  (. - AudioTemplate) = HALDevice_Audio_Size_2
+        DCD     0               ; AudioRegs: filled in during init
+        DCD     0               ; AudioWorkspace: filled in during init
+        DCB     0               ; AudioMode
+        DCB     0               ; AudioMono
+        DCW     0               ; AudioChannels
+        %       48              ; AudioChipCache
+        ALIGN
+
+        ASSERT  (. - AudioTemplate) = Audio_DeviceSize
+
+; Mixer HAL device
+
+MixerTemplate
+        DCW     HALDeviceType_Audio + HALDeviceAudio_Mixer
+        DCW     HALDeviceID_Mixer_TWL6040
+        DCD     HALDeviceBus_Ser + HALDeviceSerBus_IIC
+        DCD     1               ; API version
+        DCD     MixerDesc
+        DCD     0               ; Address - N/A
+        %       12              ; Reserved
+        DCD     MixerActivate
+        DCD     MixerDeactivate
+        DCD     MixerReset
+        DCD     MixerSleep
+        DCD     -1              ; Device
+        DCD     0               ; TestIRQ cannot be called
+        %       8
+        DCD     0               ; Filled in during init
+        DCD     MixerChannels
+        DCD     MixerGetFeatures
+        DCD     MixerSetMix
+        DCD     MixerGetMix
+        DCD     MixerGetMixLimits
+        ASSERT  (.-MixerTemplate) = HALDevice_Mixer_Size + 4
+        ; Default settings will be filled in during init
+        DCD     0, 0
+        DCD     0, 0
+        DCD     0, 0
+        DCD     0, 0
+        DCD     0, 0
+        DCD     0, 0
+        DCD     0, 0
+        DCD     0, 0
+        DCW     HS_GAIN_OFF     ; MixerHeadsetGain
+        DCW     0               ; MixerEarphoneGain
+        DCW     0               ; MixerHandsFreeGain
+        DCW     0               ; MixerAuxOutputGain
+        DCW     &1B             ; MixerSystemGain
+        %       2
+        ASSERT  (.-MixerTemplate) = Mixer_DeviceSize
+
+AudioDesc
+        =       "TWL6040-compatible audio controller", 0
+
+MixerDesc
+        =       "TWL6040-compatible audio mixer", 0
+        ALIGN
+
+AudioActivate
+        ; TODO - Fix this!
+        ; SoundDMA is higher up the module chain than SoundControl
+        ; Which means we need the audio controller to do the mixer init, otherwise stuff might
+        ; not work properly
+        Entry   "v1,sb", 4
+        ; Turn off codec, program mix params
+        LDR     v1, [a1, #HALDevice_AudioMixer]
+        ADD     v1, v1, #(:INDEX:MixerSettings)+8*MixerChannels
+        MOV     a2, #MixerChannels-1
+        LDR     sb, AudioWorkspace
+  [ AudioDebug
+        DebugTX "AudioActivate: Setting defaults"
+  ]
+        ADR     a3, ratetab
+        LDRB    a4, [a3, #(1*8+6)]
+        LDRB    a3, [a3, #(1*8+5)]      ; use 96 kHz rate
+        STRB    a4, AudioMono
+        MOV     a4, #(MCPDM_CTRL_PDM_DN1_EN + MCPDM_CTRL_PDM_DN2_EN)
+        STRH    a4, AudioChannels
+        STRB    a3, AudioMode
+        BL      SetCodecMode
+10      LDMDB   v1!,{a3-a4}
+        BL      ReallySetMix
+        SUBS    a2, a2, #1
+        BGE     %BT10
+        ; Finished!
+        MOV     a1, #1
+        EXIT
+
+AudioDeactivate
+        MOV     pc, lr
+
+AudioReset
+        MOV     pc, lr
+
+AudioSleep
+        MOV     a1, #0
+        MOV     pc, lr
+
+SetCodecMode
+        ; Reprogram TWL6040_REG_LPPLLCTL from softcopy
+        ; Assumes a1=audio device ptr, sb=HAL workspace
+        Entry   "a1-a4,v1"
+
+        ADR     a2, AudioMode
+        MOV     a1, #TWL6040_IIC*2
+        MOV     a3, #1
+        MOV     a4, #TWL6040_REG_LPPLLCTL
+        LDR     v1, OSentries+4*OS_IICOpV
+        BL      TPSWrite
+  [ AudioDebug
+        CMP     a1, #IICStatus_Completed
+        EXIT    EQ
+        DebugTX "SetCodecMode: TPS write failed!"
+  ]
+        EXIT
+
+PreEnable
+        ; a2 = DMA buffer length
+        ; Use the buffer length to calculate a DMA packet size that fits in the FIFO.
+        ; McPDM has at most 16 FIFO entries; 1 entry contains 2 channels (stereo)
+        ; packet size is handled in element numbers
+        LDR     a3, AudioWorkspace
+        MOV     a4, #(8 * 2)    ; stereo mode
+        STR     a4, [a3, #:INDEX: DMAPktSz_Audio]
+        MOV     pc, lr
+
+PostEnable
+        ; a2 = DMA buffer length
+        ; This function is a mix of two things:
+        ; The McPDM instance is initialised first, to allow the DMA to prefill the TX FIFO.
+        ; The TWL6040 is then initialised afterwards.
+        Entry   "v1-v2,sb"
+        LDR     sb, AudioWorkspace
+  [ AudioDebug
+        DebugTX "PostEnable"
+  ]
+        Push    "a1"
+        LDR     v1, AudioRegs
+        LDRH    v2, AudioChannels
+
+        ; set McPDM Downlink path to reset state
+        ; omap_mcpdm_reset_playback(1)
+        LDR     a1, [v1, #MCPDM_CTRL]
+        ORR     a1, a1, #MCPDM_CTRL_SW_DN_RST
+        STR     a1, [v1, #MCPDM_CTRL]
+
+        ; omap_mcpdm_playback_open()
+        ; clear any outstanding interrupt causes
+        MOV     a1, #-1
+        STR     a1, [v1, #MCPDM_IRQSTATUS]
+        ; enable irq request generation
+        MOV     a1, #MCPDM_IRQ_DN_MASK
+        STR     a1, [v1, #MCPDM_IRQENABLE_SET]
+        ; enable DMA request generation
+        MOV     a1, #MCPDM_DMA_DN
+        STR     a1, [v1, #MCPDM_DMAENABLE_SET]
+        ; set PDM out format
+;       LDR     a1, [v1, #MCPDM_CTRL]
+;       BIC     a1, a1, #MCPDM_CTRL_PDMOUTFORMAT        ; left justified
+;       STR     a1, [v1, #MCPDM_CTRL]
+
+        ; release McPDM Downlink path from reset state
+        ; omap_mcpdm_reset_playback(0)
+        ; omap_mcpdm_start()
+        ; enable playback channel
+        LDR     a1, [v1, #MCPDM_CTRL]
+        BIC     a1, a1, #MCPDM_CTRL_SW_DN_RST
+        ORR     a1, a1, #MCPDM_CTRL_WD_EN
+        ORR     a1, a1, v2                              ; activate our channels
+        STR     a1, [v1, #MCPDM_CTRL]
+
+        Pull    "a1"
+
+        ; enable headset (if needed)
+        LDR     a1, [a1, #HALDevice_AudioMixer]
+        LDR     a2, MixerSettings+MixerChannel_HeadsetOut*8
+        TST     a2, #MixerMixFlag_Mute
+        BLEQ    UpdateHeadset
+
+        EXIT
+
+PreDisable
+        ; Disable the TWL6040, and then McPDM
+        ; This should avoid unwanted underflow IRQs
+        Entry   "v1,sb"
+        LDR     sb, AudioWorkspace
+  [ AudioDebug
+        DebugTX "PreDisable"
+  ]
+
+        ; Disable headset output if required
+        LDR     v1, [a1, #HALDevice_AudioMixer]
+        LDR     a2, [v1, #:INDEX:MixerSettings+MixerChannel_HeadsetOut*8]
+        ANDS    a2, a2, #MixerMixFlag_Mute
+        BNE     %FT30
+        MOV     a2, #HS_GAIN_OFF        ; mark it as OFF
+        STRH    a2, [v1, #:INDEX:MixerHeadsetGain]
+        Push    "a1"
+        ADRL    a2, HeadsetDisableSequenceS
+        MOV     a3, #1
+        LDR     v1, OSentries+4*OS_IICOpV
+10
+        LDRB    a4, [a2],#1
+        MOV     a1, #TWL6040_IIC*2
+        CMP     a4, #0
+        BEQ     %FT20
+        BL      TPSWrite
+  [ AudioDebug
+        CMP     a1, #IICStatus_Completed
+        BEQ     %FT15
+        DebugReg a4,"PreDisable: Write failed, reg="
+15
+  ]
+        ADD     a2, a2, #1
+        B       %BT10
+20
+        Pull    "a1"
+30
+
+        ; omap_mcpdm_stop()
+        ; disable playback channel
+        LDR     a2, AudioRegs
+        LDR     a3, [a2, #MCPDM_CTRL]
+        BIC     a3, a3, #MCPDM_DL_CHANNELS
+        STR     a3, [a2, #MCPDM_CTRL]
+
+        ; omap_mcpdm_playback_close()
+        ; disable IRQ request generation
+        MOV     a3, #MCPDM_IRQ_DN_MASK
+        STR     a3, [a2, #MCPDM_IRQENABLE_CLR]
+        ; disable DMA request generation
+        MOV     a3, #MCPDM_DMA_DN
+        STR     a3, [a2, #MCPDM_DMAENABLE_CLR]
+
+        EXIT
+
+PostDisable
+        MOV     pc, lr
+
+IRQHandle
+  [ AudioDebug
+        Push    "sb,lr"
+        LDR     sb, AudioWorkspace
+        LDR     a2, AudioRegs
+        LDR     a2, [a2, #MCPDM_IRQSTATUS]
+        DebugReg a2,"IRQHandle: IRQSTATUS="
+        Pull    "sb,lr"
+  ]
+  [ {FALSE}
+        ; Just clear the IRQ and ask for an audio reset
+        LDR     a3, AudioRegs
+        MVN     a2, #0
+        ; Make sure we don't get bothered about this again - we can't guarantee when the OS
+        ; will get round to resetting the audio, and could potentially get stuck in a loop
+        ; if we allow the IRQ to keep firing
+        STR     a2, [a3, #MCPDM_IRQENABLE_CLR]
+        STR     a2, [a3, #MCPDM_IRQSTATUS]      ; clear all possible causes
+        MOV     a1, #AudioIRQHandle_RequestReset
+        MOV     pc, lr
+  |
+        ; restart the PDM channels and go on
+        LDR     a3, AudioRegs
+        LDR     a2, [a3, #MCPDM_IRQSTATUS]
+        STR     a2, [a3, #MCPDM_IRQSTATUS]      ; clear interrupt causes
+        LDR     a2, [a3, #MCPDM_CTRL]
+        BIC     a2, a2, #MCPDM_DL_CHANNELS
+        ORR     a2, a2, #MCPDM_CTRL_SW_DN_RST   ; reset downlink path
+        STR     a2, [a3, #MCPDM_CTRL]
+        BIC     a2, a2, #MCPDM_CTRL_SW_DN_RST   ; release reset
+        STR     a2, [a3, #MCPDM_CTRL]
+        ; prepare some data in FIFO (to avoid underflow)
+        MOV     a2, #0
+        STR     a2, [a3, #MCPDM_DN_DATA]
+        STR     a2, [a3, #MCPDM_DN_DATA]
+        LDR     a2, [a3, #MCPDM_CTRL]
+        LDRH    a1, AudioChannels
+        ORR     a2, a2, a1                      ; reenable channels
+        STR     a2, [a3, #MCPDM_CTRL]
+        MOV     a1, #AudioIRQHandle_NOP
+        MOV     pc, lr
+  ]
+
+AudioSetRate
+        ; a2 = sample rate index (0-based)
+        Entry   "sb"
+        LDR     sb, AudioWorkspace
+  [ AudioDebug
+        DebugReg a2, "AudioSetRate: "
+  ]
+        ; Reload TWL6040_REG_LPPLLCTL with the required value
+        ADRL    a3, ratetab
+        ASSERT  AudioRateTableSize = 8
+        ADD     a3, a3, a2, LSL #3
+        LDRB    a4, [a3, #6]
+        LDRB    a3, [a3, #5]
+        STRB    a4, AudioMono
+        MOV     a4, #(MCPDM_CTRL_PDM_DN1_EN + MCPDM_CTRL_PDM_DN2_EN)
+        STRH    a4, AudioChannels
+        STRB    a3, AudioMode
+        BL      SetCodecMode
+        EXIT
+
+MixerActivate
+        MOV     a1, #1
+
+MixerDeactivate
+        MOV     pc, lr
+
+MixerReset
+        Entry   "v1,sb", 4
+        ; program default mix params
+        ADR     v1, MixerSettings+8*MixerChannels
+        LDR     a1, [a1, #HALDevice_MixerCtrlr]
+        MOV     a2, #MixerChannels-1
+        LDR     sb, AudioWorkspace
+  [ AudioDebug
+        DebugTX "MixerReset: Setting defaults"
+  ]
+10      LDMDB   v1!,{a3-a4}
+        BL      ReallySetMix
+        SUBS    a2, a2, #1
+        BGE     %BT10
+        EXIT
+
+MixerSleep
+        ; TODO?
+        MOV     a1, #0
+        MOV     pc, lr
+
+MixerGetFeatures
+        ; Check if this channel is disabled and needs the 'fixed' flag
+        MOV     a4, #1
+        LDRB    a3, MixerDisableFlags
+        TST     a3, a4, LSL a2
+        ADR     a1, MixerFeaturesTab
+        LDR     a1, [a1, a2, LSL #2]
+        ORRNE   a1, a1, #MixerFeaturesFlag_Fixed
+        MOV     pc, lr
+
+MixerFeaturesTab
+        ; Stereo headset output
+        DCW     0
+        DCW     MixerCategory_Headphones
+        ; Mono earphone output
+        DCW     MixerFeaturesFlag_DefaultMute
+        DCW     MixerCategory_Speaker
+        ; Stereo hands-free output
+        DCW     MixerFeaturesFlag_DefaultMute
+        DCW     MixerCategory_LineOut
+        ; Stereo FM/aux output
+        DCW     MixerFeaturesFlag_DefaultMute
+        DCW     MixerCategory_AuxOut
+        ; System audio
+        DCW     0
+        DCW     MixerCategory_System
+        ; Stereo headset mic
+        DCW     MixerFeaturesFlag_Mono :OR: MixerFeaturesFlag_DefaultMute
+        DCW     MixerCategory_Mic
+        ; Stereo FM/aux input
+        DCW     MixerFeaturesFlag_DefaultMute
+        DCW     MixerCategory_LineIn
+        ; Mono main mic
+        DCW     MixerFeaturesFlag_Mono :OR: MixerFeaturesFlag_DefaultMute
+        DCW     MixerCategory_AuxIn
+
+; MixerDevice API v0.1
+MixerGetMixLimits
+        ADR     a1, MixerLimitsTab
+        ADD     a1, a1, a2, LSL #3
+        ADD     a1, a1, a2, LSL #2
+        LDMIA   a1, {a1, a2, a4}
+        STMIA   a3, {a1, a2, a4}
+        MOV     pc, lr
+
+MixerLimitsTab
+        ; Stereo headset output
+        DCD     -30*16
+        DCD     0
+        DCD     2*16
+        ; Mono speaker output
+        DCD     -24*16
+        DCD     6*16
+        DCD     2*16
+        ; Stereo hands-free output
+        DCD     -52*16
+        DCD     6*16
+        DCD     2*16
+        ; Stereo FM/aux output
+        DCD     -52*16
+        DCD     6*16
+        DCD     2*16
+        ; System audio
+        DCD     -18*16
+        DCD     24*16
+        DCD     6*16
+        ; Stereo headset mic
+        DCD     6*16
+        DCD     30*16
+        DCD     6*16
+        ; Stereo FM/aux input
+        DCD     6*16
+        DCD     30*16
+        DCD     6*16
+        ; Mono main mic
+        DCD     6*16
+        DCD     30*16
+        DCD     6*16
+
+MixerSetMix
+        ; a1 = mixer device
+        ; a2 = channel
+        ; a3 = mute flag
+        ; a4 = gain, in dB*16
+        Entry   "v1"
+        ; Double-check that we aren't being asked to program a disabled channel
+        ; Although ReallySetMix will do another check, we must check here to make sure we don't
+        ; update the stored settings (particularly the headset settings, which UpdateHeadset
+        ; treats as gospel)
+        MOV     ip, #1
+        LDRB    v1, MixerDisableFlags
+        TST     v1, ip, LSL a2
+        EXIT    NE
+        ADR     v1, MixerSettings
+        ADD     v1, v1, a2, LSL #3
+        LDMIA   v1, {ip, lr}
+        TEQ     a3, ip
+        TEQEQ   a4, lr
+        STMNEIA v1, {a3, a4}
+        LDRNE   a1, [a1, #HALDevice_MixerCtrlr]
+        BLNE    ReallySetMix
+        EXIT
+
+ReallySetMix
+        ; a1 = *audio* device
+        ; a2-a4 as above
+        ; Preserves all regs
+        ; Channel gain & mute control can't easily be abstracted, need to do it on a
+        ; case-by-case basis :(
+        ; Common code to get ready for IIC transfers
+        Entry   "a1-a4,v1-v5,sb,v7"
+        LDR     sb, AudioWorkspace
+  [ AudioDebug
+        DebugTX "ReallySetMix:"
+        DebugReg a2,"Channel="
+        DebugReg a3,"Mute="
+        DebugReg a4,"Gain="
+  ]
+        ; Triple-check that we aren't being asked to program a disabled channel
+        ; (ReallySetMix gets called unconditionally in a few places; easier to just check for
+        ; invalid channels here rather than in every place it gets called from)
+        LDRB    v5, [sb, #BoardConfig_MixerChans]
+        MOV     v2, #1
+        TST     v5, v2, LSL a2
+        EXIT    NE
+        LDR     v5, [a1, #HALDevice_AudioMixer]
+        MOV     v2, a3
+        ADD     v7, v5, #:INDEX: MixerSettings+4
+        LDR     v1, OSentries+4*OS_IICOpV
+        MOV     a1, #TWL6040_IIC*2
+        ADD     v7, v7, a2, LSL #3
+        ADR     a3, SetMixTab
+        MOV     v3, a4
+        LDR     pc, [a3, a2, LSL #2]
+        ; Following code entered with:
+        ; a1, v1 ready for TPSRead/TPSWrite
+        ; v2 = mute flag
+        ; v3 = gain
+        ; v5 = mixer device
+        ; sb = HAL WS
+        ; v7 = gain writeback ptr
+SetMixTab
+        DCD     SetMixHeadsetOut
+        DCD     SetMixEarphone
+        DCD     SetMixHandsFree
+        DCD     SetMixAuxOutput
+        DCD     SetMixSystem
+        DCD     SetMixHeadsetMic
+        DCD     SetMixAuxInput
+        DCD     SetMixMainMic
+
+SetMixHeadsetOut ; HS_* regs
+        ; Go through to UpdateHeadset
+        MOV     a1, v5
+        BL      UpdateHeadset
+        EXIT
+
+SetMixEarphone ; TWL6040 has no predriver regs ==> use earphone instead
+        ; Calculate EARGAIN: 0x0 == 6 dB, 0x1 == 4 dB, 0x2 == 2 dB ... 0xF == -24dB
+        TST     v2, #MixerMixFlag_Mute
+        MOVNE   v4, #0                  ; disable everything
+        BNE     %FT10
+        ; limit gain to allowed range
+        CMP     v3, #-24*16
+        LDRLT   v3, =(-24*16)
+        CMP     v3, #6*16
+        MOVGT   v3, #6*16
+        ; calculate gain value
+        MOV     lr, v3, ASR #(4+1)      ; div by step width (2 dB)
+        RSB     v4, lr, #3              ; negate at zero point
+        MOV     v4, v4, LSL #1          ; shift into EARGAIN position
+        STR     v3, [v7]                ; remember used gain value
+        ORR     v4, v4, #TWL6040_EARENA ; enable it
+10
+        ADD     a2, v5, #:INDEX:MixerEarphoneGain
+        LDRH    ip, [a2]
+        CMP     ip, v4
+        EXIT    EQ
+        STRH    v4, [a2]
+        MOV     a3, #1
+        MOV     a4, #TWL6040_REG_EARCTL
+        BL      TPSWrite
+  [ AudioDebug
+        CMP     a1, #0
+        EXIT    EQ
+        DebugTX "SetMixEarphone: TPS write failed!"
+  ]
+        EXIT
+
+SetMixHandsFree ; HF* regs
+        ; Go through to UpdateHandsFree
+        MOV     a1, v5
+        BL      UpdateHandsFree
+        EXIT
+
+
+SetMixAuxOutput
+        ; Aux Output path has no separate control registers in TWL6040
+        ; it is internally connected to handsfree path
+        B       SetMixHandsFree
+
+SetMixSystem
+        ; there is no such thing for output in TWL6040
+        ; there is only a general LINEGAIN for input paths
+        ; Calculate LINEGAIN (L|R): 0x0 == -18 dB, 0x1 == -12 dB, ... 0x7 == +24 dB
+        ; range mapping: [-18 dB .. +24 dB]
+        ; mapping: fScale = (1 / 6) = 0.166.. ~ 2370 [ * 2^14]
+        ; "/ 6" for step width of 6 dB
+        TST     v2, #MixerMixFlag_Mute
+        MOVNE   v4, #0                  ; disable everything
+        BNE     %FT10
+        ; limit gain to allowed range
+        CMP     v3, #-18*16
+        LDRLT   v3, =(-18*16)
+        CMP     v3, #24*16
+        MOVGT   v3, #24*16
+        STR     v3, [v7]                ; remember used gain value
+        ; calculate scaled gain value
+        CMP     v3, #0
+        ADDGT   v3, v3, #1              ; compensate for rounding errors
+        MOV     a3, #2370               ; == fScale
+        MUL     a3, v3, a3
+        MOV     a3, a3, ASR #(14+4)     ; div by (16 * 2^14)
+        ADD     a3, a3, #3              ; add 0 dB offset
+        AND     v4, a3, #TWL6040_LINEGAINL      ; only relevant bits
+        ORR     v4, v4, v4, LSL #3      ; fold into LINEGAINR
+10
+        ADD     a2, v5, #:INDEX:MixerSystemGain
+        LDRH    ip, [a2]
+        CMP     ip, v4
+        EXIT    EQ
+        MOV     a3, #1
+        STRH    v4, [a2]
+        MOV     a4, #TWL6040_REG_LINEGAIN
+        BL      TPSWrite
+  [ AudioDebug
+        CMP     a1, #0
+        EXIT    EQ
+        DebugTX "SetMixSystem: TPS write failed!"
+  ]
+        EXIT
+
+SetMixHeadsetMic ; TODO - Implement!
+SetMixAuxInput ; TODO - Implement!
+SetMixMainMic ; TODO - Implement!
+        EXIT
+
+MixerGetMix
+        ADR     a1, MixerSettings
+        ADD     a1, a1, a2, LSL #3
+        LDMIA   a1, {a1, a2}
+        MOV     pc, lr
+
+UpdateHeadset
+        ; This performs the steps necessary to enable/disable the headset output
+        ; Input:
+        ; a1 = mixer device
+        ; sb = HAL workspace
+        Entry   "a1-a4,v1", 12
+
+        ; Get mixer settings for headset
+        ADR     ip, MixerSettings+MixerChannel_HeadsetOut*8
+        LDMIA   ip, {a4,v1}     ; a4 = mute flag, v1 = gain
+        TST     a4, #MixerMixFlag_Mute
+        BEQ     %FT02
+        ADR     a2, HeadsetDisableSequenceS     ; Muted, so disable it
+        MOV     ip, #0
+        B       %FT05
+02
+        ; limit gain to allowed range
+        CMP     v1, #-30*16
+        LDRLT   v1, =(-30*16)
+        CMP     v1, #0
+        MOVGT   v1, #0
+        ; Calculate HSGAIN: 0x0 == 0 dB, 0x1 == -2 dB, ... 0xF == -30dB
+        MOV     a2, v1, ASR #(4+1)      ; div by step width (2 dB)
+        RSB     ip, a2, #0              ; negate
+        ORR     ip, ip, ip, LSL #4      ; fold it into HSGAINR
+        ; Copy enable sequence to stack so we can modify it with the correct gain
+        ADR     a3, HeadsetEnableSequenceS
+        MOV     a2, sp
+        LDRH    v1, MixerHeadsetGain
+        CMP     v1, #HS_GAIN_OFF        ; Is the headset currently turned off?
+        LDMIA   a3, {a3,a4,v1}
+        ORR     a4, a4, ip, LSL #8      ; Set correct gain
+        STMEQIA a2, {a3,a4,v1}          ; Full programming sequence if headset off
+        MOVNE   a4, a4, LSL #16         ; If headset on, only change HSGAIN
+        MOVNE   a4, a4, LSR #16
+        STRNE   a4, [a2]
+05
+        ; a2 = sequence to program
+        ; ip = HSGAIN value
+        LDRH    v1, MixerHeadsetGain
+  [ AudioDebug
+        DebugReg ip,"UpdateHeadset: New="
+        DebugReg v1,"Old="
+  ]
+        CMP     v1, ip
+        EXIT    EQ              ; Avoid reprogramming identical values
+        STRH    ip, MixerHeadsetGain
+        MOV     a3, #1
+        LDR     v1, OSentries+4*OS_IICOpV
+10
+        LDRB    a4, [a2],#1
+        MOV     a1, #TWL6040_IIC*2
+        CMP     a4, #0
+        EXIT    EQ
+        BL      TPSWrite
+  [ AudioDebug
+        CMP     a1, #IICStatus_Completed
+        BEQ     %FT15
+        DebugReg a4,"UpdateHeadset: Write failed, reg="
+15
+  ]
+        ADD     a2, a2, #1
+        B       %BT10
+
+HeadsetEnableSequenceS
+        DCB     TWL6040_REG_HSLCTL, &2B ; DAC ON
+        DCB     TWL6040_REG_HSRCTL, &2B ; DAC ON
+        DCB     TWL6040_REG_HSGAIN, 0   ; this gets filled in above
+        DCB     TWL6040_REG_HSLCTL, &2F ; DAC + Driver ON
+        DCB     TWL6040_REG_HSRCTL, &2F ; DAC + Driver ON
+        DCB     0       ; Terminator
+        ALIGN
+
+HeadsetDisableSequenceS
+        DCB     TWL6040_REG_HSLCTL, &2B ; DAC ON
+        DCB     TWL6040_REG_HSRCTL, &2B ; DAC ON
+        DCB     TWL6040_REG_HSGAIN, HS_GAIN_OFF ; special value for marking OFF
+        DCB     0       ; Terminator
+        ALIGN
+
+
+UpdateHandsFree
+        ; This performs the steps necessary to enable/disable the hands-free output
+        ; Input:
+        ; a1 = mixer device
+        ; sb = HAL workspace
+        Entry   "a1-a4,v1", 16
+
+        ; Get mixer settings for headset
+        ADR     ip, MixerSettings+MixerChannel_HandsFree*8
+        LDMIA   ip, {a4,v1}     ; a4 = mute flag, v1 = gain
+        TST     a4, #MixerMixFlag_Mute
+        ADRNE   a2, HandsFreeDisableSequence ; Muted, so disable it
+        MOVNE   ip, #0
+        BNE     %FT05
+        ; gain is in HFLGAIN and HFRGAIN each with the following values:
+        ; 0x00 == 6 dB, 0x01 == 4 dB, 0x02 == 2 dB, 0x03 == 0 dB, 0x04 == -2 dB,
+        ; ... 0x1C == -50 dB, 0x1D == -52 dB  (0x1E and 0x1F not valid)
+        ; limit gain to allowed range
+        CMP     v1, #-52*16
+        LDRLT   v1, =(-52*16)
+        CMP     v1, #6*16
+        MOVGT   v1, #6*16
+        ; calculate gain value
+        MOV     a3, v1, ASR #(4+1)      ; div by step width (2 dB)
+        RSB     ip, a3, #3              ; negate at zero point
+        ; Copy enable sequence to stack so we can modify it with the correct gain
+        ADR     a3, HandsFreeEnableSequence
+        MOV     a2, sp
+        LDRH    v1, MixerHandsFreeGain
+        CMP     v1, #HF_GAIN_OFF        ; Is the hands-free currently turned off?
+        LDMIA   a3, {a3,a4,v1}
+        ORR     a4, a4, ip, LSL #8      ; Set correct gain HFLGAIN
+        ORR     a4, a4, ip, LSL #24     ; Set correct gain HFRGAIN
+        STMEQIA a2, {a3,a4,v1}          ; Full programming sequence if hands-free off
+        STRNE   a4, [a2]                ; If hands-free on, only change HFxGAIN
+        MOV     a4, #0                  ; terminate sequence with 0
+        STRNE   a4, [a2, #4]
+        STREQ   a4, [a2, #3*4]
+05
+        ; a2 = sequence to program
+        ; ip = HFxGAIN value
+        LDRH    v1, MixerHandsFreeGain
+  [ AudioDebug
+        DebugReg ip,"UpdateHandsFree: New="
+        DebugReg v1,"Old="
+  ]
+        CMP     v1, ip
+        EXIT    EQ              ; Avoid reprogramming identical values
+        STRH    ip, MixerHandsFreeGain
+        MOV     a3, #1
+        LDR     v1, OSentries+4*OS_IICOpV
+10
+        LDRB    a4, [a2],#1
+        MOV     a1, #TWL6040_IIC*2
+        CMP     a4, #0
+        EXIT    EQ
+        BL      TPSWrite
+  [ AudioDebug
+        CMP     a1, #IICStatus_Completed
+        BEQ     %FT15
+        DebugReg a4,"UpdateHandsFree: Write failed, reg="
+15
+  ]
+        ADD     a2, a2, #1
+        B       %BT10
+
+HandsFreeEnableSequence
+        DCB     TWL6040_REG_HFLCTL, &07 ; DAC ON
+        DCB     TWL6040_REG_HFRCTL, &07 ; DAC ON
+        DCB     TWL6040_REG_HFLGAIN, 0  ; this gets filled in above
+        DCB     TWL6040_REG_HFRGAIN, 0  ; this gets filled in above
+        DCB     TWL6040_REG_HFLCTL, &17 ; DAC + Driver ON
+        DCB     TWL6040_REG_HFRCTL, &17 ; DAC + Driver ON
+        DCB     0       ; Terminator
+        ALIGN
+
+HandsFreeDisableSequence
+        DCB     TWL6040_REG_HFLCTL, &07 ; DAC ON
+        DCB     TWL6040_REG_HFRCTL, &07 ; DAC ON
+        DCB     TWL6040_REG_HFLGAIN, &1D        ; nearly mute
+        DCB     TWL6040_REG_HFRGAIN, &1D        ; nearly mute
+        DCB     0       ; Terminator
+        ALIGN
+
+
+        END

@@ -1,0 +1,368 @@
+; Copyright 2016 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+
+GPUMode_Init ROUT
+        Entry   "r0-r3"
+        ; Mark GPU mode changes as being available if:
+        ; * The user hasn't disabled them in the command line
+        BL      CheckGPUModeDisable
+        EXIT    VS
+        ; * The display is not rotated by 90 / 270 degrees (need to teach the OS how to specify rotation in the VIDC list)
+        LDR     r0, DisplayRotate
+        TST     r0, #DisplayRotate_90
+        EXIT    NE
+        ; * TV service is available, and DVI/HDMI output is in use
+        LDR     r0, TVService
+        CMP     r0, #0
+        EXIT    EQ
+        BL      TVService_GetState
+        EXIT    VS
+        AND     r0, r0, #12
+        CMP     r0, #4
+        CMPNE   r0, #8
+        EXIT    NE
+        ; * hdmi_timings command (+ vcgencmd) is available
+        ADR     r0, HDMITimings
+        MOV     r1, #13
+        SUB     sp, sp, #128
+        MOV     r2, sp
+        MOV     r3, #128
+        BL      GenCmd_Send
+        LDR     r0, [sp], #128
+        EXIT    VS
+        CMP     r0, #0
+        EXIT    NE
+      [ Debug
+        BL      DebugTXStrInline
+        DCB     "GPU mode changes available",10,13,0
+        ALIGN
+      ]
+        ; Mark GPU mode changes as being available
+        MOV     r0, #DisplayStatus_Changing
+        MOV     r1, #Service_DisplayStatus
+        LDRB    r2, GVinstance
+        CMP     r2, #255
+        SWINE   XOS_ServiceCall
+        STR     pc, GPUModeAvailable
+        CMP     r2, #255
+        MOV     r0, #DisplayStatus_Changed
+        SWINE   XOS_ServiceCall
+        CLRV
+        EXIT
+
+GPUMode_Finalise ROUT
+        Entry   "r0-r2"
+        LDR     r0, GPUModeAvailable
+        CMP     r0, #0
+        EXIT    EQ
+        ; Mark GPU mode changes as being unavailable
+        MOV     r0, #DisplayStatus_Changing
+        MOV     r1, #Service_DisplayStatus
+        LDRB    r2, GVinstance
+        CMP     r2, #255
+        SWINE   XOS_ServiceCall
+        MOV     r0, #0
+        STR     r0, GPUModeAvailable
+        CMP     r2, #255
+        MOVNE   r0, #DisplayStatus_Changed
+        MOVNE   r1, #Service_DisplayStatus
+        SWINE   XOS_ServiceCall
+        CLRV
+        EXIT
+        
+HDMITimings
+        = "hdmi_timings"
+        ASSERT  . - HDMITimings = HDMITimings_Len
+        = 0
+        ALIGN
+
+; In: R6 -> VIDCList
+;     R8 = interlace control list item
+; Out: R0 = 0 if mode OK
+GPUMode_Vet ROUT
+        Entry   "r1-r2"
+        LDR     r0, GPUModeAvailable
+        CMP     r0, #0
+        EXIT    EQ ; If GPU mode changes aren't available, we don't care what the VIDC list says, so don't object to it
+        ; Do a basic sanity check on the timing parameters to allow us to
+        ; detect fake modes where only width + height were given
+        LDR     r1, [r6, #VIDCList3_HorizSyncWidth]
+        CMP     r1, #0
+        LDRNE   r1, [r6, #VIDCList3_VertiSyncWidth]
+        CMPNE   r1, #0
+        BEQ     %FT999
+        LDR     r1, [r6, #VIDCList3_HorizBackPorch]
+        LDR     r2, [r6, #VIDCList3_HorizLeftBorder]
+        ADD     r1, r1, r2
+        LDR     r2, [r6, #VIDCList3_HorizRightBorder]
+        ADD     r1, r1, r2
+        LDR     r2, [r6, #VIDCList3_HorizFrontPorch]
+        ADD     r1, r1, r2
+        CMP     r1, #0
+        BEQ     %FT999
+        LDR     r1, [r6, #VIDCList3_VertiBackPorch]
+        LDR     r2, [r6, #VIDCList3_VertiTopBorder]
+        ADD     r1, r1, r2
+        LDR     r2, [r6, #VIDCList3_VertiBottomBorder]
+        ADD     r1, r1, r2
+        LDR     r2, [r6, #VIDCList3_VertiFrontPorch]
+        ADD     r1, r1, r2
+        CMP     r1, #0
+        BEQ     %FT999
+        ; Interlace not supported yet
+        CMP     r8, #0
+        BNE     %FT999
+        ; Vet against the configured GPU limits
+        LDR     r1, [r6, #VIDCList3_PixelRate]
+        MOV     lr, #1000
+        MUL     r1, lr, r1
+        LDR     r0, MinPixelClock
+        CMP     r1, r0
+        BLO     %FT999
+        LDR     r0, MaxPixelClock
+        CMP     r1, r0
+        BHI     %FT999
+        MOV     r0, #0
+        EXIT
+999
+        MOV     r0, #1
+        EXIT
+
+; R1 -> buffer (GPUMode_BufLen length, word aligned)
+; R6 -> VIDCList
+SetGPUModeFromVIDCList ROUT
+        Entry   "r0-r7"
+        ; Make sure GPU mode changes are available
+        LDR     r0, GPUModeAvailable
+        CMP     r0, #0
+        EXIT    EQ
+        ; Build the hdmi_timings command
+        ADR     r0, HDMITimings
+        ASSERT  HDMITimings_Len = 12
+        LDMIA   r0, {r2-r4}
+        STMIA   r1!, {r2-r4}
+        MOV     r2, #GPUMode_BufLen-HDMITimings_Len
+        LDR     r0, [r6, #VIDCList3_HorizDisplaySize]
+        MOV     r3, r0
+        BL      AppendNumber
+        LDR     r4, [r6, #VIDCList3_SyncPol]
+        ASSERT  SyncPol_InvertHSync = 1
+        AND     r0, r4, #SyncPol_InvertHSync
+        RSB     r0, r0, #1
+        BL      AppendNumber
+        LDR     r0, [r6, #VIDCList3_HorizFrontPorch]
+        LDR     lr, [r6, #VIDCList3_HorizRightBorder]
+        ADD     r0, r0, lr
+        ADD     r3, r3, r0
+        BL      AppendNumber
+        LDR     r0, [r6, #VIDCList3_HorizSyncWidth]
+        ADD     r3, r3, r0
+        BL      AppendNumber
+        LDR     r0, [r6, #VIDCList3_HorizBackPorch]
+        LDR     lr, [r6, #VIDCList3_HorizLeftBorder]
+        ADD     r0, r0, lr
+        ADD     r3, r3, r0
+        BL      AppendNumber
+        LDR     r0, [r6, #VIDCList3_VertiDisplaySize]
+        MOV     r5, r0
+        BL      AppendNumber
+        ASSERT  SyncPol_InvertVSync = 2
+        AND     r0, r4, #SyncPol_InvertVSync
+        MOV     r0, r0, LSR #1
+        RSB     r0, r0, #1
+        BL      AppendNumber
+        LDR     r0, [r6, #VIDCList3_VertiFrontPorch]
+        LDR     lr, [r6, #VIDCList3_VertiBottomBorder]
+        ADD     r0, r0, lr
+        ADD     r5, r5, r0
+        BL      AppendNumber
+        LDR     r0, [r6, #VIDCList3_VertiSyncWidth]
+        ADD     r5, r5, r0
+        BL      AppendNumber
+        LDR     r0, [r6, #VIDCList3_VertiBackPorch]
+        LDR     lr, [r6, #VIDCList3_VertiTopBorder]
+        ADD     r0, r0, lr
+        ADD     r5, r5, r0
+        BL      AppendNumber
+        ; Interlace sync offsets (not supported yet)
+        MOV     r0, #0
+        BL      AppendNumber
+        BL      AppendNumber
+        ; Pixel repetition (not supported yet)
+        BL      AppendNumber
+        ; Frame rate (not sure why the GPU needs this!)
+        MUL     r3, r5, r3
+        LDR     r5, [r6, #VIDCList3_PixelRate]
+        MOV     lr, #1000
+        MUL     r5, lr, r5
+        MOV     r7, r5
+        DivRem  r0, r5, r3, lr, norem
+        BL      AppendNumber
+        ; Interlace flag (not supported yet)
+        MOV     r0, #0
+        BL      AppendNumber
+        ; Pixel rate
+        MOV     r0, r7
+        BL      AppendNumber
+        ; Aspect ratio
+        ; Currently the OS doesn't tell us the intended aspect ratio, so we
+        ; just have to guess (assume square pixels)
+        ; Note that we could also just set it to 0 to let the monitor work it
+        ; out for itself
+        LDR     r5, [r6, #VIDCList3_HorizDisplaySize]
+        LDR     r3, [r6, #VIDCList3_VertiDisplaySize]
+        MOV     r5, r5, LSL #16
+        DivRem  r7, r5, r3, lr, norem
+        ADR     r3, Aspects
+        MOV     r4, #0
+        MOV     r5, #-1
+10
+        LDR     lr, [r3, r4, LSL #2]
+        ADD     r4, r4, #1
+        CMP     lr, #-1
+        BEQ     %FT20
+        SUBS    lr, lr, r7
+        RSBLT   lr, lr, #0
+        CMP     lr, r5
+        MOVLO   r5, lr
+        MOVLO   r0, r4
+        B       %BT10
+20
+        BL      AppendNumber
+        ; Check if this is the same as the last setting
+        FRAMLDR r0,,r1
+      [ Debug
+        Push    "r0-r1"
+        MOV     r1, r0
+        BL      DebugTXS
+        bl      DebugTXStrInline
+        DCB     10,13,0
+        ALIGN
+        Pull    "r0-r1"
+      ]
+        ADD     r0, r0, #HDMITimings_Len
+        ADRL    r2, LastGPUMode
+        MOV     r3, #0
+30
+        LDRB    r4, [r0], #1
+        LDRB    r5, [r2], #1
+        EORS    r5, r5, r4
+        ORR     r3, r3, r5
+        STRNEB  r4, [r2, #-1]
+        CMP     r4, #0
+        BNE     %BT30
+        CMP     r3, #0
+        EXIT    EQ ; Same timings command as before, so assume the GPU is currently set to the correct mode
+        FRAMLDR r0,,r1
+        ; Issue the command
+        SUB     r1, r1, r0
+        MOV     r2, r0
+        ADD     r1, r1, #1
+        MOV     r3, #GPUMode_BufLen
+        BL      GenCmd_Send
+        EXIT    VS
+        LDR     r0, [r2]
+        CMP     r0, #0
+        EXIT    NE
+      [ Debug
+        bl      DebugTXStrInline
+        DCB     "hdmi_timings OK",10,13,0
+        ALIGN
+      ]
+        ; Now switch mode
+        BL      TVService_GetState
+        EXIT    VS
+      [ Debug
+        BL      DebugHexTX4
+        Push    "r0"
+        MOV     r0, r1
+        BL      DebugHexTX4
+        MOV     r0, r2
+        BL      DebugHexTX4
+        Pull    "r0"
+        bl      DebugTXStrInline
+        DCB     "state flags",10,13,0
+        ALIGN
+      ]
+        AND     r0, r0, #3<<2
+        MOVS    r0, r0, LSR #2
+        EXIT    EQ ; HDMI not on (must be TV or LCD output?), leave GPU mode alone
+      [ HWPointer
+        ; Changing the GPU mode will break the hardware pointer (dispmanx loses
+        ; all resources?), so shut it down first
+        BL      HWP_Finalise
+      ]
+        BL      Dispmanx_Finalise
+        ; By default the mode will be group 2 mode 87
+        ; However if hdmi_group=1 is specified in config.txt, it will be group 1 mode 65
+        LDR     r1, ConfigHDMIGroup
+        CMP     r1, #1
+        MOVEQ   r2, #65
+        MOVNE   r1, #2
+        MOVNE   r2, #87
+        BL      TVService_SetMode
+      [ Debug
+        BL      DebugHexTX4
+        bl      DebugTXStrInline
+        DCB     "mode change result",10,13,0
+        ALIGN
+      ]
+        EXIT
+
+
+        MACRO
+        Aspect  $X, $Y
+        DCD     ($X:SHL:16)/$Y
+        MEND
+
+Aspects
+        Aspect 4, 3
+        Aspect 14, 9
+        Aspect 16, 9
+        Aspect 5, 4
+        Aspect 16, 10
+        Aspect 15, 9
+        Aspect 21, 9
+        Aspect 64, 27
+        DCD     -1
+
+; In:
+; R0 = number
+; R1 -> buffer
+; R2 = remaining space
+; Out:
+; " " + <number> + null appended to buffer
+; R1, R2 updated
+AppendNumber ROUT
+        Entry   "r0"
+        CMP     r2, #1
+        MOVGT   lr, #32
+        STRGTB  lr, [r1], #1
+        SUBGT   r2, r2, #1
+        SWI     XOS_ConvertInteger4
+        EXIT
+
+; Out:
+; VS if GPU mode changes have been disabled in the kernel/OS command line
+CheckGPUModeDisable ROUT
+        Entry   "r6"
+        ADR     r6, disable_str
+        BL      CheckCmdlineTxt
+        EXIT
+
+disable_str = "disable_mode_changes", 0
+        ALIGN
+
+        END

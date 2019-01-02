@@ -1,0 +1,692 @@
+/** @file
+
+  Implements basic FTDI operations. Knowledge about USB control codes of the operations
+  have been extracted from FTDI library written by Intra2net AG for LINUX
+  and from FTDI_SIO.H
+
+  */
+/* Created 05.02.2008 T. Milius
+   Changed 04.10.2010 T. Milius */
+/* Copyright (c) 2008-2010 by Thomas Milius Stade, Germany
+* All rights reserved.
+*
+* Redistribution and use in source and binary forms, with or without
+* modification, are permitted provided that the following conditions are met:
+*     * Redistributions of source code must retain the above copyright
+*       notice, this list of conditions and the following disclaimer.
+*     * Redistributions in binary form must reproduce the above copyright
+*       notice, this list of conditions and the following disclaimer in the
+*       documentation and/or other materials provided with the distribution.
+*     * Neither the name of Thomas Milius Stade, Germany nor the
+*       names of its contributors may be used to endorse or promote products
+*       derived from this software without specific prior written permission.
+*
+* THIS SOFTWARE IS PROVIDED BY Thomas Milius Stade, Germany ``AS IS'' AND ANY
+* EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+* WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+* DISCLAIMED. IN NO EVENT SHALL Thomas Milius Stade, Germany BE LIABLE FOR ANY
+* DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+* (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+* LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+* ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+* (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+* SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE. */
+/* RISC OS */
+
+/* !!!!!!!!!! libraries !!!!!!!!!! */
+/* ---------- ANSI-C ---------- */
+#include <stdbool.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+
+/* ------------ RISC OS ------------ */
+#include "kernel.h"
+#include "swis.h"
+
+/* ------------ Own ------------ */
+#include "ftdi.h"
+
+/* !!!!!!!!!!! definitions !!!!!!!!!! */
+
+/* !!!!!!!!!! data structures !!!!!!!!!! */
+
+/* !!!!!!!!!! support functions !!!!!!!!!! */
+/* ---------- USB ---------- */
+bool perform_usb_control_request_to_device(char *device_name,
+                                           unsigned char bm_request_type,
+                                           unsigned char brequest,
+                                           unsigned short wvalue,
+                                           unsigned short windex,
+                                           unsigned short wlength,
+                                           void *buffer)
+{
+_kernel_swi_regs regs;
+_kernel_oserror *os_error;
+
+regs.r[0]=(int) 0x80000000; /* DeviceFSCallDevice_USBRequest */
+regs.r[1]=(int) device_name;
+regs.r[3]=(int)((unsigned long) bm_request_type | ((unsigned long) brequest<<8) | ((unsigned long) (wvalue & 0xFFFF)<<16));
+regs.r[4]=(int)((unsigned long) (windex & 0xFFFF) | ((unsigned long) (wlength & 0xFFFF)<<16));
+regs.r[5]=(int) buffer;
+regs.r[6]=0;
+regs.r[7]=NULL;
+regs.r[8]=NULL;
+if ((os_error=_kernel_swi(DeviceFS_CallDevice, &regs, &regs)) != NULL) {
+  return false;
+  }
+else {
+  return true;
+  }
+}
+
+/* ---------- FTDI specials ---------- */
+unsigned short ftdi_bitbang(ftdi_environment *ftdi)
+{
+
+switch(ftdi->chip_type) {
+  case FTDI_CHIP_TYPE_2232C: {
+    /* ??? */
+    return 2;
+    }
+  default: {
+    return FTDI_BITMODE_BITBANG_ASYNC;
+    }
+  }
+}
+
+unsigned short ftdi_eeprom_size(ftdi_environment *ftdi)
+{
+
+if (!ftdi) return 0;
+return 128;
+}
+
+/* !!!!!!!!!! functions !!!!!!!!!! */
+/* ---------- FTDI usb control commands ---------- */
+bool ftdi_usb_reset(ftdi_environment *ftdi,
+                    unsigned char port_number)
+{
+
+if ((!ftdi) ||
+    (port_number >= ftdi->number_of_ports)) return false;
+if (!perform_usb_control_request_to_device(ftdi->usb_control_reference,
+                                           0x40,
+                                           FTDI_CONTROL_RESET,
+                                           0,
+                                           ftdi->configuration_port[port_number],
+                                           0,
+                                           NULL)) {
+  return false;
+  }
+return true;
+}
+
+bool ftdi_usb_purge_buffer(ftdi_environment *ftdi,
+                           int kind_of_buffer,
+                           unsigned char port_number)
+{
+
+if ((!ftdi) ||
+    (port_number >= ftdi->number_of_ports) ||
+    ((kind_of_buffer != FTDI_BUFFER_RX) &&
+     (kind_of_buffer != FTDI_BUFFER_TX))) return false;
+if (!perform_usb_control_request_to_device(ftdi->usb_control_reference,
+                                           0x40,
+                                           FTDI_CONTROL_RESET,
+                                           kind_of_buffer,
+                                           ftdi->configuration_port[port_number],
+                                           0,
+                                           NULL)) {
+  return false;
+  }
+return true;
+}
+
+bool ftdi_usb_purge_buffers(ftdi_environment *ftdi,
+                            unsigned char port_number)
+{
+
+if (!ftdi_usb_purge_buffer(ftdi,
+                           FTDI_BUFFER_RX,
+                           port_number)) {
+  return false;
+  }
+if (!ftdi_usb_purge_buffer(ftdi,
+                           FTDI_BUFFER_TX,
+                           port_number)) {
+  return false;
+  }
+return true;
+}
+
+bool ftdi_usb_set_pins(ftdi_environment *ftdi,
+                       unsigned char pin,
+                       bool set_pin,
+                       unsigned char port_number)
+{
+unsigned short wvalue;
+
+if ((!ftdi) ||
+    (port_number >= ftdi->number_of_ports)) return false;
+/* In internal format pins are represented by mask and value. */
+/* Set mask */
+wvalue=(unsigned short) pin<<8;
+if (set_pin) {
+  /* Indicate pin setting */
+  wvalue|=(unsigned short) pin;
+  }
+if (!perform_usb_control_request_to_device(ftdi->usb_control_reference,
+                                           0x40,
+                                           FTDI_CONTROL_PINS,
+                                           wvalue,
+                                           /* FTDI.C uses interface value here. */
+                                           ftdi->configuration_port[port_number],
+                                           0,
+                                           NULL)) {
+  return false;
+  }
+return true;
+}
+
+bool ftdi_usb_set_flow_control(ftdi_environment *ftdi,
+                               /* OR Control line group bits. */
+                               unsigned char flowcontrol_type,
+                               unsigned char xon_char,
+                               unsigned char xoff_char,
+                               unsigned char port_number)
+{
+unsigned short wvalue;
+unsigned short windex;
+
+if ((!ftdi) ||
+    (port_number >= ftdi->number_of_ports)) return false;
+                                                                 /* FTDI.C uses interface value here. */
+windex=(unsigned short) ((unsigned short) flowcontrol_type<<8) | ftdi->configuration_port[port_number];
+/* Arbitrary assumption on high/low Byte. Not checked. */
+wvalue=(unsigned short) ((unsigned short) xoff_char<<8) | xon_char;
+if (!perform_usb_control_request_to_device(ftdi->usb_control_reference,
+                                           0x40,
+                                           FTDI_CONTROL_FLOW,
+                                           wvalue,
+                                           windex,
+                                           0,
+                                           NULL)) {
+  return false;
+  }
+return true;
+}
+
+bool ftdi_usb_set_baudrate(ftdi_environment *ftdi,
+                           unsigned long baudrate,
+                           unsigned char port_number)
+{
+unsigned short wvalue;
+unsigned short windex;
+unsigned long clock_divisor;
+unsigned long fraction;
+
+if (!ftdi ||
+    (port_number >= ftdi->number_of_ports) ||
+    (baudrate == 0)) return false;
+/* Special case values. */
+switch(baudrate) {
+  case 3000000: {
+    /* 3000000 Baud */
+    clock_divisor=0;
+    }
+  break;
+  case 2000000: {
+    /* 2000000 Baud (BM only) */
+    if (ftdi->chip_type == FTDI_CHIP_TYPE_AM) return false;
+    clock_divisor=1;
+    }
+  break;
+  default: {
+    /* Regular calculation */
+    /* Base Clock seems to be 24MHz.
+       A divisor is required to get the required baudrate. */
+    clock_divisor=24000000/baudrate;
+    /* Round up if required */
+    if (((24000000*2/baudrate) & 1) != 0) {
+      clock_divisor++;
+      }
+    /* 3 lower Bits seems to have special divider meaning as fraction. */
+    if (ftdi->chip_type == FTDI_CHIP_TYPE_AM) {
+      /* Round down to supported fraction (AM only).
+         3 lower Bits limited to top counting Bit. */
+      if ((clock_divisor & 4) != 0) {
+        clock_divisor&=0xFFFFFFFC;
+        }
+      else if ((clock_divisor & 2) != 0) {
+        clock_divisor&=0xFFFFFFFE;
+        }
+      }
+    /* Check supported Min/Max and gaps */
+    if (clock_divisor < 8) {
+      /* Minimum */
+      return false;
+      }
+    else {
+      if (ftdi->chip_type != FTDI_CHIP_TYPE_AM) {
+        /* BM doesn't support divisors 9 through 11 inclusive */
+        if ((clock_divisor >= 9) && (clock_divisor <= 11)) {
+          return false;
+          }
+        else if (clock_divisor > 0x1FFF8) {
+          return false;
+          }
+        }
+      else {
+        /* AM doesn't support divisors 9 through 15 inclusive */
+        if ((clock_divisor >= 9) && (clock_divisor <= 15)) {
+          return false;
+          }
+        else if (clock_divisor > 0x1FFFF) {
+          return false;
+          }
+        }
+      }
+    /* Encode divisor */
+    /* Rearrange fraction. Still a mistery to me. */
+    switch(clock_divisor & 7) {
+      case 1: {
+        fraction=3;
+        }
+      break;
+      case 3: {
+        fraction=4;
+        }
+      break;
+      case 4: {
+        fraction=1;
+        }
+      break;
+      default: {
+        fraction=(clock_divisor & 7);
+        }
+      }
+    clock_divisor=(clock_divisor >> 3) | (fraction << 14);
+    }
+  }
+/* The 24 Bit value occupies value- and part of index-field.
+   However index seems to vary between the chips. */
+wvalue = (unsigned short)(clock_divisor & 0xFFFF);
+if (ftdi->chip_type == FTDI_CHIP_TYPE_2232C) {
+  windex = (unsigned short)(clock_divisor >> 8);
+  windex&= 0xFF00;
+  windex|= ftdi->configuration_port[port_number];
+  }
+else {
+  windex = (unsigned short)(clock_divisor >> 16);
+  }
+if (!perform_usb_control_request_to_device(ftdi->usb_control_reference,
+                                           0x40,
+                                           FTDI_CONTROL_BAUDRATE,
+                                           wvalue,
+                                           windex,
+                                           0,
+                                           NULL)) {
+  return false;
+  }
+return true;
+}
+
+bool ftdi_set_data_property(ftdi_environment *ftdi,
+                            unsigned char number_bits,
+                            unsigned char stopbit_type,
+                            unsigned char parity_type,
+                            /* TRUE sets TX ON (break) */
+                            bool tx_on,
+                            unsigned char port_number)
+{
+unsigned short wvalue;
+
+if ((!ftdi) ||
+    (port_number >= ftdi->number_of_ports)) return false;
+wvalue=(unsigned short) number_bits & 0x00FF;
+wvalue|=(((unsigned short) parity_type & 0x0007)<<8);
+wvalue|=(((unsigned short) stopbit_type & 0x0007)<<11);
+if (tx_on) {
+  /* (Description taken from FTDI_SIO.h)
+     Bit 14  Meaning
+      1      TX ON (break)
+      0      TX OFF (normal state) */
+  wvalue|=0x4000;
+  }
+if (!perform_usb_control_request_to_device(ftdi->usb_control_reference,
+                                           0x40,
+                                           FTDI_CONTROL_DATA,
+                                           wvalue,
+                                           ftdi->configuration_port[port_number],
+                                           0,
+                                           NULL)) {
+  return false;
+  }
+return true;
+}
+
+bool ftdi_usb_read_modem_status(ftdi_environment *ftdi,
+                                unsigned char *status_info,
+                                unsigned char port_number)
+{
+
+if ((!ftdi) ||
+    (port_number >= ftdi->number_of_ports) ||
+    (!status_info)) return false;
+if (!perform_usb_control_request_to_device(ftdi->usb_control_reference,
+                                           0xC0,
+                                           FTDI_CONTROL_GET_MODEM_STATUS,
+                                           0,
+                                           ftdi->configuration_port[port_number],
+                                           1,
+                                           status_info)) {
+  return false;
+  }
+return true;
+}
+
+bool ftdi_usb_set_event_char(ftdi_environment *ftdi,
+                             unsigned char event_char,
+                             bool enable_event,
+                             unsigned char port_number)
+{
+unsigned short wvalue;
+
+if ((!ftdi) ||
+    (port_number >= ftdi->number_of_ports)) return false;
+wvalue=(unsigned short) event_char;
+if (enable_event) {
+  wvalue|=0x0100;
+  }
+if (!perform_usb_control_request_to_device(ftdi->usb_control_reference,
+                                           0x40,
+                                           FTDI_CONTROL_EVENT_CHAR,
+                                           wvalue,
+                                           ftdi->configuration_port[port_number],
+                                           0,
+                                           0)) {
+  return false;
+  }
+return true;
+}
+
+bool ftdi_usb_set_error_char(ftdi_environment *ftdi,
+                             unsigned char error_char,
+                             bool enable_error,
+                             unsigned char port_number)
+{
+unsigned short wvalue;
+
+if ((!ftdi) ||
+    (port_number >= ftdi->number_of_ports)) return false;
+wvalue=(unsigned short) error_char;
+if (enable_error) {
+  wvalue|=0x0100;
+  }
+if (!perform_usb_control_request_to_device(ftdi->usb_control_reference,
+                                           0x40,
+                                           FTDI_CONTROL_ERROR_CHAR,
+                                           wvalue,
+                                           ftdi->configuration_port[port_number],
+                                           0,
+                                           0)) {
+  return false;
+  }
+return true;
+}
+
+bool ftdi_usb_set_latency_timer(ftdi_environment *ftdi,
+                                unsigned char timer,
+                                unsigned char port_number)
+{
+unsigned short wvalue;
+
+if ((!ftdi) ||
+    (port_number >= ftdi->number_of_ports)) return false;
+wvalue=(unsigned short) timer;
+if (!perform_usb_control_request_to_device(ftdi->usb_control_reference,
+                                           0x40,
+                                           FTDI_CONTROL_LATENCY_TIMER,
+                                           wvalue,
+                                           ftdi->configuration_port[port_number],
+                                           0,
+                                           0)) {
+  return false;
+  }
+return true;
+}
+
+bool ftdi_usb_get_latency_timer(ftdi_environment *ftdi,
+                                unsigned char *timer_info,
+                                unsigned char port_number)
+{
+
+if ((!ftdi) ||
+    (port_number >= ftdi->number_of_ports) ||
+    (!timer_info)) return false;
+if (!perform_usb_control_request_to_device(ftdi->usb_control_reference,
+                                           0xC0,
+                                           FTDI_CONTROL_GET_LATENCY_TIMER,
+                                           0,
+                                           ftdi->configuration_port[port_number],
+                                           1,
+                                           timer_info)) {
+  return false;
+  }
+return true;
+}
+
+bool ftdi_usb_set_bitmode(ftdi_environment *ftdi,
+                          unsigned char bit_direction_mask,
+                          unsigned char bitmode,
+                          unsigned char port_number)
+{
+unsigned short wvalue;
+
+if ((!ftdi) ||
+    (port_number >= ftdi->number_of_ports)) return false;
+wvalue=(unsigned short) ((unsigned short) bitmode<<8) | bit_direction_mask;
+if (!perform_usb_control_request_to_device(ftdi->usb_control_reference,
+                                           0x40,
+                                           FTDI_CONTROL_BITMODE,
+                                           wvalue,
+                                           ftdi->configuration_port[port_number],
+                                           0,
+                                           NULL)) {
+  return false;
+  }
+ftdi->actual_bitmode[port_number]=bitmode;
+return true;
+}
+
+bool ftdi_usb_enable_bitbang(ftdi_environment *ftdi,
+                             unsigned char port_number)
+{
+
+return ftdi_usb_set_bitmode(ftdi,
+                            0x07,
+                            ftdi_bitbang(ftdi),
+                            port_number);
+}
+
+bool ftdi_usb_enable_io_mode(ftdi_environment *ftdi,
+                             unsigned char port_number)
+{
+
+return ftdi_usb_set_bitmode(ftdi,
+                            0x00,
+                            0,
+                            port_number);
+}
+
+bool ftdi_usb_enable_mpsse(ftdi_environment *ftdi,
+                           unsigned char port_number)
+{
+
+return ftdi_usb_set_bitmode(ftdi,
+                            0xFF,
+                            FTDI_BITMODE_MPSSE,
+                            port_number);
+}
+
+bool ftdi_usb_enable_mcu(ftdi_environment *ftdi,
+                         unsigned char port_number)
+{
+
+return ftdi_usb_set_bitmode(ftdi,
+                            0x00,
+                            FTDI_BITMODE_MCU_HOST_BUS_EMU,
+                            port_number);
+}
+
+bool ftdi_usb_read_pins(ftdi_environment *ftdi,
+                        unsigned char *pin_info,
+                        unsigned char port_number)
+{
+
+if ((!ftdi) ||
+    (port_number >= ftdi->number_of_ports) ||
+    (!pin_info)) return false;
+if (!perform_usb_control_request_to_device(ftdi->usb_control_reference,
+                                           0xC0,
+                                           FTDI_CONTROL_GET_PINS,
+                                           0,
+                                           ftdi->configuration_port[port_number],
+                                           1,
+                                           pin_info)) {
+  return false;
+  }
+return true;
+}
+
+/* ---------- FTDI EEPROM handling ---------- */
+int ftdi_usb_read_eeprom(ftdi_environment *ftdi,
+                         unsigned char *eeprom_content_base,
+                         unsigned short eeprom_content_size,
+                         unsigned short eeprom_offset)
+{
+unsigned short wvalue;
+unsigned short windex;
+
+if (!ftdi) return 0;
+for (windex=0; windex < eeprom_content_size; windex+=2) {
+  if (!perform_usb_control_request_to_device(ftdi->usb_control_reference,
+                                             0xC0,
+                                             FTDI_CONTROL_GET_EEPROM,
+                                             0,
+                                             windex + eeprom_offset,
+                                             2,
+                                             &wvalue)) {
+    return windex;
+    }
+  eeprom_content_base[windex]=(unsigned char)((unsigned short) wvalue & 0x00FF);
+  if ((windex + 1) < eeprom_content_size) {
+    eeprom_content_base[windex + 1]=(unsigned char)((unsigned short) (wvalue>>8) & 0x00FF);
+    }
+  }
+return windex;
+}
+
+bool ftdi_usb_write_eeprom(ftdi_environment *ftdi,
+                           unsigned char *eeprom_content_base)
+{
+unsigned short wvalue;
+unsigned short windex;
+unsigned short eeprom_size;
+
+if (!ftdi) return false;
+if ((eeprom_size=ftdi_eeprom_size(ftdi)) == 0) {
+  return false;
+  }
+for (windex=0; windex < eeprom_size; windex+=2) {
+  /* Write two Bytes at once */
+  wvalue=(unsigned short) eeprom_content_base[windex];
+  wvalue|=((unsigned short) eeprom_content_base[windex + 1]<<8);
+  if (!perform_usb_control_request_to_device(ftdi->usb_control_reference,
+                                             0x40,
+                                             FTDI_CONTROL_EEPROM,
+                                             wvalue,
+                                             windex,
+                                             0,
+                                             NULL)) {
+    return false;
+    }
+  }
+return true;
+}
+
+bool ftdi_usb_erase_eeprom(ftdi_environment *ftdi)
+{
+
+if (!ftdi) return false;
+if (!perform_usb_control_request_to_device(ftdi->usb_control_reference,
+                                           0x40,
+                                           FTDI_CONTROL_EREASE_EEPROM,
+                                           0,
+                                           0,
+                                           0,
+                                           NULL)) {
+  return false;
+  }
+return true;
+}
+
+/* ---------- General ---------- */
+bool ftdi_init(ftdi_environment *ftdi,
+               int ftdi_chip_type,
+               char *usb_control_reference)
+{
+unsigned char port_number;
+
+if (!ftdi) return false;
+ftdi->usb_control_reference=usb_control_reference;
+if (ftdi_chip_type == FTDI_CHIP_TYPE_UNKNOWN) {
+  /* If the chip type is not given so try to determine it. */
+  unsigned short device_realease_no;
+
+  if (!ftdi_usb_read_eeprom(ftdi,
+                            (unsigned char *) &device_realease_no,
+                            sizeof(unsigned short),
+                            6)) return false;
+  if (device_realease_no == 0x0400) {
+    ftdi_chip_type=FTDI_CHIP_TYPE_BM;
+    }
+  else return false;
+  }
+ftdi->chip_type=ftdi_chip_type;
+switch(ftdi->chip_type) {
+  case FTDI_CHIP_TYPE_2232C: {
+    ftdi->number_of_ports=2;
+    ftdi->configuration_port[0]=FTDI_PORT_SIOA;
+    ftdi->configuration_port[1]=FTDI_PORT_SIOB;
+    }
+  default: {
+    ftdi->number_of_ports=1;
+    ftdi->configuration_port[0]=FTDI_PORT_DEFAULT;
+    }
+  }
+/* Reset the chip. */
+for (port_number=0; port_number < ftdi->number_of_ports; port_number++) {
+  ftdi->actual_bitmode[port_number]=0;
+  if (!ftdi_usb_reset(ftdi,
+                      port_number)) {
+    return false;
+    }
+  }
+/* Set some defaults/initialize some structure values */
+ftdi->allowed_configurations.eeprom_writeable=false;
+for (port_number=0; port_number < ftdi->number_of_ports; port_number++) {
+  /* Note that this are the device settings which are not known
+     at this time. This is not reflecting the chip default settings
+     after power on and after a reset. */
+  ftdi->allowed_configurations.serial[port_number].number_of_baudrates=0;
+  ftdi->allowed_configurations.serial[port_number].data_bits=0;
+  ftdi->allowed_configurations.serial[port_number].stopbits=0;
+  ftdi->allowed_configurations.serial[port_number].parity=0;
+  ftdi->allowed_configurations.serial[port_number].flowcontrol=0;
+  ftdi->allowed_configurations.serial[port_number].flow_xon_char=0x11;
+  ftdi->allowed_configurations.serial[port_number].flow_xoff_char=0x13;
+  }
+return true;
+}

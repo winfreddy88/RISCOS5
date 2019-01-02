@@ -1,0 +1,474 @@
+/* Copyright 2003 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*-*-C-*-
+ * Extent dialogue box
+ */
+
+
+#include "resed.h"
+
+#define MIN_SETTING -9999
+#define MAX_SETTING  9999
+
+
+/* For moving caret between writeables */
+
+static int grey[] =
+{
+    I_EXTENT_XMIN_DOWN, I_EXTENT_XMIN_UP, I_EXTENT_XMAX_DOWN, I_EXTENT_XMAX_UP,
+    I_EXTENT_YMIN_DOWN, I_EXTENT_YMIN_UP, I_EXTENT_YMAX_DOWN, I_EXTENT_YMAX_UP,
+    I_EXTENT_MIN, I_EXTENT_MAX, I_EXTENT_MINWIDTH, I_EXTENT_MINHEIGHT,
+    I_EXTENT_CLIP, I_EXTENT_OK, /* I_EXTENT_CANCEL, */
+};
+
+
+/*
+ * This is a singly-instantiated dialogue.
+ * Remember whether we are open or not.
+ */
+
+static Bool open = FALSE;
+
+/*
+ * Which resource is the dbox currently displaying?  When NULL, the
+ * box is inactive and should be greyed.
+ */
+
+static ResourcePtr disp = NULL;
+static WindowPtr window;
+static int nameindex;
+
+
+
+/*
+ * Create the window, but don't open it yet.  This step is done once at the
+ * beginning of execution.
+ */
+
+error * extent_load_prototypes ()
+{
+    ER ( wimp_load_template("Extent", &window) );
+    ER ( _swix(Wimp_CreateWindow, _IN(1) | _OUT(0),
+               &window->visarea,
+               &window->handle) );
+    ER ( registry_register_window (window->handle, Extent, (void *) window) );
+
+    /* Determine index of the window name in the title string.
+     * If the message is not found, then atoi on the tag string
+     * will return zero, so the name will start at the beginning
+     * of the titlebar... harmless.
+     */
+
+    nameindex = atoi(message_lookup (&msgs, "ExtentInd"));
+    return NULL;
+}
+
+
+
+/*
+ * Open window (and/or bring it to the top)
+ */
+
+error * extent_show_window ()
+{
+    extent_retitle (disp);
+    window->behind = -1;
+    ER ( _swix(Wimp_OpenWindow, _IN(1),
+               window) );
+    open = TRUE;
+    return NULL;
+}
+
+
+
+static error * shade_all (Bool shaded)
+{
+    unsigned int eor = shaded ? IF_SHADED : 0;
+    int i;
+    for (i = 0; i < NUMBER(grey); i++)
+    {
+        ER ( dbox_iconflag (window, grey[i], IF_SHADED, eor) );
+    }
+    return NULL;
+}
+
+
+
+/*
+ * Get all icon settings from the resource
+ */
+
+static error * get_values (ResourcePtr res)
+{
+    char buf[40];
+
+    ER ( dbox_setint (window, I_EXTENT_MINWIDTH, (int) res->window.minsize.width) );
+    ER ( dbox_setint (window, I_EXTENT_MINHEIGHT, (int) res->window.minsize.height) );
+
+    sprintf(buf, "%d,%d", res->window.workarea.minx, res->window.workarea.miny);
+    ER ( dbox_setstring (window, I_EXTENT_MIN, buf) );
+    
+    sprintf(buf, "%d,%d", res->window.workarea.maxx, res->window.workarea.maxy);
+    ER ( dbox_setstring (window, I_EXTENT_MAX, buf) );
+    
+    return NULL;
+}
+
+
+
+static int roundup (int n, int interval)
+{
+    int u = abs(n);
+    u = ((u + interval - 1) / interval) * interval;
+    return (n < 0) ? -u : u;
+}
+
+
+
+/*
+ * Set all grid flags from the icon settings.  Activated by the OK
+ * button.
+ */
+
+static error * set_values (ResourcePtr res)
+{
+    int minx, miny, maxx, maxy;
+    int excess;
+    char buf[20];
+
+    res->window.minsize.width = (unsigned short) atoi(dbox_getstring (window, I_EXTENT_MINWIDTH));
+    res->window.minsize.height = (unsigned short) atoi(dbox_getstring (window, I_EXTENT_MINHEIGHT));
+
+    sscanf (dbox_getstring (window, I_EXTENT_MIN), "%d,%d", &minx, &miny);
+    sscanf (dbox_getstring (window, I_EXTENT_MAX), "%d,%d", &maxx, &maxy);
+
+    /* Ensure the numbers are whole numbers of pixels.  Write-back
+     * to the writeable icons in case they needed to be rounded.
+     */
+    
+    minx = roundup (minx, scalex);
+    miny = roundup (miny, scaley);
+    maxx = roundup (maxx, scalex);
+    maxy = roundup (maxy, scaley);
+    
+    /* Swap corners if wrong way round */
+    if (minx >= maxx) { int t = minx; minx = maxx; maxx = t; }
+    if (miny >= maxy) { int t = miny; miny = maxy; maxy = t; }
+
+    /* Trim visible width and height if too big */
+
+    excess = (res->window.visarea.maxx - res->window.visarea.minx) - (maxx - minx);
+    if (excess > 0)
+        res->window.visarea.maxx -= excess;
+    excess = (res->window.visarea.maxy - res->window.visarea.miny) - (maxy - miny);
+    if (excess > 0)
+        res->window.visarea.miny += excess;
+
+    /* Validate X scrollbar */
+
+    if (res->window.scrolloffset.x < minx)
+        res->window.scrolloffset.x = minx;
+
+    excess = maxx - (res->window.visarea.maxx - res->window.visarea.minx);
+    if (res->window.scrolloffset.x > excess)
+        res->window.scrolloffset.x = excess;
+
+    /* Validate Y scrollbar */
+
+    if (res->window.scrolloffset.y > maxy)
+        res->window.scrolloffset.y = maxy;
+
+    excess = miny + (res->window.visarea.maxy - res->window.visarea.miny);
+    if (res->window.scrolloffset.y < excess)
+        res->window.scrolloffset.y = excess;
+
+    /* Write back possibly amended values */
+
+    sprintf(buf, "%d,%d", minx, miny);
+    dbox_setstring (window, I_EXTENT_MIN, buf);
+    sprintf(buf, "%d,%d", maxx, maxy);
+    dbox_setstring (window, I_EXTENT_MAX, buf);
+
+    res->window.workarea.minx = minx;
+    res->window.workarea.maxx = maxx;
+    res->window.workarea.miny = miny;
+    res->window.workarea.maxy = maxy;
+
+    if (res->window.handle != -1)
+    {
+        /* Issue wimp_open_window and wimp_set_extent */
+        WindowRec temp;
+        temp.handle = res->window.handle;
+        _swix(Wimp_GetWindowState, _IN(1),
+              &temp);
+        res->window.behind = temp.behind;
+
+        ER ( _swix(Wimp_SetExtent, _INR(0,1),
+                   res->window.handle, &res->window.workarea) );
+        ER ( template_open_window (&res->window, res) );
+    }
+
+    return NULL;
+}
+
+
+    
+/*
+ * If win is NULL, then shade the whole window.
+ * If win is non-NULL, unshade and setup the window.
+ * Don't auto-open it though.
+ */
+
+error * extent_select (ResourcePtr res)
+{
+    if (res == disp)
+    {
+        return NULL;
+    }
+    else if (res && !disp)
+    {
+        dprintf("Unshading window\n");
+        ER ( shade_all (FALSE) );
+    }
+    else if (!res && disp)
+    {
+        dprintf("Shading window\n");
+        ER ( shade_all (TRUE) );
+    }
+
+    disp = res;
+    extent_retitle (res);    
+
+    if (disp)
+    {
+        ER ( get_values (disp) );
+    }
+    return NULL;
+}
+
+
+
+/*
+ * Change the titlebar of the extent window.  This is called
+ * when extent_select, and also when the user renames a resource.
+ * NB: the name field of res is expected to fit!  (and should).
+ */
+
+error * extent_retitle (ResourcePtr res)
+{
+    char *title = (char *) window->titledata[0];
+    if (res)
+        sprintf (title + nameindex, " - %s", res->name);
+    else
+        title[nameindex] = 0;
+
+    if (open)
+    {
+        WindowRedrawRec win, vis;
+        win.handle = vis.handle = window->handle;
+        ER ( _swix(Wimp_GetWindowOutline, _IN(1),
+                   &win) );
+        ER ( _swix(Wimp_GetWindowState, _IN(1),
+                   &vis) );
+dprintf("FORCE of %d %d %d %d\n" _ win.visarea.minx _ vis.visarea.maxy _ win.visarea.maxx _ win.visarea.maxy);
+        ER ( _swix(Wimp_ForceRedraw, _INR(0,4),
+                   -1, win.visarea.minx, vis.visarea.maxy, win.visarea.maxx, win.visarea.maxy) );
+    }
+    return NULL;
+}
+
+
+
+/*
+ * Make work area same size as current visible area, and keep the
+ * current top-left in the same place.  User must click OK to
+ * actually set the values.
+ */
+
+static error * clip_window ()
+{
+    int minx, miny, maxx, maxy;
+    char buf[20];
+
+    minx = disp->window.scrolloffset.x;
+    maxx = minx + (disp->window.visarea.maxx - disp->window.visarea.minx);
+    maxy = disp->window.scrolloffset.y;
+    miny = maxy - (disp->window.visarea.maxy - disp->window.visarea.miny);
+
+    sprintf(buf, "%d,%d", minx, miny);
+    dbox_setstring (window, I_EXTENT_MIN, buf);
+    sprintf(buf, "%d,%d", maxx, maxy);
+    dbox_setstring (window, I_EXTENT_MAX, buf);
+    
+    return NULL;
+}
+
+
+
+/*
+ * Receive mouse clicks.
+ */
+
+error * extent_mouse_click (MouseClickPtr mouse, unsigned int modifiers)
+{
+    int scale = (modifiers & MODIFIER_SHIFT) ? 10 : 1;
+    int xdir = scalex * scale, ydir = scaley * scale, x, y;
+    char buf[40];
+
+    dprintf("EXTENT MOUSE %x mod %x\n" _ mouse->buttons _ modifiers);
+    switch (mouse->buttons)
+    {
+    case MB_CLICK(MB_ADJUST):
+        xdir = -xdir;
+        ydir = -ydir;
+        /* FALLTHRU */
+
+    case MB_CLICK(MB_SELECT):
+        switch (mouse->iconhandle)
+        {
+        case I_EXTENT_OK:
+            ER ( set_values (disp) );
+            if (mouse->buttons == MB_CLICK(MB_SELECT))
+            {
+                ER ( extent_close_window () );
+            }
+            break;
+
+        case I_EXTENT_CANCEL:
+            ER ( extent_close_window () );
+            break;
+
+        case I_EXTENT_CLIP:
+            ER ( clip_window () );
+            break;
+
+        case I_EXTENT_XMIN_DOWN:
+            xdir = -xdir;           /* FALLTHRU */
+        case I_EXTENT_XMIN_UP:
+            sscanf (dbox_getstring (window, I_EXTENT_MIN), "%d,%d", &x, &y);
+            x += xdir;
+            if (x < MIN_SETTING) x = MIN_SETTING;
+            if (x > MAX_SETTING) x = MAX_SETTING;
+            sprintf(buf, "%d,%d", x, y);
+            ER ( dbox_setstring (window, I_EXTENT_MIN, buf) );
+            break;
+
+        case I_EXTENT_YMIN_DOWN:
+            ydir = -ydir;           /* FALLTHRU */
+        case I_EXTENT_YMIN_UP:
+            sscanf (dbox_getstring (window, I_EXTENT_MIN), "%d,%d", &x, &y);
+            y += ydir;
+            if (y < MIN_SETTING) y = MIN_SETTING;
+            if (y > MAX_SETTING) y = MAX_SETTING;
+            sprintf(buf, "%d,%d", x, y);
+            ER ( dbox_setstring (window, I_EXTENT_MIN, buf) );
+            break;
+
+        case I_EXTENT_XMAX_DOWN:
+            xdir = -xdir;           /* FALLTHRU */
+        case I_EXTENT_XMAX_UP:
+            sscanf (dbox_getstring (window, I_EXTENT_MAX), "%d,%d", &x, &y);
+            x += xdir;
+            if (x < MIN_SETTING) x = MIN_SETTING;
+            if (x > MAX_SETTING) x = MAX_SETTING;
+            sprintf(buf, "%d,%d", x, y);
+            ER ( dbox_setstring (window, I_EXTENT_MAX, buf) );
+            break;
+
+        case I_EXTENT_YMAX_DOWN:
+            ydir = -ydir;           /* FALLTHRU */
+        case I_EXTENT_YMAX_UP:
+            sscanf (dbox_getstring (window, I_EXTENT_MAX), "%d,%d", &x, &y);
+            y += ydir;
+            if (y < MIN_SETTING) y = MIN_SETTING;
+            if (y > MAX_SETTING) y = MAX_SETTING;
+            sprintf(buf, "%d,%d", x, y);
+            ER ( dbox_setstring (window, I_EXTENT_MAX, buf) );
+            break;
+        }
+        break;
+    }
+    return NULL;
+}
+
+
+
+/*
+ * Close window if open.  Leave the window created though.
+ */
+
+error * extent_close_window ()
+{
+    if (open)
+    {
+        ER ( _swix(Wimp_CloseWindow, _IN(1),
+                   window) );
+        ER ( extent_select (NULL) );
+        open = FALSE;
+    }
+    return NULL;
+}
+
+
+
+/* 
+ * Respond to open_window_request on the extent window.
+ * Note: the 'win' parameter is only a partial window structure
+ * (just the fields returned with Open_Window_Request).
+ */
+
+error * extent_open_window (WindowPtr win)
+{
+    window->visarea = win->visarea;
+    window->scrolloffset = win->scrolloffset;
+    window->behind = win->behind;
+    return _swix(Wimp_OpenWindow, _IN(1),
+                 window);
+}
+
+
+
+/*
+ * Check for RETURN in the window.   Return in the max
+ * field moves to the min one.  Return in that closes
+ * the window and does the OK action.  Up/down arrows
+ * move between the writeable icons.
+ */
+
+error * extent_key_pressed (KeyPressPtr key, Bool *consumed)
+{
+    *consumed = TRUE;
+    if (key->caret.windowhandle == window->handle)
+    {
+        switch (key->code)
+        {
+        case 0x0d:
+            if (disp)
+            {
+                ER ( set_values (disp) );
+            }
+            return extent_close_window ();
+        }
+    }
+    *consumed = FALSE;
+    return NULL;
+}
+
+ResourcePtr extent_current ()
+{
+    return disp;
+}
+
+

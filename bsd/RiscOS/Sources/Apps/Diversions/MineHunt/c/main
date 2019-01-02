@@ -1,0 +1,816 @@
+/*
+Copyright (c) 2002-2011 Paul LeBeau
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification, are
+permitted provided that the following conditions are met:
+
+   1. Redistributions of source code must retain the above copyright notice, this list of
+      conditions and the following disclaimer.
+
+   2. Redistributions in binary form must reproduce the above copyright notice, this list
+      of conditions and the following disclaimer in the documentation and/or other materials
+      provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY PAUL LEBEAU ''AS IS'' AND ANY EXPRESS OR IMPLIED
+WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
+FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL PAUL LEBEAU OR
+CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
+ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+The views and conclusions contained in the software and documentation are those of the
+authors and should not be interpreted as representing official policies, either expressed
+or implied, of Paul LeBeau.
+*/
+
+/* Title:    c.main
+ *
+ * Purpose:  Mine Hunt game main source
+ *
+ */
+
+
+
+#include <stdlib.h>
+#include <string.h>
+
+
+#include "os.h"
+#include "wimp.h"
+#include "win.h"
+#include "event.h"
+#include "baricon.h"
+#include "res.h"
+#include "resspr.h"
+#include "template.h"
+#include "dbox.h"
+#include "werr.h"
+#include "flex.h"
+#include "visdelay.h"
+#include "xferrecv.h"
+#include "msgs.h"
+#include "akbd.h"
+#include "swis.h"
+#include "help.h"
+#include "kernel.h"
+#include "bbc.h"
+#include "coords.h"
+#include "swis.h"
+#include "alarm.h"
+#include "sprite.h"
+#include "pointer.h"
+
+
+#include "wimpt.h"
+
+
+#include "menu.h"
+#include "tools.h"
+
+
+
+#include "game.h"
+
+
+
+#define  WIMP_INIT_STRING     "Mine Hunt"
+#define  WIMP_RES_STRING      "MineHunt"
+#define  WIMP_RES_VAR         "MineHunt$Dir"
+/*#define  WIMP_ICONBAR_SPRITE  "!minehunt"*/
+#define  WIMP_ICONIZE_SPRITE  "minehnt"
+
+
+
+#define prog_name_field  0
+#define prog_purp_field  1
+#define prog_auth_field  2
+#define prog_vers_field  3
+
+
+
+
+/******************************** GLOBAL DATA *******************************/
+
+
+
+/* ProgInfo box field data */
+static char *prog_Name_Token    = "INnamed:Mine Hunt";
+static char *prog_Purpose_Token = "INpurpd:Exercise the brain?";
+static char *prog_Author_Token  = "INauthd:© Paul LeBeau, 1992";
+static char *prog_Version_Token = "_Version:Version";
+
+
+
+static menu  iconbar_menu;
+
+menu  game_menu;
+menu  level_menu;
+menu  sound_menu;
+
+
+
+wimp_w  main_handle;
+
+int   main_open = FALSE;
+
+static int   main_firstopen = TRUE;
+
+
+static  int  main_mode_change = FALSE;
+
+
+static char  desksave_startup_string[256];
+
+
+
+
+
+/******************************* MISCELLANEA *******************************/
+
+
+
+os_error *main_save_desktop(int handle)
+{
+   char     *ptr;
+
+   for (ptr = desksave_startup_string; *ptr; ptr++)
+   {
+      os_error *error = os_swi2(os_X|OS_BPut, *ptr, handle);
+      if (error) return error;
+   }
+
+   return os_swi2(os_X|OS_BPut, 10, handle);    /* line terminator */
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+BOOL main_processhelpevent(char *helpbase)
+{
+   wimp_eventstr *e = wimpt_last_event();
+
+
+   if (
+        (e->e == wimp_ESEND || e->e == wimp_ESENDWANTACK)
+        &&
+        e->data.msg.hdr.action == wimp_MHELPREQUEST
+      )
+   {
+      wimp_i icon = e->data.msg.data.helprequest.m.i;
+      char tag[50];
+      int taglen = strlen(helpbase);
+      char *message;
+      char c;
+
+
+      strcpy(tag, helpbase);
+
+      /* encode icon number as a character */
+      if (icon <= 9) c = '0' + icon;
+      else if (icon <= 35) c = 'a' + icon - 10;
+      else c = 'z';
+
+      tag[taglen] = c;
+      tag[taglen + 1] = 0;
+      message = msgs_lookup(tag);
+      if (strcmp(message, tag) != 0) help_reply(message);
+      else
+      {
+         tag[taglen] = 0;
+         message = msgs_lookup(tag);
+         if (strcmp(message, tag) != 0) help_reply(message);
+      }
+      return(TRUE); /* message has been handled. */
+   }
+   else
+      return(FALSE);
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+menu  main_menumaker(void *handle)
+{
+   /* Controls the making of the menus.
+      This is needed if menu help is wanted. */
+
+   wimp_w    w = (wimp_w)handle;
+
+
+   if (w == win_ICONBAR)
+   {
+      help_register_handler(help_simplehandler, "IHELP");    /* help for the iconbar menu */
+      return iconbar_menu;
+   }
+   else if (w == main_handle)
+   {
+      help_register_handler(help_simplehandler, "MHELP");    /* help for the iconbar menu */
+      return game_menu;
+   }
+
+   return NULL;
+}
+
+
+
+/****************************** EVENT HANDLERS ******************************/
+
+
+
+void  main_mouse(wimp_eventdata *ed)
+{
+   wimp_wstate      state;
+
+
+   if ((ed->but.m.bbits != wimp_BLEFT) && (ed->but.m.bbits != wimp_BRIGHT))
+      return;
+
+
+   wimp_get_wind_state(ed->but.m.w, &state);           /* window state - used for changing coords */
+
+   game_mouseclick(state.o.box.x0,state.o.box.y0, ed->but.m.x,ed->but.m.y,
+                   ed->but.m.bbits);
+
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+void  main_redraw(wimp_openstr *o)
+{
+   wimp_redrawstr  r;
+   int             more;
+
+
+   r.w = o->w;
+   wimp_redraw_wind(&r, &more);
+
+   /* do the redraw loop */
+   while (more)
+   {
+      game_redraw(&r);
+
+      wimp_get_rectangle(&r, &more);
+   }
+
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+void main_handler(wimp_eventstr *e, void *handle)
+{
+
+   switch(e->e)
+   {
+
+      case wimp_EREDRAW:
+         main_redraw(&e->data.o);
+         break;
+
+      /*----------*/
+
+      case wimp_EOPEN:
+         if (main_mode_change)        /* open event is due to mode change */
+         {
+            main_mode_change = FALSE;
+            if (game_mode_change() != 0)
+               return;    /* level has changed; or level is unavailable */
+         }
+
+         wimpt_noerr(wimp_open_wind(&e->data.o));
+         break;
+
+      /*----------*/
+
+      case wimp_ECLOSE:
+         wimpt_noerr(wimp_close_wind(e->data.o.w));
+         main_open = FALSE;
+         break;
+
+      /*----------*/
+
+      case wimp_EBUT: /* mouse button pressed */
+         main_mouse(&e->data);
+         break;
+
+      /*----------*/
+
+      default:
+
+         /*--- Check for a help request event ---*/
+         main_processhelpevent("MAIN");
+
+         break;   /* ignore any other event */
+   };
+
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+static BOOL   heroing;    /* Whether the hero list is being displayed */
+static char  *heropos;    /* Position in hero list */
+static dbox   herodbox;
+
+static char   hero_list[] = "\0\0\0Hello!, kia ora!\0\0You managed to find\0the hero list!\0\0-=*=-\0\0The purpose of this\0message is to provide\0one of those secret fun\0things that make programs\0more interesting!\0\0(Well, to tell the truth,\0Dizzy demanded I put it in!)\0\0-=*=-\0\0People I wish to thank\0or send greetings to:\0(in no particular order)\0\0Dave DeVorchik\0Dave Caughley\0Rob McKay\0Carl Ansley\0Mark Lovell\0Andrew Stewart\0Mike Matson\0Neil Souch\0Judith Matson\0Jean Souch\0Eric & Elaine at HQ\0Ester and Tom\0Anna and Clare\0William Stoye\0Sophie Wilson\0Stewart Palmer\0Tim Dobson\0Sue Wall\0David Bell\0James Bye\0Alastair France\0Alan Glover\0Ian Sewell\0Steve Furber\0(for his part in 'the chip')\0John McMahon\0Dick Wallin\0Kevin Roddis\0Laurie Elder\0Vorn Hancock\0Jill Osler\0Martin Neville-Smith\0Teresa Downey\0Hans Rijnen\0Jonathan Marten\0Don Slaven\0All the smArt artists\0Simon Glass\0Tony Young\0Chris Marshall\0Andrew Hersee\0Gareth Owen\0Tony Cheal\0Chris Murray\0Graham McIntosh\0Dave Eccles\0Adrian Critchlow\0Merlyn Kline\0Patrick O'Donnell\0Clare Graves\0Pat Cleaver\0Rob McMillan\0David Tee\0Anna & Nick from Longman\0Phil & Tony at Oak\0Jack Lillingston\0Gordon Taylor\0(...has the biggest\0dongle in the west)\0Mike 'Melodious'(?) Beecher\0\0-= Family etc. =-\0\0Mum\0Dad\0Andrew (bro)\0Christine (sis)\0Gran (gran)\0Pancho (dog)\0Sapphie (cat)\0Mitsi (cat)\0Suzie (Gran's dog)\0Mike Dunn\0Phil Dewar\0and all other friends\0and relations.\0\0-=*=-\0\0Finally...\0heartfelt apologies\0to anyone I've missed!\0Any omissions or\0mis-spellings will be\0corrected in the\0next version..\0\0(if there is one!)\0\0Paul\0\0PS. This game still has\0a cheat mode facility\0that I used for testing.\0It doesn't make the\0game much fun to\0play, but good luck\0finding it!\0\0\0\0end\0";
+
+
+/*- - - - - - - - - - - - - - - - -  - - - - - - - - - - - - - - - - - - - -*/
+
+
+
+static void main_info_about_program(void)
+/* Display the program info box - called from the menu processor. */
+{
+   dbox    d;  /* Dialogue box handle */
+   int     f;
+
+
+   /* Create the dialogue box */
+   if (d = dbox_new("ProgInfo"), d != NULL)
+   {
+      /* Fill in the icon texts */
+      win_settitle(dbox_syshandle(d), msgs_lookup("INtitle:About this program"));
+      dbox_setfield(d, 4, msgs_lookup("INname:Name"));
+      dbox_setfield(d, 5, msgs_lookup("INpurp:Purpose"));
+      dbox_setfield(d, 6, msgs_lookup("INauth:Author"));
+      dbox_setfield(d, 7, msgs_lookup("INvers:Version"));
+
+      /* fill the info icons */
+      dbox_setfield(d, prog_name_field, msgs_lookup(prog_Name_Token));
+      dbox_setfield(d, prog_purp_field, msgs_lookup(prog_Purpose_Token));
+      dbox_setfield(d, prog_auth_field, msgs_lookup(prog_Author_Token));
+      dbox_setfield(d, prog_vers_field, msgs_lookup(prog_Version_Token));
+
+      dbox_raw_eventhandler(d, help_dboxrawevents, (void *)"PROGINFO");   /* the only events we are interested in
+                                                                             are interactive help messages        */
+      /* Show the dialogue box */
+      dbox_show(d);
+
+      heroing = FALSE;
+
+      /* Keep it on the screen as long as needed */
+      while ((f = dbox_fillin(d)) != dbox_CLOSE)
+      {
+         if ((f == prog_name_field) && (akbd_pollalt()))
+         {
+            heroing  = TRUE;
+            herodbox = d;
+            heropos  = hero_list;
+         }
+      }
+
+      heroing = FALSE;
+
+      /* Dispose of the dialogue box */
+      dbox_dispose(&d);
+   }
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+static void  hero__list(void)
+{
+   /*--- Handles the hero list scrolling ---*/
+
+   static int         lasttime = -1;
+   static BOOL        end = FALSE;
+   _kernel_swi_regs   regs;
+   char              *tp;
+
+
+   if (!heroing)
+      return;
+
+   _kernel_swi(OS_ReadMonotonicTime, &regs, &regs);
+
+
+   if ((lasttime != -1) && (regs.r[0] < (lasttime + 100)))
+      return;
+
+   lasttime = regs.r[0];
+
+
+   if (end)
+   {
+      dbox_setfield(herodbox, prog_purp_field, msgs_lookup(prog_Purpose_Token));
+      dbox_setfield(herodbox, prog_auth_field, msgs_lookup(prog_Author_Token));
+      dbox_setfield(herodbox, prog_vers_field, msgs_lookup(prog_Version_Token));
+      heroing = FALSE;
+      end = FALSE;
+      lasttime = -1;
+      return;
+   }
+   
+   dbox_setfield(herodbox, prog_purp_field, heropos);
+   heropos += (strlen(heropos) + 1);
+   dbox_setfield(herodbox, prog_auth_field, heropos);
+   tp = heropos + (strlen(heropos) + 1);
+   dbox_setfield(herodbox, prog_vers_field, tp);
+   tp += (strlen(tp) + 1);
+
+   if (strcmpi(tp, "end") == 0)
+      end = TRUE;
+
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+static void iconbar_menuproc(void *handle, char *hit)
+/* Event handler for the menu.  'handle' is a pointer to the diagram. */
+{
+
+   handle = handle;
+
+   /* Find which menu item was hit and take action as appropriate */
+   switch (hit[0])
+   {
+      case 1: /* info */
+              main_info_about_program();
+              break;
+
+      case 2: /* save choices */
+              game_save_choices();
+              break;
+
+      case 3: /* quit */
+              game_quitting();
+              exit(0);
+              break;
+   }
+}
+
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+static void prog_iconbar_events(wimp_eventstr *e, void *handle)
+/* Event handler for icon bar (and other unknown events). */
+{
+
+   handle = handle;
+
+
+   /* Deal with event */
+   switch (e->e)
+   {
+
+      case wimp_ENULL:
+
+         game_null_events();
+
+         hero__list();
+
+         break;
+
+      /*----------*/
+
+      case wimp_ESEND:
+      case wimp_ESENDWANTACK:
+         {
+
+            if (help_process(e))    /* if this is a menu-interactive-help message then */
+               return;              /* arrange for it to be handled */
+
+
+            switch (e->data.msg.hdr.action)
+            {
+               case wimp_MPREQUIT: /* pre-quit warning */
+                  game_quitting();
+                  break;
+
+               /*----------*/
+
+               case wimp_SAVEDESK: /* desktop save message */
+                  {
+                     os_error  *er;
+
+                     if ((er = main_save_desktop(e->data.msg.data.savedesk.filehandle)) != NULL)
+                     {
+                        /* error has occurred - acknowledge the message (to stop it going further)
+                           and report the error */
+
+                        e->data.msg.hdr.your_ref = e->data.msg.hdr.my_ref;
+                        wimp_sendmessage(wimp_EACK, &e->data.msg, e->data.msg.hdr.task);
+
+                        Error(("main8:'%s' error occurred whilst attempting to make Desktop boot file",
+                               er->errmess));
+                     }
+                  }
+                  break;
+
+               /*----------*/
+
+               case wimp_MINITTASK: /* task init */
+                  {
+                     /* refuse to allow another one of me to load */
+
+                     if ( (strcmp(&e->data.msg.data.chars[8], WIMP_INIT_STRING) == 0) &&
+                          (e->data.msg.hdr.task != wimpt_task()) )
+                     {
+                        e->data.msg.hdr.your_ref = 0;
+                        e->data.msg.hdr.action   = wimp_MCLOSEDOWN;
+                        e->data.msg.hdr.size     = 20;
+                        wimp_sendmessage(wimp_ESEND, &e->data.msg, e->data.msg.hdr.task);
+                     }
+                  }
+                  break;
+
+               /*----------*/
+
+               case wimp_MMODECHANGE:   /* screen mode changed */
+                  if (main_open)                            /* if the window is open, delay the call  */
+                     main_mode_change = TRUE;               /* until after it is reopened by the wimp */
+                  else
+                     game_mode_change();
+                  break;
+
+               /*----------*/
+
+               case wimp_MHELPREQUEST:   /* interactive help request */
+                  /* Are we over the iconbar icon? */
+                  if(e->data.msg.data.helprequest.m.w == -2)
+                     help_reply(msgs_lookup("IHELPI"));
+                  break;
+
+               /*----------*/
+
+               case wimp_MWINDOWINFO:   /* for iconizing windows */
+
+                  /*--- Return some info back to the pinboard ---*/
+
+                  /* Sprite name to use */
+                  strncpy(&e->data.msg.data.chars[8], WIMP_ICONIZE_SPRITE, 8);
+                  e->data.msg.data.chars[15] = '\0';
+
+                  /* Text to use */
+                  strncpy(&e->data.msg.data.chars[16],
+
+                          (e->data.msg.data.words[0] == main_handle) ?
+                          msgs_lookup("MEicbarT:Mine Hunt") :
+                          msgs_lookup("HSicnztx:Highscores"),
+
+                          20);
+                  e->data.msg.data.chars[35] = '\0';
+
+                  /* Reply */
+                  e->data.msg.data.words[1] = 0;
+
+                  e->data.msg.hdr.your_ref = e->data.msg.hdr.my_ref;
+                  e->data.msg.hdr.size     = ((36 + strlen(&e->data.msg.data.chars[16]) + 1) + 3) & ~3;
+                  wimp_sendmessage(wimp_ESEND, &e->data.msg, e->data.msg.hdr.task);
+
+                  break;
+
+               /*----------*/
+
+               default:
+                  break;        /* ignore other messages */
+            }
+         }
+
+         break;
+
+      /*----------*/
+
+      default:   /* Ignore any other event */
+         break;
+   }
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+static void iconbar_click(wimp_i  i)
+/* called when muggins clicks SELECT on iconbar icon */
+{
+   wimp_wstate  ws;
+
+
+   if (main_open)
+      return;
+
+   /* create the window */
+
+   if (main_firstopen)
+   {
+      /* If this is the first time that the window
+         has been opened, then create and centre it */
+
+      template *t = template_copy(template_find("Main"));
+
+      if (wimpt_complain(wimp_create_wind(&t->window, &main_handle)) != NULL)
+         return;
+
+
+      /* register an event handler for the window */
+      win_register_event_handler(main_handle, main_handler, NULL);
+
+
+      /* attach a menu to the window */
+
+      event_attachmenumaker(main_handle, main_menumaker, game_menuproc, (void *)main_handle);
+
+   }
+
+
+   /* check that level is not too big */
+   if (game_mode_change() == 2)
+      return;        /* return if screen mode was too small for all levels */
+
+
+   game_set_board_size();
+
+   wimpt_noerr(wimp_get_wind_state(main_handle, &ws));
+
+
+   if (main_firstopen)
+   {
+      int       xs, ys;
+      wimp_box  wb;
+
+
+      game_main_extent(-1, &xs, &ys);
+
+      if (read_screen_limits(&wb) == NULL)
+      {
+         ws.o.box.x0 = (wb.x0 + wb.x1 - xs)/2;
+         ws.o.box.y0 = (wb.y0 + wb.y1 - ys)/2;
+         ws.o.box.x1 = ws.o.box.x0 + xs;
+         ws.o.box.y1 = ws.o.box.y0 + ys;
+      }
+
+      main_firstopen = FALSE;
+
+   }
+
+
+   ws.o.behind = -1;
+   if (wimpt_complain(wimp_open_wind(&ws.o)) == NULL)
+   {
+      win_activeinc();      /* count active windows */
+
+      main_open = TRUE;
+
+      game_level_init();
+   }
+
+
+   game_update_menu();
+
+}
+
+
+
+/****************************** INITIALISATION ******************************/
+
+
+
+static BOOL main_initialise(void)
+/* Initialise the program, returning TRUE if it was all OK. */
+{
+   wimp_msgaction mess_wanted[] = { wimp_MPREQUIT,     /* PreQuit         */
+                                    wimp_PALETTECHANGE,/* PaletteChange   */
+                                    wimp_SAVEDESK,     /* SaveDesk        */
+                                    wimp_MHELPREQUEST, /* HelpRequest     */
+                                    wimp_MMENUWARN,    /* MenuWarning     */
+                                    wimp_MMODECHANGE,  /* ModeChanged     */
+                                    wimp_MINITTASK,    /* Task Init       */
+                                    wimp_MWINDOWINFO,  /* Window Info     */
+                                    wimp_MCLOSEDOWN };
+
+   /* RISCOSLib initialisation */
+
+   wimpt_wimpversion(300);                          /* RISC-OS 3.00 aware */
+   wimpt_messages(mess_wanted);                     /* tell wimp (RO3) what messages we would like to receive */
+   wimpt_init(WIMP_INIT_STRING);                    /* Main wimp initialisation */
+
+   res_init(WIMP_RES_STRING);        /* Resources */
+   flex_init();                      /* Flexible store allocation */
+   resspr_init();                    /* application sprites */
+   template_init();                  /* Templates */
+   dbox_init();                      /* Dialogue boxes */
+   visdelay_init();                  /* Hourglass */
+   msgs_init();
+
+
+   /* put the icon on the icon bar */
+   {
+      char   *app_path,
+             *p;
+
+      /* get application directory leafname to use as iconbar sprite name
+         we do this in order to survive internationalisation of app name */
+      app_path = getenv(WIMP_RES_VAR);
+      p = app_path + strlen(app_path);
+      while (p > app_path && p[-1] != '.')
+         p--;
+
+      baricon(p, 1, iconbar_click);
+   }
+
+   /* make icon bar menu structure */
+   iconbar_menu = menu_new(msgs_lookup("MEicbarT:Mine Hunt"),
+                              msgs_lookup("MEicbarB:>Info,Save choices,Quit"));
+
+   /* attach a menu to the menu on the icon bar */
+   event_attachmenumaker(win_ICONBAR, main_menumaker, iconbar_menuproc, (void *)win_ICONBAR);
+
+
+   /* create a menu for the game windowr */
+   game_menu = menu_new(msgs_lookup("MEicbarT:Mine Hunt"),
+               msgs_lookup("MEgameB:New game,Level|Question marks,Sound,High Score"));
+
+   level_menu = menu_new(msgs_lookup("MEhiscrT:High Scores"),
+                            msgs_lookup("MEhiscrB:Show,Reset"));
+   menu_submenu(game_menu, 6, level_menu);    /* using 'level_menu' temporarily */
+
+   level_menu = menu_new(msgs_lookup("MElevelT:Level"),
+                            msgs_lookup("MElevelB:1,2,3,4,5,>Custom"));
+   menu_submenu(game_menu, 2, level_menu);
+
+   sound_menu = menu_new(msgs_lookup("MEsoundT:Sound level"),
+                            msgs_lookup("MEsoundB:Quiet,Loud"));
+   menu_submenu(game_menu, 5, sound_menu);
+
+
+   /* catch load events on icon bar */
+   win_register_event_handler(win_ICONBARLOAD, prog_iconbar_events, 0);
+
+   /* catch 'double click' and other events */
+   win_claim_unknown_events(win_ICONBARLOAD);
+
+   /* enable null events (processing is done on null events) */
+   win_claim_idle_events(win_ICONBARLOAD);
+   event_setmask((wimp_emask)0);
+
+   /* set up the string used if a desktop save is done later.  This value
+      is set up in case a different version of application is run later (in which
+      case DrawCompress$Dir will change) */
+   strcpy(desksave_startup_string, "Run ");
+   strcat(desksave_startup_string, getenv(WIMP_RES_VAR));
+
+
+
+   /* Set up miscellaneous global vars etc */
+
+
+   game_init();
+
+   /* All went ok */
+   return TRUE;
+}
+
+
+
+/******************************* MAIN PROGRAM ********************************/
+
+
+
+int main(void)
+{
+
+   if (main_initialise())
+   {
+
+      /* The main event loop */
+      while (TRUE)
+         event_process();
+   }
+
+   return 0;
+}

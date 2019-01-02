@@ -1,0 +1,531 @@
+; Copyright 2017 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:Machine.<Machine>
+        GET     Hdr:ImageSize.<ImageSize>
+
+        GET     Hdr:OSEntries
+        GET     Hdr:HALEntries
+        GET     Hdr:Proc
+
+        GET     hdr.iMx6q
+        GET     hdr.StaticWS
+        GET     hdr.Timers
+        GET     hdr.CoPro15ops
+
+        AREA    |Asm$$Code|, CODE, READONLY, PIC
+
+        EXPORT  Interrupt_Init
+        EXPORT  HAL_IRQEnable
+        EXPORT  HAL_IRQDisable
+        EXPORT  HAL_IRQClear
+        EXPORT  HAL_IRQSource
+        EXPORT  HAL_IRQStatus
+        EXPORT  HAL_FIQEnable
+        EXPORT  HAL_FIQDisable
+        EXPORT  HAL_FIQDisableAll
+        EXPORT  HAL_FIQClear
+        EXPORT  HAL_FIQSource
+        EXPORT  HAL_FIQStatus
+        EXPORT  HAL_IRQMax
+        EXPORT  HAL_IRQProperties
+        EXPORT  HAL_IRQSetCores
+        EXPORT  HAL_IRQGetCores
+
+Interrupt_Init
+; mov a4,lr
+; DebugReg a1,"HIRQ init "
+; mov lr,a4
+        ; 1. disable Distributor Controller
+        LDR     a1, IRQDi_Log
+        MOV     a2, #0          ; disable ICDDCR
+        STR     a2, [a1, #(ICDDCR - IC_DISTRIBUTOR_BASE_ADDR)]
+
+        ; 2. set all global interrupts to be level triggered, active low
+        ADD     a3, a1, #ICDICFR -IC_DISTRIBUTOR_BASE_ADDR
+        ADD     a3, a3, #8
+        MOV     a4, #GIC_INTERRUPT_COUNT
+        MOV     ip, #32
+10
+        STR     a2, [a3], #4
+        ADD     ip, ip, #16
+        CMP     ip, a4
+        BNE     %BT10
+
+        ; 3. set all global interrupts to this CPU only
+        ADD     a3, a1, #(ICDIPTR + 32  -IC_DISTRIBUTOR_BASE_ADDR)
+        MOV     ip, #32
+        MOV     a2, #1
+        ORR     a2, a2, a2, LSL #8
+        ORR     a2, a2, a2, LSL #16
+20
+        STR     a2, [a3], #4
+        ADD     ip, ip, #4
+        CMP     ip, a4
+        BNE     %BT20
+
+        ; 4. set priority on all interrupts
+        ADD     a3, a1, #(ICDIPR + 32 -IC_DISTRIBUTOR_BASE_ADDR)
+        MOV     ip, #32
+        MOV     a2, #&A0
+        ORR     a2, a2, a2, LSL #8
+        ORR     a2, a2, a2, LSL #16
+30
+        STR     a2, [a3], #4
+        ADD     ip, ip, #4
+        CMP     ip, a4
+        BNE     %BT30
+
+        ; 5. disable all interrupts
+        ADD     a3, a1, #ICDICER  -IC_DISTRIBUTOR_BASE_ADDR
+        MOV     ip, #32
+        MOV     a2, #-1
+40
+        STR     a2, [a3], #4
+        ADD     ip, ip, #32
+        CMP     ip, a4
+        BNE     %BT40
+
+      [ SupportFIQs
+        ; set all interrupts group 1 (IRQ)
+        ADD     a3, a1, #ICDISR  -IC_DISTRIBUTOR_BASE_ADDR
+        MOV     ip, #0
+        MOV     a2, #-1
+50
+        STR     a2, [a3], #4
+        ADD     ip, ip, #32
+        CMP     ip, a4
+        BNE     %BT50
+      ]
+
+        ; 6. enable Distributor Controller
+      [ SupportFIQs
+        MOV     a2, #ICDDCR_ENABLE + ICDDCR_ENABLE_GROUP1
+      |
+        MOV     a2, #ICDDCR_ENABLE
+      ]
+        STR     a2, [a1, #(ICDDCR-IC_DISTRIBUTOR_BASE_ADDR)]
+
+        ; 7. set PRIMASK in CPU interface
+        LDR     a1, IRQC_Log
+        MOV     a2, #&F0
+        STR     a2, [a1, #(ICCPMR-IC_INTERFACES_BASE_ADDR)]
+
+        ; 8. enable CPU interface
+      [ SupportFIQs
+        MOV     a2, #ICCICR_ENABLE + ICCICR_ENABLE_GROUP1 + ICCICR_ACKCTL + ICCICR_FIQEN
+      |
+        MOV     a2, #ICCICR_ENABLE
+      ]
+        STR     a2, [a1, #(ICCICR - IC_INTERFACES_BASE_ADDR)]
+
+      [ SupportFIQs
+        ; Set up FIQ tracking
+        MOV     a1, #-1
+        STR     a1, LastFIQ
+        STR     a1, LastFIQ+4
+        STR     a1, LastFIQ+8
+        STR     a1, LastFIQ+12
+      ]
+        ; ... and everything else looks good?
+        MOV     pc, lr
+
+HAL_IRQEnable
+        CMP     a1, #IMX_INTERRUPT_COUNT
+        MOVHS   a1, #0
+        MOVHS   pc, lr
+        ; Unmask the interrupt
+        CMP     a1, #GIC_INTERRUPT_COUNT
+        LDR     a3, IRQDi_Log
+        ANDHS   a1, a1, #31     ; map to GIC interrupt number
+        ADD     ip, a3, #(ICDISER - IC_DISTRIBUTOR_BASE_ADDR)
+        AND     a2, a1, #31     ; bit   = intno % 32
+        MOV     a1, a1, LSR #5  ; index = intno / 32
+        ADD     ip, ip, a1, LSL #2
+        MOV     a1, #1
+        MOV     a2, a1, LSL a2  ; mask = (1 << bit)
+        LDR     a1, [ip, #0]    ; get old state
+        STR     a2, [ip, #0]    ; set new state
+        AND     a1, a1, a2      ; Test if it was enabled or not
+        MOV     pc, lr
+
+HAL_IRQDisable
+        CMP     a1, #IMX_INTERRUPT_COUNT
+        MOVHS   a1, #0
+        MOVHS   pc, lr
+        CMP     a1, #GIC_INTERRUPT_COUNT
+        LDR     a3, IRQDi_Log
+        ANDHS   a1, a1, #31     ; map to GIC interrupt number
+        ADD     ip, a3, #(ICDICER - IC_DISTRIBUTOR_BASE_ADDR)
+        AND     a2, a1, #31     ; bit   = intno % 32
+        MOV     a4, a1, LSR #5  ; index = intno / 32
+        ADD     ip, ip, a4, LSL #2
+        MOV     a4, #1
+        MOV     a2, a4, LSL a2  ; mask = (1 << bit)
+        LDR     a4, [ip, #0]    ; get old state
+        STR     a2, [ip, #0]    ; mask the interrupt
+        ; Was it active?
+        LDR     ip, [ip, #(ICDABR - ICDICER)]
+        TST     ip, a2
+        BEQ     %FT90
+        CMP     a1, #16 ; check to see if SGI
+        BHS     %FT80
+        ; Look up the last SGI that was received for this core, it should correspond to the one we need to clear
+        MRC     p15, 0, ip, c0, c0, 5
+        ADR     a1, LastSGI
+        AND     ip, ip, #3
+        LDR     a1, [a1, ip, LSL #2]
+80
+        STR     a1, [a3, #(ICCEOIR - IC_DISTRIBUTOR_BASE_ADDR)]
+90
+        AND     a1, a4, a2      ; Test if it was enabled or not
+        DSB     SY
+        MOV     pc, lr
+
+HAL_IRQClear
+        ; This routine is used to clear the vsync interrupt
+        ; It must also restart the INTC priority sorting, as it is called after every
+        ; OS IRQ handler silences the interrupting device
+              ;;;;;;;;;;  CODE NEEDS DONE
+ [ VideoInHAL
+        CMP     a1, #VIDEO_IRQ
+        BEQ     %FT20
+ ]
+10
+        CMP     a1, #GIC_INTERRUPT_COUNT
+        ANDHS   a1, a1, #31     ; map to GIC interrupt number
+        CMP     a1, #16 ; check for SGI
+        LDR     a2, IRQC_Log
+        BHS     %FT15
+        ; Look up the last SGI that was received for this core, it should correspond to the one we need to clear
+        MRC     p15, 0, ip, c0, c0, 5
+        ADR     a1, LastSGI
+        AND     ip, ip, #3
+        LDR     a1, [a1, ip, LSL #2]
+15
+        ; signal End Of Interrupt
+        STR     a1, [a2, #(ICCEOIR -IC_INTERFACES_BASE_ADDR)]
+        ; Data synchronisation barrier to make sure INTC gets the message
+        myDSB
+        MOV     pc, lr
+
+ [ VideoInHAL
+20
+        LDR     a2, IPU1_Log
+        ADD     a2, a2, #IPU_REGISTERS_OFFSET
+        MVN     a3, #0
+        STR     a3, [a2, #IPU_IPU_INT_STAT_15_OFFSET-IPU_REGISTERS_OFFSET]
+        B       %BT10
+ ]
+
+HAL_IRQSource
+        LDR     a2, IRQC_Log
+        LDR     a3, [a2, #(ICCIAR - IC_INTERFACES_BASE_ADDR)]
+        BIC     a1, a3, #ICCIAR_CPUID
+        CMP     a1, #GIC_INTERRUPT_COUNT
+        MOVHS   a1, #-1            ; Spurious interrupt, ignore it
+        CMPLO   a1, #32
+        MOVHS   pc, lr
+        ; Private interrupt, remap it
+        MRC     p15, 0, a4, c0, c0, 5
+        ANDS    a4, a4, #3
+        ADDNE   a1, a1, #GIC_INTERRUPT_COUNT-32
+        ADDNE   a1, a1, a4, LSL #5
+        ; If it's an SGI, make a note of the ICCIAR value so we can clear the IRQ correctly in HAL_IRQClear
+        TST     a3, #16
+        ADREQ   a2, LastSGI
+        STREQ   a3, [a2, a4, LSL #2]
+        MOV     pc, lr
+
+HAL_IRQStatus
+        ; Test if IRQ is firing, irrespective of mask state
+        CMP     a1, #IMX_INTERRUPT_COUNT
+        MOVHS   a1, #0
+        MOVHS   pc, lr
+        CMP     a1, #GIC_INTERRUPT_COUNT
+        LDR     a2, IRQDi_Log
+        ANDHS   a1, a1, #31     ; map to GIC interrupt number
+        ADD     ip, a2, #(ICDABR -IC_DISTRIBUTOR_BASE_ADDR)
+        MOV     a3, a1, LSR #5  ; index = intno / 32
+        ADD     ip, ip, a3, LSL #2
+        LDR     a3, [ip, #0]    ; get old state
+        AND     a1, a1, #31     ; bit   = intno % 32
+        MOV     a1, a3, LSR a1
+        AND     a1, a1, #1      ; 0 = not firing, 1 = firing
+; mov a4,lr
+; DebugReg a1,"HIRQ status no:"
+; mov lr,a4
+        MOV     pc, lr
+
+
+HAL_IRQMax
+        MOV     a1, #IMX_INTERRUPT_COUNT
+        MOV     pc, lr
+
+; In: a1 = device number
+; Out: a1 = IRQ mask
+;      a2 = FIQ mask
+;           bits 0-29 of each register give cores that the interrupt can be
+;           assigned to
+;           bit 30 = private flag
+;           bit 31 = interrupt can be routed to multiple cores at once
+HAL_IRQProperties
+        ; 0-31 for core 0
+        ; 32-159 shared
+        ; 160-191 for core 1
+        ; 192-223 for core 2
+        ; 224-255 for core 3
+        CMP     a1, #IMX_INTERRUPT_COUNT
+      [ :LNOT: SupportFIQs
+        MOV     a2, #0
+      ]
+        MOVHS   pc, lr
+        CMP     a1, #32
+        MOVLO   a1, #1 + HALIRQProperty_Private
+      [ SupportFIQs
+        MOVLO   a2, #1 + HALIRQProperty_Private
+      ]
+        MOVLO   pc, lr
+        SUBS    a1, a1, #GIC_INTERRUPT_COUNT
+        MOVLT   a1, #&f + HALIRQProperty_Multicore
+      [ SupportFIQs
+        MOVLT   a2, #&f + HALIRQProperty_Multicore
+      ]
+        MOVLT   pc, lr
+        ; Core 1/2/3 private
+        MOV     a1, a1, LSR #5 ; Core number, minus one
+        MOV     a3, #2
+        MOV     a1, a3, LSL a1
+        ORR     a1, a1, #HALIRQProperty_Private
+      [ SupportFIQs
+        MOV     a2, a1
+      ]
+        MOV     pc, lr
+
+; In: a1 = device number
+;     a2 = desired core mask
+; Out: a1 = actual core mask
+HAL_IRQSetCores
+        CMP     a1, #GIC_INTERRUPT_COUNT
+        BHS     %FT10
+        CMP     a1, #32
+        BLO     %FT20
+        LDR     a3, IRQDi_Log
+        ADD     a3, a3, #ICDIPTR-IC_DISTRIBUTOR_BASE_ADDR
+        ADD     a3, a3, a1
+        AND     a1, a2, #&f
+        STRB    a1, [a3] ; Update mapping
+        MOV     pc, lr
+
+HAL_IRQGetCores ; read-only version of IRQSetCores
+        CMP     a1, #GIC_INTERRUPT_COUNT
+        BHS     %FT10
+        CMP     a1, #32
+        BLO     %FT20
+        LDR     a3, IRQDi_Log
+        ADD     a3, a3, #ICDIPTR-IC_DISTRIBUTOR_BASE_ADDR
+        LDRB    a1, [a3, a1] ; Get mapping
+        MOV     pc, lr
+
+10
+        CMP     a1, #IMX_INTERRUPT_COUNT
+        MOVHS   a1, #0
+        MOVHS   pc, lr
+        SUB     a1, a1, #GIC_INTERRUPT_COUNT
+        MOV     a1, a1, LSR #5 ; Core number, minus one
+        MOV     a3, #2
+        MOV     a1, a3, LSL a1        
+        MOV     pc, lr
+
+20
+        MOV     a1, #1
+        MOV     pc, lr
+
+ [ SupportFIQs
+HAL_FIQEnable
+        CMP     a1, #IMX_INTERRUPT_COUNT
+        MOVHS   a1, #0
+        MOVHS   pc, lr
+        ; Unmask the interrupt
+        CMP     a1, #GIC_INTERRUPT_COUNT
+        LDR     a3, IRQDi_Log
+        ANDHS   a1, a1, #31     ; map to GIC interrupt number
+        AND     a2, a1, #31     ; bit   = intno % 32
+        MOV     a1, a1, LSR #5  ; index = intno / 32
+        MOV     ip, #1
+        MOV     a2, ip, LSL a2  ; mask = (1 << bit)
+        ; Spinlock required for atomic update of IGROUP register (ICDISR)
+        AcquireSpinlock ip
+        ADD     ip, a3, #(ICDISR - IC_DISTRIBUTOR_BASE_ADDR)
+        LDR     a1, [ip, a1, LSL #2]!
+        BIC     a4, a1, a2      ; Switch to group 0 / secure / FIQ
+        STR     a4, [ip]
+        STR     a2, [ip, #ICDISER-ICDISR]
+        ReleaseSpinlock ip
+        AND     a1, a1, a2
+        EOR     a1, a1, a2
+        MOV     pc, lr
+
+HAL_FIQDisable  ROUT
+        CMP     a1, #IMX_INTERRUPT_COUNT
+        MOVHS   a1, #0
+        MOVHS   pc, lr
+        Entry   "v1"
+        AcquireSpinlock lr ; Not necessary to lock this early - but ensures no FIQs can occur while we're busy
+        MOV     v1, a1
+        BL      HAL_FIQSource   ; Update cached current FIQ
+        MOV     a1, v1
+        CMP     a1, #GIC_INTERRUPT_COUNT
+        LDR     a3, IRQDi_Log
+        ANDHS   a1, a1, #31     ; map to GIC interrupt number
+        ADD     ip, a3, #(ICDICER - IC_DISTRIBUTOR_BASE_ADDR)
+        AND     a2, a1, #31     ; bit   = intno % 32
+        MOV     v1, a1, LSR #5  ; index = intno / 32
+        ADD     ip, ip, v1, LSL #2
+        MOV     v1, #1
+        MOV     a2, v1, LSL a2  ; mask = (1 << bit)
+        ; Spinlock required for atomic update of IGROUP register (ICDISR)
+        LDR     v1, [ip, #ICDISR-ICDISER] ; get old state
+        STR     a2, [ip, #0]    ; mask the interrupt
+        ORR     lr, v1, a2
+        STR     lr, [ip, #ICDISR-ICDISER] ; switch to group 1 / non-secure / IRQ
+        ; Look up the last FIQ that was received for this core, it might correspond to the one we just disabled
+        LDR     ip, [a4]
+        BIC     lr, ip, #ICCIAR_CPUID
+        CMP     lr, a1
+        STREQ   ip, [a3, #(ICCEOIR - IC_DISTRIBUTOR_BASE_ADDR)]
+        MOVEQ   a1, #-1
+        STREQ   a1, [a4]
+        ReleaseSpinlock lr
+        AND     a1, v1, a2      ; Test if it was enabled or not
+        EOR     a1, a1, a2
+  ;      DSB     SY - Redundant due to ReleaseSpinlock
+        EXIT
+
+HAL_FIQDisableAll ROUT
+        Entry
+        AcquireSpinlock a4 ; Not necessary to lock this early - but ensures no FIQs can occur while we're busy
+        ; Clear any active FIQ
+        BL      HAL_FIQSource
+;        DebugReg a1, "FIQ"
+        CMP     a1, #-1
+        BLNE    HAL_FIQClear
+        ; Route all FIQs back to IRQ?
+        ; TODO only do this for FIQs which are routed to this core
+        LDR     a3, IRQDi_Log
+        ADD     a3, a3, #ICDISR-IC_DISTRIBUTOR_BASE_ADDR
+        MOV     ip, #0
+        MOV     a2, #-1
+50
+        STR     a2, [a3], #4
+        ADD     ip, ip, #32
+        CMP     ip, #GIC_INTERRUPT_COUNT
+        BNE     %BT50
+        ReleaseSpinlock a4
+      ;  DSB - Redundant due to ReleaseSpinlock
+        EXIT
+
+HAL_FIQClear    ROUT
+        Entry   "v1,v2"
+        MRS     v2, CPSR
+        CPSID   if
+        ; Check that a1 is the active FIQ
+        MOV     v1, a1
+        BL      HAL_FIQSource
+        CMP     a1, v1
+        BNE     %FT90
+        CMP     a1, #GIC_INTERRUPT_COUNT
+        ANDHS   a1, a1, #31     ; map to GIC interrupt number
+        CMP     a1, #16 ; check for SGI
+        LDR     a2, IRQC_Log
+        MRC     p15, 0, ip, c0, c0, 5
+        ADR     a3, LastFIQ
+        AND     ip, ip, #3
+        ; Look up the last FIQ that was received for this core, it should correspond to the one we need to clear
+        LDRLO   a1, [a3, ip, LSL #2]
+        ; signal End Of Interrupt
+        STR     a1, [a2, #(ICCEOIR -IC_INTERFACES_BASE_ADDR)]
+        ; Reset LastFIQ
+        MOV     a1, #-1
+        STR     a1, [a3, ip, LSL #2]
+        ; Data synchronisation barrier to make sure INTC gets the message
+        myDSB
+90
+        MSR     CPSR_c, v2
+        EXIT
+
+HAL_FIQStatus * HAL_IRQStatus
+
+        ; Exits with a4 pointing to LastFIQ for this core
+HAL_FIQSource   ROUT
+        MRS     a3, CPSR
+        CPSID   if ; Protect LastFIQ + ICCIAR access
+        ; Return cached state if we have one
+        MRC     p15, 0, a2, c0, c0, 5
+        ADR     a4, LastFIQ
+        AND     a2, a2, #3
+        LDR     a1, [a4, a2, LSL #2]!
+        CMP     a1, #-1
+        BICLO   a1, a1, #ICCIAR_CPUID
+        BLO     %FT80              ; NE would do, but use LO to make relationship with code at %FT80 obvious
+        ; Get live state, iff an FIQ is active
+        MRC     p15, 0, ip, c12, c1, 0
+        TST     ip, #F32_bit
+        BEQ     %FT90
+        LDR     a1, IRQC_Log
+        LDR     ip, [a1, #(ICCIAR - IC_INTERFACES_BASE_ADDR)]
+        BIC     a1, ip, #ICCIAR_CPUID
+        CMP     a1, #GIC_INTERRUPT_COUNT
+        MOVHS   a1, #-1            ; Spurious interrupt, ignore it
+        STRLO   ip, [a4]           ; Real interrupt, remember it
+80
+        CMPLO   a1, #32
+        BHS     %FT90
+        ; Private interrupt, remap it
+        TEQ     a2, #0
+        ADDNE   a1, a1, #GIC_INTERRUPT_COUNT-32
+        ADDNE   a1, a1, a2, LSL #5
+90
+        MSR     CPSR_c, a3
+        MOV     pc, lr
+ |
+HAL_FIQEnable
+        MOV     a1, #0
+        MOV     pc, lr
+
+HAL_FIQDisable
+        MOV     a1, #0
+        MOV     pc, lr
+
+HAL_FIQDisableAll
+        MOV     pc, lr
+
+HAL_FIQClear
+        MOV     pc, lr
+
+HAL_FIQStatus
+        MOV     a1, #0
+        MOV     pc, lr
+
+HAL_FIQSource
+        MOV     a1, #0
+        MOV     pc, lr
+ ]
+
+
+        END

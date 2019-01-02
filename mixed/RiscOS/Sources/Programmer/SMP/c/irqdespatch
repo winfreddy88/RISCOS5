@@ -1,0 +1,184 @@
+/*
+ * Copyright (c) 2017, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include <stdlib.h>
+#include "kernel.h"
+#include "swis.h"
+
+#include "Global/OSRSI6.h"
+#include "AsmUtils/irqs.h"
+#include "DebugLib/DebugLib.h"
+
+#include "irqdespatch.h"
+#include "mempool.h"
+#include "defs.h"
+#include "halcalls.h"
+#include "asm.h"
+
+#define LINK_UNSHARED 1
+
+/* KEEP IN SYNC WITH IRQASM.S! */
+typedef struct irqnode_s
+{
+	union {
+		struct irqnode_s *ptr;
+		uint32_t flags;
+	} link;
+	uint32_t r12;
+	irq_handler handler;
+} irqnode_t;
+
+typedef struct
+{
+	spinrwlock_t lock;
+	irqnode_t node;
+} irqhead_t;
+
+struct irqdespatch_s
+{
+	irqhead_t nodes[1];
+};
+
+static mempool_t *irq_mempool = NULL;
+
+uint32_t BranchToSWIExit = 0;
+
+static irqnode_t adapt_node(irqnode_t n,irq_handler kernel_unhandled)
+{
+	irqnode_t *next = &n;
+	/* Walk the chain until the end */
+	while (next->link.ptr)
+	{
+		next = (irqnode_t *) (next->link.flags & ~LINK_UNSHARED);
+	}
+	/* If this is the kernel's unhandled IRQ handler, adapt it to use ours
+	   (Note that kernel is cheeky and doesn't always have an unhandled-handler installed - e.g. system timer) */
+	if (next->handler == kernel_unhandled)
+	{
+		*next = (irqnode_t) { .link.flags = LINK_UNSHARED, .r12 = 0, .handler = asm_no_irq };
+	}
+	/* Return 'n' (possibly modified) */
+	return n;
+}
+
+irqdespatch_t *irq_alloc(void)
+{
+	if (!irq_mempool)
+	{
+		irq_mempool = mempool_new(sizeof(irqnode_t), glob.numcores*glob.numirq);
+	}
+	irqdespatch_t *irq = malloc(sizeof(irqdespatch_t)+(sizeof(irqhead_t)*glob.numirq)); /* N.B. allocates +1, but we want +1 anyway to deal with spurious IRQs */
+	/* Import the kernel's claimant list, and patch ourselves in */
+	const irqnode_t *kernel_devs;
+	_swix(OS_ReadSysInfo,_INR(0,2)|_OUT(2),6,0,OSRSI6_Devices,&kernel_devs);
+	uint32_t *kernel_swis;
+	_swix(OS_ReadSysInfo,_INR(0,2)|_OUT(2),6,0,OSRSI6_SWIDispatchTable,&kernel_swis);
+	/* BranchToSWIExit isn't exported, but we can guess that it's going to be at the end of the table */
+	BranchToSWIExit = ((uint32_t) kernel_swis) + 0x400;
+	dprintf(("","IRQ node 0 @ %08x\n",&irq->nodes[1]));
+	dprintf(("","BranchToSWIExit = %08x\n",BranchToSWIExit));
+	int irqs = ensure_irqs_off();
+	for (int i=0;i<=glob.numirq;i++)
+	{
+		irq->nodes[i].lock = (spinrwlock_t) SPINRW_INITIALISER;
+		irq->nodes[i].node = adapt_node(kernel_devs[i-1],kernel_devs[-1].handler);
+	}
+	/* Patch IRQ1V */
+	*((uint32_t *) 0xffff0100) = (uint32_t) riscos_irq1v;
+	/* Patch OS_ClaimDeviceVector / OS_ReleaseDeviceVector */
+	kernel_swis[OS_ClaimDeviceVector] = (uint32_t) riscos_claimdevicevector;
+	kernel_swis[OS_ReleaseDeviceVector] = (uint32_t) riscos_releasedevicevector;
+	restore_irqs(irqs);
+	return irq;
+}
+
+bool irq_claim(irqdespatch_t *despatch, int irq, uint32_t r12, irq_handler handler)
+{
+	irqnode_t *node = (irqnode_t *) mempool_alloc(irq_mempool);
+	if (!node)
+	{
+		return false;
+	}
+	uint32_t shared = irq & IRQ_SHARED;
+	irq = (irq & ~IRQ_SHARED) + 1;
+	irqhead_t *head = &despatch->nodes[irq];
+	spinrw_write_lock(&head->lock);
+	*node = head->node;
+	head->node = (irqnode_t) { .link.flags = ((uint32_t) node) + (shared ? 0 : LINK_UNSHARED), .r12 = r12, .handler = handler };
+	spinrw_write_unlock(&head->lock);
+	return true;
+}
+
+bool irq_release(irqdespatch_t *despatch, int irq, uint32_t r12, irq_handler handler)
+{
+	irq = (irq & ~IRQ_SHARED) + 1;
+	irqhead_t *head = &despatch->nodes[irq];
+	spinrw_write_lock(&head->lock);
+	irqnode_t *node = &head->node;
+	do
+	{
+		irqnode_t *next = (irqnode_t *) (node->link.flags & ~LINK_UNSHARED);
+		if ((node->r12 == r12) && (node->handler == handler))
+		{
+			/* Kernel is last claimant on list, so there should always be a next node here */
+			*node = *next;
+			spinrw_write_unlock(&head->lock);
+			mempool_free(irq_mempool, next);
+			return true;
+		}
+		node = next;
+	}
+	while (node);
+	spinrw_write_unlock(&head->lock);
+	return false;
+}
+
+void irq_handle(irqdespatch_t *despatch)
+{
+	int irq = HAL_IRQSource();
+	irqhead_t *head = &despatch->nodes[irq+1];
+	spinrw_read_lock(&head->lock);
+	asm_irq_handle(irq, &head->node);
+	spinrw_read_unlock(&head->lock);
+}
+
+void irq_disable(int irq)
+{
+	HAL_IRQDisable(irq);
+}
+
+bool irq_claim_swi(int irq, irq_handler handler, uint32_t r12)
+{
+	/* Match kernel behaviour and force-release all current matches */
+	while (irq_release(glob.irqdespatch, irq, r12, handler)) {};
+	return irq_claim(glob.irqdespatch, irq, r12, handler);
+}
+
+bool irq_release_swi(int irq, irq_handler handler, uint32_t r12)
+{
+	return irq_release(glob.irqdespatch, irq, r12, handler);
+}

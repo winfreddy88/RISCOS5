@@ -1,0 +1,316 @@
+; Copyright 2009 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:Machine.<Machine>
+        GET     Hdr:HALSize.<HALSize>
+
+        GET     Hdr:MEMM.VMSAv6
+
+        GET     Hdr:Proc
+        GET     Hdr:OSEntries
+        GET     Hdr:HALEntries
+        GET     Hdr:VIDCList
+
+        GET     hdr.omap3530
+        GET     hdr.StaticWS
+        GET     hdr.UART
+        GET     hdr.Post
+        GET     hdr.SDRC
+        GET     hdr.GPIO
+
+        AREA    |!!!ROMStart|, CODE, READONLY, PIC
+
+        IMPORT  rom_checkedout_ok
+        EXPORT  HAL_Base
+        IMPORT  HAL_DebugTX
+
+; Using the DMA controller to relocate the ROM image is much faster than doing it with the CPU
+             GBLL Use_DMA_Copy
+Use_DMA_Copy SETL {TRUE}
+ 
+        MACRO
+        CallOSM $entry, $reg
+        LDR     ip, [v8, #$entry*4]
+        MOV     lr, pc
+        ADD     pc, v8, ip
+        MEND
+
+        ; Jump table used to select board config on startup
+        ; See board.s for ordering of configs, and therefore what entry corresponds to what board
+HAL_Base
+        BL      selectconfig
+        BL      selectconfig
+        BL      selectconfig
+        BL      selectconfig
+        BL      selectconfig
+        BL      selectconfig
+        BL      selectconfig
+JumpTableEnd
+        ASSERT  . - HAL_Base < 0x60
+        %       0x60 - (. - HAL_Base)
+        DCD     0 ; Empty - was ROMsize
+        B       selectconfig_linux ; offset &64 - for booting as a uImage/Linux kernel. Uses Linux machine type ID to select board config.
+
+        ENTRY
+selectconfig
+        ; Get pointer to board config
+        ADR     v1, HAL_Base+4
+        SUB     v1, lr, v1
+        ADR     a1, BoardConfigTable
+        MOV     a2, #BoardConfig_Size>>2
+        MLA     v1, a2, v1, a1
+foundconfig
+        ; v1 = board config
+        MSR     CPSR_c, #F32_bit+I32_bit+SVC32_mode ; Get into SVC mode now, so we can write to sb without much fear of losing it (we may have been in FIQ)
+ [ Debug
+        ; Announce ourselves if debug
+        ADR     v2, HelloWorld
+        MOV     sb, v1
+10      LDRB    a1, [v2], #1
+        CMP     a1, #0
+        ADRNE   lr, %BT10
+        BNE     HAL_DebugTX
+        LDR     v2, =L4_CONTROL_IDCODE
+        LDR     v2, [v2]
+        LDR     a1, =HAWKEYE_AMDM37x
+        MOV     v2, v2, LSL #4
+        CMP     a1, v2, LSR #16
+        LDRNEB  v2, [v1, #BoardConfig_NameOMAP3]
+        LDREQB  v2, [v1, #BoardConfig_NameDM37x]
+        ADRL    a1, BoardConfigNames
+        ADD     v2, v2, a1
+10      LDRB    a1, [v2], #1
+        CMP     a1, #0
+        ADRNE   lr, %BT10
+        BNE     HAL_DebugTX
+        MOV     a1, #13
+        BL      HAL_DebugTX
+        MOV     a1, #10
+        BL      HAL_DebugTX
+ ]
+        ; Now copy the config to SRAM
+        ; We'll assume that the L3 interconnect has been correctly configured to give us access
+        LDR     sb, =IntSRAM_Base
+        MOV     a2, #BoardConfig_Size
+10      SUBS    a2, a2, #4
+        LDR     a3, [v1, a2]
+        STR     a3, [sb, a2]
+        BGT     %BT10
+ [ DebugTiming
+        ADD     sp, sb, #32768 ; Temp stack for debug code
+        ; Ensure debug UART FIFO is enabled (assuming UART 3)
+        MOV     a1, #0
+        STRB    a1, UARTFCRSoftCopy+2
+        MOV     a1, #2
+        STRB    a1, [sb, #BoardConfig_NumUART] ; Hide UART from RO
+        MOV     a2, #1
+        IMPORT  HAL_UARTFIFOEnable
+        BL      HAL_UARTFIFOEnable
+        DebugTimeNoMMU a1, "@ "
+ ]
+        ; Now do common init
+        B       restart
+
+ [ Debug
+HelloWorld DCB "OMAP3 HAL init",13,10,"Board config=",0
+        ALIGN
+ ]
+
+        ; Entry point for masquerading as a Linux kernel
+        ; r0=0
+        ; r1=machine type ID
+        ; r2=ptr to tag list (linux/include/asm/setup.h)
+selectconfig_linux
+        ADR     v1, BoardConfigTable_End-BoardConfig_Size
+        ADR     a3, BoardConfigTable
+10
+        LDR     a1, [v1, #BoardConfig_MachID]
+        CMP     a1, a2
+        CMPNE   v1, a3 ; If we can't find a config, abort and use default? (i.e. beagleboard)
+        BEQ     foundconfig
+        SUB     v1, v1, #BoardConfig_Size
+        B       %BT10
+
+        LTORG
+        GET     board.s
+        ASSERT  ((JumpTableEnd-HAL_Base)/4) >= (BoardConfigTable_End-BoardConfigTable)/BoardConfig_Size ; If this fires, we need a bigger jump table!
+
+; ------------------------------------------------------------------------------
+; Perform some Cortex-A8 specific CPU setup
+; Then start looking for RAM
+; In: sb = board config ptr
+restart
+        DebugChar a3,a4,48
+        MSR     CPSR_c, #F32_bit+I32_bit+SVC32_mode
+        DebugChar a3,a4,49
+
+        ADRL    v1, HAL_Base + OSROM_HALSize    ; v1 -> RISC OS image
+
+        LDR     v8, [v1, #OSHdr_Entries]
+        ADD     v8, v8, v1                      ; v8 -> RISC OS entry table
+
+        ; Ensure CPU is set up
+        MOV     a1, #0
+        CallOSM OS_InitARM
+        DebugChar a3,a4,50
+
+        ; Initialise RAM
+        BL      init_ram
+
+        ; The first 4K of the first registered block of RAM is used by RISC OS's init code, and also contains the stack
+        ; To keep things simple and safe, we'll relocate the HAL and OS image to the top end of RAM
+        ; Although with the beagleboard we know we'll be booted from RAM, this code has been written so that it should work if running from ROM
+
+        ; First, identify the top end of RAM
+        ; Then check if we intersect it
+        ; If we do, first copy ourselves down
+        ; Then copy ourselves up
+
+ [ Use_DMA_Copy
+        ; We'll use DMA for extra speed, so start by resetting the DMA controller
+        LDR     v5, =L4_sDMA
+        MOV     v1, #2
+        STR     v1, [v5, #DMA4_OCP_SYSCONFIG]
+5
+        LDR     v1, [v5, #DMA4_SYSSTATUS]
+        TST     v1, #1
+        BEQ     %BT5
+        ; Set a sensible FIFO budget (as per SDMACReset)
+        LDR     a2, =&100080
+        STR     a2, [v5, #DMA4_GCR]
+        ; Configure channel 0 for the right settings
+        ADD     v5, v5, #DMA4_i
+        LDR     v1, [v5, #DMA4_CLNK_CTRLi]
+        BIC     v1, v1, #&8000 ; Disable channel linking
+        STR     v1, [v5, #DMA4_CLNK_CTRLi]
+        MOV     v1, #1<<4
+        STR     v1, [v5, #DMA4_CICRi] ; frame end interrupt enabled
+        LDR     v1, =&2E1C2 ; 32bit elements, 64 byte bursts with packing, last write non-posted
+        STR     v1, [v5, #DMA4_CSDPi]
+        MOV     v1, #1
+        STR     v1, [v5, #DMA4_CFNi] ; 1 frame
+ ]
+
+relocate_code
+        DebugChar a1,a2,66
+        BL      get_end_of_ram
+        DebugChar v1,v2,67
+
+        ; How big are we?
+        ADRL    v1, HAL_Base + OSROM_HALSize
+        LDR     v2, [v1, #OSHdr_ImageSize]
+        LDR     lr, [v1, #OSHdr_Flags]
+        TST     lr, #OSHdrFlag_SupportsCompression
+        LDRNE   lr, [v1, #OSHdr_CompressedSize]
+        MOVEQ   lr, v2
+        SUB     v1, v1, #OSROM_HALSize ; Start of HAL
+        ADD     v2, v2, #OSROM_HALSize ; Size of HAL+OS
+        ADD     lr, lr, #OSROM_HALSize ; Size of compressed HAL+OS
+        ADD     v3, v1, lr ; End of OS
+        MOV     v4, a1 ; End of RAM
+        SUB     v5, v4, v2 ; New start address of HAL
+        CMP     v1, v5
+        BEQ     %FT10 ; No copy needed
+        CMP     v1, v4
+        BHI     %FT20 ; We're in some ROM above RAM. OK to continue with copy.
+        CMP     v3, v5
+        BLS     %FT20 ; We're in some ROM/RAM below our copy destination. OK to continue with copy.
+        ; Else we currently overlap the area we want to copy ourselves into.
+        SUB     v5, v1, lr ; Copy the HAL+OS to just before itself. TODO - This will fail with big ROMs (128MB beagleboard with >42MB ROM size)
+20
+ [ Use_DMA_Copy
+        ; Transfer everything in one DMA frame; this gives us a max ROM size of 64MB-4 bytes
+        LDR     a3, =L4_sDMA+DMA4_i
+        LDR     a1, [a3, #DMA4_CSRi]
+        STR     a1, [a3, #DMA4_CSRi] ; Clear status register
+        MOV     a1, lr, LSR #2
+        STR     a1, [a3, #DMA4_CENi]
+        STR     v5, [a3, #DMA4_CDSAi]
+        STR     v1, [a3, #DMA4_CSSAi]
+        LDR     a1, =&805080 ; Enable channel with post-increment source & destination, prefetch
+        STR     a1, [a3, #DMA4_CCRi]
+        ; Wait for copy to complete
+30
+        LDR     a1, [a3, #DMA4_CSRi]
+        TST     a1, #1<<4
+        BEQ     %BT30
+        ; Make doubly sure that it's finished by checking WR_ACTIVE/RD_ACTIVE
+40
+        LDR     a1, [a3, #DMA4_CCRi]
+        TST     a1, #&600
+        BNE     %BT40
+ |
+        MOV     a1, v5
+        MOV     a2, v1 ; Copy source
+        MOV     a3, lr
+30
+        LDR     a4, [a2], #4
+        SUBS    a3, a3, #4
+        STR     a4, [a1], #4
+        BGT     %BT30
+ ]
+        ; Invalidate I-cache, branch predictors
+        MOV     a1, #0
+        MCR     p15, 0, a1, c7, c5, 0
+        MCR     p15, 0, a1, c7, c5, 6
+        DSB     SY ; Wait for I-cache invalidation to complete
+        ISB     SY ; Wait for branch predictor invalidation to complete?
+        DebugChar a1,a2,68
+        ; Jump to our new copy
+        ADR     a1, relocate_code ; Keep things simple by just running through the same code again
+        SUB     a2, v5, v1
+        ADD     a1, a1, a2 ; relocate our branch target
+        ADD     v8, v8, a2 ; Update OS entry table ptr
+        MOV     pc, a1
+10
+        ; Copy completed OK.
+        ; v2 = size of HAL+OS
+        ; v4 = end of OS/RAM
+        ; v5 = start of HAL
+        ; v8 = OS entry table ptr
+        DebugChar a1,a2,69
+        DebugTimeNoMMU a1, "ROM relocated @ "
+        ; Clear RAM up to v5
+        MOV     a1, v5
+        BL      clear_ram
+
+        DebugChar a1,a2,70
+        DebugTimeNoMMU a1, "RAM cleared @ "
+
+; TODO - NEON seems to be on by default, need to work out how to turn it off before I can test code to turn it on!
+;        ; Enable power to the NEON unit, if present
+;        LDR     a1, =&4800244C ; 'control OMAP status register'
+;        LDR     a1, [a1]
+;        TST     a1, #1<<4
+;        BNE     %FT10
+;;        ; NEON is available, make sure it's turned on
+;        ; Enable CP10/CP11 access
+;        MRC     p15, 0, a1, c1, c0, 2
+;        ORR     a1, a1, #&F<<20
+;        MCR     p15, 0, a1, c1, c0, 2
+;        ISB     SY
+;        ; Now enable the unit
+;        MOV     a1, #1<<30 ; EN bit
+;        DCI     &EEE80A10 ; VMSR FPEXC, a1
+
+        B       rom_checkedout_ok
+
+        GET     RAM.s
+        LTORG
+        
+        END

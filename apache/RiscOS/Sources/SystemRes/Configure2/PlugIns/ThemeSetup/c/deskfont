@@ -1,0 +1,370 @@
+/* Copyright 2013 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*---------------------------------------------------------------------------*/
+/* File:    deskfont.c                                                       */
+/* Purpose: Desktop font handling                                            */
+/*---------------------------------------------------------------------------*/
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include "swis.h"
+#include "Interface/HighFSI.h"
+#include "wimplib.h"
+#include "fontmenu.h"
+#include "gadgets.h"
+#include "deskfont.h"
+#include "main.h"
+#include "defines.h"
+#include "common.h"
+
+/* Local variables */
+static size_t maxfont = 1;
+static char *romfonttable[16] = { "", "SystemFont", "", "",
+                                  "", "", "", "",
+                                  "", "", "", "",
+                                  "", "", "", "" };
+
+
+/*---------------------------------------------------------------------------*
+ * decode_font_name                                                          *
+ *                                                                           *
+ * Find the font name buried somewhere within a font identifier.             *
+ *---------------------------------------------------------------------------*/
+
+static char *decode_font_name(const char *full_id)
+{
+    static char *buf = NULL;
+    const char *ptr, *end;
+    
+    /* Try to find an "f" qualifier */
+    if (_swi(Font_FindField, _INR(1,2)|_OUT(1)|_RETURN(2), full_id, 'f', &ptr))
+    {
+        /* "f" qualifier present, skip territory number and whitespace */
+        while (*ptr >= '0' && *ptr <= '9') ptr++;
+        while (*ptr == ' ') ptr++;
+    }
+    else
+    {
+        /* "f" qualifier not present, try "F" instead */
+        if (_swi(Font_FindField, _INR(1,2)|_OUT(1)|_RETURN(2), full_id, 'F', &ptr))
+        {
+            /* "F" qualifier present, leave ptr as it is */
+        }
+        else
+        {
+            /* assume font name is given directly */
+            ptr = full_id;
+        }
+    }
+    
+    /* ptr now points at a string that's terminated by "\", " " or a control
+     * character so we need to make a null-terminated copy in a buffer
+     */
+    end = ptr;
+    while (*end > ' ' && *end != '\\') end++;
+    if (buf != NULL) free(buf);
+    buf = malloc(end - ptr + 1);
+    if (buf == NULL)
+    {
+        error_trap(common_error(messages_lookup("NotEnoughMemory")), 0);
+    }
+    else
+    {
+        strncpya(buf, ptr, end - ptr + 1);
+    }
+
+    return buf;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * decode_font_id                                                            *
+ *                                                                           *
+ * Determine font ID to compare against directory structure                  *
+ *---------------------------------------------------------------------------*/
+
+static char *decode_font_id(const char *full_id)
+{
+    static char *buf = NULL;
+    const char *ptr, *end;
+  
+    /* Try to find an "F" qualifier */
+    if (_swi(Font_FindField, _INR(1,2)|_OUT(1)|_RETURN(2), full_id, 'F', &ptr))
+    {
+        /* "F" qualifier present, leave ptr as it is */
+    }
+    else
+    {
+        /* assume font name is given directly */
+        ptr = full_id;
+    }
+  
+    /* ptr now points at a string that's terminated by "\", " " or a control
+     * character so we need to make a null-terminated copy in a buffer
+     */
+    end = ptr;
+    while (*end > ' ' && *end != '\\') end++;
+    if (buf != NULL) free(buf);
+    buf = malloc(end - ptr + 1);
+    if (buf == NULL)
+    {
+        error_trap(common_error(messages_lookup("NotEnoughMemory")), 0);
+    }
+    else
+    {
+        strncpya(buf, ptr, end - ptr + 1);
+    }
+    
+    return buf;
+}
+
+
+/*---------------------------------------------------------------------------*
+ * deskfont_build_romfont_table                                              *
+ *                                                                           *
+ * Scan for fonts in a directory and make a table.                           *
+ * This function is recursive (use subdir = NULL for top level call).        *
+ *---------------------------------------------------------------------------*/
+
+void deskfont_build_romfont_table(const char *dir, const char *subdir)
+{
+    /* Bail out if we've assigned names to every available font number */
+    if (maxfont < 15)
+    {
+        /* Check directory exists (only important for top level) */
+        if ((subdir != NULL) ||
+            (object_directory & _swi(OS_File, _INR(0,1)|_RETURN(0), OSFile_ReadNoPath, dir)))
+        {
+            int offset = 0;
+            int nread = -1;
+            char *thisdir;
+            char *tempname;
+            struct
+            {
+                int load; int exec;   int length;
+                int attr; int object; int filetype;
+                char name[256];
+            } gbpb_buf;
+
+            if (subdir == NULL)
+            {
+                subdir = "";
+            }
+            
+            /* Build the name of this directory from dir and subdir */
+            thisdir = malloc(strlen(dir) + 1 + strlen(subdir) + 1);
+            if (thisdir == NULL)
+            {
+                error_trap(common_error(messages_lookup("NotEnoughMemory")), 1);
+            }
+            sprintf(thisdir, "%s%s%s", dir, subdir[0] ? "." : "", subdir);
+            
+            /* Does this directory contain a font? */
+            tempname = malloc(strlen(thisdir) + 1 + 10 + 1);
+            if (tempname == NULL)
+            {
+                error_trap(common_error(messages_lookup("NotEnoughMemory")), 1);
+            }
+            sprintf(tempname, "%s.IntMetric*", thisdir);
+            if (object_file & _swi(OS_File, _INR(0,1)|_RETURN(0), OSFile_ReadNoPath, tempname))
+            {
+                /* We've found a font! */
+                maxfont++;
+                romfonttable[maxfont] = malloc(strlen(subdir) + 1);
+                if (romfonttable[maxfont] == NULL)
+                {
+                    error_trap(common_error(messages_lookup("NotEnoughMemory")), 1);
+                }
+                strcpy(romfonttable[maxfont], subdir);
+            }
+            free(tempname);
+            
+            /* Scan for subdirectories */
+            do
+            {
+                _swi(OS_GBPB, _INR(0,6)|_OUTR(3,4), OSGBPB_ReadDirEntriesFileType,
+                     thisdir,
+                     &gbpb_buf,
+                     1,
+                     offset,
+                     sizeof(gbpb_buf),
+                     "*",
+                     &nread,
+                     &offset);
+                if (nread && (gbpb_buf.object & object_directory))
+                {
+                    /* Found a subdirectory */
+                    tempname = malloc(strlen(subdir) + 1 + strlen(gbpb_buf.name) + 1);
+                    if (tempname == NULL)
+                    {
+                        error_trap(common_error(messages_lookup("NotEnoughMemory")), 1);
+                    }
+                    sprintf(tempname, "%s%s%s", subdir, subdir[0] ? "." : "", gbpb_buf.name);
+                    deskfont_build_romfont_table(dir, tempname); /* recurse */
+                    free(tempname);
+                }
+            } while (offset != -1);
+            
+            free(thisdir);
+        }
+    }
+}
+
+
+/*---------------------------------------------------------------------------*
+ * deskfont_get_by_number                                                    *
+ *                                                                           *
+ * Set the font menu and display based on a number.                          *
+ *---------------------------------------------------------------------------*/
+
+void deskfont_get_by_number(int fontindex)
+{
+    if (('\0' == romfonttable[fontindex][0]) || (fontindex == 1))
+    {
+        /* Font index mapping is NULL, or using system font */
+        error_trap(optionbutton_set_state(0, main_window, CheckUseOutlineFont, 0), 0);
+    }
+    else
+    {
+        error_trap(fontmenu_set_font(0, font_menu, romfonttable[fontindex]), 0);
+    }
+    deskfont_update_display_field();
+}
+
+
+/*---------------------------------------------------------------------------*
+ * deskfont_get_by_name                                                      *
+ *                                                                           *
+ * Set the font menu from the contents of Wimp$Font.                         *
+ *---------------------------------------------------------------------------*/
+
+void deskfont_get_by_name(const char *font)
+{
+    if (strlen(font))
+    {
+        error_trap(fontmenu_set_font(0, font_menu, (char *)font), 0);
+    }
+    else
+    {
+        error_trap(optionbutton_set_state(0, main_window, CheckUseOutlineFont, 0), 0);
+    }
+    deskfont_update_display_field();
+}
+
+
+/*---------------------------------------------------------------------------*
+ * deskfont_set                                                              *
+ *                                                                           *
+ * Save the font setting either to CMOS or the choices file.                 *
+ *---------------------------------------------------------------------------*/
+
+void deskfont_set(FILE *fp, char *fullfontid)
+{
+    char *shortid = decode_font_id(fullfontid);
+    const char *rd = fullfontid;
+    char *wr = fullfontid;
+    char  command[256];
+    int   fontindex;
+    int   value = 0; /* Default */
+    WimpMessage msg;
+
+    /* Strip out the encoding information ("\E" and/or "\e") */
+    do
+    {
+      if (*rd == '\\' && (*(rd+1) == 'E' || *(rd+1) == 'e'))
+      {
+        /* Skip qualifier */
+        do
+        {
+          rd++;
+        } while (*rd != '\\' && *rd >= ' ');
+      }
+      else
+      {
+        /* Copy byte down */
+        *wr = *rd;
+        rd++;
+        wr++;
+      }
+    } while (*rd >= ' ');
+    *wr = '\0';
+  
+    /* Hunt for it in the ROM table preferentially */
+    for (fontindex = 1; fontindex <= 15; fontindex++)
+    {
+        if (0 == _swi(Territory_Collate, _INR(0,3)|_RETURN(0), -1,
+                      shortid, romfonttable[fontindex], 1 /* ignore case */))
+        {
+            value = fontindex;
+        }
+    }
+
+    if (value == 0)
+    {
+        /* Need to write the status file as well */
+        sprintf(command, FontTag " %s", fullfontid);
+        fprintf(fp, "%s\n", command);
+        _swix(OS_CLI, _IN(0), command);
+    }
+    sprintf(command, "Configure WimpFont %d", value);
+    _swix(OS_CLI, _IN(0), command);
+
+    /* And prod the Wimp so it realises the font has changed! */
+    msg.hdr.size = 20;
+    msg.hdr.your_ref = 0;
+    msg.hdr.action_code = Wimp_MFontChanged;
+    error_trap(wimp_send_message(Wimp_EUserMessage, &msg, 0, 0, NULL), 0);
+}
+
+
+/*---------------------------------------------------------------------------*
+ * deskfont_update_display_field                                             *
+ *                                                                           *
+ * Put the chosen font into the top level display field.                     *
+ *---------------------------------------------------------------------------*/
+
+void deskfont_update_display_field(void)
+{
+    char *buffer;
+    int   bufsize, state;
+    const char *fontname;
+
+    error_trap(optionbutton_get_state(0, main_window, CheckUseOutlineFont, &state), 0);
+    if (state)
+    {
+        /* Outline font selected */
+        error_trap(fontmenu_get_font(0, font_menu, NULL, 0, &bufsize), 0);
+        buffer = malloc(bufsize);
+        if (buffer == NULL)
+        {
+            error_trap(common_error(messages_lookup("NotEnoughMemory")), 1);
+        }
+        error_trap(fontmenu_get_font(0, font_menu, buffer, bufsize, NULL), 0);
+        fontname = decode_font_name(buffer);
+        free(buffer);
+
+        error_trap(displayfield_set_value(0, main_window, DisplayFont, (char *)fontname), 0);
+    }
+    else
+    {
+        /* System font selected */
+        OptionButtonStateChangedEvent obsce;
+
+        obsce.hdr.event_code = OptionButton_StateChanged;
+        obsce.hdr.size = sizeof(OptionButtonStateChangedEvent);
+        obsce.new_state = 0;
+        error_trap(toolbox_raise_toolbox_event(0, main_window, CheckUseOutlineFont, (ToolboxEvent *)&obsce), 0);
+    }
+}

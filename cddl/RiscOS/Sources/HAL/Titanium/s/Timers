@@ -1,0 +1,217 @@
+;
+; CDDL HEADER START
+;
+; The contents of this file are subject to the terms of the
+; Common Development and Distribution License (the "Licence").
+; You may not use this file except in compliance with the Licence.
+;
+; You can obtain a copy of the licence at
+; cddl/RiscOS/Sources/HAL/Titanium/LICENCE.
+; See the Licence for the specific language governing permissions
+; and limitations under the Licence.
+;
+; When distributing Covered Code, include this CDDL HEADER in each
+; file and include the Licence file. If applicable, add the
+; following below this CDDL HEADER, with the fields enclosed by
+; brackets "[]" replaced with your own identifying information:
+; Portions Copyright [yyyy] [name of copyright owner]
+;
+; CDDL HEADER END
+;
+;
+; Copyright 2014 Elesar Ltd.  All rights reserved.
+; Use is subject to license terms.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:OSEntries
+
+        GET     hdr.RegMap
+        GET     hdr.StaticWS
+                
+        AREA    |Timers$$Code|, CODE, READONLY, PIC
+
+        EXPORT  HAL_Timers
+        EXPORT  HAL_TimerDevice
+        EXPORT  HAL_TimerGranularity
+        EXPORT  HAL_TimerMaxPeriod
+        EXPORT  HAL_TimerSetPeriod
+        EXPORT  HAL_TimerPeriod
+        EXPORT  HAL_TimerReadCountdown
+        EXPORT  HAL_TimerIRQClear
+        EXPORT  HAL_TimerIRQStatus
+        EXPORT  TimerInit
+        
+; Pick suitable timers that the MPU can see that are all on the
+; same clock and power domains and all have the same register layout 
+TimerDevices
+        ASSERT  IRQCount < 256
+        DCB     DevNoTimer0, DevNoTimer1, DevNoTimer2, DevNoTimer3, DevNoTimer4, DevNoTimer5
+        ALIGN
+TimerClocks
+        DCD     CM_L4PER_TIMER2_CLKCTRL
+        DCD     CM_L4PER_TIMER3_CLKCTRL
+        DCD     CM_L4PER_TIMER4_CLKCTRL
+        DCD     CM_L4PER_TIMER9_CLKCTRL
+        DCD     CM_L4PER_TIMER10_CLKCTRL
+        DCD     CM_L4PER_TIMER11_CLKCTRL
+TimerBases
+        DCD     TIMER2_PhysBase
+        DCD     TIMER3_PhysBase
+        DCD     TIMER4_PhysBase
+        DCD     TIMER9_PhysBase
+        DCD     TIMER10_PhysBase
+        DCD     TIMER11_PhysBase
+TimerCount      * (. - TimerBases):SHR:2
+        ASSERT  ?Timers_LogBase = (4 * TimerCount)
+        
+; TimerInit
+TimerInit ROUT
+        Push    "v1-v4, lr"
+
+        ; Get L4PER register set
+        LDR     v4, CMCoreL4PER_LogBase
+
+        MOV     v1, #0
+        ADR     v2, TimerBases
+        ADR     v3, Timers_LogBase
+10
+        ; Map in the timer
+        MOV     a1, #0
+        LDR     a2, [v2, v1, LSL #2]
+        MOV     a3, #TIMER_PhysSize
+        CallOS  OS_MapInIO
+        STR     a1, [v3, v1, LSL #2]    ; Assigned logical base
+
+        ; Turn on the clock (source = TIMER_SYS_CLK = SYS_CLK1)
+        MOV     a3, #CM_CLKCTRL_MODULEMODE_ENABLED
+        ADR     a2, TimerClocks
+        LDR     a2, [a2, v1, LSL #2]    ; Respective CLKCTRL offset
+        STR     a3, [v4, a2]
+
+        ; Reset the timer
+        MOV     a3, #TIMER_TIOCP_CFG_SOFTRESET :OR: TIMER_TIOCP_CFG_IDLEMODE_SMART_IDLE
+        STR     a3, [a1, #TIMER_TIOCP_CFG]
+20
+        LDR     a3, [a1, #TIMER_TIOCP_CFG]
+        TST     a3, #TIMER_TIOCP_CFG_SOFTRESET
+        BNE     %BT20
+
+        ADD     v1, v1, #1
+        TEQ     v1, #TimerCount
+        BNE     %BT10
+
+        Pull    "v1-v4, pc"
+
+; HAL_Timers
+; <= a1 = number of timers
+HAL_Timers ROUT
+        MOV     a1, #TimerCount
+        MOV     pc, lr
+
+; HAL_TimerDevice
+; => a1 = timer number
+; <= a1 = IRQ device number
+HAL_TimerDevice ROUT
+        CMP     a1, #TimerCount
+        MOVCS   a1, #-1                 ; No such timer
+        ADRCC   a2, TimerDevices
+        LDRCCB  a1, [a2, a1]
+        MOV     pc, lr
+
+; HAL_TimerMaxPeriod
+; => a1 = timer number
+; <= a1 = period
+HAL_TimerMaxPeriod ROUT
+        MOV     a1, #-1
+        MOV     pc, lr
+
+; HAL_TimerGranularity
+; => a1 = timer number
+; <= a1 = granularity in ticks per second
+HAL_TimerGranularity ROUT
+        LDR     a1, =ClkOsc0
+        MOV     pc, lr
+        
+; HAL_TimerSetPeriod
+; => a1 = timer number
+;    a2 = period in ticks
+HAL_TimerSetPeriod
+        CMP     a1, #TimerCount
+        MOVCS   pc, lr
+        ADR     a3, Timers_LogBase
+        LDR     a3, [a3, a1, LSL #2]    ; That timer
+        LDR     a4, [a3, #TIMER_TCLR]
+        BIC     a4, a4, #TIMER_TCLR_ST  ; Stop while changing
+        STR     a4, [a3, #TIMER_TCLR]
+        TEQ     a2, #0                  ; Just stop?
+        MOVEQ   pc, lr
+
+        RSB     a2, a2, #0              ; It's a 32 bit up counter
+        CMP     a2, #-1
+        SUBEQ   a2, a2, #1              ; Avoid infinite IRQs
+        STR     a2, [a3, #TIMER_TLDR]
+        STR     a2, [a3, #TIMER_TCRR]
+
+        ; Interrupt on overflow
+        ; Timer mode, auto reload, no prescale, go!
+        MOV     a1, #TIMER_IRQ_OVF_IT_FLAG
+        STR     a1, [a3, #TIMER_IRQSTATUS]
+        STR     a1, [a3, #TIMER_IRQENABLE_SET]
+        MOV     a1, #TIMER_TCLR_AR :OR: TIMER_TCLR_ST
+        STR     a1, [a3, #TIMER_TCLR]
+        MOV     pc, lr
+
+; HAL_TimerPeriod
+; => a1 = timer number
+; <= a1 = programmed period
+HAL_TimerPeriod
+        CMP     a1, #TimerCount
+        MOVCS   a1, #0
+        MOVCS   pc, lr
+        ADR     a2, Timers_LogBase
+        LDR     a2, [a2, a1, LSL #2]    ; That timer
+        LDR     a3, [a2, #TIMER_TCLR]
+        TST     a3, #TIMER_TCLR_ST
+        MOVEQ   a1, #0                  ; Is stopped
+        LDRNE   a1, [a2, #TIMER_TLDR]
+        RSBNE   a1, a1, #0
+        MOV     pc, lr
+        
+; HAL_TimerReadCountdown
+; => a1 = timer number
+; <= a1 = ticks left to go
+HAL_TimerReadCountdown
+        CMP     a1, #TimerCount
+        MOVCS   a1, #0
+        ADRCC   a2, Timers_LogBase
+        LDRCC   a2, [a2, a1, LSL #2]    ; That timer
+        LDRCC   a1, [a2, #TIMER_TCRR]   ; Count
+        RSBCC   a1, a1, #0              ; Time left until wrap
+        MOV     pc, lr
+
+; HAL_TimerIRQStatus
+; => a1 = timer number
+; <= a1 = 0 not interrupting, else is
+HAL_TimerIRQStatus ROUT
+        CMP     a1, #TimerCount
+        ADRCC   a2, Timers_LogBase
+        LDRCC   a2, [a2, a1, LSL #2]    ; That timer
+        LDRCC   a3, [a2, #TIMER_IRQSTATUS]
+        MOVCS   a3, #0
+        AND     a1, a3, #TIMER_IRQ_OVF_IT_FLAG
+        MOV     pc, lr
+
+; HAL_TimerIRQClear
+; => a1 = timer number
+HAL_TimerIRQClear ROUT
+        CMP     a1, #TimerCount
+        ADRCC   a2, Timers_LogBase
+        LDRCC   a2, [a2, a1, LSL #2]    ; That timer
+        MOVCC   a3, #TIMER_IRQ_OVF_IT_FLAG
+        STRCC   a3, [a2, #TIMER_IRQSTATUS]
+        MOV     pc, lr
+
+        END

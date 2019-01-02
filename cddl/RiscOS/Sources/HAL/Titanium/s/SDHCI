@@ -1,0 +1,557 @@
+;
+; CDDL HEADER START
+;
+; The contents of this file are subject to the terms of the
+; Common Development and Distribution License (the "Licence").
+; You may not use this file except in compliance with the Licence.
+;
+; You can obtain a copy of the licence at
+; cddl/RiscOS/Sources/HAL/Titanium/LICENCE.
+; See the Licence for the specific language governing permissions
+; and limitations under the Licence.
+;
+; When distributing Covered Code, include this CDDL HEADER in each
+; file and include the Licence file. If applicable, add the
+; following below this CDDL HEADER, with the fields enclosed by
+; brackets "[]" replaced with your own identifying information:
+; Portions Copyright [yyyy] [name of copyright owner]
+;
+; CDDL HEADER END
+;
+;
+; Copyright 2014 Elesar Ltd.  All rights reserved.
+; Use is subject to license terms.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:OSEntries
+        GET     Hdr:HALDevice
+        GET     Hdr:SDHCIDevice
+
+        GET     hdr.RegMap
+        GET     hdr.StaticWS
+
+        AREA    |SDHCI$$Code|, CODE, READONLY, PIC
+
+        EXPORT  SDHCIInit
+        EXPORT  SDHCIDeviceInit
+        IMPORT  memcpy
+        IMPORT  HAL_CounterDelay
+        IMPORT  GPIOSetPinHigh
+        IMPORT  GPIOSetPinLow
+        IMPORT  GPIOMakeOutput
+        
+; Maximum time bus power is allowed to take to ramp up or down.
+; MMC and SD agree this is 35 ms max ramp up, but nothing is said
+; about ramp down so I'm assuming it's the same.
+BUS_POWER_RAMP       * 35000            ; in us
+
+; Time to allow for Vccq ramping up or down
+VCCQ_POWER_RAMP      * 5000             ; in us
+
+; Number of reads of SYSSTATUS before we give up waiting for reset to complete
+RESET_TIMEOUT        * 100
+
+; Number of reads of SYSCTL before we give up waiting for SDCLK to stabilise
+CLOCKSET_TIMEOUT     * 1000
+
+; Time to leave initialisation procedure to execute
+INIT_PROCEDURE_TIME  * 1000             ; in us
+
+; Frequency of the clock which we divide to produce SDCLK
+FCLK_FREQ            * 192000           ; in kHz
+
+; Current limit, ultimately set by the socket contacts
+BUS_ILIM             * 500              ; mA
+
+; UHS is too orangey for crows
+                GBLL UHSSupport
+UHSSupport      SETL {FALSE}
+                      
+; SDHCIInit
+SDHCIInit ROUT
+        Push    "lr"
+
+        ; Turn on the MMC1 controller clock
+        LDR     a1, CMCoreL3INIT_LogBase
+        LDR     a2, =CM_L3INIT_MMC1_CLKCTRL_MMC1_CLK_DIV1 :OR: \
+                     CM_CLKCTRL_MODULEMODE_ENABLED :OR: \
+                     CM_L3INIT_MMC1_CLKCTRL_CLKSEL_SOURCE
+        STR     a2, [a1, #CM_L3INIT_MMC1_CLKCTRL]
+
+        ; Map in the MMC1 controller
+        MOV     a1, #0
+        LDR     a2, =MMC1_PhysBase
+        MOV     a3, #MMC_PhysSize
+        CallOS  OS_MapInIO
+        STR     a1, SDHCI_LogBase
+
+        ; Activate the Vdd switch on GPIO7.0
+        LDR     a1, =&0700
+        BL      GPIOSetPinLow
+        LDR     a1, =&0700
+        BL      GPIOMakeOutput
+
+        Pull    "pc"
+
+; SDHCIDeviceInit
+SDHCIDeviceInit ROUT
+        Push    "lr"
+
+        ADR     a1, SDHCIDevice
+        ADR     a2, SDHCIDeviceTemplate
+        MOV     a3, #HALDevice_SDHCISize + HALDeviceSDHCI_SlotInfo_Size
+        BL      memcpy
+
+        LDR     a2, SDHCI_LogBase
+        STR     a2, [a1, #HALDevice_Address]
+        ADD     a2, a2, #&200
+        STR     a2, [a1, #HALDevice_SDHCISize + HALDeviceSDHCI_SlotInfo_StdRegs]
+
+        ADRL    a2, SDHCIDevice + HALDevice_SDHCISize
+        STR     a2, [a1, #HALDevice_SDHCISlotInfo]
+
+        MOV     a2, a1
+        MOV     a1, #0                  ; No flags
+        CallOS  OS_AddDevice
+
+        Pull    "pc"
+
+SDHCIDeviceTemplate
+        DCW     HALDeviceType_ExpCtl + HALDeviceExpCtl_SDIO
+        DCW     HALDeviceID_SDIO_SDHCI
+        DCD     HALDeviceBus_Sys + HALDeviceSysBus_NoC
+        DCD     0                       ; API version 0
+        DCD     SDHCIDevice_Desc
+        DCD     0                       ; Address of controller - filled later
+        %       12                      ; Reserved
+        DCD     SDHCIDevice_Activate
+        DCD     SDHCIDevice_Deactivate
+        DCD     SDHCIDevice_Reset
+        DCD     SDHCIDevice_Sleep
+        DCD     DevNoSDHCI              ; Device number of MMC1
+        DCD     0
+        %       8
+        ASSERT  (.-SDHCIDeviceTemplate) = HALDeviceSize
+        DCD     HALDeviceSDHCI_Flag_32bit + HALDeviceSDHCI_Flag_R2bug
+        DCD     1                       ; Slots
+        DCD     0                       ; SlotInfo - filled later
+        DCD     0                       ; WriteRegister
+        DCD     0                       ; GetCapabilities
+        DCD     0                       ; GetVddCapabilities
+        DCD     SDHCIDevice_SetVdd
+        DCD     SDHCIDevice_SetBusMode
+        DCD     SDHCIDevice_PostPowerOn
+        DCD     SDHCIDevice_SetBusWidth
+        DCD     0                       ; GetMaxCurrent
+        DCD     SDHCIDevice_SetSDCLK
+        DCD     SDHCIDevice_GetTMCLK
+        DCD     SDHCIDevice_NOP         ; SetActivity
+        DCD     0                       ; GetCardDetect
+        DCD     SDHCIDevice_GetWriteProtect
+        DCD     0                       ; TriggerCommand
+        ASSERT  (.-SDHCIDeviceTemplate) = HALDevice_SDHCISize
+        DCD     HALDeviceSDHCI_SlotFlag_Bus4Bit
+        DCD     0                       ; SlotInfo_StdRegs - filled later
+        ASSERT  (.-SDHCIDeviceTemplate) = HALDevice_SDHCISize + HALDeviceSDHCI_SlotInfo_Size
+        ASSERT  HALDevice_SDHCISize + HALDeviceSDHCI_SlotInfo_Size = ?SDHCIDevice
+         
+SDHCIDevice_Desc
+        DCB     "Sitara eMMC/SD/SDIO", 0
+        ALIGN
+
+; SDHCIDevice_Activate
+; => a1 = SDHCI device
+; <= a1 = success when TRUE
+SDHCIDevice_Activate ROUT
+        Push    "v1, sb, lr"
+        SUB     sb, a1, #:INDEX:SDHCIDevice
+        LDR     a4, [a1, #HALDevice_Address]
+
+        ; 25.5.1.1.2.3 Set MMCHS Default Capabilities
+        MOV     a2, #MMC_CAPA_VS33
+        STR     a2, [a4, #MMC_CAPA]
+
+        ; The generic implementation (correctly) uses the power control register
+        ; to index into current capabilities. This is supposed to reflect Vdd,
+        ; but the datasheet for this chip advises setting the power control
+        ; register to reflect Vccq. To sort out this mess, store the current limit
+        ; in every slot of the current capabilities.
+        LDR     a2, =(BUS_ILIM / 4) * ((1:SHL:MMC_CUR_CAPA_CUR_3V3_SHIFT) + \
+                                       (1:SHL:MMC_CUR_CAPA_CUR_3V0_SHIFT) + \
+                                       (1:SHL:MMC_CUR_CAPA_CUR_1V8_SHIFT))
+        STR     a2, [a4, #MMC_CUR_CAPA]
+
+      [ UHSSupport
+        TPSRead v1, PRODUCT_ID_LSB
+        TPSRead a1, PRODUCT_ID_MSB
+        MOVW    a2, #&C035
+        MOVW    a3, #&9039
+        ORR     a1, a1, v1, LSL #8
+        TEQ     a1, a2
+        TEQNE   a1, a3
+        MOVNE   a1, #0                  ; TPS not recognised - exit failure
+        MOVEQ   a1, #1                  ; TPS recognised - exit OK
+      |
+        ; The LDO defaults to being on at 3.3V so it's already powering
+        ; the card IO, make the bias mode match that state
+        LDR     a1, ControlCore_LogBase
+        LDR     a2, [a1, #CTRL_CORE_CONTROL_PBIAS]
+        ORR     a2, a2, #CTRL_CORE_CONTROL_PBIAS_SDCARD_BIAS_VMODE
+        STR     a2, [a1, #CTRL_CORE_CONTROL_PBIAS]
+        ORR     a2, a2, #CTRL_CORE_CONTROL_PBIAS_SDCARD_BIAS_PWRDNZ :OR: \
+                         CTRL_CORE_CONTROL_PBIAS_SDCARD_IO_PWRDNZ
+        STR     a2, [a1, #CTRL_CORE_CONTROL_PBIAS]
+10
+        LDR     a2, [a1, #CTRL_CORE_CONTROL_PBIAS]
+        TST     a2, #CTRL_CORE_CONTROL_PBIAS_SDCARD_BIAS_SUPPLY_HI_OUT
+        BEQ     %BT10
+
+        MOV     a1, #1                  ; Always OK
+      ]
+        Pull    "v1, sb, pc"
+
+; SDHCIDevice_Reset
+; => a1 = SDHCI device
+SDHCIDevice_Reset ROUT
+        Push    "sb, lr"
+        SUB     sb, a1, #:INDEX:SDHCIDevice
+        LDR     a4, [a1, #HALDevice_Address]
+
+        ; 25.5.1.1.2.2 MMCHS Soft Reset Flow
+        LDR     a2, [a4, #MMC_SYSCONFIG]
+        ORR     a2, a2, #MMC_SYSCONFIG_SOFTRESET
+        STR     a2, [a4, #MMC_SYSCONFIG]
+        MOV     a3, #RESET_TIMEOUT
+10
+        SUBS    a3, a3, #1
+        Pull    "sb, pc", EQ            ; Timed out
+        LDR     a2, [a4, #MMC_SYSSTATUS]
+        TST     a2, #MMC_SYSSTATUS_RESETDONE
+        BEQ     %BT10
+        
+        ; 25.5.1.1.2.4 Wake-Up Configuration
+        LDR     a2, [a4, #MMC_SYSCONFIG]
+        BIC     a2, a2, #MMC_SYSCONFIG_ENAWAKEUP
+        STR     a2, [a4, #MMC_SYSCONFIG]
+        
+        ; 25.5.1.1.2.5 MMC Host and Bus Configuration
+        LDR     a2, [a4, #MMC_CON]
+        BIC     a2, a2, #MMC_CON_OD :OR: MMC_CON_DW8
+        BIC     a2, a2, #MMC_CON_CEATA
+        STR     a2, [a4, #MMC_CON]
+        MOV     a2, #MMC_HCTL_SDVS_3V3
+        STR     a2, [a4, #MMC_HCTL]
+        ORR     a2, a2, #MMC_HCTL_SDBP
+        STR     a2, [a4, #MMC_HCTL]
+10
+        LDR     a2, [a4, #MMC_HCTL]
+        TST     a2, #MMC_HCTL_SDBP
+        BEQ     %BT10
+
+        LDR     a2, [a4, #MMC_SYSCTL]
+        LDR     ip, =MMC_SYSCTL_CLKD_MASK :OR: MMC_SYSCTL_ICE
+        ORR     a2, a2, ip
+        STR     a2, [a4, #MMC_SYSCTL]
+10
+        LDR     a2, [a4, #MMC_SYSCTL]
+        TST     a2, #MMC_SYSCTL_ICS
+        BEQ     %BT10
+
+        LDR     a2, [a4, #MMC_SYSCONFIG]
+        BIC     a2, a2, #MMC_SYSCONFIG_CLOCKACTIVITY_FUNCTIONAL :OR: \
+                         MMC_SYSCONFIG_CLOCKACTIVITY_INTERFACE :OR: \
+                         MMC_SYSCONFIG_SIDLEMODE_MASK
+        ORR     a2, a2, #MMC_SYSCONFIG_SIDLEMODE_IGNORE :OR: MMC_SYSCONFIG_AUTOIDLE
+        STR     a2, [a4, #MMC_SYSCONFIG]
+        
+        Pull    "sb, pc"
+
+; SDHCIDevice_Sleep
+; => a1 = SDHCI device
+;    a2 = state
+; <= a1 = new state
+SDHCIDevice_Sleep ROUT
+        MOV     a1, #0
+        MOV     pc, lr
+
+; SDHCIDevice_Deactivate
+; => a1 = SDHCI device
+SDHCIDevice_Deactivate
+        ; Fall through
+
+; SDHCIDevice_NOP
+SDHCIDevice_NOP ROUT
+        MOV     pc, lr
+
+; SDHCIDevice_SetVdd
+; => a1 = SDHCI device
+;    a2 = slot
+;    a3 = target millivolts
+SDHCIDevice_SetVdd ROUT
+        Push    "sb, lr"
+        SUB     sb, a1, #:INDEX:SDHCIDevice
+        LDR     a1, =&0700              ; GPIO7.0
+        TEQ     a3, #0
+        BNE     %FT10
+        BL      GPIOSetPinHigh
+
+        Pull    "sb, pc"
+10
+        LDR     a4, =3300               ; As declared in MMC_CAPA
+        TEQ     a3, a4
+        BLEQ    GPIOSetPinLow           ; Turn on the FET
+
+        Pull    "sb, pc"
+
+; SDHCIDevice_SetBusMode
+; => a1 = SDHCI device
+;    a2 = slot
+;    a3 = open drain when TRUE
+SDHCIDevice_SetBusMode ROUT
+        LDR     a4, [a1, #HALDevice_Address]
+        LDR     ip, [a4, #MMC_CON]
+        TEQ     a3, #0
+        ORRNE   ip, ip, #MMC_CON_OD
+        BICEQ   ip, ip, #MMC_CON_OD
+        STR     ip, [a4, #MMC_CON]
+        MOV     pc, lr
+
+; SDHCIDevice_PostPowerOn
+; => a1 = SDHCI device
+;    a2 = slot
+SDHCIDevice_PostPowerOn ROUT
+        Push    "v1, sb, lr"
+        SUB     sb, a1, #:INDEX:SDHCIDevice
+        MOV     v1, a1
+        
+        ; Based on figures 25-35 and 25-36
+        ; Very similar to OMAP3, in fact...
+        ; SDIODriver has already set Vdd by the time we get here
+
+        ; We can't set SDCLK as low as 80 kHz as suggested, so just use
+        ; the slowest possible setting instead
+        MOV     a3, #80
+        BL      SDHCIDevice_SetSDCLK
+
+        LDR     a4, [v1, #HALDevice_Address]
+        LDR     a1, [a4, #MMC_CON]
+        ORR     a1, a1, #MMC_CON_INIT
+        STR     a1, [a4, #MMC_CON]
+        
+        MOV     a1, #0
+        STR     a1, [a4, #MMC_CMD]      ; Dummy command - value doesn't matter because CMD line is held at 1
+        
+        MOV     a1, #INIT_PROCEDURE_TIME
+        BL      HAL_CounterDelay
+
+        LDR     a4, [v1, #HALDevice_Address]
+        LDR     a1, [a4, #MMC_STAT]
+        ORR     a1, a1, #MMC_STAT_CC
+        STR     a1, [a4, #MMC_STAT]     ; Acknowledge command complete interrupt
+
+        LDR     a1, [a4, #MMC_CON]
+        BIC     a1, a1, #MMC_CON_INIT
+        STR     a1, [a4, #MMC_CON]      ; End initialisation sequence
+        
+        MOV     a1, #-1
+        STR     a1, [a4, #MMC_STAT]     ; Acknowledge all interrupts
+        
+        Pull    "v1, sb, pc"
+
+; SDHCIDevice_SetBusWidth
+; => a1 = SDHCI device
+;    a2 = slot
+;    a3 = bit width
+SDHCIDevice_SetBusWidth ROUT
+        LDR     a4, [a1, #HALDevice_Address]
+        LDR     ip, [a4, #MMC_CON]
+        TEQ     a3, #8
+        ORREQ   ip, ip, #MMC_CON_DW8
+        BICNE   ip, ip, #MMC_CON_DW8
+        STR     ip, [a4, #MMC_CON]
+        LDR     ip, [a4, #MMC_HCTL]
+        TEQ     a3, #4
+        ORREQ   ip, ip, #MMC_HCTL_DTW
+        BICNE   ip, ip, #MMC_HCTL_DTW
+        STR     ip, [a4, #MMC_HCTL]
+        MOV     pc, lr
+
+; SDHCIDevice_SetSDCLK
+; => a1 = SDHCI device
+;    a2 = slot
+;    a3 = target in kHz
+; <= a1 = new rate achieved
+SDHCIDevice_SetSDCLK ROUT
+        LDR     a1, [a1, #HALDevice_Address]
+        
+        LDR     ip, =FCLK_FREQ
+        ADD     a2, ip, a3
+        SUB     a2, a2, #1              ; Round divider up so we round frequency down
+        UDIV    a4, a2, a3              ; a4 = divider
+        CMP     a4, #(MMC_SYSCTL_CLKD_MASK:SHR:MMC_SYSCTL_CLKD_SHIFT) + 1
+        MOVHS   a4, #(MMC_SYSCTL_CLKD_MASK:SHR:MMC_SYSCTL_CLKD_SHIFT)
+        LDR     a2, [a1, #MMC_SYSCTL]
+        BIC     a2, a2, #MMC_SYSCTL_CEN
+        STR     a2, [a1, #MMC_SYSCTL]   ; Stop clock going to card
+
+        ; Figure 25-46 doesn't advocate touching the ICE bit
+        BFI     a2, a4, #MMC_SYSCTL_CLKD_SHIFT, #MMC_SYSCTL_CLKD_BITS
+        STR     a2, [a1, #MMC_SYSCTL]   ; Set divider
+
+        ; Figure 25-46 doesn't advocate touching the ICE bit
+        MOV     a3, #CLOCKSET_TIMEOUT
+10
+        SUBS    a3, a3, #1
+        MOVEQ   a1, #0
+        MOVEQ   pc, lr                  ; Timed out
+        LDR     a2, [a1, #MMC_SYSCTL]
+        TST     a2, #MMC_SYSCTL_ICS
+        BEQ     %BT10
+        
+        ORR     a2, a2, #MMC_SYSCTL_CEN
+        STR     a2, [a1, #MMC_SYSCTL]   ; Provide clock to card
+        
+        LDR     ip, =FCLK_FREQ
+        UDIV    a1, ip, a4
+        MOV     pc, lr
+
+; SDHCIDevice_GetTMCLK
+; => a1 = SDHCI device
+;    a2 = slot
+; <= a1 = new timeout rate
+SDHCIDevice_GetTMCLK ROUT
+        ; Assume we reuse SDCLK for TMCLK, just like the OMAPs
+        LDR     a1, [a1, #HALDevice_Address]
+        LDR     a2, [a1, #MMC_SYSCTL]
+        LDR     ip, =FCLK_FREQ
+        UBFX    a2, a2, #MMC_SYSCTL_CLKD_SHIFT, #MMC_SYSCTL_CLKD_BITS
+        UDIV    a1, ip, a2
+        MOV     pc, lr
+
+; SDHCIDevice_GetWriteProtect
+; => a1 = SDHCI device
+;    a2 = slot
+; <= a1 = write protected if TRUE
+SDHCIDevice_GetWriteProtect ROUT
+        MOV     a1, #0                  ; Permit writes - can't protect a microSD
+        MOV     pc, lr
+
+      [ UHSSupport
+SDHCIDevice_SetVccq ROUT
+        Push    "sb, lr"
+        SUB     sb, a1, #:INDEX:SDHCIDevice
+
+        LDR     a1, =1600
+        LDR     a2, =2000
+        CMP     a3, a1
+        CMPCS   a2, a3
+        BCS     %F18
+        
+        LDR     a1, =2700
+        LDR     a2, =3300
+        CMP     a3, a1
+        CMPCS   a2, a3
+        BCS     %F30
+
+        Pull    "sb, pc"                ; Shouldn't happen
+
+18      ; Set to 1.8V
+
+        ; Disable PBIAS and turn the IO pads to hi-Z while ramping
+        LDR     a1, ControlCore_LogBase
+        LDR     a2, [a1, #CTRL_CORE_CONTROL_PBIAS]
+        BIC     a2, a2, #CTRL_CORE_CONTROL_PBIAS_SDCARD_BIAS_PWRDNZ :OR: \
+                         CTRL_CORE_CONTROL_PBIAS_SDCARD_IO_PWRDNZ
+        STR     a2, [a1, #CTRL_CORE_CONTROL_PBIAS]
+
+        ; Set the power in the TPS
+        TPSWriteI LDO1_VOLTAGE, (1800-850)/50
+
+        ; Set the signalling voltage in Host Control 2
+        LDR     a1, SDHCIDevice + HALDevice_Address
+        LDR     a2, [a1, #MMC_AC12]
+        ORR     a2, a2, #MMC_AC12_V1V8_SIGEN
+        STR     a2, [a1, #MMC_AC12]
+
+        ; The datasheet advocates changing the voltage in the Power Control Register
+        ; as well, even though that's supposed to control Vdd instead of Vccq.
+        MOV     a2, #MMC_HCTL_SDVS_1V8
+        STR     a2, [a1, #MMC_HCTL]
+        MOV     a2, #MMC_HCTL_SDVS_1V8 :OR: MMC_HCTL_SDBP
+        STR     a2, [a1, #MMC_HCTL] ; needs to be two separate writes, the SDBP bit won't latch on the first write
+        
+        ; Wait for the power to ramp up
+        MOV     a1, #VCCQ_POWER_RAMP
+        BL      HAL_CounterDelay
+        
+        ; Configure IO cell supply voltage to 1.8V to match, then when it has settled, enabled them
+        LDR     a1, ControlCore_LogBase
+        LDR     a2, [a1, #CTRL_CORE_CONTROL_PBIAS]
+        BIC     a2, a2, #CTRL_CORE_CONTROL_PBIAS_SDCARD_BIAS_VMODE
+        STR     a2, [a1, #CTRL_CORE_CONTROL_PBIAS]
+        ORR     a2, a2, #CTRL_CORE_CONTROL_PBIAS_SDCARD_BIAS_PWRDNZ :OR: \
+                         CTRL_CORE_CONTROL_PBIAS_SDCARD_IO_PWRDNZ
+        STR     a2, [a1, #CTRL_CORE_CONTROL_PBIAS]
+01
+        LDR     a2, [a1, #CTRL_CORE_CONTROL_PBIAS]
+        TST     a2, #CTRL_CORE_CONTROL_PBIAS_SDCARD_BIAS_SUPPLY_HI_OUT
+        BNE     %BT01
+        ! 0, "TODO! Some sort of timeout?"
+
+        ; The datasheet advocates writing to CLKEXTFREE again here for some reason
+        LDR     a1, SDHCIDevice + HALDevice_Address
+        LDR     a2, [a1, #MMC_CON]
+        ORR     a2, a2, #MMC_CON_CLKEXTFREE
+        STR     a2, [a1, #MMC_CON]
+
+        Pull    "sb, pc"
+
+30      ; Set to 3.0V
+
+        ; Disable PBIAS and turn the IO pads to hi-Z while ramping
+        LDR     a1, ControlCore_LogBase
+        LDR     a2, [a1, #CTRL_CORE_CONTROL_PBIAS]
+        BIC     a2, a2, #SDCARD_BIAS_PWRDNZ :OR: SDCARD_IO_PWRDNZ
+        STR     a2, [a1, #CTRL_CORE_CONTROL_PBIAS]
+
+        ; Set the power in the TPS
+        TPSWriteI LDO1_VOLTAGE, (3000-850)/50
+
+        ; Set the signalling voltage in Host Control 2
+        LDR     a1, SDHCIDevice + HALDevice_Address
+        LDR     a2, [a1, #MMC_AC12]
+        BIC     a2, a2, #MMC_AC12_V1V8_SIGEN
+        STR     a2, [a1, #MMC_AC12]
+
+        ; The datasheet advocates changing the voltage in the Power Control Register
+        ; as well, even though that's supposed to control Vdd instead of Vccq.
+        MOV     a2, #MMC_HCTL_SDVS_3V0
+        STR     a2, [a1, #MMC_HCTL]
+        MOV     a2, #MMC_HCTL_SDVS_3V0 :OR: MMC_HCTL_SDBP
+        STR     a2, [a1, #MMC_HCTL] ; needs to be two separate writes, the SDBP bit won't latch on the first write
+        
+        ; Wait for the power to ramp up
+        MOV     a1, #VCCQ_POWER_RAMP
+        BL      HAL_CounterDelay
+        
+        ; Configure IO cell supply voltage to 3.0V to match, then when it has settled, enable them
+        LDR     a1, ControlCore_LogBase
+        LDR     a2, [a1, #CTRL_CORE_CONTROL_PBIAS]
+        ORR     a2, a2, #CTRL_CORE_CONTROL_PBIAS_SDCARD_BIAS_VMODE
+        STR     a2, [a1, #CTRL_CORE_CONTROL_PBIAS]
+        ORR     a2, a2, #CTRL_CORE_CONTROL_PBIAS_SDCARD_BIAS_PWRDNZ :OR: \
+                         CTRL_CORE_CONTROL_PBIAS_SDCARD_IO_PWRDNZ
+        STR     a2, [a1, #CTRL_CORE_CONTROL_PBIAS]
+01
+        LDR     a2, [a1, #CTRL_CORE_CONTROL_PBIAS]
+        TST     a2, #CTRL_CORE_CONTROL_PBIAS_SDCARD_BIAS_SUPPLY_HI_OUT
+        BEQ     %BT01
+        ! 0, "TODO! Some sort of timeout?"
+
+        Pull    "sb, pc"
+      ]
+
+        END

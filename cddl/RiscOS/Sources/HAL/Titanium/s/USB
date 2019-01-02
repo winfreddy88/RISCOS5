@@ -1,0 +1,245 @@
+;
+; CDDL HEADER START
+;
+; The contents of this file are subject to the terms of the
+; Common Development and Distribution License (the "Licence").
+; You may not use this file except in compliance with the Licence.
+;
+; You can obtain a copy of the licence at
+; cddl/RiscOS/Sources/HAL/Titanium/LICENCE.
+; See the Licence for the specific language governing permissions
+; and limitations under the Licence.
+;
+; When distributing Covered Code, include this CDDL HEADER in each
+; file and include the Licence file. If applicable, add the
+; following below this CDDL HEADER, with the fields enclosed by
+; brackets "[]" replaced with your own identifying information:
+; Portions Copyright [yyyy] [name of copyright owner]
+;
+; CDDL HEADER END
+;
+;
+; Copyright 2014 Elesar Ltd.  All rights reserved.
+; Use is subject to license terms.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:OSEntries
+        GET     Hdr:HALEntries
+
+        GET     hdr.RegMap
+        GET     hdr.StaticWS
+                
+        AREA    |USB$$Code|, CODE, READONLY, PIC
+
+        EXPORT  HAL_USBControllerInfo
+        EXPORT  HAL_USBPortDevice
+        EXPORT  HAL_USBPortPower
+        EXPORT  HAL_USBPortIRQStatus
+        EXPORT  HAL_USBPortIRQClear
+        EXPORT  USBInit
+
+; There are 4 USB controllers, but 2 are being removed so
+; USB1 => controller 0
+; USB2 => controller 1
+USBDevices
+        ASSERT  IRQCount < 256
+        DCB     DevNoUSB0, DevNoUSB1
+        ALIGN
+USBClocks
+        DCD     CM_L3INIT_USB_OTG_SS1_CLKCTRL
+        DCD     CM_L3INIT_USB_OTG_SS2_CLKCTRL
+USBBases
+        ASSERT  USB_WRAPPER1_PhysBase + USB_WRAPPER_PhysSize = USB_DWC1_PhysBase        
+        DCD     USB_WRAPPER1_PhysBase
+        ASSERT  USB_WRAPPER2_PhysBase + USB_WRAPPER_PhysSize = USB_DWC2_PhysBase        
+        DCD     USB_WRAPPER2_PhysBase
+USBCount        * (. - USBBases):SHR:2
+        ASSERT  ?USB_LogBase = (4 * USBCount)        
+
+; USBInit
+USBInit ROUT
+        Push    "v1-v4, lr"
+
+        MOV     v1, #0
+        ADR     v2, USBBases
+        ADR     v3, USB_LogBase
+        LDR     v4, CMCoreL3INIT_LogBase
+10
+        ; Map in USB wrapper and controller together
+        MOV     a1, #0
+        LDR     a2, [v2, v1, LSL #2]
+        MOV     a3, #USB_WRAPPER_PhysSize + USB_DWC_PhysSize
+        CallOS  OS_MapInIO
+        STR     a1, [v3, v1, LSL #2]    ; Assigned logical base
+
+        ; Turn on the clock
+        ASSERT  CM_L3INIT_USB_OTG_SS1_CLKCTRL_OPTFCLKEN_REFCLK960M = \
+                CM_L3INIT_USB_OTG_SS2_CLKCTRL_OPTFCLKEN_REFCLK960M
+        MOV     a3, #CM_CLKCTRL_MODULEMODE_AUTO :OR: \
+                     CM_L3INIT_USB_OTG_SS1_CLKCTRL_OPTFCLKEN_REFCLK960M
+        ADR     a2, USBClocks
+        LDR     a2, [a2, v1, LSL #2]    ; Respective CLKCTRL offset
+        STR     a3, [v4, a2]
+20
+        LDR     a3, [v4, a2]            ; Wait for it so the SYSCONFIG sticks
+        ASSERT  CM_CLKCTRL_IDLEST_FULL = 0
+        TST     a3, #CM_CLKCTRL_IDLEST_MASK
+        BNE     %BT20
+
+        ; Reset wrapper, then no idle
+        MOV     a2, #USB_SYSCONFIG_WRAPRESET
+        STR     a2, [a1, #USB_SYSCONFIG]
+30
+        LDR     a2, [a1, #USB_SYSCONFIG]
+        TST     a2, #USB_SYSCONFIG_WRAPRESET
+        BNE     %BT30
+
+        LDR     a2, =USB_SYSCONFIG_STANDBYMODE_NOSTANDBY :OR: \
+                     USB_SYSCONFIG_IDLEMODE_NOIDLE :OR: \
+                     USB_SYSCONFIG_DMADISABLE
+        STR     a2, [a1, #USB_SYSCONFIG]             
+
+        ; Having surveyed all the DWC3 specific (ie. non XHCI) registers
+        ; all the defaults are mostly sensible, so just soft reset to get the
+        ; defaults then go back and force the controller into host mode so
+        ; there's no messing about with ID pins
+        LDR     a2, [a1, #USB_FLADJ]
+        ORR     a2, a2, #USB_FLADJ_CORE_SW_RESET :OR: USB_FLADJ_HOST_U3_PORT_DISABLE
+        STR     a2, [a1, #USB_FLADJ]
+        BIC     a2, a2, #USB_FLADJ_CORE_SW_RESET
+        STR     a2, [a1, #USB_FLADJ]
+        LDR     ip, =:INDEX:USB_USBSTS
+40
+        LDR     a2, [a1, ip]
+        TST     a2, #USB_USBSTS_CNR
+        BNE     %BT40
+        
+        LDR     ip, =:INDEX:USB_GCTL
+        LDR     a2, [a1, ip]
+        BIC     a2, a2, #USB_GCTL_PRTCAPDIR_MASK
+        ORR     a2, a2, #USB_GCTL_PRTCAPDIR_DRD_HOST
+        STR     a2, [a1, ip]
+
+        ; Pass core interrupts through the wrapper, they're not latched
+        ; there so we can deal with them in the GIC like everything else
+        MOV     a2, #USB_IRQ_COREIRQ_IT_FLAG
+        STR     a2, [a1, #USB_IRQENABLE_SET_0]
+
+        ADD     v1, v1, #1
+        TEQ     v1, #USBCount
+        BNE     %BT10
+
+        ; Map in the USB3PHY and DPLL
+        MOV     a1, #0
+        LDR     a2, =USB3PHY_PhysBase
+        MOV     a3, #USB3PHY_PhysSize
+        CallOS  OS_MapInIO
+        STR     a1, USB3PHY_LogBase
+
+        ; Though the USB3PHY is later disabled, the clock is still needed to run
+        ; the MAC state machine on DWC1 (only). The frequency doesn't really matter,
+        ; but 960MHz is at least a multiple of the USB wire rate and lower power than 2500MHz.
+        ; REGN = 9, REGM = 480, SSC = off, PLL_SD = 4
+        MOV     a2, #USB3PHY_PLL_CONFIGURATION2_PLL_IDLE
+        STR     a2, [a1, #USB3PHY_PLL_CONFIGURATION2]
+
+        LDR     a2, =(9:SHL:USB3PHY_PLL_CONFIGURATION1_PLL_REGN_SHIFT) :OR: \
+                     (480:SHL:USB3PHY_PLL_CONFIGURATION1_PLL_REGM_SHIFT)
+        STR     a2, [a1, #USB3PHY_PLL_CONFIGURATION1]
+
+        ASSERT  (ClkOsc0 / 1000000 / 10) * 480 = 960
+        MOV     a2, #4:SHL:USB3PHY_PLL_CONFIGURATION3_PLL_SD_SHIFT
+        STR     a2, [a1, #USB3PHY_PLL_CONFIGURATION3]
+
+        MOV     a2, #0:SHL:USB3PHY_PLL_CONFIGURATION4_PLL_REGM_F_SHIFT
+        STR     a2, [a1, #USB3PHY_PLL_CONFIGURATION4]
+
+        LDR     a2, [a1, #USB3PHY_PLL_SSC_CONFIGURATION1]
+        BIC     a2, a2, #USB3PHY_PLL_SSC_CONFIGURATION1_EN_SSC
+        STR     a2, [a1, #USB3PHY_PLL_SSC_CONFIGURATION1]
+
+        LDR     a2, =USB3PHY_PLL_CONFIGURATION2_PLL_SELFREQDCO_500_1000 :OR: \
+                     USB3PHY_PLL_CONFIGURATION2_PLL_LOCKSEL_FREQ
+        STR     a2, [a1, #USB3PHY_PLL_CONFIGURATION2]
+
+        MOV     a2, #USB3PHY_PLL_GO_PLL_GO
+        STR     a2, [a1, #USB3PHY_PLL_GO]
+50
+        LDR     a2, [a1, #USB3PHY_PLL_STATUS]
+        TST     a2, #USB3PHY_PLL_STATUS_PLL_LOCK
+        BEQ     %BT50
+
+        ; USB3PHY power up sequence
+        LDR     a1, ControlCore_LogBase
+        LDR     a2, =((ClkOsc0 / 1000000):SHL:CTRL_CORE_PHY_POWER_USB_USB_PWRCTRL_CLK_FREQ_SHIFT) :OR: \
+                     CTRL_CORE_PHY_POWER_USB_USB_PWRCTRL_CLK_CMD_BOTH
+        STR     a2, [a1, #CTRL_CORE_PHY_POWER_USB]
+
+        Pull    "v1-v4, pc"
+
+; HAL_USBControllerInfo
+; => a1 = bus
+;    a2 = pointer to usbinfo structure
+;    a3 = size of usbinfo structure
+; <= a1 = required size of usbinfo structure (for valid buses), else 0
+HAL_USBControllerInfo ROUT
+        CMP     a1, #USBCount
+        MOVCS   a1, #0
+        MOVCS   pc, lr
+
+        ; Always give type and structure size
+        MOV     a4, #HALUSBControllerType_XHCI
+        STR     a4, [a2, #HALUSBControllerInfo_Type]
+        CMP     a3, #HALUSBControllerInfo_SizeOf
+        BCC     %FT10
+
+        ; Space for full info
+        MOV     a4, #0
+        STR     a4, [a2, #HALUSBControllerInfo_Flags]
+        ADR     a3, USB_LogBase
+        LDR     a4, [a3, a1, LSL #2]
+        STR     a4, [a2, #HALUSBControllerInfo_HW]
+        ADR     a3, USBDevices
+        LDRB    a4, [a3, a1]
+        STR     a4, [a2, #HALUSBControllerInfo_DevNo]
+10
+        MOV     a1, #HALUSBControllerInfo_SizeOf
+        MOV     pc, lr
+
+; HAL_USBPortPower
+; => a1 = bus
+;    a2 = port
+;    a3 = 1 for on, 0 for off
+HAL_USBPortPower ROUT
+        ! 0, "TODO! Not needed? Hubs should have power ctrl"
+        MOV     pc, lr
+
+; HAL_USBPortDevice
+; => a1 = bus
+;    a2 = port
+; <= a1 = IRQ device number
+HAL_USBPortDevice ROUT
+        ! 0, "TODO! Not needed? Controller report o/c event"
+        MOV     a1, #-1
+        MOV     pc, lr
+
+; HAL_USBPortIRQStatus
+; => a1 = bus
+;    a2 = port
+; <= a1 = 1 if overcurrent, 0 if OK
+HAL_USBPortIRQStatus ROUT
+        ! 0, "TODO! Not needed? Hubs report o/c events"
+        MOV     a1, #0
+        MOV     pc, lr
+
+; HAL_USBPortIRQClear
+; => a1 = bus
+;    a2 = port
+HAL_USBPortIRQClear ROUT
+        ! 0, "TODO! Not needed? Hubs manage o/c events"
+        MOV     pc, lr
+
+        END

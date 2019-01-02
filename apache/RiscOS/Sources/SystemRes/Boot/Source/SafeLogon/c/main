@@ -1,0 +1,145 @@
+/* Copyright 1996 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*main.c - SafeLogon *command*/
+
+/*History
+
+   27th Oct 1994 J R C Written
+
+*/
+
+/*From CLib*/
+#include <stdio.h>
+#include <string.h>
+#include <stdbool.h>
+
+/*From OSLib*/
+#include "oslib/econet.h"
+#include "oslib/netfs.h"
+#include "oslib/os.h"
+#include "oslib/territory.h"
+
+/*From Support*/
+#include "trace.h"
+
+int main (void)
+
+{  struct {char *prog, *fs, *user, *password; char argb [os_CLI_LIMIT + 1];}
+         argl;
+   int station, net, context, collate;
+   netfs_file_server_context file_server_context;
+   char password [os_CLI_LIMIT + 1], *end, *cmd;
+   bool logon_required = TRUE, found_fs, named_fs;
+   os_error *error = NULL;
+
+   trace_on();
+
+   if ((error = xos_get_env (&cmd, NULL, NULL)) != NULL)
+      goto finish;
+
+   tracef2 ("SafeLogon \"%.*s\"\n" , strcspn (cmd, "\r") , cmd);
+
+   if ((error = xos_read_args ("prog/a,fs/a,user/a,password", cmd,
+         (char *) &argl, sizeof argl, NULL)) != NULL)
+      goto finish;
+
+   tracef1 ("fs \"%s\"\n" , argl.fs);
+   tracef1 ("user \"%s\"\n" , argl.user);
+   tracef1 ("password \"%s\"\n" , argl.password != NULL?
+         argl.password: "NULL");
+
+   /*If the first character of the fs is not ':', we steer clear.*/
+   if (argl.fs [0] == ':')
+   {  argl.fs++;
+
+      /*Station number or name?*/
+      named_fs = xeconet_read_station_number (argl.fs, NULL, &station,
+            &net) != NULL;
+      if (named_fs)
+         tracef1 ("fs is named \"%s\"\n" , argl.fs);
+      else
+         tracef2 ("fs is numbered %d.%d\n" , net , station);
+
+      context = 0;
+      while (TRUE)
+      {  if ((error = xnetfs_enumerate_fs_contexts (context,
+               &file_server_context, sizeof file_server_context, 1,
+               &context, NULL)) != NULL)
+            goto finish;
+         if (context == netfs_NO_MORE) break;
+
+         /*The useful parts of this are space-terminated.*/
+         if ((end = strchr (file_server_context.disc_name, ' ')) != NULL)
+            *end = '\0';
+         if ((end = strchr (file_server_context.user_name, ' ')) != NULL)
+            *end = '\0';
+
+         tracef4 ("found fs %d.%d = \"%s\", user \"%s\"\n" ,
+               file_server_context.net_no ,
+               file_server_context.station_no ,
+               file_server_context.disc_name ,
+               file_server_context.user_name);
+
+         if (named_fs)
+         {  if ((error = xterritory_collate (territory_CURRENT, argl.fs,
+                  file_server_context.disc_name, territory_IGNORE_CASE,
+                  &collate)) != NULL)
+               goto finish;
+
+            found_fs = collate == 0;
+         }
+         else
+            found_fs = file_server_context.station_no == station &&
+               file_server_context.net_no == net;
+
+         if (found_fs)
+         {  if ((error = xterritory_collate (territory_CURRENT, argl.user,
+                  file_server_context.user_name, territory_IGNORE_CASE,
+                  &collate)) != NULL)
+               goto finish;
+
+            if (collate == 0)
+            {  logon_required = FALSE;
+               break;
+   }  }  }  }
+
+finish:
+   /*Ignore errors up to this point. If there have been any, it's a safe bet
+      that |logon_required| is TRUE.*/
+   error = NULL;
+
+   /*If that user is not logged on to that file server, do it now.*/
+   if (logon_required)
+   {  char logon [os_CLI_LIMIT + 1], *tail;
+
+      for (tail = cmd; *tail != ' '; tail++)
+         ;
+
+      sprintf (logon, "Net:%%Logon%.*s", strcspn (tail, "\r"), tail);
+      tracef1 ("logon \"%s\"\n" , logon);
+
+      error = xos_cli (logon);
+   }
+
+   memset (&argl, '\0', sizeof argl);
+   memset (password, '\0', sizeof password);
+
+   if (error != NULL)
+   {  fprintf (stderr, "%s\n", error->errmess);
+      return 1;
+   }
+   else
+      return 0;
+}

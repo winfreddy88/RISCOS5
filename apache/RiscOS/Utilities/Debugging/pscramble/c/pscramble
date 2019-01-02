@@ -1,0 +1,248 @@
+/* Copyright 2015 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/* pscramble.c */
+
+/* scramble pages in machine
+   - continually scans soft CAM, and forces claims for any pages not marked as Unavailable
+   - tests the code that copies/recliams pages, and the Pages_Safe/Unsafe protocol
+   - pscramble -v gives verbose printout, but is less severe test, because the intensity
+     of page moves is much less
+*/
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "kernel.h"
+#include "swis.h"
+
+#include "defs.h"
+
+#include "Global/OSMem.h"
+
+/* implemented in assembler */
+extern uint32 module,moduleend;
+extern uint32 modDAhandler,moddata;
+
+/* ------------------------------------------------------------------------ */
+
+static void removemod(void)
+{
+  _swix(OS_Module,_INR(0,1),4,"PsafeTest");
+}
+
+/* ------------------------------------------------------------------------ */
+
+static uint32 insert_module(void)
+{
+  /* returns address of (start of) module in RMA as a uint32 */
+
+  uint32 RMAaddr;
+
+  /* insert module into RMA */
+  _swi(OS_Module,_INR(0,2),11,&module,(int)(&moduleend)-(int)(&module));
+
+  /* find start of module in RMA */
+  _swi(OS_Module,_INR(0,1)|_OUT(3),18,"PSafeTest",&RMAaddr);
+
+  return RMAaddr;
+}
+
+/* ------------------------------------------------------------------------ */
+
+static void describe_flags(FILE *fp, uint32 flags, uint32 Pages_Unavailable)
+{
+  int access = 0;
+  switch(flags & 0xf)
+  {
+    case 0:
+      access = 077;
+      break;
+    case 1:
+      access = 075;
+      break;
+    case 2:
+      access = 070;
+      break;
+    case 3:
+      access = 055;
+      break;
+    default:
+      _swix(OS_Memory,_INR(0,1)|_OUT(2),OSMemReason_MemoryAccessPrivileges,flags&0xf,&access);
+      break;
+  }
+  if (access)
+  {
+    fprintf(fp,"usr %c%c%c, svc %c%c%c",(access & 4)?'r':'-',(access & 2)?'w':'-',(access & 1)?'x':'-',(access & 040)?'r':'-',(access & 020)?'w':'-',(access & 010)?'x':'-');
+  }
+  else
+  {
+    fprintf(fp,"%1x???            ",flags & 0xf);
+  }
+
+  fprintf(fp,", B=%1d C=%1d",(flags & 0x10) != 0x10,(flags & 0x20) != 0x20);
+  if (flags & DynAreaFlags_DoublyMapped) fprintf(fp,", 2-mapped");
+  if (flags & DynAreaFlags_PMP) fprintf(fp,", PMP");
+  if (flags & Pages_Unavailable) fprintf(fp,", unavailable");
+}
+
+/* ------------------------------------------------------------------------ */
+
+int main(int argc, char *argv[])
+{
+  moduledata_t *md;
+  int          osid, verbose, pass, Nmoved, Nthisblock, p, DAN,
+               Ndrampages,Nvrampages,Npages;
+  uint32       RMAaddr, DAhandler_addr, DAbase, CAMbase, Pages_Unavailable;
+  camentry_t   *CAM;
+  bigcamentry_t *BigCAM;
+  int          IsBigCAM;
+  uint32       ScrambleBase=0,ScrambleSize=~0;
+
+  for(int i=1;i<argc;i++)
+  {
+    if (!strcmp(argv[i],"-v"))
+    {
+      verbose = 1;
+    }
+    else if (!strcmp(argv[i],"da") && (i+1 < argc))
+    {
+      i++;
+      _swi(OS_DynamicArea,_INR(0,1)|_OUT(3)|_OUT(5),DAReason_GetInfo,atoi(argv[i]),&ScrambleBase,&ScrambleSize);
+    }
+    else if (!strcmp(argv[i],"range") && (i+2 < argc))
+    {
+      ScrambleBase = atoi(argv[++i]);
+      ScrambleSize = atoi(argv[++i]);
+    }
+    else
+    {
+      fprintf(stderr,
+"Usage:\n"
+"\n"
+"pscramble [-v] [da <danum> | range <base> <size>]\n"
+"\n"
+"'da' specifies a dynamic area number to scramble the pages of (n.b. only scrambles pages which are mapped in)\n"
+"'range' specifies a logical address range to scramble the pages of\n");
+      return 1;
+    }
+  }
+
+  _swi(OS_Byte,_INR(0,2)|_OUT(1),129,0,255,&osid);
+  switch(osid)
+  {
+    case 0xa5:
+    case 0xa6:
+    case 0xa7:
+      CAMbase           = 0x1e02000;
+      Pages_Unavailable = 0x2000;
+      break;
+    case 0xa8:
+    case 0xa9:
+    case 0xaa:
+      _swix(OS_ReadSysInfo,_INR(0,2)|_OUT(2),6,0,0,&CAMbase);
+      CAMbase = *((uint32 *)CAMbase);
+      _swix(OS_ReadSysInfo,_INR(0,2)|_OUT(2),6,0,2,&Pages_Unavailable);
+      break;
+    default:
+      fprintf(stderr,"cannot cope with this OS version (id=%2.2x)\n",osid);
+      exit(ErrorReturnCode);
+      break;
+  }
+  _swix(OS_ReadSysInfo,_INR(0,2)|_OUT(2),6,0,87,&IsBigCAM);
+
+  CAM = (camentry_t *)CAMbase;
+  BigCAM = (bigcamentry_t *)CAMbase;
+
+  RMAaddr = insert_module();
+  DAhandler_addr = (uint32)(&modDAhandler) - (uint32)(&module) + RMAaddr;
+  atexit(removemod);
+
+  /* non-draggable area, user read only, bufferable,cacheable,
+     has handler, specific pages required, initial size 0 */
+
+  _swi(OS_DynamicArea,_INR(0,8)|_OUT(1)|_OUT(3),
+       0,-1,0,-1,0x181,DAMaxSize,DAhandler_addr,0,"psafetest",&DAN,&DAbase);
+
+
+  md = (moduledata_t *)((uint32)(&moddata)-(uint32)(&module)+RMAaddr);
+  md->DAN = DAN;
+
+  fprintf(stdout,"DA num=%1d base=%8.8x\n",DAN,DAbase);
+
+  _swi(OS_Memory,_IN(0)|_OUT(1),0x108,&Ndrampages);
+  _swi(OS_Memory,_IN(0)|_OUT(1),0x208,&Nvrampages);
+  Npages = Ndrampages + Nvrampages;
+
+  fprintf(stdout,"Npages=%1d dram=%1d vram=%1d\n",Npages,Ndrampages,Nvrampages);
+
+  /* Make CAM USR-mode readable */
+  {
+    int cam_size = Npages * (IsBigCAM ? sizeof (bigcamentry_t) : sizeof (camentry_t));
+    struct
+    {
+      int pageno;
+      char *logical;
+      int access;
+      int terminator;
+    }
+    memmapentry;
+    memmapentry.terminator = -1;
+    for (int offset = 0; offset < cam_size; offset += 4096)
+    {
+      memmapentry.pageno = 0;
+      memmapentry.logical = ((char *) CAM) + offset;
+      _swi(OS_FindMemMapEntries, _IN(0), &memmapentry);
+      memmapentry.access = (memmapentry.access &~ 0x700f) | 1;
+      _swi(OS_SetMemMapEntries, _IN(0), &memmapentry);
+    }
+  }
+
+  pass = 0;
+  while(1)
+  {
+    Nmoved = Nthisblock = 0;
+    for (p=0; p<Npages; p++)
+    {
+      uint32 *pflags = IsBigCAM ? &BigCAM[p].flags : &CAM[p].flags;
+      uint32 *plogaddr = IsBigCAM ? &BigCAM[p].logaddr : &CAM[p].logaddr;
+      if (((*pflags & Pages_Unavailable) == 0) && (*plogaddr - ScrambleBase < ScrambleSize))
+      {
+        if (verbose)
+        {
+          fprintf(stdout,"%5d   %8.8x %8.8x (",p,*plogaddr,*pflags);
+          describe_flags(stdout,*pflags,Pages_Unavailable);
+          fprintf(stdout,")");
+        }
+        md->nextpages[Nthisblock++] = p;
+        Nmoved++;
+      }
+      if ((Nthisblock > 0) && ((Nthisblock == DAMaxPages) || (p == Npages-1)))
+      {
+        _swi(OS_ChangeDynamicArea,_INR(0,1),DAN,Nthisblock*PageSize);
+        if (verbose) fprintf(stdout,"   %8.8x %8.8x",*plogaddr,*pflags);
+        _swi(OS_ChangeDynamicArea,_INR(0,1),DAN,-Nthisblock*PageSize);
+        if (verbose) fprintf(stdout,"   %8.8x %8.8x\n",*plogaddr,*pflags);
+        Nthisblock = 0;
+      }
+    }
+    if (verbose) fprintf(stdout,"\n");
+    pass++;
+    fprintf(stdout,"pass %6d, %1d pages moved\n",pass,Nmoved);
+  }
+
+  return 0;
+}

@@ -1,0 +1,376 @@
+
+Threading model
+===============
+
+Threads can run in USR, SVC or SYS mode. If other modes need to be temporarily
+used then IRQs must be disabled for the duration, and you must not perform any
+actions which will trigger a context switch.
+
+Apart from the idle threads, all threads are treated as having equal priority,
+and will be scheduled in a round-robin fashion.
+
+Thread scheduling is primitive. Threads can explicitly yield by calling the
+SMP_Sleep or SMP_Yield SWIs (or equivalent, e.g. OS_UpCall 6). The thread
+scheduler will also be invoked on return from IRQ/ABT/UND to the foreground. By
+default each core receives a 100Hz interrupt, whose sole purpose is to trigger
+the thread scheduler to run (via the usual IRQ -> foreground return mechanism).
+
+Each thread is given a SVC stack with its base aligned to a MB boundary, making
+it suitable for use with generic CMHG veneers. If a USR/SYS stack is required
+then it must be allocated by the user. All SVC stacks are permanently mapped in,
+so can safely be used for IPC.
+
+On ARMv7+ there are three "thread/process ID" registers accessible via CP15:
+
+* TPIDRPRW (privileged r/w, user none)
+* TPIDRURO (privileged r/w, user r)
+   MRC p15, 0, <rn>, c13, c0, 3 ; read
+   MCR p15, 0, <rn>, c13, c0, 3 ; write
+* TPIDRURW (privileged r/w, user r/w)
+   MRC p15, 0, <rn>, c13, c0, 2 ; read
+   MCR p15, 0, <rn>, c13, c0, 2 ; write
+
+TPIDRPRW is used by the SMP module to allow quick access to the per-core
+workspace, and must not be used by you.
+
+TPIDRURO and TPIDRURW are free for use by user code and will be saved/restored
+as part of the thread context. When a thread is created they will have an
+initial value of 0.
+
+The only SWIs which threads are allowed to call are those which have been
+marked as MP-safe, via SMP_RegisterSWIChunk. By default the SMP SWIs will be
+available, along with a handful of kernel SWIs (see below). Attempting to call
+a SWI which isn't SMP-safe will result in a "SWI not MP-safe" error being
+returned and a BadSWI metric being logged.
+
+Threads can wait on pollwords, similar to those used by the Wimp, OS_UpCall 6,
+RTSupport, etc. After storing a non-zero value to a pollword you must execute
+a DSB and SEV instruction pair to make sure any cores which are sat in their
+idle thread wake up and re-run the thread scheduler.
+
+Thread IDs start at zero; -1 can be used as an invalid thread ID value.
+
+Currently there is no thread scheduler on the primary core, so some operations
+(e.g. SMP_SleepThread) will fail if called from there.
+
+VFP/NEON floating point contexts are not managed and so VFP/NEON use by threads
+is unsafe.
+
+
+Other notes
+===========
+
+The IRQ manager will deadlock if an attempt is made to register or de-register
+an IRQ handler for an IRQ that is currently active on the current core. E.g. a
+handler attempting to deregister itself from within itself. This may happen in
+some complex IRQ setups (e.g. multiple nested IRQs which can
+register/deregister each other). It also happens when Ctrl-Break is pressed
+(since the reset is triggered from within an IRQ context). Future changes may
+improve this behaviour.
+
+All cores share the same memory map as the primary core. This means it's unsafe
+to allow them to access application space while in the Wimp. (Unpredictable
+which task they'll access, and there's no lazy task swapping abort handler
+implemented).
+
+Data, prefetch and undefined instruction aborts will cause the current thread to
+terminate with an appropriate error. The exit code will be set to point to
+a standard register dump (R0-R15 + PSR). Note that the top of the thread's SVC
+stack will be overwritten, and the ABT/UND/IRQ stack pointers will be reset. If
+the error occurred while the idle thread was running (e.g. from an IRQ handler)
+then the error will not be recorded/reported, other than in *SMPMetrics. However
+you may be able to manually recover the register dump from the top of the core's
+ABT/UND stack.
+
+If a non-X SWI returns an error, it will cause the calling thread to terminate
+with the given error.
+
+Use of FIQs is not currently supported.
+
+Service_PagesUnsafe / Service_PagesSafe (which are issued when e.g. a dynamic
+area attempts to claim a page which is already in use by someone else) are
+dealt with by putting the additional cores to sleep in a special "stasis" area.
+This protects them from accessing the page(s) which are being moved, making the
+operation safe. However because sleep entry/exit is triggered by receipt of the
+service calls, any code which attempts to synchronise with a thread from within
+a Service_PagesUnsafe / Service_PagesSafe handler may deadlock. Future changes
+to the system should avoid this possibility (e.g. via tighter coupling with the
+kernel).
+
+Making arbitrary pages cacheable/uncacheable via OS_Memory 0 is not dealt with
+in a multicore safe way. This may result instabilities or data corruption on
+platforms which make heavy use of DMA from cacheable memory (iMX6, OMAP5,
+Titanium).
+
+Currently the idle thread uses WFI instead of WFE. This means that writing to a
+pollword and then waking up a thread using SEV won't actually work; the core
+will stay asleep until the next 100Hz thread scheduler interrupt. This is just
+a temporary measure until a WFE-friendly sleep loop can be constructed (the
+original implementation was flawed and prevented the cores from sleeping).
+
+
+Commands
+========
+
+*SMPThreads
+
+  Lists which thread each core is currently executing, and the state of all
+  threads.
+
+*SMPMetrics
+
+  Shows debug metrics for each core:
+
+  UndVec           - Number of times the undefined instruction vector was
+                     entered
+  SWIVec           - Number of times the SWI vector was entered
+  PrefetchAbortVec - Number of times the prefetch abort vector was entered
+  DataAbortVec     - Number of times the data abort vector was entered
+  IRQVec           - Number of times the IRQ vector was entered
+  Reschedule       - Number of times the thread scheduler has been run due to:
+                      (a) A return to the foreground (from IRQ/ABT/UND)
+                     or
+                      (b) The idle thread waking up
+                     Explicit reschedule operations (e.g. SMP_Sleep / SMP_Yield
+                     calls) are not counted.
+  BadSWI           - Number of times a non-MP safe SWI has been called
+
+*SMPSWIs
+
+  Lists all the MP-safe SWIs that have been registered
+
+
+SMP SWIs
+========
+
+Everything here is experimental. Don't expect software you write today to work
+tomorrow :-)
+
+
+SMP_RegisterSWIChunk (0x059bc0)
+-------------------------------
+
+Register a SWI chunk as being MP-safe
+
+Entry:
+  R0 = Base SWI number (multiple of 64)
+  R1 = Mask of which SWIs 0-31 are MP-safe
+  R2 = Mask of which SWIs 32-63 are MP-safe
+
+Exit:
+  All registers preserved
+  Error on failure
+
+Use:
+  This SWI registers one or more SWIs from a given SWI chunk as being MP-safe,
+  allowing them to be called from SMP threads.
+
+  Note that the current implementation merely appends the new record onto the
+  end of a list, without checking whether the SWI(s) are already registered.
+
+  Note that the SMP module will not detect when modules are killed or when the
+  preferred instantiation changes. Be careful to remove any current
+  registrations for a module before performing any of those actions on the
+  module.
+
+
+SMP_DeregisterSWIChunk (0x059bc1)
+---------------------------------
+
+Remove SWIs from the MP-safe whitelist
+
+Entry:
+  R0 = Base SWI number (multiple of 64)
+  R1 = Mask of which SWIs 0-31 are MP-safe
+  R2 = Mask of which SWIs 32-63 are MP-safe
+
+Exit:
+  All registers preserved
+  Error on failure
+
+Use:
+  For this call to succeed, it must be an exact match for an existing record.
+
+
+SMP_CreateThread (0x059bc2)
+---------------------------
+
+Create a new thread
+
+Entry:
+  R0 -> Thread name
+  R1 = Affinity mask, 0 for default
+  R2 = Pollword to wait on, 0 for none
+  R3 = R0 value to pass to thread
+  R4 = R12 value to pass to thread
+  R5 = Address of thread entry
+  R6 = Initial PSR value
+
+Exit:
+  R0 = Thread ID
+  Error on failure
+
+Use:
+  Creates a new thread. If you want to control when the thread starts, then
+  you can provide a pollword pointer for the thread to wait on.
+
+  The provided PSR can specify USR, SYS or SVC mode. Specifying other modes
+  will result in an error.
+
+  The thread will be entered with R0 and R12 set to the specified values.
+  R13_svc will point to the top of the thread's SVC stack, and R14 will point
+  to a termination routine. All other registers will be zero.
+
+  If the thread exits via the termination routine in R14, then R0 will be used
+  as the exit code.
+
+
+SMP_DestroyThread (0x059bc3)
+----------------------------
+
+Clean up a thread which has terminated
+
+Entry:
+  R0 = Thread ID
+
+Exit:
+  Error on failure
+
+Use:
+  Cleans up a thread which has terminated, allowing its ID and stack to be
+  re-used by future threads.
+
+
+SMP_Sleep (0x059bc4)
+--------------------
+
+Sleep on a pollword
+
+Entry:
+  R0 -> pollword
+
+Exit:
+  Error on failure
+
+Use:
+  Sleeps the current thread until the given pollword contains a non-zero value.
+
+  Returns an error if called from IRQ/ABT/UND context or from the primary core.
+
+
+SMP_Yield (0x059bc5)
+--------------------
+
+Yield the current thread to allow the next runnable thread to run
+
+Entry:
+  -
+
+Exit:
+  Error on failure
+
+Use:
+  Returns an error if called from IRQ/ABT/UND context or from the primary core.
+
+
+SMP_ExamineThread (0x059bc6)
+----------------------------
+
+Return information on a given thread
+
+Entry:
+  R0 = Thread ID
+  R1 -> Buffer to receive name
+  R2 = Length of buffer
+  R5 -> 256 byte block to receive error, or 0 to skip return of error block
+
+Exit:
+  R2 updated to contain name length (excl. terminating)
+  R3 = thread affinity
+  R4 = thread status:
+       0 = invalid
+       1 = running
+       2 = runnable
+       3 = sleeping on pollword
+       4 = complete:
+           Block at R5 is filled in if the thread exited with an error,
+             else R5 is set to 0
+           R6 is exit code
+
+  Error returned and all registers preserved if invalid thread ID provided
+
+Use:
+  Returns information on a given thread.
+
+  Only threads which are in the 'completed' state may be deleted.
+
+
+SMP_CurrentThread (0x059bc7)
+----------------------------
+
+Return the ID of the current thread
+
+Entry:
+  -
+
+Exit:
+  R0 = Thread ID, or -1 if not inside thread (e.g. on primary core)
+
+Use:
+  Returns the ID of the current foreground thread
+
+
+SMP_DefaultAffinity (0x059bc8)
+------------------------------
+
+Return the default core affinity that will be used for threads
+
+Entry:
+  -
+
+Exit:
+  R0 = Default affinity mask
+
+Use:
+  Returns the default affinity mask, which corresponds to all cores which are
+  running the thread scheduler (e.g. %1110 for a quad-core machine)
+
+
+SMP_TerminateThread (0x059bc9)
+------------------------------
+
+Terminate the current thread
+
+Entry:
+  R0 = Error block pointer (0 if no error)
+  R1 = Exit code
+
+Exit:
+  Error on failure
+  Otherwise, doesn't exit
+
+Use:
+  Terminates the current thread. Fails if not inside a thread (e.g. called from
+  primary core) or within IRQ/ABT/UND context.
+
+  If an error block is provided, the system will take a copy of it.
+
+  After termination the thread must be cleaned up via SMP_DestroyThread
+
+
+Kernel SWIs
+===========
+
+The following kernel SWIs are available:
+
+* OS_CallASWI
+* OS_CallASWIR12
+* OS_UpCall 6 (-> SMP_Sleep)
+* OS_GenerateError (just sets V flag, since there's no error handling)
+* OS_IntOn
+* OS_IntOff
+* OS_EnterOS
+* OS_LeaveOS
+* OS_Exit (-> SMP_TerminateThread)
+* OS_ClaimDeviceVector
+* OS_ReleaseDeviceVector

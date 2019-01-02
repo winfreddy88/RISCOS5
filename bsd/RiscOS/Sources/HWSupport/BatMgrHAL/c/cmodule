@@ -1,0 +1,170 @@
+/*
+ * Copyright (c) 2012, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include "BatMgrHdr.h"
+#include "swis.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stddef.h>
+
+#include "Global/RISCOS.h"
+#include "Global/Services.h"
+#include "Global/HALDevice.h"
+#include "Global/HALEntries.h"
+
+#include "AsmUtils/rminfo.h"
+
+#include "DebugLib/DebugLib.h"
+
+#include "globals.h"
+#include "bmu.h"
+
+#pragma no_check_stack
+
+void *private_word;
+msgtrans_control_block messages;
+
+#ifdef STANDALONE
+extern void* Resources(void);
+#endif
+
+_kernel_oserror* module_init (const char *cmd_tail, int podule_base, void *pw)
+{
+	(void) podule_base;
+	(void) cmd_tail;
+
+	private_word = pw;
+
+	_kernel_oserror *e;
+    
+	/* set up debugging */
+	debug_initialise(Module_Title, "", "");
+	debug_set_device(DADEBUG_OUTPUT);
+	debug_set_unbuffered_files(TRUE);
+
+	/* Check for BMUs */
+	e = bmu_init();
+	if(e)
+		goto error1;
+
+#ifdef STANDALONE
+	/* Register resources */
+	e = _swix(ResourceFS_RegisterFiles,_IN(0),Resources());
+	if(e)
+		goto error1;
+#endif
+
+	/* Open messages */
+	e = msgtrans_open_file(&messages,"Resources:$.Resources.BatMgr.Messages",0);
+	if(e)
+		goto error2;
+
+	return NULL;
+
+error2:
+#ifdef STANDALONE
+	_swix(ResourceFS_DeregisterFiles,_IN(0),Resources());
+#endif
+error1:
+	return e;
+}
+
+_kernel_oserror *module_final(int fatal, int podule, void *pw)
+{
+	(void) pw;
+	(void) podule;
+	(void) fatal;
+
+	_kernel_oserror* e = NULL;
+
+	if((taskhandle != TASKHANDLE_NONE) && (taskhandle != TASKHANDLE_STARTING))
+	{
+		e = (_kernel_oserror *) wimp_taskclose(taskhandle);
+		if(e)
+			return e;
+	}
+
+	bmu_shutdown();
+
+	/* Close messages */
+	msgtrans_close_file(&messages);
+
+#ifdef STANDALONE
+	_swix(ResourceFS_DeregisterFiles,_IN(0),Resources());
+#endif
+    
+	return NULL;
+}
+
+_kernel_oserror *module_commands(const char *arg_string, int argc, int cmd_no, void *pw)
+{
+	(void)argc;
+	(void)pw;
+	(void)arg_string;
+
+	switch (cmd_no) {
+	case CMD_Desktop_BatMgr:
+		if((taskhandle != TASKHANDLE_NONE) && (taskhandle != TASKHANDLE_STARTING))
+		{
+			_kernel_oserror e;
+			e.errnum = 0;
+			strcpy(e.errmess,"RUNI");
+			return _swix(MessageTrans_ErrorLookup,_INR(0,2),&e,&messages,NULL);
+		}
+		_swix(Wimp_SlotSize,_INR(0,1),8*1024,-1);
+		return _swix(OS_Module,_INR(0,2),2,Module_Title,NULL);
+	}
+
+	return NULL;
+}
+
+void module_service(int service_number, _kernel_swi_regs *r, void *pw)
+{
+	(void) pw;
+
+	switch(service_number)
+	{
+	case Service_Memory:
+		/* Don't let the Wimp take back our wimp slot */
+		if(r->r[2] == (int)Image_RO_Base)
+			r->r[1] = 0;
+		break;
+	case Service_StartWimp:
+		if(taskhandle == TASKHANDLE_NONE)
+		{
+			taskhandle = TASKHANDLE_STARTING;
+			r->r[1] = 0;
+			r->r[0] = (int) "Desktop_BatMgr";
+		}
+		break;
+	case Service_StartedWimp:
+		if(taskhandle == TASKHANDLE_STARTING) /* For some reason, our command wasn't called */
+			taskhandle = TASKHANDLE_NONE;
+		break;
+	}
+}

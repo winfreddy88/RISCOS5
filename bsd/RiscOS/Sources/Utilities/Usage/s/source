@@ -1,0 +1,333 @@
+;
+; Copyright (c) 1990, Ran Mokady
+; All rights reserved.
+; 
+; Redistribution and use in source and binary forms, with or without
+; modification, are permitted provided that the following conditions are met: 
+;     * Redistributions of source code must retain the above copyright
+;       notice, this list of conditions and the following disclaimer.
+;     * Redistributions in binary form must reproduce the above copyright
+;       notice, this list of conditions and the following disclaimer in the
+;       documentation and/or other materials provided with the distribution.
+;     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+;       may be used to endorse or promote products derived from this software
+;       without specific prior written permission.
+; 
+; THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+; AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+; IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+; ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+; LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+; CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+; SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+; INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+; CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+; ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+; POSSIBILITY OF SUCH DAMAGE.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:Services
+        GET     Hdr:ModHand
+        GET     Hdr:Filter
+        GET     Hdr:FSNumbers
+        GET     Hdr:NewErrors
+        GET     Hdr:WimpSpace
+        GET     Hdr:MsgTrans
+        GET     VersionAsm
+
+
+        AREA    |Usage$$Code|, CODE, READONLY, PIC
+
+Module_BaseAddr
+        DCD     0                                       ; No start entry
+        DCD     Mod_Init - Module_BaseAddr
+        DCD     Mod_Die - Module_BaseAddr
+        DCD     0                                       ; No service call handler offset
+        DCD     Mod_Title - Module_BaseAddr
+        DCD     Mod_HelpStr - Module_BaseAddr
+        DCD     0                                       ; No help and command keyword table offset
+        DCD     UsageSWI_Base
+        DCD     Mod_SWIHandler - Module_BaseAddr
+        DCD     Mod_SWITable - Module_BaseAddr
+        DCD     0
+      [ :LNOT: No32bitCode
+        DCD     0
+        DCD     Mod_Flags - Module_BaseAddr
+      ]
+Mod_Title
+        DCB     "Usage", 0
+Mod_HelpStr
+        DCB     "Usage", 9, 9, Module_HelpVersion, 0
+        ALIGN
+      [ :LNOT: No32bitCode
+Mod_Flags
+        DCD     ModuleFlag_32bit
+      ]
+      
+; ******************************************************************************
+subroutine_3
+        DCB     "Usage"
+        ALIGN
+
+; ******************************************************************************
+Mod_Init
+        Push    "R0-R3,R14"
+        LDR     R0,[R12]
+        CMP     R0,#0
+        Pull    "R0-R3,PC",NE                           ; Already got workspace
+
+        MOV     R0,#ModHandReason_Claim
+        MOV     R3,#&28
+        SWI     XOS_Module
+        ADDVS   R13,R13,#4
+        Pull    "R1-R3,PC",VS                           ; Failed to get workspace
+
+        STR     R2,[R12]
+        MOV     R12,R2
+        MOV     R0,#0
+        STR     R0,[R12,#0]
+        STR     R0,[R12,#8]
+        STR     R0,[R12,#4]
+        STR     R0,[R12,#12]
+        ADR     R0,subroutine_3
+        ADRL    R1,subroutine_1
+        MOV     R2,R12
+        MOV     R3,#0                                   ; All tasks of interest to this filter
+        SWI     XFilter_RegisterPreFilter
+        ADDVS   R13,R13,#4
+        Pull    "R1-R3,PC",VS                           ; Failed to register filter
+
+        ADR     R0,subroutine_3
+        ADRL    R1,subroutine_4
+        MOV     R2,R12
+        MOV     R3,#0                                   ; All tasks of interest to this filter
+        MOV     R4,#Null_Reason
+        SWI     XFilter_RegisterPostFilter
+        ADDVS   R13,R13,#4
+        Pull    "R1-R3,PC",VS                           ; Failed to register filter
+
+        MOV     R0,#100
+        ADRL    R1,callevery_handler
+        MOV     R2,R12
+        SWI     XOS_CallEvery                           ; Call every second
+        STRVS   R0,[R13]
+        Pull    "R0-R3,PC"
+
+; ******************************************************************************
+Mod_Die
+        Push    "R0-R11,R14"
+        LDR     R12,[R12]                               ; Get workspace
+        CMP     R12,#0
+        BEQ     %FT10
+
+        ADR     R0,subroutine_3
+        ADRL    R1,subroutine_1
+        MOV     R2,R12
+        MOV     R3,#0
+        SWI     XFilter_DeRegisterPreFilter             ; Release
+
+        ADR     R0,subroutine_3
+        ADRL    R1,subroutine_4
+        MOV     R2,R12
+        MOV     R3,#0
+        MOV     R4,#0
+        SWI     XFilter_DeRegisterPostFilter            ; Release
+
+        ADRL    R0,callevery_handler
+        MOV     R1,R12
+        SWI     XOS_RemoveTickerEvent                   ; Release
+
+        MOV     R2,R12
+        MOV     R0,#ModHandReason_Free
+        SWI     XOS_Module
+10
+        CLRV                                            ; Don't refuse to die
+        Pull    "R0-R11,PC"
+
+; ******************************************************************************
+Mod_SWIHandler
+        Push    "R14"
+
+        LDR     R12,[R12]                               ; Get workspace
+
+        CLRPSR  I_bit,R14,,R10                          ; Reenable IRQs
+        CMP     R11,#1                                  ; Just the one SWI, EnumerateTasks
+        BCC     DoEnumerateTasks
+
+        Push    "R1-R4"
+        ADR     R0,ErrorBlock_ModuleBadSWI
+        MOV     R1,#0                                   ; Global messages
+        MOV     R2,#0
+        MOV     R3,#0
+        ADR     R4,Mod_Title
+        SWI     XMessageTrans_ErrorLookup               ; V set
+        Pull    "R1-R4,PC"
+        
+        MakeErrorBlock ModuleBadSWI
+
+Mod_SWITable
+        DCB     "Usage", 0
+        DCB     "EnumerateTasks", 0
+        ALIGN
+
+DoEnumerateTasks
+        Push    "R0-R7"
+        CMP     R0,#0
+        LDREQ   R0,[R12]
+        LDRNE   R0,[R0]
+        CMP     R0,#0
+        ADDEQ   R13,R13,#4
+        MVNEQ   R0,#0
+        BEQ     %FT20
+
+        STR     R0,[R13]
+        LDR     R14,[R0,#8]
+        STR     R14,[R1],#4
+        ADD     R2,R0,#&0C
+
+        SETPSR  I_bit,R3,,R14                           ; IRQs off to collect stats
+        LDR     R0,[R12,#8]
+        LDMIA   R2,{R2-R7}
+        RestPSR R14,,cf
+
+        ADD     R14,R12,#&10
+        STMIA   R14,{R2-R7}
+        ADD     R0,R0,#1
+        CMP     R0,#6
+        MOVEQ   R0,#0
+        MOV     R0,R0,LSL #2
+        MOV     R2,#5
+loop_1
+        LDR     R3,[R14,R0]
+        STR     R3,[R1],#4
+        ADD     R0,R0,#4
+        CMP     R0,#&18
+        MOVEQ   R0,#0
+        SUBS    R2,R2,#1
+        BNE     loop_1
+10
+        RestPSR R10,,cf                                 ; Restore entry state, flags preserved
+        Pull    "R0-R7,PC"
+20
+        RestPSR R10,,cf                                 ; Restore entry state, flags preserved
+        Pull    "R1-R7,PC"
+
+; ******************************************************************************
+subroutine_1
+        Push    "R0-R5,R14"
+        LDR     R1,[R12,#4]
+        CMP     R1,#0
+        Pull    "R0-R5,PC",EQ
+
+        SETPSR  I_bit,R14,,R4                           ; IRQs off for stats fiddling
+        MOV     R0,#0
+        STR     R0,[R12,#4]
+        LDR     R5,[R12,#8]
+        LDR     R14,[R13,#24]
+        RestPSR R4,,cf
+
+        SWI     XOS_ReadMonotonicTime
+        LDR     R4,[R12,#12]
+        SUB     R0,R0,R4
+        ADD     R1,R1,R5,LSL #2
+        LDR     R2,[R1,#12]
+        ADD     R2,R2,R0
+        STR     R2,[R1,#12]                             ; Delta time
+        Pull    "R0-R5,PC"
+
+; ******************************************************************************
+subroutine_4
+        Push    "R0-R5,R14"
+        ADD     R0,R12,#0
+loop_4
+        LDR     R1,[R0,#0]
+        CMP     R1,#0
+        BEQ     skip_1
+
+        LDR     R3,[R1,#8]
+        TEQ     R3,R2
+        MOV     R0,R1
+        BNE     loop_4
+loop
+        STR     R0,[R12,#4]
+        SWI     XOS_ReadMonotonicTime
+        STR     R0,[R12,#12]
+        Pull    "R0-R5,PC"
+skip_1
+        MOV     R5,R0
+        MOV     R4,R2
+        MOV     R0,#ModHandReason_Claim
+        MOV     R3,#&24
+        SWI     XOS_Module
+        ADDVS   R13,R13,#4
+        Pull    "R1-R5,PC",VS
+
+        MOV     R0,R2
+        STR     R5,[R0,#4]
+        STR     R0,[R5,#0]
+        MOV     R14,#0
+        STR     R14,[R0,#0]
+        STR     R14,[R0,#12]
+        STR     R14,[R0,#16]
+        STR     R14,[R0,#20]
+        STR     R14,[R0,#24]
+        STR     R14,[R0,#28]
+        STR     R14,[R0,#32]
+        STR     R4,[R0,#8]
+        B       loop
+
+; ******************************************************************************
+subroutine_2
+        MOV     R3,R14
+        LDR     R1,[R2,#0]
+        MOV     R0,#0
+        STR     R0,[R2,#0]
+loop_2
+        MOV     R0,#ModHandReason_Free
+        SUBS    R2,R1,#0
+        MOVLE   PC,R3
+        LDR     R1,[R2,#0]
+        SWI     XOS_Module
+        B       loop_2
+
+; ******************************************************************************
+callevery_handler
+        Push    "R0,R14"                                ; IRQ mode stack
+        WritePSRc SVC_mode,R14,,R0                      ; Hop to SVC mode
+        Push    "R0-R5,R14"                             ; SVC mode stack
+        LDR     R5,[R12,#4]
+        CMP     R5,#0
+        SWINE   XOS_ReadMonotonicTime
+      [ {TRUE}
+        CMP     R5,#0                                   ; Allow for SWI to corrupt flags
+      ]
+        LDRNE   R1,[R12,#12]
+        STRNE   R0,[R12,#12]   
+        SUBNE   R0,R0,R1       
+        LDR     R1,[R12,#8]
+        ADDNE   R5,R5,R1,LSL #2
+        LDRNE   R2,[R5,#12]    
+        ADDNE   R2,R2,R0       
+        STRNE   R2,[R5,#12]    
+        ADD     R1,R1,#1
+        CMP     R1,#6
+        MOVEQ   R1,#0
+        STR     R1,[R12,#8]
+        MOV     R14,#0
+        ADD     R0,R12,#0
+loop_3
+        LDR     R0,[R0,#0]
+        CMP     R0,#0
+        ADDNE   R2,R0,R1,LSL #2
+        STRNE   R14,[R2,#12]
+        BNE     loop_3
+
+        Pull    "R0-R5,R14"                             ; SVC mode stack
+        RestPSR R0,,cf
+        Pull    "R0,PC"                                 ; IRQ mode stack
+
+        END
+

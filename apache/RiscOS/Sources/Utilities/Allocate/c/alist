@@ -1,0 +1,1723 @@
+/* Copyright 2015 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/*
+ * Name   : alist.c
+ * Desc   : allocation list control for the !allocate application
+ * Auther : James Bye
+ * Date   : 18-Jul-1994
+ *
+ *
+ */
+
+#include "wimp.h"        /*  access to WIMP SWIs                      */
+#include "wimpt.h"       /*  wimp task facilities                     */
+#include "win.h"         /*  registering window handlers              */
+#include "event.h"       /*  poll loops, etc                          */
+#include "baricon.h"     /*  putting icon on icon bar                 */
+#include "werr.h"        /*  error reporting                          */
+#include "res.h"         /*  access to resources                      */
+#include "resspr.h"      /*  sprite resources                         */
+#include "flex.h"        /*  dynamic mem alloc from WIMP              */
+#include "template.h"    /*  reading in template file                 */
+#include "dbox.h"        /*  dialogue box handling                    */
+#include "msgs.h"
+#include "saveas.h"
+
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+
+#include "swis.h"
+#include "kernel.h"
+
+#include "Global/FileTypes.h"
+
+#include "trace.h"
+
+#include "object.h"
+#include "guard.h"
+#include "datafile.h"
+#include "file.h"
+#include "uuencode.h"
+#include "replyform.h"
+#include "details.h"
+
+
+/*****************************************************
+ * Icon definitions                                  *
+ *****************************************************/
+
+#define i_AList_ListSrc  0
+
+#define i_Pane_SWIChunk      0
+#define i_Pane_Messages      6
+#define i_Pane_Reservation   2
+#define i_Pane_FileType     10
+#define i_Pane_ErrorBlock    4
+#define i_Pane_Podule        8
+#define i_Pane_DrawTags      1
+#define i_Pane_DrawObjects   3
+#define i_Pane_FilingSystem  5
+#define i_Pane_Devices       7
+#define i_Pane_Services      9
+
+
+#define i_DCS_Text    2
+#define i_DCS_Save    0
+#define i_DCS_Discard 1
+#define i_DCS_Cancel  3
+
+
+
+/*****************************************************
+ * Internal structures                               *
+ *****************************************************/
+
+typedef struct IList
+{
+  wimp_box bbox;        /*-- bounding box of icon  --*/
+  char indirect[100];   /*-- indirect text         --*/
+  BOOL selected;        /*-- selected flag         --*/
+
+  /*-- pointer to associated data --*/
+
+  ObjectBlock  *object;
+
+  /*-- linked list pointers --*/
+
+  struct IList *next;
+  struct IList *prev;
+} IList;
+
+
+typedef struct WList
+{
+  wimp_w w;
+  wimp_w pane;
+  BOOL edited;
+  BOOL loaded;
+  char filename[255];
+
+  /*-- pointer to list of icons --*/
+
+  int no_icons;
+  IList *icons;
+
+  /*-- linked list pointers --*/
+
+  struct WList *next;
+  struct WList *prev;
+
+} WList;
+
+
+/*****************************************************
+ * Static variables                                  *
+ *****************************************************/
+
+static menu main_menu;
+static menu save_menu;
+static menu selection_menu;
+
+#define m_Main_Save           1
+#define m_Main_Selection      2
+
+#define m_Main_Save_Request   1
+#define m_Main_Save_EMail     2
+#define m_Main_Save_Reserved  3
+#define m_Main_Save_Reply     4
+
+#define m_Main_Selection_Delete    1
+#define m_Main_Selection_Clear     2
+
+
+static WList *windows = NULL;
+static int    no_windows = 0;
+static wimp_icon source;
+
+/*-- icon to object lookup table --*/
+
+static int object_lookup[] = { i_Pane_SWIChunk, Object_SWIChunk,
+                               i_Pane_Messages, Object_Messages,
+                               i_Pane_Reservation, Object_Reservation,
+                               i_Pane_FileType, Object_FileType,
+                               i_Pane_ErrorBlock, Object_ErrorBlock,
+                               i_Pane_Podule, Object_Podule,
+                               i_Pane_DrawTags, Object_DrawTags,
+                               i_Pane_DrawObjects, Object_DrawObjects,
+                               i_Pane_FilingSystem, Object_FilingSystem,
+                               i_Pane_Services, Object_Services,
+                               i_Pane_Devices, Object_Devices,
+                               -1
+                             };
+
+
+/*****************************************************
+ * Static functions                                  *
+ *****************************************************/
+
+static void icon_add_func ( BOOL new, ObjectBlock *object, void *handle );
+static void do_save_request ( WList *node );
+
+/*
+ * discard/save/cancel dialogue box
+ */
+
+static int dcs ( char *text )
+{
+dbox d;
+int f;
+
+  if((d = dbox_new("dcs")) == NULL)
+  {
+    werr(0,"Not enough memory for DCS");
+    return(i_DCS_Discard);
+  }
+
+  dbox_show(d);
+  dbox_setfield(d,i_DCS_Text,text);
+  f = dbox_fillin(d);
+  dbox_dispose(&d);
+
+  return(f);
+}
+
+
+
+static void open_pane_window ( wimp_openstr parent, WList *node )
+{
+wimp_openstr o;
+wimp_wstate   state;
+int           width;
+
+  wimp_get_wind_state(node->pane,&state);
+  width = state.o.box.x1 - state.o.box.x0;
+
+/*  tracef4("Coords for pane x0=%d y0=%d x1=%d y1=%d\n",
+          parent.box.x0,parent.box.y0,parent.box.x0+width,parent.box.y1);
+*/
+
+  o.w      = node->pane;
+  o.box.x0 = parent.box.x0;         /* Modified to place pane on */
+#if 0
+  o.box.x1 = parent.box.x0 + width;  /*  top of parent.           */
+#else
+  o.box.x1 = parent.box.x1;         /* same size as parent        */
+#endif
+  o.box.y0 = parent.box.y0;
+  o.box.y1 = parent.box.y1;
+  o.behind = parent.behind;
+  o.x      = 0;                      /* Set scroll offsets added. */
+  o.y      = 0;                      /* Structure is not zeroed!  */
+
+  wimp_open_wind(&o);
+}
+
+
+static void open_my_window( wimp_openstr o, WList *node )
+{
+wimp_openstr store_o = o;
+
+   /*-- Open parent behind pane --*/
+
+    o.behind = node->pane;
+
+    wimp_open_wind(&o);
+
+   /*
+    * if window was forced on the screen (i.e. it had
+    * been dragged off) then we may have to re-open the
+    * pane window
+    */
+
+/*    tracef4("Coords for main (before) x0=%d y0=%d x1=%d y1=%d\n",
+          store_o.box.x0,store_o.box.y0,store_o.box.x0,store_o.box.y1);
+
+    tracef4("Coords for main (after) x0=%d y0=%d x1=%d y1=%d\n",
+          o.box.x0,o.box.y0,o.box.x0,o.box.y1);
+*/
+    if(store_o.box.x0 != o.box.x0 || store_o.box.x1 != o.box.x1 ||
+       store_o.box.y0 != o.box.y0 || store_o.box.y1 != o.box.y1  )
+    {
+       open_pane_window(o,node);
+    }
+}
+
+
+/*
+ * sets the title
+ */
+
+extern void set_title ( WList *node )
+{
+char title[100];
+
+  /*-- make title string --*/
+
+  strcpy(title,"List of allocations");
+
+  /*-- add star is edited --*/
+
+  if(node->edited)
+    strcat(title," *");
+
+  win_settitle(node->w,title);
+}
+
+
+/*
+ * allocates space for a new IList
+ */
+
+static IList *ilist_alloc ( void )
+{
+IList *node;
+
+  node = malloc(GUARD+sizeof(IList));
+
+  tracef1("Allocated new node at &%x\n",(int)node);
+
+  return(node);
+}
+
+
+/*
+ * free's an element in the IList
+ */
+
+static void ilist_free ( WList *window, IList *node  )
+{
+  /*-- re-link the list without the specified element --*/
+
+  if(node->prev == NULL)
+  {
+    /*-- if we are the first --*/
+
+    window->icons = node->next;
+  }
+  else
+  {
+    if(node->next == NULL)
+    {
+      /*-- if we are the last element --*/
+
+      node->prev->next = NULL;
+    }
+    else
+    {
+      /*-- we are in the middle --*/
+
+      node->prev->next = node->next;
+      node->next->prev = node->prev;
+    }
+  }
+
+  /*-- decrement the list of icons --*/
+
+  window->no_icons -= 1;
+
+  /*-- free icon --*/
+
+  free(node);
+
+  if(window->no_icons <= 0)
+    window->icons = NULL;
+}
+
+
+
+/*
+ * adds a IList to the linked list of icons
+ */
+
+static void ilist_add ( WList *window, IList *new  )
+{
+IList *node = window->icons;
+
+  if(node == NULL)
+  {
+    window->icons = new;
+    window->icons->next = NULL;
+    window->icons->prev = NULL;
+  }
+  else
+  {
+    new->next = window->icons;
+    new->prev = NULL;
+    window->icons = new;
+    window->icons->next->prev = window->icons;
+  }
+
+  window->no_icons++;
+}
+
+
+
+/*
+ * free's an element in the WList
+ */
+
+static void wlist_free ( WList *node )
+{
+  /*-- re-link the list without the specified element --*/
+
+
+  if(node->prev == NULL)
+  {
+    /*-- if we are the first --*/
+
+    windows = node->next;
+  }
+  else
+  {
+    if(node->next == NULL)
+    {
+      /*-- if we are the last element --*/
+
+      node->prev->next = NULL;
+    }
+    else
+    {
+      /*-- we are in the middle --*/
+
+      node->prev->next = node->next;
+      node->next->prev = node->prev;
+    }
+  }
+
+  /*-- decrement the list of windows--*/
+
+  no_windows -= 1;
+
+  /*-- free window --*/
+
+  free(node);
+  if(no_windows <= 0)
+    windows = NULL;
+}
+
+
+/*
+ * allocates space for a new WList
+ */
+
+static WList *wlist_alloc ( void )
+{
+WList *node;
+
+  node = malloc(GUARD+sizeof(WList));
+
+/*  tracef1("Allocated new node at &%x\n",(int)node); */
+
+  return(node);
+}
+
+
+
+/*
+ * adds a WList to the linked list of window
+ */
+
+static void wlist_add ( WList *new )
+{
+WList *node = windows;
+
+  if(node == NULL)
+  {
+    windows = new;
+    windows->next = NULL;
+    windows->prev = NULL;
+  }
+  else
+  {
+    new->next = windows;
+    new->prev = NULL;
+    windows = new;
+    windows->next->prev = windows;
+  }
+
+  no_windows++;
+}
+
+
+#define FixedYSize 48
+
+/*
+ * calculates the bounding box for an icon
+ */
+
+static void calc_icons_bbox ( IList *icon, int icon_number )
+{
+int move_by = (icon_number -1) * FixedYSize;
+
+  /*-- copy source icons bounding box into icons --*/
+
+  icon->bbox = source.box;
+
+  /*-- alter the bbox according to icons number --*/
+
+  icon->bbox.y0 -= move_by;
+  icon->bbox.y1 -= move_by;
+}
+
+
+/*
+ * sets the extent of the window
+ */
+
+static void set_window_extent ( WList *window, BOOL reopen )
+{
+  /*-- only set the extent if we have more than --*/
+  /*-- one icon                                 --*/
+
+  if(window->no_icons > 1)
+  {
+  wimp_redrawstr r;
+
+    r.w = window->w;
+    r.box.x0 = 0;
+    r.box.y0 = -312 - (FixedYSize * (window->no_icons-1));
+    r.box.x1 = 1086;
+    r.box.y1 = 0;
+    wimpt_complain(wimp_set_extent(&r));
+
+    /*-- and reopen the window to new size if asked to --*/
+
+    if(reopen)
+    {
+    wimp_wstate state;
+
+      wimpt_complain(wimp_get_wind_state(window->w,&state));
+      state.o.box.y0 -= (FixedYSize * (window->no_icons-1));
+      wimpt_complain(wimp_open_wind(&state.o));
+
+      /*-- because we have a pane window, we need to re-open that aswell --*/
+
+      open_pane_window(state.o,window);
+    }
+  }
+}
+
+
+/*
+ * forces an are of the screen to be redrawn
+ * (the coordinates of the box passed are expected in work area
+ *  coordinates)
+ */
+
+static void redraw_box ( wimp_w w, wimp_box box )
+{
+wimp_redrawstr r;
+
+  /*-- force a redraw --*/
+
+  r.w = w;
+  r.box = box;
+  wimpt_complain(wimp_force_redraw(&r));
+}
+
+
+
+
+/*
+ * marks a class as being edited
+ */
+
+static void mark_as_edited ( WList *node )
+{
+  if(!node->edited)
+  {
+    node->edited = TRUE;
+    set_title(node);
+  }
+}
+
+
+/*
+ * does the plotting of an icon
+ */
+
+static void do_plot_icon ( IList *icon )
+{
+wimp_icon dummy;
+
+  /*-- copy and alter the source icon data --*/
+
+  dummy = source;
+  dummy.box = icon->bbox;
+  dummy.data.indirecttext.buffer = (char *)&icon->indirect;
+
+  /*-- set selection if need to --*/
+
+  if(icon->selected)
+  {
+    dummy.flags |= wimp_ISELECTED | wimp_IFILLED;
+  }
+
+  /*-- and plot the icon --*/
+
+  wimpt_complain(wimp_ploticon(&dummy));
+}
+
+
+
+static BOOL needs_redrawing ( wimp_box *bbox, wimp_redrawstr *r )
+{
+int g_x0,g_y0,g_x1,g_y1;
+
+  /*-- convert graphics box into work area coords --*/
+
+  g_x0 = r->g.x0 + (r->scx - r->box.x0);
+  g_y0 = r->g.y0 + (r->scy - r->box.y1);
+  g_x1 = r->g.x1 + (r->scx - r->box.x0);
+  g_y1 = r->g.y1 + (r->scy - r->box.y1);
+
+  /*-- compare coords --*/
+
+#if (0)
+  tracef4("clip x0 = %d y0 = %d x1 = %d y1 = %d\n",g_x0,g_y0,g_x1,g_y1);
+  tracef4("bbox x0 = %d y0 = %d x1 = %d y1 = %d\n",bbox->x0,bbox->y0,
+                                                    bbox->x1,bbox->y1);
+#endif
+
+  if(g_x0 <= bbox->x1 && g_y0 <= bbox->y1 &&
+     g_x1 >= bbox->x0 && g_y1 >= bbox->y0)
+     return(TRUE);
+
+  return(FALSE);
+}
+
+
+
+/*
+ * redraw the icons in the list window
+ */
+
+static void redraw_icons ( WList *node, wimp_redrawstr *r )
+{
+  /*-- only need to do the plotting if we have any icons --*/
+
+  tracef2("Redrawing for &%x (icons=%d)\n",(int)node,node->no_icons);
+
+  if(node->no_icons > 0)
+  {
+  IList *icon = node->icons;
+  int x = 1;
+
+    /*-- delete the source icon --*/
+
+    wimpt_complain(wimp_delete_icon(node->w,i_AList_ListSrc));
+
+    /*-- and plot the icons --*/
+
+    while(icon != NULL && x <= node->no_icons)
+    {
+      if(needs_redrawing(&icon->bbox,r))
+        do_plot_icon(icon);
+      icon = icon->next;
+      x++;
+    }
+  }
+}
+
+
+
+/*
+ * redraw function for list window
+ */
+
+static void list_window_redraw ( WList *node )
+{
+wimp_redrawstr r;
+BOOL more;
+
+  r.w = node->w;
+  wimp_redraw_wind(&r,&more);
+
+  while(more)
+  {
+    redraw_icons(node,&r);
+    wimp_get_rectangle(&r,&more);
+  }
+}
+
+
+/*
+ * finds a icon whose bounding boxes covers the x and y point
+ * (x and y are expected to be in screen coordinates)
+ */
+
+static IList *find_icon ( WList *node, int x, int y )
+{
+IList *icons = node->icons;
+wimp_wstate state;
+
+  /*-- because the stupid wimp returns the coordinates of the      --*/
+  /*-- mouse click event is screen area coords, we need to convert --*/
+  /*-- into work area ones                                         --*/
+
+  wimpt_complain(wimp_get_wind_state(node->w,&state));
+
+  x += state.o.x - state.o.box.x0;
+  y += state.o.y - state.o.box.y1;
+
+
+  /*-- and find the icon --*/
+
+  while(icons != NULL)
+  {
+    if(x >= icons->bbox.x0 && x <= icons->bbox.x1 &&
+       y >= icons->bbox.y0 && y <= icons->bbox.y1  )
+    {
+       return(icons);
+    }
+    else
+    {
+       icons = icons->next;
+    }
+  }
+
+  return(NULL);
+}
+
+
+/*
+ * deselects all the icons in a window
+ */
+
+static void deselect_all ( WList *node )
+{
+IList *icons = node->icons;
+
+  while(icons != NULL)
+  {
+    if(icons->selected)
+    {
+      icons->selected = FALSE;
+      redraw_box(node->w,icons->bbox);
+    }
+    icons = icons->next;
+  }
+}
+
+
+/*
+ * handles a single click on the background
+ */
+
+static void background_click ( WList *node, int x, int y, BOOL select )
+{
+IList *icon;
+
+  /*-- de-select all icons first --*/
+
+  if(select)
+    deselect_all(node);
+
+  /*-- locate icon at that position --*/
+
+  if((icon = find_icon(node,x,y)) != NULL)
+  {
+    /*-- set the icon to be selected and then redraw it --*/
+
+    icon->selected = !icon->selected;
+    redraw_box(node->w,icon->bbox);
+  }
+
+}
+
+
+/*
+ * handles a double click on the background
+ */
+
+static void background_double_click ( WList *node, int x, int y, BOOL select )
+{
+IList *icon;
+
+  /*-- background double clicks with ADJUST are not supported --*/
+
+  if(select)
+  {
+    /*-- locate icon at that position --*/
+
+    if((icon = find_icon(node,x,y)) != NULL)
+    {
+      /*-- edit the data associated with that icon --*/
+
+      if(!object_show(icon->object->id,icon->object,icon_add_func,node))
+        werr(0,"%s",msgs_lookup("DBNoMem"));
+    }
+  }
+}
+
+
+/*
+ * handles a drag on the background
+ */
+
+static void background_drag ( WList *node, int x, int y, BOOL select )
+{
+  /*-- dragging is not currently supported --*/
+
+  node = node;
+  x = x;
+  y = y;
+  select = select;
+}
+
+
+
+#define BackClick_SClick        0x400
+#define BackClick_SDoubleClick  0x004
+#define BackClick_SDrag         0x040
+#define BackClick_AClick        0x100
+#define BackClick_ADoubleClick  0x001
+#define BackClick_ADrag         0x010
+
+
+/*
+ * handles the adding of an icon
+ */
+
+static void add_icon ( ObjectBlock *object, WList *node )
+{
+IList *new_il;
+
+  if((new_il = ilist_alloc()) == NULL)
+  {
+    werr(0,"Unable to allocate space for new icon");
+  }
+  else
+  {
+    /*-- add icon to linked list of icons --*/
+
+    ilist_add(node,new_il);
+
+    /*-- build indirected description string --*/
+
+    object_build_description(object,new_il->indirect,100);
+
+    /*-- calculate the bbox for the icon --*/
+
+    calc_icons_bbox(new_il,node->no_icons);
+
+    /*-- redraw the icon --*/
+
+    redraw_box(node->w,new_il->bbox);
+
+    /*-- setup the rest of the icon --*/
+
+    new_il->selected = FALSE;
+    new_il->object = object;
+
+    /*-- alter the windows extent --*/
+
+    set_window_extent(node,TRUE);
+  }
+}
+
+
+/*
+ * finds the icon with the associated object pointer
+ */
+
+static IList *find_icon_by_object ( WList *node, ObjectBlock *object )
+{
+IList *icons = node->icons;
+
+  while(icons != NULL)
+  {
+    if(icons->object == object)
+      return(icons);
+    icons = icons->next;
+  }
+
+  return(NULL);
+}
+
+
+/*
+ * icon adding function (calling when a new allocation is added)
+ */
+
+static void icon_add_func ( BOOL new, ObjectBlock *object, void *handle )
+{
+WList *node = (WList *) handle;
+
+  /*-- add the new allocate object --*/
+
+  if(new)
+  {
+    add_icon(object,node);
+  }
+  else
+  {
+  IList *icon;
+
+    /*-- find the icon that this object belongs to --*/
+
+    icon = find_icon_by_object(node,object);
+
+    /*-- rebuild the indirected string --*/
+
+    object_build_description(object,icon->indirect,100);
+
+    /*-- redraw the icon --*/
+
+    redraw_box(node->w,icon->bbox);
+  }
+
+  /*-- mark the request as being edited --*/
+
+  mark_as_edited(node);
+}
+
+
+
+/*
+ * finds a object from an icon handle
+ */
+
+static int find_id ( wimp_i i )
+{
+int x;
+
+  for(x = 0;object_lookup[x] != -1;x+=2)
+  {
+    if(object_lookup[x] == i)
+      return(object_lookup[x+1]);
+  }
+
+  return(-1);
+}
+
+
+
+/*
+ * event handler for the pane window
+ */
+
+static void pane_window_events ( wimp_eventstr *e, void *handle )
+{
+WList *node = (WList *) handle;
+int id;
+
+  switch(e->e)
+  {
+    case wimp_EOPEN  : wimp_open_wind(&e->data.o);   /* Never used! */
+                       break;
+    case wimp_EBUT   : if(e->data.but.m.i != -1)
+                       {
+                         if((id = find_id(e->data.but.m.i)) == -1)
+                         {
+                           werr(0,"%s",msgs_lookup("NoSupp"));
+                         }
+                         else
+                         {
+                           if(!object_show(id,NULL,icon_add_func,node))
+                             werr(0,"%s",msgs_lookup("DBNoMem"));
+                         }
+                       }
+                       break;
+    default          : break;
+  }
+}
+
+
+/*
+ * closes the list window and free's any data that is
+ * associated with it
+ */
+
+static void close_list_window ( WList *node )
+{
+IList *icons = node->icons;
+IList *next_icon;
+BOOL do_close = TRUE;
+int i;
+
+  /*-- only close after user does an action on DCS if the --*/
+  /*-- data has been edited                               --*/
+
+  if(node->edited)
+  {
+    if((i = dcs(msgs_lookup("DCS01"))) == i_DCS_Discard)
+      do_close = TRUE;
+    else
+    {
+      if(i == i_DCS_Save)
+        do_save_request(node);
+      do_close = FALSE;
+    }
+  }
+
+  if(do_close)
+  {
+    /*-- free the icons and their data first --*/
+
+    while(icons != NULL)
+    {
+      next_icon = icons->next;
+
+      /*-- free any associated object data --*/
+
+      object_free(icons->object);
+
+      /*-- free the icon --*/
+
+      free(icons);
+
+      icons = next_icon;
+    }
+
+    /*-- close and delete the window --*/
+
+    wimp_close_wind(node->w);
+    wimp_delete_wind(node->w);
+    wimp_close_wind(node->pane);
+    wimp_delete_wind(node->pane);
+
+    /*-- free its workspace --*/
+
+    wlist_free(node);
+  }
+}
+
+
+
+/*
+ * event handler for window list
+ */
+
+static void list_window_events ( wimp_eventstr *e, void *handle )
+{
+WList *node = (WList *) handle;
+
+  switch(e->e)
+  {
+    case wimp_EREDRAW : list_window_redraw(node);
+                        break;
+    case wimp_EOPEN   : open_pane_window(e->data.o,node);
+                        open_my_window(e->data.o,node);
+                        break;
+    case wimp_ECLOSE  : close_list_window(node);
+                        break;
+    case wimp_EBUT :
+
+       if(e->data.but.m.i == -1)
+       {
+         /*-- we clicked on the background --*/
+
+         tracef1("BBits are %d\n",(int)e->data.but.m.bbits);
+
+         switch(e->data.but.m.bbits)
+         {
+           case BackClick_SClick       : background_click(node,e->data.but.m.x,
+                                                           e->data.but.m.y,TRUE);
+                                         break;
+           case BackClick_SDoubleClick : background_double_click(node,e->data.but.m.x,
+                                                           e->data.but.m.y,TRUE);
+                                         break;
+           case BackClick_SDrag        : background_drag(node,e->data.but.m.x,
+                                                           e->data.but.m.y,TRUE);
+                                         break;
+           case BackClick_AClick       : background_click(node,e->data.but.m.x,
+                                                           e->data.but.m.y,FALSE);
+                                         break;
+           case BackClick_ADoubleClick : background_double_click(node,e->data.but.m.x,
+                                                           e->data.but.m.y,FALSE);
+                                         break;
+           case BackClick_ADrag        : background_drag(node,e->data.but.m.x,
+                                                           e->data.but.m.y,FALSE);
+                                         break;
+         }
+       }
+       break;
+  }
+}
+
+
+/*
+ * tells if any items are selected
+ */
+
+static BOOL any_selected ( WList *node )
+{
+IList *icons = node->icons;
+
+  while(icons != NULL)
+  {
+    if(icons->selected)
+      return(TRUE);
+    icons = icons->next;
+  }
+
+  return(FALSE);
+}
+
+
+
+/*
+ * builds a linked list of objects which have the id of object_id
+ * (if object_id == -1 then all objects are copied)
+ */
+
+static BOOL build_objects_list ( WList *node, DataFileObjectList **object_list, int object_id )
+{
+DataFileObjectList *objects = NULL;
+DataFileObjectList *new;
+IList *icons = node->icons;
+
+  while(icons != NULL)
+  {
+    if(object_id == Object_All || icons->object->id == object_id)
+    {
+      /*-- allocate new object list icon --*/
+
+      if((new = malloc(sizeof(DataFileObjectList))) == NULL)
+        return(FALSE);
+
+      new->next = NULL;
+      new->object = icons->object;
+
+      /*-- add the object to the linked list of objects --*/
+
+      if(objects == NULL)
+      {
+        objects = new;
+      }
+      else
+      {
+        new->next = objects;
+        objects = new;
+      }
+    }
+
+    icons = icons->next;
+  }
+
+  *object_list = objects;
+
+  return(TRUE);
+}
+
+
+/*
+ * free's a list of objects (but not the objects themselves)
+ */
+
+static void free_objects_list ( DataFileObjectList *objects, BOOL free_object )
+{
+DataFileObjectList *next;
+
+  while(objects != NULL)
+  {
+    next = objects->next;
+
+    /*-- free the object if we have to --*/
+
+    if(free_object)
+      free(objects->object);
+    free(objects);
+
+    objects = next;
+  }
+}
+
+
+/*
+ * the saveas save function for saving a request
+ */
+
+static BOOL save_request_func ( char *filename, void *handle )
+{
+WList *node = (WList *) handle;
+DataFileObjectList *objects;
+
+  /*-- build a link list for the objects --*/
+
+  if(!build_objects_list(node,&objects,Object_All))
+  {
+    werr(0,"%s",msgs_lookup("MallocFail"));
+    return(FALSE);
+  }
+
+  /*-- and save the file --*/
+
+  if(datafile_write_file(filename,objects,node->no_icons))
+  {
+    strcpy(node->filename,filename);
+    node->loaded = TRUE;
+    node->edited = FALSE;
+    set_title(node);
+  }
+
+  /*-- free the linked list --*/
+
+  free_objects_list(objects,FALSE);
+
+  return(TRUE);
+}
+
+
+
+/*
+ * email save function
+ */
+
+static BOOL save_email_func ( char *filename, void *handle )
+{
+WList *node = (WList *) handle;
+DataFileObjectList *objects;
+char *scrap_file = "<Wimp$ScrapDir>.ERequest";
+char *file_buffer;
+int file_size;
+_kernel_oserror *e;
+
+  /*-- build a link list for the objects --*/
+
+  if(!build_objects_list(node,&objects,Object_All))
+  {
+    werr(0,"%s",msgs_lookup("MallocFail"));
+    return(FALSE);
+  }
+
+  /*-- Open the file with the description fields --*/
+  {
+    DataFileObjectList *list=objects;
+
+    /* JRF: Shite code alert... */
+    char bigbuffer[1024*32];
+    int bigbuffersize=sizeof(bigbuffer);
+    int written=0;
+
+    while (list)
+    {
+      int writ;
+
+      writ=object_describe(list->object, bigbuffer+written, bigbuffersize);
+      if (writ>bigbuffersize)
+      {
+        werr(0,"%s",msgs_lookup("MemoryCorrupt"));
+        exit(1);
+      }
+      bigbuffersize-=writ;
+      written+=writ;
+
+      list=list->next;
+    }
+    bigbuffer[written++]='\n';
+    bigbuffer[written++]='\n';
+
+    if((e = file_memdump(filename,FileType_Text,bigbuffer,written)) != NULL)
+    {
+      werr(0,"Unexpected error: %s",e->errmess);
+      return(FALSE);
+    }
+  }
+
+  /*-- and save the file --*/
+
+  if(!datafile_write_file(scrap_file,objects,node->no_icons))
+    return(FALSE);
+
+  /*-- find out the size of our file --*/
+
+  if((e = file_readcat(scrap_file,0,0,0,&file_size,0)) != NULL)
+  {
+    werr(0,"Unexpected error: %s",e->errmess);
+    return(FALSE);
+  }
+
+  /*-- allocate some space for it --*/
+
+  if((file_buffer = malloc(file_size)) == NULL)
+  {
+    werr(0,"%s",msgs_lookup("MallocFail"));
+    return(FALSE);
+  }
+
+  /*-- load the file into memory --*/
+
+  if((e = file_load(scrap_file,(int)file_buffer)) != NULL)
+  {
+    werr(0,"Unexpected error: %s",e->errmess);
+    free(file_buffer);
+    return(FALSE);
+  }
+
+  /*-- write the email file --*/
+
+  if((e = uuencode_buffer_to_file_tail(file_buffer,file_size,filename,"request")) != NULL)
+  {
+    werr(0,"Unexpected error: %s",e->errmess);
+    free(file_buffer);
+    return(FALSE);
+  }
+
+  /*-- free the file buffer --*/
+
+  free(file_buffer);
+
+  /*-- delete the scrap file --*/
+
+  file_delete(scrap_file);
+
+  /*-- free the object list --*/
+
+  free_objects_list(objects,FALSE);
+
+  return(TRUE);
+}
+
+
+
+/*
+ * does a save for email
+ */
+
+static void do_email_save ( WList *node )
+{
+  saveas(FileType_Text,"Request",1024,save_email_func,NULL,NULL,node);
+}
+
+
+
+/*
+ * calls saveas for the save request
+ */
+
+static void do_save_request ( WList *node )
+{
+  if(!node->loaded)
+    saveas(FileType_Allocate,"Request",1024,save_request_func,NULL,NULL,node);
+  else
+    saveas(FileType_Allocate,node->filename,1024,save_request_func,NULL,NULL,node);
+}
+
+
+
+
+/*
+ * menu maker for the list window
+ */
+
+extern menu list_menu_maker ( void *handle )
+{
+WList *node = (WList *) handle;
+wimp_mousestr m;
+
+  wimp_get_point_info(&m);
+
+  /*-- check selections --*/
+
+  if(any_selected(node) && m.w == node->w)
+    menu_setflags(main_menu,m_Main_Selection,0,0);
+  else
+    menu_setflags(main_menu,m_Main_Selection,0,1);
+
+  return(main_menu);
+}
+
+
+
+/*
+ * deletes a selection
+ */
+
+static void delete_selection ( WList *node )
+{
+IList *icons = node->icons;
+BOOL deleted_some = FALSE;
+IList *next;
+
+  /*-- find the selected ones --*/
+
+  while(icons != NULL)
+  {
+    if(icons->selected)
+    {
+      /*-- first delete the object data --*/
+      object_free(icons->object);
+
+      /*-- delete the icon --*/
+
+      next = icons->next;
+      ilist_free(node,icons);
+      icons = next;
+
+      /*-- set flag to indicate that a deletion has taken place --*/
+
+      deleted_some = TRUE;
+    }
+    else
+      icons = icons->next;
+  }
+
+  /*-- if we have deleted some then update positions --*/
+
+  if(deleted_some)
+  {
+  int x = node->no_icons;
+  wimp_wstate state;
+
+    icons = node->icons;
+
+    while(icons != NULL)
+    {
+      calc_icons_bbox(icons,x--);
+      icons = icons->next;
+    }
+
+    /*-- set the extent --*/
+
+    set_window_extent(node,TRUE);
+
+    /*-- mark window as edited --*/
+
+    mark_as_edited(node);
+
+    /*-- and force a redraw of the window --*/
+
+    wimp_get_wind_state(node->w,&state);
+    state.o.box.x0 -= state.o.x + state.o.box.x0;
+    state.o.box.y0 -= state.o.y + state.o.box.y1;
+    state.o.box.x1 -= state.o.x + state.o.box.x0;
+    state.o.box.y1 -= state.o.y + state.o.box.y1;
+
+    redraw_box(node->w,state.o.box);
+  }
+}
+
+
+/*
+ * clears a selection
+ */
+
+static void clear_selection ( WList *node )
+{
+IList *icons = node->icons;
+
+  while(icons != NULL)
+  {
+    if(icons->selected)
+    {
+      icons->selected = FALSE;
+      redraw_box(node->w,icons->bbox);
+    }
+    icons = icons->next;
+  }
+}
+
+
+/*
+ * actual reserve CSV file saver
+ */
+
+static BOOL save_reserve_func ( char *filename, void *handle )
+{
+WList *node = (WList *) handle;
+DataFileObjectList *objects;
+
+  /*-- build an object list --*/
+
+  if(!build_objects_list(node,&objects,Object_Reservation))
+  {
+    werr(0,"%s",msgs_lookup("ObjList01"));
+    return(FALSE);
+  }
+
+  /*-- do the save --*/
+
+  datafile_write_reserve_csv(filename,objects);
+
+  /*-- free the object list --*/
+
+  free_objects_list(objects,FALSE);
+
+  return(TRUE);
+}
+
+
+
+/*
+ * calls saveas for saving a reserve CSV file
+ */
+
+static void do_reserve_save ( WList *node )
+{
+  saveas(FileType_CommaSeparatedVariables,"Reserve",1024,save_reserve_func,NULL,NULL,node);
+}
+
+
+
+/*
+ * actual reply form saver
+ */
+
+static BOOL save_reply_func ( char *filename, void *handle )
+{
+WList *node = (WList *) handle;
+DataFileObjectList *objects;
+
+  /*-- build an object list --*/
+
+  if(!build_objects_list(node,&objects,Object_All))
+  {
+    werr(0,"%s",msgs_lookup("ObjList01"));
+    return(FALSE);
+  }
+
+  /*-- do the save --*/
+
+  replyform_generate(filename,objects);
+
+  /*-- free the object list --*/
+
+  free_objects_list(objects,FALSE);
+
+  return(TRUE);
+}
+
+
+
+/*
+ * calls saveas for saving a reply form
+ */
+
+static void do_reply_save ( WList *node )
+{
+  saveas(FileType_Text,"Reply",1024,save_reply_func,NULL,NULL,node);
+}
+
+
+
+/*
+ * menu event handler for the list window
+ */
+
+extern void list_menu_events ( void *handle, char *hit )
+{
+WList *node = (WList *) handle;
+
+  switch(hit[0])
+  {
+    case m_Main_Save :
+
+      switch(hit[1])
+      {
+        case m_Main_Save_Request  :  do_save_request(node);
+                                     break;
+        case m_Main_Save_EMail    :  do_email_save(node);
+                                     break;
+        case m_Main_Save_Reserved :  do_reserve_save(node);
+                                     break;
+        case m_Main_Save_Reply    :  do_reply_save(node);
+                                     break;
+      }
+      break;
+
+    case m_Main_Selection :
+
+      switch(hit[1])
+      {
+        case m_Main_Selection_Clear  : clear_selection(node);
+                                       break;
+        case m_Main_Selection_Delete : delete_selection(node);
+                                       break;
+      }
+      break;
+  }
+}
+
+
+/*
+ * creates and shows a list window
+ */
+
+extern void show_list_window ( WList *node )
+{
+template *from;
+template *dest;
+wimp_wstate state;
+
+  /*-- make a copy of the template --*/
+
+  from = template_find("main");
+  dest = template_copy(from);
+
+  /*-- and now create and display the window --*/
+
+  wimpt_complain(wimp_create_wind(&dest->window,&node->w));
+  wimpt_complain(wimp_get_icon_info(node->w,i_AList_ListSrc,&source));
+  wimpt_complain(wimp_get_wind_state(node->w,&state));
+  wimpt_complain(wimp_open_wind(&state.o));
+
+  /*-- make a copy and create the pane window --*/
+
+  from = template_find("pane");
+  dest = template_copy(from);
+  wimpt_complain(wimp_create_wind(&dest->window,&node->pane));
+  open_pane_window(state.o,node);
+
+  /*-- attach an event handler --*/
+
+  win_register_event_handler(node->w,list_window_events,node);
+  win_register_event_handler(node->pane,pane_window_events,node);
+
+  /*-- attach menus --*/
+
+  event_attachmenumaker(node->w,list_menu_maker,list_menu_events,node);
+  event_attachmenumaker(node->pane,list_menu_maker,list_menu_events,node);
+
+  /*-- and set the title --*/
+
+  set_title(node);
+}
+
+
+
+/******************************************************************
+ * External Functions                                             *
+ ******************************************************************/
+
+/*
+ * Name    : alist_any_edited
+ * Desc    : informs of any edited windows
+ * Parms   : none
+ * Returns : True if there are any windows edited
+ */
+
+extern BOOL alist_any_edited ( void )
+{
+WList *node = windows;
+
+  while(node != NULL)
+  {
+    if(node->edited)
+      return(TRUE);
+    node = node->next;
+  }
+
+  return(FALSE);
+}
+
+
+
+
+/*
+ * Name    : alist_show
+ * Desc    : allocates a new list window and shows it
+ * Parms   : char *filename        - pointer to filename (or NULL)
+ * Returns : true or false on result
+ */
+
+extern BOOL alist_show ( char *filename )
+{
+WList *new = NULL;
+DataFileObjectList *objects = NULL;
+BOOL show_details = FALSE;
+
+  /*-- first we need to allocate a need WList --*/
+
+  if((new = wlist_alloc()) == NULL)
+  {
+    werr(0,"Not enough memory for window");
+    return(FALSE);
+  }
+
+  tracef1("New wlist at &%x\n",(int)new);
+
+  /*-- add new WList to list of elements --*/
+
+  wlist_add(new);
+
+  /*-- store pointer to class in linked list --*/
+
+  new->edited = FALSE;
+  new->no_icons = 0;
+  new->icons  = NULL;
+
+  if(filename != NULL)
+  {
+    /*-- we need to load a file --*/
+
+    if(!datafile_load_file(filename,&objects))
+    {
+      free_objects_list(objects,TRUE);
+    }
+    else
+    {
+      /*-- copy across the filename --*/
+
+      strcpy(new->filename,filename);
+      new->loaded = TRUE;
+      show_details = TRUE;
+    }
+  }
+  else
+  {
+    new->loaded = FALSE;
+  }
+
+  /*-- create and show the window --*/
+
+  show_list_window(new);
+
+  /*-- see if we need to create any icons --*/
+
+  while(objects != NULL)
+  {
+    add_icon(objects->object,new);
+    objects = objects->next;
+  }
+
+  /*-- and free the object linked list --*/
+
+  free_objects_list(objects,FALSE);
+
+  /*-- show the details if we need to --*/
+
+  if(show_details)
+    details_show();
+
+  return(TRUE);
+}
+
+
+/*
+ * Name     : alist_init
+ * Desc     : inits the alist module
+ * Parms    : none
+ * Returns  : none
+ */
+
+extern void alist_init ( void )
+{
+  /*-- create the alist menus --*/
+
+  main_menu = menu_new(msgs_lookup("MWTitle"),msgs_lookup("MWHits"));
+  save_menu = menu_new(msgs_lookup("MSTitle"),msgs_lookup("MSHits"));
+  selection_menu = menu_new(msgs_lookup("MSelTitle"),msgs_lookup("MSelHits"));
+
+  menu_submenu(main_menu,m_Main_Save,save_menu);
+  menu_submenu(main_menu,m_Main_Selection,selection_menu);
+}
+
+
+
+/*-- end --*/
+

@@ -1,0 +1,183 @@
+/*
+ * Copyright (c) 2017, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include <stdlib.h>
+#include <stdio.h>
+
+#include "Global/NewErrors.h"
+
+#include "SyncLib/synclib.h"
+
+#include "smpkernel.h"
+#include "thread.h"
+#include "asm.h"
+#include "swidespatch.h"
+#include "irqdespatch.h"
+#include "halcalls.h"
+#include "stasis.h"
+
+#ifdef IRQ_LOGGING
+uint32_t irqlog[4][128];
+static uint32_t irqidx[4];
+#endif
+
+/* The doorbell IRQ is currently used for two purposes:
+   * Triggering the thread scheduler at regular intervals
+   * Signalling a request to enter stasis
+   For the former, because the thread scheduler runs on exit to foreground from
+   any IRQ, all we need to do is ack the IRQ and exit.
+   For the latter, we must call StasisFuncPtr.
+ */
+static int doorbell_irq(void)
+{
+	if (!glob.dbell->dev.TestIRQ(&glob.dbell->dev))
+	{
+		return 1;
+	}
+	int devno = glob.dbell->GetIRQ(glob.dbell, HAL_CPUNumber());
+	/* Ack the IRQ */
+	glob.dbell->dev.ClearIRQ(&glob.dbell->dev);
+	HAL_IRQClear(devno & ~IRQ_SHARED);
+	/* Check if this was a scheduler interrupt or a stasis interrupt */
+	barrier_sync(); /* XXX potentially redundant? */
+	if (get_corews()->state == (CORESTATE_STASIS | CORESTATE_TRANSITION))
+	{
+		METRIC(Stasis);
+		StasisFuncPtr();
+	}
+	/* Claim vector call */
+	return 0;
+}
+
+#ifdef BOOTSTRAP_DEBUG
+void CPUInfo_OutFunc(uint32_t reg, const char *name)
+{
+	static const char *hex = "0123456789abcdef";
+	for(int i=0;i<8;i++)
+	{
+		HAL_DebugTX(hex[reg >> 28]);
+		reg = reg<<4;
+	}
+	HAL_DebugTX(' ');
+	while (*name)
+	{
+		HAL_DebugTX(*name++);
+	}
+	HAL_DebugTX(10);
+}
+#endif
+
+void Kernel_C_Entry(armcontext_t *ctx)
+{
+#ifdef BOOTSTRAP_DEBUG
+	/* Debug */
+	CPUInfo(CPUInfo_OutFunc);
+#endif
+	/* Mark this core as running its idle thread */
+	thread_init_idle_thread();
+	/* Flag core as running */
+	corews_t *core = get_corews();
+	core->state = CORESTATE_RUNNING;
+	barrier_sync();
+	cpuevent_send();
+	/* Claim and enable the doorbell IRQ */
+	int devno = glob.dbell->GetIRQ(glob.dbell, HAL_CPUNumber());
+	irq_claim(glob.irqdespatch, devno, (int) (void *) doorbell_irq, asm_irq_c_veneer);
+	HAL_IRQEnable(devno & ~IRQ_SHARED);
+	/* Return to the idle thread (which will then immediately run the scheduler) */
+}
+
+void Kernel_C_UndVec(armcontext_t *ctx, corews_t *core)
+{
+	core->irqsema++;
+	METRIC(UndVec);
+	_kernel_oserror err;
+	err.errnum = ErrorNumber_UndefinedInstruction;
+	sprintf(err.errmess, "Undefined instruction at &%08X", ctx->r[15]);
+	Kernel_ASM_Fatal(&err, ctx, thread_get_svcstack()); /* N.B. doesn't return */
+	if (!--core->irqsema)
+	{
+		/* Hmm, couldn't we just return a flag or something? */
+		Kernel_ASM_RequestReschedule(ctx);
+	}
+}
+
+void Kernel_C_SWIVec(armcontext_t *ctx)
+{
+	METRIC(SWIVec);
+	swidespatch_despatch(ctx);
+}
+
+void Kernel_C_PrefetchAbortVec(armcontext_t *ctx, corews_t *core)
+{
+	core->irqsema++;
+	METRIC(PrefetchAbortVec);
+	_kernel_oserror err;
+	err.errnum = ErrorNumber_InstructionAbort;
+	sprintf(err.errmess, "Abort on instruction fetch at &%08X", ctx->r[15]);
+	Kernel_ASM_Fatal(&err, ctx, thread_get_svcstack()); /* N.B. doesn't return */
+	if (!--core->irqsema)
+	{
+		Kernel_ASM_RequestReschedule(ctx);
+	}
+}
+
+void Kernel_C_DataAbortVec(armcontext_t *ctx, corews_t *core, uint32_t dfar, uint32_t dfsr)
+{
+	core->irqsema++;
+	METRIC(DataAbortVec);
+	_kernel_oserror err;
+	err.errnum = ErrorNumber_DataAbort;
+	sprintf(err.errmess, "Abort on data transfer at &%08X", ctx->r[15]);
+	Kernel_ASM_Fatal(&err, ctx, thread_get_svcstack()); /* N.B. doesn't return */
+	if (!--core->irqsema)
+	{
+		Kernel_ASM_RequestReschedule(ctx);
+	}
+}
+
+void Kernel_C_IRQVec(armcontext_t *ctx, corews_t *core)
+{
+	core->irqsema++;
+	METRIC(IRQVec);
+	irq_handle(glob.irqdespatch);
+	if (!--core->irqsema && ctx)
+	{
+#ifdef IRQ_LOGGING /* Currently, just log top-level IRQs */
+		irqlog[core->id][irqidx[core->id]] = ctx->r[15];
+		irqidx[core->id] = (irqidx[core->id]+1) & 127;
+#endif
+		Kernel_ASM_RequestReschedule(ctx);
+	}
+}
+
+void Kernel_C_Reschedule(void)
+{
+	METRIC(Reschedule);
+	/* Just yield in order to trigger a reschedule */
+	thread_yield();
+}

@@ -1,0 +1,183 @@
+/** @file
+
+  Contains access to the touch screen for RaspberyPi 7" display and is used by the driver
+  itself and the calibration program.
+
+  */
+/* Created 06.04.2016 T. Milius
+   Changed 10.07.2016 T. Milius RPi display 7" not 12" :-( */
+/* Copyright (c) 2016 by Thomas Milius Stade, Germany
+* All rights reserved.
+*
+* Redistribution and use in source and binary forms, with or without
+* modification, are permitted provided that the following conditions are met:
+*     * Redistributions of source code must retain the above copyright
+*       notice, this list of conditions and the following disclaimer.
+*     * Redistributions in binary form must reproduce the above copyright
+*       notice, this list of conditions and the following disclaimer in the
+*       documentation and/or other materials provided with the distribution.
+*     * Neither the name of the &lt;organization&gt; nor the
+*       names of its contributors may be used to endorse or promote products
+*       derived from this software without specific prior written permission.
+*
+* THIS SOFTWARE IS PROVIDED BY Thomas Milius Stade, Germany ``AS IS'' AND ANY
+* EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+* WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+* DISCLAIMED. IN NO EVENT SHALL Thomas Milius Stade, Germany BE LIABLE FOR ANY
+* DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+* (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+* LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+* ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+* (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+* SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE. */
+/* RISC OS */
+/* Note: Used for application and module.
+   So take care that module stack limit is not exceeded. */
+#ifndef rpi_disp7_h
+#define rpi_disp7_h
+
+/* !!!!!!!!!! libraries !!!!!!!!!! */
+/* ------------ RISC OS ------------ */
+#include <kernel.h>
+#include <swis.h>
+
+/* ------------ own ------------ */
+#include "common_mod.h"
+
+/* !!!!!!!!!!! definitions !!!!!!!!!! */
+#define FT5406_MaxTouchPoints 10
+#define FT5406_DevMode 0
+#define FT5406_GestID  1
+#define FT5406_Status  2
+#define FT5406_TouchXH 0
+#define FT5406_TouchXL 1
+#define FT5406_TouchYH 2
+#define FT5406_TouchYL 3
+#define FT5406_SizeGeneral 3
+#define FT5406_SizeTouchpoint 6
+
+/* !!!!!!!!!! support functions !!!!!!!!!! */
+void touch_screen_copy_register_content_rpi_disp7(touch_screen_control_struct *touch_screen_control)
+{
+int i;
+_kernel_swi_regs regs;
+
+/* TickerV kann auch im IRQ-Modus sein. Funktioniert hat es bei SVC im Aufruf. */
+_kernel_swi(OS_EnterOS, &regs, &regs);
+/* Evt. memcpy. */
+for (i=0; i < (FT5406_SizeGeneral + (FT5406_SizeTouchpoint * FT5406_MaxTouchPoints)); i++) {
+  touch_screen_control->touch_register_copy[i]=touch_screen_control->touch_register_base[i];
+  }
+/* Für Debugzwecke */
+/*if ((regs.r[0]%100) == 0) {
+  int j;
+
+  printf("Register auf %x\n", touch_screen_control->touch_register_base);
+  for (i=0; i < (FT5406_SizeGeneral + (FT5406_SizeTouchpoint * FT5406_MaxTouchPoints)); i+=16) {
+    printf("%d ", i);
+    for (j=0; j < 16; j++) {
+      printf("%x ", touch_screen_control->touch_register_copy[i + j]);
+      }
+    printf("\n");
+    }
+  } */
+}
+
+void touch_screen_prepare_change_detect_rpi_disp7(touch_screen_control_struct *touch_screen_control)
+{
+_kernel_swi_regs regs;
+
+/* TickerV kann auch im IRQ-Modus sein. Funktioniert hat es bei SVC im Aufruf. */
+_kernel_swi(OS_EnterOS, &regs, &regs);
+touch_screen_control->touch_register_base[FT5406_Status]=99;
+}
+
+/* !!!!!!!!!! functions !!!!!!!!!! */
+/** The function will update the x and y position of the pen on the screen and the button state
+    inside a given touch_screen_control_struct structure.
+
+    It will return the information whether an error occurred or the
+    position of the pen has been changed.
+
+    RaspberryPi 7" Display variant. */
+int touch_screen_get_position_rpi_disp7(touch_screen_control_struct *touch_screen_control)
+{
+int i;
+int result;
+int reported_points;
+int x;
+int y;
+int action;
+int id;
+_kernel_swi_regs regs;
+
+touch_screen_copy_register_content_rpi_disp7(touch_screen_control);
+reported_points=touch_screen_control->touch_register_copy[FT5406_Status];
+reported_points&=0x0F;
+_kernel_swi(OS_ReadMonotonicTime, &regs, &regs);
+if ((touch_screen_control->touch_register_copy[FT5406_Status] == 99) ||
+    (reported_points == 0)) {
+  /* No data available */
+  result=TOUCHSCREEN_CONNECTION_RESULT_NO_DATA;
+  /* Data is delivered continously in case of pressure.
+     If there is no data devilered this indicates that
+     the pen has been released. */
+  if (touch_screen_control->state == TOUCHSCREEN_STATE_PRESSED) {
+    if ((regs.r[0] - touch_screen_control->last_pressure_time) > 4) {
+      touch_screen_control->state=TOUCHSCREEN_STATE_RELEASED;
+      result=TOUCHSCREEN_CONNECTION_RESULT_CHANGE;
+      }
+    }
+  /* no new data available */
+  return result;
+  }
+if (reported_points > FT5406_MaxTouchPoints) {
+  /* Strange effects. Should never occur but who knows.
+     However lets simple ignore this situation */
+  /* Set value to detect new data */
+  touch_screen_prepare_change_detect_rpi_disp7(touch_screen_control);
+  return TOUCHSCREEN_CONNECTION_RESULT_NO_DATA;
+  }
+/* Assume no change. */
+result=TOUCHSCREEN_CONNECTION_RESULT_NO_CHANGE;
+/* Note time of last activity */
+touch_screen_control->last_pressure_time=regs.r[0];
+for (i=0; i < reported_points; i++) {
+  action=(touch_screen_control->touch_register_copy[FT5406_SizeGeneral + (FT5406_SizeTouchpoint * i) + FT5406_TouchXH] & 0xC0) >> 6;
+  x=(touch_screen_control->touch_register_copy[FT5406_SizeGeneral + (FT5406_SizeTouchpoint * i) + FT5406_TouchXH] & 0x0F) << 8;
+  x|=touch_screen_control->touch_register_copy[FT5406_SizeGeneral + (FT5406_SizeTouchpoint * i) + FT5406_TouchXL];
+  if (touch_screen_control->last_x_position != x) {
+    result=TOUCHSCREEN_CONNECTION_RESULT_CHANGE;
+    touch_screen_control->last_x_position=x;
+    }
+  id=(touch_screen_control->touch_register_copy[FT5406_SizeGeneral + (FT5406_SizeTouchpoint * i) + FT5406_TouchYH] & 0xF0) >> 4;
+  y=(touch_screen_control->touch_register_copy[FT5406_SizeGeneral + (FT5406_SizeTouchpoint * i) + FT5406_TouchYH] & 0x0F) << 8;
+  y|=touch_screen_control->touch_register_copy[FT5406_SizeGeneral + (FT5406_SizeTouchpoint * i) + FT5406_TouchYL];
+  if (touch_screen_control->last_y_position != y) {
+    result=TOUCHSCREEN_CONNECTION_RESULT_CHANGE;
+    touch_screen_control->last_y_position=y;
+    }
+  switch (action) {
+    case 0:
+    case 2: {
+      if (touch_screen_control->state == TOUCHSCREEN_STATE_RELEASED) {
+        result=TOUCHSCREEN_CONNECTION_RESULT_CHANGE;
+        }
+      touch_screen_control->state=TOUCHSCREEN_STATE_PRESSED;
+      }
+    break;
+    case 1: {
+      if (touch_screen_control->state == TOUCHSCREEN_STATE_PRESSED) {
+        result=TOUCHSCREEN_CONNECTION_RESULT_CHANGE;
+        }
+      touch_screen_control->state=TOUCHSCREEN_STATE_RELEASED;
+      }
+    break;
+    }
+  }
+/* Set value to detect new data */
+touch_screen_prepare_change_detect_rpi_disp7(touch_screen_control);
+return result;
+}
+
+#endif

@@ -1,0 +1,2780 @@
+/*
+Copyright (c) 2002-2011 Paul LeBeau
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without modification, are
+permitted provided that the following conditions are met:
+
+   1. Redistributions of source code must retain the above copyright notice, this list of
+      conditions and the following disclaimer.
+
+   2. Redistributions in binary form must reproduce the above copyright notice, this list
+      of conditions and the following disclaimer in the documentation and/or other materials
+      provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY PAUL LEBEAU ''AS IS'' AND ANY EXPRESS OR IMPLIED
+WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
+FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL PAUL LEBEAU OR
+CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
+ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+The views and conclusions contained in the software and documentation are those of the
+authors and should not be interpreted as representing official policies, either expressed
+or implied, of Paul LeBeau.
+*/
+
+/* Title:    c.game
+ *
+ * Purpose:  Mine Hunt game specific source
+ *
+ */
+
+
+
+#include <stdlib.h>
+#include <string.h>
+#include "kernel.h"
+#include "swis.h"
+
+
+#include "wimp.h"
+#include "win.h"
+#include "wimpt.h"
+#include "res.h"
+#include "sprite.h"
+#include "akbd.h"
+#include "msgs.h"
+#include "dbox.h"
+#include "event.h"
+#include "help.h"
+#include "template.h"
+
+
+#include "menu.h"
+#include "tools.h"
+
+
+
+extern  wimp_w  main_handle;
+
+extern  menu  game_menu;
+extern  menu  level_menu;
+extern  menu  sound_menu;
+
+
+extern  BOOL  main_open;
+
+
+
+#define  NoErr(x)  {if(wimpt_complain((x)) != NULL) exit(1);}
+
+#define  MAX_WIDTH   64
+#define  MAX_HEIGHT  64
+
+#define  MAX_LEVELS  5
+
+
+unsigned char  Board[MAX_WIDTH][MAX_HEIGHT];
+
+#define  Board_Mine     0x0b
+
+#define  Board_Covered  0x10
+#define  Board_Flag     0x20
+#define  Board_QMark    0x30
+
+/* these two are only used at the 'game over' stage */
+#define  Board_BadMine  0x0c
+#define  Board_GoodFlag 0x0d
+
+
+unsigned char  Board_cascade1[MAX_WIDTH][MAX_HEIGHT];
+unsigned char  Board_cascade2[MAX_WIDTH][MAX_HEIGHT];
+BOOL           Cascade_pending;
+
+
+
+struct
+{
+   int     width;
+   int     height;
+   int     mines;
+
+   BOOL    available;
+
+} Level[MAX_LEVELS+1] = { {8,  8,  10, TRUE},
+                          {16, 8,  20, TRUE},
+                          {16, 16, 40, TRUE},
+                          {24, 16, 60, TRUE},
+                          {30, 16, 99, TRUE},
+                          {8,  8,  10, TRUE} /* custom level */ };
+
+
+/* the high score table */
+
+
+#define NAME_LEN 15       /* length of high score name entry */
+#define NUM_TOP 5         /* number of high score entries per level */
+
+
+typedef struct __highscore_entry
+{
+   int     score;
+   char    name[NAME_LEN+1];
+
+} highscore_entry;
+
+
+highscore_entry   highscore_table[MAX_LEVELS][NUM_TOP];
+
+wimp_w  highscore_handle = NULL;
+BOOL    highscore_open = FALSE;
+BOOL    game_entername_open = FALSE;
+
+#define  HS_ICONS_PER_BOX  16
+int     hs_sectiondy;                  /* used for calculating the right section */
+int     hs_winy0;                      /* of the highscore box to display */
+int     hs_highlighted_entry = -1;     /* the icon no. of the highlighted highscore entry */
+
+BOOL    highscore_changed = FALSE;
+BOOL    highscore_save_always = TRUE;
+
+
+
+
+char  tmp_str[256];
+
+sprite_area  *game_spr;
+
+
+/* Positions of the 'flags left', 'alive' and 'time' fields */
+
+#define  SPR_INFO_Y  -96
+
+   /* following is relative to top-left of window */
+#define  SPR_INFO_FLAGS_X  32
+
+   /* following is relative to top-right of window */
+#define  SPR_INFO_ALIVE_X  -256
+#define  SPR_INFO_TIME_X   -152
+
+   /* size of the alive/dead/success sprite 'hole' */
+#define  SPR_INFO_ALIVE_W  64
+#define  SPR_INFO_ALIVE_H  64
+
+
+
+   /* height to allow for height of title bar when caculating max level etc */
+   /* be a little conservative (RO2/RO3 default = 44) */
+#define  WINTITLE_HEIGHT  56
+
+
+/* Various game variables */
+
+
+int     Current_Level;
+#if 0
+BOOL    Few_Neighbours;
+#endif
+
+BOOL    Level_started;
+BOOL    Level_dead;
+BOOL    Level_finished;
+int     Level_start_time;        /* centi-secs */
+int     Level_elapsed_time;      /* centi-secs */
+int     Level_flags_left;
+int     Level_yet_to_be_uncovered;
+
+int     Board_flags_xpos;
+int     Board_flags_ypos;
+int     Board_timer_xpos;
+int     Board_timer_ypos;
+
+
+#define  SOUND_QUIET  112
+#define  SOUND_LOUD   127
+
+BOOL    Sound_On = TRUE;
+int     Sound_Level = SOUND_LOUD;
+
+int     Sound_OldVolume;
+
+
+BOOL    Qmarks_On      = TRUE;
+BOOL    SafeCorners_On = FALSE;
+
+
+                             /*  green       white(ish)  blue        orange  */
+unsigned int LED_Colours[] = { 0x00cc0000, 0xeeeeee00, 0xffbb0000, 0x00bbff00 };
+int          LED_Colour = 0; /* default - green */
+
+
+
+#define  CHEAT_MODE_AVAILABLE  1
+#if CHEAT_MODE_AVAILABLE
+BOOL    CheatModeOn = FALSE;
+#endif
+
+
+
+/* gamepart sprites variables */
+
+sprite_ptr  spr_blank;
+sprite_ptr  spr_mine;
+sprite_ptr  spr_cover;
+sprite_ptr  spr_flag;
+sprite_ptr  spr_qmark;
+sprite_ptr  spr_s1;
+sprite_ptr  spr_s2;
+sprite_ptr  spr_s3;
+sprite_ptr  spr_s4;
+sprite_ptr  spr_s5;
+sprite_ptr  spr_s6;
+sprite_ptr  spr_s7;
+sprite_ptr  spr_s8;
+sprite_ptr  spr_badmine;
+sprite_ptr  spr_goodflag;
+
+sprite_ptr  spr_alive;
+sprite_ptr  spr_dead;
+sprite_ptr  spr_success;
+
+sprite_ptr  spr_digitb;
+sprite_ptr  spr_digit[10];
+
+sprite_ptr  spr_tplft;
+sprite_ptr  spr_tpmid;
+sprite_ptr  spr_tprgt;
+sprite_ptr  spr_sides;
+sprite_ptr  spr_btlft;
+sprite_ptr  spr_btmid;
+sprite_ptr  spr_btrgt;
+
+
+int     siz_blank_w;
+int     siz_blank_h;
+
+int     siz_top_h;
+int     siz_tplft_w;
+int     siz_tpmid_w;
+int     siz_tprgt_w;
+
+int     siz_sides_w;
+int     siz_sides_h;
+
+int     siz_bot_h;
+int     siz_btlft_w;
+int     siz_btmid_w;
+int     siz_btrgt_w;
+
+int     siz_digit_w;
+int     siz_digit_h;
+
+
+/*--- Forward declaration ---*/
+void  game_load_choices(void);
+
+
+
+
+/*==========================================================================*/
+/*                 H I G H   S C O R E   R O U T I N E S                    */
+/*==========================================================================*/
+
+
+
+void highscore_highlight_entry(int entry, BOOL on)
+{
+   wimp_i        i, j;
+   wimp_icreate  wic;
+   static BOOL   first_time_thru = TRUE;
+   static int    icon_background;
+
+
+   if (entry < 0)
+      return;
+
+
+   /*--- Work out the icon no. of the entry ---*/
+
+   i = (entry / MAX_LEVELS) * HS_ICONS_PER_BOX;
+   i += (2 + (entry % MAX_LEVELS) * 3);
+
+   
+   /*--- Get the icon data ---*/
+
+   if (wimp_get_icon_info(highscore_handle, i, &wic.i) != NULL)
+      return;
+
+
+   if (first_time_thru)
+   {
+      /* what was icons original background state (colour and 'filled' flag)?
+         - we need to know so we can set it back to original state later */
+      icon_background = wic.i.flags & (0xf0000000 | wimp_IFILLED);
+      first_time_thru = FALSE;
+   }
+
+
+   /*--- We want to recreate the icon, so first delete it ---*/
+
+   if (wimp_delete_icon(highscore_handle, i) != NULL)
+      return;
+
+
+   /*--- Change the data that needs changing ---*/
+
+   wic.i.flags &= ~(0xf0000000 | wimp_IFILLED);    /* mask out the background colour and 'filled' flag */
+   if (on)
+      wic.i.flags |= (wimp_IFILLED | 0x0);         /* set icon bg colour to white and turn on fill */
+   else
+      wic.i.flags |= icon_background;              /* set icon bg back to original state */
+
+
+   /*--- Recreate the icon ---*/
+
+   wic.w = highscore_handle;
+   if (wimp_create_icon(&wic, &j) != NULL)
+      return;
+
+   if (j != i)           /* um er.. create icon no. different from */
+      return;            /* the one it was asupposed to replace!   */
+
+
+    /*--- make sure the icon is redrawn ---*/
+
+   wimp_set_icon_state(highscore_handle, i, (wimp_iconflags)0, (wimp_iconflags)0);
+
+
+   /*--- Repeat all the above for the adjacent icon (the score) ---*/
+
+   i += 1;
+   if (wimp_get_icon_info(highscore_handle, i, &wic.i) != NULL)
+      return;
+   if (wimp_delete_icon(highscore_handle, i) != NULL)
+      return;
+
+   wic.i.flags &= ~(0xf0000000 | wimp_IFILLED);    /* mask out the background colour and 'filled' flag */
+   if (on)
+      wic.i.flags |= (wimp_IFILLED | 0x0);         /* set icon bg colour to white and turn on fill */
+   else
+      wic.i.flags |= icon_background;              /* set icon bg back to original state */
+
+   wic.w = highscore_handle;
+   if (wimp_create_icon(&wic, &j) != NULL)
+      return;
+   if (j != i)
+      return;
+
+   wimp_set_icon_state(highscore_handle, i, (wimp_iconflags)0, (wimp_iconflags)0);
+
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+void game_reset_highscores(void)
+{
+   /* reset the high score table entries to suitable defaults */
+
+   int i, j;
+
+   for (i=0; i<MAX_LEVELS; i++)
+      for(j=0; j<NUM_TOP; j++)
+      {
+         highscore_table[i][j].score = (i+1)*100 + j*50;
+         strcpy(highscore_table[i][j].name, "");
+      }
+
+
+   /*--- Turn off the last highscore entry to be highlighted ---*/
+   highscore_highlight_entry(hs_highlighted_entry, FALSE);
+
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+void game_read_highscores(void) 
+{
+   os_filestr   osf;
+
+
+   /*--- Read High Score File ---*/
+
+   strcpy(tmp_str, "Choices:MineHunt.Highscores");
+
+   osf.action   = 16;         /* load a block of memory */
+   osf.name     = tmp_str;
+   osf.loadaddr = (int)highscore_table;
+   osf.execaddr = 0;          /* to load at address in r2 */
+   if (os_file(&osf) != NULL)
+   {
+      game_reset_highscores();   /* if couldn't open highscore file, use a default table */
+      return;
+   }
+
+   highscore_changed = FALSE;
+
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+void highscore_handler(wimp_eventstr *e, void *handle)
+{
+
+   switch(e->e)
+   {
+      case wimp_EOPEN:
+         wimpt_noerr(wimp_open_wind(&e->data.o));
+         break;
+
+
+      case wimp_ECLOSE:
+         wimpt_noerr(wimp_close_wind(e->data.o.w));
+         highscore_open = FALSE;
+         break;
+   }
+
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+void game_show_highscores( void )
+/* fill in and show the high score table */
+{
+   int             i, j, k;
+   wimp_wstate     ws;
+   static char     (levname[32])[MAX_LEVELS];
+   BOOL            open_it;
+
+
+   /*--- First time through, create the highscore window ---*/
+
+   if (highscore_handle == NULL)
+   {
+      template *t = template_find("HighScore");
+
+
+      /*--- Find dy between sections of highscores (used later) ---*/
+      hs_sectiondy = (((wimp_icon *)(&t->window + 1)) + HS_ICONS_PER_BOX)->box.y1 -
+                     ((wimp_icon *)(&t->window + 1))->box.y1;
+      hs_winy0 = t->window.ex.y0;
+
+
+      if (wimpt_complain(wimp_create_wind(&t->window, &highscore_handle)) != NULL)
+         return;
+
+      win_register_event_handler(highscore_handle, highscore_handler, NULL);
+
+      highscore_open = FALSE;
+
+
+      /* Put correct language text in window title */
+
+      strcpy(tmp_str, msgs_lookup("HStitle:Mine Hunt highscores"));
+      win_settitle(highscore_handle, tmp_str);
+
+
+      /* Put correct language in the level name fields */
+
+      i = 0;
+      strcpy(levname[0], msgs_lookup("Level1:Beginner"));
+      wutils_setfield(highscore_handle, i, levname[0]);
+      i += HS_ICONS_PER_BOX;
+      strcpy(levname[1], msgs_lookup("Level2:Better"));
+      wutils_setfield(highscore_handle, i, levname[1]);
+      i += HS_ICONS_PER_BOX;
+      strcpy(levname[2], msgs_lookup("Level3:Intermediate"));
+      wutils_setfield(highscore_handle, i, levname[2]);
+      i += HS_ICONS_PER_BOX;
+      strcpy(levname[3], msgs_lookup("Level4:Good"));
+      wutils_setfield(highscore_handle, i, levname[3]);
+      i += HS_ICONS_PER_BOX;
+      strcpy(levname[4], msgs_lookup("Level5:Expert"));
+      wutils_setfield(highscore_handle, i, levname[4]);
+
+   }
+
+
+   if (wimpt_complain(wimp_get_wind_state(highscore_handle, &ws)) != 0)
+      return;
+
+   open_it = !highscore_open;
+
+
+   /*--- Make sure the relevant set of high scores is visible ---*/
+
+   if (Current_Level < MAX_LEVELS)       /* don't shift window if we are on the custom level */ 
+   {
+      i = Current_Level * hs_sectiondy;             /* position of top of current section */
+      j = MAX_LEVELS - 1 - Current_Level;
+      j = hs_winy0 - (j * hs_sectiondy);            /* position of bottom of current section */
+
+      if (j < (ws.o.y - (ws.o.box.y1 - ws.o.box.y0)))
+      {
+         /* Bottom of current section is off the bottom of the window */
+
+         ws.o.y = j + (ws.o.box.y1 - ws.o.box.y0);
+         open_it = TRUE;
+      }
+
+      if (i > ws.o.y)
+      {
+         /* Top of current section is off the top of the window */
+
+         ws.o.y = i;
+         open_it = TRUE;
+      }
+   }
+
+
+   /*--- If the window is not open, open it ---*/
+
+   if (open_it)
+   {
+      ws.o.behind = -1;
+      if (wimpt_complain(wimp_open_wind(&ws.o)) == NULL)
+      {
+         win_activeinc();      /* count active windows */
+         highscore_open = TRUE;
+      }
+   }
+
+
+   /*--- Set all the icon fields from the highscore table ---*/
+
+   i = 1;
+   for (j=0; j<MAX_LEVELS; j++)
+   {
+      for (k=0; k<NUM_TOP; k++)
+      {
+         i++;               /* skip over the 'position number' field */
+         wutils_setfield(highscore_handle, i++, highscore_table[j][k].name);
+         wutils_setnumeric(highscore_handle, i++, (highscore_table[j][k].score % 10000));
+      }
+      i += 1;
+   }
+
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+void game_check_highscore(int score)
+{
+
+   highscore_entry  *lev = highscore_table[Current_Level];
+   dbox      d;
+   int       i, k;
+   char     *last;
+   BOOL      nb;
+
+
+#if CHEAT_MODE_AVAILABLE
+   if (CheatModeOn)
+      return;
+#endif
+
+
+   /*--- Find place score will go in table ---*/
+
+   i = NUM_TOP;
+   while ((i > 0) && (lev[i-1].score > score))
+      i--;
+
+
+   /*--- Turn off the last highscore entry to be highlighted ---*/
+
+   highscore_highlight_entry(hs_highlighted_entry, FALSE);
+
+
+   /*--- If their score was not good enough to get in the table, then return ---*/
+
+   if (i == NUM_TOP)
+      return;
+
+
+   /*--- Move all the lesser scores down one ---*/
+
+   if( i < (NUM_TOP-1) )
+      memmove( &lev[i+1], &lev[i], (NUM_TOP-1-i)*sizeof(highscore_entry));
+
+
+   /*--- Get the persons name ---*/
+
+   if((d = dbox_new("EnterName")) == NULL)
+      /*werr(TRUE, "DBOX can't make a new window !!")*/;
+
+   /*--- Fill out the dbox fields with the appropriate score data etc ---*/
+
+   strcpy(tmp_str, msgs_lookup("ENtitle:Well done!"));
+   win_settitle(dbox_syshandle(d), tmp_str);
+
+   strcpy(tmp_str, msgs_lookup("ENline1:You have achieved the"));
+   dbox_setfield(d, 0, tmp_str);
+
+   switch(i)
+   {
+      case 0: strcpy(tmp_str, msgs_lookup("ENline21"));
+              break;
+      case 1: strcpy(tmp_str, msgs_lookup("ENline22:second"));
+              break;
+      case 2: strcpy(tmp_str, msgs_lookup("ENline23:third"));
+              break;
+      case 3: strcpy(tmp_str, msgs_lookup("ENline24:fourth"));
+              break;
+      case 4: strcpy(tmp_str, msgs_lookup("ENline25:fifth"));
+              break;
+   }
+
+   strcat(tmp_str, " ");
+   strcat(tmp_str, msgs_lookup("ENline2:best time on the"));
+   dbox_setfield(d, 1, tmp_str);
+
+   switch(Current_Level)
+   {
+      case 0: strcpy(tmp_str, msgs_lookup("Level1:Beginner"));
+              break;
+      case 1: strcpy(tmp_str, msgs_lookup("Level2:Better"));
+              break;
+      case 2: strcpy(tmp_str, msgs_lookup("Level3:Intermediate"));
+              break;
+      case 3: strcpy(tmp_str, msgs_lookup("Level4:Good"));
+              break;
+      case 4: strcpy(tmp_str, msgs_lookup("Level5:Expert"));
+              break;
+   }
+   dbox_setfield(d, 2, tmp_str);
+
+   strcpy(tmp_str, msgs_lookup("ENline4:level!"));
+   dbox_setfield(d, 3, tmp_str);
+
+   strcpy(tmp_str, msgs_lookup("ENline5:Please enter your name..."));
+   dbox_setfield(d, 4, tmp_str);
+
+   dbox_setnumeric(d, 5, i+1);
+
+   dbox_setfield(d, 6, "");   /* clear the entry field */
+
+   dbox_setnumeric(d, 7, (score % 10000));
+
+
+   game_entername_open = TRUE;
+   dbox_show(d);
+
+   dbox_fillin(d);
+   dbox_getfield(d, 6, lev[i].name, NAME_LEN+1);
+
+   dbox_dispose(&d);
+   game_entername_open = FALSE;
+
+   /* Check for blank name */
+
+   last=lev[i].name;
+   nb = FALSE;
+   for (k=0; k++<=NAME_LEN; last++) {
+   {
+      if (*last==0)
+         break;
+      else
+         if ((*last != 32) && (*last != 160))
+            nb=TRUE;
+      }
+   }
+
+   /*--- Insert score and name into the table ---*/
+
+   lev[i].score = score;
+   if (!nb)
+      strcpy(lev[i].name, msgs_lookup("ENnoname:Anonymous"));
+
+   highscore_changed = TRUE;
+
+
+   /*--- Save the table ---*/
+
+   if (highscore_save_always)
+   {
+      os_filestr   osf;
+
+      strcpy(tmp_str, "<Choices$Write>.MineHunt");
+      osf.action   = 8;          /* create directory */
+      osf.name     = tmp_str;
+      osf.start    = 0;          /* default number of entries */
+      os_file(&osf);
+
+      strcat(tmp_str, ".HighScores");
+
+      osf.action   = 10;         /* save a block of memory */
+      osf.name     = tmp_str;
+      osf.loadaddr = 0xffd;      /* for r0 = 10, r2 = filetype */
+      osf.start    = (int)highscore_table;
+      osf.end      = osf.start + sizeof(highscore_table);
+      if (os_file(&osf) != NULL)
+         highscore_save_always = FALSE;    /* save failed so don't try again */
+   }
+
+
+   game_show_highscores();
+
+
+   /*--- Turn on the highscore entry so user knows which one is theirs ---*/
+
+   hs_highlighted_entry = Current_Level * MAX_LEVELS + i;
+   highscore_highlight_entry(hs_highlighted_entry, TRUE);
+
+} 
+
+
+
+/*==========================================================================*/
+/*                        G A M E   R O U T I N E S                         */
+/*==========================================================================*/
+
+
+
+void  game_main_extent(int level, int *xs, int *ys)
+{
+   /* Work out how big the game window should be */
+
+   if (level < 0)
+      level = Current_Level;
+
+   *xs = siz_sides_w * 2 + Level[level].width * siz_blank_w;
+
+   *ys = siz_top_h + siz_bot_h + Level[level].height * siz_blank_h;
+
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+void  game_levels_available(void)
+{
+   wimp_box   wb;
+   int        i, xs,ys;
+
+
+   /*--- Go through all the levels, setting the 'available' flag if the
+         current screen mode is big enough to take the game window ---*/
+
+   read_screen_limits(&wb);
+
+   for (i=0; i<=MAX_LEVELS; i++)
+   {
+      game_main_extent(i, &xs, &ys);
+
+      if ((xs < (wb.x1-wb.x0)) && ((ys+WINTITLE_HEIGHT) < (wb.y1-wb.y0)))
+         Level[i].available = TRUE;
+      else
+         Level[i].available = FALSE;
+
+   }
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+void  game_update_menu(void)
+{
+   int i;
+
+
+#if 0
+   menu_setflags(game_menu, 3, Few_Neighbours, FALSE);
+#endif
+
+   menu_setflags(game_menu, 3, Qmarks_On, FALSE);
+   menu_setflags(game_menu, 4, SafeCorners_On, FALSE);
+
+   menu_setflags(game_menu, 5, Sound_On, FALSE);
+
+   menu_setflags(sound_menu, 1, (Sound_Level == SOUND_QUIET), FALSE);
+   menu_setflags(sound_menu, 2, (Sound_Level == SOUND_LOUD), FALSE);
+
+
+   for (i = 0; i < MAX_LEVELS; i++)
+   {
+      menu_setflags(level_menu, i+1, (i == Current_Level), (!Level[i].available));
+   }
+   menu_setflags(level_menu, MAX_LEVELS+1, (i == Current_Level), FALSE);
+
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+void  game_init(void)
+{
+   /* Initialise everything etc etc */
+
+   os_filestr    file;
+   sprite_id     sprid = {"foo", sprite_id_name};
+   sprite_info   sprinfo;
+   int           i;
+   char         *dg = "0";
+   _kernel_swi_regs  regs;
+   os_error     *oe;
+   int           spr_dx, spr_dy;
+
+
+   /*--- Load the board and game sprites ---*/
+
+   /* try the high-res sprites first */
+   if (wimpt_dx() == 2 && wimpt_dy() == 2)
+   {
+      res_findname("Parts22", tmp_str);
+      spr_dx = 2;
+      spr_dy = 2;
+   }
+   else
+   {
+      res_findname("Parts", tmp_str);
+      spr_dx = 2;
+      spr_dy = 4;
+   }
+
+   /* Read the size of the file */
+   file.action = 5;               /* Get catalogue info */
+   file.name   = tmp_str;
+   oe = (os_file(&file));
+   if ((spr_dy == 2) && ((oe != NULL) || (file.action != 1)))
+   {
+      /* high-res sprites are missing, load the low-res ones */
+      res_findname("Parts", tmp_str);
+
+      file.action = 5;               /* Get catalogue info */
+      file.name   = tmp_str;
+      NoErr(os_file(&file));
+
+      if (file.action != 1)
+      {
+         Error(("game1:Could not find game spritefile '%s'", "Parts"));
+         exit(1);
+      }
+
+      spr_dx = 2;
+      spr_dy = 4;
+   }
+   else
+      NoErr(oe);
+
+   game_spr = malloc(file.start + 4);
+
+   sprite_area_initialise(game_spr, file.start + 4);
+   NoErr(sprite_area_load(game_spr, tmp_str));
+
+
+   /*--- Set up some vars which record the size of the parts ---*/
+   /*    and record the sprite ptrs of all the game pieces      */
+
+   sprid.s.name = "tplft";
+   NoErr(sprite_select_rp(game_spr, &sprid, &spr_tplft));
+   NoErr(sprite_readsize(game_spr, &sprid, &sprinfo));
+   siz_tplft_w = sprinfo.width * spr_dx;
+   siz_top_h = sprinfo.height  * spr_dy;
+
+   sprid.s.name = "tpmid";
+   NoErr(sprite_select_rp(game_spr, &sprid, &spr_tpmid));
+   NoErr(sprite_readsize(game_spr, &sprid, &sprinfo));
+   siz_tpmid_w = sprinfo.width * spr_dx;
+
+   sprid.s.name = "tprgt";
+   NoErr(sprite_select_rp(game_spr, &sprid, &spr_tprgt));
+   NoErr(sprite_readsize(game_spr, &sprid, &sprinfo));
+   siz_tprgt_w = sprinfo.width * spr_dx;
+
+   sprid.s.name = "sides";
+   NoErr(sprite_select_rp(game_spr, &sprid, &spr_sides));
+   NoErr(sprite_readsize(game_spr, &sprid, &sprinfo));
+   siz_sides_w = sprinfo.width  * spr_dx;
+   siz_sides_h = sprinfo.height * spr_dy;
+
+   sprid.s.name = "btlft";
+   NoErr(sprite_select_rp(game_spr, &sprid, &spr_btlft));
+   NoErr(sprite_readsize(game_spr, &sprid, &sprinfo));
+   siz_btlft_w = sprinfo.width * spr_dx;
+   siz_bot_h = sprinfo.height  * spr_dy;
+
+   sprid.s.name = "btmid";
+   NoErr(sprite_select_rp(game_spr, &sprid, &spr_btmid));
+   NoErr(sprite_readsize(game_spr, &sprid, &sprinfo));
+   siz_btmid_w = sprinfo.width * spr_dx;
+
+   sprid.s.name = "btrgt";
+   NoErr(sprite_select_rp(game_spr, &sprid, &spr_btrgt));
+   NoErr(sprite_readsize(game_spr, &sprid, &sprinfo));
+   siz_btrgt_w = sprinfo.width * spr_dx;
+
+   sprid.s.name = "blank";
+   NoErr(sprite_select_rp(game_spr, &sprid, &spr_blank));
+   NoErr(sprite_readsize(game_spr, &sprid, &sprinfo));
+   siz_blank_w = sprinfo.width  * spr_dx;
+   siz_blank_h = sprinfo.height * spr_dy;
+
+   sprid.s.name = "mine";
+   NoErr(sprite_select_rp(game_spr, &sprid, &spr_mine));
+
+   sprid.s.name = "cover";
+   NoErr(sprite_select_rp(game_spr, &sprid, &spr_cover));
+
+   sprid.s.name = "flag";
+   NoErr(sprite_select_rp(game_spr, &sprid, &spr_flag));
+
+   sprid.s.name = "qmark";
+   NoErr(sprite_select_rp(game_spr, &sprid, &spr_qmark));
+
+   sprid.s.name = "s1";
+   NoErr(sprite_select_rp(game_spr, &sprid, &spr_s1));
+
+   sprid.s.name = "s2";
+   NoErr(sprite_select_rp(game_spr, &sprid, &spr_s2));
+
+   sprid.s.name = "s3";
+   NoErr(sprite_select_rp(game_spr, &sprid, &spr_s3));
+
+   sprid.s.name = "s4";
+   NoErr(sprite_select_rp(game_spr, &sprid, &spr_s4));
+
+   sprid.s.name = "s5";
+   NoErr(sprite_select_rp(game_spr, &sprid, &spr_s5));
+
+   sprid.s.name = "s6";
+   NoErr(sprite_select_rp(game_spr, &sprid, &spr_s6));
+
+   sprid.s.name = "s7";
+   NoErr(sprite_select_rp(game_spr, &sprid, &spr_s7));
+
+   sprid.s.name = "s8";
+   NoErr(sprite_select_rp(game_spr, &sprid, &spr_s8));
+
+   sprid.s.name = "badmine";
+   NoErr(sprite_select_rp(game_spr, &sprid, &spr_badmine));
+
+   sprid.s.name = "goodflag";
+   NoErr(sprite_select_rp(game_spr, &sprid, &spr_goodflag));
+
+   sprid.s.name = "alive";
+   NoErr(sprite_select_rp(game_spr, &sprid, &spr_alive));
+
+   sprid.s.name = "dead";
+   NoErr(sprite_select_rp(game_spr, &sprid, &spr_dead));
+
+   sprid.s.name = "success";
+   NoErr(sprite_select_rp(game_spr, &sprid, &spr_success));
+
+   sprid.s.name = "b";
+   NoErr(sprite_select_rp(game_spr, &sprid, &spr_digitb));
+   NoErr(sprite_readsize(game_spr, &sprid, &sprinfo));
+   siz_digit_w = sprinfo.width  * spr_dx;
+   siz_digit_h = sprinfo.height * spr_dy;
+
+
+   sprid.s.name = dg;
+   for (i = 0; i <= 9; i++)
+   {
+      *dg = '0' + i;
+      NoErr(sprite_select_rp(game_spr, &sprid, &spr_digit[i]));
+   }
+
+
+   /*--- Set up other game vars ---*/
+
+   Current_Level = 0;      /* first level is level 0 (internally at least) */
+
+#if 0
+   Few_Neighbours = FALSE;
+#endif
+
+
+   /*--- Load the choices file ---*/
+
+   game_load_choices();
+
+
+   game_levels_available();
+   game_update_menu();
+
+
+   /*--- Seed the random number generator ---*/
+
+   _kernel_swi(OS_ReadMonotonicTime, &regs, &regs);
+   srand(regs.r[0]);
+
+
+   /*--- Set up the sound system for sound effects ---*/
+
+   os_swi6(os_X | Sound_Configure, 2, 208, 48, 0, 0, 0);
+   os_swi1r(os_X | Sound_Volume, Sound_Level, &Sound_OldVolume);
+
+
+#if 0
+   make_window_use_wimp_pool("Custom");      /* make the window use the wimp pool! */
+#endif
+
+
+   /*--- Read the highscore table ---*/
+
+   game_read_highscores();
+
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+void  game_set_board_size(void)
+{
+   int          xs, ys;
+   wimp_wstate  ws;
+
+
+   /*--- Set the proper extent of the window (for the current level ---*/
+
+   game_main_extent(Current_Level, &xs, &ys);
+
+   ws.o.w = main_handle;
+   ws.o.box.x0 = 0;
+   ws.o.box.y0 = 0;
+   ws.o.box.x1 = xs;
+   ws.o.box.y1 = ys;
+   wimpt_noerr(wimp_set_extent((wimp_redrawstr *)&ws.o));
+
+
+   /*--- Set the window open position ---*/
+
+   wimpt_noerr(wimp_get_wind_state(main_handle, &ws));
+
+   ws.o.box.y0 = ws.o.box.y1 - ys;
+   ws.o.box.x1 = ws.o.box.x0 + xs;
+
+
+   /*--- Open the window ---*/
+
+   wimpt_noerr(wimp_open_wind(&ws.o));
+
+
+   /*--- Set up some board position vars ---*/
+
+   Board_flags_xpos = SPR_INFO_FLAGS_X;
+   Board_flags_ypos = (ws.o.box.y1 - ws.o.box.y0) + SPR_INFO_Y;
+   Board_timer_xpos = (ws.o.box.x1 - ws.o.box.x0) + SPR_INFO_TIME_X;
+   Board_timer_ypos = Board_flags_ypos;
+
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+static void  game__clear_table(unsigned char *table)
+{
+   memset(table, 0, MAX_WIDTH*MAX_HEIGHT);
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+static void  game__update_flag_count(void)
+{
+   /* update/redraw the flag counter */
+
+   wimp_redrawstr  wr;
+ 
+
+   wr.w = main_handle;
+   wr.box.x0 = Board_flags_xpos;
+   wr.box.y0 = Board_flags_ypos;
+   wr.box.x1 = wr.box.x0 + siz_digit_w * 3;
+   wr.box.y1 = wr.box.y0 + siz_digit_h;
+   NoErr(wimp_force_redraw(&wr));
+
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+static void  game__update_alive_field(void)
+{
+   /* update/redraw the alive/dead indicator */
+
+   wimp_redrawstr  wr;
+ 
+
+   wr.w = main_handle;
+   /* cheat a little, just do the area between the two counters */
+   wr.box.x0 = Board_flags_xpos + siz_digit_w * 3;
+   wr.box.y0 = Board_flags_ypos;
+   wr.box.x1 = Board_timer_xpos;
+   wr.box.y1 = wr.box.y0 + siz_digit_h;
+   NoErr(wimp_force_redraw(&wr));
+
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+void  game_level_init(void)
+{
+   int     i, rx, ry;
+   int     tx, ty;
+   BOOL    over;
+   register unsigned char  p;
+   wimp_redrawstr  wr;
+
+
+   Level_started  = FALSE;
+   Level_dead     = FALSE;
+   Level_finished = FALSE;
+
+   Level_flags_left = Level[Current_Level].mines;
+
+   Level_yet_to_be_uncovered = (Level[Current_Level].width
+                                * Level[Current_Level].height) - Level_flags_left;
+
+   Level_elapsed_time = 0;
+
+   Cascade_pending = FALSE;
+
+
+
+   /*--- Initialize the board ---*/
+
+   game__clear_table(Board[0]);
+
+
+   /*--- First: distribute the mines ---*/
+
+   i = 0;
+   while (i < Level_flags_left)
+   {
+      ry = rand();
+      rx = ry % Level[Current_Level].width;
+      ry = (ry / 256) % Level[Current_Level].height;
+
+
+      /* check that we are not going to give any of the neighbours
+         any more than three neighbours */
+      /***         not sure if this is correct !!!        ***/
+
+      over = FALSE;
+
+      if ((Board[rx][ry] & 0x80) != 0)    /* mine already here ? */
+         over = TRUE;
+#if 0
+      else if (Few_Neighbours)
+      {
+         for (tx = rx-1; tx <= rx+1; tx++)
+         {
+            if ((tx < 0) || (tx >= Level[Current_Level].width))
+               continue;
+
+            for (ty = ry-1; ty <= ry+1; ty++)
+            {
+               if ((ty < 0) || (ty >= Level[Current_Level].height))
+                  continue;
+
+               if ((tx == rx) && (ty == ry))
+                  continue;
+
+               if ((Board[tx][ty] & 0x0f) >= 3)
+                  over = TRUE;
+            }
+         }
+      }
+#endif
+      else if (SafeCorners_On)
+      {
+         if ( ((rx == 0) || (rx == Level[Current_Level].width-1)) &&
+              ((ry == 0) || (ry == Level[Current_Level].height-1)) )
+            over = TRUE;
+      }
+
+      if (!over)
+      {
+
+         Board[rx][ry] |= 0x80;    /* for now, the bit 7 indicates the presence of a mine here */
+
+         /*--- All our neighbours now have one extra ---*/
+
+         for (tx = rx-1; tx <= rx+1; tx++)
+         {
+            if ((tx < 0) || (tx >= Level[Current_Level].width))
+               continue;
+
+            for (ty = ry-1; ty <= ry+1; ty++)
+            {
+               if ((ty < 0) || (ty >= Level[Current_Level].height))
+                  continue;
+
+               if ((tx == rx) && (ty == ry))
+                  continue;
+
+               p = Board[tx][ty] & 0x80;
+               Board[tx][ty] = p | ((Board[tx][ty] & 0x0f) + 1);
+            }
+         }
+
+         /*--- Increment number of mines placed ---*/
+
+         i++;
+      }
+   }
+
+
+   /*--- Now put board into its start state (covered etc) ---*/
+
+   for (rx = 0; rx < Level[Current_Level].width; rx++)
+      for (ry = 0; ry < Level[Current_Level].height; ry++)
+      {
+         p = Board[rx][ry];
+         if ((p & 0x80) != 0)
+            p = Board_Mine;    /* convert the 'mine' flag to the normal form */
+         Board[rx][ry] = Board_Covered | p;
+      }
+       
+
+
+   /*--- Redraw the window ---*/
+
+   game_main_extent(Current_Level, &tx, &ty);
+
+   wr.w = main_handle;
+   wr.box.x0 = 0;
+   wr.box.y0 = 0;
+   wr.box.x1 = tx;
+   wr.box.y1 = ty;
+   NoErr(wimp_force_redraw(&wr));
+
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+void  game_redraw(wimp_redrawstr *r)
+{
+   register int      bx0, by0, bx1, by1;
+   _kernel_swi_regs  regs;
+   sprite_factors    sprf;
+   char              pixtrans[16];
+
+
+
+   bx0 = r->box.x0;
+   by0 = r->box.y0;
+   bx1 = r->box.x1;
+   by1 = r->box.y1;
+
+
+   /*--- Set up sprite plot scale factors and colour table ---*/
+
+   regs.r[0] = 0x200;
+   regs.r[1] = (int)game_spr;
+   regs.r[2] = (int)spr_tplft;
+   regs.r[6] = (int)&sprf;
+   regs.r[7] = (int)pixtrans;
+
+   if (_kernel_swi(Wimp_ReadPixTrans, &regs, &regs) != NULL)
+      return;
+
+
+   regs.r[1] = (int)game_spr;
+
+
+
+   /*--- plot the sprites on the left and right at the top of the window ---*/
+
+   regs.r[0] = 0x234;            /* plot sprite scaled */
+   regs.r[2] = (int)spr_tplft;
+   regs.r[3] = bx0;
+   regs.r[4] = by1 - siz_top_h;
+   regs.r[5] = 8;
+   if (_kernel_swi(OS_SpriteOp, &regs, &regs) != NULL)
+      return;
+
+   regs.r[2] = (int)spr_tprgt;
+   regs.r[3] = bx1 - siz_tprgt_w;
+   regs.r[4] = by1 - siz_top_h;
+   if (_kernel_swi(OS_SpriteOp, &regs, &regs) != NULL)
+      return;
+
+
+   regs.r[5] = 0;
+
+
+   /*--- plot the information sprites at the top of the window ---*/
+
+   {
+      register int     x, v, s = FALSE;
+      char             pixtr10 = pixtrans[10];
+
+
+      if (LED_Colour != 0)
+      {
+         /* change the colour of the LED numbers */
+
+         _kernel_swi_regs  regs2;
+
+         regs2.r[0] = LED_Colours[LED_Colour];
+         _kernel_swi(ColourTrans_ReturnColourNumber, &regs2, &regs2);
+         pixtrans[10] = regs2.r[0];
+      }
+
+
+      /*--- plot the 'flags left' count ---*/
+
+      x = bx0 + Board_flags_xpos;
+      v = Level_flags_left;
+
+      if (v > 99)
+         s = TRUE;
+      regs.r[2] = (int)((s) ? spr_digit[v / 100] : spr_digitb);
+      regs.r[3] = x;
+      regs.r[4] = by0 + Board_flags_ypos;
+      if (_kernel_swi(OS_SpriteOp, &regs, &regs) != NULL)
+         return;
+
+      x += siz_digit_w;
+      v %= 100;
+      if (v > 9)
+         s = TRUE;
+      regs.r[2] = (int)((s) ? spr_digit[v / 10] : spr_digitb);
+      regs.r[3] = x;
+      if (_kernel_swi(OS_SpriteOp, &regs, &regs) != NULL)
+         return;
+
+      x += siz_digit_w;
+      v %= 10;
+      regs.r[2] = (int)spr_digit[v];
+      regs.r[3] = x;
+      if (_kernel_swi(OS_SpriteOp, &regs, &regs) != NULL)
+         return;
+
+      /*--- plot the 'alive/dead/success' sprite ---*/
+
+      if (Level_dead)
+         regs.r[2] = (int)spr_dead;
+      else if (Level_finished)
+         regs.r[2] = (int)spr_success;
+      else
+         regs.r[2] = (int)spr_alive;
+      regs.r[3] = bx1 + SPR_INFO_ALIVE_X;
+      if (_kernel_swi(OS_SpriteOp, &regs, &regs) != NULL)
+         return;
+
+      /*--- plot the 'time' count ---*/
+
+      s = FALSE;
+      x = bx0 + Board_timer_xpos;
+      v = Level_elapsed_time / 100;
+
+      if (v > 999)
+      {
+         s = TRUE;
+         v = v % 1000;
+      }
+
+      if (v > 99)
+         s = TRUE;
+      regs.r[2] = (int)((s) ? spr_digit[v / 100] : spr_digitb);
+      regs.r[3] = x;
+      if (_kernel_swi(OS_SpriteOp, &regs, &regs) != NULL)
+         return;
+
+      x += siz_digit_w;
+      v %= 100;
+      if (v > 9)
+         s = TRUE;
+      regs.r[2] = (int)((s) ? spr_digit[v / 10] : spr_digitb);
+      regs.r[3] = x;
+      if (_kernel_swi(OS_SpriteOp, &regs, &regs) != NULL)
+         return;
+
+      x += siz_digit_w;
+      v %= 10;
+      regs.r[2] = (int)spr_digit[v];
+      regs.r[3] = x;
+      if (_kernel_swi(OS_SpriteOp, &regs, &regs) != NULL)
+         return;
+
+
+      /* restore pixtrans back to normal */
+      pixtrans[10] = pixtr10;
+   }
+
+
+
+   /*--- plot the side sprites on the left and right ---*/
+
+   {
+      int     a,b;
+
+
+      a = sprf.ymag;
+      b = sprf.ydiv;
+
+      sprf.ymag = a * (by1 - by0 - siz_top_h - siz_bot_h);
+      sprf.ydiv = b * (siz_sides_h);
+
+      regs.r[2] = (int)spr_sides;
+      regs.r[3] = bx0;
+      regs.r[4] = by0 + siz_bot_h;
+      if (_kernel_swi(OS_SpriteOp, &regs, &regs) != NULL)
+         return;
+
+      regs.r[3] = bx1 - siz_sides_w;
+      if (_kernel_swi(OS_SpriteOp, &regs, &regs) != NULL)
+         return;
+
+      sprf.ymag = a;
+      sprf.ydiv = b;
+   }
+
+
+
+   /*--- plot the play-area sprites ---*/
+
+   {
+      register int            i,j, x,y;
+      register unsigned char  p;
+      register int            is,i2, j2, xs;
+
+
+      xs = bx0 + siz_btlft_w;
+
+      is = (r->g.x0 - xs) / siz_blank_w;
+      if (is < 0)
+         is = 0;
+
+      i2 = (r->g.x1 - xs) / siz_blank_w;
+      if (i2 >= Level[Current_Level].width)
+         i2 = Level[Current_Level].width - 1;
+
+      xs += (is * siz_blank_w);
+
+      y = by0 + siz_bot_h;
+
+      j = (r->g.y0 - y) / siz_blank_h;
+      if (j < 0)
+         j = 0;
+
+      j2 = (r->g.y1 - y) / siz_blank_h;
+      if (j2 >= Level[Current_Level].height)
+         j2 = Level[Current_Level].height - 1;
+
+      y += (j * siz_blank_h);
+
+
+      for (; j <= j2; j++)
+      {
+         x = xs;
+
+         for (i = is; i <= i2; i++)
+         {
+            p = Board[i][j];
+
+            if ((p & 0xf0) != 0)
+               p &= 0xf0;
+
+            switch(p)
+            {
+               case 0:  /* uncovered blank square */
+                  regs.r[2] = (int)spr_blank;
+                  break;
+
+               case 1:  /* uncovered square with 1 neighbour */
+                  regs.r[2] = (int)spr_s1;
+                  break;
+
+               case 2:  /* uncovered square with 2 neighbours */
+                  regs.r[2] = (int)spr_s2;
+                  break;
+
+               case 3:  /* uncovered square with 3 neighbours */
+                  regs.r[2] = (int)spr_s3;
+                  break;
+
+               case 4:  /* uncovered square with 4 neighbours */
+                  regs.r[2] = (int)spr_s4;
+                  break;
+
+               case 5:  /* uncovered square with 5 neighbours */
+                  regs.r[2] = (int)spr_s5;
+                  break;
+
+               case 6:  /* uncovered square with 6 neighbours */
+                  regs.r[2] = (int)spr_s6;
+                  break;
+
+               case 7:  /* uncovered square with 7 neighbours */
+                  regs.r[2] = (int)spr_s7;
+                  break;
+
+               case 8:  /* uncovered square with 8 neighbours */
+                  regs.r[2] = (int)spr_s8;
+                  break;
+
+               case Board_Mine:
+                  regs.r[2] = (int)spr_mine;
+                  break;
+
+               case Board_BadMine:
+                  regs.r[2] = (int)spr_badmine;
+                  break;
+
+               case Board_GoodFlag:
+                  regs.r[2] = (int)spr_goodflag;
+                  break;
+
+               case Board_Covered:
+                  regs.r[2] = (int)spr_cover;
+                  break;
+
+               case Board_Flag:
+                  regs.r[2] = (int)spr_flag;
+                  break;
+
+               case Board_QMark:
+                  regs.r[2] = (int)spr_qmark;
+                  break;
+            }
+
+            regs.r[3] = x;
+            regs.r[4] = y;
+            if (_kernel_swi(OS_SpriteOp, &regs, &regs) != NULL)
+               return;
+
+            x += siz_blank_w;
+         }
+
+         y += siz_blank_h;
+      }
+   }
+
+
+
+   /*--- plot the sprites on the left and right at the bottom of the window ---*/
+
+   regs.r[2] = (int)spr_btlft;
+   regs.r[3] = bx0;
+   regs.r[4] = by0;
+   if (_kernel_swi(OS_SpriteOp, &regs, &regs) != NULL)
+      return;
+
+   regs.r[2] = (int)spr_btrgt;
+   regs.r[3] = bx1 - siz_btrgt_w;
+   regs.r[4] = by0;
+   if (_kernel_swi(OS_SpriteOp, &regs, &regs) != NULL)
+      return;
+
+
+
+  /*--- plot the sprites in the middle at the top and bottom of the window ---*/
+
+   {
+      int     a,b;
+
+
+      a = sprf.xmag;
+      b = sprf.xdiv;
+
+
+      /* the sprite at the top */
+
+      sprf.xmag = a * (bx1 - bx0 - siz_tplft_w - siz_tprgt_w);
+      sprf.xdiv = b * (siz_tpmid_w);
+
+      regs.r[2] = (int)spr_tpmid;
+      regs.r[3] = bx0 + siz_tplft_w;
+      regs.r[4] = by1 - siz_top_h;
+      if (_kernel_swi(OS_SpriteOp, &regs, &regs) != NULL)
+         return;
+
+      /* the sprite at the bottom */
+
+      sprf.xmag = a * (bx1 - bx0 - siz_btlft_w - siz_btrgt_w);
+      sprf.xdiv = b * (siz_btmid_w);
+
+      regs.r[2] = (int)spr_btmid;
+      regs.r[3] = bx0 + siz_btlft_w;
+      regs.r[4] = by0;
+      if (_kernel_swi(OS_SpriteOp, &regs, &regs) != NULL)
+         return;
+   }
+
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+void  game__show_all_mines(int mx, int my)
+
+/* We have uncovered a mine and are now dead! */
+{
+   int              rx, ry;
+   unsigned char    p, ph;
+   wimp_redrawstr   wr;
+
+
+   /* Give the one we just uncovered the (blood!) red background */
+
+   if ((mx >= 0) && (my >= 0))
+      Board[mx][my] = Board_BadMine;
+
+
+   /* Uncover all the mines */
+
+   for (rx = 0; rx < Level[Current_Level].width; rx++)
+      for (ry = 0; ry < Level[Current_Level].height; ry++)
+      {
+         p = Board[rx][ry];
+         ph = p & 0xf0;
+         p = p & 0x0f;
+
+         if (p == Board_Mine)
+         {
+            if (ph == Board_Flag)
+               Board[rx][ry] = Board_GoodFlag;
+            else
+               Board[rx][ry] = p;
+         }
+      }
+
+
+   /* Redraw the whole board */
+
+   wr.w = main_handle;
+   wr.box.x0 = siz_btlft_w;
+   wr.box.y0 = siz_bot_h;
+   wr.box.x1 = wr.box.x0 + (Level[Current_Level].width * siz_blank_w);
+   wr.box.y1 = wr.box.y0 + (Level[Current_Level].height * siz_blank_h);
+   NoErr(wimp_force_redraw(&wr));
+
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+void  game_playsound_success(void)
+{
+   static char *voice1 = "Applause";
+   static char *voice2 = "Spiffing";
+   static char *voice3 = "YouDidIt";
+   int          r;
+
+
+   /* 25% chance of voice 3 */
+   r = rand() % 100;
+   if (r < 25)
+      if (os_swi2(os_X | Sound_AttachNamedVoice, 2, (int)voice3) == NULL)
+         goto play_success;
+
+   /* 25% chance of voice 2 */
+   r = rand() % (100-25);
+   if (r < 25)
+      if (os_swi2(os_X | Sound_AttachNamedVoice, 2, (int)voice2) == NULL)
+         goto play_success;
+
+   /* 50% chance of voice 3 */
+   if (os_swi2(os_X | Sound_AttachNamedVoice, 2, (int)voice1) != NULL)
+      return;
+
+   play_success:
+      os_swi1(os_X | Sound_Volume, Sound_Level);
+      os_swi4(os_X | Sound_Control, 2, 0x17f, 0x1480, 1);
+
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+void  game_playsound_failure(void)
+{
+   static char *voice1 = "TryAgain";
+   static char *voice2 = "Shame";
+   static char *voice3 = "RealMine";
+   int          r;
+
+
+   /* 10% chance of voice 3 */
+   r = rand() % 100;
+   if (r < 10)
+      if (os_swi2(os_X | Sound_AttachNamedVoice, 2, (int)voice3) == NULL)
+         goto play_failure;
+
+   /* 45% chance of voice 2 */
+   r = rand() % (100-10);
+   if (r < 45)
+      if (os_swi2(os_X | Sound_AttachNamedVoice, 2, (int)voice2) == NULL)
+         goto play_failure;
+
+   /* 45% chance of voice 3 */
+   if (os_swi2(os_X | Sound_AttachNamedVoice, 2, (int)voice1) != NULL)
+      return;
+
+   play_failure:
+      os_swi1(os_X | Sound_Volume, Sound_Level);
+      os_swi4(os_X | Sound_Control, 2, 0x17f, 0x1480, 1);
+
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+void  game_clear_around(int mx, int my, int pl)
+{
+   int     tx,ty, n;
+
+
+   /* count up neighbours with flags on */
+   n = 0;
+   for (tx = mx-1; tx <= mx+1; tx++)
+   {
+      if ((tx < 0) || (tx >= Level[Current_Level].width))
+         continue;
+
+      for (ty = my-1; ty <= my+1; ty++)
+      {
+         if ((ty < 0) || (ty >= Level[Current_Level].height))
+            continue;
+
+         if ((tx == mx) && (ty == my))
+            continue;
+
+         if ((Board[tx][ty] & 0xf0) == Board_Flag)
+            n++;
+      }
+   }
+
+   game__clear_table(Board_cascade1[0]);
+
+   if (n == pl)        /* if this square has correct number of flag neighbours, then cascade */
+   {
+      for (tx = mx-1; tx <= mx+1; tx++)
+      {
+         if ((tx < 0) || (tx >= Level[Current_Level].width))
+            continue;
+
+         for (ty = my-1; ty <= my+1; ty++)
+         {
+            if ((ty < 0) || (ty >= Level[Current_Level].height))
+               continue;
+
+            if ((tx == mx) && (ty == my))
+               continue;
+
+            if ((Board[tx][ty] & 0xf0) != Board_Flag)
+               Board_cascade1[tx][ty] = 1;
+         }
+      }
+
+      Cascade_pending = TRUE;
+   }
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+void  game_mouseclick(int wx0, int wy0, int mx, int my, wimp_bbits mb)
+{
+   register unsigned char    p,p2, pl,ph;
+   int                       xs,ys;
+
+
+   game_main_extent(-1, &xs,&ys); 
+
+   /* Check for clicks in the score/alive/dead area */
+   if ((my >= (wy0+Board_flags_ypos)) &&
+       (my < (wy0+Board_flags_ypos+SPR_INFO_ALIVE_H)) )
+   {
+      int    brx;
+
+      brx = wx0 + xs;
+
+      /*--- Check for a click on the alive/dead icon - causes a 'New game' ---*/
+
+      if ((mx >= (brx+SPR_INFO_ALIVE_X)) &&
+          (mx < (brx+SPR_INFO_ALIVE_X+SPR_INFO_ALIVE_W)) )
+      {
+         game_level_init();
+
+#if CHEAT_MODE_AVAILABLE
+         CheatModeOn = akbd_pollctl();
+#endif
+         return;
+      }
+
+
+      /*--- Check for click on mine/score areas - causes LED colour change ---*/
+
+      if (((mx >= (wx0+SPR_INFO_FLAGS_X)) && (mx < (wx0+SPR_INFO_FLAGS_X+3*siz_digit_w))) ||
+          ((mx >= (brx+SPR_INFO_TIME_X)) && (mx < (brx+SPR_INFO_TIME_X+3*siz_digit_w))) )
+      {
+         wimp_redrawstr  wr;
+
+         LED_Colour++;
+         LED_Colour = LED_Colour % (sizeof(LED_Colours) / sizeof(LED_Colours[0]));      /* cycle the LED colour */
+
+         /* update/redraw the timer */
+         wr.w = main_handle;
+         wr.box.x0 = Board_flags_xpos;
+         wr.box.y0 = Board_flags_ypos;
+         wr.box.x1 = Board_timer_xpos + 3 * siz_digit_w;
+         wr.box.y1 = wr.box.y0 + siz_digit_h;
+         NoErr(wimp_force_redraw(&wr));
+
+         return;
+      }
+
+   }
+
+
+   if (Cascade_pending)
+      return;              /* don't allow clicks if we are still cascading */
+
+   if (Level_dead)
+      return;              /* Can't do anything if dead! */
+
+
+   mx -= (wx0 + siz_btlft_w);
+   my -= (wy0 + siz_bot_h);
+
+   if (mx < 0 || my < 0)
+      return;
+
+   mx /= siz_blank_w;
+   my /= siz_blank_h;
+
+   if ((mx >= Level[Current_Level].width) || (my >= Level[Current_Level].height))
+      return;
+
+
+   if (!Level_started)
+   {
+      /* game started - start the timer */
+
+      _kernel_swi_regs   regs;
+
+      _kernel_swi(OS_ReadMonotonicTime, &regs, &regs);
+      Level_start_time = regs.r[0];
+      Level_elapsed_time = 0;
+      Level_started = TRUE;
+
+   }
+
+
+   p = Board[mx][my];
+   ph = p & 0xf0;
+   pl = p & 0x0f;
+
+
+#if CHEAT_MODE_AVAILABLE
+   if (CheatModeOn && akbd_pollctl())
+   {
+      if (((ph == Board_Covered) || (ph == Board_QMark)) &&
+          (mb == wimp_BLEFT) &&
+          (pl == Board_Mine))
+         mb = wimp_BRIGHT;
+   }
+#endif
+
+
+   if (mb == wimp_BLEFT)   /* select */
+   {
+      if ((ph == Board_Covered) || (ph == Board_QMark))
+      {
+         int     tx,ty;
+
+         ph = 0;
+         Level_yet_to_be_uncovered--;  /* squares still covered */
+
+
+         game__clear_table(Board_cascade1[0]);
+
+         if (pl == 0)        /* if this square has no neighbouring mines, then cascade */
+         {
+            for (tx = mx-1; tx <= mx+1; tx++)
+            {
+               if ((tx < 0) || (tx >= Level[Current_Level].width))
+                  continue;
+
+               for (ty = my-1; ty <= my+1; ty++)
+               {
+                  if ((ty < 0) || (ty >= Level[Current_Level].height))
+                     continue;
+
+                  if ((tx == mx) && (ty == my))
+                     continue;
+
+                  Board_cascade1[tx][ty] = 1;
+               }
+            }
+
+            Cascade_pending = TRUE;
+         }
+
+      }
+      else if (akbd_pollsh() && (ph == 0) && (pl >= 1) && (pl <= 8))       /* are we doing a 'clear-around'? */
+      {
+         game_clear_around(mx,my, pl);
+      }
+   }
+   else  /* adjust */
+   {
+      switch (ph)
+      {
+         case 0:
+            game_clear_around(mx,my, pl);
+            break;
+
+            /*--------*/
+
+         case Board_Covered:
+            if (Level_flags_left > 0)
+            {
+               ph = Board_Flag;
+
+               Level_flags_left--;
+               game__update_flag_count();
+            }
+            break;
+
+            /*--------*/
+
+         case Board_Flag:
+            if (Qmarks_On)
+              ph = Board_QMark;
+            else
+              ph = Board_Covered;
+
+            Level_flags_left++;
+            game__update_flag_count();
+            break;
+
+            /*--------*/
+
+         case Board_QMark:
+            ph = Board_Covered;
+            break;
+
+      }
+   }
+
+   p2 = (ph | pl);
+   if (p2 != p)
+   {
+      wimp_redrawstr  wr;
+
+
+      Board[mx][my] = p2;
+
+      /* update/redraw this square */
+
+      wr.w = main_handle;
+      wr.box.x0 = siz_btlft_w + mx * siz_blank_w;
+      wr.box.y0 = siz_bot_h + my * siz_blank_h;
+      wr.box.x1 = wr.box.x0 + siz_blank_w;
+      wr.box.y1 = wr.box.y0 + siz_blank_h;
+      NoErr(wimp_force_redraw(&wr));
+
+   }
+
+
+   if (p2 == Board_Mine)
+   {
+      /* Oh no! - have uncovered a mine! */
+
+      Level_dead = TRUE;
+      game__update_alive_field();
+
+      if (Sound_On)
+         game_playsound_failure();
+
+      game__show_all_mines(mx,my);
+   }
+
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+void  game__do_cascade(void)
+{
+   register int            cx, cy;
+   register unsigned char  p, pl, ph;
+   register int            uncovered = 0;
+   register int            rx0,ry0, rx1,ry1;
+
+
+   game__clear_table(Board_cascade2[0]);
+
+   rx0 = ry0 = 999;
+   rx1 = ry1 = -1;
+
+   for (cx = 0; cx < Level[Current_Level].width; cx++)
+   {
+      for (cy = 0; cy < Level[Current_Level].height; cy++)
+      {
+         if (Board_cascade1[cx][cy] == 0)
+            continue;                      /* not flagged for a cascade */
+
+         p  = Board[cx][cy];
+         ph = p & 0xf0;
+         pl = p & 0x0f;
+
+         if ((ph == Board_Covered) || (ph == Board_QMark))
+         {
+            int     tx,ty;
+
+
+            if (pl != Board_Mine)
+               Board[cx][cy] = pl;
+            else
+            {
+               /* Oh no! - have uncovered a mine! - you must have some incorrect flags (he he!) */
+
+               Board[cx][cy] = Board_BadMine;
+               Level_dead = TRUE;
+            }
+
+
+            Level_yet_to_be_uncovered--;  /* squares still covered */
+
+            uncovered++;
+
+            if (cx < rx0)
+               rx0 = cx;
+            if (cx > rx1)
+               rx1 = cx;
+            if (cy < ry0)
+               ry0 = cy;
+            if (cy > ry1)
+               ry1 = cy;
+
+
+            /*--- Cascade to the ones surrounding this square
+                  (if this one has no neighbouring mines)     ---*/
+
+            if (pl == 0)
+            {
+               for (tx = cx-1; tx <= cx+1; tx++)
+               {
+                  if ((tx < 0) || (tx >= Level[Current_Level].width))
+                     continue;
+
+                  for (ty = cy-1; ty <= cy+1; ty++)
+                  {
+                     if ((ty < 0) || (ty >= Level[Current_Level].height))
+                        continue;
+
+                     if ((tx == cx) && (ty == cy))
+                        continue;
+
+                     Board_cascade2[tx][ty] = 1;
+                  }
+               }
+            }
+
+         }
+
+      }
+   }
+
+
+   if (uncovered > 0)
+   {
+      wimp_redrawstr  wr;
+
+
+      /*--- ask for a redraw ---*/
+
+      wr.w = main_handle;
+      wr.box.x0 = siz_btlft_w + rx0 * siz_blank_w;
+      wr.box.y0 = siz_bot_h + ry0 * siz_blank_h;
+      wr.box.x1 = siz_btlft_w + (rx1+1) * siz_blank_w;
+      wr.box.y1 = siz_bot_h + (ry1+1) * siz_blank_h;
+      NoErr(wimp_force_redraw(&wr));
+
+
+      /*--- check for re-cascades (eliminating unnecessary ones) ---*/
+
+      uncovered = 0;
+
+      for (cx = 0; cx < Level[Current_Level].width; cx++)
+         for (cy = 0; cy < Level[Current_Level].height; cy++)
+         {
+            if (Board_cascade1[cx][cy] != 0)
+               Board_cascade1[cx][cy] = 0;    /* just done this square */
+            else
+            {
+               /* a square that needs to be 're-cascaded' */
+               if ((Board_cascade1[cx][cy] = Board_cascade2[cx][cy]) != 0)
+                  uncovered++;
+            }
+         }
+   }
+
+
+   if (uncovered == 0)
+      Cascade_pending = FALSE;
+
+
+   if (Level_dead == TRUE)
+   {
+      game__update_alive_field();
+
+      if (Sound_On)
+         game_playsound_failure();
+
+      game__show_all_mines(-1, -1);
+
+      Cascade_pending = FALSE;
+   }
+   
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+void  game_null_events(void)
+{
+
+   if ((!Level_started) || Level_dead || Level_finished)
+      return;
+
+
+   if ((Level_yet_to_be_uncovered == 0)
+       && (Level_flags_left == 0))
+   {
+      /* Board successfully completed - ta-da! */
+
+      Level_finished = TRUE;
+
+      game__update_alive_field();
+
+      if (Sound_On)
+         game_playsound_success();
+
+      /* Check whether Level_elapsed_time is a high score */
+
+      game_check_highscore(Level_elapsed_time/100);
+
+      return;
+   }
+
+
+   /* Check whether there is a 'cascade' pending */
+
+   if (Cascade_pending)
+      game__do_cascade();
+
+
+   /*--- check whether the timer needs to be updated ---*/
+
+   {
+      _kernel_swi_regs   regs;
+
+
+      _kernel_swi(OS_ReadMonotonicTime, &regs, &regs);
+
+      if (regs.r[0] > (Level_start_time + Level_elapsed_time + 100))
+      {
+         wimp_redrawstr  wr;
+    
+
+         Level_elapsed_time = ((regs.r[0] - Level_start_time) / 100) * 100;
+
+         /* update/redraw the timer */
+         wr.w = main_handle;
+         wr.box.x0 = Board_timer_xpos;
+         wr.box.y0 = Board_timer_ypos;
+         wr.box.x1 = wr.box.x0 + siz_digit_w * 3;
+         wr.box.y1 = wr.box.y0 + siz_digit_h;
+         NoErr(wimp_force_redraw(&wr));
+      }
+   }
+
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+static BOOL  game_customlevel_handler(dbox d, void *event, void *handle)
+{
+   wimp_eventstr  *e = wimpt_last_event();
+
+
+   if (e->e == wimp_EBUT)       /* mouse button pressed */
+   {
+      int     dir;
+      int     dw = 0;
+      int     dh = 0;
+      int     dm = 0;
+      int     i;
+
+
+      if ((e->data.but.m.bbits != wimp_BLEFT) && (e->data.but.m.bbits != wimp_BRIGHT))
+         return FALSE;
+
+      dir = (e->data.but.m.bbits == wimp_BLEFT) ? 1 : -1;
+
+      switch(e->data.but.m.i)
+      {
+         case 4: dw = -dir;    /* decrease width */
+                 break;
+         case 5: dw = dir;     /* increase width */
+                 break;
+         case 8: dh = -dir;    /* decrease height */
+                 break;
+         case 9: dh = dir;     /* increase height */
+                 break;
+         case 12: dm = -dir;   /* decrease mines */
+                  break;
+         case 13: dm = dir;    /* increase mines */
+                  break;
+         case 14:              /* auto mines */
+                  i = (Level[MAX_LEVELS].width * Level[MAX_LEVELS].height) * 16 / 100;
+                  dm = i - Level[MAX_LEVELS].mines;
+                  break;
+
+         default: return FALSE;
+      }
+
+      Level[MAX_LEVELS].width += dw;
+      Level[MAX_LEVELS].height += dh;
+      Level[MAX_LEVELS].mines += dm;
+
+
+      /* Check whether this size will fit on screen */
+
+      {
+         wimp_box    wb;
+         int         xs, ys;
+
+         read_screen_limits(&wb);
+         game_main_extent(MAX_LEVELS, &xs, &ys);
+
+         if ( (xs >= (wb.x1-wb.x0)) ||
+              ((ys+WINTITLE_HEIGHT) >= (wb.y1-wb.y0)) ||
+              (Level[MAX_LEVELS].width < 8) ||
+              (Level[MAX_LEVELS].width > MAX_WIDTH) ||
+              (Level[MAX_LEVELS].height < 2) ||
+              (Level[MAX_LEVELS].height > MAX_HEIGHT) ||
+              (Level[MAX_LEVELS].mines < 1) ||
+              (Level[MAX_LEVELS].mines > (Level[MAX_LEVELS].width * Level[MAX_LEVELS].height)) ||
+              (Level[MAX_LEVELS].mines > 999) )
+         {
+            /* Too big - put the width and height back how they were and exit */
+            Level[MAX_LEVELS].width -= dw;
+            Level[MAX_LEVELS].height -= dh;
+            Level[MAX_LEVELS].mines -= dm;
+            return TRUE;
+         }
+      }
+
+
+      /* Size will fit OK, update the window */
+
+      if (dw)  dbox_setnumeric(d, 3, Level[MAX_LEVELS].width);
+      if (dh)  dbox_setnumeric(d, 7, Level[MAX_LEVELS].height);
+      if (dm)  dbox_setnumeric(d, 11, Level[MAX_LEVELS].mines);
+
+      return TRUE;
+   }
+   else 
+   {
+      help_dboxrawevents(d, e, "CUST");     /* check for help events */
+   }
+
+
+   return FALSE;
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+static void  game_custom_level(void)
+/* Display the program info box - called from the menu processor. */
+{
+   dbox  d;  /* Dialogue box handle */
+   int   f;
+
+
+   /* Create the dialogue box */
+   if (d = dbox_new("Custom"), d != NULL)
+   {
+      /* Put correct language text in window icons etc */
+
+      strcpy(tmp_str, msgs_lookup("CLtitle:Custom level"));
+      win_settitle(dbox_syshandle(d), tmp_str);
+
+      strcpy(tmp_str, msgs_lookup("CLwidth:Width"));
+      dbox_setfield(d, 2, tmp_str);
+      dbox_setnumeric(d, 3, Level[Current_Level].width);
+      Level[MAX_LEVELS].width = Level[Current_Level].width;
+
+      strcpy(tmp_str, msgs_lookup("CLheight:Height"));
+      dbox_setfield(d, 6, tmp_str);
+      dbox_setnumeric(d, 7, Level[Current_Level].height);
+      Level[MAX_LEVELS].height = Level[Current_Level].height;
+
+      strcpy(tmp_str, msgs_lookup("CLmines:Mines"));
+      dbox_setfield(d, 10, tmp_str);
+      dbox_setnumeric(d, 11, Level[Current_Level].mines);
+      Level[MAX_LEVELS].mines = Level[Current_Level].mines;
+
+      strcpy(tmp_str, msgs_lookup("CLauto:Auto mines"));
+      dbox_setfield(d, 14, tmp_str);
+
+      dbox_raw_eventhandler(d, game_customlevel_handler, NULL);
+
+      /* Show the dialogue box */
+      dbox_show(d);
+
+      /* Keep it on the screen as long as needed */
+      while ((f = dbox_fillin(d)) != dbox_CLOSE)
+      {
+         if (f == 1)
+         {
+            /* OK clicked */
+
+            Current_Level = MAX_LEVELS;       /* select the custom level */
+            game_set_board_size();
+            game_level_init();
+            game_update_menu();
+
+            if (!dbox_persist())
+               break;
+         }
+      }
+
+      /* Dispose of the dialogue box */
+      dbox_dispose(&d);
+   }
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+void  game_menuproc(void *handle, char *hit)
+{
+
+   switch (hit[0])
+   {
+
+      case 1:  /* New game */
+         game_level_init();
+         break;
+
+         /*--------*/
+
+      case 2: /* level */
+         if (hit[1])
+         {
+            if ((hit[1]-1) == MAX_LEVELS)   /* custom level */
+            {
+               /* Only allow going into dialogue box,
+                  Clickin on 'Custom' menu item is not allowed */
+
+               if (hit[2] != 0)
+                  game_custom_level();
+               break;
+            }
+
+            if ((hit[1]-1) != Current_Level)
+            {
+               Current_Level = hit[1]-1;
+               game_set_board_size();
+               game_level_init();
+            }
+         }
+         break;
+
+         /*--------*/
+
+#if 0
+      case 3: /* low density */
+         Few_Neighbours = !Few_Neighbours;
+         break;
+#endif
+
+         /*--------*/
+
+      case 3: /* question marks */
+         Qmarks_On = !Qmarks_On;
+         break;
+
+         /*--------*/
+
+      case 4: /* 'safe corners' flag */
+         SafeCorners_On = !SafeCorners_On;
+         break;
+
+         /*--------*/
+
+      case 5: /* sound */
+         if (hit[1] == 0)
+            Sound_On = !Sound_On;
+         else
+         {
+            Sound_Level = (hit[1] == 1) ? SOUND_QUIET : SOUND_LOUD;
+            Sound_On = TRUE;
+         }
+         break;
+
+         /*--------*/
+
+      case 6: /* high score */
+         if (hit[1] == 2) /* reset high scores (by deleting the file) */
+         {
+            strcpy(tmp_str, "<Choices$Write>.MineHunt.Highscores");
+
+            if (highscore_save_always)
+               remove(tmp_str);
+
+            game_reset_highscores();
+            if (highscore_open)
+               game_show_highscores();
+         }
+         else
+         {
+            game_read_highscores();
+            game_show_highscores();
+         }
+         break;
+   }
+
+   game_update_menu();
+
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+int  game_mode_change(void)
+{
+   /* Returns:
+      1 if the window size has changed (level has been altered)
+      2 if all levels are too big for this screen mode
+   */
+
+   os_error  oe;
+
+
+   game_levels_available();
+   game_update_menu();
+
+
+   if (!Level[Current_Level].available)     /* If current level too big... */
+   {
+      /* Find a level that is available */
+
+      int     newlevel = Current_Level;
+
+      while ((newlevel >= 0) && (!Level[newlevel].available))
+         newlevel--;
+
+
+      if (newlevel < 0)
+      {
+         /* New screen mode is too small even for lowest level game window.. */
+         oe.errnum = 42;
+         strncpy(oe.errmess, msgs_lookup("cantopen:Sorry, screen mode is too small for game window."), 251);
+         oe.errmess[251] = '\0';
+         wimp_reporterror(&oe, (wimp_errflags)(wimp_ENOERRORFROM | wimp_EOK),
+                          msgs_lookup("reportt:Message from Mine Hunt"));
+
+         if (main_open)
+         {
+            wimpt_noerr(wimp_close_wind(main_handle));
+            main_open = FALSE;
+         }
+
+         return 2;
+      }
+
+
+      Current_Level = newlevel;
+      game_update_menu();
+
+      if (main_open)
+      {
+         /* tell them that the level has changed.. */
+         oe.errnum = 42;
+         strncpy(oe.errmess, msgs_lookup("modechg:A lower level is being selected because the current board is too big for this new mode."), 251);
+         oe.errmess[251] = '\0';
+         wimp_reporterror(&oe, (wimp_errflags)(wimp_ENOERRORFROM | wimp_EOK),
+                          msgs_lookup("reportt:Message from Mine Hunt"));
+
+         game_set_board_size();
+         game_level_init();
+      }
+
+      return 1;
+   }
+
+
+   game_update_menu();
+
+   return 0;
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+void  game_quitting(void)
+{
+
+   if ((highscore_changed) && (!highscore_save_always))
+   {
+      os_error     oe;
+      os_filestr   osf;
+
+
+      oe.errnum = 42;
+      strncpy(oe.errmess, msgs_lookup("endsave:About to save the modified high score table..."), 251);
+      oe.errmess[251] = '\0';
+      wimp_reporterror(&oe, (wimp_errflags)(wimp_ENOERRORFROM | wimp_EOK),
+                       msgs_lookup("reportt:Message from Mine Hunt"));
+
+      strcpy(tmp_str, "<Choices$Write>.MineHunt");
+      osf.action   = 8;          /* create directory */
+      osf.name     = tmp_str;
+      osf.start    = 0;          /* default number of entries */
+      os_file(&osf);
+
+      strcat(tmp_str, ".HighScores");
+
+      osf.action   = 10;         /* save a block of memory */
+      osf.name     = tmp_str;
+      osf.loadaddr = 0xffd;      /* for r0 = 10, r2 = filetype */
+      osf.start    = (int)highscore_table;
+      osf.end      = osf.start + sizeof(highscore_table);
+      os_file(&osf);
+   }
+
+
+   os_cli("RMKill Applause");
+   os_cli("RMKill TryAgain");
+
+   os_cli("RMKill Spiffing");
+   os_cli("RMKill YouDidIt");
+   os_cli("RMKill Shame");
+   os_cli("RMKill RealMine");
+
+
+   os_swi1(os_X | Sound_Volume, Sound_OldVolume);
+
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+void  game_save_choices(void)
+{
+   char         opts[6];
+   os_filestr   osf;
+
+
+   /* write out current level */
+   if (Current_Level < MAX_LEVELS)
+      opts[0] = '0' + Current_Level;
+   else
+      opts[0] = '0';
+
+   /* sound on/off */
+   opts[1] = (Sound_On) ? 'S' : 's';
+
+   /* sound level */
+   opts[2] = (Sound_Level == SOUND_LOUD) ? 'L' : 'Q';
+
+   /* quextion marks on/off */
+   opts[3] = (Qmarks_On) ? '?' : '-';
+
+   /* LED colour */
+   opts[4] = '0' + LED_Colour;
+
+   /* safe corners flag */
+   opts[5] = (SafeCorners_On) ? 'C' : 'c';
+
+   strcpy(tmp_str, "<Choices$Write>.MineHunt");
+
+   osf.action   = 8;          /* create directory */
+   osf.name     = tmp_str;
+   osf.start    = 0;          /* default number of entries */
+   os_file(&osf);
+
+   strcat(tmp_str, ".Choices");
+   
+   osf.action   = 10;         /* save a block of memory */
+   osf.name     = tmp_str;
+   osf.loadaddr = 0xffd;      /* for r0 = 10, r2 = filetype */
+   osf.start    = (int)opts;
+   osf.end      = osf.start + sizeof(opts);
+   os_file(&osf);
+
+}
+
+
+
+/*--------------------------------------------------------------------------*/
+
+
+
+void  game_load_choices(void)
+{
+   char         opts[6];
+   os_filestr   osf;
+
+
+   memset(opts, 0, sizeof(opts));
+
+
+   strcpy(tmp_str, "Choices:MineHunt.Choices");
+
+
+   /* Check the size of the choices file */
+   osf.action = 5;               /* Get catalogue info */
+   osf.name   = tmp_str;
+   if (os_file(&osf) != NULL)
+      return;
+   if (osf.action != 1)
+      return;
+
+   if ((osf.loadaddr & 0xFFF00000) != 0xFFF00000)
+      return;
+
+   if (osf.start > 6)     /* check length */
+      return;
+
+
+   /* load the choices file */
+   osf.action   = 16;         /* load a block of memory */
+   osf.name     = tmp_str;
+   osf.loadaddr = (int)opts;
+   osf.execaddr = 0;          /* to load at address in r2 */
+   if (os_file(&osf) != NULL)
+      return;
+
+
+   /* read default level */
+   if (opts[0] == '\0')
+      return;
+   Current_Level = opts[0] - '0';
+
+   /* sound on/off */
+   if (opts[1] == '\0')
+      return;
+   Sound_On = (opts[1] == 'S');
+
+   /* sound level */
+   if (opts[2] == '\0')
+      return;
+   if (opts[2] == 'L')
+      Sound_Level = SOUND_LOUD;
+   else
+      Sound_Level = SOUND_QUIET;
+
+   /* question marks on/off */
+   if (opts[3] == '\0')
+      return;
+   Qmarks_On = (opts[3] == '?');
+
+   /* LED colour */
+   if (opts[4] == '\0')
+      return;
+   LED_Colour = opts[4] - '0';
+
+   /* safe corners flag */
+   SafeCorners_On = (opts[5] == 'C');
+
+}
+
+
+
+/*--------------------------------------------------------------------------*/

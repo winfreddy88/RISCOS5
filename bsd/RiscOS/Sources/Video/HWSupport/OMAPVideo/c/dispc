@@ -1,0 +1,473 @@
+/*
+ * Copyright (c) 2010, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include <string.h>
+#include "Global/RISCOS.h"
+#include "Global/HALEntries.h"
+#include "Global/GraphicsV.h"
+#include "swis.h"
+
+#include "DebugLib/DebugLib.h"
+
+#include "dispc.h"
+#include "dsi.h"
+#include "graphicsv.h"
+#include "dss.h"
+#include "regs.h"
+#include "consts.h"
+#include "utils.h"
+#include "vars.h"
+#include "globals.h"
+
+/* Scaling coefficients, from the TRM (spruf98d, section 15.6.1.3.5)
+   The values are packed into the registers as follows:
+   * The H registers contain HC0,HC1,HC2,HC3 (low byte to high)
+   * The HV registers contain HC4,VC0,VC1,VC2
+   * The V registers contain VC00, VC22 (which correspond to HC0 and HC4)
+   Corrections have been applied to make sure all table rows sum to 128
+*/
+
+static const int8_t upscale_3tap[8][3] =
+{
+/*	VC2	VC1	VC0 */
+	{0,	(int8_t)128,0}, /* Note: Although 128 causes an overflow, apparently that's OK! */
+	{3,	123,	2},
+	{12,	111,	5},
+	{32,	89,	7},
+	{0,	64,	64},
+	{7,	89,	32},
+	{5,	111,	12},
+	{2,	123,	3},
+};
+
+static const int8_t upscale_5tap[8][5] =
+{
+/* HC4/VC22	HC3/VC2	HC2/VC1	HC1/VC0	HC0/VC00 */
+	{0,	0,	(int8_t)128,0,	0},
+	{-1,	13,	124,	-8,	0},
+	{-2,	30,	112,	-11,	-1},
+	{-5,	51,	95,	-11,	-2},
+	{0,	-9,	73,	73,	-9},
+	{-2,	-11,	95,	51,	-5},
+	{-1,	-11,	112,	30,	-2},
+	{0,	-8,	124,	13,	-1},
+};
+
+static const int8_t downscale_3tap[8][3] =
+{
+/*	VC2	VC1	VC0 */
+	{36,	56,	36},
+	{40,	57,	31},
+	{45,	56,	27},
+	{50,	55,	23},
+	{18,	55,	55},
+	{23,	55,	50},
+	{27,	56,	45},
+	{31,	57,	40},
+};
+
+static const int8_t downscale_5tap[8][5] =
+{
+/* HC4/VC22	HC3/VC2	HC2/VC1	HC1/VC0	HC0/VC00 */
+	{0,	36,	56,	36,	0},
+	{4,	40,	55,	31,	-2},
+	{8,	44,	54,	27,	-5},
+	{12,	48,	53,	22,	-7},
+	{-9,	17,	52,	51,	17},
+	{-7,	22,	53,	48,	12},
+	{-5,	27,	54,	44,	8},
+	{-2,	31,	55,	40,	4},
+};
+
+/* For each register, for each 3/5 tap config, and whether it's H or V scaling, the byte offsets within the above table rows to grab the data from */
+static const uint32_t h_coefficient_offsets[3] = { /* 5-tap only */
+	0x01020304, /* H */
+	0xffffff00, /* HV */
+	0xffffffff, /* V */
+};
+
+static const uint32_t v_coefficient_offsets[2][3] =
+{
+	{ /* 3-tap */
+		0xffffffff, /* H */
+		0x000102ff, /* HV */
+		0xffffffff, /* V */
+	},
+	{ /* 5-tap */
+		0xffffffff, /* H */
+		0x010203ff, /* HV */
+		0xffff0004, /* V */
+	},
+};
+
+static uint32_t grab_coef_bytes(uint32_t offsets,const uint8_t *bytes)
+{
+	uint32_t out=0;
+	for(int byte=0;byte<4;byte++)
+	{
+		out = out<<8;
+		uint32_t offset = offsets>>24;
+		if(offset != 0xff)
+			out |= bytes[offset];
+		offsets = offsets<<8;
+	}
+	return out;
+}
+
+void dispc_program_vid_scale_coefficients(volatile struct fir_coef *coef, volatile uint32_t *coef_v,int h_upscale,int v_upscale,int v5tap)
+{
+	const uint32_t *h_coef_offsets = h_coefficient_offsets;
+	const uint32_t *v_coef_offsets = v_coefficient_offsets[v5tap];
+	const uint8_t *h_coef_table = (const uint8_t *) (h_upscale?upscale_5tap:downscale_5tap);
+	const uint8_t *v_coef_table = (v_upscale?(v5tap?(const uint8_t *) upscale_5tap:(const uint8_t *) upscale_3tap):(v5tap?(const uint8_t *) downscale_5tap:(const uint8_t *) downscale_3tap));
+	for(int phase=0;phase<8;phase++)
+	{
+		coef[phase].h = grab_coef_bytes(h_coef_offsets[0],h_coef_table);
+		coef[phase].hv = grab_coef_bytes(h_coef_offsets[1],h_coef_table) | grab_coef_bytes(v_coef_offsets[1],v_coef_table);
+		if(v5tap)
+		{
+			coef_v[phase] = grab_coef_bytes(v_coef_offsets[2],v_coef_table);
+			v_coef_table += 5;
+		}
+		else
+			v_coef_table += 3;
+		h_coef_table += 5;
+	}
+}
+
+static bool dispc_get_lloverlaycfg(const overlaycfg_t *o,lloverlaycfg_t *ll,const modelocked_t *modelocked,const irqlocked_t *irqlocked)
+{
+	if((o->target == TARGET_NONE) || !(o->ba) || !(o->enabled))
+		return false;
+	const irqlocked_head_t *head = &irqlocked->heads[o->target];
+	const modelocked_head_t *state = &modelocked->heads[o->target];
+	if(head->blanked || !state->enabled)
+		return false;
+	uint32_t interlaceoffset = (state->interlaced?o->stride:0);
+	int32_t x = o->x + state->x;
+	int32_t y = o->y + state->y;
+	/* Calculate clipping rectangle */
+	int32_t clip[4];
+	uint8_t interlace = (interlaceoffset ? 1 : 0);
+	clip[0] = MAX(x+o->clip[0],0);
+	clip[1] = MAX(y+o->clip[1],0);
+	clip[2] = MIN(x+o->clip[2],state->mode.width);
+	clip[3] = MIN(y+o->clip[3],state->mode.height << interlace);
+	if (o->desktopclip)
+	{
+		clip[0] = MAX(clip[0],state->x);
+		clip[1] = MAX(clip[1],state->y);
+		clip[2] = MIN(clip[2],state->x+state->dw);
+		clip[3] = MIN(clip[3],state->y+state->dh);
+	}
+	if ((clip[0] >= clip[2]) || (clip[1] >= clip[3]))
+		return false;
+	/* Crop to screen */
+	int32_t dispw = o->scaled_w;
+	int32_t disph = o->scaled_h;
+	if ((dispw <= 0) || (disph <= 0))
+		return false;
+	int32_t bufw = o->buf_w;
+	int32_t bufh = o->buf_h;
+	int32_t fir_x = CALC_FIR(bufw,dispw);
+	int32_t fir_y = CALC_FIR(bufh,disph);
+	int32_t accui_x = 0;
+	int32_t accui_y = 0;
+	uint32_t ba_x_offset = 0;
+	uint32_t ba_y_offset = 0;
+	uint32_t bpp = pixel_format_bpp[o->format];
+	uint32_t alignment = buffer_alignment_pixels[o->format];
+	uint8_t extra_flags = headattrs[o->target].formats[o->format].extra_flags;
+	/* YUV with 90/270 rotation needs to be treated as 32bpp for some of these adjustments to be correct */
+	bool awkward_yuv = (o->rotation & 1) && (bpp==16) && (alignment==1);
+	if(awkward_yuv)
+	{
+		bpp = 32;
+		alignment = 0; /* Also means we don't have to worry about X alignment */
+	}
+	int32_t excess = clip[0]-x;
+	if(excess > 0)
+	{
+		/* FIR register gives number of buffer pixels per screen pixel
+		   So we can easily use it to convert screen pixels (x) back to corresponding number of buffer pixels
+		   The low bits of the result can be used to generate the accumulator initialisation value */
+		accui_x = excess*fir_x;
+		int32_t crop = accui_x >> 10;
+		/* If cropping would result in an unaligned buffer, increase the amount we're cropping by, while still maintaining the position of each pixel
+		   This will result in column(s) being lost from the left of the screen */
+		int32_t x2=clip[0];
+		while (crop & alignment)
+		{
+			x2++;
+			excess++;
+			accui_x = excess*fir_x;
+			crop = accui_x >> 10;
+		}
+		dispw -= excess;
+//		bufw -= crop;
+		ba_x_offset = (crop*bpp)>>3;
+		x = x2;
+	}
+	excess = clip[1]-y;
+	if(excess > 0)
+	{
+		accui_y = excess*fir_y;
+		int32_t crop = accui_y >> 10;
+		/* Awkward YUV is awkward. */
+		uint32_t y2=clip[1];
+		if (awkward_yuv || (extra_flags & EXTRAFLAG_PLANAR))
+		{
+			while (crop & 1)
+			{
+				y2++;
+				excess++;
+				accui_y = excess*fir_y;
+				crop = accui_y >> 10;
+			}
+		}
+		disph -= excess;
+//		bufh -= crop;
+		if (awkward_yuv)
+		{
+			crop>>=1;
+		}
+		ba_y_offset += crop*o->stride;
+		y = y2;
+	}
+	/* The ACCUI values need biasing for things to work correctly
+	   And for OMAP4 (which has larger ACCUI register range), truncate to be within range of 1 pixel */
+	accui_x = (accui_x & 1023) - 512;
+	accui_y = (accui_y & 1023) - 512;
+	int32_t accui_y2 = accui_y;
+	if(interlaceoffset)
+	{
+		y = y>>1;
+//		bufh = bufh>>1;
+		disph = disph>>1;
+		accui_y2 += fir_y;
+		clip[3] = clip[3]>>1;
+	}
+	excess = (x+dispw) - clip[2];
+	if(excess > 0)
+	{
+		int32_t crop = (excess*fir_x) >> 10;
+		while (crop & alignment)
+		{
+			excess++;
+			crop = (excess*fir_x) >> 10;
+		}
+		dispw -= excess;
+//		bufw -= crop;
+	}
+	excess = (y+disph) - clip[3];
+	if(excess > 0)
+	{
+		disph -= excess;
+//		bufh -= (excess*fir_y) >> 10;
+	}
+	/* Recalculate the buffer width & height from the display size
+	   This is necessary to avoid various rounding errors that can occur above (rounding errors which can make the hardware unhappy) */
+	dispw++;
+	do {
+		/* TODO: For large downscale values, sometimes this ends up cropping by a large amount. Need to try and avoid this (allow the unaligned buffer?) */
+		dispw--;
+		bufw = (1023+dispw*fir_x)>>10;
+	} while (bufw & alignment);
+	bufh = (1023+disph*fir_y)>>10;
+	if((dispw<=0) || (disph<=0) || (bufw<=0) || (bufh<=0))
+		return false;
+#if OMAP==3
+	/* Visible width/height of 1 divides FIR values by two, for some reason */
+	if ((dispw == 1) && (fir_x != 1024))
+	{
+		fir_x >>= 1;
+	}
+	if ((disph == 1) && (fir_y != 1024))
+	{
+		fir_y >>= 1;
+	}
+#endif
+#if OMAP==4
+	/* OMAP4 struggles if an upscaled image has only one row/column (of the original buffer) visible
+	   For now, take the safe way out and hide the overlay */
+	if (((fir_x < 1024) && (bufw < 2)) || ((fir_y < 1024) && (bufh < 2)))
+	{
+		return false;
+	}
+#endif
+	ll->format = o->format;
+	ll->target = o->target;
+	ll->rotation = o->rotation;
+	ll->highprio = o->highprio;
+	ll->v5tap = o->v5tap;
+	ll->ba[0] = o->ba+ba_x_offset+ba_y_offset+interlaceoffset;
+	ll->ba[1] = o->ba+ba_x_offset+ba_y_offset;
+	if (extra_flags & EXTRAFLAG_PLANAR)
+	{
+		ll->ba_uv[0] = o->ba_uv+ba_x_offset+(ba_y_offset>>1)+interlaceoffset;
+		ll->ba_uv[1] = o->ba_uv+ba_x_offset+(ba_y_offset>>1);
+	}
+	ll->position = (x<<OVERLAY_POSITION_X_SHIFT) | (y<<OVERLAY_POSITION_Y_SHIFT);
+	ll->size = ((dispw-1)<<OVERLAY_SIZE_X_SHIFT) | ((disph-1)<<OVERLAY_SIZE_Y_SHIFT);
+	ll->row_inc = (o->stride+1+interlaceoffset)-((bufw*bpp)>>3);
+	ll->pic_size = ((bufw-1)<<OVERLAY_SIZE_X_SHIFT) | ((bufh-1)<<OVERLAY_SIZE_Y_SHIFT);
+	ll->fir = (fir_x<<VID_OVERLAY_FIR_HINC_SHIFT) | (fir_y<<VID_OVERLAY_FIR_VINC_SHIFT);
+	ll->accui[0] = ((accui_x<<VID_OVERLAY_ACCUI_HACC_SHIFT) & VID_OVERLAY_ACCUI_HACC_MASK) | ((accui_y<<VID_OVERLAY_ACCUI_VACC_SHIFT) & VID_OVERLAY_ACCUI_VACC_MASK);
+	ll->accui[1] = ((accui_x<<VID_OVERLAY_ACCUI_HACC_SHIFT) & VID_OVERLAY_ACCUI_HACC_MASK) | ((accui_y2<<VID_OVERLAY_ACCUI_VACC_SHIFT) & VID_OVERLAY_ACCUI_VACC_MASK);
+	return true;
+}
+
+void dispc_update_overlay(overlayidx idx,const modelocked_t *modelocked,const irqlocked_t *irqlocked)
+{
+	if (idx == OVERLAY_MAX)
+	{
+		return;
+	}
+	lloverlaycfg_t ll;
+	const overlaycfg_t *o = &irqlocked->overlays[idx];
+//	dprintf(("","ovl %d: target %d w %d h %d ba %08x\n",idx,o->target,o->width,o->height,o->ba));
+	/* Update overlay */
+	if(dispc_get_lloverlaycfg(o,&ll,modelocked,irqlocked))
+		(overlayattrs[idx].enable)(idx,&ll);
+	else
+		(overlayattrs[idx].disable)(idx);
+}
+
+void dispc_change_pixelrate(uint32_t pixelrate,volatile uint32_t *dispc_config,volatile uint32_t *dispc_control)
+{
+	if(*dispc_control & DISPC_CONTROL_LCDENABLE)
+	{
+		dprintf(("","Disabling LCD prior to update\n"));
+		/* -1. TODO - Should this be done irrespective of LCDENABLE state? */
+		/* 0. TODO - Disable external chip? */
+		/* 1. Disable all pipelines - should already be handled */
+		/* 2. Disable HSync, VSync, pixel data, AC bias */
+		*dispc_config |= DISPC_CONFIG_PIXELGATED | DISPC_CONFIG_HSYNCGATED | DISPC_CONFIG_VSYNCGATED | DISPC_CONFIG_ACBIASGATED;
+		/* 3. Force an update */
+		/* TODO - Should schedule update for TV as well? */
+		*dispc_control |= DISPC_CONTROL_GOLCD;
+		/* 4. Wait */
+		int timeout=100000000;
+		while((*dispc_control & DISPC_CONTROL_GOLCD) && --timeout) {};
+		if(!timeout)
+		{
+			dprintf(("","dispc_change_pixelrate: Timeout waiting for DISPC_CONTROL_GOLCD clear\n"));
+		}
+		/* 5. Disable LCD */
+		*dispc_control &= ~DISPC_CONTROL_LCDENABLE;
+		/* X. Wait for FRAMEDONE bit (according to most other docs) */
+		/* TODO - Except we can't be sure that we've received it before or after we cleared LCDENABLE! Need to do it from an interrupt routine? */
+		/* 6. Disable free-running clock
+		      (not necessary - seems to be an SDI-only thing) */
+	}
+
+	/* 7-23. Reprogram PLL */
+	dsi_pll_program_for_dispc(pixelrate);
+}
+
+void dispc_getmode(const lcdtimings_t *timings,dispcmode_t *dm)
+{
+	const lcdconfig_t *config = &hwconfig->lcd_configs[current_lcd];
+	/* Build appropriate DISPC_CONTROL value */
+	uint32_t control = dm->control & (DISPC_CONTROL_DIGITALENABLE | DISPC_CONTROL_GODIGITAL);
+	switch(config->lcd_type)
+	{
+	case LCD_TFT:
+		control |= DISPC_CONTROL_STNTFT;
+		switch(config->dsi_bpp)
+		{
+		case 12:
+			control |= DISPC_CONTROL_TFTDATALINES_12BPP;
+			break;
+		case 16:
+			control |= DISPC_CONTROL_TFTDATALINES_16BPP;
+			break;
+		case 18:
+			control |= DISPC_CONTROL_TFTDATALINES_18BPP;
+			break;
+		case 24:
+			control |= DISPC_CONTROL_TFTDATALINES_24BPP;
+			break;
+		/* else error? */
+		}
+		break;
+	case LCD_STN_COLOUR:
+		control |= 0;
+		break;
+	case LCD_STN_MONO4:
+		control |= DISPC_CONTROL_MONOCOLOR;
+		break;
+	case LCD_STN_MONO8:
+		control |= DISPC_CONTROL_MONOCOLOR | DISPC_CONTROL_M8B;
+		break;
+	/* else error? */
+	}
+	/* Program display timings */
+	dm->size_lcd = ((timings->width-1)<<DISPC_SIZE_LCD_PPL_SHIFT) | ((timings->height-1)<<DISPC_SIZE_LCD_LPP_SHIFT); /* 1-based */
+	dm->timing_h = ((timings->hsw-1)<<DISPC_TIMING_H_HSW_SHIFT) | ((timings->hfp-1)<<DISPC_TIMING_H_HFP_SHIFT) | ((timings->hbp-1)<<DISPC_TIMING_H_HBP_SHIFT); /* All 1-based */
+	dm->timing_v = ((timings->vsw-1)<<DISPC_TIMING_V_VSW_SHIFT) | (timings->vfp<<DISPC_TIMING_V_VFP_SHIFT) | (timings->vbp<<DISPC_TIMING_V_VBP_SHIFT); /* Only VSW is 1-based! */
+	uint32_t pol_freq;
+	pol_freq = config->acbias_freq << DISPC_POL_FREQ_ACB_SHIFT;
+	if(config->flags & LCDCONFIG_RF)
+		pol_freq |= DISPC_POL_FREQ_RF;
+	if(config->flags & LCDCONFIG_IEO)
+		pol_freq |= DISPC_POL_FREQ_IEO;
+	if(config->flags & LCDCONFIG_IPC)
+		pol_freq |= DISPC_POL_FREQ_IPC;
+	if(timings->syncpol & SyncPol_InvertHSync)
+		pol_freq |= DISPC_POL_FREQ_IHS;
+	if(timings->syncpol & SyncPol_InvertVSync)
+		pol_freq |= DISPC_POL_FREQ_IVS;
+	dm->pol_freq = pol_freq;
+	dm->control = control;
+}
+
+uint32_t bandwidth_estimate(const overlaycfg_t *o,const modelocked_t *modelocked)
+{
+	if (o->target == TARGET_NONE)
+	{
+		return 0;
+	}
+	/* Estimate bits per screen pixel */
+	int32_t fir_x = CALC_FIR(o->buf_w,o->scaled_w);
+	int32_t fir_y = CALC_FIR(o->buf_h,o->scaled_h);
+	uint32_t bpsp = pixel_format_bpp[o->format]*fir_x;
+	if (fir_y >= 1024)
+	{
+		/* Downscale */
+		bpsp = bpsp*fir_y;
+	}
+	else
+	{
+		/* Upscale - assume there's a line buffer so it doesn't need to read two lines at once? */
+		bpsp = bpsp*1024;
+	}
+	/* Total number of bits per second */
+	uint64_t bps = ((uint64_t) bpsp)*((uint64_t) modelocked->heads[o->target].mode.pixelrate);
+	/* Convert down to KB/s */
+	return (uint32_t) (bps >> (10+10+10+3));
+}

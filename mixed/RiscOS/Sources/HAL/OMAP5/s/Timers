@@ -1,0 +1,201 @@
+; Copyright 2015 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:Machine.<Machine>
+        GET     Hdr:ImageSize.<ImageSize>
+        $GetIO
+
+        GET     Hdr:OSEntries
+        GET     Hdr:HALEntries
+
+        GET     hdr.omap543x
+        GET     hdr.StaticWS
+        GET     hdr.Timers
+        GET     hdr.PRCM
+
+        AREA    |Asm$$Code|, CODE, READONLY, PIC
+
+        EXPORT  HAL_Timers
+        EXPORT  HAL_TimerDevice
+        EXPORT  HAL_TimerGranularity
+        EXPORT  HAL_TimerMaxPeriod
+        EXPORT  HAL_TimerSetPeriod
+        EXPORT  HAL_TimerPeriod
+        EXPORT  HAL_TimerReadCountdown
+        EXPORT  HAL_TimerIRQClear
+
+        EXPORT  HAL_CounterRate
+        EXPORT  HAL_CounterPeriod
+        EXPORT  HAL_CounterRead
+        EXPORT  HAL_CounterDelay
+
+        EXPORT  Timer_Init
+
+        IMPORT  __rt_udiv10
+
+        MACRO
+        SetRegBits $r,$bits
+        LDR     a3, =$r
+        LDR     a4, =$bits
+        LDR     a2, [a1, a3]
+        ORR     a2, a2, a4
+        STR     a2, [a1, a3]
+        MEND
+
+Timer_Init
+        ; Make sure all the timers are actually enabled
+        LDR     a1, L4_CM_CORE_AON_Log
+        ADD     a1, a1, #ABE_CM_CORE_AON
+        MOV     a2, #2          ; enable module
+        STR     a2, [a1, #CM_ABE_GPTIMER5_CLKCTRL]
+        STR     a2, [a1, #CM_ABE_GPTIMER6_CLKCTRL]
+        STR     a2, [a1, #CM_ABE_GPTIMER7_CLKCTRL]
+        STR     a2, [a1, #CM_ABE_GPTIMER8_CLKCTRL]
+
+        ; Now reset each timer for good luck
+        LDR     a1, Timers_Log
+        MOV     a2, #TIMER_MAX
+        MOV     a3, #GPT_TIOCP_CFG_SOFTRESET
+Timer_Init_Loop
+        STR     a3, [a1,#GPT_TIOCP_CFG]
+        ; Wait for reset to complete
+Timer_Init_ResetLoop
+        LDR     a4, [a1,#GPT_TIOCP_CFG]
+        TST     a4, #GPT_TIOCP_CFG_SOFTRESET
+        BNE     Timer_Init_ResetLoop
+        ; smart idle
+        MOV     a4, #GPT_TIOCP_CFG_IDLEMODE_SMART
+        STR     a4, [a1,#GPT_TIOCP_CFG]
+        SUBS    a2, a2, #1
+        ADD     a1, a1, #TIMER_STRIDE
+        BNE     Timer_Init_Loop
+        MOV     pc, lr
+
+
+HAL_Timers
+        MOV     a1, #TIMER_MAX
+        MOV     pc, lr
+
+HAL_TimerDevice
+        CMP     a1, #TIMER_MAX
+        MVNHS   a1, #0          ; Error!
+        ADDLO   a1, a1, #TIMER_IRQ_BASE
+        MOV     pc, lr
+
+HAL_CounterRate
+HAL_TimerGranularity
+        LDR     a1, sys_clk
+        MOV     pc, lr
+
+HAL_TimerMaxPeriod
+        MVN     a1, #0  ; 32-bit timers
+        MOV     pc, lr
+
+HAL_TimerSetPeriod
+        CMP     a1, #TIMER_MAX
+        MOVHS   pc, lr
+        ; Get pointer to registers
+        LDR     a3, Timers_Log
+        ADD     a3, a3, a1, LSL #TIMER_STRIDE_POW2
+        ; Temporarily stop the timer to avoid unexpected shenanigans
+        LDR     a4, [a3, #GPT_TCLR]
+        BIC     a4, a4, #GPT_TCLR_ST    ; Stop timer
+        STR     a4, [a3, #GPT_TCLR]
+        ; If we actually wanted to stop the timer, we can exit now
+        CMP     a2, #0
+        MOVEQ   pc, lr
+        ; Else set up the timer to auto-reload
+        ; OMAP manual warns against writing &FFFFFFFF to the reload register,
+        ; so limit the timer interrupt frequency to TIMER_FREQUENCY/2
+        CMP     a2, #1
+        MOVEQ   a2, #2
+        RSB     a2, a2, #0
+        STR     a2, [a3, #GPT_TLDR]     ; Reload value set
+        STR     a2, [a3, #GPT_TCRR]     ; Timer current value set
+        MOV     a2, #GPT_IRQ_OVF        ; Enable overflow interrupt
+        STR     a2, [a3, #GPT_IRQENABLE_SET]
+        ; Re-enable the timer, in auto-reload mode
+        ORR     a4, a4, #(GPT_TCLR_ST + GPT_TCLR_AR)
+        STR     a4, [a3, #GPT_TCLR]
+        MOV     pc, lr
+
+HAL_CounterPeriod
+        MOV     a1, #0
+        ; Fall through
+
+HAL_TimerPeriod
+        CMP     a1, #TIMER_MAX
+        MOVHS   a1, #0
+        MOVHS   pc, lr
+        LDR     a2, Timers_Log
+        ADD     a2, a2, a1, LSL #TIMER_STRIDE_POW2
+        LDR     a1, [a2, #GPT_TCLR]
+        ANDS    a1, a1, #GPT_TCLR_ST    ; =0 if timer is stopped
+        LDRNE   a1, [a2, #GPT_TLDR]
+        ; if timer running, get reload value and invert to convert back to original input value
+        RSBNE   a1, a1, #0
+        MOV     pc, lr
+
+HAL_CounterRead
+        MOV     a1, #0
+        ; Fall through
+
+HAL_TimerReadCountdown
+        CMP     a1, #TIMER_MAX
+        MOVHS   a1, #0
+        LDRLO   a2, Timers_Log
+        ADDLO   a2, a2, a1, LSL #TIMER_STRIDE_POW2
+        LDRLO   a1, [a2, #GPT_TCRR]
+        RSBLO   a1, a1, #0
+        MOV     pc, lr
+
+; If they want n ticks, wait until we've seen n+1 transitions of the clock.
+; This function is limited to delays of around 223.6 seconds. Should be plenty!
+HAL_CounterDelay
+        LDR     a2, Timer_DelayMul
+        MUL     a1, a2, a1 ; Calculate required ticks*10
+        MOV     a4, lr
+        BL      __rt_udiv10 ; Actual required ticks
+        MOV     lr, a4
+        LDR     a4, Timers_Log ; Get timer 0
+        LDR     a2, [a4, #GPT_TCRR]
+        RSB     a2, a2, #0 ; Convert to countdown time for ease of reuse of Tungsten code
+10
+        LDR     a3, [a4, #GPT_TCRR]
+        RSB     a3, a3, #0
+        SUBS    ip, a2, a3              ; ip = difference in ticks
+        ADDLO   ip, a2, #1              ; if wrapped, must have had at least old latch+1 ticks
+        SUBS    a1, a1, ip
+        MOVLO   pc, lr
+        LDR     a2, [a4, #GPT_TCRR]
+        RSB     a2, a2, #0
+        SUBS    ip, a3, a2              ; ip = difference in ticks
+        ADDLO   ip, a3, #1              ; if wrapped, must have had at least old latch+1 ticks
+        SUBS    a1, a1, ip
+        BHS     %BT10
+        MOV     pc, lr
+
+HAL_TimerIRQClear
+        CMP     a1, #TIMER_MAX
+        LDRLO   a2, Timers_Log
+        MOVLO   a3, #7          ; Clear all interrupts
+        ADDLO   a1, a2, a1, LSL #TIMER_STRIDE_POW2
+        STRLO   a3, [a1, #GPT_IRQSTATUS]
+        MOV     pc, lr
+
+        END

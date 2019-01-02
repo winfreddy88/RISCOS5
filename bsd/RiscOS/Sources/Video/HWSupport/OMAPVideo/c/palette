@@ -1,0 +1,255 @@
+/*
+ * Copyright (c) 2010, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include <stddef.h>
+
+#include "palette.h"
+#include "mouse.h"
+#include "vars.h"
+
+#include "DebugLib/DebugLib.h"
+
+static uint32_t gfx_palette_ro[256]; /* A copy of the graphics palette in its original form, as received from RISC OS */
+
+static volatile uint32_t *gamma_table_reg = NULL;
+
+static uint32_t *gfx_palette_l; /* Graphics palette logical addr */
+uint32_t gfx_palette_p; /* Graphics palette physical addr */
+
+palette_func_t gfx_palette_func = NULL;
+
+/* Null palette func - does nothing except shift the RISC OS entry right 8 bits
+   Suitable for non-16bpp modes with CPR */
+static void palette_func_null(const uint32_t *entries,uint32_t idx,uint32_t count)
+{
+	if(idx >= 256)
+		return;
+	if(count > 256-idx)
+		count = 256-idx;
+	uint32_t *cache = &gfx_palette_ro[idx];
+	uint32_t *out = &gfx_palette_l[idx];
+	while(count--)
+	{
+		uint32_t val = *entries++;
+		*cache++ = val;
+		*out++ = val>>8;
+	}
+}
+
+/* R/B swap palette func - Swaps the R & B channels
+   Suitable for palettised modes with CPR disabled */
+static void palette_func_rbswap(const uint32_t *entries,uint32_t idx,uint32_t count)
+{
+	if(idx >= 256)
+		return;
+	if(count > 256-idx)
+		count = 256-idx;
+	uint32_t *cache = &gfx_palette_ro[idx];
+	uint32_t *out = &gfx_palette_l[idx];
+	while(count--)
+	{
+		uint32_t val = *entries++;
+		*cache++ = val;
+		val = ((val & 0xff00)<<8) | ((val & 0xff0000)>>8) | ((val & 0xff000000) >> 24);
+		*out++ = val;
+	}
+}
+
+/* Like palette_func_null, but writes to HW reg instead of RAM buffer */
+static void palette_func_null_reg(const uint32_t *entries,uint32_t idx,uint32_t count)
+{
+	if(idx >= 256)
+		return;
+	if(count > 256-idx)
+		count = 256-idx;
+	uint32_t *cache = &gfx_palette_ro[idx];
+	volatile uint32_t *out = gamma_table_reg;
+	while(count--)
+	{
+		uint32_t val = *entries++;
+		*cache++ = val;
+		*out = (val>>8) | (idx<<24);
+		idx++;
+	}
+}
+
+/* Like palette_func_rbswap, but writes to HW reg instead of RAM buffer */
+static void palette_func_rbswap_reg(const uint32_t *entries,uint32_t idx,uint32_t count)
+{
+	if(idx >= 256)
+		return;
+	if(count > 256-idx)
+		count = 256-idx;
+	uint32_t *cache = &gfx_palette_ro[idx];
+	volatile uint32_t *out = gamma_table_reg;
+	while(count--)
+	{
+		uint32_t val = *entries++;
+		*cache++ = val;
+		val = ((val & 0xff00)<<8) | ((val & 0xff0000)>>8) | ((val & 0xff000000) >> 24);
+		*out = val | (idx<<24);
+		idx++;
+	}
+}
+
+/* 555 palette func - Maps RISC OS 555 gamma table entries to OMAP 565 gamma table entries
+   Suitable for 16bpp modes with CPR for R/B swapping */
+static void palette_func_555_565(const uint32_t *entries,uint32_t idx,uint32_t count)
+{
+	if(idx >= 256)
+		return;
+	if(count > 256-idx)
+		count = 256-idx;
+	entries -= idx;
+	uint32_t *cache = gfx_palette_ro;
+	uint8_t *out = (uint8_t *) gfx_palette_l;
+	while(count--)
+	{
+		uint32_t val = entries[idx];
+		cache[idx] = val;
+		/* Remap the gamma table:
+		   RISC OS: xxB4B3B2B1B0G4G3G2G1G0R4R3R2R1R0
+		   OMAP:    B4B3B2B1B0G5G4G3G2G1G0R4R3R2R1R0
+		   We've got replication enabled, so after expansion it becomes:
+		   Blue:  xxB4B3B2B1xxB4B3
+		   Green: B0G4G3G2G1G0B0G4
+		   Red:   R4R3R2R1R0R4R3R2
+		    */
+		uint32_t red_val = (val>>8) & 0xff;
+		uint32_t green_val = (val>>16) & 0xff;
+		uint32_t blue_val = val>>24;
+		/* Red can be written as-is */
+		out[(idx<<2)] = red_val;
+		/* For green, we want to shift the index right one, and then shift bit 2 right one as well */
+		uint32_t green_idx = ((idx>>1) & 0x7c) | ((idx>>2) & 1);
+		/* Similar transform needed for blue */
+		uint32_t blue_idx = ((idx>>1) & 0x78) | ((idx>>2) & 3);
+		/* We need to write four entries with the same values. But because multiple values of idx map to the same green_idx & blue_idx, we only want to write some of the time.
+		   To spread it out evenly over the gamma table, we'll only write if the two bits we shifted off the bottom of idx match the two bits at the top */
+		if(!(((idx>>6) ^ idx) & 3))
+		{
+			out[(green_idx<<2)+1] = out[((green_idx+2)<<2)+1] = out[((green_idx+128)<<2)+1] = out[((green_idx+130)<<2)+1] = green_val;
+			out[(blue_idx<<2)+2] = out[((blue_idx+4)<<2)+2] = out[((blue_idx+128)<<2)+2] = out[((blue_idx+132)<<2)+2] = blue_val;
+		}
+		idx++;
+	}
+}
+
+/* 555 palette func - Maps RISC OS 555 gamma table entries to OMAP 565 gamma table entries
+   Suitable for 16bpp modes with CPR disabled */
+static void palette_func_555_565_rbswap(const uint32_t *entries,uint32_t idx,uint32_t count)
+{
+	if(idx >= 256)
+		return;
+	if(count > 256-idx)
+		count = 256-idx;
+	entries -= idx;
+	uint32_t *cache = gfx_palette_ro;
+	uint8_t *out = (uint8_t *) gfx_palette_l;
+	while(count--)
+	{
+		uint32_t val = entries[idx];
+		cache[idx] = val;
+		/* As above, but swap red & blue when extracting from 'val' */
+		uint32_t red_val = val>>24;
+		uint32_t green_val = (val>>16) & 0xff;
+		uint32_t blue_val = (val>>8) & 0xff;
+		/* Red can be written as-is */
+		out[(idx<<2)] = red_val;
+		/* For green, we want to shift the index right one, and then shift bit 2 right one as well */
+		uint32_t green_idx = ((idx>>1) & 0x7c) | ((idx>>2) & 1);
+		/* Similar transform needed for blue */
+		uint32_t blue_idx = ((idx>>1) & 0x78) | ((idx>>2) & 3);
+		/* We need to write four entries with the same values. But because multiple values of idx map to the same green_idx & blue_idx, we only want to write some of the time.
+		   To spread it out evenly over the gamma table, we'll only write if the two bits we shifted off the bottom of idx match the two bits at the top */
+		if(!(((idx>>6) ^ idx) & 3))
+		{
+			out[(green_idx<<2)+1] = out[((green_idx+2)<<2)+1] = out[((green_idx+128)<<2)+1] = out[((green_idx+130)<<2)+1] = green_val;
+			out[(blue_idx<<2)+2] = out[((blue_idx+4)<<2)+2] = out[((blue_idx+128)<<2)+2] = out[((blue_idx+132)<<2)+2] = blue_val;
+		}
+		idx++;
+	}
+}
+
+void select_palette_func(volatile uint32_t *gamma_table_register, const features_t *features)
+{
+	/* Select appropriate palette func based around current head configurations */
+	bool gammahack_needed = false; /* Is something using the gamma hack? */
+	bool palette_needed = false; /* Is something using the palette? */
+	bool cpr = false; /* If a palette is in use, does it need cpr? If not, does anything need cpr? */
+	for(int i=0;i<TARGET_MAX;i++)
+	{
+		if(features->head_vals[i] & FEATURE_GAMMAHACK)
+			gammahack_needed = true;
+		if(features->head_vals[i] & FEATURE_PALETTE)
+		{
+			palette_needed = true;
+			cpr = (features->head_vals[i] & FEATURE_CPR);
+		}
+		else if(!palette_needed & (features->head_vals[i] & FEATURE_CPR))
+			cpr = true;
+	}
+	palette_func_t newfunc;
+	if (gammahack_needed)
+	{
+		if(cpr)
+			newfunc = palette_func_555_565;
+		else
+			newfunc = palette_func_555_565_rbswap;
+	}
+	else if (!palette_needed && gamma_table_register)
+	{
+		/* OMAP4, OMAP5 require use of memory mapped register for programming gamma. Palette is still handled by a buffer. */
+		if (gamma_table_reg != gamma_table_register)
+		{
+			gfx_palette_func = NULL; /* Register location has changed. Force reprogram of gamma table. */
+			gamma_table_reg = gamma_table_register;
+		}
+		if(cpr)
+			newfunc = palette_func_null_reg;
+		else
+			newfunc = palette_func_rbswap_reg;
+	}
+	else if(cpr)
+		newfunc = palette_func_null;
+	else
+		newfunc = palette_func_rbswap;
+	if(newfunc != gfx_palette_func)
+	{
+		dprintf(("","select_palette_func: palette switching palette_needed %d gammahack %d cpr %d\n",palette_needed,gammahack_needed,cpr));
+		/* Retranslate palette */
+		gfx_palette_func = newfunc;
+		(newfunc)(gfx_palette_ro,0,256);
+	}
+	mouse_select_palette_func(gammahack_needed, cpr);
+}
+
+void palette_set_buffers(uint32_t *palette_l, uint32_t palette_p)
+{
+	gfx_palette_l = palette_l;
+	gfx_palette_p = palette_p;
+}

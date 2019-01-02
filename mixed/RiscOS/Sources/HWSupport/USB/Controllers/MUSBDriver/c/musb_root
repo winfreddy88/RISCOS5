@@ -1,0 +1,599 @@
+/*
+ * Copyright (c) 2004, 2009 The NetBSD Foundation, Inc.
+ * All rights reserved.
+ *
+ * This code is derived from software contributed to The NetBSD Foundation
+ * by Lennart Augustsson (lennart@augustsson.net), Charles M. Hannum, and
+ * Jeffrey Lee (me@phlamethrower.co.uk)
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. All advertising materials mentioning features or use of this software
+ *    must display the following acknowledgement:
+ *        This product includes software developed by the NetBSD
+ *        Foundation, Inc. and its contributors.
+ * 4. Neither the name of The NetBSD Foundation nor the names of its
+ *    contributors may be used to endorse or promote products derived
+ *    from this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE NETBSD FOUNDATION, INC. AND CONTRIBUTORS
+ * ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+ * TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR
+ * PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE FOUNDATION OR CONTRIBUTORS
+ * BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
+#include "modhead.h"
+#include "swis.h"
+#include "callx/callx.h"
+#include <limits.h>
+#include <machine/bus.h>
+
+#include <sys/malloc.h>
+#include <sys/queue.h>
+#include <sys/types.h>
+#include <sys/systm.h>
+
+#include <dev/usb/usb.h>
+#include <dev/usb/usbdi.h>
+#include <dev/usb/usbdivar.h>
+
+#include "Global/RISCOS.h"
+#include "Global/HALEntries.h"
+#include "cmodule.h"
+#include "tboxlibint/messages.h"
+
+/* Have to avoid including stdio as there's a clash with the BSD stuff */
+#define __stdio_h
+
+#include "musb.h"
+#include "musb_util.h"
+#include "musb_usb.h"
+
+/*
+
+				Software root hub
+
+*/
+
+static const usb_device_descriptor_t musb_devd = {
+	USB_DEVICE_DESCRIPTOR_SIZE,
+	UDESC_DEVICE,		/* type */
+	{0x00, 0x02},		/* USB version */
+	UDCLASS_HUB,		/* class */
+	UDSUBCLASS_HUB,		/* subclass */
+	UDPROTO_HSHUBSTT,	/* protocol */
+	64,			/* max packet */
+	{0},{0},{0x00,0x01},	/* device id */
+	1,2,0,			/* string indicies */
+	1			/* # of configurations */
+};
+
+static const usb_device_qualifier_t musb_odevd = {
+	USB_DEVICE_DESCRIPTOR_SIZE,
+	UDESC_DEVICE_QUALIFIER,	/* type */
+	{0x00, 0x02},		/* USB version */
+	UDCLASS_HUB,		/* class */
+	UDSUBCLASS_HUB,		/* subclass */
+	UDPROTO_FSHUB,		/* protocol */
+	64,			/* max packet */
+	1,			/* # of configurations */
+	0
+};
+
+static const usb_config_descriptor_t musb_confd = {
+	USB_CONFIG_DESCRIPTOR_SIZE,
+	UDESC_CONFIG,
+	{USB_CONFIG_DESCRIPTOR_SIZE +
+	 USB_INTERFACE_DESCRIPTOR_SIZE +
+	 USB_ENDPOINT_DESCRIPTOR_SIZE},
+	1,
+	1,
+	0,
+	UC_SELF_POWERED,
+	0			/* max power */
+};
+
+static const usb_interface_descriptor_t musb_ifcd = {
+	USB_INTERFACE_DESCRIPTOR_SIZE,
+	UDESC_INTERFACE,
+	0,
+	0,
+	1,
+	UICLASS_HUB,
+	UISUBCLASS_HUB,
+	UIPROTO_HSHUBSTT,
+	0
+};
+
+static const usb_endpoint_descriptor_t musb_endpd = {
+	USB_ENDPOINT_DESCRIPTOR_SIZE,
+	UDESC_ENDPOINT,
+	UE_DIR_IN | MUSB_INTR_ENDPT,
+	UE_INTERRUPT,
+	{8, 0},			/* max packet */
+	12
+};
+
+static const usb_hub_descriptor_t musb_hubd = {
+	USB_HUB_DESCRIPTOR_SIZE,
+	UDESC_HUB,
+	0,
+	{0,0},
+	0,
+	0,
+	{0},
+};
+
+usbd_status
+musb_root_ctrl_transfer(usbd_xfer_handle xfer)
+{
+	usbd_status err;
+
+	/* Insert last in queue. */
+	err = usb_insert_transfer(xfer);
+	if (err)
+		return (err);
+
+	/* Pipe isn't running, start first */
+	return (musb_root_ctrl_start(SIMPLEQ_FIRST(&xfer->pipe->queue)));
+}
+
+usbd_status
+musb_root_ctrl_start(usbd_xfer_handle xfer)
+{
+	musb_softc_t *sc = (musb_softc_t *)xfer->pipe->device->bus;
+	usb_device_request_t *req;
+	void *buf = NULL;
+	int s, len, value, index, l, totlen = 0;
+	usb_port_status_t ps;
+	usb_hub_descriptor_t hubd;
+	usb_device_descriptor_t devd;
+	usb_config_descriptor_t confd;
+	usbd_status err;
+	int devctl,power;
+	char name[USB_MAX_STRING_LEN];
+	volatile musb_regs *musb_base = sc->musb_base;
+
+#ifdef DIAGNOSTIC
+	if (!(xfer->rqflags & URQ_REQUEST))
+		/* XXX panic */
+		return (USBD_INVAL);
+#endif
+	req = &xfer->request;
+
+        DPRINTFN(4,("musb_root_ctrl_start: type=0x%02x request=%02x\n",
+		    req->bmRequestType, req->bRequest));
+
+	len = UGETW(req->wLength);
+	value = UGETW(req->wValue);
+	index = UGETW(req->wIndex);
+
+	if (len != 0)
+		buf = KERNADDR(&xfer->dmabuf, 0);
+
+#define C(x,y) ((x) | ((y) << 8))
+	switch(C(req->bRequest, req->bmRequestType)) {
+	case C(UR_CLEAR_FEATURE, UT_WRITE_DEVICE):
+	case C(UR_CLEAR_FEATURE, UT_WRITE_INTERFACE):
+	case C(UR_CLEAR_FEATURE, UT_WRITE_ENDPOINT):
+		/*
+		 * DEVICE_REMOTE_WAKEUP and ENDPOINT_HALT are no-ops
+		 * for the integrated root hub.
+		 */
+		break;
+	case C(UR_GET_CONFIG, UT_READ_DEVICE):
+		if (len > 0) {
+			*(u_int8_t *)buf = sc->sc_conf;
+			totlen = 1;
+		}
+		break;
+	case C(UR_GET_DESCRIPTOR, UT_READ_DEVICE):
+                DPRINTFN(8,("musb_root_ctrl_start: wValue=0x%04x\n", value));
+		switch(value >> 8) {
+		case UDESC_DEVICE:
+			if ((value & 0xff) != 0) {
+				err = USBD_IOERROR;
+				goto ret;
+			}
+			devd = musb_devd;
+			USETW(devd.idVendor, sc->sc_id_vendor);
+			totlen = l = min(len, USB_DEVICE_DESCRIPTOR_SIZE);
+#if defined(__CC_NORCROFT) && !defined(DISABLE_PACKED)
+			memcpy(buf, (void*) &devd, l);
+#else
+			memcpy(buf, &devd, l);
+#endif
+			break;
+		/*
+		 * We can't really operate at another speed, but the spec says
+		 * we need this descriptor.
+		 */
+		case UDESC_DEVICE_QUALIFIER:
+			if ((value & 0xff) != 0) {
+				err = USBD_IOERROR;
+				goto ret;
+			}
+			totlen = l = min(len, USB_DEVICE_DESCRIPTOR_SIZE);
+#if defined(__CC_NORCROFT) && !defined(DISABLE_PACKED)
+			memcpy(buf, (void*) &musb_odevd, l);
+#else
+			memcpy(buf, &musb_odevd, l);
+#endif
+			break;
+		/*
+		 * We can't really operate at another speed, but the spec says
+		 * we need this descriptor.
+		 */
+		case UDESC_OTHER_SPEED_CONFIGURATION:
+		case UDESC_CONFIG:
+			if ((value & 0xff) != 0) {
+				err = USBD_IOERROR;
+				goto ret;
+			}
+			confd = musb_confd;
+			confd.bDescriptorType = value >> 8;
+			totlen = l = min(len, USB_CONFIG_DESCRIPTOR_SIZE);
+#if defined(__CC_NORCROFT) && !defined(DISABLE_PACKED)
+			memcpy(buf, (void*) &confd, l);
+#else
+			memcpy(buf, &confd, l);
+#endif
+			buf = (char *)buf + l;
+			len -= l;
+			l = min(len, USB_INTERFACE_DESCRIPTOR_SIZE);
+			totlen += l;
+#if defined(__CC_NORCROFT) && !defined(DISABLE_PACKED)
+			memcpy(buf, (void*) &musb_ifcd, l);
+#else
+			memcpy(buf, &musb_ifcd, l);
+#endif
+			buf = (char *)buf + l;
+			len -= l;
+			l = min(len, USB_ENDPOINT_DESCRIPTOR_SIZE);
+			totlen += l;
+#if defined(__CC_NORCROFT) && !defined(DISABLE_PACKED)
+			memcpy(buf, (void*)&musb_endpd, l);
+#else
+			memcpy(buf, &musb_endpd, l);
+#endif
+			break;
+		case UDESC_STRING:
+			if (len == 0)
+				break;
+			*(u_int8_t *)buf = 0;
+			totlen = 1;
+			switch (value & 0xff) {
+                        case 0: /* Language table */
+                                totlen = musb_str(buf, len, "\001");
+                                break;
+			case 1: /* Vendor */
+				totlen = musb_str(buf, len, sc->sc_vendor);
+				break;
+			case 2: /* Product */
+				value = sizeof(name);
+				messages_file_lookup("RHub", name, &value, 0);
+				totlen = musb_str(buf, len, name);
+				break;
+			}
+			break;
+		default:
+			err = USBD_IOERROR;
+			goto ret;
+		}
+		break;
+	case C(UR_GET_INTERFACE, UT_READ_INTERFACE):
+		if (len > 0) {
+			*(u_int8_t *)buf = 0;
+			totlen = 1;
+		}
+		break;
+	case C(UR_GET_STATUS, UT_READ_DEVICE):
+		if (len > 1) {
+			USETW(((usb_status_t *)buf)->wStatus,UDS_SELF_POWERED);
+			totlen = 2;
+		}
+		break;
+	case C(UR_GET_STATUS, UT_READ_INTERFACE):
+	case C(UR_GET_STATUS, UT_READ_ENDPOINT):
+		if (len > 1) {
+			USETW(((usb_status_t *)buf)->wStatus, 0);
+			totlen = 2;
+		}
+		break;
+	case C(UR_SET_ADDRESS, UT_WRITE_DEVICE):
+		if (value >= USB_MAX_DEVICES) {
+			err = USBD_IOERROR;
+			goto ret;
+		}
+		sc->sc_addr = value;
+		break;
+	case C(UR_SET_CONFIG, UT_WRITE_DEVICE):
+		if (value != 0 && value != 1) {
+			err = USBD_IOERROR;
+			goto ret;
+		}
+		sc->sc_conf = value;
+		break;
+	case C(UR_SET_DESCRIPTOR, UT_WRITE_DEVICE):
+		break;
+	case C(UR_SET_FEATURE, UT_WRITE_DEVICE):
+	case C(UR_SET_FEATURE, UT_WRITE_INTERFACE):
+	case C(UR_SET_FEATURE, UT_WRITE_ENDPOINT):
+		err = USBD_IOERROR;
+		goto ret;
+	case C(UR_SET_INTERFACE, UT_WRITE_INTERFACE):
+		break;
+	case C(UR_SYNCH_FRAME, UT_WRITE_ENDPOINT):
+		break;
+	/* Hub requests */
+	case C(UR_CLEAR_FEATURE, UT_WRITE_CLASS_DEVICE):
+		break;
+	case C(UR_CLEAR_FEATURE, UT_WRITE_CLASS_OTHER):
+                DPRINTFN(8, ("musb_root_ctrl_start: UR_CLEAR_PORT_FEATURE "
+			     "port=%d feature=%d\n",
+			     index, value));
+		if (index != 1) {
+			err = USBD_IOERROR;
+			goto ret;
+		}
+		switch(value) {
+		case UHF_PORT_ENABLE:
+			break;
+		case UHF_PORT_SUSPEND:
+			// todo
+			break;
+		case UHF_PORT_POWER:
+			// todo
+			break;
+		case UHF_PORT_TEST:
+                        DPRINTFN(2,("musb_root_ctrl_start: clear port test "
+				    "%d\n", index));
+			break;
+		case UHF_PORT_INDICATOR:
+                        DPRINTFN(2,("musb_root_ctrl_start: clear port ind "
+				    "%d\n", index));
+			break;
+		case UHF_C_PORT_CONNECTION:
+			break;
+		case UHF_C_PORT_ENABLE:
+			break;
+		case UHF_C_PORT_SUSPEND:
+			/* how? */
+			break;
+		case UHF_C_PORT_OVER_CURRENT:
+			break;
+		case UHF_C_PORT_RESET:
+			break;
+		default:
+			err = USBD_IOERROR;
+			goto ret;
+		}
+		sc->port_status &= ~(1 << value);
+		break;
+	case C(UR_GET_DESCRIPTOR, UT_READ_CLASS_DEVICE):
+                if ((value & 0xff) != 0) {
+			err = USBD_IOERROR;
+			goto ret;
+		}
+		hubd = musb_hubd;
+		hubd.bNbrPorts = 1;
+		USETW(hubd.wHubCharacteristics,UHD_PWR_INDIVIDUAL | UHD_OC_NONE);
+		hubd.bPwrOn2PwrGood = 5;
+		hubd.DeviceRemovable[0] = 0;
+		hubd.bDescLength = USB_HUB_DESCRIPTOR_SIZE + 1;
+		l = min(len, hubd.bDescLength);
+		totlen = l;
+#if defined(__CC_NORCROFT) && !defined(DISABLE_PACKED)
+		memcpy(buf, (void*) &hubd, l);
+#else
+		memcpy(buf, &hubd, l);
+#endif
+		break;
+	case C(UR_GET_STATUS, UT_READ_CLASS_DEVICE):
+		if (len != 4) {
+			err = USBD_IOERROR;
+			goto ret;
+		}
+		memset(buf, 0, len); /* ? XXX */
+		totlen = len;
+		break;
+	case C(UR_GET_STATUS, UT_READ_CLASS_OTHER):
+                DPRINTFN(8,("musb_root_ctrl_start: get port status i=%d\n",
+			    index));
+		if (index != 1) {
+			err = USBD_IOERROR;
+			goto ret;
+		}
+		if (len != 4) {
+			err = USBD_IOERROR;
+			goto ret;
+		}
+		/* Deduce the port status */
+		devctl = musb_base->devctl;
+		power = musb_base->common.power;
+		sc->port_status = musb_calc_port_status(devctl,power,sc->port_status);
+		DPRINTFN(8,("musb_root_ctrl_start: Status %04x change %04x\n",sc->port_status&0xffff,sc->port_status>>16));
+		USETW(ps.wPortStatus, sc->port_status);
+		USETW(ps.wPortChange, sc->port_status>>16);
+		l = min(len, sizeof ps);
+#if defined(__CC_NORCROFT) && !defined(DISABLE_PACKED)
+		memcpy(buf, (void*) &ps, l);
+#else
+		memcpy(buf, &ps, l);
+#endif
+		totlen = l;
+		break;
+	case C(UR_SET_DESCRIPTOR, UT_WRITE_CLASS_DEVICE):
+		err = USBD_IOERROR;
+		goto ret;
+	case C(UR_SET_FEATURE, UT_WRITE_CLASS_DEVICE):
+		break;
+	case C(UR_SET_FEATURE, UT_WRITE_CLASS_OTHER):
+		if (index != 1) {
+			err = USBD_IOERROR;
+			goto ret;
+		}
+//		port = EHCI_PORTSC(index);
+//		v = EOREAD4(sc, port) &~ EHCI_PS_CLEAR;
+		switch(value) {
+		case UHF_PORT_ENABLE:
+//			EOWRITE4(sc, port, v | EHCI_PS_PE);
+			break;
+		case UHF_PORT_SUSPEND:
+//			EOWRITE4(sc, port, v | EHCI_PS_SUSP);
+			break;
+		case UHF_PORT_RESET:
+                        DPRINTFN(5,("musb_root_ctrl_start: reset port %d\n",
+				    index));
+			/* Begin reset signalling */
+			if(musb_base->devctl & DEVCTL_HOSTMODE)
+			{
+				musb_base->common.power |= POWER_RESET | POWER_HSEN; /* todo - should usb driver control HSEN? */
+				/* Wait 20ms for reset to occur */
+				delay(20000);
+				/* Now clear the reset bit, and all should be good */
+				musb_base->common.power &= ~POWER_RESET;
+				DPRINTF(("musb port %d reset\n", index));
+				sc->port_status |= 1 << UHF_C_PORT_RESET;
+			}
+			else
+			{
+				DPRINTF(("musb port %d reset ignored - not in host mode!\n", index));
+				err = USBD_IOERROR;
+				goto ret;
+			}
+			break;
+		case UHF_PORT_POWER:
+                        DPRINTFN(2,("musb_root_ctrl_start: set port power "
+				    "%d\n", index));
+//			EOWRITE4(sc, port, v | EHCI_PS_PP);
+			break;
+		case UHF_PORT_TEST:
+                        DPRINTFN(2,("musb_root_ctrl_start: set port test "
+				    "%d\n", index));
+			break;
+		case UHF_PORT_INDICATOR:
+                        DPRINTFN(2,("musb_root_ctrl_start: set port ind "
+				    "%d\n", index));
+//			EOWRITE4(sc, port, v | EHCI_PS_PIC);
+			break;
+		default:
+			err = USBD_IOERROR;
+			goto ret;
+		}
+//		sc->port_status |= (1 << value);
+		break;
+	case C(UR_CLEAR_TT_BUFFER, UT_WRITE_CLASS_OTHER):
+	case C(UR_RESET_TT, UT_WRITE_CLASS_OTHER):
+	case C(UR_GET_TT_STATE, UT_READ_CLASS_OTHER):
+	case C(UR_STOP_TT, UT_WRITE_CLASS_OTHER):
+		break;
+	default:
+		err = USBD_IOERROR;
+		goto ret;
+	}
+	xfer->actlen = totlen;
+	err = USBD_NORMAL_COMPLETION;
+ret:
+	xfer->status = err;
+	s = splusb();
+	usb_transfer_complete(xfer);
+	splx(s);
+	return (USBD_IN_PROGRESS);
+}
+#undef C
+
+/* Abort a root control request. */
+void
+musb_root_ctrl_abort(usbd_xfer_handle xfer)
+{
+	/* Nothing to do, all transfers are synchronous. */
+	NOTUSED(xfer);
+}
+
+/* Close the root pipe. */
+void
+musb_root_ctrl_close(usbd_pipe_handle pipe)
+{
+	DPRINTF(("musb_root_ctrl_close\n"));
+	/* Nothing to do. */
+	NOTUSED(pipe);
+}
+
+void
+musb_root_intr_done(usbd_xfer_handle xfer)
+{
+	xfer->hcpriv = NULL;
+}
+
+usbd_status
+musb_root_intr_transfer(usbd_xfer_handle xfer)
+{
+	usbd_status err;
+
+	/* Insert last in queue. */
+	err = usb_insert_transfer(xfer);
+	if (err)
+		return (err);
+
+	/* Pipe isn't running, start first */
+	return (musb_root_intr_start(SIMPLEQ_FIRST(&xfer->pipe->queue)));
+}
+
+usbd_status
+musb_root_intr_start(usbd_xfer_handle xfer)
+{
+	usbd_pipe_handle pipe = xfer->pipe;
+	musb_softc_t *sc = (musb_softc_t *)pipe->device->bus;
+
+	sc->sc_intrxfer = xfer;
+
+	return (USBD_IN_PROGRESS);
+}
+
+/* Abort a root interrupt request. */
+void
+musb_root_intr_abort(usbd_xfer_handle xfer)
+{
+	int s;
+
+	if (xfer->pipe->intrxfer == xfer) {
+		DPRINTF(("musb_root_intr_abort: remove\n"));
+		xfer->pipe->intrxfer = NULL;
+	}
+	xfer->status = USBD_CANCELLED;
+	s = splusb();
+	usb_transfer_complete(xfer);
+	splx(s);
+}
+
+/* Close the root pipe. */
+void
+musb_root_intr_close(usbd_pipe_handle pipe)
+{
+	musb_softc_t *sc = (musb_softc_t *)pipe->device->bus;
+
+	DPRINTF(("musb_root_intr_close\n"));
+
+	sc->sc_intrxfer = NULL;
+}
+
+void
+musb_root_ctrl_done(usbd_xfer_handle xfer)
+{
+	xfer->hcpriv = NULL;
+}
+

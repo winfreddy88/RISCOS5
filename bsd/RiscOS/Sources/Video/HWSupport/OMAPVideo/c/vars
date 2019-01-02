@@ -1,0 +1,243 @@
+/*
+ * Copyright (c) 2010, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+
+#include "SyncLib/spin.h"
+#include "SyncLib/spinrw.h"
+
+#include "vars.h"
+
+static spinlock_t irqlocked_spinlock = SPIN_INITIALISER;
+static irqlocked_t irqlocked;
+
+static spinrwlock_t modelocked_lock = SPINRW_INITIALISER;
+static modelocked_t modelocked = {
+	.overlay_desktop = OVERLAY_MAX,
+	.overlay_pointer = OVERLAY_MAX,
+};
+
+static spinrwlock_t features_lock = SPINRW_INITIALISER;
+static features_t features;
+
+#ifdef LOCKDEBUG
+#include "DebugLib/debuglib.h"
+#include "kernel.h"
+#include "swis.h"
+#include "Global/HALEntries.h"
+#include "Interface/RTSupport.h"
+
+#include "globals.h"
+
+//#define LOCKDEBUG_TRACE
+
+typedef struct {
+	const char *file;
+	const char *func;
+	int line;
+} lockloc_t;
+
+typedef struct {
+	/* Details of the longest write lock */
+	lockloc_t longest;
+	uint32_t longest_time;
+	/* Details of the current write lock */
+	lockloc_t current;
+	uint32_t current_start;
+} lockdebug_t;
+
+static lockdebug_t irqlocked_debug, modelocked_debug, features_debug;
+
+void lockdebug_init(void)
+{
+#if 0
+	/* Set up hangwatch to dump out the locks */
+	_swix(0x59284,_INR(0,2),&irqlocked_spinlock,sizeof(irqlocked_spinlock),"irqlocked_spinlock");
+	_swix(0x59284,_INR(0,2),&modelocked_lock,sizeof(modelocked_lock),"modelocked_lock");
+	_swix(0x59284,_INR(0,2),&features_lock,sizeof(features_lock),"features_lock");
+	_swix(0x59280,_INR(0,3),0,2,1,20);
+#endif
+}
+
+static void lockdebug_lock(LOCKDEBUG_ARGS_DEF,lockdebug_t *state,const char *thisfunc, spinrwlock_t *lock)
+{
+	if (state->current.file)
+	{
+		dprintf(("","%s:%s:%d: recursive %s? vs. %s:%s:%d\n",file,func,line,thisfunc,state->current.file,state->current.func,state->current.line));
+	}
+	else if (lock)
+	{
+		/* If we have a rwlock, try locking it to check if there's a read lock blocking us */
+		if (spinrw_write_try_lock(lock))
+		{
+			spinrw_write_unlock(lock);
+		}
+		else
+		{
+			dprintf(("","%s:%s:%d: %s read lock held?\n",file,func,line,thisfunc));
+		}
+		/* spinrw write locks should only occur from the foreground - warn if they occur at any other time */
+		int handle = 0;
+		_swix(RT_ReadInfo,_IN(0)|_OUT(0),RTReadInfo_Handle,&handle);
+		if (handle != 0)
+		{
+			dprintf(("","%s:%s:%d: %s called from RTSupport handle %d\n",file,func,line,thisfunc,handle));
+		}
+	}
+	state->current.file = file;
+	state->current.func = func;
+	state->current.line = line;
+	state->current_start = timer_read();
+#ifdef LOCKDEBUG_TRACE
+	dprintf(("","%s:%s:%d: %s\n",file,func,line,thisfunc));
+#endif
+}
+
+static void lockdebug_unlock(lockdebug_t *state)
+{
+	uint32_t duration = state->current_start - timer_read();
+	if (duration > state->longest_time)
+	{
+		state->longest_time = duration;
+		state->longest = state->current;
+	}
+#ifdef LOCKDEBUG_TRACE
+	dprintf(("","%s:%s:%d: unlock\n",state->current.file,state->current.func,state->current.line));
+#endif
+	state->current.file = NULL;
+}
+
+static void lockdebug_output2(lockdebug_t *state,const char *name)
+{
+	if (!state->longest_time)
+	{
+		return;
+	}
+	printf(" %s: %uus from %s:%s:%d\n",name,state->longest_time,state->longest.file,state->longest.func,state->longest.line);
+	state->longest_time = 0;
+}
+
+void lockdebug_output(void)
+{
+	lockdebug_output2(&irqlocked_debug,"irqlocked");
+	lockdebug_output2(&modelocked_debug,"modelocked");
+	lockdebug_output2(&features_debug,"features");
+}
+
+
+#define LOCKDEBUG_LOCK(STATE,LOCK) lockdebug_lock(file,func,line,STATE,__func__,LOCK);
+#define LOCKDEBUG_UNLOCK(STATE) lockdebug_unlock(STATE);
+#else
+#define LOCKDEBUG_LOCK(STATE,LOCK)
+#define LOCKDEBUG_UNLOCK(STATE)
+#endif
+
+void overlaycfg_reset(overlaycfg_t *o)
+{
+	memset(o,0,sizeof(overlaycfg_t));
+	o->target = TARGET_NONE;
+	o->clip[0] = o->clip[1] = 0;
+	o->clip[2] = o->clip[3] = 0xffff;
+}
+
+irqlocked_t *_irqlocked_lock(LOCKDEBUG_ARGS_DEF)
+{
+	LOCKDEBUG_LOCK(&irqlocked_debug,NULL)
+	spin_lock(&irqlocked_spinlock);
+	return &irqlocked;
+}
+
+void irqlocked_unlock(void)
+{
+	LOCKDEBUG_UNLOCK(&irqlocked_debug)
+	spin_unlock(&irqlocked_spinlock);
+}
+
+const modelocked_t *modelocked_read_lock(void)
+{
+	spinrw_read_lock(&modelocked_lock);
+	return &modelocked;
+}
+
+void modelocked_read_unlock(void)
+{
+	spinrw_read_unlock(&modelocked_lock);
+}
+
+modelocked_t *_modelocked_write_lock(LOCKDEBUG_ARGS_DEF)
+{
+	LOCKDEBUG_LOCK(&modelocked_debug,&modelocked_lock)
+	spinrw_write_lock(&modelocked_lock);
+	return &modelocked;
+}
+
+void modelocked_write_unlock(void)
+{
+	LOCKDEBUG_UNLOCK(&modelocked_debug)
+	spinrw_write_unlock(&modelocked_lock);
+}
+
+const modelocked_t *modelocked_write_to_read(void)
+{
+	LOCKDEBUG_UNLOCK(&modelocked_debug)
+	spinrw_write_to_read(&modelocked_lock);
+	return &modelocked;
+}
+
+const features_t *features_read_lock(void)
+{
+	spinrw_read_lock(&features_lock);
+	return &features;
+}
+
+void features_read_unlock(void)
+{
+	spinrw_read_unlock(&features_lock);
+}
+
+features_t *_features_write_lock(LOCKDEBUG_ARGS_DEF)
+{
+	LOCKDEBUG_LOCK(&features_debug,&features_lock)
+	spinrw_write_lock(&features_lock);
+	return &features;
+}
+
+void features_write_unlock(void)
+{
+	LOCKDEBUG_UNLOCK(&features_debug)
+	spinrw_write_unlock(&features_lock);
+}
+
+const features_t *features_write_to_read(void)
+{
+	LOCKDEBUG_UNLOCK(&features_debug)
+	spinrw_write_to_read(&features_lock);
+	return &features;
+}
+

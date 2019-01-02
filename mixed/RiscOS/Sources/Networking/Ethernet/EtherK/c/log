@@ -1,0 +1,235 @@
+/* Copyright 2004 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/**************************************************************/
+/* File:    log.c                                             */
+/*                                                            */
+/* Purpose: Implements the *EKLog command, and also provides  */
+/*          routines for logging messages and errors.         */
+/*                                                            */
+/* Author:  J.R.Byrne.                                        */
+/**************************************************************/
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdarg.h>
+
+#include <swis.h>
+
+#include <AsmUtils/irqs.h>
+
+#include "em_riscos.h"
+#include "if_em.h"
+#include "em_device.h"
+#include "msgs.h"
+
+#include "log.h"
+
+
+/**************************************************************/
+/* log_message()                                              */
+/*                                                            */
+/* Record a message in the message log.                       */
+/*                                                            */
+/* The message log is a circular buffer. Once it is full,     */
+/* newer messages start to overwrite older ones. Each message */
+/* is stored with a time stamp of when it was logged.         */
+/*                                                            */
+/* Parameters: Pointer to the relevant device structure;      */
+/*                                                            */
+/*             Format string and parameters, as for printf(). */
+/**************************************************************/
+
+void log_message(device_t dev, const char * format, ...)
+{
+    _kernel_oserror * e;
+    uint8_t           time[5];
+    va_list           ap;
+    int               irqstate;
+    int               str_len, entry_len, offset, end_offset;
+    uint8_t         * p;
+
+    #ifdef DEBUGLIB
+    dprintf(("Log", "Log: "));
+    va_start(ap, format);
+    dvprintf(("Log", format, ap));
+    va_end(ap);
+    dprintf(("Log", "\n"));
+    #endif
+
+    /* First read the current real-time clock for the time stamp */
+
+    time[0] = 3;
+
+    e = _swix(OS_Word,
+              _INR(0,1),
+
+              14,
+              time);
+
+    if (e != NULL)
+        memset(time, 0, sizeof(time));
+
+    /* Now get the actual length of the string we will write */
+
+    va_start(ap, format);
+
+    str_len = vsnprintf(NULL, 0, format, ap);
+    if (str_len > 255)
+        str_len = 255;
+
+    va_end(ap);
+
+    /* Length of entry is string plus null, time stamp, string length */
+    entry_len = str_len + 1 + 5 + 1;
+
+    /* We could be called from an interrupt handler, so don't allow the */
+    /* update to be interrupted otherwise we might get in a mess.       */
+
+    irqstate = ensure_irqs_off();
+
+    p = dev->log.buffer;
+    offset = dev->log.last_msg_end;
+    if ((MSGLOG_BUFSIZE - offset) < entry_len)
+        offset = 0;
+
+    /* Write the entry into the buffer */
+    va_start(ap, format);
+    vsnprintf((char *)p + offset, str_len + 1, format, ap);
+    va_end(ap);
+
+    end_offset = offset + str_len + 1;
+    memcpy(p + end_offset, time, 5);
+    end_offset += 5;
+    p[end_offset] = (uint8_t)str_len;
+
+    /* Update the pointers */
+    dev->log.last_msg_end = end_offset + 1;
+    if (end_offset >= dev->log.top_msg_start)
+        dev->log.top_msg_start = offset;
+    dev->log.messages_logged++;
+
+    restore_irqs(irqstate);
+}
+
+/**************************************************************/
+/* log_error()                                                */
+/*                                                            */
+/* Record an error in the message log.                        */
+/*                                                            */
+/* Parameters: Pointer to the relevant device structure;      */
+/*                                                            */
+/*             Pointer to the error to be logged.             */
+/**************************************************************/
+
+void log_error(device_t dev, _kernel_oserror * e)
+{
+    if (e != NULL)
+        log_message(dev, "Error: %s [&%X]", e->errmess, e->errnum);
+}
+
+/**************************************************************/
+/* log_output()                                               */
+/*                                                            */
+/* Output the *EKLog messages for a given device.             */
+/*                                                            */
+/* Parameters: Pointer to the relevant device structure.      */
+/*                                                            */
+/* Returns:    Error pointer.                                 */
+/**************************************************************/
+
+_kernel_oserror * log_output(device_t dev)
+{
+    _kernel_oserror * e;
+    MessageLog      * logcopy;
+    int               irqstate;
+    int               num_msgs;
+    int               offset, first_msg_offset;
+    char              buf[80];
+    uint8_t         * p;
+    int               msg_len;
+
+    /* The log may be updated by interrupt routines, so grab a snapshot of it */
+
+    logcopy = malloc(sizeof(MessageLog));
+    if (logcopy == NULL)
+        return messages_make_error("NoStore", ENOMEM, NULL);
+
+    irqstate = ensure_irqs_off();
+    memcpy(logcopy, &dev->log, sizeof(MessageLog));
+    restore_irqs(irqstate);
+
+    /* See how many messages are in the buffer */
+
+    /* First go from the last message back to the start of the buffer */
+    num_msgs = 0;
+    offset = logcopy->last_msg_end;
+    while (offset > 0)
+    {
+        num_msgs++;
+        offset -= logcopy->buffer[offset-1] + 1 + 5 + 1;
+    }
+    first_msg_offset = offset;
+
+    /* Next go from the top message back to the last message */
+    offset = logcopy->top_msg_start;
+    while (offset >= logcopy->last_msg_end && offset > 0)
+    {
+        num_msgs++;
+        first_msg_offset = offset;
+        offset -= logcopy->buffer[offset-1] + 1 + 5 + 1;
+    }
+
+    /* Print the heading */
+    messages_lookupf(buf, sizeof(buf), (num_msgs == 1) ? "Log_Head1" : "Log_Head",
+        "%u\n%u", logcopy->messages_logged, dev->dib.dib_unit);
+    printf("%s\n", buf);
+    if (num_msgs < logcopy->messages_logged)
+    {
+        messages_lookupf(buf, sizeof(buf), "Log_Head2", "%d", num_msgs);
+        printf("%s\n", buf);
+    }
+
+    offset = first_msg_offset;
+    for (int i = 0; i < num_msgs; i++)
+    {
+        p = logcopy->buffer + offset;
+        msg_len = strlen((char *)p) + 1;
+
+        e = _swix(Territory_ConvertStandardDateAndTime,
+                  _INR(0,3),
+
+                  -1,
+                  p + msg_len,
+                  buf,
+                  sizeof(buf));
+
+        if (e != NULL)
+        {
+            buf[0] = '?';
+            buf[1] = 0;
+        }
+
+        printf("  %s: %s\n", buf, p);
+        if (offset == logcopy->top_msg_start)
+            offset = 0;
+        else
+            offset += msg_len + 5 + 1;
+    }
+
+    free(logcopy);
+
+    return NULL;
+}

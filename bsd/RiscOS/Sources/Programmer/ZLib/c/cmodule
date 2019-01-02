@@ -1,0 +1,513 @@
+/*
+ * Copyright (c) 2012, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include "modhead.h"
+#include "swis.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stddef.h>
+#include <stdbool.h>
+
+#include "Global/RISCOS.h"
+#include "Global/Services.h"
+
+#include "DebugLib/DebugLib.h"
+
+#include "globals.h"
+#include "errors.h"
+#include "task.h"
+
+void *private_word;
+
+MessagesFD messages;
+
+#ifdef STANDALONE
+extern void* Resources(void);
+#endif
+
+_kernel_oserror* module_init (const char *cmd_tail, int podule_base, void *pw)
+{
+    (void) cmd_tail;
+    (void) podule_base;
+    (void) pw;
+    _kernel_oserror *e;
+    
+    /* set up debugging */
+    debug_initialise(Module_Title, "", "");
+    debug_set_device(DADEBUG_OUTPUT);
+    debug_set_unbuffered_files(TRUE);
+    
+    private_word = pw;
+
+    /* Set up messages */
+#ifdef STANDALONE
+    e = _swix(ResourceFS_RegisterFiles,_IN(0),Resources());
+    if(e)
+        return e;
+#endif
+    
+    e = _swix(MessageTrans_OpenFile,_INR(0,2),&messages,"Resources:$.Resources.ZLib.Messages",0);
+    if(e)
+    {
+#ifdef STANDALONE
+        _swix(ResourceFS_DeregisterFiles,_IN(0),Resources());
+#endif
+        return e;
+    }        
+
+    return NULL;
+}
+
+_kernel_oserror *module_final(int fatal, int podule, void *pw)
+{
+    (void) fatal;
+    (void) podule;
+    (void) pw;
+
+    /* TODO - Free all memory
+       Tricky since many streams will be in application space
+       So maybe just refuse to exit if (task-associated) streams are active? */
+
+    /* Close messages */
+    _swix(MessageTrans_CloseFile,_IN(0),&messages);
+
+#ifdef STANDALONE
+    _swix(ResourceFS_DeregisterFiles,_IN(0),Resources());
+#endif
+
+    return NULL;
+}
+
+static _kernel_oserror *do_gzopen(_kernel_swi_regs *r)
+{
+    /* This is a mess */
+    const char *mode = (const char *) r->r[1];
+    char newmode[strlen(mode)+1];
+    char *c = newmode;
+    bool AC = false;
+    bool reading = false;
+    _kernel_oserror *e = NULL;
+
+    while(*mode)
+    {
+        if(*mode == 'R')
+        {
+            /* Use 'R' to trigger read/write of RISC OS metadata, like ROL's version does. This means there's no way of requesting RLE compression using the SWI interface. */
+            AC = true;
+            mode++;
+        }
+        if(*mode == 'r')
+        {
+            /* Make a note of whether we're reading or writing */
+            reading = true;
+        }
+        if(*mode)
+        {
+            *c++ = *mode++;
+        }
+    }
+    *c = 0;
+
+    /* Open the file */
+    gzFile file = gzopen((const char *) r->r[0], newmode);
+    r->r[0] = (int) file;
+    if(!file || !AC)
+        return NULL;
+
+    /* Read/write header */
+    gz_header header;
+    memset(&header, 0, sizeof(header));
+    if(reading)
+    {
+        /* Allocate some space for the extra field; assume 1K is enough */
+        Bytef *extra = (Bytef *) malloc(1024);
+        if(!extra)
+        {
+            /* Oh, crumbs */
+            gzclose(file);
+            e = ERROR(NoMem);
+            return e;
+        }
+        header.extra = extra;
+        header.extra_max = 1024;
+        if(gzgetheader(file, &header) < 0)
+        {
+            int err;
+            const char *msg = gzerror(file, &err);
+            e = getzliberror(err,msg);
+            gzclose(file);
+            free(extra);
+            return e;
+        }
+        /* Scan for 'AC' subfield */
+        int remain = header.extra_len;
+        Bytef *b = extra;
+        while(remain >= 4)
+        {
+            Bytef si1 = *b++;
+            Bytef si2 = *b++;
+            unsigned short len = *b++;
+            len += (*b++)<<8;
+            remain -= 4;
+            if((si1 == 'A') && (si2 == 'C') && (len >= 28) && (remain >= 16))
+            {
+                /* We found it! */
+                memcpy(&r->r[2],b,16);
+                int temp = r->r[4];
+                r->r[4] = r->r[5];
+                r->r[5] = temp;
+                break;
+            }
+            else
+            {
+                b += len;
+                remain -= len;
+            }
+        }
+        free(extra);
+    }
+    else
+    {
+        /* Construct the field on the stack */
+        int field[8];
+        field[0] = 0x001c4341;
+        field[1] = r->r[2];
+        field[2] = r->r[3];
+        field[3] = r->r[5];
+        field[4] = r->r[4];
+        field[5] = 0;
+        field[6] = 0;
+        field[7] = 0;
+        /* Fill in the main header */
+        header.extra = (Bytef *) field;
+        header.extra_len = 32;
+        header.os = 0xd;
+        if(gzputheader(file, &header) < 0)
+        {
+            int err;
+            const char *msg = gzerror(file, &err);
+            e = getzliberror(err,msg);
+            gzclose(file);
+            return e;
+        }
+    }
+
+    return NULL;
+}
+
+_kernel_oserror *module_swis(int swi_offset, _kernel_swi_regs *r, void *pw)
+{
+    (void) pw;
+    int flags;
+    int ret;
+    z_streamp stream;
+    _kernel_oserror *e;
+
+    switch(swi_offset)
+    {
+    case ZLib_Compress-ZLib_00:
+        flags = r->r[0];
+        if(flags & ~COMPRESS_VALID_FLAGS)
+            return ERROR(InvalidCompressFlag);
+        if(flags & COMPRESS_FLAG_RETURNWORKSPACE)
+        {
+            r->r[0] = sizeof(z_stream);
+            if(r->r[1] != -1)
+            {
+                r->r[1] = (int) compressBound((uLong) r->r[1]);
+            }
+            return NULL;
+        }
+        stream = (z_streamp) r->r[1];
+        if(!(flags & COMPRESS_FLAG_CONTINUE))
+        {
+            stream->zalloc = NULL;
+            stream->zfree = NULL;
+            stream->opaque = NULL;
+            ret = deflateInit(stream,9); /* Assume best compression wanted? */
+            if(ret)
+            {
+                return getzliberror(ret,stream->msg);
+            }
+            if(!(flags & COMPRESS_FLAG_WORKSPACENOTBOUND))
+            {
+                task_strmcreate(stream,true);
+            }
+        }
+        stream->next_in = (Bytef *) r->r[2];
+        stream->avail_in = (uInt) r->r[3];
+        stream->next_out = (Bytef *) r->r[4];
+        stream->avail_out = (uInt) r->r[5];
+        ret = deflate(stream,(flags & COMPRESS_FLAG_MOREREMAINING)?0:Z_FINISH);
+        r->r[2] = (int) stream->next_in;
+        r->r[3] = (int) stream->avail_in;
+        r->r[4] = (int) stream->next_out;
+        r->r[5] = (int) stream->avail_out;
+        switch(ret)
+        {
+        case Z_OK:
+        case Z_BUF_ERROR:
+            r->r[0] = ((r->r[3] || !(flags & COMPRESS_FLAG_MOREREMAINING))?COMPRESS_NEED_OUTPUT:COMPRESS_NEED_INPUT);
+            return NULL;
+        case Z_STREAM_END:
+            r->r[0] = COMPRESS_COMPLETE;
+            deflateEnd(stream);
+            task_strmdestroy(stream);
+            return NULL;
+        default:
+            e = getzliberror(ret,stream->msg);
+            deflateEnd(stream);
+            task_strmdestroy(stream);
+            return e;
+        }
+
+    case ZLib_Decompress-ZLib_00:
+        flags = r->r[0];
+        if(flags & ~DECOMPRESS_VALID_FLAGS)
+            return ERROR(InvalidDecompressFlag);
+        if(flags & DECOMPRESS_FLAG_RETURNWORKSPACE)
+        {
+            r->r[0] = sizeof(z_stream);
+            r->r[1] = -1; /* Fairly certain it's impossible/impractical to calculate this */
+            return NULL;
+        }
+        stream = (z_streamp) r->r[1];
+        if(!(flags & DECOMPRESS_FLAG_CONTINUE))
+        {
+            stream->zalloc = NULL;
+            stream->zfree = NULL;
+            stream->opaque = NULL;
+            ret = inflateInit(stream);
+            if(ret)
+            {
+                return getzliberror(ret,stream->msg);
+            }
+            if(!(flags & DECOMPRESS_FLAG_WORKSPACENOTBOUND))
+            {
+                task_strmcreate(stream,false);
+            }
+        }
+        stream->next_in = (Bytef *) r->r[2];
+        stream->avail_in = (uInt) r->r[3];
+        stream->next_out = (Bytef *) r->r[4];
+        stream->avail_out = (uInt) r->r[5];
+        ret = inflate(stream,(flags & DECOMPRESS_FLAG_MOREREMAINING)?Z_NO_FLUSH:Z_FINISH);
+        r->r[2] = (int) stream->next_in;
+        r->r[3] = (int) stream->avail_in;
+        r->r[4] = (int) stream->next_out;
+        r->r[5] = (int) stream->avail_out;
+        switch(ret)
+        {
+        case Z_OK:
+        case Z_BUF_ERROR:
+            r->r[0] = ((r->r[3] || !(flags & DECOMPRESS_FLAG_MOREREMAINING))?DECOMPRESS_NEED_OUTPUT:DECOMPRESS_NEED_INPUT);
+            return NULL;
+        case Z_STREAM_END:
+            r->r[0] = DECOMPRESS_COMPLETE;
+            inflateEnd(stream);
+            task_strmdestroy(stream);
+            return NULL;
+        default:
+            e = getzliberror(ret,stream->msg);
+            inflateEnd(stream);
+            task_strmdestroy(stream);
+            return e;
+        }
+
+    case ZLib_CRC32-ZLib_00:
+        r->r[0] = (int) crc32((uLong) r->r[0], (const Bytef *) r->r[1], (uInt) (r->r[2]-r->r[1]));
+        return NULL;
+
+    case ZLib_Adler32-ZLib_00:
+        r->r[0] = (int) adler32((uLong) r->r[0], (const Bytef *) r->r[1], (uInt) (r->r[2]-r->r[1]));
+        return NULL;
+
+    case ZLib_Version-ZLib_00:
+        r->r[0] = (int) zlib_version;
+        return NULL;
+
+    case ZLib_ZCompress-ZLib_00:
+        r->r[0] = compress((Bytef *) r->r[0], (uLongf *) &r->r[1], (const Bytef *) r->r[2], (uLong) r->r[3]);
+        return NULL;
+
+    case ZLib_ZCompress2-ZLib_00:
+        r->r[0] = compress2((Bytef *) r->r[0], (uLongf *) &r->r[1], (const Bytef *) r->r[2], (uLong) r->r[3], r->r[4]);
+        return NULL;
+
+    case ZLib_ZUncompress-ZLib_00:
+        r->r[0] = uncompress((Bytef *) r->r[0], (uLongf *) &r->r[1], (const Bytef *) r->r[2], (uLong) r->r[3]);
+        return NULL;
+
+    case ZLib_DeflateInit-ZLib_00:
+        ret = deflateInit_((z_streamp) r->r[0], r->r[1], (const char *) r->r[2], r->r[3]);
+        if(ret == Z_OK)
+          task_strmcreate((z_streamp) r->r[0],true);
+        r->r[0] = ret;
+        return NULL;
+
+    case ZLib_InflateInit-ZLib_00:
+        ret = inflateInit_((z_streamp) r->r[0], (const char *) r->r[1], r->r[2]);
+        if(ret == Z_OK)
+          task_strmcreate((z_streamp) r->r[0],false);
+        r->r[0] = ret;
+        return NULL;
+
+    case ZLib_DeflateInit2-ZLib_00:
+        ret = deflateInit2_((z_streamp) r->r[0], r->r[1], r->r[2], r->r[3], r->r[4], r->r[5], (const char *) r->r[6], r->r[7]);
+        if(ret == Z_OK)
+          task_strmcreate((z_streamp) r->r[0],true);
+        r->r[0] = ret;
+        return NULL;
+
+    case ZLib_InflateInit2-ZLib_00:
+        ret = inflateInit2_((z_streamp) r->r[0], r->r[1], (const char *) r->r[2], r->r[3]);
+        if(ret == Z_OK)
+          task_strmcreate((z_streamp) r->r[0],false);
+        r->r[0] = ret;
+        return NULL;
+
+    case ZLib_Deflate-ZLib_00:
+        r->r[0] = deflate((z_streamp) r->r[0], r->r[1]);
+        return NULL;
+
+    case ZLib_DeflateEnd-ZLib_00:
+        task_strmdestroy((z_streamp) r->r[0]);
+        r->r[0] = deflateEnd((z_streamp) r->r[0]);
+        return NULL;
+
+    case ZLib_Inflate-ZLib_00:
+        r->r[0] = inflate((z_streamp) r->r[0], r->r[1]);
+        return NULL;
+
+    case ZLib_InflateEnd-ZLib_00:
+        task_strmdestroy((z_streamp) r->r[0]);
+        r->r[0] = inflateEnd((z_streamp) r->r[0]);
+        return NULL;
+
+    case ZLib_DeflateSetDictionary-ZLib_00:
+        r->r[0] = deflateSetDictionary((z_streamp) r->r[0], (const Bytef *) r->r[1], (uInt) r->r[2]);
+        return NULL;
+
+    case ZLib_DeflateCopy-ZLib_00:
+        ret = deflateCopy((z_streamp) r->r[0], (z_streamp) r->r[1]);
+        if(ret == Z_OK)
+          task_strmcreate((z_streamp) r->r[0],true);
+        r->r[0] = ret;        
+        return NULL;
+
+    case ZLib_DeflateReset-ZLib_00:
+        r->r[0] = deflateReset((z_streamp) r->r[0]);
+        return NULL;
+
+    case ZLib_DeflateParams-ZLib_00:
+        r->r[0] = deflateParams((z_streamp) r->r[0], r->r[1], r->r[2]);
+        return NULL;
+
+    case ZLib_InflateSetDictionary-ZLib_00:
+        r->r[0] = inflateSetDictionary((z_streamp) r->r[0], (const Bytef *) r->r[1], (uInt) r->r[2]);
+        return NULL;
+
+    case ZLib_InflateSync-ZLib_00:
+        r->r[0] = inflateSync((z_streamp) r->r[0]);
+        return NULL;
+
+    case ZLib_InflateReset-ZLib_00:
+        r->r[0] = inflateReset((z_streamp) r->r[0]);
+        return NULL;
+
+    case ZLib_GZOpen-ZLib_00:
+        return do_gzopen(r);
+
+    case ZLib_GZRead-ZLib_00:
+        r->r[0] = gzread((gzFile) r->r[0], (voidp) r->r[1], r->r[2]);
+        return NULL;
+
+    case ZLib_GZWrite-ZLib_00:
+        r->r[0] = gzwrite((gzFile) r->r[0], (const voidp) r->r[1], r->r[2]);
+        return NULL;
+
+    case ZLib_GZFlush-ZLib_00:
+        r->r[0] = gzflush((gzFile) r->r[0], r->r[1]);
+        return NULL;
+
+    case ZLib_GZClose-ZLib_00:
+        r->r[0] = gzclose((gzFile) r->r[0]);
+        /* TODO - Set filetype to &F89? */ 
+        return NULL;
+
+    case ZLib_GZError-ZLib_00:
+        r->r[0] = (int) gzerror((gzFile) r->r[0], &r->r[1]);
+        return NULL;
+
+    case ZLib_GZSeek-ZLib_00:
+        if(r->r[2] == 0)
+            flags = SEEK_SET;
+        else if(r->r[2] == 1)
+            flags = SEEK_CUR;
+        else
+            return ERROR(InvalidGZSeek);
+        r->r[0] = (int) gzseek((gzFile) r->r[0], (z_off_t) r->r[1], flags);
+        return NULL;
+
+    case ZLib_GZTell-ZLib_00:
+        r->r[0] = (int) gztell((gzFile) r->r[0]);
+        return NULL;
+
+    case ZLib_GZEOF-ZLib_00:
+        r->r[0] = (int) gzeof((gzFile) r->r[0]);
+        return NULL;
+
+    case ZLib_TaskAssociate-ZLib_00:
+        switch(r->r[1])
+        {
+        case TASKASSOCIATE_DISASSOCIATE:
+          task_associate((z_streamp) r->r[0],false);
+          return NULL;
+        case TASKASSOCIATE_ASSOCIATE:
+          task_associate((z_streamp) r->r[0],true);
+          return NULL;
+        default:
+          return ERROR(InvalidTaskAssociate);
+        }
+
+    default:
+        return ERROR(UnknownSWI);
+    }
+}
+
+void module_service(int service_number, _kernel_swi_regs *r, void *pw)
+{
+  (void) pw;
+  switch (service_number)
+  {
+    case Service_WimpCloseDown:
+      if(!r->r[0])
+        task_close(r->r[2]);
+      break;
+  }
+}

@@ -1,0 +1,312 @@
+/* Copyright 1998 Acorn Computers Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/******	WimpE.c ***********************************************************\
+
+Project:	Ursula (RISC OS for Risc PC II)
+Component:	BootApps/BootBoot/BootRun
+This file:	Wimp event code
+
+History:
+Date		Who	Change
+----------------------------------------------------------------------------
+10/06/1998	BJGA	Created
+16/06/1998	BJGA	Implemented Redraw_Window_Request and Mouse_Click handlers
+17/06/1998	BJGA	Escape now cancels drags
+18/06/1998	BJGA	Clicks on pane now set input focus (to improve chances of
+			receiving Escape hotkey events). Use of Escape key to double
+			as Cancel is now explicitly coded.
+			Added User_Drag_Box handler.
+
+\**************************************************************************/
+
+/* CLib */
+#include "swis.h"
+/* Toolbox */
+#include "event.h"
+#include "wimplib.h"
+#include "toolbox.h"
+#include "window.h"
+/* ConfigureLib */
+#include "misc.h"
+/* Local headers */
+#include "List.h"
+#include "Main.h"
+#include "WimpE.h"
+
+#ifndef Wimp_AutoScroll
+#define Wimp_AutoScroll	(0x400FD)
+#endif
+
+static int static_RedrawWindowRequest (int event_code, WimpPollBlock *event, IdBlock *id_block, void *handle);
+static int static_MouseClick (int event_code, WimpPollBlock *event, IdBlock *id_block, void *handle);
+static int static_UserDragBox (int event_code, WimpPollBlock *event, IdBlock *id_block, void *handle);
+static int static_KeyPressed (int event_code, WimpPollBlock *event, IdBlock *id_block, void *handle);
+
+int WimpE_Mask =	Wimp_Poll_NullMask +
+			Wimp_Poll_PointerLeavingWindowMask +
+			Wimp_Poll_PointerEnteringWindowMask +
+			Wimp_Poll_LoseCaretMask +
+			Wimp_Poll_GainCaretMask +
+			Wimp_Poll_PollWordNonZeroMask ;
+
+/*
+ * Border in OS units between parent window edges and pane / gadgets
+*/
+#define BORDER		16
+
+/*
+ * Size of scrollbar in OS uints.
+ * Should really be read using Wimp_Extend 11
+*/
+#define SCROLLBAR	44
+#define ER(x, e) if ((e = x) != NULL) return e
+
+
+/*
+ * Embed the pane inside the main window. Doesn't need to be called on every
+ * Wimp_EOpenWindow event as we use the nested wimp to link the pane to its
+ * parent's borders.
+*/
+_kernel_oserror *WimpE_open_pane(WimpOpenWindowBlock *open) {
+  WimpGetWindowStateBlock pane_state;
+  WindowShowObjectBlock show;
+  BBox parent_area, b;
+  int gadget_xs;
+  _kernel_oserror *e;
+
+  if (open == NULL) {
+    WimpGetWindowStateBlock parent;
+
+    ER (window_get_wimp_handle (0, Window_Obj, &parent.window_handle), e);
+    ER (wimp_get_window_state(&parent), e);
+    parent_area = parent.visible_area;
+
+  } else {
+    parent_area = open->visible_area;
+  }
+
+  /*
+   * find gadget size
+  */
+  throw (gadget_get_bbox(0, Window_Obj, 0x0, &b));
+  gadget_xs = b.xmax - b.xmin;
+
+
+  ER (window_get_wimp_handle (0, Pane_Obj, &pane_state.window_handle), e);
+  ER (wimp_get_window_state (&pane_state), e);
+
+  ER (window_get_wimp_handle (0, Window_Obj, &show.parent_window_handle), e);
+
+  show.visible_area.xmin = parent_area.xmin + BORDER;
+  show.visible_area.ymax = parent_area.ymax - BORDER;
+  show.visible_area.xmax = parent_area.xmax - gadget_xs - SCROLLBAR - BORDER * 2;
+  show.visible_area.ymin = parent_area.ymin + BORDER;
+
+  show.xscroll = pane_state.xscroll;
+  show.yscroll = pane_state.yscroll;
+  show.behind = -1;
+  show.alignment_flags = (0 << 16) | (1 << 18) | (2 << 20) | (0 << 22);
+
+  return toolbox_show_object (Toolbox_ShowObject_AsSubWindow, Pane_Obj,
+      Toolbox_ShowObject_FullSpec, &show, Window_Obj, NULL_ComponentId);
+}
+
+
+/*
+ * Open the window, also resizing the pane and moving the gadgets accordingly.
+ * The window y size is restricted to not go larger than the pane's extent
+ * (plus a border).
+*/
+static int open_main_window(int event, WimpPollBlock *poll_block, IdBlock *id_block, void *handle) {
+  WimpOpenWindowRequestEvent *open = (WimpOpenWindowRequestEvent *)poll_block;
+  int i, window_xs, window_ye;
+  BBox b, o;
+
+  /*
+   * No need to reopen the pane as it's nested and linked to
+   * its parent's size.
+  */
+//  throw (WimpE_open_pane(open));
+
+  /*
+   * Move the gadgets
+  */
+  window_xs = open->visible_area.xmax - open->visible_area.xmin;
+
+  for (i = 0x0; i < 0x5; i++) {
+    int xs;
+
+    throw (gadget_get_bbox(0, Window_Obj, i, &o));
+
+    b = o;
+
+    xs = b.xmax - b.xmin;
+    b.xmin = window_xs - xs - BORDER;
+    b.xmax = b.xmin + xs;
+
+    if (b.xmin != o.xmin) {
+      throw (gadget_move_gadget(0, Window_Obj, i, &b));
+    }
+
+  } // end for (i)
+
+  /*
+   * Limit the vertical extent of the parent to the size of the pane plus border
+  */
+  throw (window_get_extent(0, Pane_Obj, &b));
+  window_ye = b.ymin - b.ymax - BORDER * 2;
+
+  b.xmin = 0;
+  b.xmax = window_xs;
+  b.ymax = 0;
+  b.ymin = open->visible_area.ymin - open->visible_area.ymax;
+  b.ymin = max(b.ymin, window_ye);
+
+  throw (window_set_extent(0, Window_Obj, &b));
+
+  throw (wimp_open_window(open));
+
+  return 1;
+}
+
+
+void WimpE_Register (void)
+{
+  throw (event_register_wimp_handler (-1, Wimp_ERedrawWindow, static_RedrawWindowRequest, NULL));
+  throw (event_register_wimp_handler (-1, Wimp_EMouseClick, static_MouseClick, NULL));
+  throw (event_register_wimp_handler (-1, Wimp_EUserDrag, static_UserDragBox, NULL));
+  throw (event_register_wimp_handler (-1, Wimp_EKeyPressed, static_KeyPressed, NULL));
+
+  throw (event_register_wimp_handler(Window_Obj, Wimp_EOpenWindow, open_main_window, NULL));
+
+}
+
+/******	static_RedrawWindowRequest() **************************************\
+
+Purpose:	Handles Redraw_Window_Request event
+
+\**************************************************************************/
+
+static int static_RedrawWindowRequest (int event_code, WimpPollBlock *event, IdBlock *id_block, void *handle)
+{
+  int pane_handle;
+  throw (window_get_wimp_handle (0, Pane_Obj, &pane_handle));
+  if (((WimpRedrawWindowRequestEvent *) event)->window_handle == pane_handle)
+  {
+    List_RedrawWindow (pane_handle);
+  }
+  return 1;
+}
+
+/******	static_MouseClick() ***********************************************\
+
+Purpose:	Handles Mouse_Click event
+
+\**************************************************************************/
+
+static int static_MouseClick (int event_code, WimpPollBlock *event, IdBlock *id_block, void *handle)
+{
+  WimpGetWindowStateBlock pane;
+  int wao_x;
+  int wao_y;
+  throw (window_get_wimp_handle (0, Pane_Obj, &(pane.window_handle)));
+  throw (wimp_get_window_state (&pane));
+  wao_x = pane.visible_area.xmin - pane.xscroll;
+  wao_y = pane.visible_area.ymax - pane.yscroll;
+  if (((WimpMouseClickEvent *) event)->window_handle == pane.window_handle)
+  {
+    if (((WimpMouseClickEvent *) event)->buttons & (Wimp_MouseButtonAdjust | Wimp_MouseButtonSelect))
+    {
+      int handle;
+      throw (window_get_wimp_handle (0, Window_Obj, &handle));
+      throw (wimp_set_caret_position (handle, -1, 0, 0, 1<<25, -1));
+    }
+    List_HandleMouseClick (pane.window_handle, ((WimpMouseClickEvent *) event)->mouse_x - wao_x,
+        ((WimpMouseClickEvent *) event)->mouse_y - wao_y, ((WimpMouseClickEvent *) event)->buttons);
+  }
+  return 1;
+}
+
+/******	static_UserDragBox() **********************************************\
+
+Purpose:	Handles User_Drag_Box event
+
+\**************************************************************************/
+
+static int static_UserDragBox (int event_code, WimpPollBlock *event, IdBlock *id_block, void *handle)
+{
+  WimpGetWindowStateBlock pane;
+  int wao_x;
+  int wao_y;
+  throw (window_get_wimp_handle (0, Pane_Obj, &(pane.window_handle)));
+  throw (wimp_get_window_state (&pane));
+  wao_x = pane.visible_area.xmin - pane.xscroll;
+  wao_y = pane.visible_area.ymax - pane.yscroll;
+  /* Make bbox work-area-relative */
+  ((WimpUserDragBoxEvent *) event)->bbox.xmin -= wao_x;
+  ((WimpUserDragBoxEvent *) event)->bbox.ymin -= wao_y;
+  ((WimpUserDragBoxEvent *) event)->bbox.xmax -= wao_x;
+  ((WimpUserDragBoxEvent *) event)->bbox.ymax -= wao_y;
+  /* Make sure min/max values are the right way round */
+  if (((WimpUserDragBoxEvent *) event)->bbox.xmin > ((WimpUserDragBoxEvent *) event)->bbox.xmax)
+  {
+    int temp = ((WimpUserDragBoxEvent *) event)->bbox.xmax;
+    ((WimpUserDragBoxEvent *) event)->bbox.xmax = ((WimpUserDragBoxEvent *) event)->bbox.xmin;
+    ((WimpUserDragBoxEvent *) event)->bbox.xmin = temp;
+  }
+  if (((WimpUserDragBoxEvent *) event)->bbox.ymin > ((WimpUserDragBoxEvent *) event)->bbox.ymax)
+  {
+    int temp = ((WimpUserDragBoxEvent *) event)->bbox.ymax;
+    ((WimpUserDragBoxEvent *) event)->bbox.ymax = ((WimpUserDragBoxEvent *) event)->bbox.ymin;
+    ((WimpUserDragBoxEvent *) event)->bbox.ymin = temp;
+  }
+
+  _swi (Wimp_AutoScroll, _IN(0), 0); /* stop autoscrolling */
+
+  List_HandleDragBox (pane.window_handle, ((WimpUserDragBoxEvent *) event)->bbox);
+  return 1;
+}
+
+/******	static_KeyPressed() ***********************************************\
+
+Purpose:	Handles Key_Pressed event
+
+\**************************************************************************/
+
+static int static_KeyPressed (int event_code, WimpPollBlock *event, IdBlock *id_block, void *handle)
+{
+  if (event->key_pressed.key_code == 0x1B) /* Escape */
+  {
+    if (Dragging)
+    {
+      _swi (Wimp_DragBox, _IN(1), -1);   /* stop dragging */
+      _swi (Wimp_AutoScroll, _IN(0), 0); /* stop scrolling */
+      Dragging = FALSE;
+    }
+    else
+    {
+      ToolboxEvent ev;
+      ev.hdr.size = sizeof (ev.hdr);
+      ev.hdr.event_code = ActionButton_Selected;
+      ev.hdr.flags = ActionButton_Selected_Cancel | ActionButton_Selected_Cancel;
+      throw (toolbox_raise_toolbox_event (0, Window_Obj, Window_CANCEL, &ev));
+    }
+  }
+  else
+  {
+    throw (wimp_process_key (event->key_pressed.key_code));
+  }
+  return 1;
+}

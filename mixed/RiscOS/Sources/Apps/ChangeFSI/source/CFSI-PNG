@@ -1,0 +1,806 @@
+;
+; Copyright (c) 2013, RISC OS Open Ltd
+; All rights reserved.
+;
+; Redistribution and use in source and binary forms, with or without
+; modification, are permitted provided that the following conditions are met: 
+;     * Redistributions of source code must retain the above copyright
+;       notice, this list of conditions and the following disclaimer.
+;     * Redistributions in binary form must reproduce the above copyright
+;       notice, this list of conditions and the following disclaimer in the
+;       documentation and/or other materials provided with the distribution.
+;     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+;       may be used to endorse or promote products derived from this software
+;       without specific prior written permission.
+; 
+; THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+; AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+; IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+; ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+; LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+; CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+; SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+; INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+; CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+; ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+; POSSIBILITY OF SUCH DAMAGE.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:FSNumbers
+        GET     Hdr:HighFSI
+        GET     Hdr:NewErrors
+        GET     Hdr:ZLib
+        
+        AREA    CFSIpng, CODE, READONLY, PIC
+
+        MACRO
+        ShowReg $reg
+        Push    "r0-r2, lr"
+        SavePSR r14                     ; User mode, so R14 is mine
+      [ ($reg = sp) :LOR: ($reg = r13)
+        ADD     r0, sp, #4*4
+      |
+        MOV     r0, $reg
+      ]
+        SUB     sp, sp, #12
+        MOV     r1, sp
+        MOV     r2, #12
+        SWI     XOS_ConvertHex8
+        SWIVC   XOS_Write0
+        SWIVC   XOS_NewLine
+        ADD     sp, sp, #12
+        RestPSR r14
+        Pull    "r0-r2, lr"
+        MEND
+
+        MACRO
+        AdvanceSrc $pixels
+      [ "$pixels" = "One"
+        ADD     r4, r6, r4
+      |
+        MLA     r4, r6, $pixels, r4
+      ]
+        ADD     r3, r3, r4, LSR #3      ; Cream off whole bytes
+        AND     r4, r4, #7              ; Bits
+        MEND
+        
+        MACRO
+        AdvanceDst $pixels
+      [ "$pixels" = "One"
+        ADD     r2, r6, r2
+      |
+        MLA     r2, r6, $pixels, r2
+      ]
+        ADD     r1, r1, r2, LSR #3      ; Cream off whole bytes
+        AND     r2, r2, #7              ; Bits
+        MEND
+
+                ^ 0
+DECOMPRESS_COMPLETE    # 1
+DECOMPRESS_NEED_INPUT  # 1
+DECOMPRESS_NEED_OUTPUT # 1
+
+                ^ 0
+Wsp_InBuf       # 4                     ; input buffer         }
+Wsp_InBufSize   # 4                     ; bytes of input data  } for ZLib_Decompress args
+Wsp_OutBufSize  # 4                     ; bytes of data wanted }
+Wsp_OutBuf      # 4                     ; current/last decompressed line buffer
+Wsp_RowBytes    # 4                     ; bytes per whole row
+Wsp_BppBytes    # 1                     ; bpp rounded up to bytes (for filtering)
+Wsp_BppBits     # 1                     ; true bpp (for deinterlacing)
+Wsp_Seeked      # 1                     ; have we skipped earlier subimages (interlaced only)
+                # 1
+Wsp_FileRem     # 4                     ; compressed data left in current IDAT
+Wsp_FileOffset  # 4                     ; file PTR to get back to that IDAT
+Wsp_FileBuf     # 4                     ; compressed data buffer base
+Wsp_FileBufSize # 4                     ; size of compressed data buffer
+Wsp_ZLibSpace   # ZLib_Stream_Size      ; workspace for ZLib here
+                # 32
+Wsp_Size        * :INDEX: @
+Wsp_SizeShift   * 7
+        ASSERT (1:SHL:Wsp_SizeShift) = Wsp_Size
+
+; This makes an image of assembler code that can be loaded in by ChangeFSI
+; and then called, to decompress a PNG image data stream.
+;
+; While it would be entirely possible to inline this within the sprawling
+; mass of conditional assembler already in ChangeFSI, keeping it isolated
+; perhaps makes things easier to read?
+;
+; It follows the CFSIjpeg idea, so there's now a magic jump table here too...
+
+        B       decompress_init
+        B       decompress_one_line
+        MOV     pc, lr
+        MOV     pc, lr
+        DCD     1                       ; version number
+
+decompress_init ROUT
+        ; Entry
+        ; r0 = decompress state block
+        ;      or 0 to request state block size
+        ; r1 = 2 rows of output buffers (each with space for filter type byte)
+        ; r2 = input buffer
+        ; r3 = size of input buffer
+        ; r4 = value of PTR for length/tag pair of 1st IDAT
+        ; r5 = b0-7:    bytes per sample
+        ;      b8-15:   bits per sample
+        ;      b16-b31: reserved
+        ; r6 = number of subimages (1 or 7)
+        ; r9 = pointer to array of bytes-per-row values (excluding filter byte)
+        ; Exit
+        ; r0 = V set and error else
+        ;      size of state block
+        TEQ     r0, #0
+        MOVEQ   r0, #Wsp_Size
+        MOVEQ   pc, lr                  ; Size query
+
+        Push    "r0-r2, r6-r8, r10, lr"
+
+        MOV     r7, #1
+10
+        STR     r1, [r0, #Wsp_OutBuf]
+        STR     r2, [r0, #Wsp_FileBuf]
+        STR     r3, [r0, #Wsp_FileBufSize]
+        STR     r4, [r0, #Wsp_FileOffset]
+        STRB    r5, [r0, #Wsp_BppBytes]
+        MOV     r14, r5, LSR #8
+        STRB    r14, [r0, #Wsp_BppBits]
+
+        LDR     r8, [r9, #0*8]          ; Base of row byte counts
+        LDR     r8, [r8, r7, LSL #2]    ; Bytes per row in this subimage
+        STR     r8, [r0, #Wsp_RowBytes]
+                
+        MOV     r14, #0
+        STR     r2, [r0, #Wsp_InBuf]    ; Ensure address is vaguely valid
+        STR     r14, [r0, #Wsp_InBufSize]
+        STR     r14, [r0, #Wsp_FileRem] ; No remaining data
+        STRB    r14, [r0, #Wsp_Seeked]  ; Not yet seeked
+
+        ADD     r7, r7, #1
+        ADD     r8, r8, #1              ; Filter type byte
+        ADD     r1, r1, r8, LSL #1      ; 2 rows
+        ADD     r2, r2, r3
+
+        ADD     r8, r0, #Wsp_ZLibSpace
+        ADD     r10, r8, #ZLib_Stream_Size
+20
+        STR     r14, [r8], #4           ; Zero init the ZLib structure
+        TEQ     r8, r10
+        BNE     %BT20
+
+        ADD     r0, r0, #Wsp_Size
+        SUBS    r6, r6, #1              ; Next subimage
+        BNE     %BT10
+
+        Pull    "r0-r2, r6-r8, r10, pc"
+
+decompress_one_line
+        TEQ     r4, #0
+        BEQ     decompress_one_normal_line
+        ; Fall through
+        
+decompress_one_adam7_line
+        ; Entry
+        ; r0 = array of decompress state blocks
+        ; r1 = file handle
+        ; r2 = row number (0's based)
+        ; r3 = total number of rows
+        ; r4 = deinterlaced row output buffer
+        ; Exit
+        ; r0 = V set and error else
+        ;      start of line of image data
+        Push    "r0-r1, r4-r7, lr"
+
+        MOV     r7, r0
+        AND     r14, r2, #7
+        ADR     r5, decompress_contrib
+        LDR     r6, [r5, r14, LSL #2]   ; At most 4 contributing rows
+10
+        AND     r0, r6, #&FF
+        LDR     r1, [sp, #1*4]
+        BL      adam7_subimage
+        BVS     %FT40
+
+        AND     r0, r6, #&FF
+        CMP     r0, #7                  ; Don't waste time copying solid rows
+        ADDEQ   r14, r7, #6:SHL:Wsp_SizeShift
+        LDREQ   r4, [r14, #Wsp_OutBuf]
+        ADDEQ   r4, r4, #1              ; Just point at subimage 7's buffer
+        BEQ     %FT20
+
+        MOV     r1, r4
+        BL      adam7_expand_row        ; Copy pixels out
+
+        MOVS    r6, r6, LSR #8
+        BNE     %BT10
+20
+        STR     r4, [sp, #0*4]
+        ADD     r14, r2, #1             ; Was that the last line?
+        TEQ     r3, r14
+        BNE     %FT40
+
+        MOV     r6, #6
+30
+        ADD     r0, r7, r6, LSL #Wsp_SizeShift
+        ADD     r0, r0, #Wsp_ZLibSpace  ; Make sure any memory the ZLib module claimed behind
+        BL      zlib_decompress_end     ; our back gets released, as 6 of the 7 subimages
+        SUBS    r6, r6, #1              ; will never reach the end of stream marker
+        BPL     %BT30
+40
+        STRVS   r0, [sp, #0*4]
+        Pull    "r0-r1, r4-r7, pc"
+
+decompress_contrib
+        DCD     &06040201               ; 1 6 4 6 2 6 4 6
+        DCD     &00000007               ; 7 7 7 7 7 7 7 7  
+        DCD     &00000605               ; 5 6 5 6 5 6 5 6  
+        DCD     &00000007               ; 7 7 7 7 7 7 7 7  
+        DCD     &00060403               ; 3 6 4 6 3 6 4 6  
+        DCD     &00000007               ; 7 7 7 7 7 7 7 7  
+        DCD     &00000605               ; 5 6 5 6 5 6 5 6  
+        DCD     &00000007               ; 7 7 7 7 7 7 7 7  
+
+decompress_one_normal_line ROUT
+        ; Entry
+        ; r0 = decompress state block
+        ; r1 = file handle
+        ; r2 = row number (0's based)
+        ; r3 = total number of rows
+        ; r4 = 0
+        ; Exit
+        ; r0 = V set and error else
+        ;      start of line of image data
+        Push    "r0-r8, lr"
+
+        MOV     r7, r0
+        LDR     r5, [r7, #Wsp_RowBytes]
+        LDR     r4, [r7, #Wsp_OutBuf]
+        TEQ     r2, #0
+        BNE     %FT20
+
+        MOV     r2, r5
+        MOV     r14, #0
+10
+        STRB    r14, [r4, r2]           ; Zero the current line
+        SUBS    r2, r2, #1
+        BPL     %BT10
+20
+        MOV     r2, r5
+        ADD     r3, r4, r5              ; Move current to previous
+        ADD     r3, r3, #1
+30
+        LDRB    r14, [r4, r2]
+        STRB    r14, [r3, r2]
+        SUBS    r2, r2, #1
+        BPL     %BT30
+40
+        LDRB    r14, [r7, #Wsp_Seeked]
+        LDR     r0, [sp, #2*4]
+        ORR     r0, r0, r14             ; Line 0 and not seeked
+        LDR     r1, [r7, #Wsp_RowBytes] ; One whole line
+        ADD     r1, r1, #1              ; Filter type byte
+        LDR     r2, [r7, #Wsp_OutBuf]
+        LDR     r3, [sp, #1*4]
+        BL      load_row
+        BVS     filter_done
+
+        LDR     r4, [r7, #Wsp_OutBuf]
+        ADD     r4, r4, #1              ; Update line start
+        STR     r4, [sp, #0*4]
+ 
+        LDRB    r1, [r4, #-1]
+        CMP     r1, #4
+        ADDLS   pc, pc, r1, LSL #2      ; Hi ho, hi ho, it's off to filter we go
+        B       filter_unknown
+        B       filter_none
+        B       filter_sub
+        B       filter_up
+        B       filter_average
+        B       filter_paeth
+
+filter_unknown
+        ADR     r0, filter_duff_err
+        SETV
+filter_done
+filter_none
+        STRVS   r0, [sp, #0*4]
+        Pull    "r0-r8, pc"
+
+filter_duff_err
+        DCD     42
+        DCB     "Corrupt filter type encountered", 0
+        ALIGN
+
+filter_sub ROUT
+        LDR     r5, [r7, #Wsp_RowBytes] ; bytes per row
+        LDRB    r6, [r7, #Wsp_BppBytes] ; bpp
+        MOV     r7, #0                  ; x
+10
+        LDRB    r1, [r4, r7]            ; Sub(x)
+        SUBS    r14, r7, r6
+        MOVMI   r0, #0                  ; Raw(i) = 0 for all i < 0
+        LDRPLB  r0, [r4, r14]           ; Raw(x-bpp)
+        ADD     r0, r1, r0
+        STRB    r0, [r4, r7]            ; Raw(x) = Sub(x) + Raw(x-bpp)
+
+        ADD     r7, r7, #1
+        TEQ     r7, r5
+        BNE     %BT10
+        B       filter_done
+
+filter_up ROUT
+        LDR     r5, [r7, #Wsp_RowBytes] ; bytes per row
+        MOV     r7, #0                  ; x
+        ADD     r8, r4, r5
+        ADD     r8, r8, #1              ; previous row buffer
+10
+        LDRB    r1, [r4, r7]            ; Up(x)
+        LDRB    r0, [r8, r7]            ; Prior(x)
+        ADD     r0, r1, r0
+        STRB    r0, [r4, r7]            ; Raw(x) = Up(x) + Prior(x)
+
+        ADD     r7, r7, #1
+        TEQ     r7, r5
+        BNE     %BT10
+        B       filter_done
+
+filter_average ROUT
+        LDR     r5, [r7, #Wsp_RowBytes] ; bytes per row
+        LDRB    r6, [r7, #Wsp_BppBytes] ; bpp
+        MOV     r7, #0                  ; x
+        ADD     r8, r4, r5
+        ADD     r8, r8, #1              ; previous row buffer
+10
+        LDRB    r1, [r4, r7]            ; Average(x)
+        SUBS    r14, r7, r6
+        MOVMI   r0, #0                  ; Raw(i) = 0 for all i < 0
+        LDRPLB  r0, [r4, r14]           ; Raw(x-bpp)
+        LDRB    r2, [r8, r7]            ; Prior(x)
+        ADD     r14, r0, r2
+        ADD     r0, r1, r14, LSR #1
+        STRB    r0, [r4, r7]            ; Raw(x) = Average(x) + floor((Raw(x-bpp)+Prior(x))/2)
+
+        ADD     r7, r7, #1
+        TEQ     r7, r5
+        BNE     %BT10
+        B       filter_done
+
+filter_paeth ROUT
+        LDR     r5, [r7, #Wsp_RowBytes] ; bytes per row
+        LDRB    r6, [r7, #Wsp_BppBytes] ; bpp
+        MOV     r7, #0                  ; x
+        ADD     r8, r4, r5
+        ADD     r8, r8, #1              ; previous row buffer
+        Push    "r10-r12"
+10
+        SUBS    r14, r7, r6
+        MOVMI   r0, #0                  ; Raw(i) = 0 for all i < 0
+        LDRPLB  r0, [r4, r14]           ; Raw(x-bpp)
+        LDRB    r1, [r8, r7]            ; Prior(x)
+        MOVMI   r2, #0                  ; Prior(i) = 0 for all i < 0
+        LDRPLB  r2, [r8, r14]           ; Prior(x-bpp)
+
+        ADD     r14, r0, r1
+        SUB     r14, r14, r2            ; p
+        SUBS    r10, r14, r0
+        RSBMI   r10, r10, #0            ; abs(p - a)
+        SUBS    r11, r14, r1
+        RSBMI   r11, r11, #0            ; abs(p - b)
+        SUBS    r12, r14, r2
+        RSBMI   r12, r12, #0            ; abs(p - c)
+
+        CMP     r10, r11
+        CMPLS   r10, r12
+        BLS     %FT20                   ; if pa <= pb AND pa <= pc then return a
+        CMP     r11, r12
+        MOVLS   r0, r1                  ; if pb <= pc then return b
+        MOVHI   r0, r2                  ; return c
+20
+        LDRB    r1, [r4, r7]            ; Paeth(x)
+        ADD     r0, r1, r0
+        STRB    r0, [r4, r7]            ; Raw(x) = Paeth(x) +
+                                        ;          Predict(Raw(x-bpp), Prior(x), Prior(x-bpp))
+        ADD     r7, r7, #1
+        TEQ     r7, r5
+        BNE     %BT10
+        Pull    "r10-r12"
+        B       filter_done
+
+adam7_expand_row ROUT
+        ; Entry
+        ; r0 = subimage to read from
+        ; r1 = deinterlaced row output buffer
+        ; r7 = array of decompress state blocks
+        ; Exit
+        ;      pixels mixed into output buffer order
+        Push    "r0-r8, lr"
+
+        SUB     r5, r0, #1              ; Make 0's based
+        ADD     r7, r7, r5, LSL #Wsp_SizeShift
+        LDR     r0, [r7, #Wsp_RowBytes]
+        TEQ     r0, #0
+        Pull    "r0-r8, pc", EQ         ; Empty subimage
+
+        LDRB    r6, [r7, #Wsp_BppBits]  ; Can be 1, 2, 4, 8, 16, 24, 32, 48, 64
+        ADR     r14, adam7_output_repeat
+        LDRB    r8, [r14, r5]
+
+        ADR     r14, adam7_output_inset
+        LDRB    r14, [r14, r5]
+        MOV     r2, #0
+        AdvanceDst r14                  ; r1 = dst byte, r2 = dst bit (0-7)
+
+        LDR     r3, [r7, #Wsp_OutBuf]
+        ADD     r3, r3, #1              ; Skip the filter type byte
+        MOV     r4, #0                  ; r3 = src byte, r4 = src bit (0-7)
+
+        ADD     r0, r0, r3              ; End of source line
+        CMP     r6, #8
+        BCS     %FT20
+
+        Push    "r9-r10"
+        MOV     r7, #1
+        MOV     r7, r7, LSL r6
+        SUB     r7, r7, #1              ; Bitmask for this bpp
+        RSB     r10, r6, #8             ; Shifter constant for BE bits
+10
+        ; Faffy bit copying 1/2/4bpp
+        LDRB    r14, [r3]
+        SUB     r9, r10, r4
+        MOV     r14, r14, LSR r9
+        AND     r14, r14, r7            ; Source bit(s) now right justified
+
+        LDRB    r5, [r1]
+        SUB     r9, r10, r2
+        BIC     r5, r5, r7, LSL r9      ; Knock out target
+        ORR     r5, r5, r14, LSL r9     ; Insert
+        STRB    r5, [r1]                ; Save
+
+        AdvanceSrc One
+        AdvanceDst r8                   ; Jump to next output location
+        CMP     r3, r0                  ; More input?
+        BCC     %BT10
+        Pull    "r9-r10"
+        Pull    "r0-r8, pc"
+20
+        ; Whole byte cases
+        MOV     r5, r1
+        RSB     r14, r6, #64
+        ADD     pc, pc, r14
+        NOP
+        LDRB    r14, [r3], #1           ; 64b
+        STRB    r14, [r5], #1
+        LDRB    r14, [r3], #1
+        STRB    r14, [r5], #1
+        LDRB    r14, [r3], #1           ; 48b
+        STRB    r14, [r5], #1
+        LDRB    r14, [r3], #1
+        STRB    r14, [r5], #1
+        LDRB    r14, [r3], #1           ; 32b
+        STRB    r14, [r5], #1
+        LDRB    r14, [r3], #1           ; 24b
+        STRB    r14, [r5], #1
+        LDRB    r14, [r3], #1           ; 16b
+        STRB    r14, [r5], #1
+        LDRB    r14, [r3], #1           ; 8b
+        STRB    r14, [r5], #1
+
+        AdvanceDst r8                   ; Jump to next output location
+        CMP     r3, r0                  ; More input?
+        BCC     %BT20
+        Pull    "r0-r8, pc"
+
+adam7_output_inset
+        DCB     0, 4, 0, 2, 0, 1        ; Pixels from left (1-6)
+        ALIGN
+
+adam7_output_repeat
+        DCB     8, 8, 4, 4, 2, 2        ; Pixel between (1-6)
+        ALIGN
+
+adam7_subimage ROUT
+        ; Entry
+        ; r0 = subimage to read from
+        ; r1 = file handle
+        ; r2 = row number (0's based)
+        ; r3 = total number of rows
+        ; r7 = array of decompress state blocks
+        ; Exit
+        ; r0 = V set and error else
+        ;      start of line of image data
+        Push    "r0-r8, lr"
+
+        MOV     r8, r7
+        SUB     r5, r0, #1              ; Make 0's based
+        ADD     r7, r8, r5, LSL #Wsp_SizeShift
+        LDRB    r0, [r7, #Wsp_Seeked]
+        TEQ     r0, #0
+        BNE     %FT40
+
+        MOV     r6, #0                  ; Subimage to skip (0's based)
+10
+        TEQ     r5, r6
+        STREQB  r5, [r7, #Wsp_Seeked]
+        BEQ     %FT40                   ; Seeked far enough
+
+        LDR     r4, [sp, #3*4]
+        ADR     r1, adam7_round_yscale
+        LDRB    r1, [r1, r6]
+        ADD     r4, r4, r1
+        ADR     r1, adam7_log2_yscale
+        LDRB    r1, [r1, r6]
+        MOV     r4, r4, LSR r1          ; Adjust to height of this subimage
+20
+        ADD     r1, r8, r6, LSL #Wsp_SizeShift
+        LDR     r1, [r1, #Wsp_RowBytes] ; For the subimage we're skipping
+        TEQ     r1, #0
+        BEQ     %FT30                   ; Empty subimage
+
+        ADD     r1, r1, #1
+        LDR     r2, [r7, #Wsp_OutBuf]   ; Row lengths are pyramidal, phew
+        LDR     r3, [sp, #1*4]
+        BL      load_row
+        BVS     %FT50
+
+        ORR     r0, r0, #1              ; Any non zero
+        SUBS    r4, r4, #1              
+        BNE     %BT20                   ; Next row
+30
+        ADD     r6, r6, #1
+        B       %BT10                   ; Next subimage
+40
+        LDR     r1, [r7, #Wsp_RowBytes]
+        TEQ     r1, #0
+        BEQ     %FT50
+
+        MOV     r0, r7
+        LDR     r1, [sp, #1*4]
+        LDR     r2, [sp, #2*4]
+        LDR     r3, [sp, #3*4]
+        MOV     r4, #0
+        BL      decompress_one_normal_line
+50
+        ADD     sp, sp, #4
+        Pull    "r1-r8, pc"
+
+adam7_round_yscale
+        DCB     7, 7, 3, 3, 1, 1        ; Height round up before truncation (1-6)
+        ALIGN
+
+adam7_log2_yscale
+        DCB     3, 3, 3, 2, 2, 1        ; Height scalers per subimage (1-6)
+        ALIGN
+
+load_row ROUT
+        ; Entry
+        ; r0 = zero if first ever call (ZLib state undefined)
+        ; r1 = number of bytes to load
+        ; r2 = destination buffer
+        ; r3 = file handle
+        ; r7 = decompress state block
+        ; Exit
+        ; r0 = V set and error else
+        ;      buffer refilled
+        Push    "r0-r5, r8, lr"
+
+        TEQ     r0, #0
+        MOVEQ   r0, #2_00010            ; First call
+        MOVNE   r0, #2_00011            ; Continue
+        STR     r1, [r7, #Wsp_OutBufSize]
+10
+        ASSERT  Wsp_InBuf = 0
+        ASSERT  Wsp_InBufSize = Wsp_InBuf + 4
+        ASSERT  Wsp_OutBufSize = Wsp_InBufSize + 4
+        LDMIA   r7, { r2-r3, r5 }       ; Recover decompress params
+        LDR     r14, [sp, #1*4]
+        SUB     r14, r14, r5            ; Bytes already got
+        LDR     r4, [sp, #2*4]
+        ADD     r4, r4, r14             ; Place to continue output
+        ADD     r1, r7, #Wsp_ZLibSpace
+        BL      zlib_decompress
+        BVS     %FT60
+        STMIA   r7, { r2-r3, r5 }
+
+        CMP     r0, #DECOMPRESS_NEED_INPUT
+        Pull    "r0-r5, r8, pc", NE     ; Complete
+        
+        ; Need to load some more from the file
+        LDR     r5, [r7, #Wsp_FileBuf]
+        STR     r5, [r7, #Wsp_InBuf]    ; Reset input buffer pointer to empty
+20
+        SUBS    r3, r3, #1              ; Re-present trailing bytes
+        LDRPLB  r1, [r2], #1
+        STRPLB  r1, [r5], #1            
+        BPL     %BT20
+30
+        LDR     r0, [r7, #Wsp_FileBufSize]
+        LDR     r1, [r7, #Wsp_FileBuf]
+        SUB     r1, r5, r1              ; Used cache
+        SUB     r8, r0, r1              ; Space remaining in cache
+        LDR     r1, [r7, #Wsp_FileRem]
+        TEQ     r1, #0
+        BEQ     %FT50
+
+        ; There was some data left in the last IDAT seen
+        CMP     r8, r1
+        MOVCS   r8, r1                  ; Limit read to data available
+
+        MOV     r0, #OSGBPB_ReadFromGiven
+        LDR     r1, [sp, #3*4]
+        MOV     r2, r5
+        MOV     r3, r8
+        LDR     r4, [r7, #Wsp_FileOffset]
+        SWI     XOS_GBPB
+        BVS     %FT60
+
+        STR     r4, [r7, #Wsp_FileOffset]
+        ADD     r5, r5, r8
+
+        LDR     r1, [r7, #Wsp_FileRem]
+        SUBS    r1, r1, r8
+        STR     r1, [r7, #Wsp_FileRem]  ; Recalculate remainder
+        BNE     %FT90                   ; Has remainder, but buffer full
+40
+        ADD     r4, r4, #4              ; That IDAT ended, skip CRC32
+        STR     r4, [r7, #Wsp_FileOffset]
+50
+        ; Hunt for the next IDAT
+        MOV     r0, #OSGBPB_ReadFromGiven
+        LDR     r1, [sp, #3*4]
+        SUB     sp, sp, #8
+        MOV     r2, sp
+        MOV     r3, #8
+        LDR     r4, [r7, #Wsp_FileOffset]
+        SWI     XOS_GBPB
+        BVS     %FT60
+
+        LDMIA   sp!, { r2-r3 }          ; r2 = BE length, r3 = tag
+
+        MOV     r14, #&FF000000
+        ORR     r14, r14, #&FF00
+        AND     r0, r14, r2, ROR #8     ; ABCD -> DABC -> D.B.
+        AND     r2, r14, r2             ; ABCD         -> A.C.
+        ORR     r2, r0, r2, ROR #24     ;              -> DCBA endian swapped
+
+        LDR     r0, load_idat
+        TEQ     r3, r0
+        BEQ     %FT70
+
+        LDR     r0, load_iend
+        TEQ     r3, r0
+        BEQ     %FT80
+
+        TST     r3, #1:SHL:5            ; Skip ancilliary tags
+        ADDNE   r4, r4, r2
+        BNE     %BT40
+
+        ADR     r0, load_duff_err
+        SETV
+60
+        ADD     sp, sp, #4
+        Pull    "r1-r5, r8, pc"         ; Fatal
+70
+        ; It's an IDAT
+        TEQ     r2, #0
+        BEQ     %BT40                   ; Skip CRC32 after empty IDAT
+
+        STR     r2, [r7, #Wsp_FileRem]
+        STR     r4, [r7, #Wsp_FileOffset]
+        B       %BT30                   ; New IDAT, go read from it
+80
+        ; It's an IEND
+        SUB     r4, r4, #8              ; If called again (why?) avoid EOF
+        STR     r4, [r7, #Wsp_FileOffset] 
+90
+        LDR     r0, [r7, #Wsp_InBuf]
+        SUB     r0, r5, r0              ; Total bytes loaded
+        STR     r0, [r7, #Wsp_InBufSize]
+
+        MOV     r0, #2_00011            ; Continue
+        B       %BT10
+
+load_idat
+        DCB     "IDAT"
+load_iend
+        DCB     "IEND"
+load_duff_err
+        DCD     42
+        DCB     "Unrecognised critical tag between IDAT and IEND", 0
+        ALIGN
+
+zlib_decompress ROUT
+        ; Entry
+        ; r0 = flags
+        ; r1 = workspace (actually a stream block)
+        ; r2 = input
+        ; r3 = input used space
+        ; r4 = output
+        ; r5 = output free space
+        ; Exit
+        ; r0 = V set and error else
+        ;      r0, r2-r5 updated after decompressing the input data
+      [ {FALSE}
+        SWI     XZLib_Decompress
+        MOV     pc, lr
+      |                                 ; This duplicates the ZLib_Decompress SWI which avoids
+        Push    "r0-r2, lr"             ; having to assume that the opaque workspace in r1 is         
+        TST     r0, #2_00001            ; in fact a stream block, because we want to manually end the inflate
+        BNE     %FT10                   ; later with ZLib_InflateEnd, which requires a stream block
+
+        ; First pass init stream block
+        MOV     r0, r1
+        ADR     r1, zlib_id
+        MOV     r2, #ZLib_Stream_Size
+        SWI     XZLib_InflateInit
+        ADDVS   sp, sp, #4
+        Pull    "r1-r2, pc", VS
+        LDMIA   sp, { r0-r2 }
+10
+        ; Decompress data
+        STR     r2, [r1, #ZLib_Stream_Next_In]
+        STR     r3, [r1, #ZLib_Stream_Avail_In]
+        STR     r4, [r1, #ZLib_Stream_Next_Out]
+        STR     r5, [r1, #ZLib_Stream_Avail_Out]
+        TST     r0, #2_00010
+        MOV     r0, r1
+        MOVNE   r1, #ZLIB_TYPE_NO_FLUSH
+        MOVEQ   r1, #ZLIB_TYPE_FINISH
+        SWI     XZLib_Inflate
+        LDR     r1, [sp, #1*4]          ; Entry r1, stream block
+        LDR     r2, [r1, #ZLib_Stream_Next_In]
+        STR     r2, [sp, #2*4]
+        Pull    "r2"                    ; Entry r0, flags
+        LDR     r3, [r1, #ZLib_Stream_Avail_In]
+        LDR     r4, [r1, #ZLib_Stream_Next_Out]
+        LDR     r5, [r1, #ZLib_Stream_Avail_Out]
+
+        CMP     r0, #ZLIB_RETURN_OK
+        CMPNE   r0, #ZLIB_RETURN_BUF_ERROR
+        BNE     %FT20
+        MVN     r2, r2                  ; Invert flag sense
+        TST     r2, #2_00010
+        TEQEQ   r3, #0
+        MOVNE   r0, #DECOMPRESS_NEED_OUTPUT
+        MOVEQ   r0, #DECOMPRESS_NEED_INPUT
+        CLRV
+        Pull    "r1-r2, pc"
+20
+        CMP     r0, #ZLIB_RETURN_STREAM_END
+        BNE     %FT30
+        MOV     r0, r1
+        SWI     XZLib_InflateEnd
+        MOV     r0, #DECOMPRESS_COMPLETE
+        CLRV
+        Pull    "r1-r2, pc"
+30
+        MOV     r0, r1
+        SWI     XZLib_InflateEnd
+        ADR     r0, zlib_inflate_duff_err
+        SETV
+        Pull    "r1-r2, pc"
+      ]
+
+zlib_id
+        DCB     "1.2.5.f", 0
+        ALIGN
+
+zlib_inflate_duff_err
+        DCD     42
+        DCB     "ZLib decompression failure", 0
+        ALIGN
+
+zlib_decompress_end ROUT
+        ; Entry
+        ; r0 = stream block
+        ; Exit
+        ; r0 = V set and error else
+        ;      preserved
+        SWI     XZLib_InflateEnd
+        MOV     pc, lr
+        
+        END
+        

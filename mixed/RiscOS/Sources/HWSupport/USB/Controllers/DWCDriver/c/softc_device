@@ -1,0 +1,273 @@
+/*
+ * Copyright (c) 2012, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include <stdarg.h>
+#include <stdlib.h>
+#include <stdbool.h>
+#include "kernel.h"
+#include "swis.h"
+#include "cmodule.h"
+#include "modhead.h"
+#include "Global/HALEntries.h"
+
+#include <sys/callout.h>
+#include <sys/queue.h>
+
+#include <machine/bus.h>
+#include <dev/usb/usb.h>
+#include <dev/usb/usbdi.h>
+#include <dev/usb/usbdivar.h>
+
+#include "dwc_os.h"
+#include "dwc_otg_riscos.h"
+
+#include "dwc/driver/dwc_otg_hcd_if.h"
+#include "dwc/driver/dwc_otg_dbg.h"
+#include "dwc/driver/dwc_otg_driver.h"
+
+#include "dwc/driver/dwc_otg_hcd.h"
+
+static void softc_device_timeout(void *addr)
+{
+	DPRINTFN(10,("softc_device_timeout: %p\n",addr));
+	riscos_abort_pipe(addr);
+}
+
+usbd_status softc_device_transfer(usbd_xfer_handle xfer)
+{
+	dwc_assert(address_valid(xfer,3),"Bad xfer handle %08x",xfer);
+	usbd_status err;
+
+	DPRINTFN(10,("softc_device_transfer: xfer=%p pipe=%p\n",xfer,xfer->pipe));
+
+#ifdef DWCDRIVER_DEBUG
+	usbd_pipe_handle pipe = xfer->pipe;
+	usbd_xfer_handle xfer2;
+	SIMPLEQ_FOREACH(xfer2, &pipe->queue, next) {
+                dwc_assert(xfer != xfer2,"xfer already in queue!");
+	}
+#endif
+	/* Add transfer to queue */
+	err = usb_insert_transfer(xfer);
+	if (err)
+		return err;
+
+	/* Pipe isn't running, start first xfer */
+	return softc_device_start(SIMPLEQ_FIRST(&xfer->pipe->queue));
+}
+
+usbd_status softc_device_start(usbd_xfer_handle xfer)
+{
+	dwc_assert(address_valid(xfer,3),"Bad xfer handle %08x",xfer);
+	struct dwc_softc_xfer *ex = (struct dwc_softc_xfer *) xfer;
+	struct dwc_softc_pipe *epipe = (struct dwc_softc_pipe *)xfer->pipe;
+	dwc_softc_t *sc = (dwc_softc_t *)epipe->pipe.device->bus;
+	usb_endpoint_descriptor_t *ed = epipe->pipe.endpoint->edesc;
+	struct usbd_device *dev = epipe->pipe.device;
+
+	DPRINTFN(10,("softc_device_start: xfer=%p pipe=%p urb=%p\n",xfer,xfer->pipe,epipe->urb));
+
+	dwc_assert(!epipe->xfer,"Pipe should be idle here");
+
+	/* DWCTODO - Hack - reset urb params
+	   DWC layer doesn't (properly) support reuse of urbs, so we must reset
+	   certain key parameters ourselves */
+	epipe->urb->actual_length = 0;
+	epipe->urb->error_count = 0;
+	epipe->urb->status = 0;
+	memset(epipe->urb->iso_descs,0,sizeof(struct dwc_otg_hcd_iso_packet_desc)*epipe->urb->packet_count);
+
+	if((ed->bmAttributes & UE_XFERTYPE) == UE_CONTROL)
+	{
+		/* Set up pipe info. Direction needs to come from request packet instead of pipe. */
+		dwc_otg_hcd_urb_set_pipeinfo(epipe->urb,dev->address,UE_GET_ADDR(ed->bEndpointAddress),UE_GET_XFERTYPE(ed->bmAttributes),ex->xfer.request.bmRequestType & UT_READ,UE_GET_SIZE(UGETW(ed->wMaxPacketSize)));
+
+		/* Copy request packet to our DMA buffer */
+		memcpy(epipe->request,&ex->xfer.request,sizeof(usb_device_request_t));
+		DPRINTF(("type %02x req %02x val %04x idx %04x len %04x\n",ex->xfer.request.bmRequestType,ex->xfer.request.bRequest,UGETW(ex->xfer.request.wValue),UGETW(ex->xfer.request.wIndex),UGETW(ex->xfer.request.wLength)));
+	}
+
+	uint32_t flags = 0;
+	if((ex->xfer.flags & USBD_FORCE_SHORT_XFER) && !(ex->xfer.length % UGETW(ed->wMaxPacketSize)))
+		flags |= URB_SEND_ZERO_PACKET;
+
+	/* Get DMA addr of buffer */
+	void *buf = KERNADDR(&ex->xfer.dmabuf,0);
+	dwc_dma_t dma_addr = ((dwc_dma_t) vtophys(buf)) + dma_offset;
+
+	DPRINTF(("xfer len %08x buf %08x -> %08x\n",ex->xfer.length,buf,dma_addr));
+
+	/* Set urb parameters for this xfer */
+	uint32_t interval = ed->bInterval;
+	if (UE_GET_XFERTYPE(ed->bmAttributes) == UE_ISOCHRONOUS ||
+	    (UE_GET_XFERTYPE(ed->bmAttributes) == UE_INTERRUPT && xfer->pipe->device->speed == USB_SPEED_HIGH))
+	{
+		interval = min(interval - 1, 15); /* USB 2.0, Table 9-13 */
+		interval = 1 << interval;
+	}
+
+	dwc_otg_hcd_urb_set_params(epipe->urb,ex,buf,dma_addr,ex->xfer.length,epipe->request,epipe->dma_req,flags,interval);
+
+	/* DWCTODO - Set isoc desc params */
+
+	/* Queue and start the urb */
+	epipe->xfer = ex;
+
+	bool timeout = ex->xfer.timeout && !sc->sc_bus.use_polling;
+
+	dwc_irqflags_t irqflags;
+	DWC_SPINLOCK_IRQSAVE(sc->dwc_dev.hcd->lock, &irqflags);
+
+	if(timeout) {
+		DPRINTFN(10,("-> set timeout %d on %x\n",ex->xfer.timeout,ex));
+		callout_reset(&(ex->xfer.timeout_handle), (MS_TO_TICKS(ex->xfer.timeout)), (softc_device_timeout), (ex));
+	}
+
+	int ret = dwc_otg_hcd_urb_enqueue(sc->dwc_dev.hcd,epipe->urb,&epipe->dwc_priv,0);
+
+	if(ret)
+	{
+		dprintf(("","urb_enqueue failed, %d\n",ret));
+		if(timeout) {
+			callout_stop(&(ex->xfer.timeout_handle));
+			/* Just in case... */
+			riscos_cancel_abort_pipe(xfer);
+		}
+	}
+
+	DWC_SPINUNLOCK_IRQRESTORE(sc->dwc_dev.hcd->lock, irqflags);
+
+	if(!ret)
+	{
+		return USBD_IN_PROGRESS;
+	}
+
+	epipe->xfer = NULL;
+
+	/* If we've failed to start we must mark the request as complete, with the appropriate error code */
+	usbd_status err;
+	switch(ret)
+	{
+	case -DWC_E_NO_DEVICE:
+		err = USBD_BAD_ADDRESS; /*?*/
+		break;
+	case -DWC_E_NO_MEMORY:
+		err = USBD_NOMEM;
+		break;
+	default:
+		err = USBD_IOERROR;
+		break;
+	}
+	xfer->status = err;
+	usb_transfer_complete(xfer);
+	/* xfer may have been deleted now */
+	return err;
+}
+
+void softc_device_abort(usbd_xfer_handle xfer)
+{
+	dwc_assert(address_valid(xfer,3),"Bad xfer handle %08x",xfer);
+
+	DPRINTF(("softc_device_abort: xfer=%p\n",xfer));
+	softc_abort_xfer(xfer,USBD_CANCELLED);
+}
+
+void softc_device_close(usbd_pipe_handle pipe)
+{
+	dwc_assert(address_valid(pipe,3),"Bad pipe handle %08x",pipe);
+
+	struct dwc_softc_pipe *epipe = (struct dwc_softc_pipe *) pipe;
+	dwc_softc_t *sc = (dwc_softc_t *)epipe->pipe.device->bus;
+	DPRINTF(("softc_device_close: pipe=%p\n",epipe));
+
+	dwc_assert(!epipe->xfer,"Pipe should be idle here");
+
+	/* Free endpoint */
+	dwc_otg_hcd_endpoint_disable(sc->dwc_dev.hcd,epipe->dwc_priv,250);
+
+	/* Free urb */
+	dwc_free(NULL,epipe->urb);
+
+	/* Free request buffer */
+	if(epipe->request)
+		dwc_dma_free(NULL,sizeof(usb_device_request_t),epipe->request,epipe->dma_req);
+}
+
+void softc_device_clear_toggle(usbd_pipe_handle pipe)
+{
+	dwc_assert(address_valid(pipe,3),"Bad pipe handle %08x",pipe);
+
+	DPRINTF(("softc_device_clear_toggle: pipe=%p\n",pipe));
+	/* DWCTODO - no way of controlling toggle? maybe have to disable endpoint? */
+}
+
+void softc_device_done(usbd_xfer_handle xfer)
+{
+	dwc_assert(address_valid(xfer,3),"Bad xfer handle %08x",xfer);
+
+	DPRINTFN(10,("softc_device_done: xfer=%p, length=%d, repeat=%d\n", xfer,xfer->actlen,xfer->pipe->repeat));
+	/* If it's a repeating xfer, we put it back on the list */
+	if(xfer->pipe->repeat)
+		softc_device_start(xfer);
+}
+
+void softc_abort_xfer(usbd_xfer_handle xfer,usbd_status status)
+{
+	dwc_assert(address_valid(xfer,3),"Bad xfer handle %08x",xfer);
+
+	struct dwc_softc_xfer *ex = (struct dwc_softc_xfer *) xfer;
+	struct dwc_softc_pipe *epipe = (struct dwc_softc_pipe *) xfer->pipe;
+	dwc_softc_t *sc = (dwc_softc_t *)epipe->pipe.device->bus;
+	DPRINTFN(10,("softc_abort_xfer: xfer %p status %d\n",xfer,status));
+
+	if(epipe->xfer == ex)
+	{
+		DPRINTFN(10,("dequeing urb\n"));
+		/* Cancel the urb */
+		dwc_otg_hcd_urb_dequeue(sc->dwc_dev.hcd,epipe->urb);
+
+		/* Mark pipe as idle */
+		epipe->xfer = NULL;
+
+		DPRINTFN(10,("urb dequeued\n"));
+	}
+
+	/* Set status */
+	xfer->status = status;
+	int s = splusb();
+
+	/* Cancel any timeout */
+	callout_stop(&(xfer->timeout_handle));
+	/* And cancel the associated callback */
+	riscos_cancel_abort_pipe(xfer);
+
+	/* Tell USBDriver */
+	usb_transfer_complete(xfer);
+
+	splx(s);
+}
+

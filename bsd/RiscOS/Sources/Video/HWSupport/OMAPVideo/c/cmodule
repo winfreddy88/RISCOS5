@@ -1,0 +1,574 @@
+/*
+ * Copyright (c) 2010, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include "modhead.h"
+#include "swis.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stddef.h>
+
+#include "Global/RISCOS.h"
+#include "Global/Services.h"
+#include "Global/NewErrors.h"
+#include "Global/HALDevice.h"
+#include "Global/HALEntries.h"
+#include "Global/GraphicsV.h"
+#include "Global/VduExt.h"
+#include "Global/OSMisc.h"
+#include "Global/OSMem.h"
+
+#include "DebugLib/DebugLib.h"
+
+#include "graphicsv.h"
+#include "dss.h"
+#include "sdma.h"
+#include "regs.h"
+#include "gvoverlay.h"
+#include "pmp.h"
+#include "mouse.h"
+#include "consts.h"
+#include "vars.h"
+#include "globals.h"
+#include "utils.h"
+#include "palette.h"
+#include "dispc.h"
+
+#if OMAP==3
+#include "omap3/vrfb.h"
+#include "omap3/venc.h"
+#define SUPPORT_TV_MODE 1
+#endif
+#if OMAP==4
+#include "omap4/tiler.h"
+#endif
+
+static uint32_t *pciram_block_l = NULL;
+
+void (*dmb)(void);
+
+#ifdef DEBUGLIB
+static uint64_t timer_scale;
+
+#define TIMER_NUMBER 1
+
+static void timer_init(void)
+{
+	/* Set up a high-resolution timer that we can use for profiling code
+	   The standard centisecond timer isn't sufficient, even if we resorted to peeking the underlying HAL timer value (hard to get accurate timings of over 1cs) */
+	_swix(OS_Hardware,_INR(0,1)|_INR(8,9),TIMER_NUMBER,0x80000000,OSHW_CallHAL,EntryNo_HAL_TimerSetPeriod);
+	uint32_t granularity;
+	_swix(OS_Hardware,_IN(0)|_INR(8,9)|_OUT(0),TIMER_NUMBER,OSHW_CallHAL,EntryNo_HAL_TimerGranularity,&granularity);
+	/* Scale factor to convert ticks to microseconds */
+	timer_scale = (((uint64_t)1000000)<<32)/granularity;
+}
+
+uint32_t timer_read(void)
+{
+	uint32_t val;
+	_swix(OS_Hardware,_IN(0)|_INR(8,9)|_OUT(0),TIMER_NUMBER,OSHW_CallHAL,EntryNo_HAL_TimerReadCountdown,&val);
+	return (uint32_t) ((val*timer_scale)>>32);
+}
+#endif
+
+_kernel_oserror* module_init (const char *cmd_tail, int podule_base, void *pw)
+{
+	(void) cmd_tail;
+
+	_kernel_oserror* e = NULL;
+	uint32_t mask=0;
+
+	/* set up debugging */
+	debug_initialise(Module_Title, "", "");
+	debug_set_device(DADEBUG_OUTPUT);
+	debug_set_unbuffered_files(TRUE);
+#ifdef DEBUGLIB
+	timer_init();
+#endif
+	lockdebug_init();
+
+	instance = podule_base;
+
+	private_word = pw;
+
+	/* Get the DMB ARMop ptr */
+	e = _swix(OS_MMUControl, _IN(0) | _OUT(0), MMUCReason_GetARMop + (ARMop_DMB_ReadWrite<<8), &dmb);
+	if (e)
+	{
+		return e;
+	}
+
+	/* Find the AP value we want to use for framebuffers */
+	e = _swix(OS_Memory, _INR(0,2) | _OUT(0), OSMemReason_FindAccessPrivilege, MemPermission_PrivR|MemPermission_PrivW|MemPermission_UserR|MemPermission_UserW, MemPermission_PrivR|MemPermission_PrivW|MemPermission_UserR|MemPermission_UserW, &memory_access_privilege);
+	if (e)
+	{
+		return e;
+	}
+
+	/* Hunt for the HAL device */
+	int pos=0;
+	do {
+		e = _swix(OS_Hardware, _INR(0,1) | _IN(8) | _OUTR(1,2), HALDeviceType_Video + HALDeviceVideo_VDU,pos,OSHW_DeviceEnumerate,&pos,&dev);
+		if(e)
+			goto error;
+		if(pos == -1)
+		{
+			static const internaterr_t badhard = { ErrorNumber_BadHard, "BadHard" };
+
+			return _swix(MessageTrans_ErrorLookup, _INR(0,2), &badhard, 0, 0);
+		}
+	} while(dev->dev.id != HALDeviceID_VDU_Desired);
+
+	/* Create the PMP */
+	e = pmp_init();
+	if (e)
+	{
+		goto error;
+	}
+
+	/* Call the Activate entry to turn on the clocks and make sure everything's OK */
+	if(!(dev->dev.Activate)(&dev->dev))
+	{
+		static const internaterr_t hwdep = { ErrorNumber_HardwareDepends, "HWDep" };
+
+		e = _swix(MessageTrans_ErrorLookup, _INR(0,2), &hwdep, 0, 0);
+		goto error;
+	}
+
+	/* Get boardconfig/hwconfig struct */
+	hwconfig = (boardconfig_t *) dev->devicespecificfield;
+
+	/* Turn all the displays off */
+	for(int i=0;i<hwconfig->num_lcds;i++)
+		(hwconfig->lcd_configs[i].power)(dev,0);
+
+	/* Make sure overlays are marked as disabled */
+	{
+		irqlocked_t *irqlocked = irqlocked_lock();
+		for(int i=0;i<OVERLAY_MAX;i++)
+		{
+			overlaycfg_reset(&irqlocked->overlays[i]);
+		}
+		irqlocked_unlock();
+	}
+
+	/* Set other default settings for some globals */
+	gvoverlay_init();
+
+	/* Get hardware addresses */
+	dss = (dss_regs_t *) dev->dev.address;
+#if OMAP==3
+	dispc = (dispc_regs_t *) (((uint32_t)dev->dev.address)+0x400);
+	rfbi = (rfbi_regs_t *) (((uint32_t)dev->dev.address)+0x800);
+	venc = (venc_regs_t *) (((uint32_t)dev->dev.address)+0xc00);
+	dsi = (dsi_regs_t *) (((uint32_t)dev->dev.address)-0x400);
+	dsi_phy = (dsi_phy_regs_t *) (((uint32_t)dev->dev.address)-0x200);
+	dsi_pll = (dsi_pll_regs_t *) (((uint32_t)dev->dev.address)-0x100);
+	vrfb_init();
+#endif
+#if OMAP==4
+	dispc = (dispc_regs_t *) (((uint32_t)dev->dev.address) + DISPC_BASE);
+	rfbi = (rfbi_regs_t *) (((uint32_t)dev->dev.address) + RFBI_BASE);
+	venc = (venc_regs_t *) (((uint32_t)dev->dev.address) + VENC_BASE);
+	dsi = (dsi_regs_t *) (((uint32_t)dev->dev.address) + DSI2_PROTOCOL_ENGINE);
+	dsi_phy = (dsi_phy_regs_t *) (((uint32_t)dev->dev.address) + DSI2_PHY);
+	dsi_pll = (dsi_pll_regs_t *) (((uint32_t)dev->dev.address) + DSI2_PLLCTRL);
+	tiler_init();
+#endif
+	sdma = hwconfig->dma_ptr;
+
+	/* Get address of the sole DMA channel we use */
+	mask = hwconfig->dma_chans;
+	if(mask)
+	{
+		sdmachan = &sdma->chans[0];
+		while(!(mask & 1))
+		{
+			sdmachan++;
+			mask = mask>>1;
+		}
+		dprintf(("","Using DMA channel at %08x\n",(uint32_t)sdmachan));
+
+		/* Make sure channel is in a sane state */
+		sdma_sync();
+		sdmachan->clnk_ctrl &= ~DMA4_CLNK_CTRL_ENABLE_LNK;
+		sdmachan->cicr = 0;
+	}
+	else
+		sdmachan = 0;
+
+	/* Init platform code */
+	omap_init();
+
+	/* Perform a reset so that we can safely enable IRQs */
+	e = dss_reset();
+
+	if(e)
+		goto error2;
+
+	/* Get some workspace from the PCI module */
+	uint32_t pciram_block_p;
+	e = _swix(PCI_RAMAlloc, _INR(0,2) | _OUTR(0,1), 4*256+32*32*4, 32, 0, &pciram_block_l, &pciram_block_p);
+
+	if(e)
+		goto error2;
+
+	palette_set_buffers(pciram_block_l,pciram_block_p); 
+	mouse_set_buffers(pciram_block_l + 256,pciram_block_p + 256*4); 
+
+	{
+		/* Pick our initial palette func */
+		const features_t *features = features_read_lock();
+		select_palette_func(NULL, features);
+		features_read_unlock();
+	}
+
+	/* Get a driver number */
+	uint32_t temp;
+	e = _swix (OS_ScreenMode, _INR(0,2)|_OUT(0), ScreenModeReason_RegisterDriver, 0, Module_Title, &temp);
+	if(e)
+		goto error3;
+	graphicsv_driver_number = temp;
+
+	/* Claim & enable IRQ */
+	e = _swix (OS_ClaimDeviceVector, _INR(0,4), dev->dev.devicenumber, dispc_irq_entry, pw, 0, 0);
+
+	if(e)
+		goto error4;
+
+	e = _swix (OS_Hardware, _IN(0) | _INR(8,9), dev->dev.devicenumber&~(1u<<31), OSHW_CallHAL, EntryNo_HAL_IRQEnable);
+
+	if(e)
+		goto error5;
+
+	/* Get on GraphicsV! */
+	e = _swix(OS_Claim, _INR(0,2), GraphicsV, graphicsv_entry, pw);
+
+	if(e)
+		goto error5;
+
+	/* Pick default head/display */
+	{
+		overlaytarget default_display = omap_pick_display();
+		modelocked_write_lock()->default_display = default_display;
+		modelocked_write_unlock();
+	}
+
+	/* Tell the OS that we're ready */
+	e = _swix(OS_ScreenMode, _INR(0,1), ScreenModeReason_StartDriver, graphicsv_driver_number);
+	if(e)
+		goto error6;
+
+	dprintf(("", "Finished module initialisation, DSS regs=%08x\n",(uint32_t)dss));
+
+	return 0;
+
+error6:
+	/* Get off GraphicsV */
+	_swix(OS_Release, _INR(0,2), GraphicsV, graphicsv_entry, pw);
+error5:
+	/* Release IRQ */
+	_swix (OS_ReleaseDeviceVector, _INR(0,4), dev->dev.devicenumber, dispc_irq_entry, pw, 0, 0);
+error4:
+	/* Release driver number */
+	_swix (OS_ScreenMode, _INR(0,1), ScreenModeReason_DeregisterDriver, graphicsv_driver_number);
+error3:
+	/* Release memory */
+	_swix(PCI_RAMFree, _IN(0), pciram_block_l);
+	palette_set_buffers(NULL,0);
+	mouse_set_buffers(NULL,0);
+error2:
+	/* Deactivate */
+	(dev->dev.Deactivate)(&dev->dev);
+	dev = 0;
+error:
+	/* Shutdown PMP */
+	pmp_shutdown();
+	dprintf(("","Failed initialisation: %s\n", e->errmess));
+	return e;
+}
+
+_kernel_oserror *module_final(int fatal, int podule, void *pw)
+{
+	(void) podule;
+	(void) fatal;
+
+	_kernel_oserror* e = NULL;
+
+	/* Tell the OS that we're shutting down */
+	e = _swix(OS_ScreenMode, _INR(0,1), ScreenModeReason_StopDriver, graphicsv_driver_number);
+	if(e)
+		return e;
+
+	/* Get off GraphicsV */
+	_swix(OS_Release, _INR(0,2), GraphicsV, graphicsv_entry, pw);
+
+	/* Destroy any overlays */
+	gvoverlay_shutdown();
+
+	if(dev)
+	{
+		/* Disable displays */
+		for(int i=0;i<hwconfig->num_lcds;i++)
+			(hwconfig->lcd_configs[i].power)(dev,0);
+
+		e = _swix (OS_ReleaseDeviceVector, _INR(0,4), dev->dev.devicenumber, dispc_irq_entry, pw, 0, 0);
+		if(e)
+			return e;
+		(dev->dev.Deactivate)(&dev->dev);
+		dev = 0;
+	}
+
+	/* Release driver number */
+	_swix(OS_ScreenMode, _INR(0,1), ScreenModeReason_DeregisterDriver, graphicsv_driver_number);
+
+	if(pciram_block_l)
+	{
+		e = _swix(PCI_RAMFree, _IN(0), pciram_block_l);
+		if(e)
+			return e;
+		palette_set_buffers(NULL,0);
+		mouse_set_buffers(NULL,0);
+	}
+
+	pmp_shutdown();
+
+	return NULL;
+}
+
+#ifdef DEBUGLIB
+
+static const char *targetnames_[] = {
+	"TARGET_NONE",
+#if OMAP==3
+	"TARGET_LCD",
+	"TARGET_TV"
+#endif
+#if OMAP==4
+	"TARGET_LCD2",
+#endif
+};
+const char **targetnames = targetnames_+1;
+const char *overlaynames[] = {
+	"OVERLAY_GFX",
+	"OVERLAY_VID1",
+	"OVERLAY_VID2",
+#if OMAP==4
+	"OVERLAY_VID3",
+#endif
+	"OVERLAY_MAX",
+};
+const char *featurenames[] = {"FEATURE_CPR","FEATURE_ALPHA","FEATURE_PALETTE","FEATURE_GAMMAHACK"};
+const char *pixelformatnames[PIXELFORMAT_MAX+1] = {
+	"PIXELFORMAT_1_PAL",
+	"PIXELFORMAT_2_PAL",
+	"PIXELFORMAT_4_PAL",
+	"PIXELFORMAT_8_PAL",
+	"PIXELFORMAT_4444_TBGR",
+	"PIXELFORMAT_4444_TRGB",
+	"PIXELFORMAT_4444_ABGR",
+	"PIXELFORMAT_4444_ARGB",
+	"PIXELFORMAT_1555_TBGR",
+	"PIXELFORMAT_1555_TRGB",
+	"PIXELFORMAT_1555_ABGR",
+	"PIXELFORMAT_1555_ARGB",
+	"PIXELFORMAT_565_BGR",
+	"PIXELFORMAT_565_RGB",
+	"PIXELFORMAT_888_BGR",
+	"PIXELFORMAT_888_RGB",
+	"PIXELFORMAT_8888_TBGR",
+	"PIXELFORMAT_8888_TRGB",
+	"PIXELFORMAT_8888_ABGR",
+	"PIXELFORMAT_8888_ARGB",
+	"PIXELFORMAT_UYVY_601_full",
+	"PIXELFORMAT_UYVY_601_video",
+	"PIXELFORMAT_UYVY_709_full",
+	"PIXELFORMAT_UYVY_709_video",
+	"PIXELFORMAT_YUY2_601_full",
+	"PIXELFORMAT_YUY2_601_video",
+	"PIXELFORMAT_YUY2_709_full",
+	"PIXELFORMAT_YUY2_709_video",
+	"PIXELFORMAT_NV12_601_full",
+	"PIXELFORMAT_NV12_601_video",
+	"PIXELFORMAT_NV12_709_full",
+	"PIXELFORMAT_NV12_709_video",
+	"PIXELFORMAT_POINTER",
+	"PIXELFORMAT_MAX",
+};
+
+_kernel_oserror *module_commands(const char *arg_string, int argc, int cmd_no, void *pw)
+{
+	(void)argc;
+	(void)pw;
+	(void)arg_string;
+
+	switch (cmd_no) {
+	case CMD_VideoRegs:
+		omap_dump_videoregs();
+		break;
+	case CMD_TVMode:
+#ifdef SUPPORT_TV_MODE
+		{
+		char *str;
+		int mode = (int)strtoul(arg_string,&str,10);
+		int type = (int)strtoul(str,&str,10);
+		int testmode = (int)strtoul(str,0,10);
+		/* Update configuration */
+		venc_configure((tvmode) mode,(tvouttype) type,(bool) testmode);
+		if (((tvouttype) type) == TVOUT_NONE)
+		{
+			/* Just turn off */
+			venc_disable();
+		}
+		else
+		{
+			/* Re-prep mode */
+			{
+				modelocked_t *modelocked = modelocked_write_lock();
+				modelocked_head_t head = modelocked->heads[TARGET_TV];
+				/* Reconstruct original mode width/height so that centering will work */
+				pixelformat format = PIXELFORMAT_8888_TBGR;
+				if (modelocked->overlay_desktop != OVERLAY_MAX)
+				{
+					const irqlocked_t *irqlocked = irqlocked_lock();
+					head.mode.width = head.dw;
+					head.mode.height = head.dh;
+					head.interlaced = false; /* Assume original mode timings weren't interlaced (if they were, the centering will be wrong) */
+					format = irqlocked->overlays[modelocked->overlay_desktop].format;
+					irqlocked_unlock();
+				}
+				venc_prepmode(&head,format);
+				modelocked->heads[TARGET_TV] = head;
+			}
+			/* Now actually set the mode */
+			const modelocked_t *modelocked = modelocked_write_to_read();
+			(headattrs[TARGET_TV].setmode)(TARGET_TV,&modelocked->heads[TARGET_TV]);
+			/* Also ensure desktop is centered correctly */
+			const irqlocked_t *irqlocked = irqlocked_lock();
+			dispc_update_overlay(modelocked->overlay_desktop,modelocked,irqlocked);
+			irqlocked_unlock();
+			modelocked_read_unlock();
+		}
+		}
+#endif /* SUPPORT_TV_MODE */
+		break;
+	case CMD_TVRegs:
+		omap_dump_tvregs();
+		break;
+	case CMD_VideoHead:
+		for(int i=0;i<TARGET_MAX;i++)
+		{
+			int len = strlen(targetnames[i]);
+			if(!strncmp(arg_string,targetnames[i],len) && (arg_string[len] <= 32))
+			{
+				printf("Head %s selected\n",targetnames[i]);
+				modelocked_write_lock()->default_display = (overlaytarget) i;
+				modelocked_write_unlock();
+				/* Don't bother with hardware update for now */
+				return 0;
+			}
+		}
+		printf("Available heads:\n");
+		{
+			const modelocked_t *modelocked = modelocked_read_lock();
+			for(int i=0;i<TARGET_MAX;i++)
+			{
+				printf("%s%s\n",targetnames[i],(i==modelocked->default_display?" (active)":""));
+			}
+			modelocked_read_unlock();
+		}
+		break;
+	case CMD_SDMARegs:
+		sdma_dump_sdmaregs();
+		break;
+	case CMD_VideoState:
+		printf("Timing metrics:\n");
+		graphicsv_debug();
+		lockdebug_output();
+		{
+			const modelocked_t *modelocked = modelocked_read_lock();
+
+			/* Take a copy of the IRQ-locked state so that we don't create a deadlock */
+			irqlocked_t irqlocked = *irqlocked_lock();
+			irqlocked_unlock();
+
+			printf("Desktop: %s\n",overlaynames[modelocked->overlay_desktop]);
+			printf("Pointer: %s\n",overlaynames[modelocked->overlay_pointer]);
+			for(int i=0;i<TARGET_MAX;i++)
+			{
+				printf("Head %s:\n",targetnames[i]);
+				printf(" %d x %d%s\n",modelocked->heads[i].mode.width,modelocked->heads[i].mode.height,(modelocked->heads[i].interlaced?" (interlaced)":""));
+				printf(" overlay offset %d x %d\n",modelocked->heads[i].x,modelocked->heads[i].y);
+				printf(" desktop clip size %d x %d\n",modelocked->heads[i].dw,modelocked->heads[i].dh);
+				printf(" background %08x\n",irqlocked.heads[i].background);
+				printf(" transparent %08x\n",irqlocked.heads[i].transparent);
+				printf(" blanked %d dpms %d\n",irqlocked.heads[i].blanked,irqlocked.heads[i].dpms);
+				printf(" enabled %d\n",modelocked->heads[i].enabled);
+				const features_t *features = features_read_lock();
+				for(int j=0;j<sizeof(featurenames)/sizeof(featurenames[0]);j++)
+				{
+					if((features->head_vals[i] | features->head_masks[i]) & (1<<j))
+						printf(" %s=%d\n",featurenames[j],(features->head_vals[i] & (1<<j))?1:0);
+				}
+				features_read_unlock();
+				printf("\n");
+			}
+			for(int i=0;i<OVERLAY_MAX;i++)
+			{
+				printf("Overlay %s:\n",overlaynames[i]);
+				printf(" buf %d x %d\n",irqlocked.overlays[i].buf_w,irqlocked.overlays[i].buf_h);
+				printf(" scaled %d x %d\n",irqlocked.overlays[i].scaled_w,irqlocked.overlays[i].scaled_h);
+				printf(" pos %d,%d\n",irqlocked.overlays[i].x,irqlocked.overlays[i].y);
+				printf(" %s\n",pixelformatnames[irqlocked.overlays[i].format]);
+				printf(" ba %08x la %08x\n",irqlocked.overlays[i].ba,(int) irqlocked.overlays[i].la);
+				printf(" stride %08x\n",irqlocked.overlays[i].stride);
+				printf(" target %s\n",targetnames[irqlocked.overlays[i].target]);
+				printf(" enabled %d\n",irqlocked.overlays[i].enabled);
+				printf(" bandwidth %dKB/s\n",bandwidth_estimate(&irqlocked.overlays[i],modelocked));
+				printf("\n");
+			}
+			modelocked_read_unlock();
+		}
+		for(int i=0;i<GVOVERLAY_MAX;i++)
+		{
+			const gvoverlay_t *gvoverlay = &gvoverlays[i]; 
+			if (gvoverlay->overlay == OVERLAY_MAX)
+			{
+				continue;
+			}
+			printf("GV overlay %d:\n",i);
+			printf(" flags %08x\n",gvoverlay->flags);
+			printf(" -> phys overlay %s\n",overlaynames[gvoverlay->overlay]);
+			printf(" display bank: %d\n",gvoverlay->display);
+			buffer_describe(gvoverlay->buffer);
+		}
+		break;
+	}
+
+	return 0;
+}
+#endif

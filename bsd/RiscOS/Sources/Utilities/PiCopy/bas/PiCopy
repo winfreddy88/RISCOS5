@@ -1,0 +1,124 @@
+REM >!PiCopy.!RunImage
+REM 
+REM Copyright (c) 2012, RISC OS Open Ltd
+REM All rights reserved.
+REM 
+REM Redistribution and use in source and binary forms, with or without
+REM modification, are permitted provided that the following conditions are met: 
+REM     * Redistributions of source code must retain the above copyright
+REM       notice, this list of conditions and the following disclaimer.
+REM     * Redistributions in binary form must reproduce the above copyright
+REM       notice, this list of conditions and the following disclaimer in the
+REM       documentation and/or other materials provided with the distribution.
+REM     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+REM       may be used to endorse or promote products derived from this software
+REM       without specific prior written permission.
+REM 
+REM THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+REM AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+REM IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+REM ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+REM LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+REM CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+REM SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+REM INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+REM CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+REM ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+REM POSSIBILITY OF SUCH DAMAGE.
+REM
+
+REM Simple error handler
+ON ERROR PRINT'REPORT$" (";ERL")":QUIT
+
+REM Read information about the current "next" slot and the total free memory
+SYS "Wimp_SlotSize", -1, -1 TO , old_next%, tot_free%
+
+REM Initialise this task
+SYS "Wimp_Initialise", 380, &4B534154, "Raspberry Pi installer", 0 TO , self%
+
+REM Set up the Wimp error handler
+in% = 0
+DIM errblk% 256
+ON ERROR PROCerror
+
+REM Set up the source and destination paths
+in% = OPENIN("<PiCopy$Dir>.Config")
+IF in% THEN
+  src_dir$  = GET$#in%
+  dest_dir$ = GET$#in%
+  exclude$  = GET$#in%
+  CLOSE#in%
+  in% = 0
+ELSE
+  ERROR 214, "Installer configuration file not found. Taking no action"
+ENDIF
+
+REM Set up a couple of buffers
+bufsz% = 4096
+DIM inbuf% bufsz%, outbuf% bufsz%
+
+REM Canonicalise the source directory
+SYS "OS_FSControl", 37, src_dir$, inbuf%, 0, 0, bufsz%
+SYS "XOS_GenerateError", inbuf% TO src_dir$
+
+REM Canonicalise the destination directory
+SYS "OS_FSControl", 37, dest_dir$, inbuf%, 0, 0, bufsz%
+SYS "XOS_GenerateError", inbuf% TO dest_dir$
+
+REM Set up a next slot as large as we can sensibly get away with
+min_free% = 512 << 10
+max_free% = min_free% << 1
+IF tot_free% > min_free% THEN
+  new_next% = tot_free% - max_free%
+  SYS "Wimp_SlotSize", -1, new_next%
+ENDIF
+
+REM Iterate over the objects in the source directory and copy them using Filer_Action
+more% = 0
+REPEAT
+  SYS "OS_GBPB", 9, src_dir$, inbuf%, bufsz% >>> 4, more%, bufsz%, 0 TO ,,, num%, more%
+  IF num% THEN
+    PROCmunge_buffer(outbuf%, inbuf%, num%)
+    SYS "Wimp_StartTask", "Filer_Action" TO task%
+    SYS "FilerAction_SendSelectedDirectory", task%, src_dir$ + CHR$(0)
+    SYS "FilerAction_SendSelectedFile", task%, outbuf%
+    SYS "FilerAction_SendStartOperation", task%, 0, 5, dest_dir$ + CHR$(0), 1 + LEN(dest_dir$)
+  ENDIF
+UNTIL more% = -1
+
+REM Restore the next slot to its original size
+SYS "Wimp_SlotSize", -1, old_next%
+QUIT
+:
+REM  « Simple error handler »
+DEF PROCerror
+  ON ERROR OFF
+  !errblk%       = ERR
+  $(errblk% + 4) = REPORT$ + " (" + STR$(ERL) + ")" + CHR$(0)
+  IF in% THEN CLOSE#in%
+  SYS "Wimp_ReportError", errblk%, &9, "RPi Installer", 0, 0, 0
+  SYS "XWimp_SlotSize", -1, old_next%
+  QUIT
+ENDPROC
+:
+REM  « Cludge to convert buffer of zero-terminated leafnames into space-separated list, minus some stuff »
+DEF PROCmunge_buffer(outbuf%, inbuf%, num%)
+  LOCAL spc%, leaf$
+
+  spc% = FALSE
+  WHILE num%
+    SYS "XOS_GenerateError", inbuf% TO leaf$
+    IF 0 = INSTR("!PiCopy " + exclude$, leaf$) THEN
+      IF spc% THEN
+        $(outbuf%) = " " + leaf$ + CHR$(0)
+        outbuf%   += 1 + LEN(leaf$)
+      ELSE
+        $(outbuf%) = leaf$ + CHR$(0)
+        outbuf%   += LEN(leaf$)
+        spc% = TRUE
+      ENDIF
+    ENDIF
+    inbuf% += 1 + LEN(leaf$)
+    num%   -= 1
+  ENDWHILE
+ENDPROC

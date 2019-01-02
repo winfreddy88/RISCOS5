@@ -1,0 +1,274 @@
+/*
+ * Copyright (c) 2012, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+
+#include <stdlib.h>
+#include <stdbool.h>
+#include "kernel.h"
+#include "swis.h"
+
+#include "DebugLib/DebugLib.h"
+#include "AsmUtils/irqs.h"
+#include "Interface/RTSupport.h"
+
+#include "globals.h"
+#include "VCHIQHdr.h"
+#include "errors.h"
+
+#include "vc04_services/interface/vchi/vchi.h"
+#include "vc04_services/interface/vchiq_arm/vchiq_if.h"
+
+static ssize_t copy_from_vectors(void *context, void *dest, size_t offset, size_t maxsize)
+{
+	const VCHI_MSG_VECTOR_T *element = (const VCHI_MSG_VECTOR_T *) context;
+	const char *src;
+	char *dst = (char *) dest;
+	size_t srcoffset = 0, remain = maxsize;
+
+	/* As the count of number of elements has been lost by this point, trust that
+	   the list is still the same size as it was when it was totalised. Since
+	   in principle this callback could be called in any order, the number of
+	   elements doesn't help - need to search for the range being asked for.
+	   Hopefully most people keep their vectors reasonably short (or 1).
+	*/
+	while (remain)
+	{
+		if (element->vec_len < 0)
+		{
+			/* List moves */
+			element = element->vec_base;
+		}
+		else
+		{
+			/* Does this element contain source data we want? */
+			if ((offset >= srcoffset) &&
+			    (offset < (srcoffset + element->vec_len)))
+			{
+				size_t copy, start = offset - srcoffset;
+
+				copy = min(element->vec_len - start, remain);
+				src = (const char *) element->vec_base;
+				memcpy(&dst[offset],
+				       &src[start],
+				       copy);
+				remain -= copy;
+				offset += copy;
+			}
+
+			/* Advance to next element of the vector */
+			srcoffset += element->vec_len;
+			element++;
+		}
+	}
+
+	return (ssize_t)maxsize;
+}
+
+static _kernel_oserror *VCHI_TO_ERROR(int32_t status)
+{
+	dprintf(("","SWI returning status %d\n",status));
+	switch(status)
+	{
+	case VCHIQ_SUCCESS:
+		return NULL;
+	case VCHIQ_RETRY:
+		return geterror(Error_Retry);
+	case VCHIQ_ERROR:
+	default:
+		return geterror(Error_Error);
+	}
+}
+
+_kernel_oserror *module_swis(int swi_offset, _kernel_swi_regs *r, void *pw)
+{
+	(void) pw;
+	int32_t status;
+	uint32_t totallen, count;
+	VCHI_MSG_VECTOR_T msg_vector, *element;
+
+	/* The SWI interface is just a wrapper around the userspace API
+	   presented in vc04_services/interface/vchiq_arm/vchiq_shim.c
+	   The only RISC OS specific changes are the addition of the client
+	   modules private word pointer to vchi_initialise(), and returning
+	   values in registers instead of pointers.
+	*/
+	dprintf(("","SWI %d %08x %08x %08x %08x %08x\n",swi_offset,r->r[0],r->r[1],r->r[2],r->r[3],r->r[4]));
+	switch(swi_offset)
+	{
+	case VCHIQ_Initialise-VCHIQ_00:
+		status = vchi_initialise(
+				(VCHI_INSTANCE_T *) &r->r[0], /* return instance */
+				(void *) r->r[0] /* private_word */
+			);
+		break;
+
+	case VCHIQ_Connect-VCHIQ_00:
+		status = vchi_connect(
+				(VCHI_CONNECTION_T **) r->r[0], /* connections */
+				r->r[1], /* num_connections */
+				(VCHI_INSTANCE_T) r->r[2] /* instance_handle */
+			);
+		break;
+
+	case VCHIQ_Disconnect-VCHIQ_00:
+		status = vchi_disconnect(
+				(VCHI_INSTANCE_T) r->r[0] /* instance_handle */
+			);
+		break;
+
+	case VCHIQ_BulkQueueTransmit-VCHIQ_00:
+		status = vchi_bulk_queue_transmit(
+				(VCHI_SERVICE_HANDLE_T) r->r[0], /* handle */
+				(const void *) r->r[1], /* data_src */
+				r->r[2], /* data_size */
+				(VCHI_FLAGS_T) r->r[3], /* flags */
+				(void *) r->r[4] /* bulk_handle */
+			);
+		break;
+
+	case VCHIQ_MsgDequeue-VCHIQ_00:
+		status = vchi_msg_dequeue(
+				(VCHI_SERVICE_HANDLE_T) r->r[0], /* handle */
+				(void *) r->r[1], /* data */
+				r->r[2], /* max_data_size_to_read */
+				(uint32_t *) &r->r[2], /* return actual_msg_size */
+				(VCHI_FLAGS_T) r->r[3] /* flags */
+			);
+		break;
+
+	case VCHIQ_MsgQueue-VCHIQ_00:
+		WARN_ON((VCHI_FLAGS_T) r->r[3] != VCHI_FLAGS_BLOCK_UNTIL_QUEUED);
+		msg_vector.vec_base = (const void *) r->r[1];
+		msg_vector.vec_len = r->r[2];
+		totallen = (uint32_t) r->r[2];
+		status = vchi_msg_queue(
+				(VCHI_SERVICE_HANDLE_T) r->r[0], /* handle */
+				copy_from_vectors, /* copy_callback */
+				&msg_vector, /* context */
+				totallen /* data_size */
+			);
+		break;
+
+	case VCHIQ_MsgQueueV-VCHIQ_00:
+		WARN_ON((VCHI_FLAGS_T) r->r[3] != VCHI_FLAGS_BLOCK_UNTIL_QUEUED);
+		totallen = 0;
+		element = (VCHI_MSG_VECTOR_T *) r->r[1];
+		count = (uint32_t) r->r[2];
+		while (count)
+		{
+			if (element->vec_len < 0)
+			{
+				/* List moves */
+				element = (VCHI_MSG_VECTOR_T *) element->vec_base;
+				count = -element->vec_len;
+			}
+			else
+			{
+				totallen += element->vec_len;
+				element++;
+				count--;
+			}
+		}
+		status = vchi_msg_queue(
+				(VCHI_SERVICE_HANDLE_T) r->r[0], /* handle */
+				copy_from_vectors, /* copy_callback */
+				(VCHI_MSG_VECTOR_T *) r->r[1], /* context */
+				totallen /* data_size */
+			);
+		break;
+
+	case VCHIQ_MsgPeek-VCHIQ_00:
+		status = vchi_msg_peek(
+				(VCHI_SERVICE_HANDLE_T) r->r[0], /* handle */
+				(void **) &r->r[0], /* return data */
+				(uint32_t *) &r->r[1], /* return msg_size */
+				(VCHI_FLAGS_T) r->r[1] /* flags */
+			);
+		break;
+
+	case VCHIQ_MsgRemove-VCHIQ_00:
+		status = vchi_msg_remove(
+				(VCHI_SERVICE_HANDLE_T) r->r[0] /* handle */
+			);
+		break;
+
+	case VCHIQ_ServiceClose-VCHIQ_00:
+		status = vchi_service_close(
+				(VCHI_SERVICE_HANDLE_T) r->r[0] /* handle */
+			);
+		break;
+
+	case VCHIQ_ServiceOpen-VCHIQ_00:
+		status = vchi_service_open(
+				(VCHI_INSTANCE_T) r->r[0], /* instance */
+				(SERVICE_CREATION_T *) r->r[1], /* setup */
+				(VCHI_SERVICE_HANDLE_T *) &r->r[0] /* return handle */
+			);
+		break;
+
+	case VCHIQ_ServiceCreate-VCHIQ_00:
+		status = vchi_service_create(
+				(VCHI_INSTANCE_T) r->r[0], /* instance_handle */
+				(SERVICE_CREATION_T *) r->r[1], /* setup */
+				(VCHI_SERVICE_HANDLE_T *) &r->r[0] /* return handle */
+			);
+		break;
+
+	case VCHIQ_ServiceDestroy-VCHIQ_00:
+		status = vchi_service_destroy(
+				(VCHI_SERVICE_HANDLE_T) r->r[0] /* handle */
+			);
+		break;
+
+	case VCHIQ_ServiceUse-VCHIQ_00:
+		status = vchi_service_use(
+				(VCHI_SERVICE_HANDLE_T) r->r[0] /* handle */
+			);
+		break;
+
+	case VCHIQ_ServiceRelease-VCHIQ_00:
+		status = vchi_service_release(
+				(VCHI_SERVICE_HANDLE_T) r->r[0] /* handle */
+			);
+		break;
+
+	case VCHIQ_BulkQueueReceive-VCHIQ_00:
+		status = vchi_bulk_queue_receive(
+				(VCHI_SERVICE_HANDLE_T) r->r[0], /* handle */
+				(void *) r->r[1], /* data_dst */
+				r->r[2], /* data_size */
+				(VCHI_FLAGS_T) r->r[3], /* flags */
+				(void *) r->r[4] /* bulk_handle */
+			);
+		break;
+
+	default:
+		return error_BAD_SWI;
+	}
+
+	return VCHI_TO_ERROR(status);
+}

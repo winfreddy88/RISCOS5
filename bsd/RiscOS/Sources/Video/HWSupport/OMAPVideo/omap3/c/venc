@@ -1,0 +1,383 @@
+/*
+ * Copyright (c) 2010, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include <stddef.h>
+#include <string.h>
+
+#include "Global/RISCOS.h"
+#include "Global/HALEntries.h"
+#include "swis.h"
+
+#include "venc.h"
+#include "regs.h"
+#include "dispc.h"
+#include "vars.h"
+#include "consts.h"
+#include "globals.h"
+
+#include "DebugLib/DebugLib.h"
+
+/* Current TV-out configuration */
+static tvcfg_t tvcfg = { .type = TVOUT_NONE };
+
+/* Actual TV-out state */
+static tvcfg_t tvstate = { .type = TVOUT_NONE };
+static bool tv_power_is_on = false;
+
+static const venc_regs_t template_ntsc_601 =
+{
+	.f_control				= 0,
+	.vidout_ctrl				= 1,
+	.sync_ctrl				= 0x8040,
+	.llen					= 0x359,
+	.flens					= 0x20C,
+	.hfltr_ctrl				= 0,
+	.cc_carr_wss_carr			= 0x043F2631,
+	.c_phase				= 0,
+	.gain_u					= 0x102,
+	.gain_v					= 0x16C,
+	.gain_y					= 0x12F,
+	.black_level				= 0x43,
+	.blank_level				= 0x38,
+	.x_color				= 0x7,
+	.m_control				= 0x1,
+	.bstamp_wss_data			= 0x38,
+	.s_carr					= 0x21F07C1F,
+	.line21					= 0,
+	.ln_sel					= 0x01310011,
+	.l21_wc_ctl				= 0x0000F003,
+	.htrigger_vtrigger			= 0,
+
+	.savid_eavid				= 0x069300F4,
+	.flen_fal				= 0x0016020C,
+	.lal_phase_reset			= 0x00060107,
+	.hs_int_start_stop_x			= 0x008E0350,
+	.hs_ext_start_stop_x			= 0x000F0359,
+	.vs_int_start_x				= 0x01A00000,
+	.vs_int_stop_x_vs_int_start_y		= 0x020701A0,
+	.vs_int_stop_y_vs_ext_start_x		= 0x01AC0024,
+	.vs_ext_stop_x_vs_ext_start_y		= 0x020D01AC,
+	.vs_ext_stop_y				= 0x00000006,
+	.avid_start_stop_x			= 0x03480078,
+	.avid_start_stop_y			= 0x02060024,
+	.fid_int_start_x_fid_int_start_y	= 0x0001008A,
+	.fid_int_offset_y_fid_ext_start_x	= 0x01AC0106,
+	.fid_ext_start_y_fid_ext_offset_y	= 0x01060006,
+	.tvdetgp_int_start_stop_x		= 0x00140001,
+	.tvdetgp_int_start_stop_y		= 0x00010001,
+	.gen_ctrl				= 0x00F90000,
+};
+
+static const venc_regs_t template_pal_601 =
+{
+	.f_control				= 0,
+	.vidout_ctrl				= 1,
+	/* sync_ctrl - NOTE - FREE isn't set in the TRM listing, but it gets the
+	 * testcard to work for me. But for some reason FREE isn't needed when
+	 * the testcard is off (and the same seems to be true of NTSC output - the
+	 * testcard only works with it on, but actual video output works regardless
+	 */
+	.sync_ctrl				= 0x8040,
+	.llen					= 0x35F,
+	.flens					= 0x270,
+	.hfltr_ctrl				= 0,
+	.cc_carr_wss_carr			= 0x2F7225ED,
+	.c_phase				= 0,
+	.gain_u					= 0x111,
+	.gain_v					= 0x181,
+	.gain_y					= 0x140,
+	.black_level				= 0x3B,
+	.blank_level				= 0x3B,
+	.x_color				= 0x7,
+	.m_control				= 0x2,
+	.bstamp_wss_data			= 0x3F,
+	.s_carr					= 0x2A098ACB,
+	.line21					= 0,
+	.ln_sel					= 0x01290015,
+	.l21_wc_ctl				= 0x0000F603,
+	.htrigger_vtrigger			= 0,
+
+	.savid_eavid				= 0x06A70108,
+	.flen_fal				= 0x00180270,
+	.lal_phase_reset			= 0x00040135,
+	.hs_int_start_stop_x			= 0x00880358,
+	.hs_ext_start_stop_x			= 0x000F035F,
+	.vs_int_start_x				= 0x01A70000,
+	.vs_int_stop_x_vs_int_start_y		= 0x000001A7,
+	.vs_int_stop_y_vs_ext_start_x		= 0x01AF0000,
+	.vs_ext_stop_x_vs_ext_start_y		= 0x000101AF,
+	.vs_ext_stop_y				= 0x00000025,
+	.avid_start_stop_x			= 0x03530083,
+	.avid_start_stop_y			= 0x026C002E,
+	.fid_int_start_x_fid_int_start_y	= 0x0001008A,
+	.fid_int_offset_y_fid_ext_start_x	= 0x002E0138,
+	.fid_ext_start_y_fid_ext_offset_y	= 0x01380001,
+	.tvdetgp_int_start_stop_x		= 0x00140001,
+	.tvdetgp_int_start_stop_y		= 0x00010001,
+	.gen_ctrl				= 0x00FF0000,
+};
+
+static const venc_regs_t *venc_templates[TVMODE_MAX] = {
+	&template_ntsc_601, /* As per TRM */
+	&template_pal_601, /* As per TRM. Broken? */
+};
+
+void venc_configure(tvmode mode,tvouttype type,bool showtestcard)
+{
+	tvcfg.mode = mode;
+	tvcfg.type = type;
+	tvcfg.testcard = showtestcard;
+}
+
+void venc_prepmode(modelocked_head_t *state,pixelformat format)
+{
+	/* Calculate an offset we can apply to the overlays in order to keep them centered
+	   We take the border+porch timing values of the requested mode into account, to allow *TV to be used to fine-tune the position */
+	const venc_regs_t *template = venc_templates[tvcfg.mode];
+	int w = (REG_EXTRACT(template->avid_start_stop_x,VENC_AVID_START_STOP_X_AVID_STOP_X)-REG_EXTRACT(template->avid_start_stop_x,VENC_AVID_START_STOP_X_AVID_START_X)); 
+	int h = (REG_EXTRACT(template->avid_start_stop_y,VENC_AVID_START_STOP_Y_AVID_STOP_Y)-REG_EXTRACT(template->avid_start_stop_y,VENC_AVID_START_STOP_Y_AVID_START_Y));
+
+	int mode_w = state->mode.hbp+state->mode.width+state->mode.hfp;
+	int mode_h = state->mode.vbp+state->mode.height+state->mode.vfp;
+	state->x = (w-mode_w)/2 + state->mode.hbp;
+	state->y = (h-mode_h)/2 + state->mode.vbp;
+	/* Try and avoid gaps at the edge of the screen caused by buffer alignment restrictions */
+	if (state->x < 0)
+	{
+		state->x &= ~buffer_alignment_pixels[format];
+	}
+
+	/* Make sure the width & height values in the timings reflect the actual display size, since that's what we rely on for overlay clipping */
+	state->mode.width = w;
+	state->mode.height = h/2;
+	state->interlaced = true;
+
+	/* Setting enabled to false here is a bit odd, but it's somewhat necessary since we don't have a general way of powering down heads yet (and doing it here avoids introducing modelocked locks from venc_setmode or similar) */
+	state->enabled = (tvcfg.type != TVOUT_NONE);
+}
+
+void venc_setmode(void)
+{
+	bool ok;
+	{
+		const irqlocked_t *irqlocked = irqlocked_lock();
+		/* Avoid pointless updates
+		   Note that we can check the blank state & tv_power_is_on, but not the modelocked_head_t enable state, since the core setmode code deliberately sets enabled to false during mode changes (to avoid the core interacting with the head during the mode change) */
+		ok = !memcmp(&tvcfg,&tvstate,sizeof(tvcfg_t)) && !irqlocked->heads[TARGET_TV].blanked && tv_power_is_on;
+		irqlocked_unlock();
+	}
+
+	if (ok)
+	{
+		/* But at the least we do want to update the overlays */
+		if(tvcfg.type != TVOUT_NONE)
+		{
+			int irqs;
+			if(!begin_quick_hardware_update(&irqs))
+			{
+				/* TODO - Mark as pending! */
+				return;
+			}
+			/* Apply features */
+			const features_t *features = features_read_lock();
+			omap3_apply_features(features);
+			features_read_unlock();
+			/* Update transparency settings*/
+			omap3_flush_transparency_cfg(true);
+			end_quick_hardware_update(irqs);
+		}
+		return;
+	}
+	dprintf(("","venc_setmode: Mode %d type %d testcard %d\n",tvcfg.mode,tvcfg.type,tvcfg.testcard));
+	tvstate = tvcfg;
+	if(tvcfg.type == TVOUT_NONE)
+	{
+		venc_disable();
+		return;
+	}
+	/* Enable, as per flow in spruf98d 15.5.8.3 (p2336) */
+	int irqs;
+	if(!begin_slow_hardware_update(&irqs))
+	{
+		/* TODO - Mark as pending! */
+		return;
+	}
+	/* Enable TV-out power if necessary */
+	if(!tv_power_is_on && (hwconfig->mysize > offsetof(boardconfig_t,tvpower_func)) && (hwconfig->tvpower_func))
+	{
+		(hwconfig->tvpower_func)(dev,true);
+	}
+	tv_power_is_on = true;
+	/* 1. Initialise the video encoder and the display controller configuration registers */
+	/* TODO - Need to set DISPC_CONTROL_HT, DISPC_DIVISOR? */
+	/* 0. Disable digital output! */
+	int timeout;
+	if (dispc->control & DISPC_CONTROL_DIGITALENABLE)
+	{
+		dispc->irqstatus = DISPC_IRQ_EVSYNC_EVEN | DISPC_IRQ_EVSYNC_ODD;
+		dispc->control &= ~DISPC_CONTROL_DIGITALENABLE;
+		/* Wait for current frame to finish */
+		timeout=10000000;
+		while(!(dispc->irqstatus & (DISPC_IRQ_EVSYNC_EVEN | DISPC_IRQ_EVSYNC_ODD)) && --timeout) {};
+		if(!timeout)
+		{
+			dprintf(("","venc_setmode: Timeout waiting for EVSYNC (disable)\n"));
+		}
+	}
+	/* X. Enable clocks first */
+	dss->control |= DSS_CONTROL_VENC_CLOCK_4X_ENABLE | DSS_CONTROL_DAC_DEMEN | DSS_CONTROL_DAC_POWERDN_BGZ;
+	/* 1. Soft reset */
+	venc->f_control = VENC_F_CONTROL_RESET;
+	timeout=1000000;
+	while((venc->f_control & VENC_F_CONTROL_RESET) && --timeout) {};
+	if(!timeout)
+	{
+		dprintf(("","venc_setmode: Timeout waiting for VENC_F_CONTROL_RESET clear\n"));
+	}
+	/* 2. Save IRQ state */
+	uint32_t irqenable = dispc->irqenable;
+	dispc->irqenable = 0;
+	/* 15.5.8.2 SVideo/Composite selection in DSS_CONTROL */
+	if(tvcfg.type == TVOUT_COMPOSITE)
+		dss->control &= ~DSS_CONTROL_VENC_OUT_SEL;
+	else
+		dss->control |= DSS_CONTROL_VENC_OUT_SEL;
+	/* 3. Program registers as per table 15-69 */
+	const venc_regs_t *template = venc_templates[tvcfg.mode];
+	const uint32_t *temp = (const uint32_t *) template;
+	uint32_t *dest = (uint32_t *) venc;
+	for(uint32_t offset=0;offset<sizeof(venc_regs_t);offset+=4)
+	{
+		/* Skip padding, revision ID, status register, VENC_F_CONTROL, VENC_SYNC_CTRL, VENC_OUTPUT_CONTROL */
+		if((offset != offsetof(venc_regs_t,_pad1))
+		&& (offset != offsetof(venc_regs_t,_pad2))
+		&& (offset != offsetof(venc_regs_t,_pad3))
+		&& (offset != offsetof(venc_regs_t,_pad4))
+		&& (offset != offsetof(venc_regs_t,_pad5))
+		&& (offset != offsetof(venc_regs_t,_pad6))
+		&& (offset != offsetof(venc_regs_t,_pad7))
+		&& (offset != offsetof(venc_regs_t,_pad8))
+		&& (offset != offsetof(venc_regs_t,rev_id))
+		&& (offset != offsetof(venc_regs_t,status))
+		&& (offset != offsetof(venc_regs_t,f_control))
+		&& (offset != offsetof(venc_regs_t,sync_ctrl))
+		&& (offset != offsetof(venc_regs_t,output_control)))
+		{
+			dest[offset>>2] = temp[offset>>2];
+		}
+	}
+	/* Program VENC_OUTPUT_CONTROL with correct value for SVideo/composite */
+	if(tvcfg.type == TVOUT_COMPOSITE)
+		venc->output_control = 0xA;
+	else
+		venc->output_control = 0xD;
+	/* Program VENC_F_CONTROL and VENC_SYNC_CTRL last */
+	venc->f_control = (template->f_control&~VENC_F_CONTROL_SVDS_MASK) | (tvcfg.testcard?VENC_F_CONTROL_SVDS_TESTCARD:VENC_F_CONTROL_SVDS_EXTERNAL);
+	venc->sync_ctrl = template->sync_ctrl;
+	/* Program DISPC_SIZE_DIG appropriately */
+	int w = (REG_EXTRACT(template->avid_start_stop_x,VENC_AVID_START_STOP_X_AVID_STOP_X)-REG_EXTRACT(template->avid_start_stop_x,VENC_AVID_START_STOP_X_AVID_START_X)); 
+	int h = (REG_EXTRACT(template->avid_start_stop_y,VENC_AVID_START_STOP_Y_AVID_STOP_Y)-REG_EXTRACT(template->avid_start_stop_y,VENC_AVID_START_STOP_Y_AVID_START_Y))/2;
+	dispc->size_dig = ((w-1)<<DISPC_SIZE_DIG_PPL_SHIFT) | ((h-1)<<DISPC_SIZE_DIG_LPP_SHIFT);
+
+	{
+		irqlocked_t *irqlocked = irqlocked_lock();
+		irqlocked->heads[TARGET_TV].dpms = 0;
+		irqlocked->heads[TARGET_TV].blanked = false;
+		irqlocked_unlock();
+	}
+
+	/* Apply features */
+	{
+		const features_t *features = features_read_lock();
+		omap3_apply_features(features);
+		features_read_unlock();
+	}
+
+	/* Update transparency settings*/
+	omap3_flush_transparency_cfg(false);
+
+	/* 4. Set the DISPC_CONTROL[6] GODIGITAL bit and DISPC_CONTROL[1] DIGITALENABLE bit to 1 */
+	/* Also, make sure EVSYNC_EVEN/EVSYNC_ODD are clear */
+	dispc->irqstatus = DISPC_IRQ_EVSYNC_EVEN | DISPC_IRQ_EVSYNC_ODD;
+	dispc->control |= DISPC_CONTROL_GODIGITAL | DISPC_CONTROL_DIGITALENABLE;
+	/* EXPERIMENTATION - Failed first time round, so let's wait a bit */
+	_swix(OS_Hardware,_IN(0)|_INR(8,9),100000,OSHW_CallHAL,EntryNo_HAL_CounterDelay);
+	/* 5. Wait for the first VSYNC pulse signal */
+	timeout=10000000;
+	while(!(dispc->irqstatus & (DISPC_IRQ_EVSYNC_EVEN | DISPC_IRQ_EVSYNC_ODD)) && --timeout) {};
+	if(!timeout)
+	{
+		dprintf(("","venc_setmode: Timeout waiting for EVSYNC (enable)\n"));
+	}
+	/* 6. Clear the SYNCLOSTDIGITAL interrupt */
+	dispc->irqstatus = DISPC_IRQ_EVSYNC_EVEN | DISPC_IRQ_EVSYNC_ODD | DISPC_IRQ_SYNCLOSTDIGITAL;
+	/* 7. Enable the SYNCLOSTDIGITAL interrupt & restore earlier context */
+	/* Except if we're in test card mode - SYNCLOSTDIGITAL seems to occur all the time and should be ignored! */
+	irqenable |= DISPC_IRQ_EVSYNC_EVEN | DISPC_IRQ_EVSYNC_ODD;
+	if(tvcfg.testcard)
+		irqenable &= ~DISPC_IRQ_SYNCLOSTDIGITAL;
+	else
+		irqenable |= DISPC_IRQ_SYNCLOSTDIGITAL;
+	dispc->irqenable = irqenable;
+	end_slow_hardware_update(irqs);
+	dprintf(("","venc_setmode: Done\n"));
+}
+
+void venc_setblank(bool blanked)
+{
+	(void) blanked;
+	/* TODO - Find an IRQ-friendly way of blanking the display */
+}
+
+void venc_disable(void)
+{
+	int irqs;
+	if(!begin_quick_hardware_update(&irqs))
+	{
+		/* TODO - Mark as pending! */
+		return;
+	}
+	/* Make sure we disable the SYNCLOSTDIGITAL interrupt else it'll keep firing and we'll die horribly */
+	dispc->irqenable &= ~DISPC_IRQ_SYNCLOSTDIGITAL;
+	/* Now disable the digital output */
+	dispc->control &= ~DISPC_CONTROL_DIGITALENABLE;
+	/* Looks like we can get away with just disabling the clocks */
+	dss->control &= ~(DSS_CONTROL_VENC_CLOCK_4X_ENABLE | DSS_CONTROL_DAC_DEMEN | DSS_CONTROL_DAC_POWERDN_BGZ);
+	end_quick_hardware_update(irqs);
+	/* Disable power completely if supported */
+	if((hwconfig->mysize > offsetof(boardconfig_t,tvpower_func)) && (hwconfig->tvpower_func))
+	{
+		(hwconfig->tvpower_func)(dev,false);
+	}
+	tv_power_is_on = false;
+	/* Mark as blanked (venc_prepmode should also have ensured it was marked as disabled - blank state is the only state we can modify from here) */
+	irqlocked_lock()->heads[TARGET_TV].blanked = true;
+	irqlocked_unlock();
+	/* Reset state */
+	tvstate = (tvcfg_t) { .type = TVOUT_NONE };
+}
+

@@ -1,0 +1,432 @@
+/*
+ * Copyright (c) 2017, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+
+#include "SyncLib/synclib.h"
+#include "AsmUtils/irqs.h"
+
+#include "defs.h"
+#include "thread.h"
+#include "asm.h"
+#include "errors.h"
+
+static const char *threadstatus_str[] = {
+	"Invalid",
+	"Running",
+	"Runnable",
+	"PollSleep",
+	"Complete",
+};
+
+struct thread_s
+{
+	int idx; /* Index in thread table */
+	void *svcstack; /* Top of SVC stack for this thread */
+
+	/* Thread configuration */
+	char name[20];
+	uint32_t affinity;
+
+	/* Thread status */
+	threadstatus status;
+
+	/* State when thread is running */
+	uint32_t core; /* core # */
+
+	/* Serialised state when the thread is suspended */
+	threadregs_t *regs; /* Saved register dump */
+	uint32_t *pollword; /* Pollword thread is waiting on (if any) */
+
+	/* Error / exit code when thread is complete */
+	bool haveerror;
+	_kernel_oserror error;
+	uint32_t exitcode;
+};
+
+static spinrwlock_t lock = SPINRW_INITIALISER; /* Lock that protects entire thread array */
+static thread_t threads[NUM_THREADS];
+
+/* Get current thread regardless of IRQ state */
+static inline thread_t *current_thread(void)
+{
+	int irqs = ensure_irqs_off();
+	corews_t *core = get_corews();
+	thread_t *thread = (core ? core->thread : NULL);
+	restore_irqs(irqs);
+	return thread;
+}
+
+/* Get current thread only if we're in the foreground */
+static inline thread_t *current_thread_if_not_irq(void)
+{
+	int irqs = ensure_irqs_off();
+	corews_t *core = get_corews();
+	thread_t *thread = ((core && !core->irqsema) ? core->thread : NULL);
+	restore_irqs(irqs);
+	return thread;
+}
+
+void threads_init(void)
+{
+	for(int i=0;i<NUM_THREADS;i++)
+	{
+		threads[i].idx = i;
+		threads[i].status = Status_Invalid;
+	}
+	/* Initialise idle threads */
+	for(int i=0;i<glob.numcores;i++)
+	{
+		threads[i].affinity = 1<<i;
+		sprintf(threads[i].name, "core %d idle", i);
+		threads[i].status = Status_Running; /* Won't actually be running until the core starts - but this is the only valid state we can leave it in that will prevent other code from messing with it */
+		threads[i].core = i;
+	}
+}
+
+void thread_set_svcstack(int id, void *stack)
+{
+	threads[id].svcstack = stack;
+}
+
+void thread_init_idle_thread(void)
+{
+	/* Update our context to say that this core is actually running its idle thread */
+	corews_t *core = get_corews();
+	core->thread = &threads[core->id];
+}
+
+void thread_init_thread(void)
+{
+	/* Called when a thread is entered for the first time (except the idle thread)
+	   The thread will have been activated via the Kernel_ASM_SwitchThread call in reschedule(), but on exit from this function we'll be going straight back to the foreground (see Kernel_ASM_InitThread)
+	   This means that we need to unlock the thread array, to mirror the lock that was obtained by the caller of reschedule() */
+	spinrw_write_unlock(&lock);
+}
+
+/* Assumptions:
+   1. We have a write lock on the thread array
+   2. core->thread will have already been marked as suspended (Runnable/PollSleep)
+   3. We're in SVC mode and can switch thread immediately
+   4. Interrupts are disabled (corews access is safe) (the write lock on the thread array should guarantee this)
+*/
+static void reschedule(void)
+{
+	corews_t *core = get_corews();
+	int coreid = core->id;
+	/* Pick a thread to run */
+	int i = core->thread->idx;
+	thread_t *thread = NULL;
+	while(true)
+	{
+		if (++i == NUM_THREADS)
+		{
+			if (core->thread->idx == coreid)
+			{
+				/* We were running the idle thread, and have checked all other threads. Continue running the idle thread. */
+				thread = core->thread;
+				i = coreid;
+				break;
+			}
+			i = glob.numcores; /* Skip the idle threads, they're always runnable but will never yield */
+		}
+		thread = &threads[i];
+		if (thread->affinity & (1<<coreid))
+		{
+			if (thread->status == Status_Runnable)
+			{
+				break;
+			}
+			if ((thread->status == Status_PollSleep) && (*thread->pollword))
+			{
+				thread->pollword = NULL;
+				break;
+			}
+		}
+		/* Can't run this thread */
+		if (thread == core->thread)
+		{
+			/* We've checked all threads, including the currently running one
+			   So switch to the idle thread */
+			i = coreid;
+			thread = &threads[coreid];
+			break;
+		}
+	}
+	/* Run thread 'i' / 'thread' */
+	thread->status = Status_Running;
+	thread->core = coreid;
+	thread_t *oldthread = core->thread;
+	if (thread == oldthread)
+	{
+		/* No context switch required */
+		return;
+	}
+	else
+	{
+		/* Context switch required */
+		core->thread = thread;
+		threadregs_t *to = thread->regs;
+		thread->regs = NULL;
+		/* Now switch context. This will switch stacks, causing us to lose everything except the provided r0.
+		   DANGER - 'core' will swap also */
+		Kernel_ASM_SwitchThread(NULL, to, &oldthread->regs);
+	}
+}
+
+bool thread_sleep(uint32_t *pollword)
+{
+	/* Don't sleep if pollword is already set */
+	if (*pollword)
+	{
+		return true;
+	}
+	thread_t *thread = current_thread_if_not_irq();
+	if (!thread)
+	{
+		return false;
+	}
+	spinrw_write_lock(&lock);
+	thread->status = Status_PollSleep;
+	thread->pollword = pollword;
+	reschedule();
+	spinrw_write_unlock(&lock);
+	return true;
+}
+
+bool thread_yield(void)
+{
+	thread_t *thread = current_thread_if_not_irq();
+	if (!thread)
+	{
+		return false;
+	}
+	spinrw_write_lock(&lock);
+	thread->status = Status_Runnable;
+	reschedule();
+	spinrw_write_unlock(&lock);
+	return true;
+}
+
+void thread_dump(void)
+{
+	for (int i=0;i<glob.numcores;i++)
+	{
+		corews_t *core = glob.corews[i];
+		if (core)
+		{
+			thread_t *thread = core->thread;
+			if (!thread)
+			{
+				printf("core %d: state %08x, irqsema %d, No thread\n", i, core->state, core->irqsema);
+			}
+			else
+			{
+				printf("core %d: state %08x, irqsema %d, Thread %d\n", i, core->state, core->irqsema, thread->idx);
+			}
+		}
+	}
+	spinrw_read_lock(&lock);
+	for (int i=0;i<NUM_THREADS;i++)
+	{
+		thread_t *thread = &threads[i];
+		if (thread->status != Status_Invalid)
+		{
+			printf("thread %d: '%s' %s affinity %x core %d pollword %08x (%08x) stack top %08x", i, thread->name, threadstatus_str[thread->status], thread->affinity, thread->core, thread->pollword, (thread->pollword ? *thread->pollword : 0), thread->svcstack);
+			if (thread->status == Status_Complete)
+			{
+				printf(" exit code %08x", thread->exitcode);
+				if (thread->haveerror)
+				{
+					printf(" error %08x %s", thread->error.errnum, thread->error.errmess);
+				}
+			}
+			printf("\n");
+		}
+	}
+	spinrw_read_unlock(&lock);
+}
+
+_kernel_oserror *thread_examine(int id, char *name, int *namelen, uint32_t *affinity, threadstatus *status, _kernel_oserror **err, uint32_t *exitcode)
+{
+	*status = Status_Invalid;
+	if ((id < 0) || (id >= NUM_THREADS))
+	{
+		return ERROR(BadThreadID);
+	}
+	spinrw_read_lock(&lock);
+	thread_t *thread = &threads[id];
+	_kernel_oserror *e = NULL;
+	if (thread && (thread->status != Status_Invalid))
+	{
+		int actuallen = strlen(thread->name)+1;
+		memcpy(name, thread->name, ((actuallen < *namelen) ? actuallen : *namelen));
+		*namelen = actuallen-1;
+		*affinity = thread->affinity;
+		*status = thread->status;
+		if (thread->status == Status_Complete)
+		{
+			if (!thread->haveerror)
+			{
+				*err = NULL;
+			}
+			else if (err && *err)
+			{
+				**err = thread->error;
+			}
+			*exitcode = thread->exitcode;
+		}
+	}
+	else
+	{
+		e = ERROR(BadThreadID);
+	}
+	spinrw_read_unlock(&lock);
+	return e;
+}
+
+int thread_getcurrent(void)
+{
+	thread_t *thread = current_thread();
+	return (thread ? thread->idx : -1);
+}
+
+uint32_t thread_defaultaffinity(void)
+{
+	return (1<<glob.numcores)-2; /* core 0 has no scheduler, exclude from affinity mask */
+}
+
+_kernel_oserror *thread_create(const char *name, uint32_t affinity, uint32_t *pollword, const threadinitregs_t *initregs, int *id)
+{
+	uint32_t defaultaffinity = thread_defaultaffinity();
+	if (affinity)
+	{
+		affinity &= defaultaffinity;
+		if (!affinity)
+		{
+			return ERROR(BadAffinity);
+		}
+	}
+	else
+	{
+		affinity = defaultaffinity;
+	}
+	switch (initregs->psr & 0x1f)
+	{
+	case 0x10: /* USR32 */
+	case 0x13: /* SVC32 */
+	case 0x1f: /* SYS32 */
+		break;
+	default:
+		return ERROR(BadProcMode); 
+	}
+	spinrw_write_lock(&lock);
+	for(int i=glob.numcores;i<NUM_THREADS;i++)
+	{
+		thread_t *thread = &threads[i];
+		if (thread->status != Status_Invalid)
+		{
+			continue;
+		}
+		*id = i;
+		strncpy(thread->name, name, sizeof(thread->name));
+		thread->name[sizeof(thread->name)-1] = 0;
+		thread->affinity = affinity;
+		thread->status = (pollword ? Status_PollSleep : Status_Runnable);
+		thread->pollword = pollword;
+		/* Convert initregs to an armcontext_t at the top of the target SVC stack */
+		armcontext_t *regs = ((armcontext_t *) thread->svcstack)-1;
+		memset(regs, 0, sizeof(armcontext_t));
+		regs->r[0] = initregs->r0;
+		regs->r[12] = initregs->r12;
+		/* If we're starting in SVC mode, give it the SVC stack */
+		if ((initregs->psr & 0x1f) == 0x13)
+		{
+			regs->r[13] = (uint32_t) thread->svcstack;
+		}
+		regs->r[14] = (uint32_t) &Kernel_ASM_TerminateThread;
+		regs->r[15] = initregs->pc;
+		regs->psr = initregs->psr;
+		/* Push a threadregs_t which will cause Kernel_ASM_InitThread to be called on exit from Kernel_ASM_SwitchThread */
+		thread->regs = ((threadregs_t *) regs)-1;
+		memset(thread->regs, 0, sizeof(threadregs_t));
+		thread->regs->pc = (uint32_t) &Kernel_ASM_InitThread;
+
+		spinrw_write_unlock(&lock);
+		return NULL;
+	}
+	spinrw_write_unlock(&lock);
+	return (_kernel_oserror *) ERROR(TooManyThreads);
+}
+
+_kernel_oserror *thread_destroy(int id)
+{
+	if ((id < 0) || (id >= NUM_THREADS))
+	{
+		return ERROR(BadThreadID);
+	}
+	_kernel_oserror *e = NULL;
+	spinrw_write_lock(&lock);
+	if (threads[id].status != Status_Complete)
+	{
+		e = ERROR(ThreadNotComplete);
+	}
+	else
+	{
+		threads[id].status = Status_Invalid;
+	}
+	spinrw_write_unlock(&lock);
+	return e;
+}
+
+_kernel_oserror *thread_terminate(_kernel_oserror *err, uint32_t exitcode)
+{
+	thread_t *thread = current_thread_if_not_irq();
+	if (!thread)
+	{
+		return ERROR(BadContext);
+	}
+	spinrw_write_lock(&lock);
+	thread->status = Status_Complete;
+	thread->haveerror = (err != NULL);
+	if (err)
+	{
+		thread->error.errnum = err->errnum;
+		strncpy(thread->error.errmess, err->errmess, sizeof(thread->error.errmess));
+	}
+	thread->exitcode = exitcode;
+	reschedule();
+	spinrw_write_unlock(&lock);
+	return ERROR(TerminateFailed);
+}
+
+void *thread_get_svcstack(void)
+{
+	return current_thread()->svcstack;
+}

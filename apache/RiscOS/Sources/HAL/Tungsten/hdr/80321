@@ -1,0 +1,694 @@
+; Copyright 2002 Tematic Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+          ; Super i/o interrupt is moved
+          GBLL    RevB
+RevB      SETL    {TRUE}
+
+          ; Debugging in the serial port (HAL_DebugTX, HAL_DebugRX)
+          GBLL    Debug
+Debug     SETL    {FALSE}
+
+          ; Choice of debug UART (1 or 3)
+          ; UART 1 = backplate port 1, shared with Serial module
+          ; UART 3 = backplate port 2. Ordinarily used by DualSerial module
+          ; (via HAL UART API). But if (Debug :LAND: (DebugPort=3)), HAL debug
+          ; code will be sole user.
+          ; Note that this option also selects the port used by the FlashCheck
+          ; code
+          GBLA    DebugPort
+DebugPort SETA    1
+
+          ; 2k EEPROM?
+          GBLL    NewEEPROM
+NewEEPROM SETL    {TRUE}
+
+          ; Will the motherboard USB appear in *PCIDEVICES
+          GBLL    DisableUSB
+DisableUSB SETL   {TRUE}
+
+          ; Should the flash be checksummed and recovered
+          GBLL    FlashCheck
+FlashCheck SETL   {TRUE} :LAND: RevB
+
+          ; Should flash checking be enabled, even if debug is
+          ; (must be true for current softload tool to load debug images)
+          GBLL    FlashCheckInDebug
+FlashCheckInDebug SETL {TRUE}
+
+          ; Should the I cache be off when the MMU is
+          GBLL    CacheOff
+CacheOff  SETL    {FALSE}
+
+CPUCLK          *       600000000
+RAMCLK          *       100000000
+PBICLK          *        66666667
+UARTCLK         *         1846154
+
+; Delay macro for really short delays
+
+        MACRO
+        Delay   $us, $r
+        LCLS    tmp
+ [ "$r" = ""
+tmp     SETS    "a1"
+ |
+tmp     SETS    "$r"
+ ]
+        LDR     $tmp, =$us * (CPUCLK/1000000) ; 1 us = CPUCLK/1000000 cycles
+        SUBS    $tmp, $tmp, #6                ; 1 cycle
+        SUBHS   pc, pc, #12                   ; always takes 5 cycles - no branch prediciction
+        MEND
+
+
+; 80321 registers
+
+; 4Gbytes of address space.
+; 00000000-0000001F reserved for exception vectors
+; FFFFE000-FFFFFFFF allocated to control registers
+
+; 00000000-7FFFFFFF ATU outbound direct addressing window (?)
+; 80000000-9001FFFF ATU outbound translation windows (?)
+
+; Our physical memory map:
+; 00000000-7FFFFFFF PCI direct addressing window
+; 80000000-83FFFFFF PCI outbound memory window 0
+; 84000000-87FFFFFF PCI outbound memory window 1
+; 90000000-9000FFFF PCI outbound I/O window
+; 90010000-9001FFFF reserved
+; A0000000-A0FFFFFF ROM bank 0 (System ROM; PBI window 0)
+; A1000000-A1FFFFFF ROM bank 1 (reserved for Expansion ROM; no PBI window)
+; A3000000-A33FFFFF "IOMD" (PBI window 1)
+; A8000000-ABFFFFFF EASI space (PBI window 2)
+; AC000000-AFFFFFFF Reserved for EASI slots 4-7 (not present; no PBI window)
+; C0000000-FFFFDFFF RAM (note overlap with MMR - 8K lost in 1G system; map softload at top?)
+; FFFFE000-FFFFFFFF 80321 Peripheral Memory-Mapped Registers
+
+; The PCI address space:
+; 00000000-7FFFFFFF Peripherals (directly mapped to ARM 00000000-7FFFFFFF)
+; 80000000-80000FFF Messaging unit RAM + ports (address window 0)
+; A0000000-AFFFFFFF 80321 Peripherals (address window 3)
+; C0000000-FFFFFFFF 80321 RAM + PMMR (address window 2)
+
+; Address window 0 is set to 4K and points to a single page of HAL workspace for the messaging
+; unit.
+
+                GBLL    ShadowRAMWindow
+ShadowRAMWindow SETL    {FALSE}
+
+PCI_Base        *       &00000000
+PCI_IO_Base     *       &90000000
+ROM_Base        *       &A0000000
+IO_Base         *       &A3000000
+EASI_Base       *       &A8000000
+RAM_Base        *       &C0000000
+Boot_RAM_Base   *       &C0000000
+
+ [ ShadowRAMWindow
+PCI_Size        *       &40000000
+ |
+PCI_Size        *       &80000000
+ ]
+PCI_IO_Size     *       &00010000
+ROM_Size        *       &01000000
+IO_Size         *       &00400000
+EASI_Size       *       &04000000
+
+
+; We copy (later decompress?) the ROM contents into RAM at boot time.
+; The ROM copy will live at the start of RAM.
+
+PMMR_Base       *       &FFFFE000
+PMMR            *       &FFFFF000       ; Handy value for LDR/STR addressing of second half
+PMMR_Size       *       &00002000
+
+                        ^       PMMR_Base+&100-PMMR ; (also visible as PCI configuration space)
+ATU_ATUVID              #       2       ; ATU Vendor ID Register
+ATU_ATUDID              #       2       ; ATU Device ID Register
+ATU_ATUCMD              #       2       ; ATU Command Register
+ATU_ATUSR               #       2       ; ATU Status Register
+ATU_ATURID              #       1       ; ATU Revision ID Register
+ATU_ATUCCR              #       3       ; ATU Class Code Register
+ATU_ATUCLSR             #       1       ; ATU Cacheline Size Register
+ATU_ATULT               #       1       ; ATU Latency Timer Register
+ATU_ATUHTR              #       1       ; ATU Header Type Register
+ATU_ATUBISTR            #       1       ; ATU BIST Register
+ATU_IABAR0              #       4       ; Inbound ATU Base Address Register 0
+ATU_IAUBAR0             #       4       ; Inbound ATU Upper Base Address Register 0
+ATU_IABAR1              #       4       ; Inbound ATU Base Address Register 1
+ATU_IAUBAR1             #       4       ; Inbound ATU Upper Base Address Register 1
+ATU_IABAR2              #       4       ; Inbound ATU Base Address Register 2
+ATU_IAUBAR2             #       4       ; Inbound ATU Upper Base Address Register 2
+                        #       4
+ATU_ASVIR               #       2       ; ATU Subsystem Vendor ID Register
+ATU_ASIR                #       2       ; ATU Subsystem ID Register
+ATU_ERBAR               #       4       ; ATU Expansion ROM Base Address Register
+ATU_ATU_Cap_Ptr         #       1       ; ATU Capabilities Pointer Register
+                        #       7
+ATU_ATUILR              #       1       ; ATU Interrupt Line Register
+ATU_ATUIPR              #       1       ; ATU Interrupt Pin Register
+ATU_ATUMGNT             #       1       ; ATU Minimum Grant Register
+ATU_ATUMLAT             #       1       ; ATU Maximum Latency Register
+ATU_IALR0               #       4       ; Inbound ATU Limit Register 0
+ATU_IATVR0              #       4       ; Inbound ATU Translate Value Register 0
+ATU_ERLR                #       4       ; Expansion ROM Limit Register
+ATU_ERTVR               #       4       ; Expansion ROM Translate Value Register
+ATU_IALR1               #       4       ; Inbound ATU Limit Register 1
+ATU_IALR2               #       4       ; Inbound ATU Limit Register 2
+ATU_IATVR2              #       4       ; Inbound ATU Translate Value Register 2
+ATU_OIOWTVR             #       4       ; Outbound I/O Window Translate Value Register
+ATU_OMWTVR0             #       4       ; Outbound Memory Window Translate Value Register 0
+ATU_OUMWTVR0            #       4       ; Outbound Upper 32-bit Memory Window Translate Value Register 0
+ATU_OMWTVR1             #       4       ; Outbound Memory Window Translate Value Register 1
+ATU_OUMWTVR1            #       4       ; Outbound Upper 32-bit Memory Window Translate Value Register 1
+                        #       8
+ATU_OUDWTVR             #       4       ; Outbound Upper 32-bit Direct Window Translate Value Register
+                        #       4
+ATU_ATUCR               #       4       ; ATU Configuration Register
+ATU_PCSR                #       4       ; PCI Configuration and Status Register
+ATU_ATUISR              #       4       ; ATU Interrupt Status Register
+ATU_ATUIMR              #       4       ; ATU Interrupt Mask Register
+ATU_IABAR3              #       4       ; Inbound ATU Base Address Register 3
+ATU_IAUBAR3             #       4       ; Inbound ATU Upper Base Address Register 3
+ATU_IALR3               #       4       ; Inbound ATU Limit Register 3
+ATU_IATVR3              #       4       ; Inbound ATU Translate Value Register 3
+                        #       4
+ATU_OCCAR               #       4       ; Outbound Configuration Cycle Address Register
+                        #       4
+ATU_OCCDR               #       4       ; Outbound Configuration Cycle Data Register
+                        #       12
+ATU_PDSCR               #       4       ; PCI Bus Drive Strength Control Register
+ATU_PM_Cap_ID           #       1       ; PM_Capabilitiy Identifier Register
+ATU_PM_Next_Item_Ptr    #       1       ; PM Next Item Pointer Register
+ATU_APMCR               #       2       ; ATU Power Management Capabilities Register
+ATU_APMCSR              #       2       ; ATU Power Management Control/Status Register
+                        #       10
+ATU_MSI_Cap_ID          #       1       ; MSI Capability Identifier Register
+ATU_MSI_Next_Ptr        #       1       ; MSI Next Item Pointer Register
+ATU_Message_Control     #       2       ; Message Control Register
+ATU_Message_Address     #       4       ; Message Address Register
+ATU_Message_Upper_Address #     4       ; Message Upper Address Register
+ATU_Message_Data        #       2       ; Message Data Register
+                        #       2
+ATU_PCI_X_Cap_ID        #       1       ; PCI-X Capability Identifier Register
+ATU_PCI_X_Next_Item_Ptr #       1       ; PCI-X Next Item Pointer Register
+ATU_PCIXCMD             #       2       ; PCI-X Command Register
+ATU_PCIXSR              #       4       ; PCI-X Status Register
+                        #       4
+ATU_PIRSR               #       4       ; PCI Interrupt Routing Select Register
+
+                ^       PMMR_Base+&300-PMMR ; (first half also visible to PCI at start of BAR0)
+MU_Base         #       4*4
+MU_IMR0         #       4       ; Inbound Message Registers
+MU_IMR1         #       4
+MU_OMR0         #       4       ; Outbound Message Registers
+MU_OMR1         #       4
+MU_IDR          #       4       ; Inbound Doorbell Register
+MU_IISR         #       4       ; Inbound Interrupt Status Register
+MU_IIMR         #       4       ; Inbound Interrupt Mask Register
+MU_ODR          #       4       ; Outbound Doorbell Register
+MU_OISR         #       4       ; Outbound Interrupt Status Register
+MU_OIMR         #       4       ; Outbound Interrupt Mask Register
+                #       4*2
+MU_IQP          #       4       ; Inbound Queue Port (accessible from PCI only)
+MU_OQP          #       4       ; Outbound Queue Port (accessible from PCI only)
+                #       4*2
+
+MU_MUCR         #       4       ; MU Configuration Register
+MU_QBAR         #       4       ; Queue Base Address Register
+                #       4*2
+MU_IFHPR        #       4       ; Inbound Free Head Pointer Register
+MU_IFTPR        #       4       ; Inbound Free Tail Pointer Register
+MU_IPHPR        #       4       ; Inbound Post Head Pointer Register
+MU_IPTPR        #       4       ; Inbound Post Tail Pointer Register
+MU_OFHPR        #       4       ; Outbound Free Head Pointer Register
+MU_OFTPR        #       4       ; Outbound Free Tail Pointer Register
+MU_OPHPR        #       4       ; Outbound Post Head Pointer Register
+MU_OPTPR        #       4       ; Outbound Post Tail Pointer Register
+MU_IAR          #       4       ; Index Address Register
+
+
+                ^       PMMR_Base+&500-PMMR
+MCU_SDIR        #       4       ; DDR SDRAM Initialization Register
+MCU_SDCR        #       4       ; DDR SDRAM Control Register
+MCU_SDBR        #       4       ; SDRAM Base Register
+MCU_SBR0        #       4       ; SDRAM Boundary Registers
+MCU_SBR1        #       4       ;
+                #       4*8
+MCU_ECCR        #       4       ; ECC Control Register
+MCU_ELOG0       #       4       ; ECC Log Registers
+MCU_ELOG1       #       4
+MCU_ECAR0       #       4       ; ECC Address Registers
+MCU_ECAR1       #       4
+MCU_ECTST       #       4       ; ECC Test Register
+MCU_MCISR       #       4       ; Memory Controller Interrupt Status Register
+MCU_RFR         #       4       ; Refresh Frequency Register
+MCU_DBUDSR      #       4       ; Data Bus Pull-Up Drive Strength Register
+MCU_DBDDSR      #       4       ; Data Bus Pull-Down Drive Strength Register
+MCU_CUDSR       #       4       ; Clock Pull-Up Drive Strength Register
+MCU_CDDSR       #       4       ; Clock Pull-Down Drive Strength Register
+MCU_CEUDSR      #       4       ; Clock Enable Pull-Up Drive Strength Register
+MCU_CEDDSR      #       4       ; Clock Enable Pull-Down Drive Strength Register
+MCU_CSUDSR      #       4       ; Chip Select Pull-Up Drive Strength Register
+MCU_CSDDSR      #       4       ; Chip Select Pull-Down Drive Strength Register
+MCU_REUDSR      #       4       ; Receive Enable Pull-Up Drive Strength Register
+MCU_REDDSR      #       4       ; Receive Enable Pull-Down Drive Strength Register
+MCU_ABUDSR      #       4       ; Address Bus Pull-Up Drive Strength Register
+MCU_ABDDSR      #       4       ; Address Bus Pull-Down Drive Strength Register
+MCU_DSDR        #       4       ; Data Strobe Delay Register
+MCU_REDR        #       4       ; Receive Enable Delay Register
+
+SDIR_MRS_CAS2           *       2_0000
+SDIR_MRS_CAS2_5         *       2_0001
+SDIR_MRS_ResetDLL_CAS2  *       2_0010
+SDIR_MRS_ResetDLL_CAS2_5 *      2_0011
+SDIR_PrechargeAll       *       2_0100
+SDIR_NOP                *       2_0101
+SDIR_EMRS_EnableDLL     *       2_0110
+SDIR_AutoRefresh        *       2_0111
+SDIR_EMRS_DisableDLL    *       2_1000
+SDIR_Operational        *       2_1111
+
+
+                ^       PMMR_Base+&680-PMMR
+PBI_PBCR        #       4       ; PBI Control Register
+PBI_PBISR       #       4       ; PBI Status Register
+PBI_PBBAR0      #       4       ; PBI Base Address Register 0
+PBI_PBLR0       #       4       ; PBI Limit Register 0
+PBI_PBBAR1      #       4       ; PBI Base Address Register 1
+PBI_PBLR1       #       4       ; PBI Limit Register 1
+PBI_PBBAR2      #       4       ; PBI Base Address Register 2
+PBI_PBLR2       #       4       ; PBI Limit Register 2
+PBI_PBBAR3      #       4       ; PBI Base Address Register 3
+PBI_PBLR3       #       4       ; PBI Limit Register 3
+PBI_PBBAR4      #       4       ; PBI Base Address Register 4
+PBI_PBLR4       #       4       ; PBI Limit Register 4
+PBI_PBBAR5      #       4       ; PBI Base Address Register 5
+PBI_PBLR5       #       4       ; PBI Limit Register 5
+PBI_PBDSCR      #       4       ; PBI Drive Strength Control Register
+                #       4
+PBI_PMBR0       #       4       ; PBI Memory-less Boot Register 0
+                #       28
+PBI_PMBR1       #       4       ; PBI Memory-less Boot Register 1
+PBI_PMBR2       #       4       ; PBI Memory-less Boot Register 2
+
+                ^       PMMR_Base+&800-PMMR
+AAU_ACR         #       4       ; Accelerator Control Register
+AAU_ASR         #       4       ; Accelerator Status Register
+AAU_ADAR        #       4       ; Accelerator Descriptor Address Register
+AAU_ANDAR       #       4       ; Accelerator Next Descriptor Address Register
+AAU_SAR1        #       4       ; Data/Source Address Register 1
+AAU_SAR2        #       4       ; Source Address Register 2
+AAU_SAR3        #       4
+AAU_SAR4        #       4
+AAU_DAR         #       4       ; Destination Address Register
+AAU_ABCR        #       4       ; Accelerator Byte Count Register
+AAU_ADCR        #       4       ; Accelerator Descriptor Control Register
+AAU_SAR5        #       4
+AAU_SAR6        #       4
+AAU_SAR7        #       4
+AAU_SAR8        #       4
+AAU_EDCR0       #       4       ; Extended Descriptor Control Register 0
+AAU_SAR9        #       4
+AAU_SAR10       #       4
+AAU_SAR11       #       4
+AAU_SAR12       #       4
+AAU_SAR13       #       4
+AAU_SAR14       #       4
+AAU_SAR15       #       4
+AAU_SAR16       #       4
+AAU_EDCR1       #       4       ; Extended Descriptor Control Register 1
+AAU_SAR17       #       4
+AAU_SAR18       #       4
+AAU_SAR19       #       4
+AAU_SAR20       #       4
+AAU_SAR21       #       4
+AAU_SAR22       #       4
+AAU_SAR23       #       4
+AAU_SAR24       #       4
+AAU_EDCR2       #       4       ; Extended Descriptor Control Register 2
+AAU_SAR25       #       4
+AAU_SAR26       #       4
+AAU_SAR27       #       4
+AAU_SAR28       #       4
+AAU_SAR29       #       4
+AAU_SAR30       #       4
+AAU_SAR31       #       4
+AAU_SAR32       #       4
+
+ACR_512byte     *       1:SHL:2
+ACR_Resume      *       1:SHL:1
+ACR_Enable      *       1:SHL:0
+
+ASR_Active      *       1:SHL:10
+ASR_EOT         *       1:SHL:9
+ASR_EOC         *       1:SHL:8
+ASR_MasterAbort *       1:SHL:5
+
+ADCR_WriteEnable *      1:SHL:31
+ADCR_ParityEnable *     1:SHL:30
+ADCR_ParityError *      1:SHL:29
+ADCR_TransferComplete * 1:SHL:28
+ADCR_NoExtra    *       0:SHL:25
+ADCR_4Extra     *       1:SHL:25
+ADCR_12Extra    *       2:SHL:25
+ADCR_28Extra    *       3:SHL:25
+ADCR_8          *       22      ; shifts for block commands
+ADCR_7          *       19
+ADCR_6          *       16
+ADCR_5          *       13
+ADCR_4          *       10
+ADCR_3          *       7
+ADCR_2          *       4
+ADCR_1          *       1
+ADCR_NullCmd    *       0
+ADCR_XORCmd     *       1
+ADCR_FillCmd    *       2       ; Block 1 only (fill with constant in D/SAR1)
+ADCR_DirectCmd  *       7       ; Block 1 only (copy direct from block 1)
+ADCR_IntEnable  *       1:SHL:0
+
+EDCR0_16        *       22
+EDCR0_15        *       19
+EDCR0_14        *       16
+EDCR0_13        *       13
+EDCR0_12        *       10
+EDCR0_11        *       7
+EDCR0_10        *       4
+EDCR0_9         *       1
+
+EDCR1_24        *       22
+EDCR1_23        *       19
+EDCR1_22        *       16
+EDCR1_21        *       13
+EDCR1_20        *       10
+EDCR1_19        *       7
+EDCR1_18        *       4
+EDCR1_17        *       1
+
+EDCR2_32        *       22
+EDCR2_31        *       19
+EDCR2_30        *       16
+EDCR2_29        *       13
+EDCR2_28        *       10
+EDCR2_27        *       7
+EDCR2_26        *       4
+EDCR2_25        *       1
+
+                ^       0
+AAUDesc_NDA     #       4       ; Next Descriptor Address
+AAUDesc_SAR1    #       4       ; Source Address for 1st block (or Immediate data)
+AAUDesc_SAR2    #       4       ; Source Address for 2nd block
+AAUDesc_SAR3    #       4       ; Source Address for 3rd block
+AAUDesc_SAR4    #       4       ; Source Address for 4th block
+AAUDesc_DAR     #       4       ; Destination Address
+AAUDesc_BC      #       4       ; Byte Count
+AAUDesc_DC      #       4       ; Descriptor Control
+
+                ^       PMMR_Base+&1680-PMMR
+IIC_ICR0        #       4       ; IIC Control Register
+IIC_ISR0        #       4       ; IIC Status Register
+IIC_ISAR0       #       4       ; IIC Slave Address Register
+IIC_IDBR0       #       4       ; IIC Data Buffer Register
+                #       4
+IIC_IBMR0       #       4       ; IIC Bus Monitor Register
+                #       8
+IIC_ICR1        #       4
+IIC_ISR1        #       4
+IIC_ISAR1       #       4
+IIC_IDBR1       #       4
+                #       4
+IIC_IBMR1       #       4
+                #       8
+
+ICR_Fast        *       1:SHL:15
+ICR_Reset       *       1:SHL:14
+ICR_SlaveAddrIE *       1:SHL:13
+ICR_ArbLossIE   *       1:SHL:12
+ICR_SlaveStopIE *       1:SHL:11
+ICR_BusErrorIE  *       1:SHL:10
+ICR_ReceiveIE   *       1:SHL:9
+ICR_TransmitIE  *       1:SHL:8
+ICR_GenCallDisable *    1:SHL:7
+ICR_Enable      *       1:SHL:6
+ICR_SCLEnable   *       1:SHL:5
+ICR_Abort       *       1:SHL:4
+ICR_Transfer    *       1:SHL:3
+ICR_Nack        *       1:SHL:2
+ICR_Stop        *       1:SHL:1
+ICR_Start       *       1:SHL:0
+
+ISR_BusError    *       1:SHL:10
+ISR_SlaveAddr   *       1:SHL:9
+ISR_GeneralCall *       1:SHL:8
+ISR_ReceiveFull *       1:SHL:7
+ISR_TransmitEmpty *     1:SHL:6
+ISR_ArbLoss     *       1:SHL:5
+ISR_SlaveStop   *       1:SHL:4
+ISR_BusBusy     *       1:SHL:3
+ISR_UnitBusy    *       1:SHL:2
+ISR_Nack        *       1:SHL:1
+ISR_RnW         *       1:SHL:0
+
+ISR_AllInts     *       ISR_BusError+ISR_SlaveAddr+ISR_ReceiveFull+ISR_TransmitEmpty+ISR_ArbLoss+ISR_SlaveStop
+
+;
+; Timer details
+;
+TIMER_RATE      *       200000000
+
+        MACRO
+$label  ReadTMR0 $r,$cond
+$label  MRC$cond p6, 0, $r, c0, c1
+        MEND
+        MACRO
+$label  ReadTMR1 $r,$cond
+$label  MRC$cond p6, 0, $r, c1, c1
+        MEND
+        MACRO
+$label  ReadTCR0 $r,$cond
+$label  MRC$cond p6, 0, $r, c2, c1
+        MEND
+        MACRO
+$label  ReadTCR1 $r,$cond
+$label  MRC$cond p6, 0, $r, c3, c1
+        MEND
+        MACRO
+$label  ReadTRR0 $r,$cond
+$label  MRC$cond p6, 0, $r, c4, c1
+        MEND
+        MACRO
+$label  ReadTRR1 $r,$cond
+$label  MRC$cond p6, 0, $r, c5, c1
+        MEND
+        MACRO
+$label  ReadTISR $r,$cond
+$label  MRC$cond p6, 0, $r, c6, c1
+        MEND
+        MACRO
+$label  ReadWDTCR $r,$cond
+$label  MRC$cond p6, 0, $r, c7, c1
+        MEND
+
+        MACRO
+$label  WriteTMR0 $r,$cond
+$label  MCR$cond p6, 0, $r, c0, c1
+        MEND
+        MACRO
+$label  WriteTMR1 $r,$cond
+$label  MCR$cond p6, 0, $r, c1, c1
+        MEND
+        MACRO
+$label  WriteTCR0 $r,$cond
+$label  MCR$cond p6, 0, $r, c2, c1
+        MEND
+        MACRO
+$label  WriteTCR1 $r,$cond
+$label  MCR$cond p6, 0, $r, c3, c1
+        MEND
+        MACRO
+$label  WriteTRR0 $r,$cond
+$label  MCR$cond p6, 0, $r, c4, c1
+        MEND
+        MACRO
+$label  WriteTRR1 $r,$cond
+$label  MCR$cond p6, 0, $r, c5, c1
+        MEND
+        MACRO
+$label  WriteTISR $r,$cond
+$label  MCR$cond p6, 0, $r, c6, c1
+        MEND
+        MACRO
+$label  WriteWDTCR $r,$cond
+$label  MCR$cond p6, 0, $r, c7, c1
+        MEND
+
+;
+; Interrupt handling
+;
+                ^       PMMR_Base+&7C0-PMMR
+DEVICEID        #       4
+GPOE            #       4       ; GPIO Output Enable
+GPID            #       4       ; GPIO Input Data
+GPOD            #       4       ; GPIO Output Data
+INTCTL          #       4       ; don't use this - use coprocessor macros below
+INTSTR          #       4       ; don't use this - use coprocessor macros below
+IINTSRC         #       4       ; don't use this - use coprocessor macros below
+FINTSRC         #       4       ; don't use this - use coprocessor macros below
+
+; Extra devices (from peeking IOMD, subset of XINT0)
+Device_FlpIndex *       2
+Device_PFIQ     *       8
+Device_PIC      *       10
+Device_Podule   *       13
+
+Device_IRQA_0   *       0
+Device_IRQB_0   *       8
+
+; Devices in south bridge (subsets of PIC)
+;                       16        IRQ0 (timer)
+Device_AC97     *       17      ; IRQ1
+Device_SlavePIC *       18      ; IRQ2 (-> IRQ8..15)
+Device_ATA1     *       19      ; IRQ3
+Device_ATA2     *       20      ; IRQ4
+Device_USB1     *       21      ; IRQ5
+Device_USB2     *       22      ; IRQ6
+Device_FDC      *       23      ; IRQ7
+;               *       24      ; IRQ8 (reserved?)
+Device_UART1    *       25      ; IRQ9
+Device_UART2    *       26      ; IRQ10
+Device_Modem    *       27      ; IRQ11
+Device_SCI      *       28      ; IRQ12
+;               *       29        IRQ13 (reserved?)
+;               *       30        IRQ14
+;               *       31        IRQ15
+
+Device_MPIC_0   *       16
+Device_SPIC_0   *       24
+
+; Device numbers (shared between IRQ and FIQ). These map to the 80321's
+; INTCTL register.
+Device_DMA0_EOT *       32
+Device_DMA0_EOC *       33
+Device_DMA1_EOT *       34
+Device_DMA1_EOC *       35
+;                       36
+;                       37
+Device_AAU_EOT  *       38
+Device_AAU_EOC  *       39
+;                       40
+Device_Timer0   *       41
+Device_Timer1   *       42
+Device_IIC0     *       43
+Device_IIC1     *       44
+Device_MU       *       45
+Device_ATU_BIST *       46
+Device_PPM      *       47
+Device_PMU      *       48
+Device_PBIError *       49
+Device_ATUError *       50
+Device_MCUError *       51
+Device_DMA0Error *      52
+Device_DMA1Error *      53
+;                       54
+Device_AAUError *       55
+Device_MUError  *       56
+Device_SSP      *       57
+Device_Message  *       58
+Device_XINT0    *       59
+Device_XINT1    *       60
+Device_XINT2    *       61
+Device_XINT3    *       62
+Device_HPI      *       63
+
+Device_80321_0  *       32
+
+ [ RevB
+Device_IOMD     *       Device_XINT1
+ |
+Device_IOMD     *       Device_XINT0
+ ]
+
+        MACRO
+$label  ReadINTCTL $r,$cond
+$label  MRC$cond p6, 0, $r, c0, c0
+        MEND
+        MACRO
+$label  ReadINTSTR $r,$cond
+$label  MRC$cond p6, 0, $r, c4, c0
+        MEND
+        MACRO
+$label  ReadIINTSRC $r,$cond
+$label  MRC$cond p6, 0, $r, c8, c0
+        MEND
+        MACRO
+$label  ReadFINTSRC $r,$cond
+$label  MRC$cond p6, 0, $r, c9, c0
+        MEND
+
+        MACRO
+$label  WriteINTCTL $r,$cond
+$label  MCR$cond p6, 0, $r, c0, c0
+        MEND
+        MACRO
+$label  WriteINTSTR $r,$cond
+$label  MCR$cond p6, 0, $r, c4, c0
+        MEND
+        MACRO
+$label  WriteIINTSRC $r,$cond
+$label  MCR$cond p6, 0, $r, c8, c0
+        MEND
+        MACRO
+$label  WriteFINTSRC $r,$cond
+$label  MCR$cond p6, 0, $r, c9, c0
+        MEND
+
+; Fixed PCI IO space (eurch)
+
+IO_MasterPIC    *       &0020
+IO_SlavePIC     *       &00A0
+IO_UART3        *       &02F8
+IO_UART2        *       &03E8
+IO_Config       *       &03F0
+IO_ConfigIndex  *       &03F0
+IO_ConfigData   *       &03F1
+IO_FDC          *       &03F0
+IO_UART1        *       &03F8
+IO_MasterPICLevel *     &04D0
+IO_SlavePICLevel *      &04D1
+
+; IOMD space
+
+IRQSTA          *       &10
+IRQRQA          *       &14
+IRQCLRA         *       &14
+IRQMSKA         *       &18
+
+IRQSTB          *       &20             ; Raw status
+IRQRQB          *       &24             ; Masked request
+IRQMSKB         *       &28
+
+FIQST           *       &30
+FIQRQ           *       &34
+FIQMSK          *       &38
+
+ECTCR           *       &C8             ; Bit 1 strickly speaking
+
+IRQA_FlpIndex   *       1:SHL:2
+
+IRQB_PFIQ       *       1:SHL:0
+IRQB_SuperIO    *       1:SHL:2
+IRQB_Podule     *       1:SHL:5
+
+        END
+

@@ -1,0 +1,632 @@
+; Copyright 2008 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+        MACRO
+        GVEntry $name
+        ASSERT  . - GraphicsV_Table = GraphicsV_$name * 4
+        B       GV_$name
+        MEND
+
+        MACRO
+        RIEntry $name
+        ASSERT  . - ReadInfo_Table = GVReadInfo_$name * 4
+        B       RI_$name
+        MEND
+
+; => R4 = b0-15 reason code
+;       = b16-23 head (only used for IICOp at present)
+;       = b24-31 display number (default 0)
+GraphicsV_Handler
+        Push    "lr"
+        LDRB    lr, GVinstance       ; may need another if more than 1 graphics module
+        EOR     lr, r4, lr, LSL #24  ; If not our display, the check below will fail
+        BIC     lr, lr, #&FF:SHL:16
+        CMP     lr, #(GraphicsV_TableEnd - GraphicsV_Table) / 4
+        ADDLO   pc, pc, lr, LSL #2
+        Pull    "pc"
+GraphicsV_Table
+        Pull    "pc"                 ;   
+        Pull    "pc"                 ; GV_VSync irq occurred                    
+        GVEntry SetMode              ; GV_SetMode                 
+        Pull    "pc"                 ; GV_SetInterlace
+        GVEntry SetBlank             ; GV_SetBlank                
+        GVEntry UpdatePointer        ; GV_UpdatePointer           
+        GVEntry SetDMAAddress        ; GV_SetAddress              
+        GVEntry VetMode              ; GV_VetMode                 
+        GVEntry DisplayFeatures      ; GV_Features                
+        GVEntry FramestoreAddress    ; GV_FramestoreAddress
+        GVEntry WritePaletteEntry    ; GV_WritePaletteEntry       
+        GVEntry WritePaletteEntries  ; GV_WritePaletteEntries     
+        Pull    "pc"                 ; GV_ReadPaletteEntry
+        GVEntry Render               ; GV_Render                  
+        GVEntry IICOp                ; GV_IICOp                
+        GVEntry SelectHead           ; GV_SelectHead
+        Pull    "pc"                 ; GV_StartupMode
+        GVEntry PixelFormats         ; GV_PixelFormats       
+        GVEntry ReadInfo             ; GV_ReadInfo
+GraphicsV_TableEnd
+
+GV_SetMode
+        Push    "r2"
+        LDR     lr, [r0, #0]
+        TEQ     lr, #3
+        Pull    "r2,pc", NE
+        BL      SetModeFromVIDCList
+        MOV     r4, #1
+        STR     r4, OurMode
+
+        MOV     r4, #255*4
+        ADR     lr, PaletteCache
+10
+        STR     r4, [lr, r4]            ; invalidate the PaletteCache by clearing all its bit 0's
+        SUBS    r4, r4, #4
+        BPL     %BT10
+
+        MOV     r4, #0
+        Pull    "r2,pc"
+
+GV_SetBlank
+        BL      SetBlankState
+        MOV     r4, #0
+        Pull    "pc"
+
+GV_SelectHead
+        BL      SelectHead
+        MOV     r4, #0
+        Pull    "pc"
+
+GV_UpdatePointer
+        Push    "r0-r3"
+        LDR     lr, OurMode
+        TEQ     lr, #0
+        BEQ     %FT90
+        ; check enable bit
+        LDRB    r4, cursor1
+        AND     r3, r4, #&FE
+        AND     lr, r0, #&01
+        ORR     r1, r3, lr
+        TEQ     r1, r4
+        STRNEB  r1, cursor1
+        MOVNE   r0, #NVCRTCX_CURCTL0
+        BLNE    WriteCRTC
+        LDR     r0, [sp]
+        TST     r1, #1
+        BEQ     %FT80
+        ; set position (if enabled)
+        LDMFD   sp, {r0, r1}
+        LDRB    r3, CurrentHead
+        TST     r3, #1
+        LDREQ   r3, PRAMDAC
+        LDRNE   r3, PRAMDAC2
+;        LDR     r3, PRAMDAC
+        MOV     r2, r2, LSL #16
+        MOV     r1, r1, LSL #16
+        ORR     lr, r2, r1, LSR #16
+        STR     lr, [r3,#&300]          ;NVDAC_CURPOS
+        TST     r0, #2
+        BEQ     %FT80
+        LDR     r0, [sp, #12]
+        LDR     r3, [r0, #4]
+        LDRB    r2, [r0, #1]
+        STR     r3, Cursor2bpp
+        STRB    r2, CursorHeight
+        BL      ChangePointerShape
+80
+        MOV     r4, #0
+90
+        Pull    "r0-r3,pc"
+
+        MACRO
+        CursorRBSwap $word, $temp1, $temp2, $temp3
+        MOV     $temp3, #&001f
+        ORR     $temp3, $temp3, $temp3, LSL #16 
+        AND     $temp1, $word, $temp3
+        AND     $temp2, $word, $temp3, LSL #10
+        BIC     $word, $word, $temp3
+        BIC     $word, $word, $temp3, LSL #10
+        ORR     $word, $word, $temp1, LSL #10
+        ORR     $word, $word, $temp2, LSR #10
+        MEND
+        
+; We assume it's 32 pixels wide
+ChangePointerShape
+        Push    "r5-r11,lr"
+        ldrb    r9, RBSwapMode
+        ldr     r8, psCardType
+        LDR     r1, CURSOR      ; r1 -> output buffer
+        ADR     r5, CursorPalette
+        LDRB    lr, CursorHeight
+        LDR     r3, Cursor2bpp
+        
+; using the internal cursor buffer (rather than frame buffer)...
+; type 1 cursor has normal addressing ..  pixel words accessed thus
+; 0..8, 8..15, 16..23, 24..31
+; type1 found on NV10 at least     
+; type 2 cursor has funny addressing ..  pixel words accessed thus
+; 8..15, 0..8, 24..31, 16..23
+; type2 found on NV18 at least      
+        MOVS    lr, lr, LSL #1  ; lr = words of data
+        BEQ     %FT30
+05      LDR     r2, [r3], #4
+        MOV     r4, #32
+10      AND     r0, r2, #2_0011
+        AND     r6, r2, #2_1100
+        MOV     r0, r0, LSL #1
+        MOV     r6, r6, LSR #1
+        LDRH    r0, [r5, r0]
+        LDRH    r6, [r5, r6]
+        MOV     r2, r2, LSR #4
+        ORR     r0, r0, r6, LSL #16
+        cmp     r8, #NV15
+        cmpne   r8, #NV17
+        cmpne   r8, #NV17M
+        cmpne   r8, #NV18
+        cmpne   r8, #NV18M
+        movne   r7, r1
+        bne     %ft15
+        tst     r1, #&10
+        addeq   r7, r1, #&10
+        subne   r7, r1, #&10
+15      add     r1, r1, #4
+        teq     r9, #0             ; r/b cursor colour swap needed?
+        beq     %ft16
+        CursorRBSwap r0, r6, r10, r11
+16      STR     r0, [r7]
+        SUBS    r4, r4, #4
+        BNE     %BT10
+        SUBS    lr, lr, #1
+        BNE     %BT05
+        ; CURSOR is &800 aligned (and &800 in size)
+30      MOV     r0, #0
+35      MOVS    lr, r1, LSL #21
+        STRNE   r0, [r1], #4
+        BNE     %BT35
+        Pull    "r5-r11,pc"
+
+GV_SetDMAAddress
+        CMP     r0, #0                  ; sets C
+        TEQNE   r0, #12,2               ; = 3, clears C
+        Pull    "pc", NE
+        Push    "r0"                    ; GV_SetRenderAddress relies on this
+        LDR     lr, OurMode
+        TEQ     lr, #0
+        BEQ     %FT90
+        LDR     r0, FrameBufferPhys
+        MOV     r4, #0
+        SUB     r0, r1, r0             ; now an offset into the frame buffer
+        ADR     lr, %FT90
+        BCS     SetStartAddress
+        BCC     SetRenderAddress
+90
+        Pull    "r0, pc"
+
+GV_VetMode      ROUT
+        ; Minimal mode vetting - just throw away unknown list formats,
+        ; pixel formats or invalid control list items
+        MOV     r4,#0
+        Push    "r5-r7"
+        LDR     r5,[r0,#0]
+        CMP     r5,#3
+        Pull    "r5-r7,pc",NE
+        LDR     r5,[r0,#VIDCList3_PixelDepth]
+        CMP     r5,#3
+        CMPNE   r5,#4
+        CMPNE   r5,#5
+        Pull    "r5-r7,pc",NE
+        ; Convert pixel depth to expected NColour value
+        MOV     r6,#1
+        MOV     r5,r6,LSL r5 ; log2bpp -> bpp
+        RSB     r5,r6,r6,LSL r5 ; bpp -> ncolour
+05
+        ADD     r6,r0,#VIDCList3_ControlList
+10        
+        LDR     r7,[r6],#4
+        CMP     r7,#-1
+        MOVEQ   r0,#0
+        Pull    "r5-r7,pc",EQ
+        LDR     r14,[r6],#4
+        TEQ     r7,#ControlList_ExtraBytes
+        BNE     %FT20
+        CMP     r14,#&800
+        Pull    "r5-r7,pc",HS
+        B       %BT10
+20
+        TEQ     r7,#ControlList_NColour
+        BNE     %FT30
+        CMP     r14,r5
+        Pull    "r5-r7,pc",NE
+        B       %BT10
+30
+        TEQ     r7,#ControlList_ModeFlags
+        BNE     %FT40
+        ; Calculate the expected ModeFlags value - look up the right entry in our pixel format list
+        ADRL    r7,GVPixelFormats+4 ; 8bpp
+        TEQ     r5,#255 ; EQ -> 8bpp, NE -> 16bpp, MI -> 32bpp
+        ADDNE   r7,r7,#12 ; 16bpp
+        ADDMI   r7,r7,#12*2 ; 32bpp
+        LDR     r7,[r7]
+        CMP     r7,r14
+        BEQ     %BT10
+        ; Extra check for 64K modes
+        TEQ     r5,#255
+        Pull    "r5-r7,pc",MI
+        ORRNE   r7,r7,#ModeFlag_64k
+        CMP     r7,r14
+        Pull    "r5-r7,pc",NE
+        B       %BT10
+40
+        TEQ     r7,#ControlList_Interlaced
+        BNE     %BT10
+        TEQ     r14,#0
+        Pull    "r5-r7,pc",NE
+        B       %BT10        
+
+GV_DisplayFeatures
+        MOV     r0, #GVDisplayFeature_HardwarePointer+GVDisplayFeature_InterlaceWithProgressiveFramestore+GVDisplayFeature_SeparateFramestore+GVDisplayFeature_CopyRectangleIsFast
+        LDRB    lr, Config
+        MOV     r1,     #2_001000       ; 8bpp always supported
+        TST     lr, #Config_Swap16bpp
+        ORREQ   r1, r1, #2_010000       ; VIDC style 16bpp supported
+        TST     lr, #Config_Swap32bpp
+        ORREQ   r1, r1, #2_100000       ; VIDC style 32bpp supported
+      [ AemulorSupport
+        ; If an old version of Aemulor is loaded, we must claim we support the
+        ; standard 16bpp & 32bpp modes otherwise things may not work correctly
+        ; (e.g. crash when selecting 16bpp modes)
+        LDRB    lr, OldAemulor
+        TEQ     lr, #0
+        ORRNE   r1, r1, #2_110000
+      ]
+        MOV     r2, #4                  ; framestore must be word aligned
+        MOV     r4, #0
+        Pull    "pc"
+
+GV_FramestoreAddress
+        LDR     r1, RAMAmount
+        LDR     r0, FrameBufferPhys
+        MOV     r4, #0
+        SUB     r1, r1, #1*1024*1024
+        Pull    "pc"
+
+GV_WritePaletteEntry ROUT
+        LDR     r4, OurMode
+        TEQ     r4, #0
+        MOV     r4, #GraphicsV_WritePaletteEntry
+        Pull    "pc", EQ
+        TEQ     r0, #2                               ; sub reason code for pointer palette
+        BEQ     GV_WritePaletteEntry_Pointer
+        TEQ     r0, #0
+        Pull    "pc", NE                             ; border palette ignored on GeForce 2
+GV_WritePaletteEntry_Normal
+        CMP     r2, #255
+        Pull    "pc", HI
+        Push    "r3"
+
+        BIC     r4, r1, #255
+        ADR     r3, PaletteCache
+        LDR     lr, [r3, r2, LSL#2]
+        TST     lr, #1                               ; has anyone ever written this cache entry?
+        BEQ     %FT80
+        BIC     lr, lr, #255
+        TEQ     lr, r4
+        MOVEQ   r4, #0
+        Pull    "r3,pc",EQ                           ; no change,don't bother
+
+80
+        ORR     r4, r1, #1                           ; supremacy not used,so make bit 0 a flag
+        STR     r4, [r3, r2, LSL#2]
+        Push    "r5"
+;        LDR     r3, PDIO
+        LDRB    r3, CurrentHead
+        TST     r3, #1
+        LDREQ   r3, PDIO
+        LDRNE   r3, PDIO2
+        MRS     lr, CPSR
+        ORR     r4, lr, #I32_bit                     ; disable IRQs
+        MSR     CPSR_c, r4
+        STRB    r2, [r3, #VGADACWriteAddr]
+        LDRB    r5, RBSwapMode
+        TEQ     r5, #0
+        MOVEQ   r4, r1, LSR #24
+        MOVNE   r4, r1, LSR #8
+        STRB    r4, [r3, #VGADACData]
+        MOV     r4, r1, LSR #16
+        STRB    r4, [r3, #VGADACData]
+        MOVEQ   r4, r1, LSR #8
+        MOVNE   r4, r1, LSR #24
+        STRB    r4, [r3, #VGADACData]                ; dribble out the entry in 8 bit slices
+        MSR     CPSR_c, lr
+        MOV     r4, #0
+        Pull    "r5"
+        Pull    "r3,pc"
+
+
+GV_WritePaletteEntry_Pointer
+        CMP     r2, #1
+        Pull    "pc", LO                             
+        CMP     r2, #3
+        Pull    "pc", HI                             
+        Push    "r0-r3"
+        ADR     r4, CursorPalette
+        ADD     r4, r4, r2, LSL #1
+        AND     r0, r1, #&F8000000
+        AND     r2, r1, #&0000F800
+        AND     r1, r1, #&00F80000
+        MOV     r2, r2, LSR #11
+        ORR     r2, r2, r1, LSR #14
+        ORR     r2, r2, r0, LSR #17
+        ORR     r2, r2, #&8000
+        STRH    r2, [r4]
+        LDRB    r4, cursor1
+        TST     r4, #&01
+        BLNE    ChangePointerShape
+        MOV     r4, #0
+        Pull    "r0-r3,pc"
+
+
+GV_WritePaletteEntries ROUT
+        LDR     r4, OurMode
+        TEQ     r4, #0
+        MOV     r4, #GraphicsV_WritePaletteEntries
+        Pull    "pc", EQ                             
+        TEQ     r0, #2                               ; sub reason code for pointer palette
+        BEQ     GV_WritePaletteEntries_Pointer
+        TEQ     r0, #0
+        Pull    "pc", NE                             ; border palette ignored on GeForce 2
+GV_WritePaletteEntries_Normal
+        CMP     r2, #255
+        Pull    "pc", HI
+        Push    "r1,r3,r5-r8"
+
+        ADD     r5, r2, r3
+        CMP     r5, #256
+        MOVHI   r5, #256                             ; no,the palette is only 256 entries silly
+        CMP     r2, r5
+        BHS     %FT80
+
+;        LDR     r3, PDIO
+        LDRB    r3, CurrentHead
+        TST     r3, #1
+        LDREQ   r3, PDIO
+        LDRNE   r3, PDIO2
+        ADR     r6, PaletteCache
+        LDRB    r8, RBSwapMode
+
+        MRS     lr, CPSR
+        ORR     r4, lr, #I32_bit                     ; disable IRQs
+        MSR     CPSR_c, r4
+
+10
+        LDR     r12, [r1], #4                        ; palette data to write
+        LDR     r4, [r6, r2, LSL#2]
+        TST     r4, #1
+        BEQ     %FT15                                ; unseen cache entry
+
+        BIC     r4, r4, #255
+        BIC     r7, r12, #255
+        TEQ     r4, r7
+        BEQ     %FT20                                ; no change,don't bother
+15
+        STRB    r2, [r3, #VGADACWriteAddr]           ; although the addr is autoincrementing,our palette
+        TEQ     r8, #0                          
+        MOVEQ   r4, r12, LSR #24                     ; cache means we may skip quite a few entries
+        MOVNE   r4, r12, LSR #8                      ; cache means we may skip quite a few entries
+        STRB    r4, [r3, #VGADACData]
+        MOV     r4, r12, LSR #16
+        STRB    r4, [r3, #VGADACData]
+        MOVEQ   r4, r12, LSR #8
+        MOVNE   r4, r12, LSR #24
+        STRB    r4, [r3, #VGADACData]                ; dribble out the entry in 8 bit slices
+        ORR     r12, r12, #1                         ; supremacy not used,so make bit 0 a flag
+        STR     r12, [r6, r2, LSL#2]
+20
+        ADD     r2, r2, #1
+        CMP     r2, r5
+        BLO     %BT10
+        MSR     CPSR_c, lr
+80      MOV     r4,#0
+
+        Pull    "r1,r3,r5-r8,pc"
+
+
+GV_WritePaletteEntries_Pointer
+        CMP     r2, #3
+        Pull    "pc", HI                             
+        Push    "r0-r3,r5"
+        ADR     r4, CursorPalette
+        ADD     r4, r4, r2, LSL #1
+        ADD     r3, r2, r3
+10      CMP     r2, r3
+        BHS     %FT80
+        LDR     r0, [r1], #4
+        CMP     r2, #1
+        BLO     %FT60
+        AND     r5, r0, #&F8000000
+        AND     lr, r0, #&0000F800
+        AND     r0, r0, #&00F80000
+        MOV     lr, lr, LSR #11
+        ORR     lr, lr, r0, LSR #14
+        ORR     lr, lr, r5, LSR #17
+        ORR     lr, lr, #&8000
+        STRH    lr, [r4]
+60      ADD     r4, r4, #2
+        ADD     r2, r2, #1
+        B       %BT10
+80      LDRB    r4, cursor1
+        TST     r4, #&01
+        BLNE    ChangePointerShape
+        MOV     r4, #0
+        Pull    "r0-r3,r5,pc"
+
+GV_IICOp
+        Push    "r3"
+        LDRB    r3, CurrentHead
+        EOR     r3, r3, r4, LSR #16
+        AND     r3, r3, #1              ; Head (using the same SelectHead aliasing AND)
+        BL      DoI2COp
+        MOV     r4, #0
+        Pull    "r3,pc"
+
+GV_PixelFormats
+        ADRL    r0, GVPixelFormats
+        MOV     r1, #4
+        MOV     r4, #0
+ [ AemulorSupport
+        ; Old versions of Aemulor don't know about the new GV_PixelFormats
+        ; call, which stops their low colour mode emulation from working
+        ; because they only override the BPP flags returned by
+        ; GV_DisplayFeatures. If we detected that an old version is running,
+        ; adjust the list of returned modes to include all the low colour ones
+        LDRB    lr, OldAemulor
+        TEQ     lr, #0
+        ADDNE   r1, r1, #3              ; Adjust list to include low colour modes
+ ]
+        Pull    "pc"
+
+GV_ReadInfo ROUT
+        Push    "r0-r4"
+        CMP     r0, #(ReadInfo_TableEnd - ReadInfo_Table) / 4
+        SUBLO   sp, sp, #256
+        ADDLO   pc, pc, r0, LSL #2
+        Pull    "r0-r4,pc"
+ReadInfo_Table
+        RIEntry Version
+        RIEntry ModuleName
+        RIEntry DriverName
+        RIEntry HardwareName
+        RIEntry ControlListItems
+ReadInfo_TableEnd
+
+        GBLA    VersionBCD
+VersionBCD SETBCD Module_Version
+
+VersionBCDVal DCD VersionBCD<<8
+
+ControlListItems
+        DCD     ControlList_Interlaced
+        DCD     ControlList_ExtraBytes
+        DCD     ControlList_NColour
+        DCD     ControlList_ModeFlags
+        DCD     ControlList_Terminator        
+ControlListItems_End
+
+RI_Version
+        ADR     r3, VersionBCDVal
+        MOV     r4, #4
+        B       %FT10
+
+RI_ModuleName
+        ; Either NVidia%Base or NVidia%<instance>
+        ADRL    r3, ModuleTitle
+        MOV     r4, #0
+01
+        LDRB    r0, [r3, r4]
+        CMP     r0, #0
+        MOVEQ   r0, #'%'
+        STRB    r0, [sp, r4]
+        ADD     r4, r4, #1
+        BNE     %BT01
+        LDRB    r0, instance
+        CMP     r0, #0
+        ADDNE   r0, r0, #'0'
+        MOVEQ   r0, #'B'
+        STRB    r0, [sp, r4]
+        ADD     r4, r4, #1
+        MOVEQ   r0, #'a'
+        STREQB  r0, [sp, r4]
+        ADDEQ   r4, r4, #1
+        MOVEQ   r0, #'s'
+        STREQB  r0, [sp, r4]
+        ADDEQ   r4, r4, #1
+        MOVEQ   r0, #'e'
+        STREQB  r0, [sp, r4]
+        ADDEQ   r4, r4, #1
+        MOV     r0, #0
+        STRB    r0, [sp, r4]
+        ADD     r4, r4, #1
+        MOV     r3, sp
+        B       %FT10
+
+RI_DriverName
+        ADRL    r3, ModuleTitle
+        MOV     r4, #0
+02
+        LDRB    r0, [r3, r4]
+        ADD     r4, r4, #1
+        TEQ     r0, #0
+        BNE     %BT02
+        B       %FT10
+
+RI_HardwareName
+        LDR     r0, =PCI_ReadInfo_Description+PCI_ReadInfo_Vendor
+        ADD     r1, sp, #256-8
+        MOV     r2, #8
+        LDR     r3, PCIHandle
+        SWI     XPCI_ReadInfo
+        MOVVS   r2, #0
+        CMP     r2, #8
+        ADDNE   sp, sp, #256
+        Pull    "r0-r4,pc", NE
+        MOV     r4, #0
+        ; Copy vendor name if provided
+        ASSERT  PCI_ReadInfo_Vendor > PCI_ReadInfo_Description
+        LDR     r3, [sp, #256-4]
+        CMP     r3, #0
+        BEQ     %FT04
+03
+        LDRB    r0, [r3, r4]
+        CMP     r4, #128
+        CMPNE   r0, #0
+        MOVEQ   r0, #32
+        STRB    r0, [sp, r4]
+        ADD     r4, r4, #1
+        BNE     %BT03
+        ; Copy device description
+04
+        LDR     r3, [sp, #256-8]
+05
+        LDRB    r0, [r3], #1
+        CMP     r4, #255
+        MOVEQ   r0, #0
+        STRB    r0, [sp, r4]
+        ADD     r4, r4, #1
+        CMP     r0, #0
+        BNE     %BT05
+        LDR     r1, [sp, #4+256]
+        LDR     r2, [sp, #8+256]
+        MOV     r3, sp
+        B       %FT10
+
+RI_ControlListItems
+        ADRL    r3, ControlListItems
+        MOV     r4, #ControlListItems_End-ControlListItems
+10
+        TEQ     r4, #0
+        ADDEQ   sp, sp, #256
+        Pull    "r0-r4,pc", EQ
+        CMP     r4, r2
+        SUB     lr, r2, r4
+        MOVLT   r2, r4
+        STR     lr, [sp, #8+256]
+20
+        SUBS    r2, r2, #1
+        LDRGEB  r0, [r3], #1
+        STRGEB  r0, [r1], #1
+        BGT     %BT20
+        ADD     sp, sp, #256
+        MOV     r4, #0
+        STR     r4, [sp, #16]
+        Pull    "r0-r4,pc"
+
+        END

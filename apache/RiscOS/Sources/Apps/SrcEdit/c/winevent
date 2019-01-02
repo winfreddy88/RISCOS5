@@ -1,0 +1,237 @@
+/* Copyright 2007 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/* Title:   winevent.c
+ * Purpose: vet edit window events before passing them on
+ * Author: IDJ
+ * History: 01-Mar-90: IDJ: created
+ *          07-Mar-90: IDJ: added bra-ket matching CTRL-( CTRL-)
+ *          18-Mar-90: IDJ: fixed bug in matching {}
+ *          25-Mar-90: IDJ: added Sh-F9 as keyboard shortcut for save all
+ *          27-Mar-90: IDJ: added ctl-? as keyboard shortcut for language help
+ *          31-Aug-90: IDJ: changed help request to F1 (style guide)
+ *          10-Sep-90: IDJ: changed bracket matching to have caret BEFORE both brackets
+ *                          better for use of Ctrl F7
+ *          04-Mar-91: IDJ: orrible kludge to make ColTab the default
+ *          03-Apr-91: IDJ: new coltab overwrite wordwrap global options
+ *
+ *          Aquarius
+ *          16-Dec-94: IDJ: fixed bra-ket matching AQU-00528
+ *
+ */
+
+#include <string.h>
+
+#include "txtedit.h"
+#include "event.h"
+#include "txt.h"
+#include "txtscrap.h"
+#include "akbd.h"
+#include "werr.h"
+#include "msgs.h"
+
+#include "srcedmenus.h"
+#include "selectload.h"
+#include "saveall.h"
+#include "options.h"
+#include "langhelp.h"
+
+#include "winevent.h"
+
+#define CTRL_L 0xc
+#define CTRL_A 0x1
+#define ch_bra_round   '('
+#define ch_ket_round   ')'
+#define ch_bra_square  '['
+#define ch_ket_square  ']'
+#define ch_bra_curly   '{'
+#define ch_ket_curly   '}'
+
+static txt_event_proc winevent__oldtxthandler;
+
+static txt_index winevent__matchfor(txt t, char bra)
+{
+   txt_index nowat = txt_dot(t);  /* dot is before ket */
+   int kets = 0, bras = 0;
+   char c;
+   char ket = (bra == ch_bra_round)?ch_ket_round:
+              (bra == ch_bra_square)?ch_ket_square:
+              ch_ket_curly;
+
+   /* search backwards */
+   while (nowat <= txt_size(t))
+   {
+       if ((c = txt_charat(t, nowat)) == ket) kets++;
+       else if (c == bra) bras++;
+       if (bras == kets) return nowat;
+       nowat++;
+   }
+   return -1;
+}
+
+
+static txt_index winevent__matchback(txt t, char ket)
+{
+   txt_index nowat = txt_dot(t);  /* dot is before ket */
+   int kets = 0, bras = 0;
+   char c;
+   char bra = (ket == ch_ket_round)?ch_bra_round:
+              (ket == ch_ket_square)?ch_bra_square:
+              ch_bra_curly;
+
+   /* search backwards */
+   while (nowat >= 0)
+   {
+       if ((c = txt_charat(t, nowat)) == bra) bras++;
+       else if (c == ket) kets++;
+       if (bras == kets) return nowat;
+       nowat--;
+   }
+   return -1;
+}
+
+      
+
+static void winevent__eventhandler(txt t, void *handle)
+{
+   txtedit_state *s = (txtedit_state *)handle;
+   txt_eventcode e = txt_get(t);
+
+   switch(e)
+   {
+      case CTRL_L:
+        if (txtscrap_selectowner() != 0)  
+           selectload_load(s);
+        else
+           goto ignore;
+        break;
+
+ /*
+  *          16-Dec-94: IDJ: fixed bra-ket matching AQU-00528 (use F10)
+  *
+  */
+
+      case akbd_Fn10:   /* use F10 for bra-ket matching */
+        {
+           char c = txt_charatdot(t);
+           int matchat;
+
+           if (c == ch_bra_round || c == ch_bra_square || c == ch_bra_curly)
+           {
+               /* search forwards for corresponding ket */
+               if ((matchat = winevent__matchfor(t, c)) != -1)
+                   txtscrap_setselect(t, matchat, matchat+1);
+               else
+                   werr(FALSE, msgs_lookup("winevent2:No corresponding closing bracket"));
+           }
+           else if (c == ch_ket_round || c == ch_ket_square || c == ch_ket_curly)
+           {
+               /* search backwards for corresponding bra */
+               if ((matchat = winevent__matchback(t, c)) != -1)
+                   txtscrap_setselect(t, matchat, matchat+1);
+               else
+                   werr(FALSE, msgs_lookup("winevent1:No corresponding opening bracket"));  
+           }
+           else
+             goto ignore;
+        }
+        break;
+
+#if 0
+      /****** IDJ: 16-Dec-94:doesn't work with RISC OS 3 keybd drivers ******/
+      case ch_bra_round:
+        if (akbd_pollctl())
+        {  
+           char c;
+           txt_index matchat;
+
+           /* see if it's a ket */
+           if ((c = txt_charatdot(t)) != ch_ket_round && c != ch_ket_square && c != ch_ket_curly) goto ignore;
+
+           /* search backwards for corresponding bra */
+           if ((matchat = winevent__matchback(t, c)) != -1)
+               txtscrap_setselect(t, matchat, matchat+1);
+           else
+               werr(FALSE, msgs_lookup("winevent1:No corresponding opening bracket"));         
+        }
+        else
+          goto ignore;
+        break;
+
+      case ch_ket_round: 
+        if (akbd_pollctl())
+        {
+           char c;
+           int matchat;
+ 
+           /* see if it's a bra */
+           if ((c = txt_charatdot(t)) != ch_bra_round && c != ch_bra_square && c != ch_bra_curly) goto ignore;
+
+           /* search forwards for corresponding ket */
+           if ((matchat = winevent__matchfor(t, c)) != -1)
+               txtscrap_setselect(t, matchat, matchat+1);
+           else
+               werr(FALSE, msgs_lookup("winevent2:No corresponding closing bracket"));
+        }
+        else
+          goto ignore;
+        break;
+#endif
+  
+      case akbd_Fn + akbd_Sh + 9:
+        saveall_savethem();
+        break;
+
+      case akbd_Fn + 1:
+        langhelp_gethelp();
+        break;
+
+      ignore:
+      default:
+        txt_unget(t, e);
+        winevent__oldtxthandler(t, s);
+        break; 
+   }
+}
+
+     
+
+extern void winevent_open_handler(char *filename, txtedit_state *s, void *handle)
+{
+   void *winevent__oldtxthandle;
+   char title[256+32];
+
+   handle = handle;
+   filename = filename;
+  
+   /* attach our own menumaker */
+   event_attachmenumaker(txt_syshandle(s->t), srcedmenus_menumaker, srcedmenus_menuproc, s);
+
+   /* attach our own txt event handler (remembering old one) */
+   txt_readeventhandler(s->t, &winevent__oldtxthandler, &winevent__oldtxthandle);
+   txt_eventhandler(s->t, winevent__eventhandler, winevent__oldtxthandle);
+
+   /* --- set from global defaults --- */
+   s->wordtab = options_coltab()?FALSE:TRUE;
+   s->overwrite = options_overwrite();
+   s->wordwrap = options_wordwrap();
+   if (s->filename[0] == 0)
+       strcpy(title, "<untitled>");
+   else
+       strcpy(title, s->filename);
+   if (!s->wordtab) strcat(title, msgs_lookup("txt23: (ColTab)"));
+   if (s->overwrite) strcat(title, msgs_lookup("txt24: (Overwrite"));
+   if (s->wordwrap)  strcat(title, msgs_lookup("txt25: (Wordwrap)"));
+   txt_settitle(s->t, title);
+}

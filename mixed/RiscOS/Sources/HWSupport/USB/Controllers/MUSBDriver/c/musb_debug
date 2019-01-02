@@ -1,0 +1,148 @@
+/* Copyright 2011 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "modhead.h"
+#include "swis.h"
+#include "callx/callx.h"
+#include <stdlib.h>
+#include <string.h>
+#include <stdlib.h>
+#include <limits.h>
+#include <stddef.h>
+#include <machine/bus.h>
+
+#include <sys/queue.h>
+#include <sys/types.h>
+#include <sys/systm.h>
+
+#include <dev/usb/usb.h>
+#include <dev/usb/usbdi.h>
+#include <dev/usb/usbdivar.h>
+
+#include "Global/RISCOS.h"
+#include "Global/HALEntries.h"
+#include "cmodule.h"
+
+/* Have to avoid including stdio as there's a clash with the BSD stuff */
+#define __stdio_h
+
+#include "DebugLib/DebugLib.h"
+
+#include "musb.h"
+
+#ifdef MUSB_DEBUG
+int musbdebug=20;
+extern musb_softc_t musb_soft;
+
+char *musb_dump_regs(char *buf)
+{
+	volatile musb_regs *musb_base = musb_soft.musb_base;
+	buf += sprintf(buf,"FADDR: %02x\n",musb_base->common.faddr);
+	buf += sprintf(buf,"POWER: %02x\n",musb_base->common.power);
+	buf += sprintf(buf,"FRAME: %04x\n",musb_base->common.frame);
+	buf += sprintf(buf,"INDEX: %02x\n",musb_base->common.index);
+	buf += sprintf(buf,"TESTMODE: %02x\n",musb_base->common.testmode);
+	buf += sprintf(buf,"DEVCTL: %02x\n",musb_base->devctl);
+	buf += sprintf(buf,"ULPIVBUSCONTROL: %02x\n",musb_base->ulpivbuscontrol);
+	buf += sprintf(buf,"ULPIUTMICONTROL: %02x\n",musb_base->ulpiutmicontrol);
+	buf += sprintf(buf,"ULPIINTMASK: %02x\n",musb_base->ulpiintmask);
+	buf += sprintf(buf,"ULPIINTSRC: %02x\n",musb_base->ulpiintsrc);
+	buf += sprintf(buf,"OTG_REVISION: %08x\n",musb_base->otg_revision);
+	buf += sprintf(buf,"OTG_SYSCONFIG: %08x\n",musb_base->otg_sysconfig);
+	buf += sprintf(buf,"OTG_SYSSTATUS: %08x\n",musb_base->otg_sysstatus);
+	buf += sprintf(buf,"OTG_INTERFSEL: %08x\n",musb_base->otg_interfsel);
+	buf += sprintf(buf,"OTG_FORCESTDBY: %08x\n",musb_base->otg_forcestdby);
+	buf += sprintf(buf,"EP TXMAXP TXCSR TXTYPE TXINTERVAL RXMAXP RXCSR RXCOUNT RXTYPE RXINTERVAL\n");
+	for(int i=0;i<16;i++)
+		buf += sprintf(buf,"%2d %04x   %04x  %02x     %02x         %04x   %04x  %04x    %02x     %02x\n",i,musb_base->csr.host_ep[i].txmaxp,musb_base->csr.host_ep[i].host_txcsr,musb_base->csr.host_ep[i].host_txtype,musb_base->csr.host_ep[i].host_txinterval,musb_base->csr.host_ep[i].rxmaxp,musb_base->csr.host_ep[i].host_rxcsr,musb_base->csr.host_ep[i].rxcount,musb_base->csr.host_ep[i].host_rxtype,musb_base->csr.host_ep[i].host_rxinterval);
+	return buf;
+}
+
+char *musb_dump_pipe(char *buf,struct musb_pipe *epipe)
+{
+	buf += sprintf(buf,"  Pipe %p run %d ep %d toggle %d xfer %p null_packet %d remain %d buf %p\n",epipe,epipe->running,epipe->ep,epipe->toggle,SIMPLEQ_FIRST(&epipe->pipe.queue),epipe->null_packet,epipe->remain,epipe->buf);
+	epipe = SIMPLEQ_NEXT(epipe,multiq);
+	if(epipe)
+		return musb_dump_pipe(buf,epipe);
+	return buf;
+}
+
+char *musb_dump_mp(char *buf,const char *name,struct musb_multiplexer *mp)
+{
+	struct musb_pipe *epipe = SIMPLEQ_FIRST(&mp->waitq);
+	buf += sprintf(buf,"mp %p tx %d idle %04x interval %d queue %p\n",mp,mp->tx,mp->idle_mask,mp->interval,epipe);
+	if(epipe)
+		return musb_dump_pipe(buf,epipe);
+	return buf;
+}
+
+char *musb_dump_state(char *buf)
+{
+	static const char *peri_ep0_state[] = { "Idle","TX","RX","Status","Error" };
+	static const char *host_ep0_state[] = { "Idle","Setup","In data","Out data","In status","Out status" };
+	volatile musb_regs *musb_base = musb_soft.musb_base;
+	int devctl = musb_base->devctl;
+	int isbdevice = devctl & DEVCTL_BDEVICE;
+	int ishost = devctl & DEVCTL_HOSTMODE;
+	buf += sprintf(buf,"DEVCTL: %02x (%c %s)\n",devctl,(isbdevice?'B':'A'),(ishost?"Host":"Peripheral"));
+	buf += sprintf(buf,"Port status: %04x change %04x (Speed: %s)\n\n",musb_soft.port_status&0xffff,musb_soft.port_status>>16,(musb_soft.port_status&UPS_HIGH_SPEED?"High":(musb_soft.port_status&UPS_LOW_SPEED?"Low":"Full")));
+	buf += sprintf(buf,"Peripheral mode:\nState %d (%s)\nAddress %02x%s\n\n",musb_soft.peri_ep0_state,peri_ep0_state[musb_soft.peri_ep0_state],musb_soft.peri_addr,(musb_soft.peri_addr_pending?" (pending)":""));
+	buf += sprintf(buf,"Host mode: EP 0 state %d (%s)\n",musb_soft.host_ep0_state,host_ep0_state[musb_soft.host_ep0_state]);
+	for(int i=0;i<16;i++)
+	{
+		if(musb_soft.host_tx[i])
+		{
+			buf += sprintf(buf,"EP%d TX = pipe %p mp %p\n",i,musb_soft.host_tx[i],musb_soft.host_tx[i]->multiplexer);
+			buf = musb_dump_pipe(buf,musb_soft.host_tx[i]);
+		}
+		if(musb_soft.host_rx[i])
+		{
+			buf += sprintf(buf,"EP%d RX = pipe %p mp %p\n",i,musb_soft.host_rx[i],musb_soft.host_rx[i]->multiplexer);
+			buf = musb_dump_pipe(buf,musb_soft.host_rx[i]);
+		}
+	}
+	buf = musb_dump_mp(buf,"mp_ep0",&musb_soft.mp_ep0);
+	buf = musb_dump_mp(buf,"mp_bulktx",&musb_soft.mp_bulktx);
+	buf = musb_dump_mp(buf,"mp_bulkrx",&musb_soft.mp_bulkrx);
+	buf = musb_dump_mp(buf,"mp_iitx",&musb_soft.mp_iitx);
+	buf = musb_dump_mp(buf,"mp_iirx",&musb_soft.mp_iirx);
+	return buf;
+}
+
+void musb_assert_fail(const char *file,int line,const char *reason)
+{
+	int s = _kernel_irqs_disabled();
+	_kernel_irqs_off();
+	static char buf[32768];
+	char *bufpos = buf;
+	bufpos += sprintf(bufpos,"*** Assertion failed ***\nFile %s\nLine %d\nReason %s\n",file,line,reason);
+	bufpos += sprintf(bufpos,"IRQs %d\n\nHardware regs:\n",s);
+	bufpos = musb_dump_regs(bufpos);
+	bufpos += sprintf(bufpos,"\nState:\n");
+	bufpos = musb_dump_state(bufpos);
+	bufpos += sprintf(bufpos,"\nDebug log:\n");
+	/* Dump it out over the serial port */
+	bufpos = buf;
+	while(*bufpos)
+	{
+		_swix(OS_Hardware,_IN(0)|_INR(8,9), *bufpos, 0, EntryNo_HAL_DebugTX);
+		bufpos++;
+	}
+	_swix(OS_CLI,_IN(0),"*dadprint");
+	/* Die */
+	while(1) {};
+}
+
+#endif

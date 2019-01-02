@@ -1,0 +1,152 @@
+/*
+ * Copyright (c) 2017, RISC OS Open Ltd
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met: 
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of RISC OS Open Ltd nor the names of its contributors
+ *       may be used to endorse or promote products derived from this software
+ *       without specific prior written permission.
+ * 
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+ * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+ * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+ * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+ * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ */
+#include <stdlib.h>
+#include "kernel.h"
+#include "swis.h"
+
+#include "Global/RISCOS.h"
+#include "Global/OsBytes.h"
+#include "Global/GraphicsV.h"
+#include "Global/Services.h"
+
+#include "globals.h"
+#include "events.h"
+#include "modhead.h"
+#include "overlays.h"
+#include "utils.h"
+
+static bool enabled = false;
+static bool callback = false;
+
+_kernel_oserror *events_init(void)
+{
+	if (enabled)
+	{
+		return NULL;
+	}
+	/* Get on EventV */
+	_kernel_oserror *e = _swix(OS_Claim,_INR(0,2),EventV,eventv_handler_entry,private_word);
+	if (e)
+	{
+		return e;
+	}
+	/* Enable VSync event */
+	e = _swix(OS_Byte,_INR(0,1),OsByte_EnableEvent,Event_VSync);
+	if (e)
+	{
+		_swix(OS_Release,_INR(0,2),EventV,eventv_handler_entry,private_word);
+		return e;
+	}
+	enabled = true;
+	return NULL;
+}
+
+void events_shutdown(void)
+{
+	if (!enabled)
+	{
+		return;
+	}
+	enabled = false;
+	_swix(OS_Byte,_INR(0,1),OsByte_DisableEvent,Event_VSync);
+	_swix(OS_Release,_INR(0,2),EventV,eventv_handler_entry,private_word);
+	if (callback)
+	{
+		_swix(OS_RemoveCallBack,_INR(0,1),callback_handler_entry,private_word);
+		callback = false;
+	}
+}
+
+int eventv_handler(_kernel_swi_regs *r, void *pw)
+{
+	(void) r;
+	(void) pw;
+	/* Assume we're only ever called for VSync
+	   Register a callback so we can safely update things */
+	if (!callback && !_swix(OS_AddCallBack,_INR(0,1),callback_handler_entry,private_word))
+	{
+		callback = true;
+	}
+	return 1;
+}
+
+static int last_state = -1;
+
+static void hide_cb(overlay_t *o, void *param)
+{
+	(void) param;
+	if (o->gvoverlay && o->visible)
+	{
+		o->visible = false;
+		_swix(OS_CallAVector,_IN(1)|_IN(4)|_IN(9),0,GraphicsV_SetOverlayPosition | (vduvars.gvdriver<<24) | (o->gvoverlay<<16),GraphicsV);
+	}
+}
+
+static void update_cb(overlay_t *o,void *param)
+{
+	(void) param;
+	show_overlay(o,false);
+}
+
+static void callback_internal(void)
+{
+	/* Get Wimp state so we can work out whether to show or hide the overlays */
+	int state;
+	if (_swix(Wimp_ReadSysInfo,_IN(0)|_OUT(0),3,&state))
+	{
+		state = 0;
+	}
+	if (state != last_state)
+	{
+		last_state = state;
+	}
+	else if (!state)
+	{
+		return;
+	}
+	if (!state)
+	{
+		/* Left the Wimp, hide all the overlays */
+		overlay_iterate(hide_cb,NULL);
+	}
+	else
+	{
+		/* In the Wimp, update everything */
+		overlay_iterate(update_cb,NULL);
+		update_zorder();
+	}
+}
+
+_kernel_oserror *callback_handler(_kernel_swi_regs *r, void *pw)
+{
+	(void) r;
+	(void) pw;
+	callback_internal();
+	callback = false;
+	return NULL;
+}

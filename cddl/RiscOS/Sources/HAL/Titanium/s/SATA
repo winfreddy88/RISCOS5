@@ -1,0 +1,240 @@
+;
+; CDDL HEADER START
+;
+; The contents of this file are subject to the terms of the
+; Common Development and Distribution License (the "Licence").
+; You may not use this file except in compliance with the Licence.
+;
+; You can obtain a copy of the licence at
+; cddl/RiscOS/Sources/HAL/Titanium/LICENCE.
+; See the Licence for the specific language governing permissions
+; and limitations under the Licence.
+;
+; When distributing Covered Code, include this CDDL HEADER in each
+; file and include the Licence file. If applicable, add the
+; following below this CDDL HEADER, with the fields enclosed by
+; brackets "[]" replaced with your own identifying information:
+; Portions Copyright [yyyy] [name of copyright owner]
+;
+; CDDL HEADER END
+;
+;
+; Copyright 2014 Elesar Ltd.  All rights reserved.
+; Use is subject to license terms.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:HALDevice
+        GET     Hdr:OSEntries
+
+        GET     hdr.RegMap
+        GET     hdr.StaticWS
+                
+        AREA    |SATA$$Code|, CODE, READONLY, PIC
+
+        EXPORT  SATAInit
+        EXPORT  SATADeviceInit
+        IMPORT  memcpy
+
+; SATAInit
+SATAInit ROUT
+        Push    "v1-v2, lr"
+
+        ; Turn on the SATA controller clock
+        LDR     a1, CMCoreL3INIT_LogBase
+        LDR     a2, =CM_L3INIT_SATA_CLKCTRL_OPTFCLKEN_REF_CLK :OR: \
+                     CM_CLKCTRL_MODULEMODE_ENABLED
+        STR     a2, [a1, #CM_L3INIT_SATA_CLKCTRL]
+
+        ; Map in the SATA controller, MAC, PHY and DPLL
+        MOV     a1, #0
+        LDR     a2, =SATAMAC_WRAPPER_PhysBase
+        MOV     a3, #SATAMAC_WRAPPER_PhysSize
+        CallOS  OS_MapInIO
+        STR     a1, SATA_LogBase
+        MOV     v2, a1
+
+        MOV     a1, #0
+        LDR     a2, =SATA_PhysBase
+        MOV     a3, #SATA_PhysSize
+        CallOS  OS_MapInIO
+        STR     a1, SATA_LogBase
+        MOV     v1, a1
+
+        MOV     a1, #0
+        LDR     a2, =SATAPHY_PhysBase
+        MOV     a3, #SATAPHY_PhysSize
+        CallOS  OS_MapInIO
+        STR     a1, SATAPHY_LogBase
+
+        ; SATA PHY power down sequence
+        LDR     a3, ControlCore_LogBase
+        LDR     a2, =((ClkOsc0 / 1000000) :SHL: CTRL_CORE_PHY_POWER_SATA_SATA_PWRCTRL_CLK_FREQ_SHIFT) :OR: \
+                     CTRL_CORE_PHY_POWER_SATA_SATA_PWRCTRL_CLK_CMD_OFF
+        STR     a2, [a3, #CTRL_CORE_PHY_POWER_SATA]
+
+        ; Erratum i783: PLL requires a reset in order to re-lock
+        LDR     a2, [a3, #CTRL_CORE_SMA_SW_0]
+        ORR     a2, a2, #CTRL_CORE_SMA_SW_0_SATA_PLL_SOFT_RESET
+        STR     a2, [a3, #CTRL_CORE_SMA_SW_0]
+        BIC     a2, a2, #CTRL_CORE_SMA_SW_0_SATA_PLL_SOFT_RESET
+        STR     a2, [a3, #CTRL_CORE_SMA_SW_0]
+
+        ; Constant DPLL ratios for an output of 1500MHz
+        ; REGN = 9, REGM = 750, SSC = off, PLL_SD = 6
+        MOV     a2, #SATAPHY_PLL_CONFIGURATION2_PLL_IDLE
+        STR     a2, [a1, #SATAPHY_PLL_CONFIGURATION2]
+
+        LDR     a2, =(9:SHL:SATAPHY_PLL_CONFIGURATION1_PLL_REGN_SHIFT) :OR: \
+                     (750:SHL:SATAPHY_PLL_CONFIGURATION1_PLL_REGM_SHIFT)
+        STR     a2, [a1, #SATAPHY_PLL_CONFIGURATION1]
+
+        ASSERT  (ClkOsc0 / 1000000 / 10) * 750 = 1500
+        MOV     a2, #6:SHL:SATAPHY_PLL_CONFIGURATION3_PLL_SD_SHIFT
+        STR     a2, [a1, #SATAPHY_PLL_CONFIGURATION3]
+
+        MOV     a2, #0:SHL:SATAPHY_PLL_CONFIGURATION4_PLL_REGM_F_SHIFT
+        STR     a2, [a1, #SATAPHY_PLL_CONFIGURATION4]
+
+        LDR     a2, [a1, #SATAPHY_PLL_SSC_CONFIGURATION1]
+        BIC     a2, a2, #SATAPHY_PLL_SSC_CONFIGURATION1_EN_SSC
+        STR     a2, [a1, #SATAPHY_PLL_SSC_CONFIGURATION1]
+
+        LDR     a2, =SATAPHY_PLL_CONFIGURATION2_PLL_SELFREQDCO_1000_2000 :OR: \
+                     SATAPHY_PLL_CONFIGURATION2_PLL_LOCKSEL_FREQ
+        STR     a2, [a1, #SATAPHY_PLL_CONFIGURATION2]
+
+        MOV     a2, #SATAPHY_PLL_GO_PLL_GO
+        STR     a2, [a1, #SATAPHY_PLL_GO]
+10
+        LDR     a2, [a1, #SATAPHY_PLL_STATUS]
+        TST     a2, #SATAPHY_PLL_STATUS_PLL_LOCK
+        BEQ     %BT10
+
+        ; Tune up the PHY per Table 26-9 of TRM
+        LDR     a2, =(2_01000:SHL:27) :OR: (2_0101:SHL:14) :OR: (2_00:SHL:5)
+        STR     a2, [a1, #SATAPHYRX_ANA_PROGRAMMABILITY_REG1]
+        LDR     a2, =(2_00001:SHL:19) :OR: (2_01100110:SHL:11)
+        STR     a2, [a1, #SATAPHYRX_DIGITAL_MODES_REG1]
+        LDR     a2, =(2_01:SHL:30)
+        STR     a2, [a1, #SATAPHYRX_TRIM_REG4]
+        LDR     a2, =(2_10:SHL:30) :OR: (2_101001000001100100010101:SHL:0)
+        STR     a2, [a1, #SATAPHYRX_DLL_REG1]
+        LDR     a2, =(2_0000000000000000:SHL:16) :OR: (2_111110000:SHL:7) :OR: (2_11:SHL:1)
+        STR     a2, [a1, #SATAPHYRX_EQUALIZER_REG1]        
+        LDR     a2, =(2_00:SHL:9)
+        STR     a2, [a1, #SATAPHYRX_IO_AND_A2D_OVERRIDES_REG1]
+
+        ; SATA PHY power up sequence
+        LDR     a1, ControlCore_LogBase
+        LDR     a2, =((ClkOsc0 / 1000000) :SHL: CTRL_CORE_PHY_POWER_SATA_SATA_PWRCTRL_CLK_FREQ_SHIFT) :OR: \
+                     CTRL_CORE_PHY_POWER_SATA_SATA_PWRCTRL_CLK_CMD_BOTH
+        STR     a2, [a1, #CTRL_CORE_PHY_POWER_SATA]
+
+        ; Get the write once capability registers over with
+        LDR     a2, [v1, #SATA_CAP]
+        BIC     a2, a2, #SATA_CAP_SSS :OR: SATA_CAP_SMPS
+        STR     a2, [v1, #SATA_CAP]
+        MOV     a2, #1:SHL:0            ; One port
+        STR     a2, [v1, #SATA_PI]
+
+        ; Force no standby since the DMA controller can't ask for itself
+        LDR     a2, =SATAMAC_SYSCONFIG_IDLEMODE_NOIDLE :OR: \
+                     SATAMAC_SYSCONFIG_STANDBYMODE_NOSTANDBY
+        STR     a2, [v2, #SATAMAC_SYSCONFIG]
+
+        Pull    "v1-v2, pc"
+
+; SATADeviceInit
+SATADeviceInit ROUT
+        Push    "lr"
+
+        ADR     a1, SATADevice
+        ADR     a2, SATADeviceTemplate
+        MOV     a3, #HALDeviceSize
+        BL      memcpy
+
+        LDR     a2, SATA_LogBase
+        STR     a2, [a1, #HALDevice_Address]
+
+        MOV     a2, a1
+        MOV     a1, #0                  ; No flags
+        CallOS  OS_AddDevice
+
+        Pull    "pc"
+        
+SATADeviceTemplate
+        DCW     HALDeviceType_ExpCtl + HALDeviceExpCtl_AHCI
+        DCW     HALDeviceID_AHCI_SynopsisDWC
+        DCD     HALDeviceBus_Sys + HALDeviceSysBus_NoC
+        DCD     &10000                       ; API version - 1.0
+        DCD     SATADevice_Desc
+        DCD     0                       ; Address of controller - filled later
+        %       12                      ; Reserved
+        DCD     SATADevice_Activate
+        DCD     SATADevice_Deactivate
+        DCD     SATADevice_Reset
+        DCD     SATADevice_Sleep
+        DCD     DevNoSATA
+        DCD     0
+        %       8
+        ASSERT  (.-SATADeviceTemplate) = HALDeviceSize
+
+SATADevice_Desc
+        DCB     "Synopsys SATA DWC", 0
+        ALIGN
+
+; SATADevice_Activate
+; => a1 = SATA device
+; <= a1 = success when TRUE
+SATADevice_Activate
+        LDR     a1, [a1, #HALDevice_Address]
+
+        ; Enable and reset (doesn't reset SATA_CAP or SATA_PI)
+        MOV     a2, #SATA_GHC_AE :OR: SATA_GHC_HR
+        STR     a2, [a1, #SATA_GHC]
+10
+        LDR     a2, [a1, #SATA_GHC]
+        TST     a2, #SATA_GHC_HR
+        BNE     %BT10
+
+        ; Turn off those things that don't exist
+        LDR     a2, [a1, #SATA_P0CMD]
+        BIC     a2, a2, #SATA_P0CMD_ESP :OR: SATA_P0CMD_CPD :OR: \
+                         SATA_P0CMD_MPSP :OR: SATA_P0CMD_HPCP
+        STR     a2, [a1, #SATA_P0CMD]
+
+        ; Bus timeout
+        ASSERT  ((ClkCore / 1000) :SHL: SATA_TIMER1MS_TIMV_SHIFT) < SATA_TIMER1MS_TIMV_MASK
+        LDR     a2, =ClkCore / 1000
+        STR     a2, [a1, #SATA_TIMER1MS]
+
+        MOV     a1, #1
+        MOV     pc, lr
+
+; SATADevice_Reset
+; => a1 = SDHCI device
+SATADevice_Reset ROUT
+        LDR     a1, [a1, #HALDevice_Address]
+        LDR     a2, [a1, #SATA_GHC]
+        BIC     a2, a2, #SATA_GHC_AE :OR: SATA_GHC_IE
+        STR     a2, [a1, #SATA_GHC]
+
+        MOV     pc, lr
+
+; SATADevice_Sleep
+; => a1 = SATA device
+;    a2 = state
+; <= a1 = new state
+SATADevice_Sleep ROUT
+        MOV     a1, #0
+        MOV     pc, lr
+
+; SATADevice_Deactivate
+; => a1 = SATA device
+SATADevice_Deactivate ROUT
+        MOV     pc, lr
+
+        END

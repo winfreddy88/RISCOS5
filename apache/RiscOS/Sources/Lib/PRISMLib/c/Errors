@@ -1,0 +1,223 @@
+/* Copyright 2005 Castle Technology Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+/**************************************************************/
+/* File:    Errors.c                                          */
+/*          (C) 2005 Tematic Ltd.                             */
+/*          All rights reserved                               */
+/*                                                            */
+/* Purpose: Error handling support.                           */
+/*                                                            */
+/* Author:  A.D.Hodgkinson.                                   */
+/*                                                            */
+/* History: 14-Apr-2005 (ADH): Created from Utils.c.          */
+/**************************************************************/
+
+#include <stdlib.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
+
+#include <swis.h>
+
+#ifdef TRACE2
+  #define TRACE
+#endif
+#ifdef TRACE
+  #define DEBUGLIB
+#endif
+#include <debuglib/debuglib.h>
+
+#include "Errors.h"
+#include "Interrupts.h"
+#include "Messages.h"
+
+/* Local definitions */
+
+#define ERR_BLOCKS 3
+
+/* Local variables */
+
+static _kernel_oserror stored_error;
+
+/* Local functions */
+
+static _kernel_oserror * find_error (void);
+
+/**************************************************************/
+/* find_error()                                               */
+/*                                                            */
+/* Get a pointer to one of ERR_BLOCKS locally stored error    */
+/* blocks, in which error messages can be stored for future   */
+/* reference. Each request increments the internal counter    */
+/* until it wraps around back to the first error block held.  */
+/*                                                            */
+/* Re-entrancy: Function is re-entrant.                       */
+/*                                                            */
+/* Interrupts:  Function is interrupt safe.                   */
+/*              Interrupts are disabled if called in SVC      */
+/*              mode.                                         */
+/**************************************************************/
+
+static _kernel_oserror * find_error(void)
+{
+  static _kernel_oserror global_error_block[ERR_BLOCKS];
+  static int             errblock = 0;
+
+  PRISMLIB_SVC_INT_DISABLE; /* No effect in USR mode */
+  errblock = (errblock+1) % ERR_BLOCKS;
+  PRISMLIB_SVC_INT_RESTORE; /* No effect in USR mode */
+
+  return &global_error_block[errblock];
+}
+
+/**************************************************************/
+/* prismlib_make_error()                                      */
+/*                                                            */
+/* Raise an error based on an error number masked with &FF -  */
+/* see the Messages file for a list.                          */
+/*                                                            */
+/* Parameters:  Error number;                                 */
+/*                                                            */
+/*              Number of arguments given that are to be      */
+/*              substituted into the message string;          */
+/*                                                            */
+/*              Zero to four NUL terminated strings to use    */
+/*              for substitution.                             */
+/*                                                            */
+/* Re-entrancy: Function is re-entrant.                       */
+/*                                                            */
+/* Interrupts:  Function is interrupt safe.                   */
+/*              Interrupts are disabled for some of the       */
+/*              execution time if called in SVC mode.         */
+/**************************************************************/
+
+_kernel_oserror * prismlib_make_error
+                  (
+                    const int err_num,
+                    int       num_args,
+                    ...
+                  )
+{
+  va_list            ap;
+  char             * s, token[4];
+  int                i = 0;
+  _kernel_oserror  * e, * ptr;
+  char             * sub[4] = {0,0,0,0};
+  size_t             len;
+
+  ptr         = find_error();
+  ptr->errnum = err_num;
+
+  num_args    = (num_args > 4) ? 4 : num_args;
+
+  for (va_start (ap, num_args); num_args--; i++)
+  {
+    s      = va_arg (ap, char *);
+    sub[i] = (s && *s) ? s : NULL; /* copy (pointer to args)s into registers */
+  }
+
+  len = sizeof(*ptr) - sizeof(ptr->errnum) /* 252! */;
+
+  /* Try this twice. Once in lower case, once in upper case. */
+
+  {
+    sprintf(token, "E%02x", err_num & 0xff);
+    e = prismlib_make_message(token,
+                              ptr->errmess,
+                              &len,
+                              4,
+                              sub[0],
+                              sub[1],
+                              sub[2],
+                              sub[3]);
+  }
+
+  if ((e != NULL) && (e->errnum == MessageTrans_TokenNotFound))
+  {
+    sprintf(token, "E%02X", err_num & 0xff);
+    e = prismlib_make_message(token,
+                              ptr->errmess,
+                              &len,
+                              4,
+                              sub[0],
+                              sub[1],
+                              sub[2],
+                              sub[3]);
+  }
+
+  /* If the functions gave an error, return that instead */
+
+  if (e != NULL) *ptr = *e;
+
+  va_end (ap);
+  return ptr;
+}
+
+/**************************************************************/
+/* prismlib_store_error()                                     */
+/*                                                            */
+/* Stores a copy of an error into a local block, overwriting  */
+/* any previously stored error.                               */
+/*                                                            */
+/* Parameters:  Pointer to the _kernel_oserror * struct to    */
+/*              copy away. May be NULL.                       */
+/*                                                            */
+/* Re-entrancy: Function is re-entrant.                       */
+/*                                                            */
+/* Interrupts:  Function is interrupt safe.                   */
+/*              Interrupts are disabled if called in SVC      */
+/*              mode.                                         */
+/*                                                            */
+/* Notes:       Clearly, if re-entered, whichever caller gets */
+/*              in last ends up with their error stored in    */
+/*              the block.                                    */
+/**************************************************************/
+
+void prismlib_store_error(const _kernel_oserror * e)
+{
+  if (e != NULL)
+  {
+    PRISMLIB_SVC_INT_DISABLE; /* No effect in USR mode */
+
+    stored_error.errnum = e->errnum;
+    strncpy(stored_error.errmess, e->errmess, sizeof(stored_error.errmess));
+
+    PRISMLIB_SVC_INT_RESTORE; /* No effect in USR mode */
+  }
+
+  return;
+}
+
+/**************************************************************/
+/* prismlib_recall_error()                                    */
+/*                                                            */
+/* Recall errors stored with prismlib_store_error. The caller */
+/* bears responsibility for matching store to recall. Only    */
+/* one error can be stored at a time. See also find_error for */
+/* a different way of accessing similar functionality.        */
+/*                                                            */
+/* Returns:     Pointer to the stored error.                  */
+/*                                                            */
+/* Re-entrancy: Function is re-entrant.                       */
+/*                                                            */
+/* Interrupts:  Function is interrupt safe.                   */
+/*              Interrupts are disabled if called in SVC      */
+/*              mode.                                         */
+/**************************************************************/
+
+_kernel_oserror * prismlib_recall_error(void)
+{
+  return &stored_error;
+}

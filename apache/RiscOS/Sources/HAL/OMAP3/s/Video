@@ -1,0 +1,396 @@
+; Copyright 2009 Castle Technology Ltd
+;
+; Licensed under the Apache License, Version 2.0 (the "License");
+; you may not use this file except in compliance with the License.
+; You may obtain a copy of the License at
+;
+;     http://www.apache.org/licenses/LICENSE-2.0
+;
+; Unless required by applicable law or agreed to in writing, software
+; distributed under the License is distributed on an "AS IS" BASIS,
+; WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+; See the License for the specific language governing permissions and
+; limitations under the License.
+;
+
+        GET     Hdr:ListOpts
+        GET     Hdr:Macros
+        GET     Hdr:System
+        GET     Hdr:Machine.<Machine>
+        GET     Hdr:ImageSize.<ImageSize>
+        $GetIO
+        GET     Hdr:Proc
+
+        GET     Hdr:OSEntries
+        GET     Hdr:HALEntries
+
+        GET     hdr.omap3530
+        GET     hdr.StaticWS
+        GET     hdr.PRCM
+        GET     hdr.GPIO
+        GET     hdr.Timers
+        GET     hdr.SPI
+
+        AREA    |Asm$$Code|, CODE, READONLY, PIC
+
+        EXPORT  Video_Init
+        EXPORT  VideoDevice_Init
+        EXPORT  Video_Power_VBC_DVI
+        EXPORT  Video_Power_VBC_Pandora
+        EXPORT  Video_Power_VBC_TouchBook
+        EXPORT  Video_SetPandoraGamma
+
+        IMPORT  memcpy
+        IMPORT  GPIOx_SetAsOutput
+        IMPORT  GPIOx_SetOutput
+        IMPORT  HAL_CounterDelay
+        IMPORT  TPSWrite
+
+Video_Init
+        ; Configure GPIO pins so we can turn the DVI framer on/off
+        LDRB    a1, [sb, #BoardConfig_VideoGPIO]
+        CMP     a1, #255
+        MOV     a2, #0
+        BNE     GPIOx_SetAsOutput ; Turn DVI framer off
+        MOV     pc, lr
+
+VideoDevice_Init
+        ; Not much to do here - just register our HAL device
+        Push    "v1,lr"
+        ADRL    v1, VideoDevice
+        MOV     a1, v1
+        ADR     a2, VideoDeviceTemplate
+        MOV     a3, #Video_DeviceSize
+        BL      memcpy
+        LDR     a1, L4_Display_Log
+        STR     a1, [v1, #HALDevice_Address]
+        ADRL    a3, VideoBoardConfig
+        STR     a3, [v1, #HALDevice_VDUDeviceSpecificField]
+        STR     sb, [v1, #:INDEX:VideoWorkspace]
+        ; Fill in the board config
+        LDR     a2, sys_clk
+        STR     a2, [a3, #VideoBoardConfig_sys_clk]
+        BL      Determine_PorchSync_Limits
+        STRH    a1, [a3, #VideoBoardConfig_Max_Porch]
+        STRH    a2, [a3, #VideoBoardConfig_Max_Sync]
+        LDR     a2, L4_sDMA_Log
+        STR     a2, [a3, #VideoBoardConfig_DMA_Ptr]
+        MOV     a2, #SDMA_IRQ_1
+        STR     a2, [a3, #VideoBoardConfig_DMA_Device]
+        ASSERT  SDMA_NumDevices = 31
+        MOV     a2, #&80000000
+        STR     a2, [a3, #VideoBoardConfig_DMA_Chans]
+        LDRB    a2, [sb, #BoardConfig_VBC_Flags]
+        STRB    a2, [a3, #VideoBoardConfig_Flags]
+        LDRB    a2, [sb, #BoardConfig_VBC_LCDNum]
+        STRB    a2, [a3, #VideoBoardConfig_Num_LCDs]
+        MOV     a2, #VideoBoardConfig_Size
+        STRH    a2, [a3, #VideoBoardConfig_MySize]
+        LDR     a2, [sb, #BoardConfig_VBC_LCDPtr]
+        STR     a2, [a3, #VideoBoardConfig_LCD_Configs]
+        ADR     a2, Video_TVDet_Func
+        STR     a2, [a3, #VideoBoardConfig_TVDet_Func]
+        ADR     a2, Video_TVPower_Func
+        STR     a2, [a3, #VideoBoardConfig_TVPower_Func]
+        MOV     a1, #0
+        MOV     a2, v1
+        CallOS  OS_AddDevice
+      [ {FALSE}
+        ; Pandora hack - point GFX overlay at the start of physical memory so we can catch any early error messages
+        ; This will treat the 8bpp display as 16bpp, so it'll be a bit squashed, but better than nothing
+        LDR     a1, L4_Display_Log
+        MOV     a2, #&80000000
+        STR     a2, [a1, #&480]
+        STR     a2, [a1, #&484]
+        LDR     a2, =319+(479<<16)
+        STR     a2, [a1, #&48c]
+        LDR     a2, =&18329
+        STR     a2, [a1, #&440]
+      ]
+        Pull    "v1,pc"
+
+VideoDeviceTemplate
+        DCW     HALDeviceType_Video + HALDeviceVideo_VDU
+        DCW     HALDeviceID_VDU_OMAP3
+        DCD     HALDeviceBus_Sys + HALDeviceSysBus_SonicsMX
+        DCD     0               ; API version 0
+        DCD     VideoDevice_Desc
+        DCD     0               ; Address - filled in later
+        %       12              ; Reserved
+        DCD     VideoDevice_Activate
+        DCD     VideoDevice_Deactivate
+        DCD     VideoDevice_Reset
+        DCD     VideoDevice_Sleep
+        DCD     VIDEO_IRQ ; Device.
+        DCD     0               ; TestIRQ cannot be called
+        %       8
+        DCD     0          ; Pointer to board config stuff - filled in later
+        ASSERT (.-VideoDeviceTemplate) = HALDevice_VDU_Size
+        DCD     0          ; HAL workspace pointer - filled in later
+        ASSERT (.-VideoDeviceTemplate) = Video_DeviceSize        
+
+VideoDevice_Desc
+        =       "OMAP3 video controller", 0
+        ALIGN
+
+VideoDevice_Activate
+        Entry   "sb"
+        LDR     sb, VideoWorkspace
+        ; Enable DSS power
+        ; TODO - should disable interrupts for this bit!
+        LDR     a1, L4_ClockMan_Log
+        LDR     a2, [a1, #CM_ICLKEN_DSS]
+        ORR     a2, a2, #1 ; EN_DSS (correct to enable iclk before fclk?)
+        STR     a2, [a1, #CM_ICLKEN_DSS]
+        LDR     a2, [a1, #CM_FCLKEN_DSS]
+        ORR     a2, a2, #7 ; EN_DSS1, EN_DSS2, EN_TV (required for reset)
+        STR     a2, [a1, #CM_FCLKEN_DSS]
+        MOV     a1, #1
+        EXIT
+
+VideoDevice_Deactivate ; TODO!
+VideoDevice_Reset
+        MOV     pc, lr
+
+VideoDevice_Sleep
+        MOV     a1, #0
+        MOV     pc, lr
+
+Video_Power_VBC_DVI
+        ; a1 = HAL device
+        ; a2 = brightness 0-65536, which we treat as a simple on/off flag
+        Entry   "sb"
+        LDR     sb, VideoWorkspace
+      [ DebugTiming
+        CMP     a2, #0
+        BEQ     %FT10
+        DebugTime a1, "Video on @ "
+10
+      ]
+        ; Just set the GPIO to the right value
+        LDRB    a1, [sb, #BoardConfig_VideoGPIO]
+        CMP     a1, #255
+        BLNE    GPIOx_SetOutput
+        EXIT
+
+Video_Power_VBC_TouchBook
+        ; a1 = HAL device
+        ; a2 = brightness 0-65536
+        Entry   "sb"
+        LDR     sb, VideoWorkspace
+        ; TODO - Proper brightness controls
+        ; For now, just toggle on/off, via the SCPWM bit of GPTIMER9.TCLR
+        LDR     a3, Timers_Log
+        ADD     a3, a3, #L4_GPTIMER9-TIMER_BASE
+        CMP     a2, #0
+        LDR     a4, [a3, #TCLR]
+        BICEQ   a4, a4, #&80
+        ORRNE   a4, a4, #&80
+        STR     a4, [a3, #TCLR]
+        ; Also toggle the GPIO that controls the DVI framer
+        LDRB    a1, [sb, #BoardConfig_VideoGPIO]
+        CMP     a1, #255
+        BLNE    GPIOx_SetOutput
+        EXIT
+
+Video_Power_VBC_Pandora ROUT
+        ; a1 = HAL device
+        ; a2 = brightness 0-65536
+        Entry   "a2,v4,sb"
+        LDR     sb, VideoWorkspace
+        ; TODO - Proper brightness controls, and proper LCD power control.
+        ; To turn the power on/off properly it looks like it needs to be done over several frames, which would ideally require some changes to OMAPVideo to ensure we're called from the foreground and aren't re-entered.
+        ; For now we'll just put the LCD in/out of standby, via the SPI interface
+        TEQ     a2, #0
+        MOVEQ   a4, #&d8
+        MOVNE   a4, #&df
+        LDR     a2, L4_Core_Log
+        ADD     a2, a2, #L4_McSPI1-L4_Core
+        ADD     a2, a2, #MCSPI_STRIDE
+        LDR     v4, =(7<<2)+(1<<6)+(15<<7)+(2<<12)+(1<<16)
+        MOV     a3, #3
+        BL      td043_write
+        ; The datasheet says we should wait 9 frames before cutting the sync
+        ; signals, but OMAPVideo will cut them right away. Luckily it looks like
+        ; we can get by with waiting just one frame.
+        LDR     a2, [sp]
+        TEQ     a2, #0
+        LDREQ   a1, =17000
+        BLEQ    HAL_CounterDelay
+        EXIT
+
+Determine_PorchSync_Limits
+        ; Returns:
+        ; a1 = max porch value
+        ; a2 = max sync value
+        ; Get the OMAP revision so we can find out how large the timing registers are. OMAP35x errata shows that in ES 3.1+ the registers were increased from 8/6 bits to 12/8 bits.
+        LDR     a2, L4_Wakeup_Log
+        ADD     a2, a2, #(L4_CONTROL_IDCODE-L4_Wakeup) :AND: &FF00
+        LDR     a2, [a2, #(L4_CONTROL_IDCODE-L4_Wakeup) :AND: &00FF]
+        ; Check revision first
+        CMP     a2, #REVISION_ES31 :SHL: 28
+        MOVHS   a1, #1:SHL:12
+        MOVHS   a2, #1:SHL:8
+        MOVHS   pc, lr
+        ; Revision check failed - check if this is OMAP35x
+        ; If not, assume it's something newer which supports the larger timings
+        LDR     a1, =HAWKEYE_OMAP35x_ES10
+        MOV     a2, a2, LSL #4
+        CMP     a1, a2, LSR #16
+        LDRNE   a1, =HAWKEYE_OMAP35x
+        CMPNE   a1, a2, LSR #16
+        MOVNE   a1, #1:SHL:12
+        MOVNE   a2, #1:SHL:8
+        MOVEQ   a1, #1:SHL:8
+        MOVEQ   a2, #1:SHL:6
+        MOV     pc, lr
+
+Video_TVDet_Func
+        Entry   "sb"
+        LDR     sb, VideoWorkspace
+        ; The TV detect signal is internally hardwired to GPIO 33
+        GPIO_PrepareC a1, a2, 33
+        GPIO_GetInput a1, a1, a2
+        EXIT
+
+Video_TVPower_Func
+        Entry   "v1-v2,sb", 4
+        LDR     sb, VideoWorkspace
+        LDR     v1, OSentries+4*OS_IICOpV
+        MOVS    ip, a2
+        MOV     a3, #1
+        MOV     a2, sp
+        BEQ     %FT50
+        ; Configure VDAC for 1.8V output
+        MOV     a1, #&4b*2
+        MOV     ip, #3
+        MOV     a4, #&99 ; VDAC_DEDICATED
+        STR     ip, [a2]
+        BL      TPSWrite
+        ; Enable it
+        MOV     ip, #&20
+50      ; Arrive here with ip=0 when disabling
+        MOV     a1, #&4b*2
+        MOV     a4, #&96 ; VDAC_DEV_GRP
+        STR     ip, [a2]
+        BL      TPSWrite
+        EXIT
+
+Video_SetPandoraGamma ROUT
+        Entry   "v1-v4"
+        ADR     a1, PandoraGamma
+        ; Reset McSPI1 and configure channel 1
+        LDR     a2, L4_Core_Log
+        ADD     a2, a2, #L4_McSPI1-L4_Core
+        MOV     a3, #2
+        STR     a3, [a2, #MCSPI_SYSCONFIG]
+10
+        LDR     a3, [a2, #MCSPI_SYSSTATUS]
+        TST     a3, #1
+        BEQ     %BT10
+        MOV     a3, #1
+        STR     a3, [a2, #MCSPI_MODULCTRL]
+        LDR     v4, =(7<<2)+(1<<6)+(15<<7)+(2<<12)+(1<<16)
+        ADD     a2, a2, #MCSPI_STRIDE
+        STR     v4, [a2, #MCSPI_CHxCONF]
+        ; Configure display
+        MOV     a3, #2
+        MOV     a4, #&f
+        BL      td043_write
+        MOV     a3, #3
+        MOV     a4, #&df
+        BL      td043_write
+        MOV     a3, #&20
+        MOV     a4, #&f0
+        BL      td043_write
+        MOV     a3, #&21
+        MOV     a4, #&f0
+        BL      td043_write
+        ; Process gamma table
+        ; Bits 9-8 of table entries
+        MOV     v1, #2
+20
+        MOV     a4, #0
+        MOV     v2, #3
+30
+        ADD     v3, v2, v1, LSL #2
+        ADD     v3, a1, v3, LSL #1
+        ADD     ip, v2, #1
+        LDRH    v3, [v3]
+        MOV     ip, ip, LSL #1
+        AND     v3, v3, #&300
+        ORR     a4, a4, v3, LSR ip
+        SUBS    v2, v2, #1
+        BGE     %BT30
+        ADD     a3, v1, #&11
+        BL      td043_write
+        SUBS    v1, v1, #1
+        BGE     %BT20
+        ; bits 7-0
+        MOV     v1, #0
+40
+        LDRH    a4, [a1], #2
+        ADD     a3, v1, #&14
+        AND     a4, a4, #255
+        BL      td043_write
+        ADD     v1, v1, #1
+        CMP     v1, #12
+        BLT     %BT40
+        ; Done
+        EXIT
+
+td043_write     ROUT
+        Entry   "a1-a2"
+        ; In:
+        ;  a2 = SPI register block
+        ;  a3 = register
+        ;  a4 = data
+        ;  v4 = channel config
+        ; Out:
+        ;  a3-a4 corrupt
+        ; Construct 16 bit SPI data word
+        ORR     a3, a4, a3, LSL #10
+        ORR     a3, a3, #1<<8
+        ; Set force flag
+        ORR     a4, v4, #1<<20
+        STR     a4, [a2, #MCSPI_CHxCONF]
+        ; Enable channel
+        MOV     a4, #1
+        STR     a4, [a2, #MCSPI_CHxCTRL]
+        ; Write data
+        STR     a3, [a2, #MCSPI_TXx]
+        ; Wait for transmission
+10
+        LDR     a4, [a2, #MCSPI_CHxSTAT]
+        AND     a4, a4, #6
+        TEQ     a4, #6
+        BNE     %BT10
+        ; Disable channel
+        MOV     a4, #0
+        STR     a4, [a2, #MCSPI_CHxCTRL]
+        ; Clear force flag
+        STR     v4, [a2, #MCSPI_CHxCONF]
+        ; TD043 datasheet says a minimum 1ns period is needed between transfers
+        ; Chances are that amount of time has already passed, but play it safe
+        ; and wait for 1us
+        MOV     a1, #1
+        BL      HAL_CounterDelay
+        EXIT
+
+        ; Default gamma table used by Linux
+PandoraGamma
+        DCW 105
+        DCW 315
+        DCW 381
+        DCW 431
+        DCW 490
+        DCW 537
+        DCW 579
+        DCW 686
+        DCW 780
+        DCW 837
+        DCW 880
+        DCW 1023
+
+        END
+
